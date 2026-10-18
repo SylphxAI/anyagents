@@ -6,6 +6,7 @@ members = [
     "crates/anyagents-harness-claude",
     "crates/anyagents-harness-codex",
     "crates/anyagents-agent",
+    "crates/anyagents-gateway",
     "crates/anyagents",
     "tests/invariants",
 ]
