@@ -6,8 +6,16 @@
 //!
 //! The vendor's delivery mode has not been verified against a real OMP session.
 //! This adapter declares followup and marks steer support unverified, which is
-//! the honest reading until that session is run. A `done` event closes the open
-//! turn.
+//! the honest reading until that session is run.
+//!
+//! The first real session has to confirm these field names before the adapter
+//! is called working:
+//! - a finished turn is a line whose `type` is `done`;
+//! - that line's `session_id` is the session, and `usage.input_tokens`,
+//!   `usage.output_tokens`, `usage.cache_read_tokens` and
+//!   `usage.cache_write_tokens` are the token counts;
+//! - a wait is a line whose `type` is `rate_limit` with `resets_at_ms` in epoch
+//!   milliseconds.
 //!
 //! Resume starts the child again with `--session`. Cancel writes
 //! `{"type":"cancel"}`.
