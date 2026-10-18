@@ -5,18 +5,8 @@ fn bin() -> Command {
 }
 
 #[test]
-fn serve_and_mcp_are_not_implemented() {
+fn mcp_without_a_server_fails() {
     let dir = tempfile::tempdir().unwrap();
-    let serve = bin()
-        .arg("--data")
-        .arg(dir.path())
-        .arg("serve")
-        .output()
-        .unwrap();
-    assert!(!serve.status.success());
-    let stderr = String::from_utf8(serve.stderr).unwrap();
-    assert!(stderr.contains("not implemented yet"), "{stderr}");
-
     let mcp = bin()
         .arg("--data")
         .arg(dir.path())
@@ -27,7 +17,7 @@ fn serve_and_mcp_are_not_implemented() {
         .unwrap();
     assert!(!mcp.status.success());
     let stderr = String::from_utf8(mcp.stderr).unwrap();
-    assert!(stderr.contains("not implemented yet"), "{stderr}");
+    assert!(stderr.contains("cannot reach the server"), "{stderr}");
 }
 
 #[test]

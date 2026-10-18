@@ -1,11 +1,14 @@
-//! Command line for the mailbox. The server and the MCP entry point come later;
-//! until then those commands say so and exit non-zero.
+//! Command line, local server, and per-agent MCP entry point.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyagents_core::{Address, Incoming, NewAgent, ReceiveOutcome, Store};
 use clap::{Parser, Subcommand};
+
+mod api;
+mod mcp;
+mod server;
 
 #[derive(Parser)]
 #[command(
@@ -91,8 +94,8 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     match cli.command {
-        Command::Serve => Err(anyagents_core::Error::NotImplemented("serve".into())),
-        Command::Mcp { .. } => Err(anyagents_core::Error::NotImplemented("mcp".into())),
+        Command::Serve => server::run(&cli.data),
+        Command::Mcp { agent } => mcp::run(&cli.data, &agent),
         Command::Agents { action } => agents(&cli.data, action),
         Command::Send {
             to,
