@@ -94,8 +94,10 @@ dependencies = [
 name = "anyagents-channel-telegram"
 version = "0.1.0"
 dependencies = [
+ "anyagents-core",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
 ]
 

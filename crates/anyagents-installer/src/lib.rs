@@ -135,9 +135,24 @@ pub fn combination(entry: &CatalogEntry, model: &str, auth: AuthMode) -> Combina
     }
 }
 
-/// Runs one command and returns what it printed. The only seam to a real process.
+/// One line a command printed, handed over before the command finishes.
+pub trait LineSink {
+    fn line(&mut self, line: &str);
+}
+
+/// Runs one command. The only seam to a real process.
+///
+/// `on_line` is called for each line as it is printed, so a sign-in can hand a
+/// link or a code to the client while the vendor command is still waiting.
 pub trait CommandRunner {
-    fn run(&mut self, program: &str, args: &[String], dir: &Path) -> Result<String, InstallError>;
+    fn run(
+        &mut self,
+        program: &str,
+        args: &[String],
+        dir: &Path,
+        env: &[(&str, &str)],
+        on_line: &mut dyn LineSink,
+    ) -> Result<(), InstallError>;
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -174,7 +189,7 @@ pub fn ensure_installed(
     }
     std::fs::create_dir_all(&dir).map_err(|e| InstallError::Failed(e.to_string()))?;
     let (program, args) = install_command(&entry.install, version);
-    runner.run(&program, &args, &dir)?;
+    runner.run(&program, &args, &dir, &[], &mut NopLines)?;
     std::fs::write(dir.join(".installed"), version)
         .map_err(|e| InstallError::Failed(e.to_string()))?;
     Ok(dir)
@@ -224,51 +239,121 @@ pub struct SignInOutcome {
     pub prompts: Vec<SignInPrompt>,
 }
 
-/// Run the vendor's sign-in command and record only the outcome.
+/// One line of a sign-in, handed to the client as it arrives.
+pub trait SignInSink {
+    fn prompt(&mut self, prompt: &SignInPrompt);
+    fn done(&mut self, outcome: &SignInOutcome);
+}
+
+struct NopLines;
+
+impl LineSink for NopLines {
+    fn line(&mut self, _: &str) {}
+}
+
+/// Where a harness writes its own sign-in credential.
 ///
-/// Lines the command prints are classified into prompts. A line `SIGNED_IN <account>`
-/// is the outcome; the vendor writes its own credential.
+/// `<root>/config/<harness>/<profile>/`. The vendor tool is pointed at this
+/// directory by the variable it documents; this crate never reads what it writes.
+pub fn config_dir(root: &Path, harness: &str, profile: &str) -> PathBuf {
+    root.join("config").join(harness).join(profile)
+}
+
+/// The variable that points this harness at its private config directory.
+pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
+    match harness {
+        "claude-code" => Some("CLAUDE_CONFIG_DIR"),
+        "codex" => Some("CODEX_HOME"),
+        _ => None,
+    }
+}
+
+struct CollectingSink<'a> {
+    prompts: &'a mut Vec<SignInPrompt>,
+    account: &'a mut Option<String>,
+    client: &'a mut dyn SignInSink,
+}
+
+impl LineSink for CollectingSink<'_> {
+    fn line(&mut self, line: &str) {
+        if let Some(rest) = line.strip_prefix("LINK ") {
+            let prompt = SignInPrompt::Link(rest.to_string());
+            self.client.prompt(&prompt);
+            self.prompts.push(prompt);
+        } else if let Some(rest) = line.strip_prefix("DEVICE ") {
+            let prompt = SignInPrompt::DeviceCode(rest.to_string());
+            self.client.prompt(&prompt);
+            self.prompts.push(prompt);
+        } else if let Some(rest) = line.strip_prefix("PROMPT ") {
+            let prompt = SignInPrompt::Prompt(rest.to_string());
+            self.client.prompt(&prompt);
+            self.prompts.push(prompt);
+        } else if let Some(rest) = line.strip_prefix("SIGNED_IN ") {
+            *self.account = Some(rest.to_string());
+        }
+    }
+}
+
+/// Run the vendor's sign-in inside a private config directory.
+///
+/// Each link, device code or prompt is handed to `sink` as the vendor prints
+/// it, before this returns. The vendor writes its own credential into that
+/// directory. The returned outcome records only whether sign-in finished and
+/// as whom, never the credential.
 pub fn sign_in(
     catalog: &[CatalogEntry],
     root: &Path,
     harness: &str,
-    version: &str,
+    profile: &str,
     runner: &mut dyn CommandRunner,
+    sink: &mut dyn SignInSink,
 ) -> Result<SignInOutcome, InstallError> {
     let entry = catalog
         .iter()
         .find(|e| e.id == harness)
         .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
-    let dir = install_dir(root, harness, version);
+    let dir = config_dir(root, harness, profile);
+    std::fs::create_dir_all(&dir).map_err(|e| InstallError::Failed(e.to_string()))?;
     let (program, args) = entry
         .sign_in_command
         .split_first()
         .ok_or_else(|| InstallError::Failed("no sign-in command".to_string()))?;
-    let output = runner.run(program, args, &dir)?;
     let mut prompts = Vec::new();
     let mut account = None;
-    for line in output.lines() {
-        if let Some(rest) = line.strip_prefix("LINK ") {
-            prompts.push(SignInPrompt::Link(rest.to_string()));
-        } else if let Some(rest) = line.strip_prefix("DEVICE ") {
-            prompts.push(SignInPrompt::DeviceCode(rest.to_string()));
-        } else if let Some(rest) = line.strip_prefix("PROMPT ") {
-            prompts.push(SignInPrompt::Prompt(rest.to_string()));
-        } else if let Some(rest) = line.strip_prefix("SIGNED_IN ") {
-            account = Some(rest.to_string());
-        }
-    }
-    Ok(SignInOutcome {
+    let mut lines = CollectingSink {
+        prompts: &mut prompts,
+        account: &mut account,
+        client: sink,
+    };
+    let variable = config_dir_variable(harness);
+    let value = dir.display().to_string();
+    let env: Vec<(&str, &str)> = match variable {
+        Some(name) => vec![(name, value.as_str())],
+        None => Vec::new(),
+    };
+    runner.run(program, args, &dir, &env, &mut lines)?;
+    let outcome = SignInOutcome {
         signed_in: account.is_some(),
         account,
         prompts,
-    })
+    };
+    sink.done(&outcome);
+    Ok(outcome)
+}
+
+/// One recorded command: program, args, working directory, and the env it was given.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordedCall {
+    pub program: String,
+    pub args: Vec<String>,
+    pub dir: PathBuf,
+    pub env: Vec<(String, String)>,
 }
 
 /// A runner that records every command and answers from a script. Tests only.
 #[derive(Default)]
 pub struct ScriptedRunner {
-    pub calls: Vec<(String, Vec<String>, PathBuf)>,
+    pub calls: Vec<RecordedCall>,
     answers: BTreeMap<String, String>,
     fail: BTreeMap<String, String>,
 }
@@ -280,13 +365,32 @@ impl ScriptedRunner {
 }
 
 impl CommandRunner for ScriptedRunner {
-    fn run(&mut self, program: &str, args: &[String], dir: &Path) -> Result<String, InstallError> {
-        self.calls
-            .push((program.to_string(), args.to_vec(), dir.to_path_buf()));
+    fn run(
+        &mut self,
+        program: &str,
+        args: &[String],
+        dir: &Path,
+        env: &[(&str, &str)],
+        on_line: &mut dyn LineSink,
+    ) -> Result<(), InstallError> {
+        self.calls.push(RecordedCall {
+            program: program.to_string(),
+            args: args.to_vec(),
+            dir: dir.to_path_buf(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        });
         if let Some(reason) = self.fail.get(program) {
             return Err(InstallError::Failed(reason.clone()));
         }
-        Ok(self.answers.get(program).cloned().unwrap_or_default())
+        if let Some(output) = self.answers.get(program) {
+            for line in output.lines() {
+                on_line.line(line);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -347,13 +451,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut runner = ScriptedRunner::default();
         ensure_installed(&catalog(), root.path(), "claude-code", "2.0.0", &mut runner).unwrap();
-        let (program, args, dir) = &runner.calls[0];
-        assert_eq!(program, "npm");
+        let call = &runner.calls[0];
+        assert_eq!(call.program, "npm");
         assert!(
-            args.iter()
+            call.args
+                .iter()
                 .any(|a| a.contains("@anthropic-ai/claude-code@2.0.0"))
         );
-        assert!(dir.ends_with("harnesses/claude-code/2.0.0"));
+        assert!(call.dir.ends_with("harnesses/claude-code/2.0.0"));
     }
 
     #[test]
@@ -373,7 +478,23 @@ mod tests {
             "codex",
             "LINK https://auth.example/device\nDEVICE ABCD-1234\nSIGNED_IN ada@example\n",
         );
-        let outcome = sign_in(&catalog(), root.path(), "codex", "1.0.0", &mut runner).unwrap();
+        struct Collect(Vec<SignInPrompt>);
+        impl SignInSink for Collect {
+            fn prompt(&mut self, prompt: &SignInPrompt) {
+                self.0.push(prompt.clone());
+            }
+            fn done(&mut self, _: &SignInOutcome) {}
+        }
+        let mut sink = Collect(Vec::new());
+        let outcome = sign_in(
+            &catalog(),
+            root.path(),
+            "codex",
+            "default",
+            &mut runner,
+            &mut sink,
+        )
+        .unwrap();
         assert!(outcome.signed_in);
         assert_eq!(outcome.account.as_deref(), Some("ada@example"));
         assert_eq!(
@@ -383,5 +504,48 @@ mod tests {
                 SignInPrompt::DeviceCode("ABCD-1234".to_string()),
             ]
         );
+        let call = &runner.calls[0];
+        assert!(call.dir.ends_with("config/codex/default"));
+        assert!(
+            call.env
+                .iter()
+                .any(|(k, v)| k == "CODEX_HOME" && v.ends_with("config/codex/default"))
+        );
+        assert_eq!(sink.0, outcome.prompts);
+    }
+
+    #[test]
+    fn a_link_reaches_the_client_before_sign_in_finishes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut runner = ScriptedRunner::default();
+        runner.answer("codex", "DEVICE ABCD\nSIGNED_IN ada@example");
+        struct Order {
+            prompts_before_done: usize,
+            done: bool,
+        }
+        impl SignInSink for Order {
+            fn prompt(&mut self, _: &SignInPrompt) {
+                assert!(!self.done, "a prompt arrived after sign-in finished");
+                self.prompts_before_done += 1;
+            }
+            fn done(&mut self, _: &SignInOutcome) {
+                self.done = true;
+            }
+        }
+        let mut sink = Order {
+            prompts_before_done: 0,
+            done: false,
+        };
+        sign_in(
+            &catalog(),
+            root.path(),
+            "codex",
+            "default",
+            &mut runner,
+            &mut sink,
+        )
+        .unwrap();
+        assert!(sink.done);
+        assert_eq!(sink.prompts_before_done, 1);
     }
 }
