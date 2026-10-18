@@ -1,14 +1,16 @@
-//! Long-poll Telegram bots recorded as channels.
+//! Long-poll Telegram bots recorded as channels, and post one agent's text back.
 //!
-//! The token is read from the credential store when a poll connects, and it
-//! stays in memory. `getUpdates` and `sendMessage` are built without it; the
-//! token is attached only on the request path. Failures name no URL, so a
+//! The token is read from the credential store when a poll or a send connects,
+//! and it stays in memory. `getUpdates` and `sendMessage` are built without it;
+//! the token is attached only on the request path. Failures name no URL, so a
 //! token on that path cannot reach a log.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyagents_channel_telegram::{BotCall, Poll, deliver_to_mailbox};
+use anyagents_channel_telegram::{
+    BotCall, Poll, deliver_to_mailbox, send_message, sent_message_id,
+};
 use anyagents_core::{Channel, CredentialStore, FileCredentialStore, Store};
 
 const API: &str = "https://api.telegram.org";
@@ -44,11 +46,7 @@ fn poll_channel(
     let Some(agent_id) = channel.agents.first() else {
         return Ok(());
     };
-    let secret = secrets.read(credential_ref)?;
-    let token = secret
-        .as_str()
-        .map_err(|_| anyagents_core::Error::Message("telegram token is not text".into()))?
-        .to_string();
+    let token = token_of(secrets, credential_ref)?;
     let mut poll = Poll::default();
     let call = poll.get_updates(0);
     let response = call_api(&token, &call)?;
@@ -92,6 +90,83 @@ pub async fn run(
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
         }
     }
+}
+
+/// A `sendMessage` for one chat, plus the secret it must be sent with.
+pub(crate) struct Outbound {
+    pub credential_ref: String,
+    pub call: BotCall,
+}
+
+/// Build the outbound call. The token is not read here.
+pub(crate) fn outbound_call(
+    store: &Store,
+    from: Option<&str>,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) -> Result<Outbound, anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    Ok(Outbound {
+        credential_ref,
+        call: send_message(chat_id, text, reply_to),
+    })
+}
+
+/// Post one text through the agent's bot. The token is read for this call only.
+pub fn post_text(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: Option<&str>,
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+) -> Result<i64, anyagents_core::Error> {
+    let outbound = outbound_call(store, from, chat_id, text, reply_to)?;
+    let token = token_of(
+        &FileCredentialStore::new(data_dir),
+        &outbound.credential_ref,
+    )?;
+    let response = call_api(&token, &outbound.call)?;
+    sent_message_id(&response).map_err(|err| anyagents_core::Error::Message(err.to_string()))
+}
+
+fn channel_for(store: &Store, from: Option<&str>) -> Result<Channel, anyagents_core::Error> {
+    let mut channels = Vec::new();
+    for channel in store.list_channels()? {
+        if channel.kind == "telegram" && channel.credential_ref.is_some() {
+            channels.push(channel);
+        }
+    }
+    if let Some(name) = from {
+        let agent = store.agent_by_name(name)?;
+        return channels
+            .into_iter()
+            .find(|channel| channel.agents.iter().any(|id| id == &agent.id))
+            .ok_or_else(|| {
+                anyagents_core::Error::Message(format!("no telegram channel for {name}"))
+            });
+    }
+    channels
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyagents_core::Error::Message("no telegram channel".into()))
+}
+
+fn token_of(
+    secrets: &FileCredentialStore,
+    credential_ref: &str,
+) -> Result<String, anyagents_core::Error> {
+    let secret = secrets.read(credential_ref)?;
+    secret
+        .as_str()
+        .map(ToString::to_string)
+        .map_err(|_| anyagents_core::Error::Message("telegram token is not text".into()))
 }
 
 /// The update list from a `getUpdates` response. Anything else is refused.
@@ -144,5 +219,47 @@ mod tests {
             })
             .unwrap();
         poll_once(&store, dir.path()).unwrap();
+    }
+
+    #[test]
+    fn outbound_uses_the_named_agents_bot_and_keeps_the_token_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let ada = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let bea = store
+            .create_agent(anyagents_core::NewAgent::new("bea", "codex"))
+            .unwrap();
+        let ada_channel = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: Some("channels/ada".into()),
+            })
+            .unwrap();
+        let bea_channel = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: Some("channels/bea".into()),
+            })
+            .unwrap();
+        store.attach_channel(&ada_channel.id, &ada.id).unwrap();
+        store.attach_channel(&bea_channel.id, &bea.id).unwrap();
+
+        let sent = outbound_call(&store, Some("bea"), 100, "hello", Some(5)).unwrap();
+        assert_eq!(sent.credential_ref, "channels/bea");
+        assert_eq!(sent.call.method, "sendMessage");
+        assert_eq!(sent.call.body["chat_id"], 100);
+        assert_eq!(sent.call.body["text"], "hello");
+        assert_eq!(sent.call.body["reply_to_message_id"], 5);
+        assert!(!sent.call.body.to_string().contains("token"));
+
+        let first = outbound_call(&store, None, 100, "hello", None).unwrap();
+        assert_eq!(first.credential_ref, "channels/ada");
+        assert!(outbound_call(&store, Some("cy"), 100, "hello", None).is_err());
     }
 }

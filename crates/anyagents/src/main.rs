@@ -343,10 +343,13 @@ fn send(
     let address = Address::parse(to)?;
     let name = match address {
         Address::Agent(name) => name,
-        Address::Group(_) | Address::TelegramChat(_) | Address::TelegramUser(_) => {
+        Address::Group(_) => {
             return Err(anyagents_core::Error::NotImplemented(
-                "send to a group or a telegram target".into(),
+                "send to a group".into(),
             ));
+        }
+        Address::TelegramChat(id) | Address::TelegramUser(id) => {
+            return send_telegram(data, &id, &text, reply_to.as_deref(), from.as_deref());
         }
     };
     let store = open(data)?;
@@ -368,6 +371,28 @@ fn send(
             println!("{}\t{}\tduplicate", message.id, message.seq);
         }
     }
+    Ok(())
+}
+
+fn send_telegram(
+    data: &Path,
+    chat: &str,
+    text: &str,
+    reply_to: Option<&str>,
+    from: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    let chat_id: i64 = chat
+        .parse()
+        .map_err(|_| anyagents_core::Error::Message("telegram chat id is not a number".into()))?;
+    let reply_to = match reply_to {
+        None => None,
+        Some(raw) => Some(raw.parse().map_err(|_| {
+            anyagents_core::Error::Message("reply_to is not a telegram message id".into())
+        })?),
+    };
+    let store = open(data)?;
+    let message_id = telegram::post_text(&store, data, from, chat_id, text, reply_to)?;
+    println!("{message_id}");
     Ok(())
 }
 
