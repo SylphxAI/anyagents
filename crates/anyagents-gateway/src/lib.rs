@@ -7,6 +7,7 @@ mod canonical;
 mod error;
 mod route;
 mod sse;
+mod stream;
 mod usage;
 
 pub use canonical::{
