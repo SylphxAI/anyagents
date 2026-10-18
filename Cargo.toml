@@ -7,6 +7,8 @@ members = [
     "crates/anyagents-harness-codex",
     "crates/anyagents-agent",
     "crates/anyagents-supervisor",
+    "crates/anyagents-installer",
+    "crates/anyagents-channel-telegram",
     "crates/anyagents",
     "tests/invariants",
 ]

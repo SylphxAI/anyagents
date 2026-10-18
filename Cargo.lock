@@ -96,6 +96,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-channel-telegram"
+version = "0.1.0"
+dependencies = [
+ "anyagents-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "anyagents-core"
 version = "0.1.0"
 dependencies = [
@@ -131,6 +142,15 @@ dependencies = [
  "anyagents-harness",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "anyagents-installer"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
