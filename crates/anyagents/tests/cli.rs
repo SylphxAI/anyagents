@@ -288,3 +288,63 @@ fn usage(data: &std::path::Path, args: &[&str]) -> String {
     );
     String::from_utf8(output.stdout).unwrap()
 }
+
+#[test]
+fn add_telegram_copies_the_token_and_lists_no_secret() {
+    use anyagents_core::CredentialStore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let created = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let token_file = dir.path().join("token");
+    std::fs::write(&token_file, b"123456:ABC\n").unwrap();
+    let added = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args([
+            "channels",
+            "add",
+            "telegram",
+            "--agent",
+            "alpha",
+            "--token-file",
+        ])
+        .arg(&token_file)
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let line = String::from_utf8(added.stdout).unwrap();
+    assert!(!line.contains("123456"), "{line}");
+    let id = line.split('\t').next().unwrap().trim();
+    let secrets = anyagents_core::FileCredentialStore::new(dir.path());
+    let secret = secrets.read(&format!("channels/{id}")).unwrap();
+    assert_eq!(secret.as_str().unwrap(), "123456:ABC");
+    let path = dir.path().join("secrets").join("channels").join(id);
+    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600);
+    let listed = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["channels", "list"])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let stdout = String::from_utf8(listed.stdout).unwrap();
+    assert!(stdout.contains("telegram"), "{stdout}");
+    assert!(stdout.contains("alpha"), "{stdout}");
+    assert!(!stdout.contains("123456"), "{stdout}");
+}

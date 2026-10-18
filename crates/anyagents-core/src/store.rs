@@ -62,12 +62,19 @@ impl NewAgent {
 }
 
 /// A channel adapter and the bot or account it speaks as.
+///
+/// `credential_ref` names a secret. The secret itself is never in this row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Channel {
     pub id: ChannelId,
     pub kind: String,
     pub identity: Option<String>,
+    /// Adapter settings, as JSON. Never a secret.
+    pub config: String,
+    pub credential_ref: Option<String>,
     pub created_at_ms: i64,
+    /// Agents attached to this channel, in attach order.
+    pub agents: Vec<AgentId>,
 }
 
 /// Fields for creating a channel.
@@ -75,6 +82,8 @@ pub struct Channel {
 pub struct NewChannel {
     pub kind: String,
     pub identity: Option<String>,
+    pub config: String,
+    pub credential_ref: Option<String>,
 }
 
 /// One append to a mailbox. An empty source key is not a key.
@@ -436,18 +445,64 @@ impl Store {
             id: ChannelId::generate(),
             kind: new.kind,
             identity: new.identity,
+            config: if new.config.is_empty() {
+                "{}".to_string()
+            } else {
+                new.config
+            },
+            credential_ref: new.credential_ref,
             created_at_ms: now_ms(),
+            agents: Vec::new(),
         };
         self.conn().execute(
-            "INSERT INTO channels (id, kind, identity, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO channels (id, kind, identity, config, credential_ref, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 channel.id.as_str(),
                 channel.kind,
                 channel.identity,
+                channel.config,
+                channel.credential_ref,
                 channel.created_at_ms,
             ],
         )?;
         Ok(channel)
+    }
+
+    /// Every channel, with the agents attached to it. No secret is in the rows.
+    pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms FROM channels
+             ORDER BY created_at_ms",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut channels = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut channel = channel_from_row(row)?;
+            channel.agents = agents_of(&conn, &channel.id)?;
+            channels.push(channel);
+        }
+        Ok(channels)
+    }
+
+    /// Point a channel at a secret that is already stored. The value stays out.
+    pub fn set_credential_ref(
+        &self,
+        channel_id: &ChannelId,
+        credential_ref: &str,
+    ) -> Result<(), Error> {
+        if credential_ref.is_empty() {
+            return Err(Error::Message("credential ref is empty".into()));
+        }
+        let changed = self.conn().execute(
+            "UPDATE channels SET credential_ref = ?2 WHERE id = ?1",
+            params![channel_id.as_str(), credential_ref],
+        )?;
+        if changed == 0 {
+            return Err(Error::ChannelNotFound(channel_id.to_string()));
+        }
+        Ok(())
     }
 
     pub fn attach_channel(&self, channel_id: &ChannelId, agent_id: &AgentId) -> Result<(), Error> {
@@ -838,7 +893,7 @@ fn validate_token(value: &str, what: &str) -> Result<(), Error> {
 fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
     let found = conn
         .query_row(
-            "SELECT id, kind, identity, created_at_ms FROM channels WHERE id = ?1",
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms FROM channels WHERE id = ?1",
             [id.as_str()],
             channel_from_row,
         )
@@ -881,8 +936,25 @@ fn channel_from_row(row: &rusqlite::Row<'_>) -> Result<Channel, rusqlite::Error>
             .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
         kind: row.get(1)?,
         identity: row.get(2)?,
-        created_at_ms: row.get(3)?,
+        config: row.get(3)?,
+        credential_ref: row.get(4)?,
+        created_at_ms: row.get(5)?,
+        agents: Vec::new(),
     })
+}
+
+fn agents_of(conn: &Connection, channel: &ChannelId) -> Result<Vec<AgentId>, Error> {
+    let mut stmt = conn
+        .prepare("SELECT agent_id FROM channel_agents WHERE channel_id = ?1 ORDER BY agent_id")?;
+    let ids = stmt.query_map([channel.as_str()], |row| {
+        let raw: String = row.get(0)?;
+        Ok(raw)
+    })?;
+    let mut agents = Vec::new();
+    for id in ids {
+        agents.push(AgentId::parse(&id?)?);
+    }
+    Ok(agents)
 }
 
 fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, Error> {
@@ -1053,9 +1125,9 @@ mod tests {
             .unwrap();
         assert_eq!(mode, "wal");
         let version = migrate::current_version(&store.conn()).unwrap();
-        assert_eq!(version, 1);
+        assert_eq!(version, 2);
         let again = Store::open(dir.path().join("state.db")).unwrap();
-        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 1);
+        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 2);
         assert_eq!(again.list_agents().unwrap(), store.list_agents().unwrap());
     }
 
@@ -1163,9 +1235,16 @@ mod tests {
             .create_channel(NewChannel {
                 kind: "telegram".into(),
                 identity: Some("bot".into()),
+                config: "{}".into(),
+                credential_ref: Some("channels/one".into()),
             })
             .unwrap();
         store.attach_channel(&channel.id, &agent.id).unwrap();
+        let listed = store.list_channels().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].agents, vec![agent.id.clone()]);
+        assert_eq!(listed[0].credential_ref.as_deref(), Some("channels/one"));
+        assert!(!format!("{listed:?}").contains("token"));
         let missing = ChannelId::generate();
         assert!(matches!(
             store.attach_channel(&missing, &agent.id).unwrap_err(),

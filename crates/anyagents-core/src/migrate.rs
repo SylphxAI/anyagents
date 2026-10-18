@@ -12,7 +12,10 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[(1, include_str!("../migrations/001_init.sql"))];
+const MIGRATIONS: &[(i64, &str)] = &[
+    (1, include_str!("../migrations/001_init.sql")),
+    (2, include_str!("../migrations/002_channel_credential.sql")),
+];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
 pub fn migrate(conn: &mut Connection) -> Result<(), Error> {

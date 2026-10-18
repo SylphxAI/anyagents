@@ -6,7 +6,10 @@ use std::process::ExitCode;
 use std::collections::HashMap;
 use std::path::Path;
 
-use anyagents_core::{Address, Incoming, ReceiveOutcome, Store, sum_usage};
+use anyagents_core::{
+    Address, CredentialStore, FileCredentialStore, Incoming, NewChannel, ReceiveOutcome, Store,
+    sum_usage,
+};
 use anyagents_supervisor::{declared, mode_name, steer_name};
 use clap::{Parser, Subcommand};
 
@@ -15,6 +18,7 @@ mod create;
 mod mcp;
 mod mcp_config;
 mod server;
+mod telegram;
 mod vendor;
 
 #[derive(Parser)]
@@ -75,6 +79,27 @@ enum Command {
         #[arg(long)]
         agent: String,
     },
+    /// Record a channel. The secret is copied into the credential store.
+    Channels {
+        #[command(subcommand)]
+        action: ChannelsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ChannelsCommand {
+    /// Copy a token and record the channel that uses it.
+    Add {
+        /// Channel kind. Only `telegram` is supported.
+        kind: String,
+        #[arg(long)]
+        agent: String,
+        /// File holding the bot token. The token is not an argument.
+        #[arg(long)]
+        token_file: PathBuf,
+    },
+    /// List channels. No secret is printed.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -129,7 +154,74 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         ),
         Command::Inbox { agent, since } => inbox(&cli.data, &agent, since),
         Command::Usage { agent, by } => usage(&cli.data, agent.as_deref(), by.as_deref()),
+        Command::Channels { action } => channels(&cli.data, action),
     }
+}
+
+fn channels(data: &Path, action: ChannelsCommand) -> Result<(), anyagents_core::Error> {
+    match action {
+        ChannelsCommand::Add {
+            kind,
+            agent,
+            token_file,
+        } => add_channel(data, &kind, &agent, &token_file),
+        ChannelsCommand::List => list_channels(data),
+    }
+}
+
+fn add_channel(
+    data: &Path,
+    kind: &str,
+    agent_name: &str,
+    token_file: &Path,
+) -> Result<(), anyagents_core::Error> {
+    if kind != "telegram" {
+        return Err(anyagents_core::Error::Message(format!(
+            "unsupported channel kind: {kind}"
+        )));
+    }
+    let token = std::fs::read(token_file)?;
+    let token = String::from_utf8(token)
+        .map_err(|_| anyagents_core::Error::Message("token file is not text".into()))?;
+    let token = token.trim();
+    if token.is_empty() || token.chars().any(|ch| ch.is_whitespace() || ch == '/') {
+        return Err(anyagents_core::Error::Message(
+            "token is empty or contains whitespace or a slash".into(),
+        ));
+    }
+    let store = open(data)?;
+    let agent = store.agent_by_name(agent_name)?;
+    let channel = store.create_channel(NewChannel {
+        kind: kind.to_string(),
+        identity: None,
+        config: "{}".to_string(),
+        credential_ref: None,
+    })?;
+    let credential_ref = format!("channels/{}", channel.id);
+    FileCredentialStore::new(data).write(&credential_ref, token.as_bytes())?;
+    store.set_credential_ref(&channel.id, &credential_ref)?;
+    store.attach_channel(&channel.id, &agent.id)?;
+    println!("{}\t{}", channel.id, channel.kind);
+    Ok(())
+}
+
+fn list_channels(data: &Path) -> Result<(), anyagents_core::Error> {
+    let store = open(data)?;
+    for channel in store.list_channels()? {
+        let names: Vec<String> = channel
+            .agents
+            .iter()
+            .filter_map(|id| store.agent(id).ok().map(|agent| agent.name))
+            .collect();
+        println!(
+            "{}\t{}\t{}\t{}",
+            channel.id,
+            channel.kind,
+            channel.credential_ref.as_deref().unwrap_or("-"),
+            names.join(",")
+        );
+    }
+    Ok(())
 }
 
 fn open(data: &std::path::Path) -> Result<Store, anyagents_core::Error> {

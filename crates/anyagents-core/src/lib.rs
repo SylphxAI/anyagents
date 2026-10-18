@@ -8,11 +8,13 @@ mod address;
 mod error;
 mod id;
 mod migrate;
+mod secret;
 mod store;
 
 pub use address::{Address, AddressError};
 pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
+pub use secret::{CredentialStore, FileCredentialStore, Secret};
 pub use store::{
     Ack, Agent, AgentLock, BillingMode, Channel, Incoming, Lag, Message, NewAgent, NewChannel,
     NewUsage, ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake, agent_config_dir,
