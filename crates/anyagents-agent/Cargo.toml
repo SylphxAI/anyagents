@@ -1,0 +1,15 @@
+[package]
+name = "anyagents-agent"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+description = "Per-agent delivery loop over the mailbox and a harness adapter"
+
+[dependencies]
+anyagents-core = { path = "../anyagents-core" }
+anyagents-harness = { path = "../anyagents-harness" }
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"

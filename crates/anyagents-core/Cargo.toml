@@ -1,0 +1,18 @@
+[package]
+name = "anyagents-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+description = "Identifiers, address grammar, and the durable mailbox"
+
+[dependencies]
+libc = "0.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+uuid = { version = "1", features = ["v7"] }
+
+[dev-dependencies]
+serde_json = "1"
+tempfile = "3"

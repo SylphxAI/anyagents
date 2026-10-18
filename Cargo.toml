@@ -1,0 +1,15 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/anyagents-core",
+    "crates/anyagents-harness",
+    "crates/anyagents-agent",
+    "crates/anyagents",
+    "tests/invariants",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"

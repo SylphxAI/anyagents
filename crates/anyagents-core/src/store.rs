@@ -1,0 +1,1076 @@
+//! SQLite mailbox. A message is received when its insert commits, and that
+//! commit assigns the next per-agent sequence. Source time is stored and never
+//! used to order delivery. The accepted and processed cursors move only over a
+//! contiguous prefix.
+
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
+use std::time::Duration;
+
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+
+use crate::error::Error;
+use crate::id::{AgentId, ChannelId, MessageId, UsageId};
+use crate::migrate::{self, now_ms as clock_now_ms};
+
+/// Milliseconds since the Unix epoch. A clock that is before the epoch reads as 0.
+pub fn now_ms() -> i64 {
+    clock_now_ms()
+}
+
+const MESSAGE_COLS: &str =
+    "id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms";
+
+/// One agent row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Agent {
+    pub id: AgentId,
+    pub name: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub workdir: Option<String>,
+    pub instructions: Option<String>,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+/// Fields for `agents.create`. The harness value is a catalog key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewAgent {
+    pub name: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub workdir: Option<String>,
+    pub instructions: Option<String>,
+}
+
+impl NewAgent {
+    pub fn new(name: impl Into<String>, harness: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            harness: harness.into(),
+            model: None,
+            workdir: None,
+            instructions: None,
+        }
+    }
+}
+
+/// A channel adapter and the bot or account it speaks as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Channel {
+    pub id: ChannelId,
+    pub kind: String,
+    pub identity: Option<String>,
+    pub created_at_ms: i64,
+}
+
+/// Fields for creating a channel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewChannel {
+    pub kind: String,
+    pub identity: Option<String>,
+}
+
+/// One append to a mailbox. An empty source key is not a key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incoming {
+    pub text: String,
+    pub sender: Option<String>,
+    pub source_time_ms: Option<i64>,
+    pub source_key: Option<String>,
+    pub reply_to: Option<String>,
+    /// Overrides the receive clock so tests can age a message without sleeping.
+    pub received_at_ms: Option<i64>,
+}
+
+impl Incoming {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            sender: None,
+            source_time_ms: None,
+            source_key: None,
+            reply_to: None,
+            received_at_ms: None,
+        }
+    }
+}
+
+/// How far a message has moved through the three cursors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Ack {
+    Received,
+    Accepted,
+    Processed,
+}
+
+impl std::fmt::Display for Ack {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Received => "received",
+            Self::Accepted => "accepted",
+            Self::Processed => "processed",
+        })
+    }
+}
+
+/// One mailbox entry. `ack` is derived from the cursors, not stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Message {
+    pub id: MessageId,
+    pub agent_id: AgentId,
+    pub seq: i64,
+    pub text: String,
+    pub sender: Option<String>,
+    pub source_time_ms: Option<i64>,
+    pub source_key: Option<String>,
+    pub reply_to: Option<String>,
+    pub received_at_ms: i64,
+    pub ack: Ack,
+}
+
+/// A new insert, or the row already stored for this source key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReceiveOutcome {
+    New(Message),
+    Duplicate(Message),
+}
+
+/// Age of the oldest message past each cursor. `None` means that cursor is caught up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lag {
+    pub oldest_unaccepted_age_ms: Option<i64>,
+    pub oldest_unprocessed_age_ms: Option<i64>,
+}
+
+/// How this turn was paid for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BillingMode {
+    Subscription,
+    ApiKey,
+}
+
+impl BillingMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Subscription => "subscription",
+            Self::ApiKey => "api-key",
+        }
+    }
+
+    fn parse(raw: &str) -> Result<Self, Error> {
+        match raw {
+            "subscription" => Ok(Self::Subscription),
+            "api-key" => Ok(Self::ApiKey),
+            other => Err(Error::Message(format!("unknown billing mode: {other}"))),
+        }
+    }
+}
+
+impl std::fmt::Display for BillingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// One turn's usage row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageRecord {
+    pub id: UsageId,
+    pub agent_id: AgentId,
+    pub harness: String,
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reported_cost_micros: Option<i64>,
+    pub estimated_cost_micros: Option<i64>,
+    pub billing_mode: BillingMode,
+    pub quota_state: Option<String>,
+    pub day: String,
+    pub recorded_at_ms: i64,
+}
+
+/// Fields for one usage insert. The id and record time are assigned here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewUsage {
+    pub agent_id: AgentId,
+    pub harness: String,
+    pub model: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reported_cost_micros: Option<i64>,
+    pub estimated_cost_micros: Option<i64>,
+    pub billing_mode: BillingMode,
+    pub quota_state: Option<String>,
+    pub day: String,
+}
+
+/// Held for the life of one agent loop. Drop releases the lock.
+#[derive(Debug)]
+pub struct AgentLock {
+    _file: File,
+}
+
+/// Open database. Methods take a shared reference; writes serialize on the mutex.
+pub struct Store {
+    conn: Mutex<Connection>,
+    data_dir: PathBuf,
+}
+
+impl Store {
+    /// Open or create the database, turn on WAL, and apply pending migrations.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
+        let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(Error::Message(format!(
+                "sqlite journal mode is {mode}, not wal"
+            )));
+        }
+        let mut conn = conn;
+        migrate::migrate(&mut conn)?;
+        if migrate::current_version(&conn)? < 1 {
+            return Err(Error::Message("migrations did not apply".into()));
+        }
+        Ok(Self {
+            conn: Mutex::new(conn),
+            data_dir: data_dir_for(path),
+        })
+    }
+
+    pub fn data_dir(&self) -> &Path {
+        &self.data_dir
+    }
+
+    /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
+    pub fn try_lock_agent(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
+        let dir = self.data_dir.join("locks");
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join(format!("{}.lock", agent_id.as_str()));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        // flock, not a POSIX record lock: two descriptors in one process must exclude
+        // each other, which is what a second loop in the same test process needs.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
+                return Err(Error::AgentBusy);
+            }
+            return Err(Error::Io(err));
+        }
+        Ok(AgentLock { _file: file })
+    }
+
+    pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
+        validate_token(&new.name, "agent name")?;
+        if new.harness.is_empty() {
+            return Err(Error::Message("harness is empty".into()));
+        }
+        let agent = Agent {
+            id: AgentId::generate(),
+            name: new.name,
+            harness: new.harness,
+            model: new.model,
+            workdir: new.workdir,
+            instructions: new.instructions,
+            state: "created".into(),
+            created_at_ms: now_ms(),
+        };
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let taken: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM agents WHERE name = ?1",
+            [&agent.name],
+            |row| row.get(0),
+        )?;
+        if taken != 0 {
+            return Err(Error::AgentExists(agent.name));
+        }
+        tx.execute(
+            "INSERT INTO agents (
+                id, name, harness, model, workdir, instructions, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7)",
+            params![
+                agent.id.as_str(),
+                agent.name,
+                agent.harness,
+                agent.model,
+                agent.workdir,
+                agent.instructions,
+                agent.created_at_ms,
+            ],
+        )?;
+        tx.execute(
+            "INSERT INTO mailbox_cursors (agent_id, accepted_seq, processed_seq) VALUES (?1, 0, 0)",
+            [agent.id.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(agent)
+    }
+
+    pub fn agent(&self, id: &AgentId) -> Result<Agent, Error> {
+        agent_by_id(&self.conn(), id)
+    }
+
+    pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+                 FROM agents WHERE name = ?1",
+                [name],
+                agent_from_row,
+            )
+            .optional()?;
+        found.ok_or_else(|| Error::AgentNotFound(name.to_string()))
+    }
+
+    pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+             FROM agents ORDER BY name",
+        )?;
+        let mut rows = stmt.query([])?;
+        let mut agents = Vec::new();
+        while let Some(row) = rows.next()? {
+            agents.push(agent_from_row(row)?);
+        }
+        Ok(agents)
+    }
+
+    pub fn create_channel(&self, new: NewChannel) -> Result<Channel, Error> {
+        if new.kind.is_empty() {
+            return Err(Error::Message("channel kind is empty".into()));
+        }
+        let channel = Channel {
+            id: ChannelId::generate(),
+            kind: new.kind,
+            identity: new.identity,
+            created_at_ms: now_ms(),
+        };
+        self.conn().execute(
+            "INSERT INTO channels (id, kind, identity, created_at_ms) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                channel.id.as_str(),
+                channel.kind,
+                channel.identity,
+                channel.created_at_ms,
+            ],
+        )?;
+        Ok(channel)
+    }
+
+    pub fn attach_channel(&self, channel_id: &ChannelId, agent_id: &AgentId) -> Result<(), Error> {
+        let conn = self.conn();
+        channel_with(&conn, channel_id)?;
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO channel_agents (channel_id, agent_id) VALUES (?1, ?2)",
+            params![channel_id.as_str(), agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Append one message, or return the row already stored for this source key.
+    /// The sequence is assigned inside the insert transaction.
+    pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
+        let source_key = incoming.source_key.filter(|key| !key.is_empty());
+        let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        if let Some(key) = &source_key
+            && let Some(existing) = message_by_source(&tx, agent_id, key)?
+        {
+            return Ok(ReceiveOutcome::Duplicate(existing));
+        }
+        let message = Message {
+            id: MessageId::generate(),
+            agent_id: agent_id.clone(),
+            seq: next_seq(&tx, agent_id)?,
+            text: incoming.text,
+            sender: incoming.sender,
+            source_time_ms: incoming.source_time_ms,
+            source_key,
+            reply_to: incoming.reply_to,
+            received_at_ms,
+            ack: Ack::Received,
+        };
+        tx.execute(
+            "INSERT INTO messages (
+                id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                message.id.as_str(),
+                message.agent_id.as_str(),
+                message.seq,
+                message.source_time_ms,
+                message.source_key,
+                message.sender,
+                message.text,
+                message.reply_to,
+                message.received_at_ms,
+            ],
+        )?;
+        tx.commit()?;
+        Ok(ReceiveOutcome::New(message))
+    }
+
+    /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
+    pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let (accepted, processed) = cursors(&conn, agent_id)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS} FROM messages
+             WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq"
+        ))?;
+        let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(0)])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(message_from_row(row, accepted, processed)?);
+        }
+        Ok(messages)
+    }
+
+    /// The message at `accepted + 1`, or `None` when delivery has caught up.
+    pub fn next_unaccepted(&self, agent_id: &AgentId) -> Result<Option<Message>, Error> {
+        let accepted = self.accepted_cursor(agent_id)?;
+        let next = accepted + 1;
+        if let Some(message) = self.message_at(agent_id, next)? {
+            return Ok(Some(message));
+        }
+        let received = self.received_cursor(agent_id)?;
+        if received > accepted {
+            return Err(Error::Message(format!(
+                "mailbox sequence has a hole at {next}"
+            )));
+        }
+        Ok(None)
+    }
+
+    pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
+            [agent_id.as_str()],
+            |row| row.get(0),
+        )?;
+        Ok(seq)
+    }
+
+    pub fn accepted_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        Ok(cursors(&conn, agent_id)?.0)
+    }
+
+    pub fn processed_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        Ok(cursors(&conn, agent_id)?.1)
+    }
+
+    /// Move `accepted` to `seq`. `seq` must be exactly one past the current cursor.
+    pub fn advance_accepted(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        bump_accepted(&tx, agent_id, seq)?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// Move `processed` through `seq`. Every message in the skipped range must exist,
+    /// and `seq` must already be accepted.
+    pub fn advance_processed_through(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        bump_processed(&tx, agent_id, seq)?;
+        tx.commit()?;
+        Ok(seq)
+    }
+
+    /// Record acceptance, and processing when the turn already finished, in one commit.
+    pub fn note_delivery(
+        &self,
+        agent_id: &AgentId,
+        seq: i64,
+        turn_finished: bool,
+    ) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        bump_accepted(&tx, agent_id, seq)?;
+        if turn_finished {
+            bump_processed(&tx, agent_id, seq)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn lag(&self, agent_id: &AgentId, now_ms: i64) -> Result<Lag, Error> {
+        let accepted = self.accepted_cursor(agent_id)?;
+        let processed = self.processed_cursor(agent_id)?;
+        Ok(Lag {
+            oldest_unaccepted_age_ms: self.age_at(agent_id, accepted + 1, now_ms)?,
+            oldest_unprocessed_age_ms: self.age_at(agent_id, processed + 1, now_ms)?,
+        })
+    }
+
+    pub fn record_usage(&self, new: NewUsage) -> Result<UsageRecord, Error> {
+        let record = UsageRecord {
+            id: UsageId::generate(),
+            agent_id: new.agent_id.clone(),
+            harness: new.harness,
+            model: new.model,
+            input_tokens: new.input_tokens,
+            output_tokens: new.output_tokens,
+            cache_read_tokens: new.cache_read_tokens,
+            cache_write_tokens: new.cache_write_tokens,
+            reported_cost_micros: new.reported_cost_micros,
+            estimated_cost_micros: new.estimated_cost_micros,
+            billing_mode: new.billing_mode,
+            quota_state: new.quota_state,
+            day: new.day,
+            recorded_at_ms: now_ms(),
+        };
+        let conn = self.conn();
+        agent_by_id(&conn, &record.agent_id)?;
+        conn.execute(
+            "INSERT INTO usage_records (
+                id, agent_id, harness, model, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reported_cost_micros,
+                estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                record.id.as_str(),
+                record.agent_id.as_str(),
+                record.harness,
+                record.model,
+                record.input_tokens,
+                record.output_tokens,
+                record.cache_read_tokens,
+                record.cache_write_tokens,
+                record.reported_cost_micros,
+                record.estimated_cost_micros,
+                record.billing_mode.as_str(),
+                record.quota_state,
+                record.day,
+                record.recorded_at_ms,
+            ],
+        )?;
+        Ok(record)
+    }
+
+    pub fn list_usage(&self, agent_id: Option<&AgentId>) -> Result<Vec<UsageRecord>, Error> {
+        let conn = self.conn();
+        let sql = match agent_id {
+            Some(id) => {
+                agent_by_id(&conn, id)?;
+                "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, reported_cost_micros,
+                        estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
+                 FROM usage_records WHERE agent_id = ?1 ORDER BY recorded_at_ms, id"
+            }
+            None => {
+                "SELECT id, agent_id, harness, model, input_tokens, output_tokens,
+                        cache_read_tokens, cache_write_tokens, reported_cost_micros,
+                        estimated_cost_micros, billing_mode, quota_state, day, recorded_at_ms
+                 FROM usage_records ORDER BY recorded_at_ms, id"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = match agent_id {
+            Some(id) => stmt.query(params![id.as_str()])?,
+            None => stmt.query([])?,
+        };
+        let mut records = Vec::new();
+        while let Some(row) = rows.next()? {
+            records.push(usage_from_row(row)?);
+        }
+        Ok(records)
+    }
+
+    fn message_at(&self, agent_id: &AgentId, seq: i64) -> Result<Option<Message>, Error> {
+        let conn = self.conn();
+        let (accepted, processed) = cursors(&conn, agent_id)?;
+        let found = conn
+            .query_row(
+                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND seq = ?2"),
+                params![agent_id.as_str(), seq],
+                |row| Ok(message_from_row(row, accepted, processed)),
+            )
+            .optional()?;
+        found.transpose()
+    }
+
+    fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
+        let conn = self.conn();
+        let received_at: Option<i64> = conn
+            .query_row(
+                "SELECT received_at_ms FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                params![agent_id.as_str(), seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(received_at.map(|at| (now_ms - at).max(0)))
+    }
+
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn data_dir_for(path: &Path) -> PathBuf {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn validate_token(value: &str, what: &str) -> Result<(), Error> {
+    if value.is_empty() || value.contains(':') || value.chars().any(char::is_whitespace) {
+        Err(Error::Message(format!(
+            "{what} is empty or contains whitespace or a colon"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
+    let found = conn
+        .query_row(
+            "SELECT id, kind, identity, created_at_ms FROM channels WHERE id = ?1",
+            [id.as_str()],
+            channel_from_row,
+        )
+        .optional()?;
+    found.ok_or_else(|| Error::ChannelNotFound(id.to_string()))
+}
+
+fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
+    let found = conn
+        .query_row(
+            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+             FROM agents WHERE id = ?1",
+            [id.as_str()],
+            agent_from_row,
+        )
+        .optional()?;
+    found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
+}
+
+fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    let agent_id = AgentId::parse(&id)
+        .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    Ok(Agent {
+        id: agent_id,
+        name: row.get(1)?,
+        harness: row.get(2)?,
+        model: row.get(3)?,
+        workdir: row.get(4)?,
+        instructions: row.get(5)?,
+        state: row.get(6)?,
+        created_at_ms: row.get(7)?,
+    })
+}
+
+fn channel_from_row(row: &rusqlite::Row<'_>) -> Result<Channel, rusqlite::Error> {
+    let id: String = row.get(0)?;
+    Ok(Channel {
+        id: ChannelId::parse(&id)
+            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        kind: row.get(1)?,
+        identity: row.get(2)?,
+        created_at_ms: row.get(3)?,
+    })
+}
+
+fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, Error> {
+    let id: String = row.get(0)?;
+    let agent_id: String = row.get(1)?;
+    let billing: String = row.get(10)?;
+    Ok(UsageRecord {
+        id: UsageId::parse(&id)?,
+        agent_id: AgentId::parse(&agent_id)?,
+        harness: row.get(2)?,
+        model: row.get(3)?,
+        input_tokens: row.get(4)?,
+        output_tokens: row.get(5)?,
+        cache_read_tokens: row.get(6)?,
+        cache_write_tokens: row.get(7)?,
+        reported_cost_micros: row.get(8)?,
+        estimated_cost_micros: row.get(9)?,
+        billing_mode: BillingMode::parse(&billing)?,
+        quota_state: row.get(11)?,
+        day: row.get(12)?,
+        recorded_at_ms: row.get(13)?,
+    })
+}
+
+fn message_from_row(
+    row: &rusqlite::Row<'_>,
+    accepted: i64,
+    processed: i64,
+) -> Result<Message, Error> {
+    let id: String = row.get(0)?;
+    let agent_id: String = row.get(1)?;
+    let seq: i64 = row.get(2)?;
+    let ack = if seq <= processed {
+        Ack::Processed
+    } else if seq <= accepted {
+        Ack::Accepted
+    } else {
+        Ack::Received
+    };
+    Ok(Message {
+        id: MessageId::parse(&id)?,
+        agent_id: AgentId::parse(&agent_id)?,
+        seq,
+        source_time_ms: row.get(3)?,
+        source_key: row.get(4)?,
+        sender: row.get(5)?,
+        text: row.get(6)?,
+        reply_to: row.get(7)?,
+        received_at_ms: row.get(8)?,
+        ack,
+    })
+}
+
+fn message_by_source(
+    conn: &Connection,
+    agent_id: &AgentId,
+    source_key: &str,
+) -> Result<Option<Message>, Error> {
+    let (accepted, processed) = cursors(conn, agent_id)?;
+    let found = conn
+        .query_row(
+            &format!(
+                "SELECT {MESSAGE_COLS} FROM messages
+                 WHERE agent_id = ?1 AND source_key = ?2"
+            ),
+            params![agent_id.as_str(), source_key],
+            |row| Ok(message_from_row(row, accepted, processed)),
+        )
+        .optional()?;
+    found.transpose()
+}
+
+fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
+    let seq = conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE agent_id = ?1",
+        [agent_id.as_str()],
+        |row| row.get(0),
+    )?;
+    Ok(seq)
+}
+
+fn cursors(conn: &Connection, agent_id: &AgentId) -> Result<(i64, i64), Error> {
+    let found = conn
+        .query_row(
+            "SELECT accepted_seq, processed_seq FROM mailbox_cursors WHERE agent_id = ?1",
+            [agent_id.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    found.ok_or_else(|| Error::Message(format!("mailbox cursors missing for {agent_id}")))
+}
+
+fn bump_accepted(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
+    let (accepted, _) = cursors(conn, agent_id)?;
+    if seq != accepted + 1 || !message_exists(conn, agent_id, seq)? {
+        return Err(Error::CursorGap {
+            cursor: "accepted",
+            at: accepted,
+            attempted: seq,
+        });
+    }
+    conn.execute(
+        "UPDATE mailbox_cursors SET accepted_seq = ?1 WHERE agent_id = ?2",
+        params![seq, agent_id.as_str()],
+    )?;
+    Ok(())
+}
+
+fn bump_processed(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
+    let (accepted, processed) = cursors(conn, agent_id)?;
+    if seq <= processed || seq > accepted {
+        return Err(Error::CursorGap {
+            cursor: "processed",
+            at: processed,
+            attempted: seq,
+        });
+    }
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3",
+        params![agent_id.as_str(), processed, seq],
+        |row| row.get(0),
+    )?;
+    if count != seq - processed {
+        return Err(Error::CursorGap {
+            cursor: "processed",
+            at: processed,
+            attempted: seq,
+        });
+    }
+    conn.execute(
+        "UPDATE mailbox_cursors SET processed_seq = ?1 WHERE agent_id = ?2",
+        params![seq, agent_id.as_str()],
+    )?;
+    Ok(())
+}
+
+fn message_exists(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<bool, Error> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq = ?2",
+        params![agent_id.as_str(), seq],
+        |row| row.get(0),
+    )?;
+    Ok(count == 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        (dir, store)
+    }
+
+    fn agent(store: &Store, name: &str) -> Agent {
+        store
+            .create_agent(NewAgent::new(name, "claude-code"))
+            .unwrap()
+    }
+
+    #[test]
+    fn opens_in_wal_and_migrates_once() {
+        let (dir, store) = setup();
+        let mode: String = store
+            .conn()
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let version = migrate::current_version(&store.conn()).unwrap();
+        assert_eq!(version, 1);
+        let again = Store::open(dir.path().join("state.db")).unwrap();
+        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 1);
+        assert_eq!(again.list_agents().unwrap(), store.list_agents().unwrap());
+    }
+
+    #[test]
+    fn sequence_dedupes_without_consuming_a_number() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let mut first = Incoming::new("one");
+        first.source_key = Some("src:1".into());
+        first.source_time_ms = Some(50);
+        let ReceiveOutcome::New(first) = store.receive(&agent.id, first).unwrap() else {
+            panic!("first receive should be new");
+        };
+        assert_eq!(first.seq, 1);
+        assert_eq!(first.ack, Ack::Received);
+        let mut again = Incoming::new("one again");
+        again.source_key = Some("src:1".into());
+        let ReceiveOutcome::Duplicate(again) = store.receive(&agent.id, again).unwrap() else {
+            panic!("same source key should dedupe");
+        };
+        assert_eq!(again.id, first.id);
+        assert_eq!(again.seq, 1);
+        let mut blank_a = Incoming::new("a");
+        blank_a.source_key = Some(String::new());
+        let mut blank_b = Incoming::new("b");
+        blank_b.source_key = None;
+        let ReceiveOutcome::New(a) = store.receive(&agent.id, blank_a).unwrap() else {
+            panic!("empty key is not a key");
+        };
+        let ReceiveOutcome::New(b) = store.receive(&agent.id, blank_b).unwrap() else {
+            panic!("missing key is not a key");
+        };
+        assert_eq!((a.seq, b.seq), (2, 3));
+        assert_eq!(store.received_cursor(&agent.id).unwrap(), 3);
+    }
+
+    #[test]
+    fn late_source_time_gets_the_next_sequence() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let mut early_arrival = Incoming::new("later clock");
+        early_arrival.source_time_ms = Some(500);
+        let mut late = Incoming::new("earlier clock");
+        late.source_time_ms = Some(100);
+        let ReceiveOutcome::New(first) = store.receive(&agent.id, early_arrival).unwrap() else {
+            panic!("new");
+        };
+        let ReceiveOutcome::New(second) = store.receive(&agent.id, late).unwrap() else {
+            panic!("new");
+        };
+        assert_eq!((first.seq, second.seq), (1, 2));
+        assert!(second.source_time_ms.unwrap() < first.source_time_ms.unwrap());
+    }
+
+    #[test]
+    fn cursors_refuse_a_gap_and_inbox_is_exclusive() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("a")).unwrap()
+        else {
+            panic!("new");
+        };
+        let ReceiveOutcome::New(second) = store.receive(&agent.id, Incoming::new("b")).unwrap()
+        else {
+            panic!("new");
+        };
+        assert!(store.advance_accepted(&agent.id, 2).is_err());
+        assert_eq!(store.advance_accepted(&agent.id, 1).unwrap(), 1);
+        assert!(store.advance_processed_through(&agent.id, 2).is_err());
+        store.advance_accepted(&agent.id, 2).unwrap();
+        assert_eq!(store.advance_processed_through(&agent.id, 2).unwrap(), 2);
+        let all = store.inbox(&agent.id, None).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].ack, Ack::Processed);
+        assert_eq!(all[1].id, second.id);
+        let rest = store.inbox(&agent.id, Some(first.seq)).unwrap();
+        assert_eq!(rest.len(), 1);
+        assert_eq!(rest[0].seq, 2);
+        assert!(store.next_unaccepted(&agent.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn note_delivery_commits_both_cursors_when_the_turn_finished() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        store.receive(&agent.id, Incoming::new("a")).unwrap();
+        store.note_delivery(&agent.id, 1, true).unwrap();
+        assert_eq!(store.accepted_cursor(&agent.id).unwrap(), 1);
+        assert_eq!(store.processed_cursor(&agent.id).unwrap(), 1);
+    }
+
+    #[test]
+    fn unknown_agent_is_rejected() {
+        let (_dir, store) = setup();
+        let missing = AgentId::generate();
+        let err = store.receive(&missing, Incoming::new("nope")).unwrap_err();
+        assert!(matches!(err, Error::AgentNotFound(_)));
+    }
+
+    #[test]
+    fn channel_attaches_to_an_agent() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let channel = store
+            .create_channel(NewChannel {
+                kind: "telegram".into(),
+                identity: Some("bot".into()),
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &agent.id).unwrap();
+        let missing = ChannelId::generate();
+        assert!(matches!(
+            store.attach_channel(&missing, &agent.id).unwrap_err(),
+            Error::ChannelNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn usage_round_trips() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let record = store
+            .record_usage(NewUsage {
+                agent_id: agent.id.clone(),
+                harness: "claude-code".into(),
+                model: Some("model".into()),
+                input_tokens: 3,
+                output_tokens: 4,
+                cache_read_tokens: 1,
+                cache_write_tokens: 0,
+                reported_cost_micros: None,
+                estimated_cost_micros: Some(12),
+                billing_mode: BillingMode::Subscription,
+                quota_state: None,
+                day: "2026-10-18".into(),
+            })
+            .unwrap();
+        assert_eq!(record.input_tokens, 3);
+        assert_eq!(store.list_usage(Some(&agent.id)).unwrap(), vec![record]);
+    }
+
+    #[test]
+    fn second_lock_is_busy_until_the_first_drops() {
+        let (dir, store) = setup();
+        let held_agent = agent(&store, "alpha");
+        let other = agent(&store, "beta");
+        let held = store.try_lock_agent(&held_agent.id).unwrap();
+        let again = Store::open(dir.path().join("state.db")).unwrap();
+        assert!(matches!(
+            again.try_lock_agent(&held_agent.id).unwrap_err(),
+            Error::AgentBusy
+        ));
+        let _other_lock = store.try_lock_agent(&other.id).unwrap();
+        drop(held);
+        again.try_lock_agent(&held_agent.id).unwrap();
+    }
+
+    #[test]
+    fn lag_uses_the_message_receive_time() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let mut incoming = Incoming::new("held");
+        incoming.received_at_ms = Some(1_000);
+        store.receive(&agent.id, incoming).unwrap();
+        let lag = store.lag(&agent.id, 6_000).unwrap();
+        assert_eq!(lag.oldest_unaccepted_age_ms, Some(5_000));
+        assert_eq!(lag.oldest_unprocessed_age_ms, Some(5_000));
+    }
+
+    #[test]
+    fn rejects_a_bad_agent_name_and_a_duplicate() {
+        let (_dir, store) = setup();
+        assert!(
+            store
+                .create_agent(NewAgent::new("has space", "claude-code"))
+                .is_err()
+        );
+        agent(&store, "alpha");
+        assert!(matches!(
+            store
+                .create_agent(NewAgent::new("alpha", "claude-code"))
+                .unwrap_err(),
+            Error::AgentExists(_)
+        ));
+    }
+}

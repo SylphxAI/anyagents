@@ -1,0 +1,14 @@
+[package]
+name = "anyagents-invariants"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.98"
+description = "Crash-injection tests for the delivery guarantees"
+publish = false
+
+[dev-dependencies]
+anyagents-agent = { path = "../../crates/anyagents-agent" }
+anyagents-core = { path = "../../crates/anyagents-core" }
+anyagents-harness = { path = "../../crates/anyagents-harness" }
+tempfile = "3"

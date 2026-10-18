@@ -1,0 +1,6 @@
+/target
+.anyagents/
+*.db
+*.db-wal
+*.db-shm
+*.sock
