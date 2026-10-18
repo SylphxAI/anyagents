@@ -370,49 +370,131 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
             "send needs an address",
         ));
     }
-    let mut names = Vec::with_capacity(body.to.len());
+    enum Target {
+        Agent(String),
+        Telegram { address: String, chat: String },
+    }
+    let mut targets = Vec::with_capacity(body.to.len());
     for raw in &body.to {
-        match Address::parse(raw).map_err(Error::from) {
-            Ok(Address::Agent(name)) => names.push(name),
-            Ok(Address::Group(_) | Address::TelegramChat(_) | Address::TelegramUser(_)) => {
+        match Address::parse(raw)
+            .map_err(Error::from)
+            .map_err(ApiError::from_store)?
+        {
+            Address::Agent(name) => targets.push(Target::Agent(name)),
+            Address::TelegramChat(id) | Address::TelegramUser(id) => {
+                targets.push(Target::Telegram {
+                    address: raw.clone(),
+                    chat: id,
+                });
+            }
+            Address::Group(_) => {
                 return Err(ApiError::from_store(Error::NotImplemented(
-                    "send to a group or a telegram target".into(),
+                    "send to a group".into(),
                 )));
             }
-            Err(err) => return Err(ApiError::from_store(err)),
         }
     }
-    let mut agents = Vec::with_capacity(names.len());
-    for name in &names {
-        agents.push(store.agent_by_name(name).map_err(ApiError::from_store)?);
+    for target in &targets {
+        match target {
+            Target::Agent(name) => {
+                store.agent_by_name(name).map_err(ApiError::from_store)?;
+            }
+            Target::Telegram { chat, .. } => {
+                prepare_telegram(store, &body, chat)?;
+            }
+        }
     }
-    let mut deliveries = Vec::with_capacity(agents.len());
-    for agent in &agents {
-        let outcome = store
-            .receive(
-                &agent.id,
-                Incoming {
-                    text: body.text.clone(),
-                    sender: body.sender.clone(),
-                    source_time_ms: None,
-                    source_key: None,
-                    reply_to: body.reply_to.clone(),
-                    received_at_ms: None,
-                },
-            )
-            .map_err(ApiError::from_store)?;
-        let (message, duplicate) = match outcome {
-            ReceiveOutcome::New(message) => (message, false),
-            ReceiveOutcome::Duplicate(message) => (message, true),
+    let mut deliveries = Vec::with_capacity(targets.len());
+    for target in targets {
+        let delivery = match target {
+            Target::Agent(name) => deliver_agent(store, &body, &name)?,
+            Target::Telegram { address, chat } => deliver_telegram(store, &body, &address, &chat)?,
         };
-        deliveries.push(Delivery {
-            to: format!("agent:{}", agent.name),
-            id: message.id.to_string(),
-            seq: message.seq,
-            duplicate,
-        });
+        deliveries.push(delivery);
     }
     Ok(Json(SendResponse { deliveries }))
+}
+
+fn deliver_agent(store: &Store, body: &SendRequest, name: &str) -> Result<Delivery, ApiError> {
+    let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
+    let outcome = store
+        .receive(
+            &agent.id,
+            Incoming {
+                text: body.text.clone(),
+                sender: body.sender.clone(),
+                source_time_ms: None,
+                source_key: None,
+                reply_to: body.reply_to.clone(),
+                received_at_ms: None,
+            },
+        )
+        .map_err(ApiError::from_store)?;
+    let (message, duplicate) = match outcome {
+        ReceiveOutcome::New(message) => (message, false),
+        ReceiveOutcome::Duplicate(message) => (message, true),
+    };
+    Ok(Delivery {
+        to: format!("agent:{}", agent.name),
+        id: message.id.to_string(),
+        seq: message.seq,
+        duplicate,
+    })
+}
+
+/// Resolve the bot and the chat before any mailbox write. This does not post.
+fn prepare_telegram(store: &Store, body: &SendRequest, chat: &str) -> Result<(), ApiError> {
+    let chat_id: i64 = chat
+        .parse()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "telegram chat id is not a number"))?;
+    let reply_to = telegram_reply(body)?;
+    let from =
+        crate::telegram::bound_sender(body.sender.as_deref()).map_err(ApiError::from_store)?;
+    crate::telegram::outbound_call(store, from.as_deref(), chat_id, &body.text, reply_to)
+        .map_err(ApiError::from_store)?;
+    Ok(())
+}
+
+fn telegram_reply(body: &SendRequest) -> Result<Option<i64>, ApiError> {
+    match body.reply_to.as_deref() {
+        None => Ok(None),
+        Some(value) => Ok(Some(value.parse().map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "reply_to is not a telegram message id",
+            )
+        })?)),
+    }
+}
+
+/// `id` is the Telegram message id. This delivery has no mailbox sequence.
+fn deliver_telegram(
+    store: &Store,
+    body: &SendRequest,
+    address: &str,
+    chat: &str,
+) -> Result<Delivery, ApiError> {
+    let chat_id: i64 = chat
+        .parse()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "telegram chat id is not a number"))?;
+    let reply_to = telegram_reply(body)?;
+    let from =
+        crate::telegram::bound_sender(body.sender.as_deref()).map_err(ApiError::from_store)?;
+    let message_id = crate::telegram::post_text(
+        store,
+        store.data_dir(),
+        from.as_deref(),
+        chat_id,
+        &body.text,
+        reply_to,
+    )
+    .map_err(ApiError::from_store)?;
+    Ok(Delivery {
+        to: address.to_string(),
+        id: message_id.to_string(),
+        seq: 0,
+        duplicate: false,
+    })
 }
 
 async fn spawn_store<T: Send + 'static>(

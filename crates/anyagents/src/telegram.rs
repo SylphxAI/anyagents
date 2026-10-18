@@ -93,6 +93,7 @@ pub async fn run(
 }
 
 /// A `sendMessage` for one chat, plus the secret it must be sent with.
+#[derive(Debug)]
 pub(crate) struct Outbound {
     pub credential_ref: String,
     pub call: BotCall,
@@ -152,10 +153,39 @@ fn channel_for(store: &Store, from: Option<&str>) -> Result<Channel, anyagents_c
                 anyagents_core::Error::Message(format!("no telegram channel for {name}"))
             });
     }
-    channels
-        .into_iter()
-        .next()
-        .ok_or_else(|| anyagents_core::Error::Message("no telegram channel".into()))
+    let names = agent_names(store, &channels)?;
+    match channels.len() {
+        1 => Ok(channels.remove(0)),
+        0 => Err(anyagents_core::Error::Message("no telegram channel".into())),
+        _ => Err(anyagents_core::Error::Message(format!(
+            "telegram sender is ambiguous: {names}"
+        ))),
+    }
+}
+
+/// `None` means the caller named nobody. MCP always passes `agent:<name>`.
+pub(crate) fn bound_sender(sender: Option<&str>) -> Result<Option<String>, anyagents_core::Error> {
+    match sender {
+        None => Ok(None),
+        Some(raw) => match anyagents_core::Address::parse(raw)? {
+            anyagents_core::Address::Agent(name) => Ok(Some(name)),
+            _ => Err(anyagents_core::Error::Message(
+                "telegram sender must be an agent".into(),
+            )),
+        },
+    }
+}
+
+fn agent_names(store: &Store, channels: &[Channel]) -> Result<String, anyagents_core::Error> {
+    let mut names = Vec::new();
+    for channel in channels {
+        for id in &channel.agents {
+            names.push(store.agent(id)?.name);
+        }
+    }
+    names.sort();
+    names.dedup();
+    Ok(names.join(", "))
 }
 
 fn token_of(
@@ -258,8 +288,49 @@ mod tests {
         assert_eq!(sent.call.body["reply_to_message_id"], 5);
         assert!(!sent.call.body.to_string().contains("token"));
 
-        let first = outbound_call(&store, None, 100, "hello", None).unwrap();
-        assert_eq!(first.credential_ref, "channels/ada");
+        let ambiguous = outbound_call(&store, None, 100, "hello", None).unwrap_err();
+        let message = ambiguous.to_string();
+        assert!(message.contains("ada"), "{message}");
+        assert!(message.contains("bea"), "{message}");
         assert!(outbound_call(&store, Some("cy"), 100, "hello", None).is_err());
+    }
+
+    #[test]
+    fn one_telegram_channel_sends_without_a_named_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let ada = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let channel = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: Some("channels/ada".into()),
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &ada.id).unwrap();
+        let sent = outbound_call(&store, None, 100, "hello", None).unwrap();
+        assert_eq!(sent.credential_ref, "channels/ada");
+        assert_eq!(sent.call.method, "sendMessage");
+    }
+
+    #[test]
+    fn no_telegram_channel_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let err = outbound_call(&store, None, 100, "hello", None).unwrap_err();
+        assert!(err.to_string().contains("no telegram channel"), "{err}");
+    }
+
+    #[test]
+    fn a_bound_sender_is_that_agent_and_anything_else_is_refused() {
+        assert_eq!(
+            bound_sender(Some("agent:ada")).unwrap().as_deref(),
+            Some("ada")
+        );
+        assert_eq!(bound_sender(None).unwrap(), None);
+        assert!(bound_sender(Some("group:crew")).is_err());
     }
 }
