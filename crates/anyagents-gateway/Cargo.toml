@@ -20,4 +20,4 @@ tokio = { version = "1", features = ["macros", "rt", "sync"] }
 axum = { version = "0.8", features = ["json"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }

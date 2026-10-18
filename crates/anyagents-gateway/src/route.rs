@@ -29,11 +29,13 @@ pub struct ProviderRoute {
 }
 
 /// Resolves a per-agent gateway bearer token to a provider route.
-pub trait RouteTable: Send + Sync {
+pub trait RouteResolver: Send + Sync {
     fn resolve(&self, token: &str) -> Option<ProviderRoute>;
 }
 
-/// In-memory route table for tests and for a server that keeps routes itself.
+pub use RouteResolver as RouteTable;
+
+/// In-memory [`RouteResolver`] for tests and for a server that keeps routes itself.
 #[derive(Debug, Default)]
 pub struct MemoryRoutes {
     routes: RwLock<HashMap<String, ProviderRoute>>,
@@ -52,7 +54,7 @@ impl MemoryRoutes {
     }
 }
 
-impl RouteTable for MemoryRoutes {
+impl RouteResolver for MemoryRoutes {
     fn resolve(&self, token: &str) -> Option<ProviderRoute> {
         self.routes.read().expect("route table").get(token).cloned()
     }
