@@ -1,0 +1,15 @@
+[package]
+name = "anyagents-harness-agy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Antigravity stream adapter"
+
+[dependencies]
+anyagents-harness = { path = "../anyagents-harness" }
+anyagents-harness-stream = { path = "../anyagents-harness-stream" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
