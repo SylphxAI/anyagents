@@ -4,6 +4,8 @@ members = [
     "crates/anyagents-core",
     "crates/anyagents-harness",
     "crates/anyagents-agent",
+    "crates/anyagents-installer",
+    "crates/anyagents-channel-telegram",
     "crates/anyagents",
     "tests/invariants",
 ]
