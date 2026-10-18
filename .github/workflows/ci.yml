@@ -1,0 +1,130 @@
+name: ci
+
+# Continuous integration for a public repository: format, clippy and the
+# workspace tests on Linux and macOS.
+#
+# GitHub-hosted standard runners are free only on a public repository, so a
+# private one must never reach them: every job here carries
+# `github.event.repository.private == false`, and a private repository runs no
+# hosted minute. The same rule keeps a self-hosted runner, which a public
+# repository could reach with a fork pull request's code, out of this workflow:
+# `runs-on` names GitHub-hosted labels only.
+#
+# `ci-ok` is the one required check. It runs no repository code - it reads the
+# other jobs' results and writes a summary - so it stays on the reserved gate
+# pool and a superseded run cannot hold its concurrency group.
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A newer push replaces its pull request's run; a merge-group or trunk run is
+# never cancelled.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  # Whether the change reaches more than documentation, so a docs-only pull
+  # request skips the compile and lint jobs. Everything except Markdown under
+  # docs/, the root notices and the issue templates counts as code; a run with
+  # no diff (main, manual) reports everything changed.
+  changes:
+    if: github.event.repository.private == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.scope.outputs.code }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+      - id: scope
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            pull_request | merge_group) ;;
+            *) echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if git diff --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/scope.txt"; then
+            docs='^(docs/.+\.md|[^/]+\.md|LICENSE[^/]*|\.github/ISSUE_TEMPLATE/.+)$'
+            if grep -qvE "$docs" "$RUNNER_TEMP/scope.txt"; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "code=false" >> "$GITHUB_OUTPUT"
+            fi
+            echo "$(wc -l < "$RUNNER_TEMP/scope.txt") changed paths" >&2
+          else
+            # A diff that cannot be computed runs everything rather than skipping.
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # The Linux lane: format, clippy and the whole workspace test suite.
+  test:
+    needs: changes
+    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # The macOS lane: the same gate on a second platform. macOS is a supported
+  # host for a long-lived agent, so its build is checked before merge.
+  macos:
+    needs: changes
+    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Format
+        run: cargo fmt --all -- --check
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
+
+  # The required check name. Skipped lanes pass; a failed or cancelled lane
+  # fails. It reads results only, so it runs on the reserved gate pool.
+  ci-ok:
+    if: always() && !cancelled()
+    needs: [changes, test, macos]
+    runs-on: sylphx-linux-control
+    timeout-minutes: 5
+    steps:
+      - uses: SylphxAI/.github/.github/actions/needs-pass@46ec433892bca8693193049b5ee7441bb916a7ad # main
+        with:
+          needs: ${{ toJSON(needs) }}

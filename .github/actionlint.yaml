@@ -1,0 +1,11 @@
+# Labels the workflow lint does not know from GitHub's own list: the Sylphx
+# fleet's self-hosted runners. `ci-ok` reads job results only, so it runs on the
+# reserved gate pool; every job that runs repository code names a GitHub-hosted
+# label, because this repository is public.
+self-hosted-runner:
+  labels:
+    - sylphx-linux-standard
+    - sylphx-linux-standard-merge
+    - sylphx-linux-xlarge
+    - sylphx-linux-xlarge-merge
+    - sylphx-linux-control
