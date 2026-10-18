@@ -121,7 +121,19 @@ fn path_segment(raw: &str) -> String {
     out
 }
 
-async fn get_json<T: DeserializeOwned>(
+pub(crate) fn get_json_sync<T: DeserializeOwned>(
+    socket: &Path,
+    method: &str,
+    path: &str,
+) -> Result<T, String> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|err| err.to_string())?;
+    runtime.block_on(get_json(socket, method, path, None))
+}
+
+pub(crate) async fn get_json<T: DeserializeOwned>(
     socket: &Path,
     method: &str,
     path: &str,

@@ -20,7 +20,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -46,6 +46,7 @@ pub struct CodexHarness {
 struct State {
     child: Option<Child>,
     alive: bool,
+    epoch: u64,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
@@ -92,7 +93,17 @@ impl CodexHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
     ) -> Result<Self, HarnessError> {
-        let harness = Self::launch(program.into(), environment)?;
+        Self::start_in(program, session_id, environment, None)
+    }
+
+    /// Start one child with its working directory set to `work_dir`.
+    pub fn start_in(
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
+        let harness = Self::launch(program.into(), environment, work_dir)?;
         match harness.handshake(session_id) {
             Ok(()) => Ok(harness),
             Err(err) => {
@@ -178,7 +189,11 @@ impl CodexHarness {
         }
     }
 
-    fn launch(program: PathBuf, environment: &[(&str, &str)]) -> Result<Self, HarnessError> {
+    fn launch(
+        program: PathBuf,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
         let harness = Self {
             shared: Arc::new(Mutex::new(State::default())),
             stdin: Arc::new(Mutex::new(None)),
@@ -190,6 +205,9 @@ impl CodexHarness {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(dir) = work_dir {
+            cmd.current_dir(dir);
+        }
         for (key, value) in environment {
             cmd.env(key, value);
         }
@@ -487,6 +505,22 @@ impl Harness for CodexHarness {
             sign_in_fault: None,
         }
     }
+
+    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
+        CodexHarness::usage_for(self, id)
+    }
+
+    fn clear_quota(&mut self) {
+        lock(&self.shared).quota_reset_at_ms = None;
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        lock(&self.shared).child.as_ref().map(Child::id)
+    }
+
+    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        watch_child(Arc::clone(&self.shared), Arc::clone(&self.wake), notify);
+    }
 }
 
 fn commit_delivery(state: &mut State, id: &str, started_turn: bool, method: &str, result: &Value) {
@@ -550,11 +584,40 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         {
             let mut state = lock(&shared);
             apply_line(&mut state, &value);
+            state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
     }
-    lock(&shared).alive = false;
+    {
+        let mut state = lock(&shared);
+        state.alive = false;
+        state.epoch = state.epoch.wrapping_add(1);
+    }
     wake.notify_all();
+}
+
+fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn() + Send + Sync>) {
+    let _ = thread::Builder::new()
+        .name("anyagents-codex-watch".into())
+        .spawn(move || {
+            let mut state = lock(&shared);
+            let mut seen = 0u64;
+            loop {
+                if !state.alive {
+                    drop(state);
+                    notify();
+                    break;
+                }
+                if state.epoch != seen {
+                    seen = state.epoch;
+                    drop(state);
+                    notify();
+                    state = lock(&shared);
+                    continue;
+                }
+                state = wake.wait(state).unwrap_or_else(|err| err.into_inner());
+            }
+        });
 }
 
 fn apply_line(state: &mut State, value: &Value) {

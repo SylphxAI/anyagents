@@ -8,9 +8,33 @@ pub struct AgentView {
     pub id: String,
     pub name: String,
     pub harness: String,
+    pub model: Option<String>,
+    pub workdir: Option<String>,
     pub state: String,
+    pub process: String,
+    pub delivery_mode: String,
+    pub steer_support: String,
+    pub quota_reset_at_ms: Option<i64>,
     pub oldest_unaccepted_age_ms: Option<i64>,
     pub oldest_unprocessed_age_ms: Option<i64>,
+}
+
+fn default_harness() -> String {
+    "claude-code".to_string()
+}
+
+/// Body of `POST /v1/agents`.
+#[derive(Clone, Debug, Deserialize, JsonSchema)]
+pub struct CreateAgentRequest {
+    pub name: String,
+    #[serde(default = "default_harness")]
+    pub harness: String,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub workdir: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

@@ -77,13 +77,33 @@ pub enum HarnessError {
     Failed(String),
 }
 
-/// Five calls every harness adapter implements.
+/// Calls every harness adapter implements. The last four have defaults so a
+/// scripted fake can stay a delivery double without a process.
 pub trait Harness: Send {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError>;
     fn background(&mut self) -> Result<(), HarnessError>;
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;
     fn health(&self) -> HarnessHealth;
+
+    /// Usage recorded for a finished turn, if this adapter kept it.
+    fn usage_for(&self, _id: &str) -> Option<TurnUsage> {
+        None
+    }
+
+    /// Forget a quota wait so delivery can resume after the reset time.
+    fn clear_quota(&mut self) {}
+
+    /// Operating system id of the vendor process, when it has one.
+    fn process_id(&self) -> Option<u32> {
+        None
+    }
+
+    /// Call `notify` after the vendor process reports activity or exits.
+    ///
+    /// The callback runs on a background thread. It must not call back into
+    /// this harness.
+    fn watch_activity(&self, _notify: std::sync::Arc<dyn Fn() + Send + Sync>) {}
 }
 
 /// Token and cost totals one vendor turn reported.

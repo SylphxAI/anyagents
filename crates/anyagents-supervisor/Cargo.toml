@@ -1,0 +1,23 @@
+[package]
+name = "anyagents-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Keeps one harness process running for each agent"
+
+[dependencies]
+anyagents-agent = { path = "../anyagents-agent" }
+anyagents-core = { path = "../anyagents-core" }
+anyagents-harness = { path = "../anyagents-harness" }
+
+[dev-dependencies]
+anyagents-agent = { path = "../anyagents-agent" }
+anyagents-core = { path = "../anyagents-core" }
+anyagents-harness = { path = "../anyagents-harness" }
+anyagents-harness-claude = { path = "../anyagents-harness-claude" }
+tempfile = "3"
+
+[[bin]]
+name = "scripted_claude"
+path = "../anyagents-harness-claude/src/bin/fake_claude.rs"

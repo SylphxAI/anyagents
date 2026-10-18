@@ -65,7 +65,12 @@ dependencies = [
 name = "anyagents"
 version = "0.1.0"
 dependencies = [
+ "anyagents-agent",
  "anyagents-core",
+ "anyagents-harness",
+ "anyagents-harness-claude",
+ "anyagents-harness-codex",
+ "anyagents-supervisor",
  "axum",
  "bytes",
  "clap",
@@ -135,6 +140,17 @@ dependencies = [
  "anyagents-agent",
  "anyagents-core",
  "anyagents-harness",
+ "tempfile",
+]
+
+[[package]]
+name = "anyagents-supervisor"
+version = "0.1.0"
+dependencies = [
+ "anyagents-agent",
+ "anyagents-core",
+ "anyagents-harness",
+ "anyagents-harness-claude",
  "tempfile",
 ]
 

@@ -23,6 +23,9 @@ struct AgentView {
     name: String,
     harness: String,
     state: String,
+    process: String,
+    delivery_mode: String,
+    steer_support: String,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +69,8 @@ fn start_server(data: &std::path::Path) -> Serve {
         .arg("--data")
         .arg(data)
         .arg("serve")
+        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CODEX_BIN", "/bin/true")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
@@ -176,9 +181,28 @@ async fn mcp_tools_use_the_server_socket() {
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
     assert_eq!(listed.agents.len(), 2);
-    assert!(listed.agents.iter().any(|agent| {
-        agent.name == "alpha" && agent.harness == "claude-code" && agent.state == "created"
-    }));
+    let alpha_row = listed
+        .agents
+        .iter()
+        .find(|agent| agent.name == "alpha")
+        .expect("alpha");
+    assert_eq!(alpha_row.harness, "claude-code");
+    assert_eq!(alpha_row.state, "running");
+    assert_eq!(alpha_row.delivery_mode, "followup");
+    assert_eq!(alpha_row.steer_support, "unproven");
+    assert!(alpha_row.process == "alive" || alpha_row.process == "down");
+
+    let listed_cli = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "list"])
+        .output()
+        .unwrap();
+    assert!(listed_cli.status.success());
+    let text = String::from_utf8(listed_cli.stdout).unwrap();
+    assert!(text.contains("running"), "{text}");
+    assert!(text.contains("followup"), "{text}");
+    assert!(text.contains("unproven"), "{text}");
 
     let sent: SendResponse = ok_json(
         call(

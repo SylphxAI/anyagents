@@ -1,0 +1,56 @@
+//! `agents.create`. The agent row, its directories, and its MCP registration
+//! are one step. The harness config is written only under the agent's own
+//! config directory.
+
+use std::path::{Path, PathBuf};
+
+use anyagents_core::{Agent, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
+
+use crate::mcp_config;
+
+pub struct CreateRequest {
+    pub name: String,
+    pub harness: String,
+    pub model: Option<String>,
+    pub workdir: Option<PathBuf>,
+    pub instructions: Option<String>,
+}
+
+pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
+    if request.harness != "claude-code" && request.harness != "codex" {
+        return Err(Error::Message(format!(
+            "unknown harness: {}",
+            request.harness
+        )));
+    }
+    let mut new = NewAgent::new(request.name, request.harness);
+    new.model = request.model;
+    new.instructions = request.instructions;
+    let agent = store.create_agent(new)?;
+    let data = std::path::absolute(data)?;
+    let managed = agent_work_dir(&data, &agent.id);
+    std::fs::create_dir_all(&managed)?;
+    let config = agent_config_dir(&data, &agent.id);
+    std::fs::create_dir_all(&config)?;
+    let cwd = match &request.workdir {
+        Some(path) => {
+            std::fs::create_dir_all(path)?;
+            std::path::absolute(path)?
+        }
+        None => std::path::absolute(&managed)?,
+    };
+    let command = std::env::current_exe()?;
+    let args = vec![
+        "--data".to_string(),
+        data.display().to_string(),
+        "mcp".to_string(),
+        "--agent".to_string(),
+        agent.name.clone(),
+    ];
+    if agent.harness == "codex" {
+        mcp_config::write_codex(&config.join("config.toml"), &command, &args)?;
+    } else {
+        mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
+    }
+    store.set_agent_running(&agent.id, &cwd.display().to_string())
+}

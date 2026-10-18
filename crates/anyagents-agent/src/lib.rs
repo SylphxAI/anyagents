@@ -162,6 +162,18 @@ impl<H: Harness> DeliveryLoop<H> {
         &mut self.harness
     }
 
+    /// Swap the vendor process without releasing the agent lock.
+    pub fn replace_harness(&mut self, harness: H) {
+        self.harness = harness;
+        self.quota_reset_at_ms = None;
+    }
+
+    /// Clear a quota wait on the loop and on the harness.
+    pub fn clear_quota(&mut self) {
+        self.quota_reset_at_ms = None;
+        self.harness.clear_quota();
+    }
+
     pub fn store(&self) -> &Store {
         &self.store
     }

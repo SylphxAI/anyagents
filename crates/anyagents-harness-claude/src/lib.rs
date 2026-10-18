@@ -14,7 +14,7 @@
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 pub struct ClaudeHarness {
     program: PathBuf,
     environment: Vec<(String, String)>,
+    work_dir: Option<PathBuf>,
     shared: Arc<Mutex<State>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
@@ -40,6 +41,7 @@ pub struct ClaudeHarness {
 struct State {
     child: Option<Child>,
     alive: bool,
+    epoch: u64,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
@@ -63,12 +65,23 @@ impl ClaudeHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
     ) -> Result<Self, HarnessError> {
+        Self::start_in(program, session_id, environment, None)
+    }
+
+    /// Start one child with its working directory set to `work_dir`.
+    pub fn start_in(
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             program: program.into(),
             environment: environment
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect(),
+            work_dir: work_dir.map(Path::to_path_buf),
             shared: Arc::new(Mutex::new(State::default())),
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
@@ -175,6 +188,9 @@ impl ClaudeHarness {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        if let Some(dir) = &self.work_dir {
+            cmd.current_dir(dir);
+        }
         for (key, value) in &self.environment {
             cmd.env(key, value);
         }
@@ -337,6 +353,22 @@ impl Harness for ClaudeHarness {
             sign_in_fault: None,
         }
     }
+
+    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
+        ClaudeHarness::usage_for(self, id)
+    }
+
+    fn clear_quota(&mut self) {
+        lock(&self.shared).quota_reset_at_ms = None;
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        lock(&self.shared).child.as_ref().map(Child::id)
+    }
+
+    fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        watch_child(Arc::clone(&self.shared), Arc::clone(&self.wake), notify);
+    }
 }
 
 fn accept_message(state: &mut State, id: &str) {
@@ -382,11 +414,40 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
             if value.get("type").and_then(Value::as_str) == Some("result") {
                 apply_result(&mut state, &value);
             }
+            state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
     }
-    lock(&shared).alive = false;
+    {
+        let mut state = lock(&shared);
+        state.alive = false;
+        state.epoch = state.epoch.wrapping_add(1);
+    }
     wake.notify_all();
+}
+
+fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn() + Send + Sync>) {
+    let _ = thread::Builder::new()
+        .name("anyagents-claude-watch".into())
+        .spawn(move || {
+            let mut state = lock(&shared);
+            let mut seen = 0u64;
+            loop {
+                if !state.alive {
+                    drop(state);
+                    notify();
+                    break;
+                }
+                if state.epoch != seen {
+                    seen = state.epoch;
+                    drop(state);
+                    notify();
+                    state = lock(&shared);
+                    continue;
+                }
+                state = wake.wait(state).unwrap_or_else(|err| err.into_inner());
+            }
+        });
 }
 
 fn apply_result(state: &mut State, value: &Value) {

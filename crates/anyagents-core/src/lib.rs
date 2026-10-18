@@ -15,5 +15,6 @@ pub use error::Error;
 pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use store::{
     Ack, Agent, AgentLock, BillingMode, Channel, Incoming, Lag, Message, NewAgent, NewChannel,
-    NewUsage, ReceiveOutcome, Store, UsageRecord, now_ms,
+    NewUsage, ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake, agent_config_dir,
+    agent_work_dir, now_ms, sum_usage, utc_day,
 };

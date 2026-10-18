@@ -6,7 +6,9 @@
 use std::fs::{File, OpenOptions};
 use std::io::ErrorKind;
 use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -221,10 +223,20 @@ pub struct AgentLock {
     _file: File,
 }
 
+/// A mailbox or agent change a waiter can block on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// A new message was inserted for this agent.
+    Mail { agent_id: AgentId },
+    /// This agent was marked running.
+    Agent { agent_id: AgentId },
+}
+
 /// Open database. Methods take a shared reference; writes serialize on the mutex.
 pub struct Store {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
+    wakes: Mutex<Vec<Sender<Wake>>>,
 }
 
 impl Store {
@@ -253,11 +265,65 @@ impl Store {
         Ok(Self {
             conn: Mutex::new(conn),
             data_dir: data_dir_for(path),
+            wakes: Mutex::new(Vec::new()),
         })
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// A channel for later mailbox inserts and running transitions.
+    ///
+    /// Events already committed are not replayed. Scan current state after
+    /// subscribing.
+    pub fn subscribe(&self) -> Receiver<Wake> {
+        let (sender, receiver) = mpsc::channel();
+        self.wakes
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(sender);
+        receiver
+    }
+
+    /// Drop every subscriber so a blocked `recv` returns.
+    pub fn close_wakes(&self) {
+        self.wakes
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+    }
+
+    /// Fan a wake to in-process subscribers. Does not touch the datagram socket.
+    pub fn poke(&self, wake: Wake) {
+        self.fanout(&wake);
+    }
+
+    fn notify(&self, wake: Wake) {
+        self.send_datagram(&wake);
+        self.fanout(&wake);
+    }
+
+    fn fanout(&self, wake: &Wake) {
+        let mut wakes = self.wakes.lock().unwrap_or_else(|err| err.into_inner());
+        wakes.retain(|sender| sender.send(wake.clone()).is_ok());
+    }
+
+    fn send_datagram(&self, wake: &Wake) {
+        let (tag, id) = match wake {
+            Wake::Mail { agent_id } => (b'm', agent_id.as_str()),
+            Wake::Agent { agent_id } => (b'a', agent_id.as_str()),
+        };
+        let path = self.data_dir.join("wake.sock");
+        if path.as_os_str().len() > 107 {
+            return;
+        }
+        let mut payload = Vec::with_capacity(1 + id.len());
+        payload.push(tag);
+        payload.extend_from_slice(id.as_bytes());
+        if let Ok(socket) = UnixDatagram::unbound() {
+            let _ = socket.send_to(&payload, &path);
+        }
     }
 
     /// Exclusive lock for this agent's vendor process. A second caller gets [`Error::AgentBusy`].
@@ -437,7 +503,30 @@ impl Store {
             ],
         )?;
         tx.commit()?;
+        drop(conn);
+        self.notify(Wake::Mail {
+            agent_id: agent_id.clone(),
+        });
         Ok(ReceiveOutcome::New(message))
+    }
+
+    /// Store the work directory and mark the agent running.
+    pub fn set_agent_running(&self, id: &AgentId, workdir: &str) -> Result<Agent, Error> {
+        let changed = {
+            let conn = self.conn();
+            let updated = conn.execute(
+                "UPDATE agents SET workdir = ?1, state = 'running' WHERE id = ?2",
+                params![workdir, id.as_str()],
+            )?;
+            if updated == 0 {
+                return Err(Error::AgentNotFound(id.to_string()));
+            }
+            agent_by_id(&conn, id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(changed)
     }
 
     /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
@@ -648,6 +737,85 @@ impl Store {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+/// `{data}/agents/{id}/work`.
+pub fn agent_work_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
+    data_dir.join("agents").join(id.as_str()).join("work")
+}
+
+/// `{data}/agents/{id}/config`.
+pub fn agent_config_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
+    data_dir.join("agents").join(id.as_str()).join("config")
+}
+
+/// UTC calendar day for a Unix millisecond timestamp, `YYYY-MM-DD`.
+pub fn utc_day(unix_ms: i64) -> String {
+    let days = unix_ms.div_euclid(86_400_000);
+    let (year, month, day) = civil_from_days(days);
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Howard Hinnant's `civil_from_days`. `days` is days since 1970-01-01.
+fn civil_from_days(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    (year as i32, month as u32, day as u32)
+}
+
+/// One summed usage row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageTotal {
+    pub agent_id: AgentId,
+    pub day: Option<String>,
+    pub input_tokens: i64,
+    pub output_tokens: i64,
+    pub cache_read_tokens: i64,
+    pub cache_write_tokens: i64,
+    pub reported_cost_micros: Option<i64>,
+}
+
+/// Sum usage rows by agent, or by agent and day.
+pub fn sum_usage(records: &[UsageRecord], by_day: bool) -> Vec<UsageTotal> {
+    use std::collections::BTreeMap;
+    let mut totals: BTreeMap<(String, String), UsageTotal> = BTreeMap::new();
+    for record in records {
+        let day_key = if by_day {
+            record.day.clone()
+        } else {
+            String::new()
+        };
+        let key = (record.agent_id.as_str().to_string(), day_key);
+        let entry = totals.entry(key).or_insert_with(|| UsageTotal {
+            agent_id: record.agent_id.clone(),
+            day: if by_day {
+                Some(record.day.clone())
+            } else {
+                None
+            },
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reported_cost_micros: None,
+        });
+        entry.input_tokens += record.input_tokens;
+        entry.output_tokens += record.output_tokens;
+        entry.cache_read_tokens += record.cache_read_tokens;
+        entry.cache_write_tokens += record.cache_write_tokens;
+        if let Some(cost) = record.reported_cost_micros {
+            entry.reported_cost_micros = Some(entry.reported_cost_micros.unwrap_or(0) + cost);
+        }
+    }
+    totals.into_values().collect()
 }
 
 fn data_dir_for(path: &Path) -> PathBuf {
@@ -1072,5 +1240,94 @@ mod tests {
                 .unwrap_err(),
             Error::AgentExists(_)
         ));
+    }
+
+    #[test]
+    fn a_new_message_wakes_a_subscriber_and_a_duplicate_does_not() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let wakes = store.subscribe();
+        let mut incoming = Incoming::new("hello");
+        incoming.source_key = Some("same".into());
+        store.receive(&agent.id, incoming.clone()).unwrap();
+        assert!(matches!(
+            wakes
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            Wake::Mail { .. }
+        ));
+        store.receive(&agent.id, incoming).unwrap();
+        assert!(
+            wakes
+                .recv_timeout(std::time::Duration::from_millis(200))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn set_agent_running_stores_the_workdir_and_wakes() {
+        let (_dir, store) = setup();
+        let agent = agent(&store, "alpha");
+        let wakes = store.subscribe();
+        let running = store.set_agent_running(&agent.id, "/work").unwrap();
+        assert_eq!(running.state, "running");
+        assert_eq!(running.workdir.as_deref(), Some("/work"));
+        assert!(matches!(
+            wakes
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            Wake::Agent { .. }
+        ));
+        let missing = AgentId::generate();
+        assert!(matches!(
+            store.set_agent_running(&missing, "/work").unwrap_err(),
+            Error::AgentNotFound(_)
+        ));
+    }
+
+    #[test]
+    fn utc_day_and_usage_sums() {
+        assert_eq!(utc_day(0), "1970-01-01");
+        assert_eq!(utc_day(1_700_000_000_000), "2023-11-14");
+        let alpha = AgentId::generate();
+        let beta = AgentId::generate();
+        let records = [
+            sample_usage(alpha.clone(), "2023-11-14", 1, Some(5)),
+            sample_usage(alpha.clone(), "2023-11-15", 4, None),
+            sample_usage(beta.clone(), "2023-11-14", 2, Some(7)),
+        ];
+        let by_agent = sum_usage(&records, false);
+        assert_eq!(by_agent.len(), 2);
+        let alpha_total = by_agent.iter().find(|row| row.agent_id == alpha).unwrap();
+        assert_eq!(alpha_total.day, None);
+        assert_eq!(alpha_total.input_tokens, 5);
+        assert_eq!(alpha_total.reported_cost_micros, Some(5));
+        let by_day = sum_usage(&records, true);
+        assert_eq!(by_day.len(), 3);
+        assert!(
+            by_day
+                .iter()
+                .any(|row| row.day.as_deref() == Some("2023-11-15")
+                    && row.reported_cost_micros.is_none())
+        );
+    }
+
+    fn sample_usage(agent_id: AgentId, day: &str, input: i64, cost: Option<i64>) -> UsageRecord {
+        UsageRecord {
+            id: crate::UsageId::generate(),
+            agent_id,
+            harness: "claude-code".into(),
+            model: None,
+            input_tokens: input,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            reported_cost_micros: cost,
+            estimated_cost_micros: None,
+            billing_mode: BillingMode::Subscription,
+            quota_state: None,
+            day: day.into(),
+            recorded_at_ms: 0,
+        }
     }
 }

@@ -4,7 +4,8 @@ use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyagents_core::{Address, Error, Incoming, ReceiveOutcome, Store, now_ms};
+use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
+use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -13,8 +14,11 @@ use axum::{Json, Router};
 use serde::Deserialize;
 
 use crate::api::{
-    AgentView, AgentsResponse, Delivery, InboxResponse, MessageView, SendRequest, SendResponse,
+    AgentView, AgentsResponse, CreateAgentRequest, Delivery, InboxResponse, MessageView,
+    SendRequest, SendResponse,
 };
+use crate::create::{self, CreateRequest};
+use crate::vendor::{self, VendorHarness};
 
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
@@ -29,6 +33,12 @@ pub fn run(data: &Path) -> Result<(), Error> {
     runtime.block_on(serve(data))
 }
 
+#[derive(Clone)]
+struct AppState {
+    store: Arc<Store>,
+    health: HealthBoard,
+}
+
 async fn serve(data: &Path) -> Result<(), Error> {
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let path = socket_path(data);
@@ -38,13 +48,24 @@ async fn serve(data: &Path) -> Result<(), Error> {
         )));
     }
     prepare_socket(&path)?;
+    let supervisor = Supervisor::<VendorHarness>::start(
+        Arc::clone(&store),
+        Arc::new(SystemClock::new()),
+        Arc::new(vendor::vendor_launch),
+        vendor::child_env(),
+    )
+    .map_err(Error::Message)?;
+    let state = AppState {
+        store,
+        health: supervisor.board(),
+    };
     let listener = tokio::net::UnixListener::bind(&path)?;
     set_socket_mode(&path)?;
     let app = Router::new()
-        .route("/v1/agents", get(list_agents))
+        .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/send", post(send))
-        .with_state(store);
+        .with_state(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = axum::serve(listener, app)
         .with_graceful_shutdown(async move {
@@ -54,6 +75,7 @@ async fn serve(data: &Path) -> Result<(), Error> {
             }
         })
         .await;
+    drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
 }
@@ -79,25 +101,71 @@ fn set_socket_mode(path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-async fn list_agents(State(store): State<Arc<Store>>) -> Result<Json<AgentsResponse>, ApiError> {
-    spawn_store(move || list_agents_sync(&store)).await
+async fn list_agents(State(state): State<AppState>) -> Result<Json<AgentsResponse>, ApiError> {
+    spawn_store(move || list_agents_sync(&state)).await
 }
 
-fn list_agents_sync(store: &Store) -> Result<Json<AgentsResponse>, ApiError> {
-    let now = now_ms();
+fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> {
     let mut agents = Vec::new();
-    for agent in store.list_agents().map_err(ApiError::from_store)? {
-        let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
-        agents.push(AgentView {
-            id: agent.id.to_string(),
-            name: agent.name,
-            harness: agent.harness,
-            state: agent.state,
-            oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
-            oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
-        });
+    for agent in state.store.list_agents().map_err(ApiError::from_store)? {
+        agents.push(agent_view(&state.store, &state.health, &agent)?);
     }
     Ok(Json(AgentsResponse { agents }))
+}
+
+fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
+    let lag = store
+        .lag(&agent.id, now_ms())
+        .map_err(ApiError::from_store)?;
+    let (process, mode, steer, quota) = match health.get(&agent.id) {
+        Some(live) => (
+            if live.process_alive { "alive" } else { "down" },
+            mode_name(live.delivery_mode),
+            steer_name(live.steer_support),
+            live.quota_reset_at_ms,
+        ),
+        None => {
+            let (mode, steer) = declared(&agent.harness);
+            ("down", mode_name(mode), steer_name(steer), None)
+        }
+    };
+    Ok(AgentView {
+        id: agent.id.to_string(),
+        name: agent.name.clone(),
+        harness: agent.harness.clone(),
+        model: agent.model.clone(),
+        workdir: agent.workdir.clone(),
+        state: agent.state.clone(),
+        process: process.to_string(),
+        delivery_mode: mode.to_string(),
+        steer_support: steer.to_string(),
+        quota_reset_at_ms: quota,
+        oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
+        oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
+    })
+}
+
+async fn create_agent_route(
+    State(state): State<AppState>,
+    Json(body): Json<CreateAgentRequest>,
+) -> Result<(StatusCode, Json<AgentView>), ApiError> {
+    spawn_store(move || {
+        let agent = create::create(
+            &state.store,
+            state.store.data_dir(),
+            CreateRequest {
+                name: body.name,
+                harness: body.harness,
+                model: body.model,
+                workdir: body.workdir.map(PathBuf::from),
+                instructions: body.instructions,
+            },
+        )
+        .map_err(ApiError::from_store)?;
+        let view = agent_view(&state.store, &state.health, &agent)?;
+        Ok((StatusCode::CREATED, Json(view)))
+    })
+    .await
 }
 
 #[derive(Deserialize)]
@@ -106,11 +174,11 @@ struct Since {
 }
 
 async fn inbox(
-    State(store): State<Arc<Store>>,
+    State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    spawn_store(move || inbox_sync(&store, &name, query.since)).await
+    spawn_store(move || inbox_sync(&state.store, &name, query.since)).await
 }
 
 fn inbox_sync(
@@ -138,10 +206,10 @@ fn inbox_sync(
 }
 
 async fn send(
-    State(store): State<Arc<Store>>,
+    State(state): State<AppState>,
     Json(body): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
-    spawn_store(move || send_sync(&store, body)).await
+    spawn_store(move || send_sync(&state.store, body)).await
 }
 
 fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, ApiError> {
@@ -224,6 +292,7 @@ impl ApiError {
     fn from_store(err: Error) -> Self {
         let status = match &err {
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            Error::AgentExists(_) => StatusCode::CONFLICT,
             Error::InvalidAddress(_) | Error::Message(_) => StatusCode::BAD_REQUEST,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
