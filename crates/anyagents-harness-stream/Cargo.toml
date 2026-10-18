@@ -1,0 +1,11 @@
+[package]
+name = "anyagents-harness-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Long-lived line-stream child shared by followup adapters"
+
+[dependencies]
+anyagents-harness = { path = "../anyagents-harness" }
+serde_json = "1"

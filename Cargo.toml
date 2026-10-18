@@ -3,8 +3,12 @@ resolver = "3"
 members = [
     "crates/anyagents-core",
     "crates/anyagents-harness",
+    "crates/anyagents-harness-stream",
     "crates/anyagents-harness-claude",
     "crates/anyagents-harness-codex",
+    "crates/anyagents-harness-opencode",
+    "crates/anyagents-harness-agy",
+    "crates/anyagents-harness-omp",
     "crates/anyagents-agent",
     "crates/anyagents",
     "tests/invariants",

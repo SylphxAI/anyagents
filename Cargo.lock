@@ -111,6 +111,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-harness-agy"
+version = "0.1.0"
+dependencies = [
+ "anyagents-harness",
+ "anyagents-harness-stream",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "anyagents-harness-claude"
 version = "0.1.0"
 dependencies = [
@@ -126,6 +136,34 @@ dependencies = [
  "anyagents-harness",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "anyagents-harness-omp"
+version = "0.1.0"
+dependencies = [
+ "anyagents-harness",
+ "anyagents-harness-stream",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "anyagents-harness-opencode"
+version = "0.1.0"
+dependencies = [
+ "anyagents-harness",
+ "anyagents-harness-stream",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "anyagents-harness-stream"
+version = "0.1.0"
+dependencies = [
+ "anyagents-harness",
+ "serde_json",
 ]
 
 [[package]]
