@@ -25,9 +25,14 @@ fn scripted(mode: &'static str, log: PathBuf) -> anyagents_supervisor::Launch<Cl
     })
 }
 
+/// Polls until `ready` holds. The bound is a ceiling, not a delay: a passing
+/// check returns at once (about 0.07 s alone), while a loaded parallel test run
+/// can take several seconds to spawn the scripted vendor processes.
+const WAIT_CEILING: Duration = Duration::from_secs(30);
+
 fn wait_until(mut ready: impl FnMut() -> bool) -> bool {
     let started = Instant::now();
-    while started.elapsed() < Duration::from_secs(5) {
+    while started.elapsed() < WAIT_CEILING {
         if ready() {
             return true;
         }
