@@ -1,7 +1,8 @@
 //! Adapter contract for a vendor harness, plus a scripted fake used by tests.
 //!
 //! A harness is admitted with whatever delivery mode it can actually do. The
-//! mailbox and the delivery loop do not change between modes.
+//! mailbox and the delivery loop do not change between modes. Adapters carry
+//! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
 mod fake;
 
@@ -83,4 +84,44 @@ pub trait Harness: Send {
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;
     fn health(&self) -> HarnessHealth;
+}
+
+/// Token and cost totals one vendor turn reported.
+///
+/// Cost is in millionths of the vendor's currency unit when the vendor reports
+/// a cost. A vendor that reports only tokens leaves the cost empty.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+    pub reported_cost_micros: Option<i64>,
+}
+
+/// First line of user text. The rest of the text is the mailbox body.
+pub const MESSAGE_MARKER_PREFIX: &str = "anyagents-message:";
+
+/// User text whose first line is the mailbox id.
+pub fn marked_message(id: &str, text: &str) -> String {
+    format!("{MESSAGE_MARKER_PREFIX}{id}\n{text}")
+}
+
+/// Mailbox id when `text` starts with the marker line.
+pub fn message_id_in_text(text: &str) -> Option<&str> {
+    let id = text.lines().next()?.strip_prefix(MESSAGE_MARKER_PREFIX)?;
+    if id.is_empty() { None } else { Some(id) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marker_is_only_the_first_line() {
+        let text = marked_message("msg_1", "hello\nanyagents-message:other");
+        assert_eq!(message_id_in_text(&text), Some("msg_1"));
+        assert_eq!(message_id_in_text("hello"), None);
+        assert_eq!(message_id_in_text("anyagents-message:"), None);
+    }
 }

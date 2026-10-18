@@ -125,7 +125,7 @@ Every input to an agent (a Telegram message, another agent's `send`, a CLI or TU
   2. `accepted`: the adapter reports the harness took it.
   3. `processed`: a turn that included it has completed.
 - **Contiguous cursors.** Each cursor advances only over a contiguous prefix of the sequence, so one stuck message is visible as the oldest unaccepted one rather than skipped.
-- **Idempotent delivery.** After a crash, messages past the `accepted` cursor are delivered again. The adapter carries the message id into the harness and drops an id it has already written, so a replay never starts a second turn. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
+- **Idempotent delivery.** After a crash, messages past the `accepted` cursor are delivered again. The adapter carries the message id into the harness and drops an id it has already written, so a replay never starts a second turn. The Claude Code and Codex adapters put that id on the first line of the user text as `anyagents-message:<id>`, and Codex also sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
 - **Retention.** Processed messages are kept for a configurable period for `inbox` and audit, then compacted.
 
 ### Guarantees

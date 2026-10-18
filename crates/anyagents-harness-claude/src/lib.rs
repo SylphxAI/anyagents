@@ -1,0 +1,533 @@
+//! Claude Code adapter.
+//!
+//! One child runs `claude -p` with stream-json on stdin and stdout. The mailbox
+//! id is the first line of the user text (`anyagents-message:<id>`). An id already
+//! written, or echoed back on stdout, is not written again.
+//!
+//! Declared delivery mode is followup. Steer support is unproven: a message written
+//! while a turn is open waits for the next result. `turn_finished` becomes true when
+//! a `result` event closes the open turn. Token counts and `total_cost_usd` from
+//! that event are kept on the finished ids.
+//!
+//! Resume starts the child again with `--resume` when the session id changed or the
+//! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
+
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Write};
+use std::path::PathBuf;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyagents_harness::{
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+};
+use serde_json::{Value, json};
+
+/// One long-lived Claude Code child.
+pub struct ClaudeHarness {
+    program: PathBuf,
+    environment: Vec<(String, String)>,
+    shared: Arc<Mutex<State>>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    wake: Arc<Condvar>,
+    reader: Option<JoinHandle<()>>,
+}
+
+#[derive(Default)]
+struct State {
+    child: Option<Child>,
+    alive: bool,
+    seen: HashSet<String>,
+    written: Vec<String>,
+    open: Vec<String>,
+    followups: Vec<String>,
+    finished: HashSet<String>,
+    turns_started: usize,
+    quota_reset_at_ms: Option<i64>,
+    session_id: Option<String>,
+    usages: Vec<(String, TurnUsage)>,
+    request_seq: u64,
+}
+
+impl ClaudeHarness {
+    /// Start one child.
+    ///
+    /// `program` is the `claude` executable, or a test double. `session_id`, when
+    /// set, is passed as `--resume`. `environment` overrides those variables in
+    /// the child; pass an empty slice for a normal launch.
+    pub fn start(
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+    ) -> Result<Self, HarnessError> {
+        let mut harness = Self {
+            program: program.into(),
+            environment: environment
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect(),
+            shared: Arc::new(Mutex::new(State::default())),
+            stdin: Arc::new(Mutex::new(None)),
+            wake: Arc::new(Condvar::new()),
+            reader: None,
+        };
+        harness.launch(session_id)?;
+        Ok(harness)
+    }
+
+    /// Ids this process actually wrote, in write order.
+    pub fn written_ids(&self) -> Vec<String> {
+        lock(&self.shared).written.clone()
+    }
+
+    /// Turns opened so far, including a followup promoted by a result.
+    pub fn turns_started(&self) -> usize {
+        lock(&self.shared).turns_started
+    }
+
+    /// Session id passed at launch, or the id a later `result` reported.
+    pub fn session_id(&self) -> Option<String> {
+        lock(&self.shared).session_id.clone()
+    }
+
+    /// Usage from the result that finished `id`.
+    pub fn usage_for(&self, id: &str) -> Option<TurnUsage> {
+        let state = lock(&self.shared);
+        state
+            .usages
+            .iter()
+            .rev()
+            .find(|(item, _)| item == id)
+            .map(|(_, usage)| usage.clone())
+    }
+
+    /// Whether a result has finished `id`.
+    pub fn is_finished(&self, id: &str) -> bool {
+        lock(&self.shared).finished.contains(id)
+    }
+
+    /// Whether `id` was written or echoed.
+    pub fn seen(&self, id: &str) -> bool {
+        lock(&self.shared).seen.contains(id)
+    }
+
+    /// Wait until a result finishes `id`, or the deadline passes.
+    pub fn wait_finished(&self, id: &str, timeout: Duration) -> bool {
+        self.wait_pred(timeout, |state| state.finished.contains(id))
+    }
+
+    /// Wait until `id` is written or echoed.
+    pub fn wait_seen(&self, id: &str, timeout: Duration) -> bool {
+        self.wait_pred(timeout, |state| state.seen.contains(id))
+    }
+
+    /// Wait until a rate-limit event with a reset time has been seen.
+    pub fn wait_quota(&self, timeout: Duration) -> Option<i64> {
+        let mut found = None;
+        self.wait_pred(timeout, |state| {
+            found = state.quota_reset_at_ms;
+            found.is_some()
+        });
+        found
+    }
+
+    /// Wait until the child has exited or its stdout has closed.
+    pub fn wait_dead(&self, timeout: Duration) -> bool {
+        self.wait_pred(timeout, |state| !state.alive)
+    }
+
+    fn wait_pred(&self, timeout: Duration, mut pred: impl FnMut(&State) -> bool) -> bool {
+        let mut state = lock(&self.shared);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if pred(&state) {
+                return true;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, wait) = self
+                .wake
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|err| err.into_inner());
+            state = guard;
+            if wait.timed_out() && !pred(&state) {
+                return false;
+            }
+        }
+    }
+
+    fn launch(&mut self, session_id: Option<&str>) -> Result<(), HarnessError> {
+        let mut cmd = Command::new(&self.program);
+        cmd.arg("-p")
+            .arg("--input-format")
+            .arg("stream-json")
+            .arg("--output-format")
+            .arg("stream-json")
+            .arg("--verbose");
+        if let Some(session_id) = session_id {
+            cmd.arg("--resume").arg(session_id);
+        }
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        for (key, value) in &self.environment {
+            cmd.env(key, value);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| HarnessError::Failed(err.to_string()))?;
+        let Some(child_stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::Failed("child stdin missing".into()));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::Failed("child stdout missing".into()));
+        };
+        {
+            let mut state = lock(&self.shared);
+            state.child = Some(child);
+            state.alive = true;
+            state.open.clear();
+            state.followups.clear();
+            if let Some(session_id) = session_id {
+                state.session_id = Some(session_id.to_string());
+            }
+        }
+        *lock(&self.stdin) = Some(child_stdin);
+        let shared = Arc::clone(&self.shared);
+        let wake = Arc::clone(&self.wake);
+        match thread::Builder::new()
+            .name("anyagents-claude".into())
+            .spawn(move || read_stdout(stdout, shared, wake))
+        {
+            Ok(handle) => self.reader = Some(handle),
+            Err(err) => {
+                self.stop_child();
+                return Err(HarnessError::Failed(err.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    fn stop_child(&mut self) {
+        *lock(&self.stdin) = None;
+        {
+            let mut state = lock(&self.shared);
+            state.alive = false;
+            if let Some(child) = state.child.as_mut() {
+                let _ = child.kill();
+            }
+        }
+        self.wake.notify_all();
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        let mut state = lock(&self.shared);
+        if let Some(mut child) = state.child.take() {
+            let _ = child.wait();
+        }
+        state.open.clear();
+        state.followups.clear();
+        state.alive = false;
+    }
+}
+
+impl Drop for ClaudeHarness {
+    fn drop(&mut self) {
+        self.stop_child();
+    }
+}
+
+impl Harness for ClaudeHarness {
+    fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        let mut state = lock(&self.shared);
+        if !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        if state.seen.contains(&message.id) {
+            return Ok(DeliverOutcome::Accepted {
+                turn_finished: state.finished.contains(&message.id),
+            });
+        }
+        if let Some(reset_at_ms) = state.quota_reset_at_ms {
+            return Ok(DeliverOutcome::Quota { reset_at_ms });
+        }
+        let line = json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": marked_message(&message.id, &message.text)
+                }]
+            }
+        });
+        if write_stdin(&self.stdin, &line).is_err() {
+            state.alive = false;
+            self.wake.notify_all();
+            return Err(HarnessError::Dead);
+        }
+        accept_message(&mut state, &message.id);
+        Ok(DeliverOutcome::Accepted {
+            turn_finished: state.finished.contains(&message.id),
+        })
+    }
+
+    fn background(&mut self) -> Result<(), HarnessError> {
+        if lock(&self.shared).alive {
+            Ok(())
+        } else {
+            Err(HarnessError::Dead)
+        }
+    }
+
+    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+        let same = {
+            let state = lock(&self.shared);
+            state.alive && state.session_id.as_deref() == Some(session)
+        };
+        if same {
+            return Ok(());
+        }
+        self.stop_child();
+        self.launch(Some(session))
+    }
+
+    fn cancel(&mut self) -> Result<(), HarnessError> {
+        let mut state = lock(&self.shared);
+        if !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        state.request_seq += 1;
+        let request_id = state.request_seq.to_string();
+        let line = json!({
+            "type": "control_request",
+            "request_id": request_id,
+            "request": {"subtype": "interrupt"}
+        });
+        if write_stdin(&self.stdin, &line).is_err() {
+            state.alive = false;
+            self.wake.notify_all();
+            return Err(HarnessError::Dead);
+        }
+        state.open.clear();
+        Ok(())
+    }
+
+    fn health(&self) -> HarnessHealth {
+        let state = lock(&self.shared);
+        HarnessHealth {
+            process_alive: state.alive,
+            turn_state: if state.open.is_empty() {
+                TurnState::Idle
+            } else {
+                TurnState::InTurn
+            },
+            delivery_mode: DeliveryMode::Followup,
+            steer_support: SteerSupport::Unproven,
+            quota_reset_at_ms: state.quota_reset_at_ms,
+            sign_in_fault: None,
+        }
+    }
+}
+
+fn accept_message(state: &mut State, id: &str) {
+    if state.open.is_empty() {
+        state.turns_started += 1;
+        state.open.push(id.to_string());
+    } else {
+        state.followups.push(id.to_string());
+    }
+    state.seen.insert(id.to_string());
+    state.written.push(id.to_string());
+}
+
+fn finish_open(state: &mut State, usage: TurnUsage) {
+    if state.open.is_empty() {
+        return;
+    }
+    for id in state.open.drain(..) {
+        state.finished.insert(id.clone());
+        state.usages.push((id, usage.clone()));
+    }
+    if !state.followups.is_empty() {
+        state.turns_started += 1;
+        state.open.append(&mut state.followups);
+    }
+}
+
+fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else { break };
+        if line.trim().is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        {
+            let mut state = lock(&shared);
+            note_markers(&mut state, &value);
+            if let Some(reset_at_ms) = quota_from_claude(&value) {
+                state.quota_reset_at_ms = Some(reset_at_ms);
+            }
+            if value.get("type").and_then(Value::as_str) == Some("result") {
+                apply_result(&mut state, &value);
+            }
+        }
+        wake.notify_all();
+    }
+    lock(&shared).alive = false;
+    wake.notify_all();
+}
+
+fn apply_result(state: &mut State, value: &Value) {
+    if let Some(id) = value.get("session_id").and_then(Value::as_str)
+        && !id.is_empty()
+    {
+        state.session_id = Some(id.to_string());
+    }
+    if state.open.is_empty() {
+        return;
+    }
+    finish_open(state, usage_from_claude(value));
+}
+
+fn usage_from_claude(value: &Value) -> TurnUsage {
+    let usage = value.get("usage");
+    TurnUsage {
+        input_tokens: u64_field(usage, "input_tokens"),
+        output_tokens: u64_field(usage, "output_tokens"),
+        cache_read_tokens: u64_field(usage, "cache_read_input_tokens"),
+        cache_write_tokens: u64_field(usage, "cache_creation_input_tokens"),
+        reported_cost_micros: value.get("total_cost_usd").and_then(usd_to_micros),
+    }
+}
+
+fn usd_to_micros(value: &Value) -> Option<i64> {
+    let number = value.as_f64()?;
+    if !number.is_finite() {
+        return None;
+    }
+    let micros = (number * 1_000_000.0).round();
+    if !(i64::MIN as f64..=i64::MAX as f64).contains(&micros) {
+        return None;
+    }
+    Some(micros as i64)
+}
+
+fn u64_field(value: Option<&Value>, key: &str) -> u64 {
+    value
+        .and_then(|item| item.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn note_markers(state: &mut State, value: &Value) {
+    match value {
+        Value::String(text) => {
+            if let Some(id) = message_id_in_text(text) {
+                state.seen.insert(id.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                note_markers(state, item);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                note_markers(state, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn quota_from_claude(value: &Value) -> Option<i64> {
+    if !mentions_rate_limit(value) {
+        return None;
+    }
+    find_named_reset(value).or_else(|| find_delay(value))
+}
+
+fn mentions_rate_limit(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => {
+            let category = map.get("category").and_then(Value::as_str);
+            let type_ = map.get("type").and_then(Value::as_str);
+            let subtype = map.get("subtype").and_then(Value::as_str);
+            if category == Some("rate_limit")
+                || type_ == Some("rate_limit")
+                || subtype.is_some_and(|text| text.contains("rate_limit"))
+            {
+                return true;
+            }
+            map.values().any(mentions_rate_limit)
+        }
+        Value::Array(items) => items.iter().any(mentions_rate_limit),
+        _ => false,
+    }
+}
+
+fn find_named_reset(value: &Value) -> Option<i64> {
+    match value {
+        Value::Object(map) => {
+            for key in ["resets_at_ms", "reset_at_ms", "resetsAt", "resetAt"] {
+                if let Some(n) = map.get(key).and_then(Value::as_i64) {
+                    return Some(interpret_reset(key, n));
+                }
+            }
+            map.values().find_map(find_named_reset)
+        }
+        Value::Array(items) => items.iter().find_map(find_named_reset),
+        _ => None,
+    }
+}
+
+fn interpret_reset(key: &str, n: i64) -> i64 {
+    if key.ends_with("_ms") || n >= 1_000_000_000_000 {
+        n
+    } else {
+        n.saturating_mul(1_000)
+    }
+}
+
+fn find_delay(value: &Value) -> Option<i64> {
+    match value {
+        Value::Object(map) => {
+            if let Some(delay) = map.get("retry_delay_ms").and_then(Value::as_i64) {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .ok()?
+                    .as_millis();
+                let now = i64::try_from(now).ok()?;
+                return Some(now.saturating_add(delay));
+            }
+            map.values().find_map(find_delay)
+        }
+        Value::Array(items) => items.iter().find_map(find_delay),
+        _ => None,
+    }
+}
+
+fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Result<()> {
+    let mut guard = lock(slot);
+    let Some(stdin) = guard.as_mut() else {
+        return Err(std::io::Error::other("stdin closed"));
+    };
+    writeln!(stdin, "{value}")?;
+    stdin.flush()
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|err| err.into_inner())
+}

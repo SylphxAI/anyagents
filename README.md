@@ -2,7 +2,7 @@
 
 Run any coding agent harness as a long-lived agent on your own machine or server. AnyAgents installs and signs in Claude Code, Codex, OpenCode, Gemini CLI and more on demand, keeps every agent running, connects each one to Telegram, lets agents message each other, and shows what each one costs.
 
-> Status: early development, nothing released yet. Working today: the durable per-agent mailbox with its delivery guarantees and tests, the server on a Unix socket, and the `send`, `inbox` and `agents` MCP tools. Not yet: real harness adapters, harness install and sign-in, Telegram, the protocol gateway and usage collection. The design is in [docs/](docs/).
+> Status: early development, nothing released yet. Working today: the durable per-agent mailbox with its delivery guarantees and tests, the server on a Unix socket, the `send`, `inbox` and `agents` MCP tools, and the Claude Code and Codex adapters. Not yet: harness install and sign-in, Telegram, the protocol gateway, and recording usage in the mailbox. The design is in [docs/](docs/).
 
 ## Why
 

@@ -111,6 +111,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyagents-harness-claude"
+version = "0.1.0"
+dependencies = [
+ "anyagents-harness",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "anyagents-harness-codex"
+version = "0.1.0"
+dependencies = [
+ "anyagents-harness",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "anyagents-invariants"
 version = "0.1.0"
 dependencies = [
