@@ -6,6 +6,8 @@
 
 mod fake;
 
+use std::time::Duration;
+
 pub use fake::FakeHarness;
 
 /// How a harness takes input that arrives during a turn.
@@ -85,6 +87,24 @@ pub trait Harness: Send {
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;
     fn health(&self) -> HarnessHealth;
+
+    /// Answer text the vendor sent for `id`, when it sends text before a result.
+    fn answer_for(&self, _id: &str) -> Option<String> {
+        None
+    }
+
+    /// How long a turn must stay silent before its answer stands still, for a
+    /// vendor that streams text and never closes a turn with a result line.
+    /// `None` means the vendor always closes its turn.
+    fn ends_on_quiet(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Wait until the turn is silent long enough to stand still, giving up
+    /// after `patience`.
+    fn quiet_for(&self, _id: &str, _quiet: Duration, _patience: Duration) -> bool {
+        false
+    }
 
     /// Usage recorded for a finished turn, if this adapter kept it.
     fn usage_for(&self, _id: &str) -> Option<TurnUsage> {

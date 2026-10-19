@@ -111,6 +111,7 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 | --- | --- | --- |
 | `steer` | Input enters the active turn, including while a tool runs. | Codex `app-server` `turn/steer`. |
 | `followup` | The tool takes the input now and acts on it when the current turn ends. | OpenCode `serve`; a harness with a long-lived stream that reads the next line after the result. |
+| `followup`, ending on quiet | The tool streams the answer and never prints a closing result line, so the turn is over once the stream has been silent for half a second. | None yet: the OpenCode adapter still ends a turn on its `result` line, so an agent on it is recorded only when the vendor sends one. |
 | `queue` | The tool cannot take input during a turn. The adapter holds the message (it is already durable in the mailbox) and delivers it when the turn ends. | Any harness with only one-shot runs. |
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).

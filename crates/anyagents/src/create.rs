@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
 
-use crate::mcp_config;
+use crate::{mcp_config, opencode_config};
 
 pub struct CreateRequest {
     pub name: String,
@@ -17,7 +17,7 @@ pub struct CreateRequest {
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
-    if request.harness != "claude-code" && request.harness != "codex" {
+    if !matches!(request.harness.as_str(), "claude-code" | "codex" | "opencode") {
         return Err(Error::Message(format!(
             "unknown harness: {}",
             request.harness
@@ -49,6 +49,8 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     ];
     if agent.harness == "codex" {
         mcp_config::write_codex(&config.join("config.toml"), &command, &args)?;
+    } else if agent.harness == "opencode" {
+        opencode_config::write(&config, agent.model.as_deref(), &command, &args)?;
     } else {
         mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
     }
