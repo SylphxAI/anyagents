@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState,
+    SteerSupport, TurnReport, TurnState, TurnUsage,
 };
 
 #[derive(Clone, Debug)]
@@ -25,6 +25,8 @@ pub struct FakeHarness {
     open: Vec<Written>,
     followups: Vec<Written>,
     finished: HashSet<String>,
+    failed: Vec<(String, String)>,
+    turns: std::collections::BTreeMap<String, u64>,
     turns_started: usize,
     quota_reset_at_ms: Option<i64>,
     auto_finish: bool,
@@ -42,6 +44,8 @@ impl FakeHarness {
             open: Vec::new(),
             followups: Vec::new(),
             finished: HashSet::new(),
+            failed: Vec::new(),
+            turns: std::collections::BTreeMap::new(),
             turns_started: 0,
             quota_reset_at_ms: None,
             auto_finish: false,
@@ -80,6 +84,24 @@ impl FakeHarness {
         seq
     }
 
+    /// Finish the open turn as a failed one. Its ids stay written and are not
+    /// marked processed by the supervisor.
+    pub fn fail_turn(&mut self, reason: &str) -> Option<i64> {
+        if self.open.is_empty() {
+            return None;
+        }
+        let seq = self.open.iter().map(|message| message.seq).max();
+        for message in self.open.drain(..) {
+            self.finished.insert(message.id.clone());
+            self.failed.push((message.id, reason.to_string()));
+        }
+        if !self.followups.is_empty() {
+            self.turns_started += 1;
+            self.open.append(&mut self.followups);
+        }
+        seq
+    }
+
     pub fn given_ids(&self) -> &[String] {
         &self.given
     }
@@ -110,6 +132,7 @@ impl FakeHarness {
             self.followups.push(written);
         }
         self.seen.insert(message.id.clone());
+        *self.turns.entry(message.id.clone()).or_insert(0) += 1;
         self.written.push(message.id.clone());
         if self.auto_finish && self.open.iter().any(|item| item.id == message.id) {
             self.complete_turn();
@@ -155,6 +178,19 @@ impl Harness for FakeHarness {
         }
         self.resumed.push(session.to_string());
         Ok(())
+    }
+
+    fn turn_version(&self, id: &str) -> u64 {
+        self.turns.get(id).copied().unwrap_or(0)
+    }
+
+    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
+        if let Some((_, reason)) = self.failed.iter().rev().find(|(item, _)| item == id) {
+            return Some(TurnReport::Failed(reason.clone()));
+        }
+        self.finished
+            .contains(id)
+            .then(|| TurnReport::Succeeded(TurnUsage::default()))
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {

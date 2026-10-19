@@ -111,6 +111,8 @@ impl<H: Harness> DeliveryLoop<H> {
             match self.harness.deliver(&outbound(&message)) {
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store
+                        .note_handover(&self.agent_id, seq, turn_finished)?;
+                    self.store
                         .note_delivery(&self.agent_id, seq, turn_finished)?;
                     accepted += 1;
                     if turn_finished {
@@ -131,6 +133,14 @@ impl<H: Harness> DeliveryLoop<H> {
 
     pub fn mark_processed_through(&self, seq: i64) -> Result<(), Error> {
         self.store.advance_processed_through(&self.agent_id, seq)?;
+        self.store.clear_failed_turns(&self.agent_id, seq)?;
+        Ok(())
+    }
+
+    /// Record that the turn ending at `seq` failed. The processed cursor stays.
+    pub fn record_failed_turn(&self, seq: i64, reason: &str) -> Result<(), Error> {
+        self.store
+            .record_failed_turn(&self.agent_id, seq, reason, anyagents_core::now_ms())?;
         Ok(())
     }
 
@@ -152,6 +162,27 @@ impl<H: Harness> DeliveryLoop<H> {
     /// Drop the store and the lock, keeping the harness so a restarted loop can dedupe.
     pub fn into_harness(self) -> H {
         self.harness
+    }
+
+    /// The ids the harness has taken and whose turn has not finished.
+    pub fn pending_ids(&self) -> Vec<String> {
+        let Ok(accepted) = self.store.accepted_cursor(&self.agent_id) else {
+            return Vec::new();
+        };
+        let Ok(messages) = self.store.inbox(&self.agent_id, None) else {
+            return Vec::new();
+        };
+        messages
+            .into_iter()
+            .filter(|message| {
+                message.seq <= accepted && message.ack != anyagents_core::Ack::Processed
+            })
+            .map(|message| message.id.as_str().to_string())
+            .collect()
+    }
+
+    pub fn agent_id(&self) -> AgentId {
+        self.agent_id.clone()
     }
 
     pub fn harness(&self) -> &H {

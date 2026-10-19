@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
+    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnReport, TurnState,
 };
 use anyagents_harness_claude::ClaudeHarness;
 use tempfile::TempDir;
@@ -211,4 +211,35 @@ fn echoed_id_is_not_written_again() {
     harness.deliver(&msg("echoed")).unwrap();
     assert!(harness.written_ids().is_empty());
     assert!(!read_log(&log_path(&dir)).contains("echoed"));
+}
+
+#[test]
+fn an_errored_result_is_a_failed_turn_with_no_usage() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "failed_turn", None);
+    harness.deliver(&msg("m1")).unwrap();
+    assert!(
+        harness.wait_finished("m1", Duration::from_secs(5)),
+        "the errored result is still the end of its turn"
+    );
+    assert!(harness.usage_for("m1").is_none());
+    let report = harness.turn_report_for("m1").expect("report");
+    match report {
+        TurnReport::Failed(reason) => {
+            assert!(reason.contains("error_during_execution"), "{reason}");
+            assert!(reason.contains("Invalid API key"), "{reason}");
+        }
+        other => panic!("expected a failed turn, got {other:?}"),
+    }
+    assert_eq!(harness.health().turn_state, TurnState::Idle);
+    // Handing the failed message back writes it once more, because the turn that
+    // succeeds has to carry it; the replay starts a second turn.
+    assert!(
+        matches!(
+            harness.deliver(&msg("m1")).unwrap(),
+            DeliverOutcome::Accepted { .. }
+        ),
+        "the hand-over is accepted"
+    );
+    assert_eq!(harness.turns_started(), 2);
 }
