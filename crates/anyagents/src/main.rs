@@ -413,8 +413,27 @@ fn send(
                 "send to a group".into(),
             ));
         }
-        Address::TelegramChat(id) | Address::TelegramUser(id) => {
-            return send_telegram(data, &id, &text, reply_to.as_deref(), from.as_deref());
+        Address::TelegramChat { chat, thread } => {
+            return send_telegram(
+                data,
+                &chat,
+                thread.as_deref(),
+                &text,
+                reply_to.as_deref(),
+                None,
+                from.as_deref(),
+            );
+        }
+        Address::TelegramUser { user, message } => {
+            return send_telegram(
+                data,
+                &user,
+                None,
+                &text,
+                reply_to.as_deref(),
+                message.as_deref(),
+                from.as_deref(),
+            );
         }
     };
     let store = open(data)?;
@@ -439,26 +458,37 @@ fn send(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_telegram(
     data: &Path,
     chat: &str,
+    thread: Option<&str>,
     text: &str,
     reply_to: Option<&str>,
+    address_reply: Option<&str>,
     from: Option<&str>,
 ) -> Result<(), anyagents_core::Error> {
     let chat_id: i64 = chat
         .parse()
         .map_err(|_| anyagents_core::Error::Message("telegram chat id is not a number".into()))?;
-    let reply_to = match reply_to {
+    let thread_id = match thread {
         None => None,
-        Some(raw) => Some(raw.parse().map_err(|_| {
-            anyagents_core::Error::Message("reply_to is not a telegram message id".into())
-        })?),
+        Some(raw) => Some(parse_id(raw, "telegram topic id")?),
+    };
+    let reply_to = match reply_to.or(address_reply) {
+        None => None,
+        Some(raw) => Some(parse_id(raw, "reply_to is not a telegram message id")?),
     };
     let store = open(data)?;
-    let message_id = telegram::post_text(&store, data, from, chat_id, text, reply_to)?;
+    let message_id =
+        telegram::post_text(&store, data, from, chat_id, text, reply_to, thread_id)?;
     println!("{message_id}");
     Ok(())
+}
+
+fn parse_id(raw: &str, what: &'static str) -> Result<i64, anyagents_core::Error> {
+    raw.parse()
+        .map_err(|_| anyagents_core::Error::Message(what.into()))
 }
 
 fn inbox(

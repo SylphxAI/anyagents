@@ -72,6 +72,9 @@ pub struct Channel {
     /// Adapter settings, as JSON. Never a secret.
     pub config: String,
     pub credential_ref: Option<String>,
+    /// Adapter memory, as JSON: a poll offset, the chats an agent answers in.
+    /// Never a secret.
+    pub state: String,
     pub created_at_ms: i64,
     /// Agents attached to this channel, in attach order.
     pub agents: Vec<AgentId>,
@@ -459,18 +462,20 @@ impl Store {
                 new.config
             },
             credential_ref: new.credential_ref,
+            state: "{}".to_string(),
             created_at_ms: now_ms(),
             agents: Vec::new(),
         };
         self.conn().execute(
-            "INSERT INTO channels (id, kind, identity, config, credential_ref, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO channels (id, kind, identity, config, credential_ref, state, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 channel.id.as_str(),
                 channel.kind,
                 channel.identity,
                 channel.config,
                 channel.credential_ref,
+                channel.state,
                 channel.created_at_ms,
             ],
         )?;
@@ -481,7 +486,7 @@ impl Store {
     pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, kind, identity, config, credential_ref, created_at_ms FROM channels
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels
              ORDER BY created_at_ms",
         )?;
         let mut rows = stmt.query([])?;
@@ -506,6 +511,20 @@ impl Store {
         let changed = self.conn().execute(
             "UPDATE channels SET credential_ref = ?2 WHERE id = ?1",
             params![channel_id.as_str(), credential_ref],
+        )?;
+        if changed == 0 {
+            return Err(Error::ChannelNotFound(channel_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Replace a channel's adapter memory.
+    pub fn set_channel_state(&self, channel_id: &ChannelId, state: &str) -> Result<(), Error> {
+        serde_json::from_str::<serde_json::Value>(state)
+            .map_err(|_| Error::Message("channel state is not json".into()))?;
+        let changed = self.conn().execute(
+            "UPDATE channels SET state = ?2 WHERE id = ?1",
+            params![channel_id.as_str(), state],
         )?;
         if changed == 0 {
             return Err(Error::ChannelNotFound(channel_id.to_string()));
@@ -1043,7 +1062,7 @@ fn validate_token(value: &str, what: &str) -> Result<(), Error> {
 fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
     let found = conn
         .query_row(
-            "SELECT id, kind, identity, config, credential_ref, created_at_ms FROM channels WHERE id = ?1",
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels WHERE id = ?1",
             [id.as_str()],
             channel_from_row,
         )
@@ -1089,6 +1108,7 @@ fn channel_from_row(row: &rusqlite::Row<'_>) -> Result<Channel, rusqlite::Error>
         config: row.get(3)?,
         credential_ref: row.get(4)?,
         created_at_ms: row.get(5)?,
+        state: row.get(6)?,
         agents: Vec::new(),
     })
 }
@@ -1283,9 +1303,9 @@ mod tests {
             .unwrap();
         assert_eq!(mode, "wal");
         let version = migrate::current_version(&store.conn()).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let again = Store::open(dir.path().join("state.db")).unwrap();
-        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 3);
+        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 4);
         assert_eq!(again.list_agents().unwrap(), store.list_agents().unwrap());
     }
 

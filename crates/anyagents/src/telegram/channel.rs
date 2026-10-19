@@ -1,26 +1,47 @@
 //! Long-poll Telegram bots recorded as channels, and post one agent's text back.
 //!
 //! The token is read from the credential store when a poll or a send connects,
-//! and it stays in memory. `getUpdates` and `sendMessage` are built without it;
-//! the token is attached only on the request path. Failures name no URL, so a
-//! token on that path cannot reach a log.
+//! and it stays in memory. `getUpdates`, `getMe` and `sendMessage` are built
+//! without it; the token is attached only on the request path. Failures name
+//! neither the URL nor the request body, so a token on that path cannot reach a
+//! log. `ANYAGENTS_TELEGRAM_API` points the calls at a fake server in tests.
+//!
+//! A channel's offset is saved after the updates it covers are in the mailbox,
+//! so a restart asks for what it has not stored and a repeated update is kept
+//! once by its source key.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyagents_channel_telegram::{
-    BotCall, Poll, deliver_to_mailbox, send_message, sent_message_id,
+    BotCall, Memory, Poll, Routed, bot_identity, deliver_to_mailbox, get_me, send_message,
+    sent_message_id,
 };
 use anyagents_core::{Channel, CredentialStore, FileCredentialStore, Store};
 
-const API: &str = "https://api.telegram.org";
+/// Seconds one `getUpdates` may hold the connection open.
+pub const LONG_POLL_S: u64 = 30;
+/// A call that answers at once gets this long; a long poll gets its own plus ten.
+const SHORT_TIMEOUT_S: u64 = 30;
 
-/// One poll cycle for every telegram channel. A channel with no secret is skipped.
-pub fn poll_once(store: &Store, data_dir: &std::path::Path) -> Result<(), anyagents_core::Error> {
+fn api_base() -> String {
+    std::env::var("ANYAGENTS_TELEGRAM_API")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| anyagents_channel_telegram::API.to_string())
+}
+
+/// One poll cycle for every telegram channel, waiting up to `timeout_s` for
+/// each. A channel with no secret is skipped. It returns when every channel has
+/// answered, so a runner that is about to stop does not wait out a long poll.
+pub fn poll_once(
+    store: &Store,
+    data_dir: &std::path::Path,
+    timeout_s: u64,
+) -> Result<(), anyagents_core::Error> {
     let secrets = FileCredentialStore::new(data_dir);
     let mut failure = None;
     for channel in store.list_channels()? {
-        if let Err(err) = poll_channel(store, &secrets, &channel)
+        if let Err(err) = poll_channel(store, &secrets, &channel, timeout_s)
             && failure.is_none()
         {
             failure = Some(err);
@@ -36,6 +57,7 @@ fn poll_channel(
     store: &Store,
     secrets: &FileCredentialStore,
     channel: &Channel,
+    timeout_s: u64,
 ) -> Result<(), anyagents_core::Error> {
     if channel.kind != "telegram" {
         return Ok(());
@@ -46,50 +68,87 @@ fn poll_channel(
     let Some(agent_id) = channel.agents.first() else {
         return Ok(());
     };
+    let mut memory = Memory::from_state(&channel.state);
     let token = token_of(secrets, credential_ref)?;
-    let mut poll = Poll::default();
-    let call = poll.get_updates(0);
-    let response = call_api(&token, &call)?;
+    if memory.bot.is_none() {
+        let identity = bot_identity(&call_api(&token, &get_me(), SHORT_TIMEOUT_S)?)
+            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+        memory.bot = Some(format!("{}:{}", identity.id, identity.username));
+        store.set_channel_state(&channel.id, &memory.to_state())?;
+    }
+    let mut poll = Poll::resume(memory.offset);
+    let response = call_api(&token, &poll.get_updates(timeout_s), timeout_s + 10)?;
     let body = updates_payload(&response)?;
+    let before = poll.offset;
     let routed = poll
         .route("bot", agent_id.as_str(), &body)
         .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-    for one in &routed {
-        deliver_to_mailbox(store, one, &[])?;
+    let attached = attached_agents(store, channel)?;
+    let mut grew = false;
+    for one in routed {
+        // This bot answers in the chat its update came from, so a post it makes
+        // there reaches the other agents on that chat.
+        if let Routed::ToAgent { inbound, .. } = &one {
+            let known = memory
+                .chats
+                .iter()
+                .any(|link| link.agent == agent_id.as_str() && link.chat_id == inbound.chat_id);
+            memory.attach(agent_id.as_str(), inbound.chat_id);
+            grew |= !known;
+        }
+        let peers = peer_ids(store, &poll, &one, agent_id.as_str(), &attached)?;
+        deliver_to_mailbox(store, &one, &peers)?;
+    }
+    // The offset and the chats are saved only once the updates are stored, so a
+    // restart asks for what it did not keep and a repeat is one row.
+    if poll.offset != before || grew {
+        memory.offset = poll.offset.max(memory.offset);
+        store.set_channel_state(&channel.id, &memory.to_state())?;
     }
     Ok(())
 }
 
-/// Run `poll_once` until `stop` is set. A failed poll waits and tries again.
-pub async fn run(
-    store: Arc<Store>,
-    data_dir: std::path::PathBuf,
-    mut stop: tokio::sync::watch::Receiver<bool>,
-) {
-    loop {
-        if *stop.borrow() {
-            return;
-        }
-        let store = Arc::clone(&store);
-        let dir = data_dir.clone();
-        match tokio::task::spawn_blocking(move || poll_once(&store, &dir)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                let _ = err;
-            }
-            Err(err) => {
-                let _ = err;
-            }
-        }
-        tokio::select! {
-            _ = stop.changed() => {
-                if *stop.borrow() {
-                    return;
-                }
-            }
-            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+/// The other agents on a chat a peer's post belongs to, with that chat.
+fn peer_ids(
+    store: &Store,
+    poll: &Poll,
+    one: &Routed,
+    sender: &str,
+    attached: &[(String, i64)],
+) -> Result<Vec<(anyagents_core::AgentId, i64)>, anyagents_core::Error> {
+    let Routed::EchoToPeers { chat_id, .. } = one else {
+        return Ok(Vec::new());
+    };
+    let attached: Vec<(&str, i64)> = attached
+        .iter()
+        .map(|(name, chat)| (name.as_str(), *chat))
+        .collect();
+    let mut peers = Vec::new();
+    for name in poll.peers(*chat_id, sender, &attached) {
+        if let Ok(agent) = store.agent_by_name(name) {
+            peers.push((agent.id, *chat_id));
         }
     }
+    Ok(peers)
+}
+
+/// The agents on this channel with the chats each answers in, from its state.
+fn attached_agents(
+    store: &Store,
+    channel: &Channel,
+) -> Result<Vec<(String, i64)>, anyagents_core::Error> {
+    let memory = Memory::from_state(&channel.state);
+    let names: Vec<String> = channel
+        .agents
+        .iter()
+        .filter_map(|id| store.agent(id).ok().map(|agent| agent.name))
+        .collect();
+    Ok(memory
+        .chats
+        .into_iter()
+        .filter(|link| names.iter().any(|name| name == &link.agent))
+        .map(|link| (link.agent, link.chat_id))
+        .collect())
 }
 
 /// A `sendMessage` for one chat, plus the secret it must be sent with.
@@ -106,6 +165,7 @@ pub(crate) fn outbound_call(
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
+    thread: Option<i64>,
 ) -> Result<Outbound, anyagents_core::Error> {
     let channel = channel_for(store, from)?;
     let Some(credential_ref) = channel.credential_ref else {
@@ -115,11 +175,12 @@ pub(crate) fn outbound_call(
     };
     Ok(Outbound {
         credential_ref,
-        call: send_message(chat_id, text, reply_to),
+        call: send_message(chat_id, text, reply_to, thread),
     })
 }
 
 /// Post one text through the agent's bot. The token is read for this call only.
+#[allow(clippy::too_many_arguments)]
 pub fn post_text(
     store: &Store,
     data_dir: &std::path::Path,
@@ -127,14 +188,42 @@ pub fn post_text(
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
+    thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
-    let outbound = outbound_call(store, from, chat_id, text, reply_to)?;
+    let outbound = outbound_call(store, from, chat_id, text, reply_to, thread)?;
     let token = token_of(
         &FileCredentialStore::new(data_dir),
         &outbound.credential_ref,
     )?;
-    let response = call_api(&token, &outbound.call)?;
+    let response = call_api(&token, &outbound.call, SHORT_TIMEOUT_S)?;
     sent_message_id(&response).map_err(|err| anyagents_core::Error::Message(err.to_string()))
+}
+
+/// Record that `agent` answers in `chat`, and learn the chat's title if the
+/// adapter has one. The state stays the sender's own memory.
+pub fn record_chat(
+    store: &Store,
+    agent: &str,
+    chat_id: i64,
+) -> Result<(), anyagents_core::Error> {
+    for channel in store.list_channels()? {
+        let memory = Memory::from_state(&channel.state);
+        if memory.chats.iter().any(|link| link.chat_id == chat_id) {
+            continue;
+        }
+        let ours = channel
+            .agents
+            .iter()
+            .filter_map(|id| store.agent(id).ok())
+            .any(|row| row.name == agent);
+        if ours {
+            let mut memory = memory;
+            memory.attach(agent, chat_id);
+            store.set_channel_state(&channel.id, &memory.to_state())?;
+            return Ok(());
+        }
+    }
+    Ok(())
 }
 
 fn channel_for(store: &Store, from: Option<&str>) -> Result<Channel, anyagents_core::Error> {
@@ -213,9 +302,18 @@ pub(crate) fn updates_payload(response: &str) -> Result<String, anyagents_core::
     }
 }
 
-fn call_api(token: &str, call: &BotCall) -> Result<String, anyagents_core::Error> {
-    let url = format!("{API}/bot{token}/{}", call.method);
-    let response = ureq::post(&url)
+fn call_api(
+    token: &str,
+    call: &BotCall,
+    timeout_s: u64,
+) -> Result<String, anyagents_core::Error> {
+    let url = format!("{}/bot{token}/{}", api_base(), call.method);
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(timeout_s)))
+        .build()
+        .new_agent();
+    let response = agent
+        .post(&url)
         .send_json(&call.body)
         .map_err(|_| anyagents_core::Error::Message("telegram request failed".into()))?;
     response
@@ -248,7 +346,7 @@ mod tests {
                 credential_ref: None,
             })
             .unwrap();
-        poll_once(&store, dir.path()).unwrap();
+        poll_once(&store, dir.path(), 0).unwrap();
     }
 
     #[test]
@@ -280,19 +378,20 @@ mod tests {
         store.attach_channel(&ada_channel.id, &ada.id).unwrap();
         store.attach_channel(&bea_channel.id, &bea.id).unwrap();
 
-        let sent = outbound_call(&store, Some("bea"), 100, "hello", Some(5)).unwrap();
+        let sent = outbound_call(&store, Some("bea"), 100, "hello", Some(5), Some(3)).unwrap();
         assert_eq!(sent.credential_ref, "channels/bea");
         assert_eq!(sent.call.method, "sendMessage");
         assert_eq!(sent.call.body["chat_id"], 100);
         assert_eq!(sent.call.body["text"], "hello");
         assert_eq!(sent.call.body["reply_to_message_id"], 5);
+        assert_eq!(sent.call.body["message_thread_id"], 3);
         assert!(!sent.call.body.to_string().contains("token"));
 
-        let ambiguous = outbound_call(&store, None, 100, "hello", None).unwrap_err();
+        let ambiguous = outbound_call(&store, None, 100, "hello", None, None).unwrap_err();
         let message = ambiguous.to_string();
         assert!(message.contains("ada"), "{message}");
         assert!(message.contains("bea"), "{message}");
-        assert!(outbound_call(&store, Some("cy"), 100, "hello", None).is_err());
+        assert!(outbound_call(&store, Some("cy"), 100, "hello", None, None).is_err());
     }
 
     #[test]
@@ -311,7 +410,7 @@ mod tests {
             })
             .unwrap();
         store.attach_channel(&channel.id, &ada.id).unwrap();
-        let sent = outbound_call(&store, None, 100, "hello", None).unwrap();
+        let sent = outbound_call(&store, None, 100, "hello", None, None).unwrap();
         assert_eq!(sent.credential_ref, "channels/ada");
         assert_eq!(sent.call.method, "sendMessage");
     }
@@ -320,7 +419,7 @@ mod tests {
     fn no_telegram_channel_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let err = outbound_call(&store, None, 100, "hello", None).unwrap_err();
+        let err = outbound_call(&store, None, 100, "hello", None, None).unwrap_err();
         assert!(err.to_string().contains("no telegram channel"), "{err}");
     }
 
@@ -332,5 +431,37 @@ mod tests {
         );
         assert_eq!(bound_sender(None).unwrap(), None);
         assert!(bound_sender(Some("group:crew")).is_err());
+    }
+
+    #[test]
+    fn a_chat_an_agent_answers_in_is_remembered_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let ada = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let bea = store
+            .create_agent(anyagents_core::NewAgent::new("bea", "codex"))
+            .unwrap();
+        let channel = store
+            .create_channel(anyagents_core::NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: Some("channels/ada".into()),
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &ada.id).unwrap();
+        store.attach_channel(&channel.id, &bea.id).unwrap();
+        record_chat(&store, "ada", -1007).unwrap();
+        record_chat(&store, "ada", -1007).unwrap();
+        let channel = store.list_channels().unwrap().remove(0);
+        let memory = Memory::from_state(&channel.state);
+        assert_eq!(memory.chats.len(), 1);
+        assert_eq!(memory.chats[0].chat_id, -1007);
+        assert_eq!(
+            attached_agents(&store, &channel).unwrap(),
+            vec![("ada".to_string(), -1007)]
+        );
     }
 }

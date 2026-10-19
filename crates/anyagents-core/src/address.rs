@@ -1,7 +1,8 @@
 //! Address grammar for `send`.
 //!
 //! `agent:<name>` and a bare name are an agent. `group:<name>` is a named
-//! group. `telegram:chat:<id>` and `telegram:user:<id>` are channel targets.
+//! group. `telegram:chat:<id>[:<thread>]` and `telegram:user:<id>[:<message>]`
+//! are channel targets: a forum topic, and the message a reply answers.
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -10,8 +11,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 pub enum Address {
     Agent(String),
     Group(String),
-    TelegramChat(String),
-    TelegramUser(String),
+    /// A chat, and the forum topic inside it when the address names one.
+    TelegramChat { chat: String, thread: Option<String> },
+    /// A person, and the message being answered when the address names one.
+    TelegramUser { user: String, message: Option<String> },
 }
 
 /// Why an address string was rejected.
@@ -49,15 +52,17 @@ impl Address {
                 .map(Self::Group)
                 .ok_or_else(|| err("empty group name"));
         }
-        if let Some(id) = input.strip_prefix("telegram:chat:") {
-            return id_token(id)
-                .map(Self::TelegramChat)
-                .ok_or_else(|| err("empty telegram chat id"));
+        if let Some(rest) = input.strip_prefix("telegram:chat:") {
+            return match split_optional(rest) {
+                (Some(chat), thread) => Ok(Self::TelegramChat { chat, thread }),
+                (None, _) => Err(err("empty or malformed telegram chat id")),
+            };
         }
-        if let Some(id) = input.strip_prefix("telegram:user:") {
-            return id_token(id)
-                .map(Self::TelegramUser)
-                .ok_or_else(|| err("empty telegram user id"));
+        if let Some(rest) = input.strip_prefix("telegram:user:") {
+            return match split_optional(rest) {
+                (Some(user), message) => Ok(Self::TelegramUser { user, message }),
+                (None, _) => Err(err("empty or malformed telegram user id")),
+            };
         }
         if input.contains(':') {
             return Err(err("unknown address scheme"));
@@ -72,8 +77,14 @@ impl Address {
         match self {
             Self::Agent(name) => format!("agent:{name}"),
             Self::Group(name) => format!("group:{name}"),
-            Self::TelegramChat(id) => format!("telegram:chat:{id}"),
-            Self::TelegramUser(id) => format!("telegram:user:{id}"),
+            Self::TelegramChat { chat, thread } => match thread {
+                Some(thread) => format!("telegram:chat:{chat}:{thread}"),
+                None => format!("telegram:chat:{chat}"),
+            },
+            Self::TelegramUser { user, message } => match message {
+                Some(message) => format!("telegram:user:{user}:{message}"),
+                None => format!("telegram:user:{user}"),
+            },
         }
     }
 }
@@ -106,6 +117,18 @@ fn name_token(value: &str) -> Option<String> {
     }
 }
 
+/// `a` or `a:b`. A first part that is empty or malformed is `None`, and so is a
+/// second part that is wrong.
+fn split_optional(value: &str) -> (Option<String>, Option<String>) {
+    match value.split_once(':') {
+        Some((first, rest)) => match id_token(rest) {
+            Some(rest) => (id_token(first), Some(rest)),
+            None => (None, None),
+        },
+        None => (id_token(value), None),
+    }
+}
+
 fn id_token(value: &str) -> Option<String> {
     if value.is_empty() || value.contains(':') || value.chars().any(char::is_whitespace) {
         None
@@ -135,11 +158,25 @@ mod tests {
         );
         assert_eq!(
             Address::parse("telegram:chat:-100123").unwrap(),
-            Address::TelegramChat("-100123".into())
+            Address::TelegramChat {
+                chat: "-100123".into(),
+                thread: None
+            }
         );
         assert_eq!(
             Address::parse("telegram:user:42").unwrap(),
-            Address::TelegramUser("42".into())
+            Address::TelegramUser {
+                user: "42".into(),
+                message: None
+            }
+        );
+        assert_eq!(
+            Address::parse("telegram:chat:-100123:7").unwrap().canonical(),
+            "telegram:chat:-100123:7"
+        );
+        assert_eq!(
+            Address::parse("telegram:user:42:9").unwrap().canonical(),
+            "telegram:user:42:9"
         );
     }
 
@@ -152,6 +189,8 @@ mod tests {
         assert!(Address::parse("group:").is_err());
         assert!(Address::parse("telegram:chat:").is_err());
         assert!(Address::parse("telegram:user:").is_err());
+        assert!(Address::parse("telegram:chat:1:").is_err());
+        assert!(Address::parse("telegram:user:1::2").is_err());
         assert!(Address::parse("telegram:room:1").is_err());
         assert!(Address::parse("email:a@b.c").is_err());
     }
