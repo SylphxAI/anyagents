@@ -111,6 +111,21 @@ pub trait Harness: Send {
         None
     }
 
+    /// Which finished turn this is for `id`, counting from 1. A message that
+    /// fails and is handed over again reports 2, so the host can tell the retry
+    /// from the failure it already recorded. `None` means the adapter does not
+    /// count, and every report is treated as the same turn.
+    fn turn_version(&self, _id: &str) -> u64 {
+        0
+    }
+
+    /// How the finished turn that included `id` ended. `None` means the adapter
+    /// cannot tell, and the turn counts as a success. An adapter that reports a
+    /// failure keeps the message accepted, never processed.
+    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
+        self.usage_for(id).map(TurnReport::Succeeded)
+    }
+
     /// Forget a quota wait so delivery can resume after the reset time.
     fn clear_quota(&mut self) {}
 
@@ -137,6 +152,16 @@ pub struct TurnUsage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reported_cost_micros: Option<i64>,
+}
+
+/// How a finished turn ended, as the vendor reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnReport {
+    /// The turn completed. Its usage is recorded.
+    Succeeded(TurnUsage),
+    /// The turn ended in an error. The message is not processed and is offered
+    /// to the next turn. `reason` comes from the vendor's own error text.
+    Failed(String),
 }
 
 /// First line of user text. The rest of the text is the mailbox body.

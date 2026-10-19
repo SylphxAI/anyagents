@@ -469,9 +469,13 @@ fn inbox(
     let store = open(data)?;
     let agent = store.agent_by_name(agent)?;
     for message in store.inbox(&agent.id, since)? {
+        let ack = match &message.failed_reason {
+            Some(reason) => format!("failed ({reason})"),
+            None => message.ack.to_string(),
+        };
         println!(
             "{}\t{}\t{}\t{}",
-            message.seq, message.ack, message.received_at_ms, message.text
+            message.seq, ack, message.received_at_ms, message.text
         );
     }
     Ok(())

@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerSupport, TurnReport, TurnState, TurnUsage, marked_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -51,6 +51,8 @@ struct State {
     quota_reset_at_ms: Option<i64>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
+    failures: Vec<(String, String)>,
+    turns: std::collections::BTreeMap<String, u64>,
     request_seq: u64,
 }
 
@@ -115,6 +117,24 @@ impl ClaudeHarness {
             .rev()
             .find(|(item, _)| item == id)
             .map(|(_, usage)| usage.clone())
+    }
+
+    fn usage_at(&self, at: usize) -> Option<TurnUsage> {
+        lock(&self.shared)
+            .usages
+            .get(at)
+            .map(|(_, usage)| usage.clone())
+    }
+
+    /// Why the result that finished `id` reported an error, if it did.
+    pub fn failure_for(&self, id: &str) -> Option<String> {
+        let state = lock(&self.shared);
+        state
+            .failures
+            .iter()
+            .rev()
+            .find(|(item, _)| item == id)
+            .map(|(_, reason)| reason.clone())
     }
 
     /// Whether a result has finished `id`.
@@ -268,7 +288,15 @@ impl Harness for ClaudeHarness {
         if !state.alive {
             return Err(HarnessError::Dead);
         }
-        if state.seen.contains(&message.id) {
+        // A message whose last turn failed is not a duplicate: the turn that
+        // succeeds has to carry it. The adapter remembers it failed, so the
+        // host handing it over again always means a new attempt.
+        let failed_before = state.failures.iter().any(|(item, _)| item == &message.id);
+        if !failed_before
+            && (state.seen.contains(&message.id)
+                || state.open.contains(&message.id)
+                || state.followups.contains(&message.id))
+        {
             return Ok(DeliverOutcome::Accepted {
                 turn_finished: state.finished.contains(&message.id),
             });
@@ -293,7 +321,8 @@ impl Harness for ClaudeHarness {
         }
         accept_message(&mut state, &message.id);
         Ok(DeliverOutcome::Accepted {
-            turn_finished: state.finished.contains(&message.id),
+            turn_finished: state.finished.contains(&message.id)
+                && !state.failures.iter().any(|(item, _)| item == &message.id),
         })
     }
 
@@ -358,6 +387,33 @@ impl Harness for ClaudeHarness {
         ClaudeHarness::usage_for(self, id)
     }
 
+    fn turn_version(&self, id: &str) -> u64 {
+        lock(&self.shared).turns.get(id).copied().unwrap_or(0)
+    }
+
+    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
+        let (failed_at, usage_at) = {
+            let state = lock(&self.shared);
+            (
+                state.failures.iter().rposition(|(item, _)| item == id),
+                state.usages.iter().rposition(|(item, _)| item == id),
+            )
+        };
+        // The most recent result decides, so a replay that succeeds replaces
+        // the turn that had failed.
+        match (failed_at, usage_at) {
+            (Some(failed), Some(usage)) if usage > failed => {
+                self.usage_at(usage).map(TurnReport::Succeeded)
+            }
+            (Some(failed), _) => lock(&self.shared)
+                .failures
+                .get(failed)
+                .map(|(_, reason)| TurnReport::Failed(reason.clone())),
+            (None, Some(usage)) => self.usage_at(usage).map(TurnReport::Succeeded),
+            (None, None) => None,
+        }
+    }
+
     fn clear_quota(&mut self) {
         lock(&self.shared).quota_reset_at_ms = None;
     }
@@ -372,6 +428,7 @@ impl Harness for ClaudeHarness {
 }
 
 fn accept_message(state: &mut State, id: &str) {
+    *state.turns.entry(id.to_string()).or_insert(0) += 1;
     if state.open.is_empty() {
         state.turns_started += 1;
         state.open.push(id.to_string());
@@ -390,6 +447,11 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
         state.finished.insert(id.clone());
         state.usages.push((id, usage.clone()));
     }
+    promote_followups(state);
+}
+
+/// Messages written while a turn was open start the next turn when it ends.
+fn promote_followups(state: &mut State) {
     if !state.followups.is_empty() {
         state.turns_started += 1;
         state.open.append(&mut state.followups);
@@ -407,6 +469,9 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         };
         {
             let mut state = lock(&shared);
+            // An id the vendor wrote or echoed starts no second turn. An id that
+            // only appears inside an error or a system notice is not proof it
+            // wrote the message: the turn that failed must be able to try again.
             note_markers(&mut state, &value);
             if let Some(reset_at_ms) = quota_from_claude(&value) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
@@ -459,7 +524,40 @@ fn apply_result(state: &mut State, value: &Value) {
     if state.open.is_empty() {
         return;
     }
+    // An errored result (a sign-in failure, a vendor error) is not a successful
+    // turn: its ids finish, but with the vendor's own reason instead of usage.
+    if let Some(reason) = result_error(value) {
+        let ids = std::mem::take(&mut state.open);
+        for id in ids {
+            state.finished.insert(id.clone());
+            state.failures.push((id, reason.clone()));
+        }
+        promote_followups(state);
+        return;
+    }
     finish_open(state, usage_from_claude(value));
+}
+
+/// The vendor's error text from a `result` event, or `None` when it succeeded.
+fn result_error(value: &Value) -> Option<String> {
+    let subtype = value
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    let is_error =
+        value.get("is_error").and_then(Value::as_bool) == Some(true) || subtype != "success";
+    if !is_error {
+        return None;
+    }
+    let text = match value.get("result") {
+        Some(Value::String(text)) if !text.trim().is_empty() => text.clone(),
+        _ => subtype.to_string(),
+    };
+    if text == subtype {
+        Some(text)
+    } else {
+        Some(format!("{subtype}: {text}"))
+    }
 }
 
 fn usage_from_claude(value: &Value) -> TurnUsage {
@@ -493,6 +591,34 @@ fn u64_field(value: Option<&Value>, key: &str) -> u64 {
 }
 
 fn note_markers(state: &mut State, value: &Value) {
+    if !mentions_user_text(value) {
+        return;
+    }
+    collect_markers(state, value);
+}
+
+/// Whether a line carries user or assistant content, the only place the vendor
+/// writes a mailbox id back.
+fn mentions_user_text(value: &Value) -> bool {
+    match value {
+        Value::String(_) => false,
+        Value::Array(items) => items.iter().any(mentions_user_text),
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str).is_some_and(|kind| {
+                matches!(
+                    kind,
+                    "user" | "assistant" | "message" | "text" | "content_block"
+                )
+            }) {
+                return true;
+            }
+            map.values().any(mentions_user_text)
+        }
+        _ => false,
+    }
+}
+
+fn collect_markers(state: &mut State, value: &Value) {
     match value {
         Value::String(text) => {
             if let Some(id) = message_id_in_text(text) {
@@ -501,12 +627,12 @@ fn note_markers(state: &mut State, value: &Value) {
         }
         Value::Array(items) => {
             for item in items {
-                note_markers(state, item);
+                collect_markers(state, item);
             }
         }
         Value::Object(map) => {
             for item in map.values() {
-                note_markers(state, item);
+                collect_markers(state, item);
             }
         }
         _ => {}
