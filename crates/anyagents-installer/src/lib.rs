@@ -308,12 +308,31 @@ pub fn sign_in(
     runner: &mut dyn CommandRunner,
     sink: &mut dyn SignInSink,
 ) -> Result<SignInOutcome, InstallError> {
+    sign_in_at(
+        catalog,
+        &config_dir(root, harness, profile),
+        harness,
+        runner,
+        sink,
+    )
+}
+
+/// Run the vendor's sign-in inside `dir`, the exact directory the vendor tool is
+/// later started with. An agent needs this: the supervisor launches its harness
+/// with the agent's own config directory, so a sign-in under any other path
+/// leaves that agent signed out.
+pub fn sign_in_at(
+    catalog: &[CatalogEntry],
+    dir: &Path,
+    harness: &str,
+    runner: &mut dyn CommandRunner,
+    sink: &mut dyn SignInSink,
+) -> Result<SignInOutcome, InstallError> {
     let entry = catalog
         .iter()
         .find(|e| e.id == harness)
         .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
-    let dir = config_dir(root, harness, profile);
-    std::fs::create_dir_all(&dir).map_err(|e| InstallError::Failed(e.to_string()))?;
+    std::fs::create_dir_all(dir).map_err(|e| InstallError::Failed(e.to_string()))?;
     let (program, args) = entry
         .sign_in_command
         .split_first()
@@ -331,7 +350,7 @@ pub fn sign_in(
         Some(name) => vec![(name, value.as_str())],
         None => Vec::new(),
     };
-    runner.run(program, args, &dir, &env, &mut lines)?;
+    runner.run(program, args, dir, &env, &mut lines)?;
     let outcome = SignInOutcome {
         signed_in: account.is_some(),
         account,
@@ -512,6 +531,35 @@ mod tests {
                 .any(|(k, v)| k == "CODEX_HOME" && v.ends_with("config/codex/default"))
         );
         assert_eq!(sink.0, outcome.prompts);
+    }
+
+    #[test]
+    fn sign_in_at_writes_into_the_given_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("agents/agt_1/config");
+        let mut runner = ScriptedRunner::default();
+        runner.answer("claude", "SIGNED_IN ada@example\n");
+        let mut sink = NopSignIn;
+        let outcome = sign_in_at(&catalog(), &dir, "claude-code", &mut runner, &mut sink).unwrap();
+        assert!(outcome.signed_in);
+        let call = &runner.calls[0];
+        assert_eq!(
+            call.dir, dir,
+            "the vendor runs in the agent's own directory"
+        );
+        assert!(call.args.iter().any(|arg| arg == "login"));
+        assert!(
+            call.env
+                .iter()
+                .any(|(key, value)| key == "CLAUDE_CONFIG_DIR" && Path::new(value) == dir)
+        );
+    }
+
+    struct NopSignIn;
+
+    impl SignInSink for NopSignIn {
+        fn prompt(&mut self, _: &SignInPrompt) {}
+        fn done(&mut self, _: &SignInOutcome) {}
     }
 
     #[test]

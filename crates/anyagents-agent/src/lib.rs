@@ -1,8 +1,8 @@
 //! Delivery loop. It hands each message past the accepted cursor to the harness,
 //! in sequence order, and moves the cursors only after the harness answers.
 
-use anyagents_core::{AgentId, Message, Store};
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
+use anyagents_core::{Agent, AgentId, Incoming, Message, Store};
+use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, message_id_in_text};
 
 pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
 
@@ -62,6 +62,20 @@ pub struct DeliveryLoop<H: Harness> {
     // Held so the process lock stays until this loop is dropped.
     _lock: anyagents_core::AgentLock,
     quota_reset_at_ms: Option<i64>,
+}
+
+/// The vendor echoes the marked prompt as the first line. The marker line is
+/// not part of the answer.
+fn answer_text(text: &str) -> String {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    if message_id_in_text(first).is_some() {
+        lines.collect::<Vec<_>>().join("\n").trim().to_string()
+    } else {
+        text.trim().to_string()
+    }
 }
 
 impl<H: Harness> DeliveryLoop<H> {
@@ -129,6 +143,39 @@ impl<H: Harness> DeliveryLoop<H> {
                 Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
             }
         }
+    }
+
+    /// Record the harness's latest answer to the first message past the
+    /// processed cursor, as a reply from the agent. A repeated answer is one row.
+    pub fn record_answer(&self, agent: &Agent) -> Result<(), Error> {
+        let seq = self.store.processed_cursor(&self.agent_id)?;
+        let Some(message) = self
+            .store
+            .inbox(&self.agent_id, Some(seq))?
+            .into_iter()
+            .find(|message| message.seq > seq && message.reply_to.is_none())
+        else {
+            return Ok(());
+        };
+        let Some(text) = self.harness.answer_for(message.id.as_str()) else {
+            return Ok(());
+        };
+        let text = answer_text(&text);
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.store.receive(
+            &self.agent_id,
+            Incoming {
+                text,
+                sender: Some(format!("agent:{}", agent.name)),
+                source_time_ms: None,
+                source_key: Some(format!("answer:{}", message.id)),
+                reply_to: Some(message.id.to_string()),
+                received_at_ms: None,
+            },
+        )?;
+        Ok(())
     }
 
     pub fn mark_processed_through(&self, seq: i64) -> Result<(), Error> {

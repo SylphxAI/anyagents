@@ -135,6 +135,7 @@ fn read_line(value: &Value) -> LineEffect {
             .map(str::to_string),
         usage: is_result.then(|| usage_of(value)),
         quota_reset_at_ms: quota_of(value),
+        text: None,
     }
 }
 
