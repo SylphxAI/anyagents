@@ -185,6 +185,11 @@ pub struct LaunchRequest {
 
 pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Sync>;
 
+/// How long a turn must stand still before a harness that never closes it is
+/// counted as done, and how long to watch for that.
+const ANSWER_QUIET: Duration = Duration::from_millis(500);
+const ANSWER_PATIENCE: Duration = Duration::from_millis(120_000);
+
 /// Supervisor view of one agent. Ages stay on the mailbox; this is the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveState {
@@ -596,6 +601,7 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             self.settle();
+            self.settle_quiet();
             if self.quota_waiting() {
                 continue;
             }
@@ -787,6 +793,57 @@ impl<H: Harness + 'static> Session<H> {
                 break;
             }
             self.settled = seq;
+        }
+    }
+
+    /// A harness that never closes its turn records a finished message with no
+    /// token counts once its turn stands still. The answer is already on the
+    /// harness, so the message counts as done.
+    fn settle_quiet(&mut self) {
+        let Some(delivery) = self.delivery.as_ref() else {
+            return;
+        };
+        if delivery.harness().ends_on_quiet().is_none() {
+            return;
+        }
+        let Ok(accepted) = delivery.store().accepted_cursor(&self.id) else {
+            return;
+        };
+        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
+            return;
+        };
+        if accepted <= processed {
+            return;
+        }
+        let Ok(messages) = delivery.store().inbox(&self.id, Some(processed)) else {
+            return;
+        };
+        // An answer is not asked of the harness again, so it never holds the turn.
+        let Some(open) = messages
+            .into_iter()
+            .find(|message| message.seq > processed && message.reply_to.is_none())
+        else {
+            return;
+        };
+        if !delivery.harness().quiet_for(
+            open.id.as_str(),
+            ANSWER_QUIET,
+            ANSWER_PATIENCE,
+        ) {
+            return;
+        }
+        // The answer is the reply; then the message itself is done.
+        let agent = self.agent.clone();
+        if let Some(delivery) = self.delivery.as_ref() {
+            let _ = delivery.record_answer(&agent);
+        }
+        // A second loop in the same store may already have settled it.
+        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
+            return;
+        };
+        if open.seq > processed {
+            self.settled = open.seq;
+            self.mark_processed(open.seq);
         }
     }
 

@@ -15,8 +15,10 @@ use clap::{Parser, Subcommand};
 
 mod api;
 mod create;
+mod fake_opencode;
 mod mcp;
 mod mcp_config;
+mod opencode_config;
 mod server;
 mod signin;
 mod telegram;
@@ -90,6 +92,10 @@ enum Command {
         #[arg(long)]
         agent: String,
     },
+    /// Test double for a streaming vendor. It prints text and no result line,
+    /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
+    #[command(hide = true)]
+    FakeOpencode,
     /// Record a channel. The secret is copied into the credential store.
     Channels {
         #[command(subcommand)]
@@ -159,6 +165,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             }
         },
         Command::Mcp { agent } => mcp::run(&cli.data, &agent),
+        Command::FakeOpencode => fake_opencode::run(),
         Command::Agents { action } => agents(&cli.data, action),
         Command::Send {
             to,
