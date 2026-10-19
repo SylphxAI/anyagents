@@ -20,6 +20,7 @@ mod mcp;
 mod mcp_config;
 mod opencode_config;
 mod server;
+mod signin;
 mod telegram;
 mod vendor;
 
@@ -42,6 +43,16 @@ struct Cli {
 enum Command {
     /// Run the server.
     Serve,
+    /// Sign an agent's harness in through the vendor's own command.
+    SignIn {
+        /// The agent name.
+        agent: String,
+    },
+    /// Harness catalog: what can be signed in, and what installs it.
+    Harnesses {
+        #[command(subcommand)]
+        action: HarnessesCommand,
+    },
     /// Create and list agents.
     Agents {
         #[command(subcommand)]
@@ -93,6 +104,12 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum HarnessesCommand {
+    /// List the harnesses this client can sign in. Prints no credential.
+    List,
+}
+
+#[derive(Subcommand)]
 enum ChannelsCommand {
     /// Copy a token and record the channel that uses it.
     Add {
@@ -140,6 +157,13 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     match cli.command {
         Command::Serve => server::run(&cli.data),
+        Command::SignIn { agent } => sign_in(&cli.data, &agent),
+        Command::Harnesses { action } => match action {
+            HarnessesCommand::List => {
+                list_harnesses();
+                Ok(())
+            }
+        },
         Command::Mcp { agent } => mcp::run(&cli.data, &agent),
         Command::FakeOpencode => fake_opencode::run(),
         Command::Agents { action } => agents(&cli.data, action),
@@ -163,6 +187,40 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Usage { agent, by } => usage(&cli.data, agent.as_deref(), by.as_deref()),
         Command::Channels { action } => channels(&cli.data, action),
     }
+}
+
+/// Print the catalog: id, the variable that points the vendor at its private
+/// config directory, and the command that installs it. Never a credential.
+fn list_harnesses() {
+    for entry in anyagents_installer::builtin_catalog() {
+        println!(
+            "{}\t{}\t{}",
+            entry.id,
+            signin::config_variable(&entry.id).unwrap_or("-"),
+            signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
+        );
+    }
+}
+
+/// The installer's sign-in, run against the agent's own config directory. This
+/// command reads no socket, so it works before the server is up and while it is
+/// restarting a harness that is signed out.
+fn sign_in(data: &Path, agent: &str) -> Result<(), anyagents_core::Error> {
+    let mut runner = signin::ProcessRunner;
+    let mut sink = signin::TerminalSink;
+    let outcome = signin::sign_in_agent(data, agent, &mut runner, &mut sink)?;
+    let harness = open(data)?.agent_by_name(agent)?.harness;
+    if !outcome.signed_in {
+        let hint = signin::install_hint(&harness).unwrap_or_else(|| "-".to_string());
+        return Err(anyagents_core::Error::Message(format!(
+            "{agent} is not signed in: the vendor command finished without reporting a sign-in (install: {hint})"
+        )));
+    }
+    println!(
+        "signed in\t{agent}\t{harness}\t{}",
+        outcome.account.as_deref().unwrap_or("-")
+    );
+    Ok(())
 }
 
 fn channels(data: &Path, action: ChannelsCommand) -> Result<(), anyagents_core::Error> {
