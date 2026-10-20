@@ -15,9 +15,9 @@ use anyagents_harness_opencode::OpenCodeHarness;
 use anyagents_supervisor::LaunchRequest;
 
 pub enum VendorHarness {
-    Claude(ClaudeHarness),
-    Codex(CodexHarness),
-    OpenCode(OpenCodeHarness),
+    Claude(Box<ClaudeHarness>),
+    Codex(Box<CodexHarness>),
+    OpenCode(Box<OpenCodeHarness>),
 }
 
 pub fn child_env() -> Vec<(String, String)> {
@@ -52,7 +52,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             Some(&request.work_dir),
         )
         .map_err(|err| err.to_string())?;
-        Ok(VendorHarness::OpenCode(harness))
+        Ok(VendorHarness::OpenCode(Box::new(harness)))
     } else if request.agent.harness == "codex" {
         env.push((
             "CODEX_HOME".to_string(),
@@ -60,7 +60,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         ));
         let program = std::env::var("ANYAGENTS_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
         let harness = start_codex(&program, &env, &request.work_dir)?;
-        Ok(VendorHarness::Codex(harness))
+        Ok(VendorHarness::Codex(Box::new(harness)))
     } else {
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
@@ -69,7 +69,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         let program =
             std::env::var("ANYAGENTS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
         let harness = start_claude(&program, &env, &request.work_dir)?;
-        Ok(VendorHarness::Claude(harness))
+        Ok(VendorHarness::Claude(Box::new(harness)))
     }
 }
 

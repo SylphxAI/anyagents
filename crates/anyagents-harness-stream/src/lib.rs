@@ -1,12 +1,12 @@
-//! One long-lived vendor child that speaks one JSON object per line.
+//! One long-lived child from a catalog entry, and the line protocol it speaks.
 //!
-//! The adapter decides what a line means. This crate owns the process: spawning
-//! it, writing a line, reading lines, remembering which mailbox ids were written,
-//! and finishing the open turn when the adapter says a line is a result.
-//!
-//! An id already written, or found in any text the child sends back, is not
-//! written again. A message written while a turn is open waits, and the next
-//! result promotes it. That is followup.
+//! A stream harness is data: its program name, the arguments that resume or
+//! start it, the line that carries a message, and what a printed line means.
+//! This module holds that data in [`StreamSpec`] and the process in
+//! [`StreamHarness`], so a new followup harness is a catalog entry rather than a
+//! copied adapter. The mailbox id is the first line of the user text
+//! (`anyagents-message:<id>`); an id already written, or echoed back, is not
+//! written again.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -18,11 +18,12 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, HarnessError, HarnessHealth, OutboundMessage, SteerSupport,
-    TurnState, TurnUsage, message_id_in_text,
+    TurnState, TurnUsage, marked_message, message_id_in_text,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 
-/// What an adapter does with one line the child printed.
+/// What one printed line means to the turn it belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineEffect {
     /// This line closes the open turn.
     pub finishes_turn: bool,
@@ -36,9 +37,127 @@ pub struct LineEffect {
     pub text: Option<String>,
 }
 
+/// What a vendor child prints, and how it is started again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LineProtocol {
+    /// `result` closes the turn and reports usage but no cost.
+    Result,
+    /// `done` closes the turn and reports usage but no cost.
+    Done,
+    /// `result` closes the turn with usage and an optional `cost_micros`; a
+    /// `text` line is answer text.
+    ResultWithCost,
+}
+
+/// One harness's catalog entry, as the launch needs it.
+#[derive(Clone, Debug)]
+pub struct StreamSpec {
+    /// Thread and process name, unique per harness.
+    pub name: String,
+    /// Arguments before the resume flag. `None` means the program takes no
+    /// arguments until it resumes.
+    pub args: Vec<String>,
+    /// The flag that carries a session id, and the line that starts a turn.
+    pub resume_flag: &'static str,
+    pub start_line: &'static str,
+    pub cancel: &'static str,
+    pub protocol: LineProtocol,
+}
+
+impl StreamSpec {
+    /// The catalog entry for `program`, a followup harness whose fields a real
+    /// session still has to confirm.
+    pub fn for_program(program: &str) -> Self {
+        match program {
+            "agy" => Self {
+                name: "anyagents-agy".to_string(),
+                args: vec!["--output-format".to_string(), "stream-json".to_string()],
+                resume_flag: "--resume",
+                start_line: "user",
+                cancel: "interrupt",
+                protocol: LineProtocol::Result,
+            },
+            "opencode" => Self {
+                name: "anyagents-opencode".to_string(),
+                args: vec!["serve".to_string()],
+                resume_flag: "--session",
+                start_line: "prompt",
+                cancel: "cancel",
+                protocol: LineProtocol::ResultWithCost,
+            },
+            _ => Self {
+                name: format!("anyagents-{program}"),
+                args: Vec::new(),
+                resume_flag: "--session",
+                start_line: "user",
+                cancel: "cancel",
+                protocol: LineProtocol::Done,
+            },
+        }
+    }
+
+    fn resume_args(&self, session: Option<&str>) -> Vec<String> {
+        let mut args = self.args.clone();
+        if let Some(id) = session {
+            args.push(self.resume_flag.to_string());
+            args.push(id.to_string());
+        }
+        args
+    }
+
+    fn effect(&self, value: &Value) -> LineEffect {
+        let kind = value.get("type").and_then(Value::as_str);
+        let finishes = match self.protocol {
+            LineProtocol::Result | LineProtocol::ResultWithCost => kind == Some("result"),
+            LineProtocol::Done => kind == Some("done"),
+        };
+        LineEffect {
+            finishes_turn: finishes,
+            session_id: value
+                .get("session_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            usage: finishes.then(|| self.usage_of(value)),
+            quota_reset_at_ms: quota_of(value),
+            text: self.text_of(value, finishes),
+        }
+    }
+
+    fn usage_of(&self, value: &Value) -> TurnUsage {
+        let usage = value.get("usage");
+        TurnUsage {
+            input_tokens: number(usage, "input_tokens"),
+            output_tokens: number(usage, "output_tokens"),
+            cache_read_tokens: number(usage, "cache_read_tokens"),
+            cache_write_tokens: number(usage, "cache_write_tokens"),
+            reported_cost_micros: match self.protocol {
+                LineProtocol::ResultWithCost => value.get("cost_micros").and_then(Value::as_i64),
+                _ => None,
+            },
+        }
+    }
+
+    /// Only a vendor that streams an answer without a closing result line has
+    /// answer text: a `text` line, or the text on the closing line itself.
+    fn text_of(&self, value: &Value, finishes: bool) -> Option<String> {
+        if self.protocol != LineProtocol::ResultWithCost {
+            return None;
+        }
+        let kind = value.get("type").and_then(Value::as_str);
+        if !(finishes || kind == Some("text")) {
+            return None;
+        }
+        value
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    }
+}
+
 /// How to start one vendor child.
 pub struct Launch {
-    pub name: String,
+    pub spec: StreamSpec,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub environment: Vec<(String, String)>,
@@ -46,12 +165,11 @@ pub struct Launch {
     pub session_id: Option<String>,
     pub mode: DeliveryMode,
     pub steer: SteerSupport,
-    pub on_line: Arc<dyn Fn(&Value) -> LineEffect + Send + Sync>,
 }
 
 /// One vendor child.
 pub struct StreamHarness {
-    name: String,
+    spec: StreamSpec,
     program: PathBuf,
     args: Vec<String>,
     environment: Vec<(String, String)>,
@@ -62,7 +180,6 @@ pub struct StreamHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
-    on_line: Arc<dyn Fn(&Value) -> LineEffect + Send + Sync>,
 }
 
 /// Shared by every harness over one child: the owner and any reader.
@@ -88,11 +205,10 @@ struct State {
 impl StreamHarness {
     /// Spawn the child described by `launch` and start reading its stdout.
     ///
-    /// `on_line` runs on the reader thread for every JSON line. It must not call
-    /// back into this harness.
+    /// The spec's protocol runs on the reader thread for every JSON line.
     pub fn launch(launch: Launch) -> Result<Self, HarnessError> {
         let mut harness = Self {
-            name: launch.name,
+            spec: launch.spec,
             program: launch.program,
             args: launch.args,
             environment: launch.environment,
@@ -103,10 +219,30 @@ impl StreamHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
-            on_line: launch.on_line,
         };
         harness.spawn()?;
         Ok(harness)
+    }
+
+    /// Start a child for `program` from the catalog, reading its answers under
+    /// `spec`.
+    pub fn open(
+        spec: StreamSpec,
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: Vec<(String, String)>,
+    ) -> Result<Self, HarnessError> {
+        let args = spec.resume_args(session_id);
+        Self::launch(Launch {
+            spec,
+            program: program.into(),
+            args,
+            environment,
+            work_dir: None,
+            session_id: session_id.map(str::to_string),
+            mode: DeliveryMode::Followup,
+            steer: SteerSupport::Unproven,
+        })
     }
 
     pub fn program(&self) -> &Path {
@@ -245,8 +381,8 @@ impl StreamHarness {
         }
     }
 
-    /// Restart the child with `command` when the session changed or it has exited.
-    pub fn resume(&mut self, session: &str, mut command: Command) -> Result<(), HarnessError> {
+    /// Restart the child when the session changed or it has exited.
+    pub fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
         let same = {
             let state = lock(&self.shared);
             state.alive && state.session_id.as_deref() == Some(session)
@@ -255,22 +391,9 @@ impl StreamHarness {
             return Ok(());
         }
         self.stop_child();
-        self.args = command
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if let Some(dir) = &self.work_dir {
-            command.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            command.env(key, value);
-        }
+        self.args = self.spec.resume_args(Some(session));
         lock(&self.shared).session_id = Some(session.to_string());
-        self.spawn_command(command)
+        self.spawn()
     }
 
     /// Write `line` and drop the open turn. The vendor decides what the line means.
@@ -317,7 +440,7 @@ impl StreamHarness {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
         let _ = thread::Builder::new()
-            .name(format!("{}-watch", self.name))
+            .name(format!("{}-watch", self.spec.name))
             .spawn(move || {
                 let mut state = lock(&shared);
                 let mut seen = 0u64;
@@ -342,10 +465,6 @@ impl StreamHarness {
     fn spawn(&mut self) -> Result<(), HarnessError> {
         let mut command = Command::new(&self.program);
         command.args(&self.args);
-        self.spawn_command(command)
-    }
-
-    fn spawn_command(&mut self, mut command: Command) -> Result<(), HarnessError> {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -380,10 +499,10 @@ impl StreamHarness {
         *lock(&self.stdin) = Some(child_stdin);
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
-        let on_line = Arc::clone(&self.on_line);
+        let spec = self.spec.clone();
         match thread::Builder::new()
-            .name(self.name.clone())
-            .spawn(move || read_stdout(stdout, shared, wake, on_line))
+            .name(spec.name.clone())
+            .spawn(move || read_stdout(stdout, shared, wake, spec))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
@@ -471,7 +590,7 @@ fn read_stdout(
     stdout: ChildStdout,
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
-    on_line: Arc<dyn Fn(&Value) -> LineEffect + Send + Sync>,
+    spec: StreamSpec,
 ) {
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
@@ -481,7 +600,7 @@ fn read_stdout(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let effect = on_line(&value);
+        let effect = spec.effect(&value);
         {
             let mut state = lock(&shared);
             note_markers(&mut state, &value);
@@ -586,3 +705,33 @@ fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Resu
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
 }
+
+fn number(value: Option<&Value>, key: &str) -> u64 {
+    value
+        .and_then(|item| item.get(key))
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn quota_of(value: &Value) -> Option<i64> {
+    if value.get("type").and_then(Value::as_str) != Some("rate_limit") {
+        return None;
+    }
+    value.get("resets_at_ms").and_then(Value::as_i64)
+}
+
+/// The line that puts one message into the child.
+pub fn message_line(spec: &StreamSpec, message: &OutboundMessage) -> Value {
+    json!({
+        "type": spec.start_line,
+        "text": marked_message(&message.id, &message.text)
+    })
+}
+
+/// The line that stops the current turn.
+pub fn cancel_line(spec: &StreamSpec) -> Value {
+    json!({"type": spec.cancel})
+}
+
+#[cfg(test)]
+mod tests;

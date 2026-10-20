@@ -7,7 +7,6 @@ rust-version = "1.98"
 description = "Server, command line, and MCP entry point for long-lived coding agents"
 
 [dependencies]
-anyagents-agent = { path = "../anyagents-agent" }
 anyagents-channel-telegram = { path = "../anyagents-channel-telegram" }
 anyagents-core = { path = "../anyagents-core" }
 anyagents-harness = { path = "../anyagents-harness" }

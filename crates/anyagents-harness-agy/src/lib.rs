@@ -1,27 +1,19 @@
-//! Antigravity adapter.
+//! Spec: `docs/vision.md` "First version" item 2 (any harness through one
+//! adapter contract) and the architecture head "Lazy harness setup".
 //!
-//! One child runs `agy` with stream-json on stdin and stdout, and stays up for
-//! the life of the agent. The mailbox id is the first line of the user text
-//! (`anyagents-message:<id>`). An id already written, or echoed back, is not
-//! written again.
-//!
-//! Declared delivery mode is followup. Steer support is unproven. A `result`
-//! event closes the open turn and keeps the token counts it carries.
-//!
-//! Resume starts the child again with `--resume`. Cancel writes
-//! `{"type":"interrupt"}`.
+//! The Antigravity harness is one catalog entry, not a copied adapter: this
+//! crate is the thin name the supervisor starts it by. Its launch shape, closing
+//! line and usage come from `StreamSpec::for_program("agy")`.
 
 use std::path::PathBuf;
-use std::process::Command;
-use std::sync::Arc;
 
-use anyagents_harness::{DeliveryMode, SteerSupport, marked_message};
-use anyagents_harness_stream::{Launch, LineEffect, StreamHarness};
-use serde_json::{Value, json};
+use anyagents_harness::{DeliverOutcome, Harness, HarnessError, HarnessHealth, TurnUsage};
+use anyagents_harness_stream::{StreamHarness, StreamSpec, cancel_line, message_line};
 
 /// One long-lived Antigravity child.
 pub struct AgyHarness {
     inner: StreamHarness,
+    spec: StreamSpec,
 }
 
 impl AgyHarness {
@@ -33,25 +25,14 @@ impl AgyHarness {
         program: impl Into<PathBuf>,
         session_id: Option<&str>,
         environment: &[(&str, &str)],
-    ) -> Result<Self, anyagents_harness::HarnessError> {
-        let mut args = vec!["--output-format".to_string(), "stream-json".to_string()];
-        if let Some(id) = session_id {
-            args.push("--resume".to_string());
-            args.push(id.to_string());
-        }
-        Ok(Self {
-            inner: StreamHarness::launch(Launch {
-                name: "anyagents-agy".to_string(),
-                program: program.into(),
-                args,
-                environment: owned_env(environment),
-                work_dir: None,
-                session_id: session_id.map(str::to_string),
-                mode: DeliveryMode::Followup,
-                steer: SteerSupport::Unproven,
-                on_line: Arc::new(read_line),
-            })?,
-        })
+    ) -> Result<Self, HarnessError> {
+        let environment = environment
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let spec = StreamSpec::for_program("agy");
+        let inner = StreamHarness::open(spec.clone(), program, session_id, environment)?;
+        Ok(Self { inner, spec })
     }
 
     pub fn written_ids(&self) -> Vec<String> {
@@ -75,91 +56,33 @@ impl AgyHarness {
     pub fn wait_seen(&self, id: &str, timeout: std::time::Duration) -> bool {
         self.inner.wait_seen(id, timeout)
     }
-}
-
-impl anyagents_harness::Harness for AgyHarness {
-    fn deliver(
-        &mut self,
-        message: &anyagents_harness::OutboundMessage,
-    ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
-        let line = json!({
-            "type": "user",
-            "text": marked_message(&message.id, &message.text)
-        });
-        self.inner.deliver(message, &line)
-    }
-
-    fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
-        self.inner.background()
-    }
-
-    fn resume(&mut self, session: &str) -> Result<(), anyagents_harness::HarnessError> {
-        let mut command = Command::new(self.inner.program());
-        command
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--resume")
-            .arg(session);
-        self.inner.resume(session, command)
-    }
-
-    fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
-        self.inner.cancel(&json!({"type": "interrupt"}))
-    }
-
-    fn health(&self) -> anyagents_harness::HarnessHealth {
-        self.inner.health()
-    }
-}
-
-impl AgyHarness {
-    pub fn usage_for(&self, id: &str) -> Option<anyagents_harness::TurnUsage> {
+    pub fn usage_for(&self, id: &str) -> Option<TurnUsage> {
         self.inner.usage_for(id)
     }
 }
 
-fn owned_env(environment: &[(&str, &str)]) -> Vec<(String, String)> {
-    environment
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-fn read_line(value: &Value) -> LineEffect {
-    let is_result = value.get("type").and_then(Value::as_str) == Some("result");
-    LineEffect {
-        finishes_turn: is_result,
-        session_id: value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        usage: is_result.then(|| usage_of(value)),
-        quota_reset_at_ms: quota_of(value),
-        text: None,
+impl Harness for AgyHarness {
+    fn deliver(
+        &mut self,
+        message: &anyagents_harness::OutboundMessage,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        self.inner
+            .deliver(message, &message_line(&self.spec, message))
     }
-}
 
-fn usage_of(value: &Value) -> anyagents_harness::TurnUsage {
-    let usage = value.get("usage");
-    anyagents_harness::TurnUsage {
-        input_tokens: number(usage, "input_tokens"),
-        output_tokens: number(usage, "output_tokens"),
-        cache_read_tokens: number(usage, "cache_read_tokens"),
-        cache_write_tokens: number(usage, "cache_write_tokens"),
-        reported_cost_micros: None,
+    fn background(&mut self) -> Result<(), HarnessError> {
+        self.inner.background()
     }
-}
 
-fn number(value: Option<&Value>, key: &str) -> u64 {
-    value
-        .and_then(|item| item.get(key))
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-}
-
-fn quota_of(value: &Value) -> Option<i64> {
-    if value.get("type").and_then(Value::as_str) != Some("rate_limit") {
-        return None;
+    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+        self.inner.resume(session)
     }
-    value.get("resets_at_ms").and_then(Value::as_i64)
+
+    fn cancel(&mut self) -> Result<(), HarnessError> {
+        self.inner.cancel(&cancel_line(&self.spec))
+    }
+
+    fn health(&self) -> HarnessHealth {
+        self.inner.health()
+    }
 }
