@@ -52,6 +52,10 @@ pub struct MessageView {
     pub source_time_ms: Option<i64>,
     pub received_at_ms: i64,
     pub ack: String,
+    /// Why the last turn on this message failed, when it did. The message stays
+    /// accepted and is offered to the next turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_reason: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

@@ -32,6 +32,8 @@ pub struct LineEffect {
     pub usage: Option<TurnUsage>,
     /// A rate limit with a reset time, in epoch milliseconds.
     pub quota_reset_at_ms: Option<i64>,
+    /// Answer text for the open turn, when this line carries some.
+    pub text: Option<String>,
 }
 
 /// How to start one vendor child.
@@ -63,6 +65,7 @@ pub struct StreamHarness {
     on_line: Arc<dyn Fn(&Value) -> LineEffect + Send + Sync>,
 }
 
+/// Shared by every harness over one child: the owner and any reader.
 struct State {
     child: Option<Child>,
     alive: bool,
@@ -76,6 +79,10 @@ struct State {
     quota_reset_at_ms: Option<i64>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
+    /// The text lines of the open turn so far, and the id they were read under.
+    text: Option<(String, Vec<String>)>,
+    /// The last open turn ended on quiet rather than on a result line.
+    finished_quiet: HashSet<String>,
 }
 
 impl StreamHarness {
@@ -128,6 +135,11 @@ impl StreamHarness {
             .map(|(_, usage)| usage.clone())
     }
 
+    /// The last open turn for `id` ended on quiet, not on a result line.
+    pub fn finished_quiet(&self, id: &str) -> bool {
+        lock(&self.shared).finished_quiet.contains(id)
+    }
+
     pub fn wait_finished(&self, id: &str, timeout: Duration) -> bool {
         self.wait_pred(timeout, |state| state.finished.contains(id))
     }
@@ -140,6 +152,33 @@ impl StreamHarness {
         self.wait_pred(timeout, |state| state.seen.contains(id))
     }
 
+    /// No line has arrived for `quiet` and the process is up. Gives up after
+    /// `patience` and when the child exits.
+    pub fn quiet(&self, quiet: Duration, patience: Duration) -> bool {
+        let deadline = Instant::now() + patience;
+        loop {
+            let epoch = lock(&self.shared).epoch;
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let state = lock(&self.shared);
+            let (state, _) = self
+                .wake
+                .wait_timeout_while(state, quiet.min(deadline - now), |state| state.epoch == epoch)
+                .unwrap_or_else(|err| err.into_inner());
+            if state.alive && state.epoch == epoch {
+                let mut state = state;
+                finish_open_quiet(&mut state);
+                self.wake.notify_all();
+                return true;
+            }
+            if !state.alive {
+                return false;
+            }
+        }
+    }
+
     pub fn wait_quota(&self, timeout: Duration) -> Option<i64> {
         let mut found = None;
         self.wait_pred(timeout, |state| {
@@ -147,6 +186,17 @@ impl StreamHarness {
             found.is_some()
         });
         found
+    }
+
+    /// The text lines the adapter attached to `id`, joined. The turn may still
+    /// be open, so the answer may still grow.
+    pub fn text_for(&self, id: &str) -> Option<String> {
+        let state = lock(&self.shared);
+        state
+            .text
+            .as_ref()
+            .filter(|(owner, _)| owner == id)
+            .map(|(_, lines)| lines.join("\n"))
     }
 
     /// Write one line for `message`, unless that id was already written or echoed.
@@ -323,6 +373,7 @@ impl StreamHarness {
             state.alive = true;
             state.open.clear();
             state.followups.clear();
+            state.text = None;
         }
         *lock(&self.stdin) = Some(child_stdin);
         let shared = Arc::clone(&self.shared);
@@ -360,6 +411,7 @@ impl StreamHarness {
         }
         state.open.clear();
         state.followups.clear();
+        state.text = None;
         state.alive = false;
     }
 
@@ -407,6 +459,8 @@ impl State {
             quota_reset_at_ms: None,
             session_id: session_id.map(str::to_string),
             usages: Vec::new(),
+            text: None,
+            finished_quiet: HashSet::new(),
         }
     }
 }
@@ -437,6 +491,14 @@ fn read_stdout(
             {
                 state.session_id = Some(session_id);
             }
+            if let Some(text) = effect.text
+                && let Some(id) = state.open.first().cloned()
+            {
+                match &mut state.text {
+                    Some((owner, lines)) if *owner == id => lines.push(text),
+                    other => *other = Some((id, vec![text])),
+                }
+            }
             if effect.finishes_turn {
                 finish_open(&mut state, effect.usage.unwrap_or_default());
             }
@@ -450,6 +512,29 @@ fn read_stdout(
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();
+}
+
+/// A harness that streams without a closing result line ends its turn here:
+/// the open message is finished with the text seen so far and no usage.
+fn finish_open_quiet(state: &mut State) {
+    let Some((id, _)) = state.text.clone() else {
+        return;
+    };
+    // A turn that steers in a followup is not over until the vendor says so.
+    if !state.open.first().is_some_and(|owner| owner == &id) || !state.followups.is_empty() {
+        return;
+    }
+    state.finished_quiet.insert(id.clone());
+    id_for_quiet(state, &id);
+}
+
+/// Finish the open message with no usage of its own, keeping its last text.
+fn id_for_quiet(state: &mut State, id: &str) {
+    let text = state.text.clone();
+    state.open.clear();
+    state.followups.clear();
+    state.finished.insert(id.to_string());
+    state.text = text;
 }
 
 fn finish_open(state: &mut State, usage: TurnUsage) {

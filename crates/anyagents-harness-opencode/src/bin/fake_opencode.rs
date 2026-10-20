@@ -1,7 +1,9 @@
 //! Speaks just enough of the OpenCode serve line protocol for the adapter tests.
 //!
-//! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `quota`, `echo`.
-//! `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin.
+//! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `quota`, `echo`,
+//! `stream`. `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin. A test
+//! that starts this program through a symlink gets `<link path>.log` instead,
+//! so it can use `env!` for one binary and still start a real process.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -14,7 +16,7 @@ const ECHO: &str = r#"{"type":"prompt","text":"anyagents-message:echoed\nprior"}
 
 fn main() {
     let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_else(|_| "hold".into());
-    let log_path = env::var_os("ANYAGENTS_FAKE_LOG").map(PathBuf::from);
+    let log_path = log_path();
     log(
         &log_path,
         &format!("argv:{}", env::args().skip(1).collect::<Vec<_>>().join(" ")),
@@ -31,10 +33,33 @@ fn main() {
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         log(&log_path, &line);
-        if mode == "finish" && line.contains("\"type\":\"prompt\"") {
-            let _ = writeln!(stdout, "{RESULT}");
-            let _ = stdout.flush();
+        match mode.as_str() {
+            "finish" if line.contains("\"type\":\"prompt\"") => {
+                let _ = writeln!(stdout, "{RESULT}");
+                let _ = stdout.flush();
+            }
+            // Text only, and no closing result line, as a streaming vendor does.
+            "stream" if line.contains("\"type\":\"prompt\"") => {
+                let _ = writeln!(
+                    stdout,
+                    r#"{{"type":"text","session_id":"sess-1","text":"pong"}}"#
+                );
+                let _ = stdout.flush();
+            }
+            _ => {}
         }
+    }
+}
+
+/// `ANYAGENTS_FAKE_LOG`, or beside a symlinked name for this program.
+fn log_path() -> Option<PathBuf> {
+    if let Some(path) = env::var_os("ANYAGENTS_FAKE_LOG").map(PathBuf::from) {
+        return Some(path);
+    }
+    let exe = env::current_exe().ok()?;
+    match std::fs::read_link(&exe) {
+        Ok(link) => Some(link.with_extension("log")),
+        Err(_) => None,
     }
 }
 

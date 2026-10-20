@@ -21,3 +21,7 @@ tempfile = "3"
 [[bin]]
 name = "scripted_claude"
 path = "../anyagents-harness-claude/src/bin/fake_claude.rs"
+
+[[bin]]
+name = "fails_once"
+path = "src/bin/fails_once.rs"

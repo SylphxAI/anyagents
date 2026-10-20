@@ -1,8 +1,8 @@
 //! Delivery loop. It hands each message past the accepted cursor to the harness,
 //! in sequence order, and moves the cursors only after the harness answers.
 
-use anyagents_core::{AgentId, Message, Store};
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage};
+use anyagents_core::{Agent, AgentId, Incoming, Message, Store};
+use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, message_id_in_text};
 
 pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
 
@@ -64,6 +64,20 @@ pub struct DeliveryLoop<H: Harness> {
     quota_reset_at_ms: Option<i64>,
 }
 
+/// The vendor echoes the marked prompt as the first line. The marker line is
+/// not part of the answer.
+fn answer_text(text: &str) -> String {
+    let mut lines = text.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    if message_id_in_text(first).is_some() {
+        lines.collect::<Vec<_>>().join("\n").trim().to_string()
+    } else {
+        text.trim().to_string()
+    }
+}
+
 impl<H: Harness> DeliveryLoop<H> {
     /// Take the per-agent lock and refuse a second loop for the same agent.
     pub fn start(store: Store, agent_id: AgentId, harness: H) -> Result<Self, Error> {
@@ -111,6 +125,8 @@ impl<H: Harness> DeliveryLoop<H> {
             match self.harness.deliver(&outbound(&message)) {
                 Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store
+                        .note_handover(&self.agent_id, seq, turn_finished)?;
+                    self.store
                         .note_delivery(&self.agent_id, seq, turn_finished)?;
                     accepted += 1;
                     if turn_finished {
@@ -129,8 +145,49 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
+    /// Record the harness's latest answer to the first message past the
+    /// processed cursor, as a reply from the agent. A repeated answer is one row.
+    pub fn record_answer(&self, agent: &Agent) -> Result<(), Error> {
+        let seq = self.store.processed_cursor(&self.agent_id)?;
+        let Some(message) = self
+            .store
+            .inbox(&self.agent_id, Some(seq))?
+            .into_iter()
+            .find(|message| message.seq > seq && message.reply_to.is_none())
+        else {
+            return Ok(());
+        };
+        let Some(text) = self.harness.answer_for(message.id.as_str()) else {
+            return Ok(());
+        };
+        let text = answer_text(&text);
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.store.receive(
+            &self.agent_id,
+            Incoming {
+                text,
+                sender: Some(format!("agent:{}", agent.name)),
+                source_time_ms: None,
+                source_key: Some(format!("answer:{}", message.id)),
+                reply_to: Some(message.id.to_string()),
+                received_at_ms: None,
+            },
+        )?;
+        Ok(())
+    }
+
     pub fn mark_processed_through(&self, seq: i64) -> Result<(), Error> {
         self.store.advance_processed_through(&self.agent_id, seq)?;
+        self.store.clear_failed_turns(&self.agent_id, seq)?;
+        Ok(())
+    }
+
+    /// Record that the turn ending at `seq` failed. The processed cursor stays.
+    pub fn record_failed_turn(&self, seq: i64, reason: &str) -> Result<(), Error> {
+        self.store
+            .record_failed_turn(&self.agent_id, seq, reason, anyagents_core::now_ms())?;
         Ok(())
     }
 
@@ -152,6 +209,27 @@ impl<H: Harness> DeliveryLoop<H> {
     /// Drop the store and the lock, keeping the harness so a restarted loop can dedupe.
     pub fn into_harness(self) -> H {
         self.harness
+    }
+
+    /// The ids the harness has taken and whose turn has not finished.
+    pub fn pending_ids(&self) -> Vec<String> {
+        let Ok(accepted) = self.store.accepted_cursor(&self.agent_id) else {
+            return Vec::new();
+        };
+        let Ok(messages) = self.store.inbox(&self.agent_id, None) else {
+            return Vec::new();
+        };
+        messages
+            .into_iter()
+            .filter(|message| {
+                message.seq <= accepted && message.ack != anyagents_core::Ack::Processed
+            })
+            .map(|message| message.id.as_str().to_string())
+            .collect()
+    }
+
+    pub fn agent_id(&self) -> AgentId {
+        self.agent_id.clone()
     }
 
     pub fn harness(&self) -> &H {

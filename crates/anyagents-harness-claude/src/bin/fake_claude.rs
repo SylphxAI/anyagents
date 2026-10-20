@@ -1,7 +1,7 @@
 //! Speaks just enough stream-json for the adapter tests.
 //!
 //! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `batch`, `quota`,
-//! `echo`, or `die`. `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin.
+//! `echo`, `failed_turn`, or `die`. `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 const RESULT: &str = r#"{"type":"result","subtype":"success","session_id":"sess-from-vendor","total_cost_usd":0.5,"usage":{"input_tokens":11,"output_tokens":7,"cache_read_input_tokens":3,"cache_creation_input_tokens":2}}"#;
 const QUOTA: &str = r#"{"type":"system","subtype":"api_retry","category":"rate_limit","resets_at_ms":1700000000000}"#;
+const FAILED: &str = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"sess-from-vendor","result":"Invalid API key · Please run /login","usage":{"input_tokens":0,"output_tokens":0}}"#;
 const ECHO: &str = r#"{"type":"user","message":{"role":"user","content":[{"type":"text","text":"anyagents-message:echoed\nprior"}]}}"#;
 
 fn main() {
@@ -41,6 +42,10 @@ fn main() {
         users += 1;
         if mode == "finish" || (mode == "batch" && users == 2) {
             let _ = writeln!(stdout, "{RESULT}");
+            let _ = stdout.flush();
+        }
+        if mode == "failed_turn" && users == 1 {
+            let _ = writeln!(stdout, "{FAILED}");
             let _ = stdout.flush();
         }
         if mode == "finish" && users == 1 {
