@@ -106,11 +106,7 @@ impl OpenCodeHarness {
     }
     /// Wait `quiet` with no line from the child. A quiet turn the child never
     /// closed is finished when the answer stands still.
-    pub fn wait_quiet(
-        &self,
-        quiet: std::time::Duration,
-        patience: std::time::Duration,
-    ) -> bool {
+    pub fn wait_quiet(&self, quiet: std::time::Duration, patience: std::time::Duration) -> bool {
         self.inner.quiet(quiet, patience)
     }
     /// The turn for `id` ended on quiet, not on a result line.
@@ -157,7 +153,12 @@ impl anyagents_harness::Harness for OpenCodeHarness {
         Some(std::time::Duration::from_millis(500))
     }
 
-    fn quiet_for(&self, _id: &str, quiet: std::time::Duration, patience: std::time::Duration) -> bool {
+    fn quiet_for(
+        &self,
+        _id: &str,
+        quiet: std::time::Duration,
+        patience: std::time::Duration,
+    ) -> bool {
         self.wait_quiet(quiet, patience)
     }
 

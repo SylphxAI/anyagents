@@ -165,7 +165,9 @@ impl StreamHarness {
             let state = lock(&self.shared);
             let (state, _) = self
                 .wake
-                .wait_timeout_while(state, quiet.min(deadline - now), |state| state.epoch == epoch)
+                .wait_timeout_while(state, quiet.min(deadline - now), |state| {
+                    state.epoch == epoch
+                })
                 .unwrap_or_else(|err| err.into_inner());
             if state.alive && state.epoch == epoch {
                 let mut state = state;

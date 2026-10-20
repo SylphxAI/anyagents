@@ -17,7 +17,10 @@ pub struct CreateRequest {
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
-    if !matches!(request.harness.as_str(), "claude-code" | "codex" | "opencode") {
+    if !matches!(
+        request.harness.as_str(),
+        "claude-code" | "codex" | "opencode"
+    ) {
         return Err(Error::Message(format!(
             "unknown harness: {}",
             request.harness

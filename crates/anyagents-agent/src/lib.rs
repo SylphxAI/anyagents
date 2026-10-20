@@ -2,7 +2,9 @@
 //! in sequence order, and moves the cursors only after the harness answers.
 
 use anyagents_core::{Agent, AgentId, Incoming, Message, Store};
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, message_id_in_text};
+use anyagents_harness::{
+    DeliverOutcome, Harness, HarnessError, OutboundMessage, message_id_in_text,
+};
 
 pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
 
