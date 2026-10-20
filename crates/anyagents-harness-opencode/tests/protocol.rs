@@ -131,3 +131,34 @@ fn the_message_id_is_the_first_line_of_the_prompt() {
     let text = read_log(&log);
     assert!(text.contains("argv:serve --session sess-1"));
 }
+
+#[test]
+fn a_pushed_line_is_delivered_as_a_steered_prompt_once() {
+    use anyagents_harness::SteerLine;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("steer.jsonl");
+    std::fs::write(
+        &path,
+        serde_json::to_string(&SteerLine {
+            id: "m7".to_string(),
+            seq: 7,
+            message: "later".to_string(),
+        })
+        .unwrap()
+            + "\n",
+    )
+    .unwrap();
+    let mut harness = start(&dir, "hold", None)
+        .with_steer(anyagents_harness::SteerQueue::new(&path, 4));
+    harness.deliver(&msg("m1")).unwrap();
+    let item = harness.poll_steer().unwrap().expect("taken");
+    assert_eq!(item.message.id, "m7");
+    assert!(harness.inject(&item.message).unwrap());
+    assert!(harness.wait_seen("m7", Duration::from_secs(5)));
+    let log = dir.path().join("log");
+    let text = read_log(&log);
+    assert!(text.contains("\"delivery\":\"steer\""), "{text}");
+    assert_eq!(text.matches("anyagents-message:m7").count(), 1, "{text}");
+    assert_eq!(harness.turns_started(), 1);
+}

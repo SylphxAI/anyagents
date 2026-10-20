@@ -2,7 +2,17 @@
 //! in sequence order, and moves the cursors only after the harness answers.
 
 use anyagents_core::{Agent, AgentId, Incoming, Message, Store};
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, message_id_in_text};
+use anyagents_harness::{
+    DeliverOutcome, Harness, HarnessError, OutboundMessage, SteerItem, message_id_in_text,
+};
+
+/// How many pushed lines ahead of the mailbox message are injected first.
+const PUSHED_AHEAD_LIMIT: usize = 64;
+
+/// A mid-turn injection did not happen: the adapter took the message and did not
+/// write it. The work stands still and the supervisor asks again later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Held;
 
 pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
 
@@ -15,6 +25,8 @@ pub enum Error {
     HarnessDown,
     #[error("harness failed: {0}")]
     HarnessFailed(String),
+    #[error("mid-turn input is held for the next step")]
+    Held,
 }
 
 impl Error {
@@ -38,6 +50,11 @@ pub enum RunOutcome {
     },
     Quota {
         reset_at_ms: i64,
+    },
+    /// A new mailbox message reached the running turn and was taken by the
+    /// vendor; the cursor advanced exactly once. The turn is still open.
+    Steered {
+        seq: i64,
     },
 }
 
@@ -142,6 +159,91 @@ impl<H: Harness> DeliveryLoop<H> {
                 Err(HarnessError::Dead) => return Err(Error::HarnessDown),
                 Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
             }
+        }
+    }
+
+    /// Put every new mailbox message into the running turn through the
+    /// adapter's between-steps channel, in sequence order.
+    ///
+    /// The message is still written by [`DeliveryLoop::deliver_next_without_commit`]
+    /// and committed by [`DeliveryLoop::run_once`] when `inject` reports the
+    /// vendor took it, so a replay after a crash either sees the id held by the
+    /// adapter (not written twice) or writes it as a fresh turn. The cursor
+    /// holds while the adapter does not take the message.
+    pub fn steer_next(&mut self) -> Result<Option<SteerItem>, Error> {
+        let Some(message) = self.store.next_unaccepted(&self.agent_id)? else {
+            return Ok(None);
+        };
+        // The vendor's channel may hold lines the mailbox does not have yet; an
+        // older line is injected as itself and the mailbox message waits for
+        // the line the channel pushed for it, or is written when none comes.
+        let mut pushed = 0;
+        loop {
+            let item = self.harness.poll_steer().map_err(inject_error)?;
+            match item {
+                Some(item) if item.message.id != message.id.as_str() && pushed < PUSHED_AHEAD_LIMIT => {
+                    pushed += 1;
+                    self.inject_pushed(item)?;
+                }
+                Some(item) if item.message.id == message.id.as_str() => {
+                    if self.inject(item, true)? {
+                        return Ok(Some(SteerItem {
+                            order: 0,
+                            message: outbound(&message),
+                        }));
+                    }
+                    return Err(Error::Held);
+                }
+                _ => break,
+            }
+        }
+        let item = SteerItem {
+            order: 0,
+            message: outbound(&message),
+        };
+        if self.inject(item.clone(), false)? {
+            Ok(Some(item))
+        } else {
+            Err(Error::Held)
+        }
+    }
+
+    /// Write one message into the running turn. `true` when the vendor took it;
+    /// `false` when the adapter holds it for the next step.
+    ///
+    /// A message the vendor took is accepted once, and its turn is the open turn
+    /// that will settle it: the processed cursor does not move on the hand-over.
+    pub fn inject(&mut self, item: SteerItem, pushed: bool) -> Result<bool, Error> {
+        let id = item.message.id.clone();
+        let seq = item.message.seq;
+        let taken = match self.harness.inject(&item.message) {
+            Ok(taken) => taken,
+            Err(HarnessError::Dead) => return Err(Error::HarnessDown),
+            Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
+        };
+        if !taken {
+            self.harness.release_steer(&id);
+            return Ok(false);
+        }
+        self.store.note_handover(&self.agent_id, seq, false)?;
+        // A line only the channel pushed still moves the accepted cursor, so the
+        // open turn settles it like any other message.
+        if pushed {
+            self.store.note_delivery(&self.agent_id, seq, false)?;
+        }
+        Ok(true)
+    }
+
+    fn inject_pushed(&mut self, item: SteerItem) -> Result<(), Error> {
+        let id = item.message.id.clone();
+        match self.harness.inject(&item.message) {
+            Ok(true) => Ok(()),
+            Ok(false) => {
+                self.harness.release_steer(&id);
+                Ok(())
+            }
+            Err(HarnessError::Dead) => Err(Error::HarnessDown),
+            Err(HarnessError::Failed(reason)) => Err(Error::HarnessFailed(reason)),
         }
     }
 
@@ -257,7 +359,14 @@ impl<H: Harness> DeliveryLoop<H> {
     }
 }
 
-fn outbound(message: &Message) -> OutboundMessage {
+fn inject_error(err: HarnessError) -> Error {
+    match err {
+        HarnessError::Dead => Error::HarnessDown,
+        HarnessError::Failed(reason) => Error::HarnessFailed(reason),
+    }
+}
+
+pub(crate) fn outbound(message: &Message) -> OutboundMessage {
     OutboundMessage {
         id: message.id.as_str().to_string(),
         seq: message.seq,
@@ -310,6 +419,31 @@ mod tests {
         assert_eq!(loop_.harness().written_ids().len(), 2);
         assert_eq!(loop_.harness().turns_started(), 2);
         assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), second);
+    }
+
+    #[test]
+    fn a_steered_message_enters_the_open_turn_once() {
+        // The fake steers on `deliver`, which is what the mailbox pass does.
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let first = recv(loop_.store(), &id, "one");
+        loop_.run_once().unwrap();
+        let second = recv(loop_.store(), &id, "two");
+        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), first);
+        loop_.run_once().unwrap();
+        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), second);
+        assert_eq!(loop_.harness().written_ids().len(), 2);
+        assert_eq!(loop_.harness().turns_started(), 1);
+    }
+
+    #[test]
+    fn a_followup_message_is_held_until_the_turn_ends() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Followup);
+        recv(loop_.store(), &id, "one");
+        loop_.run_once().unwrap();
+        recv(loop_.store(), &id, "two");
+        assert!(matches!(loop_.steer_next(), Err(Error::Held)));
+        assert_eq!(loop_.harness().written_ids().len(), 1);
+        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), 1);
     }
 
     #[test]

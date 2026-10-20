@@ -1,7 +1,7 @@
 //! Speaks just enough of the OpenCode serve line protocol for the adapter tests.
 //!
 //! `ANYAGENTS_FAKE_MODE` selects the script: `hold`, `finish`, `quota`, `echo`,
-//! `stream`. `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin. A test
+//! `stream`, `steer`. `ANYAGENTS_FAKE_LOG` is a file that receives argv and stdin. A test
 //! that starts this program through a symlink gets `<link path>.log` instead,
 //! so it can use `env!` for one binary and still start a real process.
 
@@ -37,6 +37,20 @@ fn main() {
             "finish" if line.contains("\"type\":\"prompt\"") => {
                 let _ = writeln!(stdout, "{RESULT}");
                 let _ = stdout.flush();
+            }
+            // A steered prompt is echoed at once and the turn stays open; a
+            // plain prompt opens the turn.
+            "steer" => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let steer = value.get("delivery").and_then(|d| d.as_str()) == Some("steer");
+                    let text = value.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    log(&log_path, &format!("prompt:steer={steer}"));
+                    if steer {
+                        let echo = serde_json::json!({"type": "text", "text": text});
+                        let _ = writeln!(stdout, "{echo}");
+                        let _ = stdout.flush();
+                    }
+                }
             }
             // Text only, and no closing result line, as a streaming vendor does.
             "stream" if line.contains("\"type\":\"prompt\"") => {

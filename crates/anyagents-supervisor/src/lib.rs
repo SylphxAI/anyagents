@@ -219,12 +219,19 @@ impl HealthBoard {
     }
 }
 
-/// Catalog delivery when no process is up. Codex steers; other harnesses follow up.
+/// Catalog delivery when no process is up. Codex steers inside the turn;
+/// Claude Code and Antigravity take input between model steps through a
+/// steering channel; every other harness follows up after the turn.
+///
+/// Claude Code writes a new line into the running conversation (stream-json on
+/// stdin, acknowledged by its replay echo); Antigravity takes an `injectSteps`
+/// answer from a before-step hook; OpenCode takes a prompt with
+/// `delivery=steer`.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
-    if harness == "codex" {
-        (DeliveryMode::Steer, SteerSupport::Yes)
-    } else {
-        (DeliveryMode::Followup, SteerSupport::Unproven)
+    match harness {
+        "codex" => (DeliveryMode::Steer, SteerSupport::Yes),
+        "claude-code" | "agy" => (DeliveryMode::Followup, SteerSupport::Yes),
+        _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
 
@@ -845,7 +852,10 @@ impl<H: Harness + 'static> Session<H> {
         };
         match outcome {
             Ok(RunOutcome::Quota { .. }) => false,
-            Ok(RunOutcome::Idle | RunOutcome::Delivered { .. } | RunOutcome::Deferred { .. }) => {
+            Ok(RunOutcome::Idle
+            | RunOutcome::Delivered { .. }
+            | RunOutcome::Deferred { .. }
+            | RunOutcome::Steered { .. }) => {
                 self.settle();
                 if self.quota_is_ahead() {
                     return false;

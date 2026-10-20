@@ -5,8 +5,10 @@
 //! id already written, or echoed back, is not written again.
 //!
 //! Declared delivery mode is followup: a message written while a turn is open
-//! waits for the next `result`. Steer support is unproven. Token counts and a
-//! reported cost, when the vendor sends one, are kept on the finished ids.
+//! waits for the next `result`. Steer support is yes through the vendor's own
+//! value on a prompt: `{"type":"prompt","text":...,"delivery":"steer"}` enters
+//! the running turn instead of queueing behind it. Token counts and a reported
+//! cost, when the vendor sends one, are kept on the finished ids.
 //!
 //! Resume starts the child again with `--session` when the session id changed or
 //! the process has exited. Cancel writes `{"type":"cancel"}`.
@@ -19,13 +21,17 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use anyagents_harness::{DeliveryMode, SteerSupport, marked_message};
+use anyagents_harness::{
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, OutboundMessage, SteerItem, SteerQueue,
+    SteerSupport, marked_message,
+};
 use anyagents_harness_stream::{Launch, LineEffect, StreamHarness};
 use serde_json::{Value, json};
 
 /// One long-lived OpenCode `serve` child.
 pub struct OpenCodeHarness {
     inner: StreamHarness,
+    steer: Option<SteerQueue>,
 }
 
 impl OpenCodeHarness {
@@ -77,6 +83,23 @@ impl OpenCodeHarness {
                 steer: SteerSupport::Unproven,
                 on_line: Arc::new(read_line),
             })?,
+            steer: None,
+        })
+    }
+
+    /// Also watch `queue` for lines a channel pushed between model steps, and
+    /// take them in through a steered prompt.
+    pub fn with_steer(mut self, queue: SteerQueue) -> Self {
+        self.steer = Some(queue);
+        self
+    }
+
+    /// A prompt that enters the running turn.
+    pub fn steer_prompt(message: &OutboundMessage) -> Value {
+        json!({
+            "type": "prompt",
+            "text": marked_message(&message.id, &message.text),
+            "delivery": "steer"
         })
     }
 
@@ -123,16 +146,52 @@ impl OpenCodeHarness {
     }
 }
 
-impl anyagents_harness::Harness for OpenCodeHarness {
-    fn deliver(
-        &mut self,
-        message: &anyagents_harness::OutboundMessage,
-    ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
+impl Harness for OpenCodeHarness {
+    fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         let line = json!({
             "type": "prompt",
             "text": marked_message(&message.id, &message.text)
         });
         self.inner.deliver(message, &line)
+    }
+
+    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
+        let Some(queue) = &self.steer else {
+            return Ok(None);
+        };
+        if !self.inner.health().process_alive {
+            return Err(HarnessError::Dead);
+        }
+        // A line the child already echoes is not written a second time.
+        while let Some(line) = queue.lines().into_iter().next() {
+            if !self.inner.seen(&line.id) {
+                break;
+            }
+            queue.consume(&line.id);
+        }
+        Ok(queue.take())
+    }
+
+    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
+        if self.steer.is_none() {
+            return Ok(false);
+        }
+        if !self.inner.health().process_alive {
+            return Err(HarnessError::Dead);
+        }
+        if self.inner.seen(&message.id) {
+            return Ok(false);
+        }
+        // A prompt written while the turn is open is taken by that turn; the
+        // queue line is the copy that was pushed, not a turn of its own.
+        let outcome = self.inner.deliver(message, &Self::steer_prompt(message))?;
+        Ok(matches!(outcome, DeliverOutcome::Accepted { .. }))
+    }
+
+    fn release_steer(&mut self, keep: &str) {
+        if let Some(queue) = &self.steer {
+            queue.release_for(keep);
+        }
     }
 
     fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
@@ -162,7 +221,11 @@ impl anyagents_harness::Harness for OpenCodeHarness {
     }
 
     fn health(&self) -> anyagents_harness::HarnessHealth {
-        self.inner.health()
+        let mut health = self.inner.health();
+        if self.steer.is_some() {
+            health.steer_support = SteerSupport::Yes;
+        }
+        health
     }
 }
 

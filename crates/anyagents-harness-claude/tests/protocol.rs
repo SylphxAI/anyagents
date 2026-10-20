@@ -243,3 +243,104 @@ fn an_errored_result_is_a_failed_turn_with_no_usage() {
     );
     assert_eq!(harness.turns_started(), 2);
 }
+
+#[test]
+fn the_child_is_asked_to_replay_the_lines_it_reads() {
+    let dir = TempDir::new().unwrap();
+    let harness = start(&dir, "hold", None);
+    assert!(
+        read_log(&log_path(&dir)).contains("--replay-user-messages"),
+        "{}",
+        read_log(&log_path(&dir))
+    );
+    drop(harness);
+}
+
+#[test]
+fn a_line_steered_mid_turn_is_echoed_and_never_written_twice() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "steer", Some("sess-1"));
+    harness.deliver(&msg("m1")).unwrap();
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
+    assert!(harness.wait_echoed("m1", Duration::from_secs(5)));
+    // The turn is still open after the echo: the agent is working.
+    assert!(!harness.is_finished("m1"));
+    let steered = harness.deliver(&msg("m2")).unwrap();
+    assert_eq!(steered, DeliverOutcome::Accepted { turn_finished: false });
+    assert!(harness.wait_echoed("m2", Duration::from_secs(5)));
+    assert_eq!(harness.turns_started(), 1);
+    // Running the mailbox again, or a replay after a crash, writes nothing.
+    harness.deliver(&msg("m2")).unwrap();
+    assert_eq!(
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    let text = read_log(&log_path(&dir));
+    assert_eq!(text.matches("anyagents-message:m1").count(), 2, "{text}");
+    assert_eq!(text.matches("anyagents-message:m2").count(), 2, "{text}");
+    // Closing stdin lets the child exit; the turn ends with the child.
+    drop(harness);
+}
+
+#[test]
+fn a_pushed_line_is_injected_once_and_settled_on_its_echo() {
+    use anyagents_harness::SteerItem;
+    use anyagents_harness::SteerQueue;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("steer.jsonl");
+    std::fs::write(
+        &path,
+        "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n",
+    )
+    .unwrap();
+    let queue = SteerQueue::new(&path, 4);
+    let mut harness = start(&dir, "steer", None).with_steer(queue.clone());
+    harness.deliver(&msg("m1")).unwrap();
+    let item = harness.poll_steer().unwrap().expect("taken");
+    assert_eq!(item, SteerItem {
+        message: anyagents_harness::OutboundMessage {
+            id: "m7".to_string(),
+            seq: 7,
+            text: "later".to_string(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+        },
+        order: 0,
+    });
+    assert!(harness.inject(&item.message).unwrap());
+    assert!(harness.wait_echoed("m7", Duration::from_secs(5)));
+    assert_eq!(harness.written_ids(), vec!["m1".to_string(), "m7".to_string()]);
+    // A second inject of the same id is a no-op, and the queue drops it.
+    assert!(harness.inject(&item.message).unwrap());
+    assert!(harness.poll_steer().unwrap().is_none());
+    assert!(queue.lines().is_empty());
+    // The same id handed in again by the mailbox writes nothing.
+    harness.deliver(&msg("m7")).unwrap();
+    assert_eq!(harness.written_ids().len(), 2);
+    // A pushed line the mailbox does not have yet settles once, from the queue.
+    drop(harness);
+    let rest: Vec<String> = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert!(rest.is_empty(), "{rest:?}");
+}
+
+#[test]
+fn a_pushed_line_the_child_does_not_take_stays_on_the_queue() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("steer.jsonl");
+    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
+    let mut harness = start(&dir, "hold", None)
+        .with_steer(anyagents_harness::SteerQueue::new(&path, 4));
+    let item = harness.poll_steer().unwrap().expect("taken");
+    harness.release_steer("m7");
+    let lines = std::fs::read_to_string(&path).unwrap();
+    assert!(lines.contains("\"m7\""), "{lines}");
+    // Held again, so the same line is not taken twice into one turn.
+    assert!(harness.poll_steer().unwrap().is_none());
+    let _ = item;
+}

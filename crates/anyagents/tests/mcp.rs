@@ -189,7 +189,7 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(alpha_row.harness, "claude-code");
     assert_eq!(alpha_row.state, "running");
     assert_eq!(alpha_row.delivery_mode, "followup");
-    assert_eq!(alpha_row.steer_support, "unproven");
+    assert_eq!(alpha_row.steer_support, "yes");
     assert!(alpha_row.process == "alive" || alpha_row.process == "down");
 
     let listed_cli = bin()

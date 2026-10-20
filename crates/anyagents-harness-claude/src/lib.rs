@@ -9,6 +9,16 @@
 //! a `result` event closes the open turn. Token counts and `total_cost_usd` from
 //! that event are kept on the finished ids.
 //!
+//! Mid-turn delivery: with `--replay-user-messages` the child echoes back every
+//! line written to its stdin as a `user` event, which is the harness's own
+//! acknowledgement that the line entered the running conversation. A line
+//! written during a turn reaches the agent before its next model step; the
+//! echo is what marks it taken, and an id already echoed is never written twice.
+//!
+//! A [`SteerQueue`] ([`ClaudeHarness::with_steer`]) holds lines a channel pushed
+//! between model steps even when the mailbox has not stored them yet; they are
+//! written by [`Harness::inject`] with the same acknowledgement.
+//!
 //! Resume starts the child again with `--resume` when the session id changed or the
 //! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
 
@@ -21,8 +31,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnReport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
+    SteerQueue, SteerSupport, TurnReport, TurnState, TurnUsage, marked_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -35,6 +45,7 @@ pub struct ClaudeHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
+    steer: Option<SteerQueue>,
 }
 
 #[derive(Default)]
@@ -54,6 +65,8 @@ struct State {
     failures: Vec<(String, String)>,
     turns: std::collections::BTreeMap<String, u64>,
     request_seq: u64,
+    /// Ids an echoed `user` event proved the child took.
+    echoed: HashSet<String>,
 }
 
 impl ClaudeHarness {
@@ -88,9 +101,46 @@ impl ClaudeHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
+            steer: None,
         };
         harness.launch(session_id)?;
         Ok(harness)
+    }
+
+    /// Also watch `queue` for lines a channel pushed between model steps.
+    pub fn with_steer(mut self, queue: SteerQueue) -> Self {
+        self.steer = Some(queue);
+        self
+    }
+
+    /// The create input line Claude Code reads: one `user` event whose text is
+    /// the marked message. Its echo is the acknowledgement.
+    pub fn create_input(message: &OutboundMessage) -> Value {
+        json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{
+                    "type": "text",
+                    "text": marked_message(&message.id, &message.text)
+                }]
+            }
+        })
+    }
+
+    /// The `user` event one line of the between-steps channel carries.
+    pub fn steer_input(message: &OutboundMessage) -> Value {
+        Self::create_input(message)
+    }
+
+    /// Whether the child echoed `id` back as a `user` event.
+    pub fn echoed(&self, id: &str) -> bool {
+        lock(&self.shared).echoed.contains(id)
+    }
+
+    /// Wait until the child echoes `id`.
+    pub fn wait_echoed(&self, id: &str, timeout: Duration) -> bool {
+        self.wait_pred(timeout, |state| state.echoed.contains(id))
     }
 
     /// Ids this process actually wrote, in write order.
@@ -201,7 +251,8 @@ impl ClaudeHarness {
             .arg("stream-json")
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--verbose");
+            .arg("--verbose")
+            .arg("--replay-user-messages");
         if let Some(session_id) = session_id {
             cmd.arg("--resume").arg(session_id);
         }
@@ -304,16 +355,7 @@ impl Harness for ClaudeHarness {
         if let Some(reset_at_ms) = state.quota_reset_at_ms {
             return Ok(DeliverOutcome::Quota { reset_at_ms });
         }
-        let line = json!({
-            "type": "user",
-            "message": {
-                "role": "user",
-                "content": [{
-                    "type": "text",
-                    "text": marked_message(&message.id, &message.text)
-                }]
-            }
-        });
+        let line = Self::create_input(message);
         if write_stdin(&self.stdin, &line).is_err() {
             state.alive = false;
             self.wake.notify_all();
@@ -400,7 +442,11 @@ impl Harness for ClaudeHarness {
             )
         };
         // The most recent result decides, so a replay that succeeds replaces
-        // the turn that had failed.
+        // the turn that had failed. A line the child echoed after that failure
+        // is taken by the open turn, whose result settles it.
+        if self.echoed(id) && !self.is_finished(id) {
+            return None;
+        }
         match (failed_at, usage_at) {
             (Some(failed), Some(usage)) if usage > failed => {
                 self.usage_at(usage).map(TurnReport::Succeeded)
@@ -416,6 +462,64 @@ impl Harness for ClaudeHarness {
 
     fn clear_quota(&mut self) {
         lock(&self.shared).quota_reset_at_ms = None;
+    }
+
+    fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
+        let Some(queue) = &self.steer else {
+            return Ok(None);
+        };
+        if !lock(&self.shared).alive {
+            return Err(HarnessError::Dead);
+        }
+        // A line the child already echoed, or whose turn already finished, is
+        // taken off the queue without a second write.
+        while let Some(line) = queue.lines().into_iter().next() {
+            let settled = {
+                let state = lock(&self.shared);
+                state.echoed.contains(&line.id) || state.finished.contains(&line.id)
+            };
+            if !settled {
+                break;
+            }
+            queue.consume(&line.id);
+        }
+        Ok(queue.take())
+    }
+
+    fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
+        let mut state = lock(&self.shared);
+        if !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        if state.echoed.contains(&message.id) || state.finished.contains(&message.id) {
+            return Ok(true);
+        }
+        // An id the mailbox already handed over is not written twice. The line
+        // stays held for the step where the host settles it.
+        if state.seen.contains(&message.id) {
+            return Ok(false);
+        }
+        state.seen.insert(message.id.clone());
+        state.written.push(message.id.clone());
+        if state.open.is_empty() {
+            state.turns_started += 1;
+            state.open.push(message.id.clone());
+        } else {
+            state.followups.push(message.id.clone());
+        }
+        let line = Self::steer_input(message);
+        if write_stdin(&self.stdin, &line).is_err() {
+            state.alive = false;
+            self.wake.notify_all();
+            return Err(HarnessError::Dead);
+        }
+        Ok(true)
+    }
+
+    fn release_steer(&mut self, keep: &str) {
+        if let Some(queue) = &self.steer {
+            queue.release_for(keep);
+        }
     }
 
     fn process_id(&self) -> Option<u32> {
@@ -473,6 +577,7 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
             // only appears inside an error or a system notice is not proof it
             // wrote the message: the turn that failed must be able to try again.
             note_markers(&mut state, &value);
+            note_echo(&mut state, &value);
             if let Some(reset_at_ms) = quota_from_claude(&value) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
             }
@@ -615,6 +720,45 @@ fn mentions_user_text(value: &Value) -> bool {
             map.values().any(mentions_user_text)
         }
         _ => false,
+    }
+}
+
+/// A `user` event the child sends back is proof it took the line: the replay
+/// echo of a written line, or a message it reports itself. An error or a notice
+/// is not an echo. An echoed id is taken, and a turn that failed before it
+/// arrived no longer counts against it.
+fn note_echo(state: &mut State, value: &Value) {
+    if value.get("type").and_then(Value::as_str) != Some("user") {
+        return;
+    }
+    let mut ids = Vec::new();
+    collect_ids(value, &mut ids);
+    for id in ids {
+        state.echoed.insert(id.clone());
+        state.seen.insert(id.clone());
+        state.finished.remove(&id);
+        state.failures.retain(|(item, _)| item != &id);
+    }
+}
+
+fn collect_ids(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::String(text) => {
+            if let Some(id) = message_id_in_text(text) {
+                out.push(id.to_string());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_ids(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for item in map.values() {
+                collect_ids(item, out);
+            }
+        }
+        _ => {}
     }
 }
 

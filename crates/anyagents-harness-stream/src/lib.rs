@@ -109,6 +109,13 @@ impl StreamHarness {
         Ok(harness)
     }
 
+    /// Add one environment variable for every child this harness starts from
+    /// now on, including a restart after a resume.
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.environment.retain(|(item, _)| item != key);
+        self.environment.push((key.to_string(), value.to_string()));
+    }
+
     pub fn program(&self) -> &Path {
         &self.program
     }
