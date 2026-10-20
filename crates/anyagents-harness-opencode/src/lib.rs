@@ -10,8 +10,12 @@
 //!
 //! Resume starts the child again with `--session` when the session id changed or
 //! the process has exited. Cancel writes `{"type":"cancel"}`.
+//!
+//! The answer a turn produced is the last `text` line after the prompt, up to
+//! and including the `result` line. It is read with [`OpenCodeHarness::answer`]
+//! and does not finish the turn.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -34,7 +38,29 @@ impl OpenCodeHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
     ) -> Result<Self, anyagents_harness::HarnessError> {
-        let mut args = vec!["serve".to_string()];
+        Self::start_in(program, session_id, environment, None)
+    }
+
+    /// Start one child with its working directory set to `work_dir`.
+    pub fn start_in(
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, anyagents_harness::HarnessError> {
+        Self::start_double(program, None, session_id, environment, work_dir)
+    }
+
+    /// Start one child. `subcommand` replaces `serve` for a test double that
+    /// takes its orders from a subcommand of the same executable.
+    pub fn start_double(
+        program: impl Into<PathBuf>,
+        subcommand: Option<&str>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, anyagents_harness::HarnessError> {
+        let mut args = vec![subcommand.unwrap_or("serve").to_string()];
         if let Some(id) = session_id {
             args.push("--session".to_string());
             args.push(id.to_string());
@@ -45,7 +71,7 @@ impl OpenCodeHarness {
                 program: program.into(),
                 args,
                 environment: owned_env(environment),
-                work_dir: None,
+                work_dir: work_dir.map(Path::to_path_buf),
                 session_id: session_id.map(str::to_string),
                 mode: DeliveryMode::Followup,
                 steer: SteerSupport::Unproven,
@@ -78,6 +104,23 @@ impl OpenCodeHarness {
     pub fn wait_seen(&self, id: &str, timeout: std::time::Duration) -> bool {
         self.inner.wait_seen(id, timeout)
     }
+    /// Wait `quiet` with no line from the child. A quiet turn the child never
+    /// closed is finished when the answer stands still.
+    pub fn wait_quiet(
+        &self,
+        quiet: std::time::Duration,
+        patience: std::time::Duration,
+    ) -> bool {
+        self.inner.quiet(quiet, patience)
+    }
+    /// The turn for `id` ended on quiet, not on a result line.
+    pub fn closed_on_quiet(&self, id: &str) -> bool {
+        self.inner.finished_quiet(id)
+    }
+    /// The answer text the vendor sent for `id`, when it has sent one.
+    pub fn answer(&self, id: &str) -> Option<String> {
+        self.inner.text_for(id)
+    }
 }
 
 impl anyagents_harness::Harness for OpenCodeHarness {
@@ -106,6 +149,18 @@ impl anyagents_harness::Harness for OpenCodeHarness {
         self.inner.cancel(&json!({"type": "cancel"}))
     }
 
+    fn answer_for(&self, id: &str) -> Option<String> {
+        self.answer(id)
+    }
+
+    fn ends_on_quiet(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_millis(500))
+    }
+
+    fn quiet_for(&self, _id: &str, quiet: std::time::Duration, patience: std::time::Duration) -> bool {
+        self.wait_quiet(quiet, patience)
+    }
+
     fn health(&self) -> anyagents_harness::HarnessHealth {
         self.inner.health()
     }
@@ -128,7 +183,20 @@ fn read_line(value: &Value) -> LineEffect {
             .map(str::to_string),
         usage: is_result.then(|| usage_of(value)),
         quota_reset_at_ms: quota_of(value),
+        text: answer_of(value, is_result),
     }
+}
+
+/// A text line, or the text on the `result` line itself, is the answer so far.
+fn answer_of(value: &Value, is_result: bool) -> Option<String> {
+    if !(is_result || value.get("type").and_then(Value::as_str) == Some("text")) {
+        return None;
+    }
+    value
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string)
 }
 
 fn usage_of(value: &Value) -> anyagents_harness::TurnUsage {

@@ -81,6 +81,7 @@ A harness is data: a catalog entry per vendor tool, shipped with the binary and 
 - **Lazy install.** Nothing is installed until an agent needs it. The first `agents.create` on a harness starts the install in the background and the agent waits in `INSTALLING`. Each harness lives under the AnyAgents data directory at a pinned version (`harnesses/<id>/<version>/`), never in a global location the user's own setup depends on.
 - **Update.** The server checks for a new version on a schedule and applies it only when none of that harness's agents is in a turn. The previous version stays installed until the new one has answered once, so a bad update rolls back by switching the pin.
 - **Sign in inside AnyAgents.** The server runs the vendor's own sign-in command for that harness and streams what it asks for (a link, a device code, a prompt) to the client that asked, through the API. The user completes it in a browser; the vendor tool writes its credential to its own store under the AnyAgents-managed config directory for that harness. AnyAgents records only the outcome (signed in, as whom when the vendor says, and when). An API-key sign-in is passed to the vendor tool through the variable it documents and kept in the OS keychain, or a 0600 file where there is no keychain.
+- **Sign in one agent from the CLI.** Each agent runs with its own config directory (`agents/<id>/config`), so a harness signature is only usable by that agent when it was made in that directory. `anyagents sign-in <agent>` runs the vendor's command there, reads it out before the server is up, and prints only each link, device code or prompt as it arrives and the outcome on the last line. It never reads, prints or copies the credential. `anyagents harnesses list` prints each catalog key, the variable that points the vendor at its private directory, and the command that installs it, so a missing vendor program is one line away from fixed.
 - **Sharing.** All agents on one harness share its sign-in by default, because a subscription belongs to a person, not to an agent. A separate profile per agent is an option on create.
 
 ## Agents: create and supervise
@@ -92,6 +93,7 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A per-agent lock: a second process for the same agent is refused, never started beside the first.
 - Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden.
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
+- A turn that ends in an error leaves its messages accepted, never processed. If the very next turn fails on the same messages, the process that swallowed them is replaced once, so a process that is stuck in an error state cannot hold the mailbox forever.
 
 ### The adapter contract
 
@@ -104,6 +106,7 @@ One adapter per harness, five calls. A new harness is an adapter plus a catalog 
 | `resume(session)` | Reattach to the same vendor session id. |
 | `cancel()` | The vendor's own interrupt for the current turn. |
 | `health()` | Process alive, turn state, declared delivery mode, steer support (yes, no or unproven), and any current quota or sign-in fault. |
+| `turn_report_for(id)` | How the finished turn that carried `id` ended: a success with its usage, or a failure with the vendor's own error text. An adapter that cannot tell returns nothing, and the turn counts as a success. |
 
 Every harness is admitted. The delivery mode is whatever that tool does best, declared rather than hidden:
 
@@ -111,6 +114,7 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 | --- | --- | --- |
 | `steer` | Input enters the active turn, including while a tool runs. | Codex `app-server` `turn/steer`. |
 | `followup` | The tool takes the input now and acts on it when the current turn ends. | OpenCode `serve`; a harness with a long-lived stream that reads the next line after the result. |
+| `followup`, ending on quiet | The tool streams the answer and never prints a closing result line, so the turn is over once the stream has been silent for half a second. | None yet: the OpenCode adapter still ends a turn on its `result` line, so an agent on it is recorded only when the vendor sends one. |
 | `queue` | The tool cannot take input during a turn. The adapter holds the message (it is already durable in the mailbox) and delivers it when the turn ends. | Any harness with only one-shot runs. |
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
@@ -123,7 +127,7 @@ Every input to an agent (a Telegram message, another agent's `send`, a CLI or TU
 - **Three acknowledgements**, each with its own cursor and lag:
   1. `received`: committed to the database. From here the message survives a crash.
   2. `accepted`: the adapter reports the harness took it.
-  3. `processed`: a turn that included it has completed.
+  3. `processed`: a turn that included it has **succeeded**. A turn that ends in an error (a sign-in failure, a vendor error, a crash after the write) records a failed turn for every message it carried: those stay `accepted`, `inbox` shows the vendor's reason, and the next turn carries them again. Only success moves this cursor.
 - **Contiguous cursors.** Each cursor advances only over a contiguous prefix of the sequence, so one stuck message is visible as the oldest unaccepted one rather than skipped.
 - **Idempotent delivery.** After a crash, messages past the `accepted` cursor are delivered again. The adapter carries the message id into the harness and drops an id it has already written, so a replay never starts a second turn. The Claude Code and Codex adapters put that id on the first line of the user text as `anyagents-message:<id>`, and Codex also sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
 - **Retention.** Processed messages are kept for a configurable period for `inbox` and audit, then compacted.
@@ -139,6 +143,7 @@ These are invariants with tests (`tests/invariants/`), run against a scripted fa
 5. Lag is always visible: `health` reports the age of the oldest message not yet accepted and not yet processed, per agent.
 6. A quota fault is a reported state with a reset time, and the server keeps the mailbox growing durably while it lasts.
 7. One vendor process per agent.
+8. No inbound line is lost to a failed turn: a turn that ends in an error leaves its messages accepted and readable as failed in `inbox`, and a later successful turn processes each of them once.
 
 ## Channels
 

@@ -309,3 +309,62 @@ fn finished_turns_sum_by_agent_and_day() {
     assert_ne!(utc_day(later), first_day);
     drop(supervisor);
 }
+
+/// The compiled double answers the turn carrying `fail-once` with an auth
+/// error and every other turn with a success.
+#[test]
+fn a_failed_turn_is_never_processed_and_the_next_turn_tries_again() {
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("alpha", "claude-code"))
+        .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_600_000_000_000);
+    let launch: anyagents_supervisor::Launch<ClaudeHarness> = Arc::new(|_request| {
+        ClaudeHarness::start(env!("CARGO_BIN_EXE_fails_once"), None, &[])
+            .map_err(|err| err.to_string())
+    });
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock) as Arc<dyn Clock>,
+        launch,
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.pid.is_some() && live.process_alive)
+    }));
+    let other = Store::open(dir.path().join("state.db")).unwrap();
+    other
+        .receive(&agent.id, Incoming::new("fail-once"))
+        .unwrap();
+
+    // The vendor took it and answered with an auth error. The supervisor
+    // retries at once, so the failed state is brief: the next successful turn
+    // must be the one that moves the cursor, and the failed turn must be on
+    // record with the vendor's reason.
+    assert!(
+        wait_until(|| other.processed_cursor(&agent.id).unwrap() >= 1),
+        "{:?}",
+        other.inbox(&agent.id, None)
+    );
+    let inbox = other.inbox(&agent.id, None).unwrap();
+    assert!(
+        inbox
+            .iter()
+            .all(|message| message.ack == anyagents_core::Ack::Processed)
+    );
+    assert!(inbox.iter().all(|message| message.failed_reason.is_none()));
+    assert!(other.failed_turns(&agent.id).unwrap().is_empty());
+
+    // Only the successful turn is billed.
+    assert_eq!(store.list_usage(None).unwrap().len(), 1);
+    drop(supervisor);
+}

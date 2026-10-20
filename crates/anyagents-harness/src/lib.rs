@@ -6,6 +6,8 @@
 
 mod fake;
 
+use std::time::Duration;
+
 pub use fake::FakeHarness;
 
 /// How a harness takes input that arrives during a turn.
@@ -86,9 +88,42 @@ pub trait Harness: Send {
     fn cancel(&mut self) -> Result<(), HarnessError>;
     fn health(&self) -> HarnessHealth;
 
+    /// Answer text the vendor sent for `id`, when it sends text before a result.
+    fn answer_for(&self, _id: &str) -> Option<String> {
+        None
+    }
+
+    /// How long a turn must stay silent before its answer stands still, for a
+    /// vendor that streams text and never closes a turn with a result line.
+    /// `None` means the vendor always closes its turn.
+    fn ends_on_quiet(&self) -> Option<Duration> {
+        None
+    }
+
+    /// Wait until the turn is silent long enough to stand still, giving up
+    /// after `patience`.
+    fn quiet_for(&self, _id: &str, _quiet: Duration, _patience: Duration) -> bool {
+        false
+    }
+
     /// Usage recorded for a finished turn, if this adapter kept it.
     fn usage_for(&self, _id: &str) -> Option<TurnUsage> {
         None
+    }
+
+    /// Which finished turn this is for `id`, counting from 1. A message that
+    /// fails and is handed over again reports 2, so the host can tell the retry
+    /// from the failure it already recorded. `None` means the adapter does not
+    /// count, and every report is treated as the same turn.
+    fn turn_version(&self, _id: &str) -> u64 {
+        0
+    }
+
+    /// How the finished turn that included `id` ended. `None` means the adapter
+    /// cannot tell, and the turn counts as a success. An adapter that reports a
+    /// failure keeps the message accepted, never processed.
+    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
+        self.usage_for(id).map(TurnReport::Succeeded)
     }
 
     /// Forget a quota wait so delivery can resume after the reset time.
@@ -117,6 +152,16 @@ pub struct TurnUsage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reported_cost_micros: Option<i64>,
+}
+
+/// How a finished turn ended, as the vendor reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TurnReport {
+    /// The turn completed. Its usage is recorded.
+    Succeeded(TurnUsage),
+    /// The turn ended in an error. The message is not processed and is offered
+    /// to the next turn. `reason` comes from the vendor's own error text.
+    Failed(String),
 }
 
 /// First line of user text. The rest of the text is the mailbox body.

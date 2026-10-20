@@ -77,6 +77,7 @@ dependencies = [
  "anyagents-harness",
  "anyagents-harness-claude",
  "anyagents-harness-codex",
+ "anyagents-harness-opencode",
  "anyagents-installer",
  "anyagents-supervisor",
  "axum",

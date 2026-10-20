@@ -4,17 +4,20 @@
 //! the process at another home.
 
 use std::path::Path;
+use std::time::Duration;
 
 use anyagents_harness::{
     DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage, TurnUsage,
 };
 use anyagents_harness_claude::ClaudeHarness;
 use anyagents_harness_codex::CodexHarness;
+use anyagents_harness_opencode::OpenCodeHarness;
 use anyagents_supervisor::LaunchRequest;
 
 pub enum VendorHarness {
     Claude(ClaudeHarness),
     Codex(CodexHarness),
+    OpenCode(OpenCodeHarness),
 }
 
 pub fn child_env() -> Vec<(String, String)> {
@@ -29,7 +32,28 @@ pub fn child_env() -> Vec<(String, String)> {
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     let mut env = request.extra_env;
-    if request.agent.harness == "codex" {
+    if request.agent.harness == "opencode" {
+        // The agent's config directory is the in-project config OpenCode reads.
+        // Credentials stay in the user's state directory, which the child
+        // inherits; nothing is copied here.
+        env.push((
+            "XDG_CONFIG_HOME".to_string(),
+            request.config_dir.display().to_string(),
+        ));
+        let program =
+            std::env::var("ANYAGENTS_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
+        // The test double is this binary with one subcommand.
+        let doubles = std::env::var_os("ANYAGENTS_FAKE_OPENCODE").is_some();
+        let harness = OpenCodeHarness::start_double(
+            &program,
+            doubles.then_some("fake-opencode"),
+            None,
+            &pairs(&env),
+            Some(&request.work_dir),
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(VendorHarness::OpenCode(harness))
+    } else if request.agent.harness == "codex" {
         env.push((
             "CODEX_HOME".to_string(),
             request.config_dir.display().to_string(),
@@ -78,6 +102,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.deliver(message),
             Self::Codex(harness) => harness.deliver(message),
+            Self::OpenCode(harness) => harness.deliver(message),
         }
     }
 
@@ -85,6 +110,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.background(),
             Self::Codex(harness) => harness.background(),
+            Self::OpenCode(harness) => harness.background(),
         }
     }
 
@@ -92,6 +118,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.resume(session),
             Self::Codex(harness) => harness.resume(session),
+            Self::OpenCode(harness) => harness.resume(session),
         }
     }
 
@@ -99,6 +126,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.cancel(),
             Self::Codex(harness) => harness.cancel(),
+            Self::OpenCode(harness) => harness.cancel(),
         }
     }
 
@@ -106,6 +134,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.health(),
             Self::Codex(harness) => harness.health(),
+            Self::OpenCode(harness) => harness.health(),
         }
     }
 
@@ -113,6 +142,31 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.usage_for(id),
             Self::Codex(harness) => harness.usage_for(id),
+            Self::OpenCode(harness) => harness.usage_for(id),
+        }
+    }
+
+    fn answer_for(&self, id: &str) -> Option<String> {
+        match self {
+            Self::Claude(harness) => harness.answer_for(id),
+            Self::Codex(harness) => harness.answer_for(id),
+            Self::OpenCode(harness) => harness.answer_for(id),
+        }
+    }
+
+    fn quiet_for(&self, id: &str, quiet: Duration, patience: Duration) -> bool {
+        match self {
+            Self::Claude(harness) => harness.quiet_for(id, quiet, patience),
+            Self::Codex(harness) => harness.quiet_for(id, quiet, patience),
+            Self::OpenCode(harness) => harness.quiet_for(id, quiet, patience),
+        }
+    }
+
+    fn ends_on_quiet(&self) -> Option<Duration> {
+        match self {
+            Self::Claude(harness) => harness.ends_on_quiet(),
+            Self::Codex(harness) => harness.ends_on_quiet(),
+            Self::OpenCode(harness) => harness.ends_on_quiet(),
         }
     }
 
@@ -120,6 +174,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.clear_quota(),
             Self::Codex(harness) => harness.clear_quota(),
+            Self::OpenCode(harness) => harness.clear_quota(),
         }
     }
 
@@ -127,6 +182,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.process_id(),
             Self::Codex(harness) => harness.process_id(),
+            Self::OpenCode(harness) => harness.process_id(),
         }
     }
 
@@ -134,6 +190,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness) => harness.watch_activity(notify),
             Self::Codex(harness) => harness.watch_activity(notify),
+            Self::OpenCode(harness) => harness.watch_activity(notify),
         }
     }
 }

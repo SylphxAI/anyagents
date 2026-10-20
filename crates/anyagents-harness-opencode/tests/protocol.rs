@@ -85,6 +85,18 @@ fn a_second_message_during_a_turn_waits_for_the_result() {
 }
 
 #[test]
+fn text_without_a_result_line_is_the_answer_once_it_stands_still() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "stream", None);
+    harness.deliver(&msg("m1")).unwrap();
+    assert!(!harness.wait_finished("m1", Duration::from_millis(100)));
+    assert!(harness.wait_quiet(Duration::from_millis(500), Duration::from_secs(5)));
+    assert!(harness.closed_on_quiet("m1"));
+    assert_eq!(harness.answer("m1").as_deref(), Some("pong"));
+    assert!(harness.usage_for("m1").is_none());
+}
+
+#[test]
 fn a_rate_limit_is_a_wait_and_not_a_write() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "quota", None);

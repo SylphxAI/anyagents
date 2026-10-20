@@ -351,6 +351,7 @@ fn inbox_sync(
             source_time_ms: message.source_time_ms,
             received_at_ms: message.received_at_ms,
             ack: message.ack.to_string(),
+            failed_reason: message.failed_reason,
         })
         .collect();
     Ok(Json(InboxResponse { messages }))

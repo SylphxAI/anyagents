@@ -23,8 +23,8 @@ pub fn now_ms() -> i64 {
     clock_now_ms()
 }
 
-const MESSAGE_COLS: &str =
-    "id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms";
+const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
+     reply_to, received_at_ms, delivered_at_ms, processed_at_delivery";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -143,6 +143,14 @@ pub struct Message {
     pub reply_to: Option<String>,
     pub received_at_ms: i64,
     pub ack: Ack,
+    /// Why the last turn that included this message ended in an error, if it did.
+    /// Such a message stays `accepted` and is never counted as processed.
+    pub failed_reason: Option<String>,
+    /// When the message was last handed to a vendor process.
+    pub delivered_at_ms: Option<i64>,
+    /// The hand-over already found its turn finished. Only then may a delivery
+    /// move `processed` directly; a turn settled by the host is recorded there.
+    pub processed_at_delivery: bool,
 }
 
 /// A new insert, or the row already stored for this source key.
@@ -540,6 +548,9 @@ impl Store {
             reply_to: incoming.reply_to,
             received_at_ms,
             ack: Ack::Received,
+            failed_reason: None,
+            delivered_at_ms: None,
+            processed_at_delivery: false,
         };
         tx.execute(
             "INSERT INTO messages (
@@ -588,17 +599,31 @@ impl Store {
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
-        let (accepted, processed) = cursors(&conn, agent_id)?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM messages
-             WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq"
-        ))?;
+        let mut stmt = self.prepare_inbox(&conn, since.unwrap_or(0))?;
         let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(0)])?;
         let mut messages = Vec::new();
         while let Some(row) = rows.next()? {
-            messages.push(message_from_row(row, accepted, processed)?);
+            messages.push(message_from_row(&conn, row)?);
         }
         Ok(messages)
+    }
+
+    /// An inbox query: everything when `since` is 0, otherwise the messages a
+    /// change since `since` can have touched (a hand-over records when it was
+    /// handed over and whether its turn was already finished).
+    fn prepare_inbox<'c>(
+        &self,
+        conn: &'c Connection,
+        since: i64,
+    ) -> Result<rusqlite::Statement<'c>, Error> {
+        const ALL: &str = "SELECT id, agent_id, seq, source_time_ms, source_key, sender, body,
+             reply_to, received_at_ms, delivered_at_ms, processed_at_delivery
+             FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq";
+        const CHANGED: &str = "SELECT id, agent_id, seq, source_time_ms, source_key, sender, body,
+             reply_to, received_at_ms, delivered_at_ms, processed_at_delivery
+             FROM messages WHERE agent_id = ?1 AND (seq > ?2 OR delivered_at_ms > ?2)
+             ORDER BY seq";
+        Ok(conn.prepare(if since <= 0 { ALL } else { CHANGED })?)
     }
 
     /// The message at `accepted + 1`, or `None` when delivery has caught up.
@@ -672,10 +697,136 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         agent_by_id(&tx, agent_id)?;
         bump_accepted(&tx, agent_id, seq)?;
-        if turn_finished {
+        // A turn that finished before this hand-over was seen is only counted as
+        // processed when the host has settled it: the app records the turn and
+        // advances `processed` itself.
+        let seen_finished: bool = tx
+            .query_row(
+                "SELECT processed_at_delivery FROM messages WHERE agent_id = ?1 AND seq = ?2",
+                params![agent_id.as_str(), seq],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+            .is_some_and(|flag| flag != 0);
+        if turn_finished && seen_finished {
             bump_processed(&tx, agent_id, seq)?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    /// Note that `seq` was handed to a vendor process. `turn_finished` says the
+    /// adapter found its turn already finished at that moment.
+    pub fn note_handover(
+        &self,
+        agent_id: &AgentId,
+        seq: i64,
+        turn_finished: bool,
+    ) -> Result<(), Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "UPDATE messages SET delivered_at_ms = ?1, processed_at_delivery = ?2
+             WHERE agent_id = ?3 AND seq = ?4",
+            params![now_ms(), i64::from(turn_finished), agent_id.as_str(), seq],
+        )?;
+        Ok(())
+    }
+
+    /// Record that a turn ending at `seq` failed. The failed range starts at the
+    /// first accepted message past the processed cursor. The processed cursor does
+    /// not move, so the same messages are offered to the next turn.
+    pub fn record_failed_turn(
+        &self,
+        agent_id: &AgentId,
+        seq: i64,
+        reason: &str,
+        failed_at_ms: i64,
+    ) -> Result<Vec<Message>, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        agent_by_id(&tx, agent_id)?;
+        let (accepted, processed) = cursors(&tx, agent_id)?;
+        if seq <= processed || seq > accepted {
+            return Err(Error::CursorGap {
+                cursor: "failed",
+                at: processed,
+                attempted: seq,
+            });
+        }
+        let messages = {
+            let mut stmt = tx.prepare(&format!(
+                "SELECT {MESSAGE_COLS} FROM messages
+                 WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq"
+            ))?;
+            let mut rows = stmt.query(params![agent_id.as_str(), processed, seq])?;
+            let mut messages = Vec::new();
+            while let Some(row) = rows.next()? {
+                messages.push(message_from_row(&tx, row)?);
+            }
+            messages
+        };
+        for message in &messages {
+            tx.execute(
+                "INSERT INTO failed_turns (message_id, agent_id, seq, reason, failed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (message_id) DO UPDATE SET
+                     reason = excluded.reason,
+                     failed_at_ms = excluded.failed_at_ms",
+                params![
+                    message.id.as_str(),
+                    agent_id.as_str(),
+                    message.seq,
+                    reason,
+                    failed_at_ms,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(messages)
+    }
+
+    /// One stored message by id, with its current ack.
+    pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let found = conn
+            .query_row(
+                &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND id = ?2"),
+                params![agent_id.as_str(), id],
+                |row| Ok(message_from_row(&conn, row)),
+            )
+            .optional()?;
+        found.transpose()
+    }
+
+    /// Failed turns for one agent: accepted, not processed, and last seen failing.
+    pub fn failed_turns(&self, agent_id: &AgentId) -> Result<Vec<Message>, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let (_, processed) = cursors(&conn, agent_id)?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS} FROM messages AS m
+             WHERE m.agent_id = ?1 AND m.seq > ?2
+               AND m.id IN (SELECT message_id FROM failed_turns WHERE agent_id = ?1)
+             ORDER BY m.seq"
+        ))?;
+        let mut rows = stmt.query(params![agent_id.as_str(), processed])?;
+        let mut messages = Vec::new();
+        while let Some(row) = rows.next()? {
+            messages.push(message_from_row(&conn, row)?);
+        }
+        Ok(messages)
+    }
+
+    /// Drop the failed-turn rows a turn has since processed.
+    pub fn clear_failed_turns(&self, agent_id: &AgentId, through: i64) -> Result<(), Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "DELETE FROM failed_turns WHERE agent_id = ?1 AND seq <= ?2",
+            params![agent_id.as_str(), through],
+        )?;
         Ok(())
     }
 
@@ -764,12 +915,11 @@ impl Store {
 
     fn message_at(&self, agent_id: &AgentId, seq: i64) -> Result<Option<Message>, Error> {
         let conn = self.conn();
-        let (accepted, processed) = cursors(&conn, agent_id)?;
         let found = conn
             .query_row(
                 &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND seq = ?2"),
                 params![agent_id.as_str(), seq],
-                |row| Ok(message_from_row(row, accepted, processed)),
+                |row| Ok(message_from_row(&conn, row)),
             )
             .optional()?;
         found.transpose()
@@ -979,24 +1129,24 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, Error> {
     })
 }
 
-fn message_from_row(
-    row: &rusqlite::Row<'_>,
-    accepted: i64,
-    processed: i64,
-) -> Result<Message, Error> {
+fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Message, Error> {
     let id: String = row.get(0)?;
-    let agent_id: String = row.get(1)?;
+    let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
     let seq: i64 = row.get(2)?;
-    let ack = if seq <= processed {
-        Ack::Processed
-    } else if seq <= accepted {
-        Ack::Accepted
+    let (accepted, processed) = cursors(conn, &agent_id)?;
+    let failed_reason: Option<String> = if seq > processed {
+        conn.query_row(
+            "SELECT reason FROM failed_turns WHERE message_id = ?1",
+            [id.as_str()],
+            |row| row.get(0),
+        )
+        .optional()?
     } else {
-        Ack::Received
+        None
     };
     Ok(Message {
         id: MessageId::parse(&id)?,
-        agent_id: AgentId::parse(&agent_id)?,
+        agent_id,
         seq,
         source_time_ms: row.get(3)?,
         source_key: row.get(4)?,
@@ -1004,7 +1154,16 @@ fn message_from_row(
         text: row.get(6)?,
         reply_to: row.get(7)?,
         received_at_ms: row.get(8)?,
-        ack,
+        ack: if seq <= processed {
+            Ack::Processed
+        } else if seq <= accepted {
+            Ack::Accepted
+        } else {
+            Ack::Received
+        },
+        failed_reason,
+        delivered_at_ms: row.get(9)?,
+        processed_at_delivery: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -1013,7 +1172,6 @@ fn message_by_source(
     agent_id: &AgentId,
     source_key: &str,
 ) -> Result<Option<Message>, Error> {
-    let (accepted, processed) = cursors(conn, agent_id)?;
     let found = conn
         .query_row(
             &format!(
@@ -1021,7 +1179,7 @@ fn message_by_source(
                  WHERE agent_id = ?1 AND source_key = ?2"
             ),
             params![agent_id.as_str(), source_key],
-            |row| Ok(message_from_row(row, accepted, processed)),
+            |row| Ok(message_from_row(conn, row)),
         )
         .optional()?;
     found.transpose()
@@ -1125,9 +1283,9 @@ mod tests {
             .unwrap();
         assert_eq!(mode, "wal");
         let version = migrate::current_version(&store.conn()).unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let again = Store::open(dir.path().join("state.db")).unwrap();
-        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 2);
+        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 3);
         assert_eq!(again.list_agents().unwrap(), store.list_agents().unwrap());
     }
 
@@ -1214,6 +1372,8 @@ mod tests {
         let (_dir, store) = setup();
         let agent = agent(&store, "alpha");
         store.receive(&agent.id, Incoming::new("a")).unwrap();
+        // The turn finished before the hand-over was seen.
+        store.note_handover(&agent.id, 1, true).unwrap();
         store.note_delivery(&agent.id, 1, true).unwrap();
         assert_eq!(store.accepted_cursor(&agent.id).unwrap(), 1);
         assert_eq!(store.processed_cursor(&agent.id).unwrap(), 1);
