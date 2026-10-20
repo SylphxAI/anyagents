@@ -32,6 +32,11 @@ pub fn child_env() -> Vec<(String, String)> {
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     let mut env = request.extra_env;
+    let root = request.data_dir.clone();
+    // An agent's own launch environment: the gateway origin for the API it
+    // speaks, and this agent's own token. Never a provider key.
+    let mut launch_env = request.agent.launch_env.clone();
+    env.append(&mut launch_env);
     if request.agent.harness == "opencode" {
         // The agent's config directory is the in-project config OpenCode reads.
         // Credentials stay in the user's state directory, which the child
@@ -40,8 +45,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             "XDG_CONFIG_HOME".to_string(),
             request.config_dir.display().to_string(),
         ));
-        let program =
-            std::env::var("ANYAGENTS_OPENCODE_BIN").unwrap_or_else(|_| "opencode".to_string());
+        let program = crate::install::program(&root, &request.agent.harness);
         // The test double is this binary with one subcommand.
         let doubles = std::env::var_os("ANYAGENTS_FAKE_OPENCODE").is_some();
         let harness = OpenCodeHarness::start_double(
@@ -58,17 +62,16 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             "CODEX_HOME".to_string(),
             request.config_dir.display().to_string(),
         ));
-        let program = std::env::var("ANYAGENTS_CODEX_BIN").unwrap_or_else(|_| "codex".to_string());
-        let harness = start_codex(&program, &env, &request.work_dir)?;
+        let program = crate::install::program(&root, &request.agent.harness);
+        let harness = start_codex(&program.display().to_string(), &env, &request.work_dir)?;
         Ok(VendorHarness::Codex(harness))
     } else {
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
             request.config_dir.display().to_string(),
         ));
-        let program =
-            std::env::var("ANYAGENTS_CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
-        let harness = start_claude(&program, &env, &request.work_dir)?;
+        let program = crate::install::program(&root, &request.agent.harness);
+        let harness = start_claude(&program.display().to_string(), &env, &request.work_dir)?;
         Ok(VendorHarness::Claude(harness))
     }
 }

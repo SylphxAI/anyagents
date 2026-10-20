@@ -16,6 +16,8 @@ use clap::{Parser, Subcommand};
 mod api;
 mod create;
 mod fake_opencode;
+mod gateway;
+mod install;
 mod mcp;
 mod mcp_config;
 mod opencode_config;
@@ -57,6 +59,20 @@ enum Command {
     Agents {
         #[command(subcommand)]
         action: AgentsCommand,
+    },
+    /// Store the provider key an agent's model runs on (API key mode).
+    Model {
+        /// The agent name.
+        agent: String,
+        /// The provider origin, for example https://api.deepseek.com.
+        #[arg(long = "base-url")]
+        base_url: String,
+        /// The model id the provider serves, for example deepseek-chat.
+        #[arg(long)]
+        model: String,
+        /// A file holding the key, on its own line. The key is never an argument.
+        #[arg(long = "key-file")]
+        key_file: PathBuf,
     },
     /// Append a message to an agent's mailbox.
     Send {
@@ -167,6 +183,12 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Mcp { agent } => mcp::run(&cli.data, &agent),
         Command::FakeOpencode => fake_opencode::run(),
         Command::Agents { action } => agents(&cli.data, action),
+        Command::Model {
+            agent,
+            base_url,
+            model,
+            key_file,
+        } => store_key(&cli.data, &agent, &base_url, &model, &key_file),
         Command::Send {
             to,
             text,
@@ -200,6 +222,38 @@ fn list_harnesses() {
             signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
         );
     }
+}
+
+/// Store an agent's provider key. The key is read from a file, kept 0600 under
+/// the agent's directory, and never printed. The next turn then runs through the
+/// server's gateway on that provider.
+fn store_key(
+    data: &Path,
+    agent: &str,
+    base_url: &str,
+    model: &str,
+    key_file: &Path,
+) -> Result<(), anyagents_core::Error> {
+    let raw = std::fs::read_to_string(key_file)?;
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(anyagents_core::Error::Message(format!(
+            "{} holds no key",
+            key_file.display()
+        )));
+    }
+    if key.contains(char::is_whitespace) {
+        return Err(anyagents_core::Error::Message(format!(
+            "{} does not hold one key on its own line",
+            key_file.display()
+        )));
+    }
+    let store = open(data)?;
+    let recorded = store.agent_by_name(agent)?;
+    let data = std::path::absolute(data)?;
+    gateway::store_key(&data, &recorded, base_url, model, key)?;
+    println!("key stored\t{}\t{}", recorded.name, model);
+    Ok(())
 }
 
 /// The installer's sign-in, run against the agent's own config directory. This

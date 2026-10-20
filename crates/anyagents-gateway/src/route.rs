@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 /// Which provider protocol a route speaks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,9 +36,12 @@ pub trait RouteResolver: Send + Sync {
 pub use RouteResolver as RouteTable;
 
 /// In-memory [`RouteResolver`] for tests and for a server that keeps routes itself.
-#[derive(Debug, Default)]
+///
+/// A clone shares one table, so a caller that keeps a handle sees every route
+/// the server adds after the gateway has started.
+#[derive(Clone, Debug, Default)]
 pub struct MemoryRoutes {
-    routes: RwLock<HashMap<String, ProviderRoute>>,
+    routes: Arc<RwLock<HashMap<String, ProviderRoute>>>,
 }
 
 impl MemoryRoutes {
@@ -51,6 +54,11 @@ impl MemoryRoutes {
             .write()
             .expect("route table")
             .insert(token.into(), route);
+    }
+
+    /// Forget a token, so an agent created again gets a fresh one.
+    pub fn remove(&self, token: &str) {
+        self.routes.write().expect("route table").remove(token);
     }
 }
 

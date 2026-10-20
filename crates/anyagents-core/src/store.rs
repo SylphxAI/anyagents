@@ -37,6 +37,9 @@ pub struct Agent {
     pub instructions: Option<String>,
     pub state: String,
     pub created_at_ms: i64,
+    /// The gateway origin and this agent's own gateway token, set at create.
+    /// Never a provider key.
+    pub launch_env: Vec<(String, String)>,
 }
 
 /// Fields for `agents.create`. The harness value is a catalog key.
@@ -381,6 +384,7 @@ impl Store {
             instructions: new.instructions,
             state: "created".into(),
             created_at_ms: now_ms(),
+            launch_env: Vec::new(),
         };
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -422,7 +426,7 @@ impl Store {
         let conn = self.conn();
         let found = conn
             .query_row(
-                "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+                "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
                  FROM agents WHERE name = ?1",
                 [name],
                 agent_from_row,
@@ -434,7 +438,7 @@ impl Store {
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
              FROM agents ORDER BY name",
         )?;
         let mut rows = stmt.query([])?;
@@ -574,6 +578,44 @@ impl Store {
             agent_id: agent_id.clone(),
         });
         Ok(ReceiveOutcome::New(message))
+    }
+
+    /// Store the environment the agent's harness is started with, and wake it
+    /// so the next start reads it. Never called with a provider key.
+    pub fn set_agent_launch_env(
+        &self,
+        id: &AgentId,
+        env: &[(String, String)],
+    ) -> Result<Agent, Error> {
+        let json = encode_env(env);
+        let changed = {
+            let conn = self.conn();
+            // A database written before this column existed still reads: the
+            // harness then keeps whatever sign-in it already has.
+            let updated = conn
+                .execute(
+                    "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+                    params![json, id.as_str()],
+                )
+                .map_err(|err| match err {
+                    rusqlite::Error::SqliteFailure(_, Some(ref text))
+                        if text.contains("no column named launch_env") =>
+                    {
+                        Error::Message(
+                            "this database has no launch environment column yet".to_string(),
+                        )
+                    }
+                    other => other.into(),
+                })?;
+            if updated == 0 {
+                return Err(Error::AgentNotFound(id.to_string()));
+            }
+            agent_by_id(&conn, id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(changed)
     }
 
     /// Store the work directory and mark the agent running.
@@ -1054,13 +1096,102 @@ fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
 fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
     let found = conn
         .query_row(
-            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
              FROM agents WHERE id = ?1",
             [id.as_str()],
             agent_from_row,
         )
         .optional()?;
     found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
+}
+
+/// A launch environment is a list of name and value pairs, stored as JSON so a
+/// value with an `=` or a space survives. Values are never keys.
+fn encode_env(env: &[(String, String)]) -> String {
+    let pairs: Vec<[&str; 2]> = env
+        .iter()
+        .map(|(name, value)| [name.as_str(), value.as_str()])
+        .collect();
+    let mut out = String::from("[");
+    for (index, [name, value]) in pairs.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!("[{},{}]", quote(name), quote(value)));
+    }
+    out.push(']');
+    out
+}
+
+fn quote(text: &str) -> String {
+    let mut out = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            control if control < ' ' => out.push_str(&format!("\\u{:04x}", u32::from(control))),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Read what [`encode_env`] wrote. Anything unreadable reads as no environment.
+fn decode_env(text: &str) -> Vec<(String, String)> {
+    let bytes = text.as_bytes();
+    let mut at = 0;
+    let mut env = Vec::new();
+    while let Some(open) = text[at..].find('[') {
+        at += open + 1;
+        let Some((name, next)) = read_string(bytes, at) else {
+            break;
+        };
+        let after = next + text[next..].find(',').map_or(0, |comma| comma + 1);
+        let Some((value, end)) = read_string(bytes, after) else {
+            return env;
+        };
+        env.push((name, value));
+        at = end;
+    }
+    env
+}
+
+/// One JSON string starting at `at`, and where the closing quote is.
+fn read_string(bytes: &[u8], at: usize) -> Option<(String, usize)> {
+    if bytes.get(at) != Some(&b'"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut index = at + 1;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => return Some((out, index + 1)),
+            b'\\' => {
+                match bytes.get(index + 1)? {
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'u' => {
+                        let hex = std::str::from_utf8(bytes.get(index + 2..index + 6)?).ok()?;
+                        let code = u32::from_str_radix(hex, 16).ok()?;
+                        out.push(char::from_u32(code)?);
+                        index += 4;
+                    }
+                    other => out.push(char::from(*other)),
+                }
+                index += 2;
+            }
+            _ => {
+                let rest = std::str::from_utf8(&bytes[index..]).ok()?;
+                let ch = rest.chars().next()?;
+                out.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+    None
 }
 
 fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
@@ -1076,6 +1207,10 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         instructions: row.get(5)?,
         state: row.get(6)?,
         created_at_ms: row.get(7)?,
+        launch_env: row
+            .get::<_, Option<String>>(8)?
+            .map(|json| decode_env(&json))
+            .unwrap_or_default(),
     })
 }
 

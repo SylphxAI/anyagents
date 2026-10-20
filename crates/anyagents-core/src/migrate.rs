@@ -16,6 +16,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_channel_credential.sql")),
     (3, include_str!("../migrations/003_failed_turns.sql")),
+    (4, include_str!("../migrations/004_launch_env.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.

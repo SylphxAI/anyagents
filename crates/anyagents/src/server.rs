@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
+use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::{CommandRunner, InstallError, LineSink, builtin_catalog, sign_in};
 use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
 use axum::body::Body;
@@ -77,6 +78,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         vendor::child_env(),
     )
     .map_err(Error::Message)?;
+    crate::gateway::start(data)?;
     let state = AppState {
         store,
         health: supervisor.board(),
@@ -110,6 +112,33 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// A loopback port the operating system picked, held open until the caller
+/// serves on it, or why none could be bound.
+pub fn listen_on_loopback() -> Result<(u16, tokio::net::TcpListener), Error> {
+    // A non-blocking listener before it joins the runtime; the runtime makes it
+    // blocking-polled itself.
+    let address = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    address.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(address)?;
+    let port = listener.local_addr()?.port();
+    Ok((port, listener))
+}
+
+/// Serve the gateway on the loopback listener it was given, for the life of the
+/// process. Each harness reaches it with its own token; nothing else can. It
+/// runs on the server's runtime, so the caller must be inside one.
+pub fn serve_gateway(
+    listener: tokio::net::TcpListener,
+    routes: MemoryRoutes,
+    usage: anyagents_gateway::MemoryUsage,
+) -> Result<(), Error> {
+    let app = anyagents_gateway::router(routes, usage);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok(())
 }
 
 fn prepare_socket(path: &Path) -> Result<(), Error> {
@@ -293,7 +322,18 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         quota_reset_at_ms: quota,
         oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
         oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
+        install: install_state(agent),
     })
+}
+
+/// `installed` once this harness is on the machine, `needed` when the reason it
+/// is not, `pending` when nothing has been recorded yet.
+fn install_state(agent: &Agent) -> String {
+    match crate::install::recorded(&agent.harness) {
+        Some(Ok(())) => "installed".to_string(),
+        Some(Err(reason)) => reason,
+        None => "pending".to_string(),
+    }
 }
 
 async fn create_agent_route(

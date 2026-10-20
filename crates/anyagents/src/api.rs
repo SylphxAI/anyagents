@@ -17,6 +17,9 @@ pub struct AgentView {
     pub quota_reset_at_ms: Option<i64>,
     pub oldest_unaccepted_age_ms: Option<i64>,
     pub oldest_unprocessed_age_ms: Option<i64>,
+    /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
+    /// has been installed yet, and what stopped it.
+    pub install: String,
 }
 
 fn default_harness() -> String {

@@ -233,7 +233,13 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(got.messages.len(), 2);
     assert_eq!(got.messages[0].text, "hello");
     assert_eq!(got.messages[0].sender.as_deref(), Some("agent:alpha"));
-    assert_eq!(got.messages[0].ack, "received");
+    // The running agent takes the message at once; a turn may already have
+    // processed it, so the acknowledgement is at least `accepted`.
+    assert!(
+        matches!(got.messages[0].ack.as_str(), "accepted" | "processed"),
+        "{}",
+        got.messages[0].ack
+    );
 
     let rejected = call(
         &alpha,

@@ -19,6 +19,8 @@ pub enum InstallMethod {
     VendorScript { url: String },
     /// A release binary checked against a published checksum.
     ReleaseBinary { url: String, sha256: String },
+    /// The vendor tool is already on the machine and AnyAgents only records it.
+    Vendored,
 }
 
 /// Which models a subscription on this harness may run, and where that was read.
@@ -71,9 +73,7 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
         ),
         entry(
             "opencode",
-            InstallMethod::Npm {
-                package: "opencode-ai".to_string(),
-            },
+            InstallMethod::Vendored,
             vec![
                 "opencode".to_string(),
                 "auth".to_string(),
@@ -188,15 +188,18 @@ pub fn ensure_installed(
         return Ok(dir);
     }
     std::fs::create_dir_all(&dir).map_err(|e| InstallError::Failed(e.to_string()))?;
-    let (program, args) = install_command(&entry.install, version);
-    runner.run(&program, &args, &dir, &[], &mut NopLines)?;
+    if let Some((program, args)) = install_command(&entry.install, version) {
+        runner.run(&program, &args, &dir, &[], &mut NopLines)?;
+    }
     std::fs::write(dir.join(".installed"), version)
         .map_err(|e| InstallError::Failed(e.to_string()))?;
     Ok(dir)
 }
 
-fn install_command(method: &InstallMethod, version: &str) -> (String, Vec<String>) {
-    match method {
+/// The command that installs one method. `None` means the tool is already on
+/// the machine and only its version is recorded.
+fn install_command(method: &InstallMethod, version: &str) -> Option<(String, Vec<String>)> {
+    Some(match method {
         InstallMethod::Npm { package } => (
             "npm".to_string(),
             vec![
@@ -217,6 +220,76 @@ fn install_command(method: &InstallMethod, version: &str) -> (String, Vec<String
                 format!("curl -fsSL -o bin {url} && printf '%s  bin\\n' {sha256} | sha256sum -c -"),
             ],
         ),
+        InstallMethod::Vendored => return None,
+    })
+}
+
+/// The version an install records for a harness. `npm` is asked which version
+/// it would install; a vendored tool is whatever the machine has. Unreadable
+/// count as `unpinned`: the harness still runs, from the machine's own copy.
+pub fn catalog_version(
+    catalog: &[CatalogEntry],
+    harness: &str,
+    runner: &mut dyn CommandRunner,
+) -> Result<String, InstallError> {
+    let entry = catalog
+        .iter()
+        .find(|e| e.id == harness)
+        .ok_or_else(|| InstallError::UnknownHarness(harness.to_string()))?;
+    match &entry.install {
+        InstallMethod::Npm { package } => {
+            let mut out = String::new();
+            let dir = std::env::temp_dir();
+            let mut sink = TextSink(&mut out);
+            match runner.run(
+                "npm",
+                &["view".to_string(), package.clone(), "version".to_string()],
+                &dir,
+                &[],
+                &mut sink,
+            ) {
+                Ok(()) => {
+                    let version = out.trim();
+                    if version.is_empty() {
+                        Ok(UNPINNED.to_string())
+                    } else {
+                        Ok(version.to_string())
+                    }
+                }
+                Err(_) => Ok(UNPINNED.to_string()),
+            }
+        }
+        _ => Ok(UNPINNED.to_string()),
+    }
+}
+
+/// Recorded when the machine's copy of a tool is used at whatever version it is.
+pub const UNPINNED: &str = "unpinned";
+
+/// The launcher a harness's own copy is called when the machine has one.
+fn launcher_name(harness: &str) -> &str {
+    match harness {
+        "claude-code" => "claude",
+        other => other,
+    }
+}
+
+/// Whether the harness's launcher is already on `PATH`.
+pub fn machine_has(harness: &str) -> bool {
+    let name = launcher_name(harness);
+    std::env::var_os("PATH").is_some_and(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(name))
+            .any(|candidate| candidate.is_file())
+    })
+}
+
+struct TextSink<'a>(&'a mut String);
+
+impl LineSink for TextSink<'_> {
+    fn line(&mut self, line: &str) {
+        self.0.push_str(line);
+        self.0.push('\n');
     }
 }
 
@@ -478,6 +551,38 @@ mod tests {
                 .any(|a| a.contains("@anthropic-ai/claude-code@2.0.0"))
         );
         assert!(call.dir.ends_with("harnesses/claude-code/2.0.0"));
+    }
+
+    #[test]
+    fn a_vendored_harness_installs_nothing_and_records_the_machine_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let catalog = vec![entry(
+            "opencode",
+            InstallMethod::Vendored,
+            vec!["opencode".to_string()],
+            None,
+            vec![],
+            "",
+        )];
+        let mut runner = ScriptedRunner::default();
+        let dir =
+            ensure_installed(&catalog, root.path(), "opencode", UNPINNED, &mut runner).unwrap();
+        assert!(runner.calls.is_empty(), "{:?}", runner.calls);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(".installed")).unwrap(),
+            UNPINNED
+        );
+        ensure_installed(&catalog, root.path(), "opencode", UNPINNED, &mut runner).unwrap();
+        assert!(runner.calls.is_empty(), "{:?}", runner.calls);
+    }
+
+    #[test]
+    fn an_npm_harness_is_pinned_to_the_version_npm_reports() {
+        let mut runner = ScriptedRunner::default();
+        runner.answer("npm", "1.2.3\n");
+        let version = catalog_version(&catalog(), "codex", &mut runner).unwrap();
+        assert_eq!(version, "1.2.3");
+        assert_eq!(runner.calls[0].args, ["view", "@openai/codex", "version"]);
     }
 
     #[test]

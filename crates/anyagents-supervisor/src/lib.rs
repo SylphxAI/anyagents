@@ -180,6 +180,8 @@ fn fnv1a(text: &str) -> u64 {
 #[derive(Clone, Debug)]
 pub struct LaunchRequest {
     pub agent: Agent,
+    /// The AnyAgents data directory: where installed harnesses live.
+    pub data_dir: std::path::PathBuf,
     pub config_dir: PathBuf,
     pub work_dir: PathBuf,
     pub extra_env: Vec<(String, String)>,
@@ -651,6 +653,7 @@ impl<H: Harness + 'static> Session<H> {
         let _ = fs::create_dir_all(&self.paths.work_dir);
         (self.inner.launch)(LaunchRequest {
             agent: self.agent.clone(),
+            data_dir: self.inner.store.data_dir().to_path_buf(),
             config_dir: self.paths.config_dir.clone(),
             work_dir: self.paths.work_dir.clone(),
             extra_env: self.inner.extra_env.clone(),

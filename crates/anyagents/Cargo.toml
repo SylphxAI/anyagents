@@ -10,6 +10,7 @@ description = "Server, command line, and MCP entry point for long-lived coding a
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-channel-telegram = { path = "../anyagents-channel-telegram" }
 anyagents-core = { path = "../anyagents-core" }
+anyagents-gateway = { path = "../anyagents-gateway" }
 anyagents-harness = { path = "../anyagents-harness" }
 anyagents-installer = { path = "../anyagents-installer" }
 anyagents-harness-claude = { path = "../anyagents-harness-claude" }
