@@ -45,8 +45,18 @@ mod tests {
     #[test]
     fn the_model_and_the_mcp_server_are_written() {
         let dir = tempfile::tempdir().unwrap();
-        let args = vec!["--data".to_string(), "/tmp/d".to_string(), "mcp".to_string()];
-        write(dir.path(), Some("sylphx/deepseek"), Path::new("/bin/anyagents"), &args).unwrap();
+        let args = vec![
+            "--data".to_string(),
+            "/tmp/d".to_string(),
+            "mcp".to_string(),
+        ];
+        write(
+            dir.path(),
+            Some("sylphx/deepseek"),
+            Path::new("/bin/anyagents"),
+            &args,
+        )
+        .unwrap();
         let parsed: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.path().join("opencode.json")).unwrap())
                 .unwrap();
