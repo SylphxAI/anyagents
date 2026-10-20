@@ -71,7 +71,6 @@ dependencies = [
 name = "anyagents"
 version = "0.1.0"
 dependencies = [
- "anyagents-agent",
  "anyagents-channel-telegram",
  "anyagents-core",
  "anyagents-harness",
@@ -139,7 +138,6 @@ dependencies = [
  "bytes",
  "futures",
  "reqwest",
- "serde",
  "serde_json",
  "thiserror",
  "tokio",

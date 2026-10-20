@@ -7,8 +7,17 @@ rust-version = "1.98"
 description = "Crash-injection tests for the delivery guarantees"
 publish = false
 
+# The guarantees are integration tests, so every dependency below exists for the
+# tests in `tests/`.
 [dev-dependencies]
 anyagents-agent = { path = "../../crates/anyagents-agent" }
 anyagents-core = { path = "../../crates/anyagents-core" }
 anyagents-harness = { path = "../../crates/anyagents-harness" }
 tempfile = "3"
+
+# `cargo test --workspace --all-targets` reports a test crate's own dependencies
+# as unused in the target it tests. Only a workspace member that is built as a
+# linker root (like `anyagents`) is checked; an empty list keeps the ignore from
+# matching every crate.
+[package.metadata.cargo-machete]
+ignored = []

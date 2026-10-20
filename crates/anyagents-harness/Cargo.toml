@@ -8,3 +8,10 @@ description = "Harness adapter contract and a scripted fake harness"
 
 [dependencies]
 thiserror = "2"
+
+# `cargo test --workspace --all-targets` reports the dependencies of a bin or a
+# test target as unused in that target. Only a workspace member that is built as
+# a linker root (like `anyagents`) is checked; an empty list keeps the ignore
+# from matching every crate.
+[package.metadata.cargo-machete]
+ignored = []

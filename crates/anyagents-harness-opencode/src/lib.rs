@@ -1,31 +1,29 @@
-//! OpenCode adapter.
+//! Spec: `docs/vision.md` "First version" item 2 (any harness through one
+//! adapter contract) and item 3 (AnyAgents owns the answer).
 //!
-//! One child runs `opencode serve`. Messages are one JSON object per line. The
-//! mailbox id is the first line of the user text (`anyagents-message:<id>`). An
-//! id already written, or echoed back, is not written again.
+//! The OpenCode harness is one catalog entry, not a copied adapter: this crate
+//! is the thin name the server starts it by. Its launch shape, closing line,
+//! reported cost and answer text come from `StreamSpec::for_program("opencode")`.
 //!
 //! Declared delivery mode is followup: a message written while a turn is open
-//! waits for the next `result`. Steer support is unproven. Token counts and a
-//! reported cost, when the vendor sends one, are kept on the finished ids.
-//!
-//! Resume starts the child again with `--session` when the session id changed or
-//! the process has exited. Cancel writes `{"type":"cancel"}`.
-//!
-//! The answer a turn produced is the last `text` line after the prompt, up to
-//! and including the `result` line. It is read with [`OpenCodeHarness::answer`]
-//! and does not finish the turn.
+//! waits for the next `result`. Steer support is unproven. Resume starts the
+//! child again with `--session` when the session id changed or the process has
+//! exited. An answer is the last `text` line after the prompt, up to and
+//! including the `result` line, and does not finish the turn.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::Arc;
+use std::time::Duration;
 
-use anyagents_harness::{DeliveryMode, SteerSupport, marked_message};
-use anyagents_harness_stream::{Launch, LineEffect, StreamHarness};
-use serde_json::{Value, json};
+use anyagents_harness::{
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnUsage,
+};
+use anyagents_harness_stream::{StreamHarness, StreamSpec, cancel_line, message_line};
 
 /// One long-lived OpenCode `serve` child.
 pub struct OpenCodeHarness {
     inner: StreamHarness,
+    spec: StreamSpec,
 }
 
 impl OpenCodeHarness {
@@ -37,7 +35,7 @@ impl OpenCodeHarness {
         program: impl Into<PathBuf>,
         session_id: Option<&str>,
         environment: &[(&str, &str)],
-    ) -> Result<Self, anyagents_harness::HarnessError> {
+    ) -> Result<Self, HarnessError> {
         Self::start_in(program, session_id, environment, None)
     }
 
@@ -47,7 +45,7 @@ impl OpenCodeHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
-    ) -> Result<Self, anyagents_harness::HarnessError> {
+    ) -> Result<Self, HarnessError> {
         Self::start_double(program, None, session_id, environment, work_dir)
     }
 
@@ -59,25 +57,34 @@ impl OpenCodeHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
-    ) -> Result<Self, anyagents_harness::HarnessError> {
-        let mut args = vec![subcommand.unwrap_or("serve").to_string()];
-        if let Some(id) = session_id {
-            args.push("--session".to_string());
-            args.push(id.to_string());
+    ) -> Result<Self, HarnessError> {
+        let environment = environment
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let mut spec = StreamSpec::for_program("opencode");
+        if let Some(subcommand) = subcommand {
+            spec.args = vec![subcommand.to_string()];
         }
-        Ok(Self {
-            inner: StreamHarness::launch(Launch {
-                name: "anyagents-opencode".to_string(),
-                program: program.into(),
-                args,
-                environment: owned_env(environment),
-                work_dir: work_dir.map(Path::to_path_buf),
-                session_id: session_id.map(str::to_string),
-                mode: DeliveryMode::Followup,
-                steer: SteerSupport::Unproven,
-                on_line: Arc::new(read_line),
-            })?,
-        })
+        let args = {
+            let mut args = spec.args.clone();
+            if let Some(id) = session_id {
+                args.push(spec.resume_flag.to_string());
+                args.push(id.to_string());
+            }
+            args
+        };
+        let inner = StreamHarness::launch(anyagents_harness_stream::Launch {
+            spec: spec.clone(),
+            program: program.into(),
+            args,
+            environment,
+            work_dir: work_dir.map(Path::to_path_buf),
+            session_id: session_id.map(str::to_string),
+            mode: DeliveryMode::Followup,
+            steer: SteerSupport::Unproven,
+        })?;
+        Ok(Self { inner, spec })
     }
 
     pub fn written_ids(&self) -> Vec<String> {
@@ -89,24 +96,24 @@ impl OpenCodeHarness {
     pub fn session_id(&self) -> Option<String> {
         self.inner.session_id()
     }
-    pub fn wait_finished(&self, id: &str, timeout: std::time::Duration) -> bool {
+    pub fn wait_finished(&self, id: &str, timeout: Duration) -> bool {
         self.inner.wait_finished(id, timeout)
     }
-    pub fn wait_quota(&self, timeout: std::time::Duration) -> Option<i64> {
+    pub fn wait_quota(&self, timeout: Duration) -> Option<i64> {
         self.inner.wait_quota(timeout)
     }
-    pub fn usage_for(&self, id: &str) -> Option<anyagents_harness::TurnUsage> {
+    pub fn usage_for(&self, id: &str) -> Option<TurnUsage> {
         self.inner.usage_for(id)
     }
     pub fn seen(&self, id: &str) -> bool {
         self.inner.seen(id)
     }
-    pub fn wait_seen(&self, id: &str, timeout: std::time::Duration) -> bool {
+    pub fn wait_seen(&self, id: &str, timeout: Duration) -> bool {
         self.inner.wait_seen(id, timeout)
     }
     /// Wait `quiet` with no line from the child. A quiet turn the child never
     /// closed is finished when the answer stands still.
-    pub fn wait_quiet(&self, quiet: std::time::Duration, patience: std::time::Duration) -> bool {
+    pub fn wait_quiet(&self, quiet: Duration, patience: Duration) -> bool {
         self.inner.quiet(quiet, patience)
     }
     /// The turn for `id` ended on quiet, not on a result line.
@@ -119,108 +126,37 @@ impl OpenCodeHarness {
     }
 }
 
-impl anyagents_harness::Harness for OpenCodeHarness {
-    fn deliver(
-        &mut self,
-        message: &anyagents_harness::OutboundMessage,
-    ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
-        let line = json!({
-            "type": "prompt",
-            "text": marked_message(&message.id, &message.text)
-        });
-        self.inner.deliver(message, &line)
+impl Harness for OpenCodeHarness {
+    fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        self.inner
+            .deliver(message, &message_line(&self.spec, message))
     }
 
-    fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+    fn background(&mut self) -> Result<(), HarnessError> {
         self.inner.background()
     }
 
-    fn resume(&mut self, session: &str) -> Result<(), anyagents_harness::HarnessError> {
-        let mut command = Command::new(self.inner.program());
-        command.arg("serve").arg("--session").arg(session);
-        self.inner.resume(session, command)
+    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+        self.inner.resume(session)
     }
 
-    fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
-        self.inner.cancel(&json!({"type": "cancel"}))
+    fn cancel(&mut self) -> Result<(), HarnessError> {
+        self.inner.cancel(&cancel_line(&self.spec))
     }
 
     fn answer_for(&self, id: &str) -> Option<String> {
         self.answer(id)
     }
 
-    fn ends_on_quiet(&self) -> Option<std::time::Duration> {
-        Some(std::time::Duration::from_millis(500))
+    fn ends_on_quiet(&self) -> Option<Duration> {
+        Some(Duration::from_millis(500))
     }
 
-    fn quiet_for(
-        &self,
-        _id: &str,
-        quiet: std::time::Duration,
-        patience: std::time::Duration,
-    ) -> bool {
+    fn quiet_for(&self, _id: &str, quiet: Duration, patience: Duration) -> bool {
         self.wait_quiet(quiet, patience)
     }
 
-    fn health(&self) -> anyagents_harness::HarnessHealth {
+    fn health(&self) -> HarnessHealth {
         self.inner.health()
     }
-}
-
-fn owned_env(environment: &[(&str, &str)]) -> Vec<(String, String)> {
-    environment
-        .iter()
-        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
-        .collect()
-}
-
-fn read_line(value: &Value) -> LineEffect {
-    let is_result = value.get("type").and_then(Value::as_str) == Some("result");
-    LineEffect {
-        finishes_turn: is_result,
-        session_id: value
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        usage: is_result.then(|| usage_of(value)),
-        quota_reset_at_ms: quota_of(value),
-        text: answer_of(value, is_result),
-    }
-}
-
-/// A text line, or the text on the `result` line itself, is the answer so far.
-fn answer_of(value: &Value, is_result: bool) -> Option<String> {
-    if !(is_result || value.get("type").and_then(Value::as_str) == Some("text")) {
-        return None;
-    }
-    value
-        .get("text")
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
-        .map(str::to_string)
-}
-
-fn usage_of(value: &Value) -> anyagents_harness::TurnUsage {
-    let usage = value.get("usage");
-    anyagents_harness::TurnUsage {
-        input_tokens: number(usage, "input_tokens"),
-        output_tokens: number(usage, "output_tokens"),
-        cache_read_tokens: number(usage, "cache_read_tokens"),
-        cache_write_tokens: number(usage, "cache_write_tokens"),
-        reported_cost_micros: value.get("cost_micros").and_then(Value::as_i64),
-    }
-}
-
-fn number(value: Option<&Value>, key: &str) -> u64 {
-    value
-        .and_then(|item| item.get(key))
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-}
-
-fn quota_of(value: &Value) -> Option<i64> {
-    if value.get("type").and_then(Value::as_str) != Some("rate_limit") {
-        return None;
-    }
-    value.get("resets_at_ms").and_then(Value::as_i64)
 }
