@@ -1,0 +1,23 @@
+{
+  "name": "@sylphx/anyagents-darwin-arm64",
+  "version": "0.1.0",
+  "description": "anyagents native binary for darwin-arm64. Installed as an optional dependency of @sylphx/anyagents.",
+  "os": [
+    "darwin"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "files": [
+    "anyagents"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SylphxAI/anyagents.git",
+    "directory": "packages/npm/darwin-arm64"
+  }
+}

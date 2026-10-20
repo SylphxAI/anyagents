@@ -1,0 +1,14 @@
+{
+  "name": "anyagents-workspace",
+  "private": true,
+  "type": "module",
+  "description": "AnyAgents workspace: the Rust workspace (crates/) builds one binary; the npm launcher and its platform packages live in packages/.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test packages/anyagents/test"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SylphxAI/anyagents.git"
+  }
+}
