@@ -104,8 +104,30 @@ impl CodexHarness {
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
         let harness = Self::launch(program.into(), environment, work_dir)?;
-        match harness.handshake(session_id) {
-            Ok(()) => Ok(harness),
+        match harness.handshake(session_id, false) {
+            Ok(_) => Ok(harness),
+            Err(err) => {
+                if harness.health().process_alive {
+                    Err(err)
+                } else {
+                    Ok(harness)
+                }
+            }
+        }
+    }
+
+    /// Start one child and resume `session_id`, or start a new thread when the
+    /// vendor says it does not have that thread. Reaching the vendor at all is
+    /// a start; a failed resume is reported on stderr, never silently kept.
+    pub fn start_after_restart(
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
+        let harness = Self::launch(program.into(), environment, work_dir)?;
+        match harness.handshake(session_id, session_id.is_some()) {
+            Ok(_) => Ok(harness),
             Err(err) => {
                 if harness.health().process_alive {
                     Err(err)
@@ -242,28 +264,112 @@ impl CodexHarness {
         Ok(harness)
     }
 
-    fn handshake(&self, session: Option<&str>) -> Result<(), HarnessError> {
+    /// Complete the handshake and, when a session was given, `restart` says
+    /// whether a thread the vendor refuses starts a new one instead. The answer
+    /// says whether the vendor resumed the session.
+    fn handshake(&self, session: Option<&str>, restart: bool) -> Result<bool, HarnessError> {
         self.rpc(
             "initialize",
             json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
         )?;
         self.notify("initialized", json!({}))?;
-        let (method, params) = if let Some(session) = session {
-            ("thread/resume", json!({"threadId": session}))
+        let mut session = session.map(str::to_string);
+        let mut resumed = session.is_some();
+        let mut method = if session.is_some() {
+            "thread/resume"
         } else {
-            ("thread/start", json!({}))
+            "thread/start"
         };
-        let result = self.rpc(method, params)?;
+        let result = match self.startup_call(method, params_for(method, &session)) {
+            Ok(result) if restart && resumed && thread_refused(&result.to_string()) => {
+                let err = rpc_failure(&result);
+                eprintln!(
+                    "anyagents-codex: thread {} was not resumed ({err}); starting a new one",
+                    session.as_deref().unwrap_or_default()
+                );
+                thread_start(&mut session, &mut resumed, &mut method)?;
+                self.startup_call(method, params_for(method, &session))?
+            }
+            Ok(result) => result,
+            // A thread this vendor does not have is a new conversation, said
+            // out loud rather than hidden. Any other failure is reported.
+            Err(err) if restart && resumed && thread_refused(&err.to_string()) => {
+                eprintln!(
+                    "anyagents-codex: thread {} was not resumed ({err}); starting a new one",
+                    session.as_deref().unwrap_or_default()
+                );
+                thread_start(&mut session, &mut resumed, &mut method)?;
+                self.startup_call(method, params_for(method, &session))?
+            }
+            Err(err) => return Err(err),
+        };
         let thread_id = result
             .pointer("/thread/id")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned)
-            .or_else(|| session.map(ToOwned::to_owned));
+            .or(session);
         let Some(thread_id) = thread_id else {
             return Err(HarnessError::Failed("thread id missing".into()));
         };
         lock(&self.shared).thread_id = Some(thread_id);
-        Ok(())
+        Ok(resumed)
+    }
+
+    /// One startup call, which succeeds even when the vendor answers an error:
+    /// the refusal is read by the caller, not turned into a stop at startup.
+    fn startup_call(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
+        match self.call_raw(method, params) {
+            Ok(value) => Ok(value),
+            Err(CallFail::Dead) => Err(HarnessError::Dead),
+            Err(CallFail::Quota(_)) => Err(HarnessError::Failed("quota during startup".into())),
+            Err(CallFail::Failed(reason)) => Ok(json!({"error": {"message": reason}})),
+        }
+    }
+
+    /// One call whose error is a possible refusal: the vendor's own error
+    /// comes back as a result, so the caller can tell "no such thread" from a
+    /// request that failed.
+    fn call_raw(&self, method: &str, params: Value) -> Result<Value, CallFail> {
+        let id = {
+            let mut state = lock(&self.shared);
+            if !state.alive {
+                return Err(CallFail::Dead);
+            }
+            state.next_rpc += 1;
+            let id = state.next_rpc;
+            state.pending.insert(id, Pending::Waiting);
+            id
+        };
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        if write_stdin(&self.stdin, &line).is_err() {
+            lock(&self.shared).pending.remove(&id);
+            self.mark_dead();
+            return Err(CallFail::Dead);
+        }
+        let deadline = Instant::now() + RPC_WAIT;
+        let mut state = lock(&self.shared);
+        loop {
+            if let Some(ready) = take_ready(&mut state, id) {
+                return match ready {
+                    Ready::Done(value) => Ok(value),
+                    Ready::Err(error) => Ok(json!({"error": error})),
+                };
+            }
+            if !state.alive {
+                state.pending.remove(&id);
+                return Err(CallFail::Dead);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                state.pending.remove(&id);
+                return Err(CallFail::Failed("timed out".into()));
+            }
+            let (guard, _) = self
+                .wake
+                .wait_timeout(state, deadline - now)
+                .unwrap_or_else(|err| err.into_inner());
+            state = guard;
+        }
     }
 
     fn rpc(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
@@ -366,6 +472,40 @@ impl CodexHarness {
 fn attach_reader(mut harness: CodexHarness, handle: JoinHandle<()>) -> CodexHarness {
     harness.reader = Some(handle);
     harness
+}
+
+/// The params each startup call takes.
+fn params_for(method: &str, session: &Option<String>) -> Value {
+    if method == "thread/resume"
+        && let Some(session) = session
+    {
+        return json!({"threadId": session});
+    }
+    json!({})
+}
+
+/// Start a new thread in place of one the vendor refused.
+fn thread_start(
+    session: &mut Option<String>,
+    resumed: &mut bool,
+    method: &mut &'static str,
+) -> Result<(), HarnessError> {
+    *resumed = false;
+    *session = None;
+    *method = "thread/start";
+    Ok(())
+}
+
+/// `true` when the vendor says this thread does not exist rather than that the
+/// request failed. Only that answer starts a new thread.
+fn thread_refused(text: &str) -> bool {
+    let text = text.to_lowercase();
+    text.contains("not found")
+        || text.contains("notfound")
+        || text.contains("unknown thread")
+        || text.contains("no such thread")
+        || text.contains("does not exist")
+        || text.contains("404")
 }
 
 impl Drop for CodexHarness {

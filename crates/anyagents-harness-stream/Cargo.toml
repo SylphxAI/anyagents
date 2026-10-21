@@ -10,6 +10,10 @@ description = "Long-lived line-stream child shared by followup adapters"
 anyagents-harness = { path = "../anyagents-harness" }
 serde_json = "1"
 
+[features]
+# A restart inside one process, driven by an adapter's test double.
+double = []
+
 
 # `cargo test --workspace --all-targets` reports the dependencies of a bin or a
 # test target as unused in that target. Only a workspace member that is built as

@@ -11,6 +11,14 @@ anyagents-harness = { path = "../anyagents-harness" }
 anyagents-harness-stream = { path = "../anyagents-harness-stream" }
 serde_json = "1"
 
+# A scripted vendor for the restart tests: it answers each vendor's own
+# protocol and writes down the sessions it was asked to resume. It is not part
+# of the released binary.
+[[bin]]
+name = "restart-muse"
+path = "src/bin/vendor_double.rs"
+test = false
+
 [dev-dependencies]
 tempfile = "3"
 
