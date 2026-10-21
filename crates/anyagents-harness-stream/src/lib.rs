@@ -184,6 +184,50 @@ pub struct StreamHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
+    /// The file this vendor writes anything it means to act on, from the
+    /// environment it was started with. Without one, a silent launch is read as
+    /// a refusal after a short wait.
+    inbox: Option<Inbox>,
+}
+
+/// The inbox a stream vendor writes, watched by its state file's stamp.
+#[derive(Clone)]
+struct Inbox {
+    path: PathBuf,
+    stamp: std::time::SystemTime,
+}
+
+impl Inbox {
+    /// The inbox named in `environment`, when the file exists.
+    fn from_environment(environment: &[(String, String)]) -> Option<Self> {
+        let path = environment
+            .iter()
+            .find(|(key, _)| key == INBOX_ENV)
+            .map(|(_, value)| PathBuf::from(value))?;
+        let stamp = std::fs::metadata(&path).ok()?.modified().ok()?;
+        Some(Self { path, stamp })
+    }
+
+    /// Whether the vendor has written to it since this inbox was read.
+    fn changed(&self) -> bool {
+        std::fs::metadata(&self.path)
+            .and_then(|meta| meta.modified())
+            .map(|stamp| stamp > self.stamp)
+            .unwrap_or(false)
+    }
+}
+
+/// The environment variable naming a vendor's inbox file.
+pub const INBOX_ENV: &str = "ANYAGENTS_INBOX";
+
+/// How long a resumed launch is watched for a sign of life, in milliseconds.
+const RESUME_WATCH_MS: i64 = 500;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// Shared by every harness over one child: the owner and any reader.
@@ -191,6 +235,10 @@ struct State {
     child: Option<Child>,
     alive: bool,
     epoch: u64,
+    /// Lines the current launch printed.
+    lines: usize,
+    /// When the current launch started, in epoch milliseconds.
+    launch_ms: Option<i64>,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
@@ -211,6 +259,7 @@ impl StreamHarness {
     ///
     /// The spec's protocol runs on the reader thread for every JSON line.
     pub fn launch(launch: Launch) -> Result<Self, HarnessError> {
+        let inbox = Inbox::from_environment(&launch.environment);
         let mut harness = Self {
             spec: launch.spec,
             program: launch.program,
@@ -223,6 +272,7 @@ impl StreamHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
+            inbox,
         };
         harness.spawn()?;
         Ok(harness)
@@ -251,6 +301,11 @@ impl StreamHarness {
 
     pub fn program(&self) -> &Path {
         &self.program
+    }
+
+    /// The arguments the current launch was started with.
+    pub fn args(&self) -> &[String] {
+        &self.args
     }
 
     pub fn written_ids(&self) -> Vec<String> {
@@ -400,6 +455,81 @@ impl StreamHarness {
         self.spawn()
     }
 
+    /// Start a new child with `session`: the same one when it is already the
+    /// session this child runs, else a child with the catalog's resume flag and
+    /// that session.
+    ///
+    /// A vendor that prints nothing at all and leaves its inbox untouched never
+    /// took the session. A caller with `restart` gets a child without it
+    /// instead, and the reason is returned: a conversation that had to be left
+    /// behind is never dropped silently. A vendor that printed anything, or
+    /// acted on whether it had a session, was running.
+    pub fn resume_or_start(
+        &mut self,
+        session: Option<&str>,
+        restart: bool,
+    ) -> Result<Option<String>, HarnessError> {
+        let Some(session) = session else {
+            return Ok(None);
+        };
+        if lock(&self.shared).session_id.as_deref() != Some(session) {
+            self.resume(session)?;
+        }
+        if !(restart && self.silent_start().unwrap_or(false)) {
+            return Ok(None);
+        }
+        let reason = format!(
+            "{}: session {session} was not resumed (the child printed nothing); starting a new one",
+            self.spec.name
+        );
+        self.stop_child();
+        self.args = self.spec.resume_args(None);
+        lock(&self.shared).session_id = None;
+        self.spawn()?;
+        Ok(Some(reason))
+    }
+
+    /// The launch just started printed nothing and left its inbox untouched
+    /// within `RESUME_WATCH_MS`: it never took what it was given. `None` while
+    /// a line has arrived, which is proof it took it.
+    pub fn silent_start(&self) -> Option<bool> {
+        let started = lock(&self.shared).launch_ms?;
+        let deadline = started + RESUME_WATCH_MS;
+        loop {
+            {
+                let state = lock(&self.shared);
+                if state.lines > 0 {
+                    return None;
+                }
+                if !state.alive {
+                    return Some(true);
+                }
+            }
+            if now_ms() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Some(self.inbox.as_ref().is_none_or(|inbox| !inbox.changed()))
+    }
+
+    /// End the launch in flight as a vendor crash does: the child is killed,
+    /// its reader reaches the end, and the adapter sees it stopped.
+    #[cfg(feature = "double")]
+    pub fn end_launch(&mut self) {
+        let child = lock(&self.shared).child.as_ref().map(Child::id);
+        if let Some(pid) = child {
+            // The exact child, never a pattern: a shared desk refuses a group
+            // signal it does not own, and it is right to.
+            let _ = Command::new("kill")
+                .args(["-KILL", &pid.to_string()])
+                .status();
+        }
+        if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+    }
+
     /// Write `line` and drop the open turn. The vendor decides what the line means.
     pub fn cancel(&mut self, line: &Value) -> Result<(), HarnessError> {
         let mut state = lock(&self.shared);
@@ -496,6 +626,8 @@ impl StreamHarness {
             let mut state = lock(&self.shared);
             state.child = Some(child);
             state.alive = true;
+            state.lines = 0;
+            state.launch_ms = Some(now_ms());
             state.open.clear();
             state.followups.clear();
             state.text = None;
@@ -537,6 +669,7 @@ impl StreamHarness {
         state.open.clear();
         state.followups.clear();
         state.text = None;
+        state.launch_ms = None;
         state.alive = false;
     }
 
@@ -575,6 +708,8 @@ impl State {
             child: None,
             alive: false,
             epoch: 0,
+            lines: 0,
+            launch_ms: None,
             seen: HashSet::new(),
             written: Vec::new(),
             open: Vec::new(),
@@ -601,6 +736,9 @@ fn read_stdout(
         if line.trim().is_empty() {
             continue;
         }
+        // Every line, even one this adapter cannot read, proves the child took
+        // the session it was given.
+        lock(&shared).lines += 1;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };

@@ -2,6 +2,9 @@
 //! so tests never start a real vendor. The agent's config directory is the
 //! harness home; it is applied after any extra variables so those cannot point
 //! the process at another home.
+//!
+//! Every harness resumes the vendor session it last ran, the way OpenCode does:
+//! the id is kept beside the agent's config, and a restart passes it back.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -109,7 +112,17 @@ pub fn child_env() -> Vec<(String, String)> {
 }
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
-    let mut env = request.extra_env;
+    start(&request)
+}
+
+/// Build one agent's harness, resuming the vendor session it last ran.
+///
+/// The stored session is resumed when the vendor takes it. A vendor that
+/// refuses it begins a new conversation, and that is said on stderr: a
+/// conversation that had to be left behind is never dropped silently.
+fn start(request: &LaunchRequest) -> Result<VendorHarness, String> {
+    let session = stored_session(&request.config_dir, &request.agent.harness);
+    let mut env = request.extra_env.clone();
     let root = request.data_dir.clone();
     // The agent's own config directory is the home the vendor tool reads its
     // sign-in from, and the only place AnyAgents writes into it.
@@ -149,13 +162,28 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         // The agent's own config directory carries the steering hook, so a
         // message reaches the running turn instead of waiting for the next one.
-        let harness =
-            AgyHarness::start(&program, None, &pairs(&env)).map_err(|err| err.to_string())?;
+        let harness = AgyHarness::start_after_restart(&program, session.as_deref(), &pairs(&env))
+            .map_err(|err| err.to_string())?;
+        record_session(
+            &request.config_dir,
+            &request.agent.harness,
+            harness.session_id(),
+        );
         Ok(VendorHarness::Agy(Box::new(harness)))
     } else if request.agent.harness == "muse" {
         let program = std::env::var("ANYAGENTS_MUSE_BIN").unwrap_or_else(|_| "muse".to_string());
-        let harness = MuseHarness::start_in(&program, None, &pairs(&env), Some(&request.work_dir))
-            .map_err(|err| err.to_string())?;
+        let harness = MuseHarness::start_after_restart(
+            &program,
+            session.as_deref(),
+            &pairs(&env),
+            Some(&request.work_dir),
+        )
+        .map_err(|err| err.to_string())?;
+        record_session(
+            &request.config_dir,
+            &request.agent.harness,
+            harness.session_id(),
+        );
         Ok(VendorHarness::Muse(Box::new(harness)))
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
@@ -174,9 +202,6 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             request.config_dir.join("state-home").display().to_string(),
         ));
         let program = crate::install::program(&root, &request.agent.harness);
-        // The session this agent last ran is kept beside its config, so a
-        // restart resumes that exact conversation instead of starting one.
-        let session = opencode_session(&request.config_dir);
         // The service speaks HTTP; the adapter drives it with `opencode api`.
         let harness = OpenCodeHarness::start_in_config(
             &program,
@@ -193,7 +218,17 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             request.config_dir.display().to_string(),
         ));
         let program = crate::install::program(&root, &request.agent.harness);
-        let harness = start_codex(&program.display().to_string(), &env, &request.work_dir)?;
+        let harness = start_codex(
+            &program.display().to_string(),
+            session.as_deref(),
+            &env,
+            &request.work_dir,
+        )?;
+        record_session(
+            &request.config_dir,
+            &request.agent.harness,
+            harness.session_id(),
+        );
         Ok(VendorHarness::Codex(Box::new(harness)))
     } else {
         env.push((
@@ -201,27 +236,41 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             request.config_dir.display().to_string(),
         ));
         let program = crate::install::program(&root, &request.agent.harness);
-        let harness = start_claude(&program.display().to_string(), &env, &request.work_dir)?;
+        let harness = start_claude(
+            &program.display().to_string(),
+            session.as_deref(),
+            &env,
+            &request.work_dir,
+        )?;
+        record_session(
+            &request.config_dir,
+            &request.agent.harness,
+            harness.session_id(),
+        );
         Ok(VendorHarness::Claude(Box::new(harness)))
     }
 }
 
 fn start_claude(
     program: &str,
+    session: Option<&str>,
     env: &[(String, String)],
     work_dir: &Path,
 ) -> Result<ClaudeHarness, String> {
     let pairs = pairs(env);
-    ClaudeHarness::start_in(program, None, &pairs, Some(work_dir)).map_err(|err| err.to_string())
+    ClaudeHarness::start_after_restart(program, session, &pairs, Some(work_dir))
+        .map_err(|err| err.to_string())
 }
 
 fn start_codex(
     program: &str,
+    session: Option<&str>,
     env: &[(String, String)],
     work_dir: &Path,
 ) -> Result<CodexHarness, String> {
     let pairs = pairs(env);
-    CodexHarness::start_in(program, None, &pairs, Some(work_dir)).map_err(|err| err.to_string())
+    CodexHarness::start_after_restart(program, session, &pairs, Some(work_dir))
+        .map_err(|err| err.to_string())
 }
 
 fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -353,9 +402,19 @@ impl Harness for VendorHarness {
     }
 }
 
-/// The OpenCode session id this agent last ran, kept beside its config.
-fn opencode_session(config_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(config_dir.join("opencode-session-id")).ok()?;
+/// The vendor session this agent last ran, kept beside its config.
+fn stored_session(config_dir: &Path, harness: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_dir.join(format!("{harness}-session-id"))).ok()?;
     let id = text.trim();
     (!id.is_empty()).then(|| id.to_string())
+}
+
+/// Keep the session the vendor named, so the next start resumes it.
+fn record_session(config_dir: &Path, harness: &str, session: Option<String>) {
+    if let Some(session) = session {
+        let _ = std::fs::write(
+            config_dir.join(format!("{harness}-session-id")),
+            format!("{session}\n"),
+        );
+    }
 }

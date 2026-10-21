@@ -60,6 +60,40 @@ struct State {
     last_usage: Option<TurnUsage>,
 }
 
+/// The session id `result` names, for `session/start` or `session/resume`, or
+/// `wanted` when the vendor did not name one.
+fn session_from(result: &Value, wanted: Option<String>) -> Option<String> {
+    result
+        .pointer("/session/sessionId")
+        .and_then(Value::as_str)
+        .or_else(|| result.get("sessionId").and_then(Value::as_str))
+        .map(str::to_string)
+        .or(wanted)
+}
+
+/// `true` when the vendor said this session is unknown rather than that it
+/// could not be reached. Only that answer starts a new session.
+fn is_refusal(session: &str, error: &str) -> bool {
+    let error = error.to_lowercase();
+    let named = !session.is_empty() && error.contains(&session.to_lowercase());
+    error.contains("not found")
+        || error.contains("notfound")
+        || error.contains("unknown session")
+        || error.contains("no such session")
+        || error.contains("does not exist")
+        || error.contains("404")
+        || named && error.contains("not ")
+}
+
+/// `true` when the vendor's answer to `session/resume` says the session is
+/// gone.
+fn session_refused(result: &Value) -> bool {
+    match result.get("error") {
+        Some(error) => is_refusal("", &error.to_string()),
+        None => false,
+    }
+}
+
 impl MuseHarness {
     /// Start one child and complete the handshake.
     ///
@@ -70,7 +104,9 @@ impl MuseHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
     ) -> Result<Self, HarnessError> {
-        Self::start_in(program, session_id, environment, None)
+        let harness = Self::start_in(program, session_id, environment, None)?;
+        harness.handshake()?;
+        Ok(harness)
     }
 
     /// Start one child with its working directory set to `work_dir`.
@@ -97,17 +133,31 @@ impl MuseHarness {
             Arc::new(on_request),
         )?;
         lock(&shared).wanted_session = session_id.map(str::to_string);
-        let harness = Self { rpc, shared };
-        match harness.handshake() {
-            Ok(()) => Ok(harness),
-            Err(err) => {
-                if harness.health().process_alive {
-                    Err(err)
-                } else {
-                    Ok(harness)
-                }
-            }
+        Ok(Self { rpc, shared })
+    }
+
+    /// Start one child and resume `session_id` when the vendor still knows it.
+    ///
+    /// A vendor that answers "no such session" starts a new session instead,
+    /// and stderr says so: a conversation that had to be left behind is never
+    /// dropped silently. Any other failure is reported, never read as gone.
+    pub fn start_after_restart(
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
+        let program: PathBuf = program.into();
+        // The new server's step: the stored session is handed to the child at
+        // start, as `session/resume`. A vendor that says it is gone starts a
+        // new conversation instead, on the same child, and stderr says why.
+        let mut harness = Self::start_in(program, session_id, environment, work_dir)?;
+        if let Err(refusal) = harness.handshake() {
+            let said = format!("anyagents-muse: {refusal}; starting a new one");
+            harness.resume_after_refusal(&said)?;
+            eprintln!("{said}");
         }
+        Ok(harness)
     }
 
     /// Ids this process actually wrote, in write order.
@@ -132,6 +182,94 @@ impl MuseHarness {
             return Some(state.session.clone());
         }
         state.wanted_session.clone()
+    }
+
+    /// The arguments the current child was started with.
+    pub fn args(&self) -> Vec<String> {
+        self.rpc.args_record().to_vec()
+    }
+
+    /// Start a new child with `session`: the same one when it is already the
+    /// session this child runs, else a child that resumes it.
+    ///
+    /// A vendor that answers "no such session" starts a new session instead,
+    /// and the reason goes to `said`: a conversation that had to be left
+    /// behind is never dropped silently. Any other answer stands.
+    pub fn resume_or_start(
+        &mut self,
+        session: Option<&str>,
+        restart: bool,
+        said: &mut Vec<String>,
+    ) -> Result<(), HarnessError> {
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if self.session_id().as_deref() == Some(session) {
+            return Ok(());
+        }
+        if let Err(err) = self.resume_vendor(session) {
+            let message = match &err {
+                RpcFail::Dead => HarnessError::Dead.to_string(),
+                other => other.reason(),
+            };
+            if !(restart && is_refusal(session, &message)) || !self.rpc.alive() {
+                return Err(HarnessError::Failed(message));
+            }
+            let said_text =
+                format!("session {session} was not resumed ({message}); starting a new one");
+            said.push(format!("anyagents-muse: {said_text}"));
+            // The vendor is up and holding no session: it gets a new one on the
+            // same child, with the same fresh state.
+            return self.resume_after_refusal(&said_text);
+        }
+        Ok(())
+    }
+
+    /// The vendor has ended without speaking once since it started: the
+    /// session it was asked to resume was not taken.
+    pub fn silent_end(&self) -> bool {
+        !self.rpc.alive() && self.rpc.lines() == 0
+    }
+
+    /// Attach to `session` on the running child.
+    fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+        self.resume_vendor(session)
+            .map(|_| ())
+            .map_err(|err| match err {
+                RpcFail::Dead => HarnessError::Dead,
+                other => HarnessError::Failed(other.reason()),
+            })
+    }
+
+    /// Ask the vendor for `session`. Its own error comes back unresolved, so a
+    /// caller can tell "no such session" from a request that failed.
+    fn resume_vendor(&self, session: &str) -> Result<Value, RpcFail> {
+        let result = self.rpc.request(
+            "session/resume",
+            json!({
+                "commandId": command_id(),
+                "sessionId": session,
+                "excludeItems": true
+            }),
+            RESUME_WAIT,
+        )?;
+        let mut state = lock(&self.shared);
+        state.session =
+            session_from(&result, Some(session.to_string())).unwrap_or_else(|| session.to_string());
+        state.turn = result
+            .pointer("/session/activeTurnId")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        state.open.clear();
+        Ok(result)
+    }
+
+    /// Take up a new session on the running child after a resume it refused:
+    /// the resume's own state is dropped, and `session/start` names the new one.
+    fn resume_after_refusal(&mut self, said: &str) -> Result<(), HarnessError> {
+        *lock(&self.shared) = State::default();
+        self.handshake()
+            .map_err(|err| HarnessError::Failed(format!("{said} ({err})")))
     }
 
     /// Wait until a finished turn closed `id`, or the deadline passes.
@@ -171,7 +309,6 @@ impl MuseHarness {
             json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
             RPC_WAIT,
         )?;
-        self.rpc.notify("initialized", json!({})).map_err(fail)?;
         let wanted = lock(&self.shared).wanted_session.clone();
         let (method, params) = match &wanted {
             Some(session) => (
@@ -185,13 +322,20 @@ impl MuseHarness {
             None => ("session/start", json!({"commandId": command_id()})),
         };
         let result = self.call(method, params, RESUME_WAIT)?;
-        let session = result
-            .pointer("/session/sessionId")
-            .and_then(Value::as_str)
-            .or_else(|| result.get("sessionId").and_then(Value::as_str))
-            .map(str::to_string)
-            .or(wanted)
-            .ok_or_else(|| HarnessError::Failed("session id missing".into()))?;
+        // The vendor's own answer decides: a resume it refused is never
+        // recorded as the session this host runs.
+        let session = session_from(&result, wanted);
+        let Some(session) =
+            session.filter(|_| method == "session/start" || !session_refused(&result))
+        else {
+            let reason = result
+                .get("error")
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "the vendor named no session".into());
+            return Err(HarnessError::Failed(format!(
+                "session resume refused: {reason}"
+            )));
+        };
         {
             let mut state = lock(&self.shared);
             state.session = session.clone();
@@ -300,30 +444,7 @@ impl Harness for MuseHarness {
     }
 
     fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
-        if !self.rpc.alive() {
-            return Err(HarnessError::Dead);
-        }
-        let result = self.call(
-            "session/resume",
-            json!({
-                "commandId": command_id(),
-                "sessionId": session,
-                "excludeItems": true
-            }),
-            RESUME_WAIT,
-        )?;
-        let mut state = lock(&self.shared);
-        state.session = result
-            .pointer("/session/sessionId")
-            .and_then(Value::as_str)
-            .unwrap_or(session)
-            .to_string();
-        state.turn = result
-            .pointer("/session/activeTurnId")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        state.open.clear();
-        Ok(())
+        MuseHarness::resume(self, session)
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
