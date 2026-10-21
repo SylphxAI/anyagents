@@ -230,13 +230,21 @@ fn an_api_key_agent_gets_the_gateway_and_its_turn_reaches_the_provider() {
     assert!(stored_key.contains("sk-provider-secret"));
 
     // A running server takes the key at once: its route answers, and the agent
-    // is told the gateway from its next start. It is restarted here so the
-    // harness itself starts with that environment.
-    let launch = Store::open(data.join("state.db"))
-        .unwrap()
-        .agent_by_name("alpha")
-        .unwrap()
-        .launch_env;
+    // is told the gateway from its next start. The server records that origin
+    // as it starts, which can land just after this process reads, so it is
+    // waited for rather than assumed.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let launch = loop {
+        let launch = Store::open(data.join("state.db"))
+            .unwrap()
+            .agent_by_name("alpha")
+            .unwrap()
+            .launch_env;
+        if !launch.is_empty() || Instant::now() > deadline {
+            break launch;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(
         launch
             .iter()

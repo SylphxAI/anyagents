@@ -70,6 +70,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
             "socket path is longer than {MAX_SOCKET_PATH} bytes"
         )));
     }
+    // The gateway is up and every agent repointed before anything is bound or
+    // started: a client that sees the socket must find a live origin, not the
+    // port of the server that just stopped.
+    crate::gateway::start(data)?;
     // The API is bound before any vendor starts: an agent that is slow, silent
     // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
@@ -82,7 +86,6 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         vendor::child_env(),
     )
     .map_err(Error::Message)?;
-    crate::gateway::start(data)?;
     let state = AppState {
         store: Arc::clone(&store),
         health: supervisor.board(),
