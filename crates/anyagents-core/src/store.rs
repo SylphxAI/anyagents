@@ -33,7 +33,7 @@ pub fn now_ms() -> i64 {
 }
 
 const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
-     reply_to, received_at_ms, delivered_at_ms";
+     reply_to, received_at_ms, delivered_at_ms, origin";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -174,6 +174,8 @@ pub struct Message {
     pub ack: Ack,
     /// When the message was handed to the vendor process.
     pub delivered_at_ms: Option<i64>,
+    /// The provider coordinates the channel stored with it.
+    pub origin: Option<Origin>,
 }
 
 /// A new insert, or the row already stored for this source key.
@@ -869,11 +871,12 @@ impl Store {
             received_at_ms,
             ack: Ack::Received,
             delivered_at_ms: None,
+            origin: incoming.origin,
         };
         tx.execute(
             "INSERT INTO messages (
-                id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms, origin
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 message.id.as_str(),
                 message.agent_id.as_str(),
@@ -884,6 +887,9 @@ impl Store {
                 message.text,
                 message.reply_to,
                 message.received_at_ms,
+                message
+                    .origin
+                    .map(|origin| serde_json::to_string(&origin).unwrap_or_default()),
             ],
         )?;
         tx.commit()?;
@@ -1532,6 +1538,9 @@ fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Messag
             Ack::Received
         },
         delivered_at_ms: row.get(9)?,
+        origin: row
+            .get::<_, Option<String>>(10)?
+            .and_then(|text| serde_json::from_str(&text).ok()),
     })
 }
 

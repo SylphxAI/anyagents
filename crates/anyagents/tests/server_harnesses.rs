@@ -107,6 +107,8 @@ fn create(dir: &Path, name: &str, harness: &str, agent_file: &Path) -> String {
         "agent_file": agent_file.display().to_string(),
         // The double answers as `kind`, the agent that asks below.
         "sender": "agent:kind",
+        // The agent to answer. A mailbox reply to a message another agent
+        // asked is addressed to that agent by the server, not to a name.
         "reply_to": "kind",
     });
     std::fs::write(
