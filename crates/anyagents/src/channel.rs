@@ -12,7 +12,7 @@ use anyagents_core::{
     Address, CredentialStore, Error, FileCredentialStore, Incoming, NewChannel, Store,
 };
 
-use crate::agent::{open, named};
+use crate::agent::{named, open};
 use crate::api::{InboxResponse, SendRequest, SendResponse};
 use crate::client;
 use crate::server;
@@ -70,15 +70,7 @@ pub fn send(
             return Ok(());
         }
     }
-    send_stored(
-        data,
-        to,
-        text,
-        source_key,
-        source_time_ms,
-        reply_to,
-        from,
-    )
+    send_stored(data, to, text, source_key, source_time_ms, reply_to, from)
 }
 
 /// The single-user path: the store itself, with the sender as named.
@@ -202,8 +194,7 @@ fn send_telegram(
 }
 
 fn parse_id(raw: &str, what: &'static str) -> Result<i64, Error> {
-    raw.parse()
-        .map_err(|_| Error::Message(what.into()))
+    raw.parse().map_err(|_| Error::Message(what.into()))
 }
 
 pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> {
@@ -276,8 +267,8 @@ pub fn add_channel(
         return Err(Error::Message(format!("unsupported channel kind: {kind}")));
     }
     let token = std::fs::read(token_file)?;
-    let token = String::from_utf8(token)
-        .map_err(|_| Error::Message("token file is not text".into()))?;
+    let token =
+        String::from_utf8(token).map_err(|_| Error::Message("token file is not text".into()))?;
     let token = token.trim();
     if token.is_empty() || token.chars().any(|ch| ch.is_whitespace() || ch == '/') {
         return Err(Error::Message(
@@ -334,4 +325,3 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
     }
     Ok(())
 }
-

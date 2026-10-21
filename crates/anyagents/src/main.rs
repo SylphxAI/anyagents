@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-
 use clap::{Parser, Subcommand};
 
 use crate::api::{InboxResponse, MessageView};
@@ -464,4 +463,3 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
     }
     Ok(())
 }
-

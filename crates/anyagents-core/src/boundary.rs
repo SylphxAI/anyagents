@@ -80,7 +80,11 @@ pub fn write(data_dir: &Path) -> Result<Boundary, Error> {
                 "/proc/*/fd/**".to_string(),
             ],
             writable: vec!["/work/**".to_string()],
-            readable: vec!["/usr/**".to_string(), "/lib/**".to_string(), "/lib64/**".to_string()],
+            readable: vec![
+                "/usr/**".to_string(),
+                "/lib/**".to_string(),
+                "/lib64/**".to_string(),
+            ],
         },
         server: ServerRequirement {
             user: server_user,
@@ -90,12 +94,13 @@ pub fn write(data_dir: &Path) -> Result<Boundary, Error> {
             agent_presentation: data_text,
         },
     };
-    let text = serde_json::to_string_pretty(&boundary)
-        .map_err(|err| Error::Message(err.to_string()))?;
+    let text =
+        serde_json::to_string_pretty(&boundary).map_err(|err| Error::Message(err.to_string()))?;
     let path = data.join(BOUNDARY_FILE);
     std::fs::write(&path, text)?;
     let back = std::fs::read_to_string(&path)?;
-    let read: Boundary = serde_json::from_str(&back).map_err(|err| Error::Message(err.to_string()))?;
+    let read: Boundary =
+        serde_json::from_str(&back).map_err(|err| Error::Message(err.to_string()))?;
     if read != boundary {
         return Err(Error::Message(format!(
             "{} does not read back as it was written",

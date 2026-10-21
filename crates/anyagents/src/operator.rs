@@ -67,10 +67,10 @@ mod tests {
     fn a_minted_capability_is_a_private_file_and_replaces_the_last_one() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        store.hold_capability_key("0123456789abcdef0123456789abcdef").unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("ada", "codex"))
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
             .unwrap();
+        let agent = store.create_agent(NewAgent::new("ada", "codex")).unwrap();
         mint(&store, &agent.id).unwrap();
         let path = config_dir(dir.path(), agent.id.as_str()).join(CAPABILITY_FILE);
         let first = std::fs::read_to_string(&path).unwrap();

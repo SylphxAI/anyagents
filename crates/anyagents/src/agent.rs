@@ -104,14 +104,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
 /// `agents list`: the server's view when it is there, else the stored rows.
 fn list(data: &Path) -> Result<(), Error> {
     if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
-        let listed = client::call::<AgentsResponse>(
-            data,
-            "GET",
-            "/v1/agents",
-            None,
-            &client::authority(),
-        )
-        .map_err(Error::Message)?;
+        let listed =
+            client::call::<AgentsResponse>(data, "GET", "/v1/agents", None, &client::authority())
+                .map_err(Error::Message)?;
         if let Some(listed) = listed {
             for agent in listed.agents {
                 print_agent(AgentLine {
@@ -178,14 +173,9 @@ pub fn open(data: &Path) -> Result<Store, Error> {
 /// One agent by name, from the socket when the server is there.
 pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
     if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
-        let listed = client::call::<AgentsResponse>(
-            data,
-            "GET",
-            "/v1/agents",
-            None,
-            &client::authority(),
-        )
-        .map_err(Error::Message)?;
+        let listed =
+            client::call::<AgentsResponse>(data, "GET", "/v1/agents", None, &client::authority())
+                .map_err(Error::Message)?;
         if let Some(listed) = listed
             && let Some(found) = listed.agents.into_iter().find(|row| row.name == agent)
         {

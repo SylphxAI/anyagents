@@ -122,8 +122,8 @@ pub fn resolve(
         return Ok(None);
     };
     if let Some(name) = anyagents_harness::ref_message(reply_to) {
-        let message = own(name)?
-            .ok_or_else(|| "that reply names no message in this mailbox".to_string())?;
+        let message =
+            own(name)?.ok_or_else(|| "that reply names no message in this mailbox".to_string())?;
         return destination_through(principal, &message, &own).map(Some);
     }
     // An address the tool takes, or nothing: a bare number or message id is
@@ -314,7 +314,10 @@ mod tests {
             (group.chat_id, group.thread_id, group.message_id),
             (Some(-100), Some(3), Some(3))
         );
-        let user = origin(&message(Some("telegram:user:42:61"), Some("telegram:chat:42")));
+        let user = origin(&message(
+            Some("telegram:user:42:61"),
+            Some("telegram:chat:42"),
+        ));
         assert_eq!(
             (user.chat_id, user.thread_id, user.message_id),
             (Some(42), None, Some(61))

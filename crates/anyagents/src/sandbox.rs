@@ -16,8 +16,8 @@
 
 use std::path::Path;
 
-use anyagents_core::boundary::{self, Boundary};
 use anyagents_core::Error;
+use anyagents_core::boundary::{self, Boundary};
 
 /// Read the boundary contract of `data`, or fail with what is missing.
 pub fn boundary_of(data: &Path) -> Result<Boundary, Error> {
@@ -37,10 +37,7 @@ fn launcher(mechanism: &str) -> Option<&'static str> {
         "userns" | "bwrap" => &["bwrap", "setpriv", "unshare"],
         _ => &[],
     };
-    candidates
-        .iter()
-        .copied()
-        .find(|program| on_path(program))
+    candidates.iter().copied().find(|program| on_path(program))
 }
 
 fn on_path(program: &str) -> bool {
@@ -133,10 +130,7 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
     let Some(program) = launcher(&boundary.agents.mechanism) else {
         return Err(Error::Message(unadmitted(
             &boundary,
-            &format!(
-                "no {} launcher is installed",
-                boundary.agents.mechanism
-            ),
+            &format!("no {} launcher is installed", boundary.agents.mechanism),
         )));
     };
     let mut argv = prefix(&boundary, program, agent_uid);

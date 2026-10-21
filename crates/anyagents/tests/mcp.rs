@@ -150,7 +150,11 @@ fn listed_id(dir: &std::path::Path, name: &str) -> String {
         .args(["agents", "list"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).unwrap();
     text.lines()
         .find(|line| line.split('\t').nth(1) == Some(name))
@@ -166,7 +170,6 @@ async fn connect(
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
     let id = created_id(data, agent);
     let config = data.join("agents").join(&id).join("config");
-
 
     let transport = TokioChildProcess::new(
         tokio::process::Command::new(env!("CARGO_BIN_EXE_anyagents")).configure(|cmd| {
