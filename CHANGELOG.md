@@ -71,3 +71,4 @@ the first release will move it under a version heading.
 
 - Telegram sign-in, the MCP registry entry, and a published release.
 - A TUI or GUI (the API is designed for them).
+
