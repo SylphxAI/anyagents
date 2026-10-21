@@ -559,3 +559,188 @@ fn a_room_reaches_only_the_bots_on_the_same_chat() {
     );
     let _ = fake;
 }
+
+/// A private chat is one person and one agent: nothing fans out from it.
+#[test]
+fn a_private_chat_reaches_no_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["ada", "bea"] {
+        create(&data, name);
+    }
+    for (name, token) in [("ada", "771:token-ada"), ("bea", "772:token-bea")] {
+        add_channel(&data, name, token);
+    }
+    // Both bots know this private chat, with its kind recorded.
+    let store = Store::open(data.join("state.db")).unwrap();
+    for channel in store.list_channels().unwrap() {
+        let agent = store.agent(&channel.agents[0]).unwrap();
+        store
+            .set_channel_state(
+                &channel.id,
+                &format!(
+                    "{{\"offset\":0,\"chats\":[{{\"agent\":\"{}\",\"chat_id\":100,\"chat_type\":\"private\"}}]}}",
+                    agent.name
+                ),
+            )
+            .unwrap();
+    }
+
+    // A message posted in that private chat reaches no other agent.
+    let delivered = store
+        .receive_room(
+            "telegram:chat:100",
+            anyagents_core::Incoming {
+                text: "just us".to_string(),
+                sender: Some("telegram:chat:100:5".to_string()),
+                source_time_ms: None,
+                source_key: Some("tg-out:100:5".to_string()),
+                reply_to: Some("telegram:chat:100".to_string()),
+                received_at_ms: None,
+            },
+        )
+        .unwrap();
+    let _ = delivered;
+
+    // A private chat is not a room, so the local half never fans out of it.
+    let channel = store.list_channels().unwrap().into_iter().next().unwrap();
+    let memory = anyagents_channel_telegram::Memory::from_state(&channel.state);
+    assert!(!memory.is_room(100), "a private chat is not a room");
+    assert!(memory.is_attached("ada", 100));
+}
+
+/// A successful post whose local step fails is never posted again: the retry is
+/// local only, and a repeated fan-out is one row.
+#[test]
+fn a_local_retry_after_a_post_is_one_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    for name in ["ada", "bea"] {
+        create(&data, name);
+    }
+    for (name, token) in [("ada", "775:token-ada"), ("bea", "776:token-bea")] {
+        add_channel(&data, name, token);
+    }
+    let store = Store::open(data.join("state.db")).unwrap();
+    for channel in store.list_channels().unwrap() {
+        let agent = store.agent(&channel.agents[0]).unwrap();
+        store
+            .set_channel_state(
+                &channel.id,
+                &format!(
+                    "{{\"offset\":0,\"chats\":[{{\"agent\":\"{}\",\"chat_id\":-1009,\"chat_type\":\"supergroup\"}}]}}",
+                    agent.name
+                ),
+            )
+            .unwrap();
+    }
+    // The same receipt delivered twice stands for a retried local step.
+    for _ in 0..2 {
+        store
+            .receive_room(
+                "telegram:chat:-1009",
+                anyagents_core::Incoming {
+                    text: "once".to_string(),
+                    sender: Some("telegram:chat:-1009:4242".to_string()),
+                    source_time_ms: None,
+                    source_key: Some("tg-out:-1009:4242".to_string()),
+                    reply_to: Some("telegram:chat:-1009".to_string()),
+                    received_at_ms: None,
+                },
+            )
+            .unwrap();
+    }
+    let bea = store.agent_by_name("bea").unwrap();
+    let copies = store
+        .inbox(&bea.id, None)
+        .unwrap()
+        .into_iter()
+        .filter(|message| message.text == "once")
+        .count();
+    assert_eq!(copies, 1, "a retried local step is one row");
+}
+
+/// One post through the API: exactly one Telegram send, the poster excluded,
+/// every other member reached, a private chat reaching nobody, and a retried
+/// local step adding no second send and no second row.
+#[test]
+fn one_post_reaches_every_member_once_and_never_the_poster() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let fake = FakeTelegram::start(vec![]);
+    for name in ["ada", "bea", "cy"] {
+        create(&data, name);
+    }
+    for (name, token) in [
+        ("ada", "781:token-ada"),
+        ("bea", "782:token-bea"),
+        ("cy", "783:token-cy"),
+    ] {
+        add_channel(&data, name, token);
+    }
+    // ada and bea are in group -1011; cy is in private chat 300.
+    let store = Store::open(data.join("state.db")).unwrap();
+    for channel in store.list_channels().unwrap() {
+        let agent = store.agent(&channel.agents[0]).unwrap();
+        let (chat, kind) = match agent.name.as_str() {
+            "cy" => (300, "private"),
+            _ => (-1011, "supergroup"),
+        };
+        store
+            .set_channel_state(
+                &channel.id,
+                &format!("{{\"offset\":0,\"chats\":[{{\"agent\":\"{}\",\"chat_id\":{chat},\"chat_type\":\"{kind}\"}}]}}", agent.name),
+            )
+            .unwrap();
+    }
+
+    let server = Server::start(&data, &fake.address);
+    let socket = data.join("anyagents.sock");
+    let _ = server;
+
+    // A post into the group: bea is reached, ada is not, cy is not.
+    // The fake fails the first post's local step by refusing the third send, so
+    // the retry path is exercised without a second Telegram call.
+    let posted = post(
+        &socket,
+        &json!({"sender": "agent:ada", "to": ["telegram:chat:-1011"], "text": "hello room"}),
+    );
+    assert!(posted["deliveries"][0]["id"].is_string(), "{posted}");
+    assert_eq!(fake.sent().len(), 1, "exactly one Telegram send");
+
+    let store = Store::open(data.join("state.db")).unwrap();
+    let bea = store.agent_by_name("bea").unwrap();
+    let ada = store.agent_by_name("ada").unwrap();
+    let cy = store.agent_by_name("cy").unwrap();
+    let in_bea = store.inbox(&bea.id, None).unwrap();
+    let in_ada = store.inbox(&ada.id, None).unwrap();
+    let in_cy = store.inbox(&cy.id, None).unwrap();
+    assert!(
+        in_bea.iter().any(|m| m.text == "hello room"),
+        "every other member receives it"
+    );
+    assert!(
+        !in_ada.iter().any(|m| m.text == "hello room"),
+        "the poster is not a recipient"
+    );
+    assert!(
+        !in_cy.iter().any(|m| m.text == "hello room"),
+        "a bot on another chat receives nothing"
+    );
+
+    // A private chat fans out to no peer.
+    let private = post(
+        &socket,
+        &json!({"sender": "agent:cy", "to": ["telegram:chat:300"], "text": "just us"}),
+    );
+    assert!(private["deliveries"][0]["id"].is_string(), "{private}");
+    let store = Store::open(data.join("state.db")).unwrap();
+    let in_ada = store.inbox(&ada.id, None).unwrap();
+    assert!(
+        !in_ada.iter().any(|m| m.text == "just us"),
+        "a private chat reaches no peer"
+    );
+}

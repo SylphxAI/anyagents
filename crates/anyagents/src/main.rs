@@ -136,6 +136,21 @@ enum Command {
         #[command(subcommand)]
         action: ChannelsCommand,
     },
+    /// Named groups of agents, and who is in them.
+    Groups {
+        #[command(subcommand)]
+        action: GroupsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupsCommand {
+    /// Add an agent to a named group, creating the group if it is new.
+    Join { group: String, agent: String },
+    /// Take an agent out of a named group.
+    Leave { group: String, agent: String },
+    /// List a named group's members, one per line.
+    Members { group: String },
 }
 
 #[derive(Subcommand)]
@@ -235,6 +250,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Inbox { agent, since } => inbox(&cli.data, &agent, since),
         Command::Usage { agent, by } => usage(&cli.data, agent.as_deref(), by.as_deref()),
         Command::Channels { action } => channels(&cli.data, action),
+        Command::Groups { action } => groups(&cli.data, action),
     }
 }
 
@@ -410,6 +426,28 @@ fn add_channel(
     store.set_credential_ref(&channel.id, &credential_ref)?;
     store.attach_channel(&channel.id, &agent.id)?;
     println!("{}\t{}", channel.id, channel.kind);
+    Ok(())
+}
+
+fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Error> {
+    let store = open(data)?;
+    match action {
+        GroupsCommand::Join { group, agent } => {
+            let agent = store.agent_by_name(&agent)?;
+            store.join_group(&group, &agent.id)?;
+            println!("{group}\t{}", agent.name);
+        }
+        GroupsCommand::Leave { group, agent } => {
+            let agent = store.agent_by_name(&agent)?;
+            store.leave_group(&group, &agent.id)?;
+            println!("{group}\t{}", agent.name);
+        }
+        GroupsCommand::Members { group } => {
+            for name in store.group_members(&group)? {
+                println!("{name}");
+            }
+        }
+    }
     Ok(())
 }
 
