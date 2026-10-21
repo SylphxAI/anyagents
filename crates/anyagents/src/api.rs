@@ -1,5 +1,6 @@
 //! JSON shapes shared by the unix-socket server and the MCP tools.
 
+use anyagents_core::Quote;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -73,12 +74,23 @@ pub struct InboxResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SendRequest {
+    /// The principal this message is from. On the identity boundary the server
+    /// already knows it from the capability, and this must agree or the call is
+    /// refused; the operator names its own principal explicitly.
     pub sender: Option<String>,
     #[serde(default)]
     pub to: Vec<String>,
     pub text: String,
     #[serde(default)]
     pub reply_to: Option<String>,
+    /// The message this one quotes, as the sender's channel sent it. Rendered
+    /// into the stored body; a harness cannot forge a quoted author.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<Quote>,
+    /// Names one send, so a retry after a lost answer is the same delivery
+    /// instead of a second one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

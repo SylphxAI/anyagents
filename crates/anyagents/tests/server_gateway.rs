@@ -6,6 +6,8 @@
 //! fake-claude`, this binary's test double, and the provider is a loopback
 //! server that answers one Anthropic Messages request and records what it saw.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -172,7 +174,8 @@ fn post(socket: &Path, path: &str, body: &str) -> String {
     stream
         .write_all(
             format!(
-                "POST {path} HTTP/1.1\r\nHost: local\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                "POST {path} HTTP/1.1\r\nHost: local\r\n{}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                support::header(),
                 body.len()
             )
             .as_bytes(),
@@ -189,9 +192,11 @@ fn agent_dir(data: &Path, id: &str) -> PathBuf {
 
 #[test]
 fn an_api_key_agent_gets_the_gateway_and_its_turn_reaches_the_provider() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
+    support::operator(&data);
     let provider = provider();
     let server = Server::start(&data);
 

@@ -1,8 +1,15 @@
-//! MCP stdio server bound to one agent. Tools call the local unix-socket API.
+//! MCP stdio server bound to one agent.
+//!
+//! An agent's tools reach the server through the one mailbox capability the
+//! server minted for that agent's session. The capability is read from a file
+//! in the agent's own config directory, which the CLI is told once as an
+//! argument; it is never an argument itself, never a tool argument and never
+//! printed. The server decides whose mailbox a call reads and who a message is
+//! from, so a name the model writes can only choose a destination.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyagents_core::Error;
+use anyagents_core::{AgentId, Error};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http1;
@@ -14,25 +21,57 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::api::{AgentsResponse, InboxResponse, SendRequest, SendResponse};
+use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
-pub fn run(data: &Path, agent: &str) -> Result<(), Error> {
+/// The agent whose tools run here: the id and name the server resolved from
+/// the capability, never a name the caller wrote.
+#[derive(Clone, Debug)]
+pub struct AgentRef {
+    pub id: AgentId,
+    pub name: String,
+}
+
+/// Run the tool server for the agent whose config directory is `config`. The
+/// server names the directory it started this agent with as
+/// `ANYAGENTS_AGENT_CONFIG`; a command line that omits it is read from there,
+/// and from nowhere else.
+pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
+    let owned;
+    let config = match config {
+        Some(config) => config,
+        None => {
+            owned = std::env::var_os("ANYAGENTS_AGENT_CONFIG")
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    Error::Message(
+                        "the tool server was given no config directory and its environment names none"
+                            .into(),
+                    )
+                })?;
+            &owned
+        }
+    };
     let socket = server::socket_path(data);
+    let capability = capability_of(config)?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let listed = get_json::<AgentsResponse>(&socket, "GET", "/v1/agents", None)
+        let client = Client { socket, capability };
+        let who = client.whoami().await.map_err(Error::Message)?;
+        // A harness names the agent id it was given; the server already
+        // answered with the agent this session acts as, and the two may not
+        // differ.
+        if let Ok(named) = std::env::var("ANYAGENTS_AGENT_ID")
+            && named.trim() != who.id.as_str()
+        {
+            return Err(Error::Message(
+                "this config directory belongs to another agent".into(),
+            ));
+        }
+        let service = AgentMcp { agent: who, client }
+            .serve(rmcp::transport::io::stdio())
             .await
-            .map_err(Error::Message)?;
-        if !listed.agents.iter().any(|row| row.name == agent) {
-            return Err(Error::AgentNotFound(agent.to_string()));
-        }
-        let service = AgentMcp {
-            agent: agent.to_string(),
-            socket,
-        }
-        .serve(rmcp::transport::io::stdio())
-        .await
-        .map_err(|err| Error::Message(err.to_string()))?;
+            .map_err(|err| Error::Message(err.to_string()))?;
         service
             .waiting()
             .await
@@ -41,9 +80,93 @@ pub fn run(data: &Path, agent: &str) -> Result<(), Error> {
     })
 }
 
+/// The capability an agent's harness reads: a file only that agent's own
+/// config directory holds.
+fn capability_of(config: &Path) -> Result<String, Error> {
+    let path = config.join(CAPABILITY_FILE);
+    let text = std::fs::read_to_string(&path).map_err(|err| {
+        Error::Message(format!(
+            "this agent has no mailbox capability at {}: {err}",
+            path.display()
+        ))
+    })?;
+    let capability = text.trim().to_string();
+    if capability.is_empty() {
+        return Err(Error::Message(
+            "this agent's mailbox capability is empty".into(),
+        ));
+    }
+    Ok(capability)
+}
+
+#[derive(Clone)]
+struct Client {
+    socket: PathBuf,
+    capability: String,
+}
+
+impl Client {
+    /// The agent this capability authenticates, as the server resolved it.
+    async fn whoami(&self) -> Result<AgentRef, String> {
+        let named = crate::client::agent_identity().map(|id| id.to_string());
+        let who: serde_json::Value = request_naming(
+            &self.socket,
+            "GET",
+            "/v1/whoami",
+            None,
+            Some(&self.capability),
+            None,
+            named.as_deref(),
+        )
+        .await
+        .and_then(|(status, bytes)| {
+            if status.is_success() {
+                serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+            } else {
+                Err(error_message(&bytes))
+            }
+        })?;
+        let id = who
+            .get("agent_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "the server named no agent".to_string())?;
+        let name = who
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "the server named no agent".to_string())?;
+        Ok(AgentRef {
+            id: AgentId::parse(id).map_err(|err| err.to_string())?,
+            name: name.to_string(),
+        })
+    }
+
+    async fn get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<T, String> {
+        let method = if body.is_some() { "POST" } else { "GET" };
+        let named = crate::client::agent_identity().map(|id| id.to_string());
+        let (status, bytes) = request_naming(
+            &self.socket,
+            method,
+            path,
+            body,
+            Some(&self.capability),
+            None,
+            named.as_deref(),
+        )
+        .await?;
+        if !status.is_success() {
+            return Err(error_message(&bytes));
+        }
+        serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+    }
+}
+
 struct AgentMcp {
-    agent: String,
-    socket: std::path::PathBuf,
+    agent: AgentRef,
+    client: Client,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -53,6 +176,10 @@ struct SendArgs {
     text: String,
     #[serde(default)]
     reply_to: Option<String>,
+    /// Names this send. Send it again with the same value only when an earlier
+    /// attempt got no answer.
+    #[serde(default)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -70,18 +197,22 @@ impl AgentMcp {
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<SendResponse>, String> {
         let body = SendRequest {
-            sender: Some(format!("agent:{}", self.agent)),
+            // The server sends as this agent whatever this says, and refuses a
+            // body that names anyone else.
+            sender: Some(format!("agent:{}", self.agent.name)),
             to: args.to,
             text: args.text,
             reply_to: args.reply_to,
+            quote: None,
+            idempotency_key: args.idempotency_key,
         };
-        let response = get_json(
-            &self.socket,
-            "POST",
-            "/v1/send",
-            Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
-        )
-        .await?;
+        let response = self
+            .client
+            .get(
+                "/v1/send",
+                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
@@ -90,61 +221,82 @@ impl AgentMcp {
         &self,
         Parameters(args): Parameters<InboxArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<InboxResponse>, String> {
-        let path = match args.since {
-            Some(since) => format!(
-                "/v1/agents/{}/inbox?since={since}",
-                path_segment(&self.agent)
-            ),
-            None => format!("/v1/agents/{}/inbox", path_segment(&self.agent)),
+        // The server answers with its own agent id, so this path names the
+        // mailbox the capability owns; on a deployment without the boundary the
+        // route resolves it the same way.
+        let agent = match crate::client::agent_identity() {
+            Some(id) => id,
+            None => self.agent.id.clone(),
         };
-        let response = get_json(&self.socket, "GET", &path, None).await?;
+        let path = match args.since {
+            Some(since) => format!("/v1/agents/{agent}/inbox?since={since}"),
+            None => format!("/v1/agents/{agent}/inbox"),
+        };
+        let response = self.client.get(&path, None).await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
     #[tool(description = "List the agents on this server, with harness, state, and lag.")]
     async fn agents(&self) -> Result<rmcp::handler::server::wrapper::Json<AgentsResponse>, String> {
-        let response = get_json(&self.socket, "GET", "/v1/agents", None).await?;
+        let response = self.client.get("/v1/agents", None).await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 }
 
-fn path_segment(raw: &str) -> String {
-    let mut out = String::new();
-    for byte in raw.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char);
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+fn error_message(bytes: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(bytes)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned())
 }
 
-pub(crate) fn get_json_sync<T: DeserializeOwned>(
-    socket: &Path,
-    method: &str,
-    path: &str,
-) -> Result<T, String> {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|err| err.to_string())?;
-    runtime.block_on(get_json(socket, method, path, None))
-}
-
-pub(crate) async fn get_json<T: DeserializeOwned>(
+/// One call on the socket: the status code and the body.
+pub(crate) async fn request(
     socket: &Path,
     method: &str,
     path: &str,
     body: Option<Vec<u8>>,
-) -> Result<T, String> {
+    capability: Option<&str>,
+    operator: Option<&str>,
+) -> Result<(hyper::StatusCode, Vec<u8>), String> {
+    request_naming(socket, method, path, body, capability, operator, None).await
+}
+
+/// One call on the socket, with the agent id this tool server was given. The id
+/// is what a deployment without the boundary uses to name its one route; with
+/// the boundary only the capability decides, and an operator token alone is
+/// accepted beside it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn request_naming(
+    socket: &Path,
+    method: &str,
+    path: &str,
+    body: Option<Vec<u8>>,
+    capability: Option<&str>,
+    operator: Option<&str>,
+    agent_id: Option<&str>,
+) -> Result<(hyper::StatusCode, Vec<u8>), String> {
     let payload = body.unwrap_or_default();
-    let request = hyper::Request::builder()
+    let mut builder = hyper::Request::builder()
         .method(method)
         .uri(format!("http://localhost{path}"))
         .header(hyper::header::HOST, "localhost")
-        .header(hyper::header::CONTENT_TYPE, "application/json")
+        .header(hyper::header::CONTENT_TYPE, "application/json");
+    if let Some(token) = capability {
+        builder = builder.header(crate::operator::AGENT_HEADER, token);
+    }
+    if let Some(token) = operator {
+        builder = builder.header(crate::operator::HEADER, token);
+    }
+    if let Some(id) = agent_id {
+        builder = builder.header(crate::auth::AGENT_ID_HEADER, id);
+    }
+    let request = builder
         .body(Full::new(Bytes::from(payload)))
         .map_err(|err| err.to_string())?;
     let stream = tokio::net::UnixStream::connect(socket)
@@ -166,18 +318,7 @@ pub(crate) async fn get_json<T: DeserializeOwned>(
         .collect()
         .await
         .map_err(|err| err.to_string())?
-        .to_bytes();
-    if !status.is_success() {
-        let message = serde_json::from_slice::<serde_json::Value>(&bytes)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_else(|| String::from_utf8_lossy(&bytes).into_owned());
-        return Err(message);
-    }
-    serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+        .to_bytes()
+        .to_vec();
+    Ok((status, bytes))
 }

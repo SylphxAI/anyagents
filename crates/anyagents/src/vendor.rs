@@ -109,7 +109,24 @@ pub fn child_env() -> Vec<(String, String)> {
 }
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    // The data directory the deployment serves, so an agent's tools find the
+    // one socket and one config directory that hold its capability. Never a
+    // secret: the capability itself stays in a file only this agent reads.
     let mut env = request.extra_env;
+    env.push((
+        "ANYAGENTS_DATA".to_string(),
+        request.data_dir.display().to_string(),
+    ));
+    env.push((
+        "ANYAGENTS_AGENT_ID".to_string(),
+        request.agent.id.as_str().to_string(),
+    ));
+    // The agent's own config directory. Its tool server reads the mailbox
+    // capability from here and nothing else.
+    env.push((
+        "ANYAGENTS_AGENT_CONFIG".to_string(),
+        request.config_dir.display().to_string(),
+    ));
     let root = request.data_dir.clone();
     // The agent's own config directory is the home the vendor tool reads its
     // sign-in from, and the only place AnyAgents writes into it.

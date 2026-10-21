@@ -4,7 +4,10 @@
 //! mailbox and the delivery loop do not change between modes. Adapters carry
 //! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
+mod compose;
 mod fake;
+
+pub use compose::{CONTEXT_BEGIN, CONTEXT_END, Envelope, compose, ref_message, reply_ref};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;

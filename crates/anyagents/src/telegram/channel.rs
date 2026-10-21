@@ -192,7 +192,7 @@ pub(crate) struct Outbound {
 /// Build the outbound call. The token is not read here.
 pub(crate) fn outbound_call(
     store: &Store,
-    from: Option<&str>,
+    from: &str,
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
@@ -215,7 +215,7 @@ pub(crate) fn outbound_call(
 pub fn post_text(
     store: &Store,
     data_dir: &std::path::Path,
-    from: Option<&str>,
+    from: &str,
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
@@ -260,16 +260,8 @@ pub fn chat_member_is_in(token: &str, chat_id: i64, user_id: i64) -> bool {
 /// The local half of one post: remember the chat, and copy the message into the
 /// room when the chat is a group. Nothing here posts; it can be retried from the
 /// receipt alone, and a repeated fan-out is one row.
-pub fn deliver_locally(
-    store: &Store,
-    from: Option<&str>,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-) {
-    let Some(agent) = from else {
-        return;
-    };
+pub fn deliver_locally(store: &Store, from: &str, chat_id: i64, message_id: i64, text: &str) {
+    let agent = from;
     if record_chat(store, agent, chat_id).is_err() {
         // One retry: the store may have been busy on the first attempt.
         let _ = record_chat(store, agent, chat_id);
@@ -313,6 +305,12 @@ pub fn fan_out(
         source_time_ms: None,
         source_key: Some(format!("tg-out:{chat_id}:{message_id}")),
         reply_to: Some(room.clone()),
+        quote: None,
+        origin: Some(anyagents_core::Origin {
+            chat_id: Some(chat_id),
+            thread_id: None,
+            message_id: Some(message_id),
+        }),
         received_at_ms: None,
     };
     Ok(store.receive_room(&room, incoming)?.len())
@@ -341,55 +339,25 @@ pub fn record_chat(store: &Store, agent: &str, chat_id: i64) -> Result<(), anyag
     Ok(())
 }
 
-fn channel_for(store: &Store, from: Option<&str>) -> Result<Channel, anyagents_core::Error> {
-    let mut channels = Vec::new();
-    for channel in store.list_channels()? {
-        if channel.kind == "telegram" && channel.credential_ref.is_some() {
-            channels.push(channel);
-        }
-    }
-    if let Some(name) = from {
-        let agent = store.agent_by_name(name)?;
-        return channels
-            .into_iter()
-            .find(|channel| channel.agents.iter().any(|id| id == &agent.id))
-            .ok_or_else(|| {
-                anyagents_core::Error::Message(format!("no telegram channel for {name}"))
-            });
-    }
-    let names = agent_names(store, &channels)?;
-    match channels.len() {
-        1 => Ok(channels.remove(0)),
-        0 => Err(anyagents_core::Error::Message("no telegram channel".into())),
+/// The one bot an agent posts through. An agent that has none, or more than
+/// one, posts nothing: there is no default bot to fall back to.
+fn channel_for(store: &Store, from: &str) -> Result<Channel, anyagents_core::Error> {
+    let agent = store.agent_by_name(from)?;
+    let mine: Vec<Channel> = store
+        .list_channels()?
+        .into_iter()
+        .filter(|channel| channel.kind == "telegram" && channel.credential_ref.is_some())
+        .filter(|channel| channel.agents.iter().any(|id| id == &agent.id))
+        .collect();
+    match mine.len() {
+        1 => Ok(mine.into_iter().next().unwrap_or_else(|| unreachable!())),
+        0 => Err(anyagents_core::Error::Message(format!(
+            "no telegram channel for {from}"
+        ))),
         _ => Err(anyagents_core::Error::Message(format!(
-            "telegram sender is ambiguous: {names}"
+            "{from} has more than one telegram bot; name one"
         ))),
     }
-}
-
-/// `None` means the caller named nobody. MCP always passes `agent:<name>`.
-pub(crate) fn bound_sender(sender: Option<&str>) -> Result<Option<String>, anyagents_core::Error> {
-    match sender {
-        None => Ok(None),
-        Some(raw) => match anyagents_core::Address::parse(raw)? {
-            anyagents_core::Address::Agent(name) => Ok(Some(name)),
-            _ => Err(anyagents_core::Error::Message(
-                "telegram sender must be an agent".into(),
-            )),
-        },
-    }
-}
-
-fn agent_names(store: &Store, channels: &[Channel]) -> Result<String, anyagents_core::Error> {
-    let mut names = Vec::new();
-    for channel in channels {
-        for id in &channel.agents {
-            names.push(store.agent(id)?.name);
-        }
-    }
-    names.sort();
-    names.dedup();
-    Ok(names.join(", "))
 }
 
 fn token_of(
@@ -494,7 +462,7 @@ mod tests {
         store.attach_channel(&ada_channel.id, &ada.id).unwrap();
         store.attach_channel(&bea_channel.id, &bea.id).unwrap();
 
-        let sent = outbound_call(&store, Some("bea"), 100, "hello", Some(5), Some(3)).unwrap();
+        let sent = outbound_call(&store, "bea", 100, "hello", Some(5), Some(3)).unwrap();
         assert_eq!(sent.credential_ref, "channels/bea");
         assert_eq!(sent.call.method, "sendMessage");
         assert_eq!(sent.call.body["chat_id"], 100);
@@ -503,15 +471,12 @@ mod tests {
         assert_eq!(sent.call.body["message_thread_id"], 3);
         assert!(!sent.call.body.to_string().contains("token"));
 
-        let ambiguous = outbound_call(&store, None, 100, "hello", None, None).unwrap_err();
-        let message = ambiguous.to_string();
-        assert!(message.contains("ada"), "{message}");
-        assert!(message.contains("bea"), "{message}");
-        assert!(outbound_call(&store, Some("cy"), 100, "hello", None, None).is_err());
+        // Nobody else's bot is ever used, and an unknown agent has none.
+        assert!(outbound_call(&store, "cy", 100, "hello", None, None).is_err());
     }
 
     #[test]
-    fn one_telegram_channel_sends_without_a_named_agent() {
+    fn a_bot_belongs_to_one_agent() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let ada = store
@@ -526,27 +491,27 @@ mod tests {
             })
             .unwrap();
         store.attach_channel(&channel.id, &ada.id).unwrap();
-        let sent = outbound_call(&store, None, 100, "hello", None, None).unwrap();
+        let sent = outbound_call(&store, "ada", 100, "hello", None, None).unwrap();
         assert_eq!(sent.credential_ref, "channels/ada");
         assert_eq!(sent.call.method, "sendMessage");
+        // There is no default bot: another agent does not post through it.
+        let bea = store
+            .create_agent(anyagents_core::NewAgent::new("bea", "codex"))
+            .unwrap();
+        assert!(outbound_call(&store, "bea", 100, "hi", None, None).is_err());
+        assert!(bea.name == "bea");
     }
 
     #[test]
     fn no_telegram_channel_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
-        let err = outbound_call(&store, None, 100, "hello", None, None).unwrap_err();
+        let ada = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let err = outbound_call(&store, "ada", 100, "hello", None, None).unwrap_err();
         assert!(err.to_string().contains("no telegram channel"), "{err}");
-    }
-
-    #[test]
-    fn a_bound_sender_is_that_agent_and_anything_else_is_refused() {
-        assert_eq!(
-            bound_sender(Some("agent:ada")).unwrap().as_deref(),
-            Some("ada")
-        );
-        assert_eq!(bound_sender(None).unwrap(), None);
-        assert!(bound_sender(Some("group:crew")).is_err());
+        assert!(ada.name == "ada");
     }
 
     #[test]

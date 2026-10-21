@@ -48,13 +48,14 @@ fn mcp_without_a_server_fails() {
         .arg("--data")
         .arg(dir.path())
         .arg("mcp")
-        .arg("--agent")
-        .arg("alpha")
+        .arg("--config")
+        .arg(dir.path().join("agents").join("alpha").join("config"))
         .output()
         .unwrap();
     assert!(!mcp.status.success());
     let stderr = String::from_utf8(mcp.stderr).unwrap();
-    assert!(stderr.contains("cannot reach the server"), "{stderr}");
+    // Nothing starts without the one capability its own config holds.
+    assert!(stderr.contains("no mailbox capability"), "{stderr}");
 }
 
 #[test]
@@ -75,7 +76,7 @@ fn create_send_inbox_and_usage() {
     let send = bin()
         .arg("--data")
         .arg(dir.path())
-        .args(["send", "alpha", "hello"])
+        .args(["send", "alpha", "hello", "--from", "agent:alpha"])
         .output()
         .unwrap();
     assert!(
@@ -181,12 +182,12 @@ fn create_send_inbox_and_usage() {
     let lonely = bin()
         .arg("--data")
         .arg(dir.path().join("empty"))
-        .args(["send", "group:crew", "hello"])
+        .args(["send", "group:crew", "hello", "--from", "agent:alpha"])
         .output()
         .unwrap();
     assert!(!lonely.status.success());
     let stderr = String::from_utf8(lonely.stderr).unwrap();
-    assert!(stderr.contains("has no agent"), "{stderr}");
+    assert!(stderr.contains("no agent"), "{stderr}");
 }
 
 #[test]
@@ -262,7 +263,10 @@ fn create_registers_mcp_only_in_the_agent_config() {
     assert_eq!(server["env"], serde_json::json!({}));
     let args = server["args"].as_array().unwrap();
     assert!(args.iter().any(|arg| arg == "mcp"));
-    assert!(args.iter().any(|arg| arg == "alpha"));
+    // The server is pointed at the agent's own config directory, which holds
+    // its capability; no name on the command line is an identity.
+    assert!(args.iter().any(|arg| arg == "--config"), "{args:?}");
+    assert!(!args.iter().any(|arg| arg == "--agent"), "{args:?}");
 
     let codex = bin_in(dir.path())
         .env("HOME", &home)

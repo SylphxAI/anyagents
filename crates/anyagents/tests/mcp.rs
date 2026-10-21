@@ -125,13 +125,64 @@ fn start_server(data: &std::path::Path) -> Serve {
     }
 }
 
+/// An agent's id, from the one directory its config lives in.
+fn created_id(dir: &std::path::Path, name: &str) -> String {
+    let out = bin()
+        .arg("--data")
+        .arg(dir)
+        .args(["agents", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    text.lines()
+        .find(|line| line.split('\t').nth(1) == Some(name))
+        .and_then(|line| line.split('\t').next())
+        .unwrap_or_else(|| panic!("no {name} in {text}"))
+        .to_string()
+}
+
+#[allow(dead_code)]
+fn listed_id(dir: &std::path::Path, name: &str) -> String {
+    let out = bin()
+        .env("PATH", machine_path(dir))
+        .arg("--data")
+        .arg(dir)
+        .args(["agents", "list"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    text.lines()
+        .find(|line| line.split('\t').nth(1) == Some(name))
+        .and_then(|line| line.split('\t').next())
+        .unwrap_or_else(|| panic!("no {name} in {text}"))
+        .to_string()
+}
+
+/// A tool server for one agent: its capability is in that agent's own config.
 async fn connect(
     data: &std::path::Path,
     agent: &str,
 ) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
+    let id = created_id(data, agent);
+    let config = data.join("agents").join(&id).join("config");
+
     let transport = TokioChildProcess::new(
         tokio::process::Command::new(env!("CARGO_BIN_EXE_anyagents")).configure(|cmd| {
-            cmd.arg("--data").arg(data).args(["mcp", "--agent", agent]);
+            // The single-user route: this deployment has no operator token, so
+            // its own agent route names the agent. The server still resolves
+            // the name itself, and a tool call never sends as anyone else.
+            cmd.env("ANYAGENTS_AGENT_ROUTE", data)
+                .env("ANYAGENTS_DATA", data)
+                .env("ANYAGENTS_AGENT_ID", &id)
+                .arg("--data")
+                .arg(data)
+                .args(["mcp", "--config"])
+                .arg(&config);
         }),
     )
     .unwrap();
