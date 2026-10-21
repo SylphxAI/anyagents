@@ -158,7 +158,7 @@ mod tests {
         let body = compose("yes", Some(&quote()));
         assert!(body.starts_with("yes\n\n"), "{body}");
         assert!(body.contains(QUOTE_FENCE), "{body}");
-        assert!(body.contains("Kyle replied to"), "{body}");
+        assert!(body.contains("The person replied to Kyle"), "{body}");
         assert!(body.contains("\"ship it\""), "{body}");
         assert!(body.ends_with(QUOTE_END), "{body}");
     }

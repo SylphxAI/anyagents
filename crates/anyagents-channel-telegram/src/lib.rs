@@ -858,7 +858,7 @@ mod tests {
         let body = &inbox[0].text;
         assert!(body.starts_with("yes\n\n"), "{body}");
         assert!(
-            body.contains("The person replied to Sage (@sage_bot):"),
+            body.contains("The agent replied to Sage (@sage_bot):"),
             "{body}"
         );
         assert!(body.contains("forged"), "{body}");
