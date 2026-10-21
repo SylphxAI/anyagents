@@ -135,7 +135,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/send", post(send))
         .route("/v1/harnesses/{id}/sign-in", post(sign_in_route))
-        .route("/v1/operator/agents/{name}/capability", post(mint_capability))
+        .route(
+            "/v1/operator/agents/{name}/capability",
+            post(mint_capability),
+        )
         .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
         .route("/v1/whoami", get(whoami))
         .with_state(state);
@@ -217,7 +220,9 @@ async fn mint_capability(
         .agent_by_name(&name)
         .map_err(ApiError::from_store)?;
     operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
-    Ok(Json(serde_json::json!({ "agent": agent.name, "minted": true })))
+    Ok(Json(
+        serde_json::json!({ "agent": agent.name, "minted": true }),
+    ))
 }
 
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
@@ -250,10 +255,7 @@ impl axum::extract::FromRequestParts<AppState> for Whoami {
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
         if state.auth.is_trusted()
-            && parts
-                .headers
-                .get(crate::operator::AGENT_HEADER)
-                .is_none()
+            && parts.headers.get(crate::operator::AGENT_HEADER).is_none()
             && let Some(id) = parts
                 .headers
                 .get("x-anyagents-agent-id")
@@ -262,13 +264,13 @@ impl axum::extract::FromRequestParts<AppState> for Whoami {
             // A machine without the boundary: the tool server says which agent
             // its own config directory belongs to, and the server checks that
             // the agent exists. Only here, and only for this read.
-            let principal = auth::agent_by_name(&state.store, id.trim())
-                .map_err(auth::AuthRejection)?;
+            let principal =
+                auth::agent_by_name(&state.store, id.trim()).map_err(auth::AuthRejection)?;
             return Ok(Self { principal });
         }
         use axum::extract::FromRequestParts;
-        let principal = <Principal as FromRequestParts<AppState>>::from_request_parts(parts, state)
-            .await?;
+        let principal =
+            <Principal as FromRequestParts<AppState>>::from_request_parts(parts, state).await?;
         Ok(Self { principal })
     }
 }
@@ -588,11 +590,13 @@ async fn inbox(
     // The name in the path is a check, never an identity: a call reads its own
     // mailbox, and the operator reads any agent's by naming it explicitly.
     let agent_id = match &principal {
-        Principal::Operator => state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?
-            .id,
+        Principal::Operator => {
+            state
+                .store
+                .agent_by_name(&name)
+                .map_err(ApiError::from_store)?
+                .id
+        }
         // A session reads the mailbox its capability names. The id in the path
         // is a check that it named its own, so an inbox is never chosen by a
         // string the model wrote.
@@ -682,10 +686,18 @@ async fn send(
 /// One send, resolved to the destinations it will write, before any of them is
 /// validated or posted. `reply_to` is a mailbox reference the server resolves
 /// against this agent's own mailbox, or a destination written plainly.
-fn plan_send(store: &Store, principal: &Principal, body: &SendRequest) -> Result<SendPlan, ApiError> {
+fn plan_send(
+    store: &Store,
+    principal: &Principal,
+    body: &SendRequest,
+) -> Result<SendPlan, ApiError> {
     let mut plan = SendPlan::parse(store, body)?;
-    let reply = match crate::reply::resolve(principal, |id| own_message(store, principal, id), body.reply_to.as_deref())
-        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?
+    let reply = match crate::reply::resolve(
+        principal,
+        |id| own_message(store, principal, id),
+        body.reply_to.as_deref(),
+    )
+    .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?
     {
         Some(destination) => Some(destination),
         None => None,
@@ -724,9 +736,7 @@ fn own_message(
         Principal::Agent { agent_id, .. } => agent_id.clone(),
         Principal::Operator => return Ok(None),
     };
-    store
-        .message(&agent_id, id)
-        .map_err(|err| err.to_string())
+    store.message(&agent_id, id).map_err(|err| err.to_string())
 }
 
 fn target_of(destination: &crate::reply::Destination) -> Target {
@@ -819,7 +829,12 @@ impl SendPlan {
 
 /// Every destination is checked before any write, so a refused address never
 /// leaves half a send behind.
-fn check_targets(store: &Store, actor: &Actor, body: &SendRequest, plan: &SendPlan) -> Result<(), ApiError> {
+fn check_targets(
+    store: &Store,
+    actor: &Actor,
+    body: &SendRequest,
+    plan: &SendPlan,
+) -> Result<(), ApiError> {
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
@@ -841,7 +856,14 @@ fn check_targets(store: &Store, actor: &Actor, body: &SendRequest, plan: &SendPl
                 reply,
                 ..
             } => {
-                prepare_telegram(store, actor, body, chat, thread.as_deref(), reply.as_deref())?;
+                prepare_telegram(
+                    store,
+                    actor,
+                    body,
+                    chat,
+                    thread.as_deref(),
+                    reply.as_deref(),
+                )?;
             }
         }
     }
@@ -937,10 +959,10 @@ impl Actor {
     fn parse(raw: &str) -> Result<Self, ApiError> {
         match anyagents_core::Address::parse(raw) {
             Ok(anyagents_core::Address::Agent(name)) => Ok(Self::Agent(name)),
-            Ok(address @ (anyagents_core::Address::TelegramUser { .. }
-            | anyagents_core::Address::TelegramChat { .. })) => {
-                Ok(Self::Operator(address.canonical()))
-            }
+            Ok(
+                address @ (anyagents_core::Address::TelegramUser { .. }
+                | anyagents_core::Address::TelegramChat { .. }),
+            ) => Ok(Self::Operator(address.canonical())),
             Ok(other) => Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 format!("{other} cannot write a message"),
@@ -1319,7 +1341,10 @@ mod tests {
         // them, and sets them for its own duration only.
         unsafe {
             std::env::set_var("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_file);
-            std::env::set_var("ANYAGENTS_CAPABILITY_KEY", "0123456789abcdef0123456789abcdef");
+            std::env::set_var(
+                "ANYAGENTS_CAPABILITY_KEY",
+                "0123456789abcdef0123456789abcdef",
+            );
         }
         let store = Store::open(data.path().join("state.db")).unwrap();
         let configured = "0123456789abcdef0123456789abcdef";

@@ -163,7 +163,11 @@ impl TgMessage {
             }),
             sender_id: quoted.from.as_ref().map(|user| user.id),
             author_is_bot: quoted.from.as_ref().is_some_and(|user| user.is_bot),
-            author: quoted.from.as_ref().map(TgUser::display_name).unwrap_or_default(),
+            author: quoted
+                .from
+                .as_ref()
+                .map(TgUser::display_name)
+                .unwrap_or_default(),
             text: quoted.body().unwrap_or_default().to_string(),
             mentions,
         };
@@ -595,9 +599,7 @@ pub fn deliver_to_mailbox(
                 incoming.source_key = Some(format!("echo:{chat_id}:{outbound_id}"));
                 // The poster is an agent this server authenticated, so a peer
                 // reads the post as that agent and not as a bot's text.
-                incoming.sender = sender_agent
-                    .as_ref()
-                    .map(|agent| format!("agent:{agent}"));
+                incoming.sender = sender_agent.as_ref().map(|agent| format!("agent:{agent}"));
                 if let Some(reply_to) = reply_to {
                     incoming.reply_to = reply_to.clone();
                 }
@@ -855,7 +857,10 @@ mod tests {
         let inbox = store.inbox(&agent.id, None).unwrap();
         let body = &inbox[0].text;
         assert!(body.starts_with("yes\n\n"), "{body}");
-        assert!(body.contains("The person replied to Sage (@sage_bot):"), "{body}");
+        assert!(
+            body.contains("The person replied to Sage (@sage_bot):"),
+            "{body}"
+        );
         assert!(body.contains("forged"), "{body}");
         // The quoted text's own fence line cannot open a second quote.
         let forged = body.matches("----- quoted message -----").count();

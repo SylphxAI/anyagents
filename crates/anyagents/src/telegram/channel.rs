@@ -260,13 +260,7 @@ pub fn chat_member_is_in(token: &str, chat_id: i64, user_id: i64) -> bool {
 /// The local half of one post: remember the chat, and copy the message into the
 /// room when the chat is a group. Nothing here posts; it can be retried from the
 /// receipt alone, and a repeated fan-out is one row.
-pub fn deliver_locally(
-    store: &Store,
-    from: &str,
-    chat_id: i64,
-    message_id: i64,
-    text: &str,
-) {
+pub fn deliver_locally(store: &Store, from: &str, chat_id: i64, message_id: i64, text: &str) {
     let agent = from;
     if record_chat(store, agent, chat_id).is_err() {
         // One retry: the store may have been busy on the first attempt.
