@@ -533,21 +533,13 @@ impl Harness for OpenCodeHarness {
                 });
             }
         }
-        // One prompt per turn. While a turn is still open the message stays in
-        // the mailbox: `run_once` stops here and hands it over after the open
-        // turn settles. Without this every waiting line is prompted at once and
-        // the vendor answers them together as one batched reply.
-        if !self.lock().open.is_empty() {
-            let _ = self.poll();
-            if !self.lock().open.is_empty() {
-                return Ok(DeliverOutcome::Deferred);
-            }
-        }
+        // OpenCode owns turn state: a prompt with delivery "steer" joins the
+        // running turn or starts the next one, so nothing is held here.
         let Some(session) = self.lock().session.clone() else {
             return Err(HarnessError::Failed("no session".into()));
         };
         let text = marked_message(&message.id, &message.text);
-        let body = json!({"text": text, "delivery": "queue"});
+        let body = json!({"text": text, "delivery": "steer"});
         let answer = self.api(
             "POST",
             &format!("/api/session/{session}/prompt"),
@@ -563,9 +555,9 @@ impl Harness for OpenCodeHarness {
         // close this turn, and a retry moves the floor with it.
         state.turn_since = Some(now_ms());
         state.written.push(message.id.clone());
-        state.open.push(message.id.clone());
+        // Handed to the harness is done: OpenCode queues or steers it itself.
         Ok(DeliverOutcome::Accepted {
-            turn_finished: state.finished.contains(&message.id),
+            turn_finished: true,
         })
     }
 
