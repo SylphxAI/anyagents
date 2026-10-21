@@ -682,6 +682,31 @@ mod tests {
     }
 
     #[test]
+    fn two_identical_messages_in_one_second_are_two_events() {
+        // The same person sends the same words twice, Telegram showing the same
+        // second for both. The update id is what tells them apart: nothing is
+        // folded by text or time, and the second is not dropped as a repeat.
+        let first = r#"[{"update_id":900,"message":{"message_id":50,"chat":{"id":100},"from":{"id":42,"first_name":"Kai"},"date":1700000000,"text":"same words"}}]"#;
+        let second = r#"[{"update_id":901,"message":{"message_id":51,"chat":{"id":100},"from":{"id":42,"first_name":"Kai"},"date":1700000000,"text":"same words"}}]"#;
+        let mut poll = Poll::default();
+        let one = poll.route("bot_a", "ada", first).unwrap();
+        let two = poll.route("bot_a", "ada", second).unwrap();
+        let Routed::ToAgent { inbound: a, .. } = &one[0] else {
+            panic!("{one:?}");
+        };
+        let Routed::ToAgent { inbound: b, .. } = &two[0] else {
+            panic!("{two:?}");
+        };
+        assert_eq!((a.message_id, a.text.as_str()), (50, "same words"));
+        assert_eq!((b.message_id, b.text.as_str()), (51, "same words"));
+        assert_ne!(a.source_key, b.source_key);
+        // The same update offered again is the same event, dropped as a repeat.
+        let again = poll.route("bot_a", "ada", second).unwrap();
+        assert!(matches!(again[0], Routed::Dropped), "{again:?}");
+        assert_eq!(poll.offset, 902);
+    }
+
+    #[test]
     fn media_with_a_caption_is_delivered_and_a_sticker_is_not() {
         let photo = r#"[{"update_id":30,"message":{"message_id":70,"chat":{"id":100},"date":1700000000,"caption":"look"}}]"#;
         let sticker =

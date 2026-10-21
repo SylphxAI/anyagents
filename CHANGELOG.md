@@ -56,7 +56,12 @@ the first release will move it under a version heading.
 
 ### Fixed
 
-- **An OpenCode agent's mailbox stalled after its first turn or two.** The
+- **An OpenCode agent's mailbox stalled after its first turn or two.**
+- **Shutdown no longer abandons a Telegram long poll.** A held `getUpdates`
+  blocks the bot, so the server now releases every bot's poll before it stops
+  (one call with the shortest timeout and no offset), and each bot's thread
+  joins only after its last offset is written. A poller is never left behind
+  polling beside the next server. The
   adapter wrote one prompt per turn and waited for a turn end it could not
   observe, so every later row stayed `received` and a server restart did not
   clear it. Every line is now a prompt with `delivery: "steer"`, taken when the
