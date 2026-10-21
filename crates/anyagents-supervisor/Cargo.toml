@@ -30,3 +30,10 @@ path = "../anyagents-harness-claude/src/bin/fake_claude.rs"
 [[bin]]
 name = "fails_once"
 path = "src/bin/fails_once.rs"
+
+# `cargo test --workspace --all-targets` reports the dependencies of a bin or a
+# test target as unused in that target. Only a workspace member that is built as
+# a linker root (like `anyagents`) is checked; an empty list keeps the ignore
+# from matching every crate.
+[package.metadata.cargo-machete]
+ignored = []

@@ -194,22 +194,10 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     let agy_id = create(&data, "argon", "agy", &agy_file);
     let muse_id = create(&data, "calliope", "muse", &muse_file);
 
-    // The agy config carries the steering hook; the Muse one carries the tool
-    // server. Both were written by create, before the server was up.
+    // The Muse config carries the tool server, written by create before the
+    // server was up. The Antigravity CLI keeps its own config.
     let agy_config = data.join("agents").join(&agy_id).join("config");
-    // The adapter registers the hook in `hooks.json`, the file it also serves.
-    let settings: Value =
-        serde_json::from_slice(&std::fs::read(agy_config.join("hooks.json")).unwrap()).unwrap();
-    // The hook `agy` reads: `hooks.PreInvocation`, one entry holding hooks.
-    let entries = settings["hooks"]["PreInvocation"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no PreInvocation: {settings}"));
-    assert_eq!(entries.len(), 1, "{settings}");
-    let command = &entries[0]["hooks"][0]["command"];
-    assert!(
-        command.as_str().unwrap().ends_with("agy-steer-hook"),
-        "{settings}"
-    );
+    assert!(agy_config.is_dir(), "the agy agent has its config directory");
     let muse_config = data
         .join("agents")
         .join(&muse_id)

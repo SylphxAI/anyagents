@@ -6,29 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
 
-use crate::{agy_config, install, mcp_config, muse_config, opencode_config};
-
-/// The executable script the Antigravity hook runs: this binary's hook
-/// command, for this agent, in this data directory.
-fn agy_hook_script(command: &Path, args: &[String], agent: &str) -> String {
-    // `--data <path> mcp --agent <name>`: the data directory follows `--data`.
-    let data = args
-        .iter()
-        .position(|arg| arg == "--data")
-        .and_then(|at| args.get(at + 1))
-        .cloned()
-        .unwrap_or_default();
-    format!(
-        "#!/bin/sh\nexec {} --data {} agy-hook --agent {}\n",
-        shell_quote(&command.display().to_string()),
-        shell_quote(&data),
-        shell_quote(agent)
-    )
-}
-
-fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
-}
+use crate::{install, mcp_config, muse_config, opencode_config};
 
 pub struct CreateRequest {
     pub name: String,
@@ -78,18 +56,8 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     } else if agent.harness == "opencode" {
         opencode_config::write(&config, agent.model.as_deref(), &command, &args)?;
     } else if agent.harness == "agy" {
-        // The steering hook is the one thing this client can write. The MCP
-        // server needs the CLI's own `mcp add` consent flow, so the agent
-        // starts without it rather than failing to start.
-        let hook = agy_config::hook_path(&config);
-        std::fs::write(&hook, agy_hook_script(&command, &args, &agent.name))?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700))?;
-        }
-        // The adapter registers it where `agy` reads it, and serves its queue.
-        anyagents_harness_agy::write_settings(&config, &hook)
-            .map_err(|err| Error::Message(err.to_string()))?;
+        // The Antigravity CLI writes its own config here; the MCP server needs
+        // the CLI's own `mcp add` consent flow, so the agent starts without it.
     } else if agent.harness == "muse" {
         muse_config::write(&config, agent.model.as_deref(), &command, &args)?;
         muse_config::point_vendor_home(&config)?;

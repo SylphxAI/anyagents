@@ -13,7 +13,6 @@ use anyagents_core::{
 use anyagents_supervisor::{declared, mode_name, steer_name};
 use clap::{Parser, Subcommand};
 
-mod agy_config;
 mod api;
 mod create;
 mod fake_opencode;

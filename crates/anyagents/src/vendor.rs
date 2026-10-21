@@ -14,16 +14,16 @@ use anyagents_harness_claude::ClaudeHarness;
 use anyagents_harness_codex::CodexHarness;
 use anyagents_harness_muse::MuseHarness;
 use anyagents_harness_opencode::OpenCodeHarness;
-use anyagents_harness_stream::{Launch, LineEffect, StreamHarness};
+use anyagents_harness_stream::{Launch, StreamHarness};
 use anyagents_supervisor::LaunchRequest;
 
 pub enum VendorHarness {
-    Claude(ClaudeHarness),
-    Codex(CodexHarness),
-    OpenCode(OpenCodeHarness),
-    Agy(AgyHarness),
-    Muse(MuseHarness),
-    Contract(ContractHarness),
+    Claude(Box<ClaudeHarness>),
+    Codex(Box<CodexHarness>),
+    OpenCode(Box<OpenCodeHarness>),
+    Agy(Box<AgyHarness>),
+    Muse(Box<MuseHarness>),
+    Contract(Box<ContractHarness>),
 }
 
 /// A harness driven by a program named in the agent's config, which must obey
@@ -53,7 +53,7 @@ impl ContractHarness {
     ) -> Result<Self, anyagents_harness::HarnessError> {
         Ok(Self {
             inner: StreamHarness::launch(Launch {
-                name: "anyagents-contract".to_string(),
+                spec: anyagents_harness_stream::StreamSpec::for_program("contract"),
                 program: program.into(),
                 args: vec!["harness".to_string(), config.to_string()],
                 environment: environment
@@ -64,14 +64,6 @@ impl ContractHarness {
                 session_id: None,
                 mode: anyagents_harness::DeliveryMode::Followup,
                 steer: anyagents_harness::SteerSupport::Unproven,
-                on_line: std::sync::Arc::new(|value| LineEffect {
-                    finishes_turn: value.get("type").and_then(serde_json::Value::as_str)
-                        == Some("result"),
-                    session_id: None,
-                    usage: None,
-                    quota_reset_at_ms: None,
-                    text: None,
-                }),
             })?,
         })
     }
@@ -151,16 +143,15 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             Some(&request.work_dir),
         )
         .map_err(|err| err.to_string())?;
-        return Ok(VendorHarness::Contract(harness));
+        return Ok(VendorHarness::Contract(Box::new(harness)));
     }
     if request.agent.harness == "agy" {
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         // The agent's own config directory carries the steering hook, so a
         // message reaches the running turn instead of waiting for the next one.
         let harness = AgyHarness::start(&program, None, &pairs(&env))
-            .and_then(|harness| harness.with_hook(request.config_dir.clone()))
             .map_err(|err| err.to_string())?;
-        Ok(VendorHarness::Agy(harness))
+        Ok(VendorHarness::Agy(Box::new(harness)))
     } else if request.agent.harness == "muse" {
         let program = std::env::var("ANYAGENTS_MUSE_BIN").unwrap_or_else(|_| "muse".to_string());
         let harness = MuseHarness::start_in(
@@ -170,7 +161,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             Some(&request.work_dir),
         )
         .map_err(|err| err.to_string())?;
-        Ok(VendorHarness::Muse(harness))
+        Ok(VendorHarness::Muse(Box::new(harness)))
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
         // shares ~/.local/share/opencode/opencode.db with the desk's own
@@ -203,7 +194,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             &request.config_dir,
         )
         .map_err(|err| err.to_string())?;
-        Ok(VendorHarness::OpenCode(harness))
+        Ok(VendorHarness::OpenCode(Box::new(harness)))
     } else if request.agent.harness == "codex" {
         env.push((
             "CODEX_HOME".to_string(),
@@ -211,7 +202,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         ));
         let program = crate::install::program(&root, &request.agent.harness);
         let harness = start_codex(&program.display().to_string(), &env, &request.work_dir)?;
-        Ok(VendorHarness::Codex(harness))
+        Ok(VendorHarness::Codex(Box::new(harness)))
     } else {
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
@@ -219,7 +210,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         ));
         let program = crate::install::program(&root, &request.agent.harness);
         let harness = start_claude(&program.display().to_string(), &env, &request.work_dir)?;
-        Ok(VendorHarness::Claude(harness))
+        Ok(VendorHarness::Claude(Box::new(harness)))
     }
 }
 
@@ -351,8 +342,10 @@ impl Harness for VendorHarness {
     /// supervisor never marks its message processed on a guess.
     fn turn_report_for(&self, id: &str) -> Option<anyagents_harness::TurnReport> {
         match self {
-            Self::Agy(harness) => anyagents_harness::Harness::turn_report_for(harness, id),
-            Self::Muse(harness) => anyagents_harness::Harness::turn_report_for(harness, id),
+            Self::Agy(harness) => anyagents_harness::Harness::turn_report_for(harness.as_ref(), id),
+            Self::Muse(harness) => {
+                anyagents_harness::Harness::turn_report_for(harness.as_ref(), id)
+            }
             _ => None,
         }
     }

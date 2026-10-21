@@ -20,3 +20,10 @@ tempfile = "3"
 name = "fake_opencode"
 path = "tests/bin/fake_opencode.rs"
 test = false
+
+# `cargo test --workspace --all-targets` reports the dependencies of a bin or a
+# test target as unused in that target. Only a workspace member that is built as
+# a linker root (like `anyagents`) is checked; an empty list keeps the ignore
+# from matching every crate.
+[package.metadata.cargo-machete]
+ignored = []
