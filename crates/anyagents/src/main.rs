@@ -454,6 +454,7 @@ fn agents(data: &Path, action: AgentsCommand) -> Result<(), anyagents_core::Erro
                     harness,
                     model,
                     workdir,
+                    workdir_default: server::owner_workdir(),
                     instructions,
                 },
             )?;

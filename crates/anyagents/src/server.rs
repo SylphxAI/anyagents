@@ -353,6 +353,7 @@ async fn create_agent_route(
                 harness: body.harness,
                 model: body.model,
                 workdir: body.workdir.map(PathBuf::from),
+                workdir_default: owner_workdir(),
                 instructions: body.instructions,
             },
         )
@@ -724,6 +725,13 @@ impl IntoResponse for ApiError {
         let body = Json(serde_json::json!({ "error": self.message }));
         (self.status, body).into_response()
     }
+}
+
+/// The working directory every owner agent shares, when the deployment sets one.
+/// `ANYAGENTS_OWNER_WORKDIR` names it; without it an agent keeps its own
+/// managed directory.
+pub fn owner_workdir() -> Option<std::path::PathBuf> {
+    std::env::var_os("ANYAGENTS_OWNER_WORKDIR").map(std::path::PathBuf::from)
 }
 
 #[cfg(test)]
