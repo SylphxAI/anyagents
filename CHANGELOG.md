@@ -54,6 +54,15 @@ the first release will move it under a version heading.
   `failed_turns` table are dropped, and the stale `answer:<id>` rows are
   removed.
 
+### Fixed
+
+- **An OpenCode agent's mailbox stalled after its first turn or two.** The
+  adapter wrote one prompt per turn and waited for a turn end it could not
+  observe, so every later row stayed `received` and a server restart did not
+  clear it. Every line is now a prompt with `delivery: "steer"`, taken when the
+  prompt API answers, so the session's own inbox decides whether it joins the
+  running turn or starts the next one.
+
 ### Not yet
 
 - Telegram sign-in, the MCP registry entry, and a published release.
