@@ -570,6 +570,7 @@ async fn create_agent_route(
             },
         )
         .map_err(ApiError::from_store)?;
+        operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
         let view = agent_view(&state.store, &state.health, &agent)?;
         Ok((StatusCode::CREATED, Json(view)))
     })

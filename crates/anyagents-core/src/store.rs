@@ -961,11 +961,10 @@ impl Store {
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
-        let mut stmt = conn.prepare(
-            "SELECT id, agent_id, seq, source_time_ms, source_key, sender, body,
-             reply_to, received_at_ms, delivered_at_ms
-             FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq",
-        )?;
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS}
+             FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq"
+        ))?;
         let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(0)])?;
         let mut messages = Vec::new();
         while let Some(row) = rows.next()? {

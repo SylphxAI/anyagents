@@ -3,6 +3,8 @@
 //! The vendor is the scripted `opencode` the adapter's tests use: it holds a
 //! service and answers `opencode api` calls, as the real CLI does.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -102,7 +104,8 @@ fn call(socket: &Path, request: &str) -> Value {
     stream
         .write_all(
             format!(
-                "POST /v1/send HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}",
+                "POST /v1/send HTTP/1.1\r\nHost: local\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}",
+                support::header(),
                 request.len()
             )
             .as_bytes(),
@@ -117,9 +120,11 @@ fn call(socket: &Path, request: &str) -> Value {
 
 #[test]
 fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
+    support::operator(&data);
 
     let server = Server::start(&data);
     let created = create(&data, "alpha");
@@ -137,11 +142,8 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         .next()
         .unwrap()
         .to_string();
-    let config = data
-        .join("agents")
-        .join(&id)
-        .join("config")
-        .join("opencode.json");
+    let config_dir = data.join("agents").join(&id).join("config");
+    let config = config_dir.join("opencode.json");
     let parsed: Value = serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
     assert_eq!(parsed["model"], "opencode/big-pickle");
     assert_eq!(parsed["mcp"]["anyagents"]["type"], "local");
@@ -168,7 +170,13 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     let other = create(&data, "owner");
     assert!(other.status.success(), "{other:?}");
     let answered = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-        .args(["--data", data.to_str().unwrap(), "mcp", "--agent", "alpha"])
+        .args([
+            "--data",
+            data.to_str().unwrap(),
+            "mcp",
+            "--config",
+            config_dir.to_str().unwrap(),
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
