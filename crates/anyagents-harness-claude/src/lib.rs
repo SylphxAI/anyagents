@@ -21,10 +21,7 @@
 //! written by [`Harness::inject`] with the same acknowledgement.
 //!
 //! Resume starts the child again with `--resume` when the session id changed or the
-//! process has exited. A restart asks for the stored session and keeps whichever
-//! id the child reports; a child that answers "no conversation found" begins a
-//! new conversation instead, never silently. Cancel sends a `control_request`
-//! whose subtype is `interrupt`.
+//! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
@@ -39,24 +36,6 @@ use anyagents_harness::{
     SteerQueue, SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
 };
 use serde_json::{Value, json};
-
-/// How long a restart waits for a resumed child to answer or end.
-const RESUME_SETTLE: Duration = Duration::from_secs(3);
-
-/// A `result` is the vendor saying the session it was given is not there.
-fn result_refused(value: &Value) -> bool {
-    value.get("type").and_then(Value::as_str) == Some("result")
-        && value.get("is_error").and_then(Value::as_bool) == Some(true)
-        && value
-            .get("result")
-            .and_then(Value::as_str)
-            .is_some_and(|text| {
-                text.contains("No conversation found")
-                    || text.contains("no conversation found")
-                    || text.contains("Session not found")
-                    || text.contains("session not found")
-            })
-}
 
 /// One long-lived Claude Code child.
 pub struct ClaudeHarness {
@@ -75,12 +54,6 @@ struct State {
     child: Option<Child>,
     alive: bool,
     epoch: u64,
-    /// Lines the child printed since the launch.
-    lines: usize,
-    /// The child answered a session it was given with "no conversation found".
-    /// A refusal stays for the life of this adapter: a later launch that was
-    /// never asked to resume is not a fresh answer to the question.
-    refused: bool,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
@@ -120,33 +93,6 @@ impl ClaudeHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
-        // Every start gives a child it resumes the same brief moment a restart
-        // gives it, so the vendor's answer to the resume is read, not raced.
-        let started = Self::launch_now(program, session_id, environment, work_dir)?;
-        if session_id.is_some() && started.refused_launch(RESUME_SETTLE) == Some(false) {
-            // A resume that answered is the conversation the child runs.
-            started.wait_seen_resume(RESUME_SETTLE);
-        }
-        Ok(started)
-    }
-
-    /// Wait until the resumed child has printed anything, or `wait` passes.
-    fn wait_seen_resume(&self, wait: Duration) {
-        let deadline = Instant::now() + wait;
-        loop {
-            if lock(&self.shared).lines > 0 || Instant::now() >= deadline {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-
-    fn launch_now(
-        program: impl Into<PathBuf>,
-        session_id: Option<&str>,
-        environment: &[(&str, &str)],
-        work_dir: Option<&Path>,
-    ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             program: program.into(),
             environment: environment
@@ -168,60 +114,6 @@ impl ClaudeHarness {
     pub fn with_steer(mut self, queue: SteerQueue) -> Self {
         self.steer = Some(queue);
         self
-    }
-
-    /// Start the child again with `session`: the same one when it is already
-    /// the conversation it runs, else a child that resumes it.
-    ///
-    /// A session the vendor says it does not have is answered with an error
-    /// result and nothing else. A caller with `restart` then starts a child
-    /// without it, and the reason is returned: a conversation that had to be
-    /// left behind is never dropped silently. A child that printed anything
-    /// else was running, whatever it reported.
-    pub fn resume_or_start(
-        &mut self,
-        session: Option<&str>,
-        restart: bool,
-    ) -> Result<Option<String>, HarnessError> {
-        let Some(session) = session else {
-            return Ok(None);
-        };
-        if self.session_id().as_deref() != Some(session) {
-            self.resume(session)?;
-        }
-        let refused = self.refused_launch(RESUME_SETTLE);
-
-        if !(restart && refused == Some(true)) {
-            return Ok(None);
-        }
-        let reason = format!(
-            "anyagents-claude: session {session} was not resumed (the vendor does not have it); starting a new one"
-        );
-        self.stop_child();
-        self.launch(None)?;
-        Ok(Some(reason))
-    }
-
-    /// The start just asked for was a resume, and its child said the session
-    /// is not there: `Some(true)`. `None` when the child was launched fresh or
-    /// answered with anything else, and `Some(false)` while it still runs.
-    pub fn refused_launch(&self, wait: Duration) -> Option<bool> {
-        let deadline = Instant::now() + wait;
-        loop {
-            {
-                let state = lock(&self.shared);
-                if state.refused {
-                    return Some(true);
-                }
-                if state.lines > 0 || !state.alive {
-                    return Some(false);
-                }
-            }
-            if Instant::now() >= deadline {
-                return Some(false);
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
     }
 
     /// The create input line Claude Code reads: one `user` event whose text is
@@ -355,25 +247,6 @@ impl ClaudeHarness {
         }
     }
 
-    /// Start one child and resume `session_id` when the vendor still has it.
-    ///
-    /// The new server's step: a child starts, then the stored session is
-    /// resumed on it. A vendor that answers "no conversation found" begins a
-    /// new conversation instead, and stderr says why. Anything else the
-    /// resumed child reported stands.
-    pub fn start_after_restart(
-        program: impl Into<PathBuf>,
-        session_id: Option<&str>,
-        environment: &[(&str, &str)],
-        work_dir: Option<&Path>,
-    ) -> Result<Self, HarnessError> {
-        let mut harness = Self::start_in(program, None, environment, work_dir)?;
-        if let Some(said) = harness.resume_or_start(session_id, true)? {
-            eprintln!("{said}");
-        }
-        Ok(harness)
-    }
-
     fn launch(&mut self, session_id: Option<&str>) -> Result<(), HarnessError> {
         let mut cmd = Command::new(&self.program);
         cmd.arg("-p")
@@ -412,7 +285,6 @@ impl ClaudeHarness {
             let mut state = lock(&self.shared);
             state.child = Some(child);
             state.alive = true;
-            state.lines = 0;
             state.open.clear();
             state.followups.clear();
             if let Some(session_id) = session_id {
@@ -694,10 +566,7 @@ fn promote_followups(state: &mut State) {
 
 fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
     for line in BufReader::new(stdout).lines() {
-        let line = match line {
-            Ok(line) => line,
-            Err(_) => break,
-        };
+        let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
@@ -706,10 +575,6 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         };
         {
             let mut state = lock(&shared);
-            state.lines += 1;
-            if result_refused(&value) {
-                state.refused = true;
-            }
             // An id the vendor wrote or echoed starts no second turn. An id that
             // only appears inside an error or a system notice is not proof it
             // wrote the message: the turn that failed must be able to try again.

@@ -6,18 +6,6 @@ license.workspace = true
 rust-version.workspace = true
 description = "Antigravity stream adapter"
 
-[features]
-# A restart inside one process, driven by the adapter's test double.
-double = ["anyagents-harness-stream/double"]
-
-# A scripted vendor for the restart tests: it answers each vendor's own
-# protocol and writes down the sessions it was asked to resume. It is not part
-# of the released binary.
-[[bin]]
-name = "restart-agy"
-path = "src/bin/vendor_double.rs"
-test = false
-
 [[bin]]
 name = "anyagents-steer-hook"
 path = "src/bin/anyagents-steer-hook.rs"
@@ -31,9 +19,6 @@ serde_json = "1"
 [dev-dependencies]
 serde_json = "1"
 tempfile = "3"
-# The adapter with its restart-only helpers, so a test can end a launch the way
-# a server going down does.
-anyagents-harness-agy = { path = ".", features = ["double"] }
 
 
 # `cargo test --workspace --all-targets` reports the dependencies of a bin or a

@@ -162,7 +162,6 @@ name = "anyagents-harness-agy"
 version = "0.1.0"
 dependencies = [
  "anyagents-harness",
- "anyagents-harness-agy",
  "anyagents-harness-stream",
  "serde",
  "serde_json",
