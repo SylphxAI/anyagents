@@ -349,33 +349,18 @@ impl OpenCodeHarness {
         let mut child = command
             .spawn()
             .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")))?;
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-        let stdout_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut out) = stdout_pipe {
-                let _ = std::io::Read::read_to_end(&mut out, &mut buf);
-            }
-            buf
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut err) = stderr_pipe {
-                let _ = std::io::Read::read_to_end(&mut err, &mut buf);
-            }
-            buf
-        });
         let deadline = Instant::now() + CALL_TIMEOUT;
         loop {
             if let Ok(Some(status)) = child.try_wait() {
-                let stdout = stdout_reader.join().unwrap_or_default();
-                let stderr = stderr_reader.join().unwrap_or_default();
+                let output = child
+                    .wait_with_output()
+                    .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")))?;
                 if !status.success() {
-                    let text = String::from_utf8_lossy(&stderr);
+                    let text = String::from_utf8_lossy(&output.stderr);
                     let reason = text.lines().next().unwrap_or("no reason").to_string();
                     return Err(HarnessError::Failed(format!("{method} {path}: {reason}")));
                 }
-                return serde_json::from_slice(&stdout)
+                return serde_json::from_slice(&output.stdout)
                     .map_err(|err| HarnessError::Failed(format!("{method} {path}: {err}")));
             }
             if Instant::now() >= deadline {
@@ -408,9 +393,7 @@ impl OpenCodeHarness {
         let mut idle_succeeded = false;
         let mut failed = None;
         let mut usage = TurnUsage::default();
-        // The service lists messages newest first; walk oldest to newest so the
-        // newest assistant text and usage win over earlier steps in the turn.
-        for message in messages.iter().rev() {
+        for message in messages {
             // Only this turn's messages count. A session keeps its history, so
             // an earlier turn's answer or idle would otherwise close this one.
             let created = message
@@ -422,15 +405,26 @@ impl OpenCodeHarness {
             }
             match message.get("type").and_then(Value::as_str) {
                 Some("assistant") => {
-                    // The newest assistant message with text is the answer; an
-                    // earlier one belonged to a turn already settled, and a
-                    // tool-only step must not wipe out the turn's text.
-                    let candidate = text_of(message);
-                    if !candidate.is_empty() {
-                        text = candidate;
+                    // The newest assistant message is the answer; an earlier one
+                    // belonged to a turn already settled.
+                    text.clear();
+                    for part in message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
+                        // Only a `text` part is the answer; a `reasoning` part is
+                        // the model's own thinking and is never recorded.
+                        if part.get("type").and_then(Value::as_str) != Some("text") {
+                            continue;
+                        }
+                        if let Some(part) = part.get("text").and_then(Value::as_str) {
+                            text.push_str(part);
+                        }
                     }
                     usage = usage_of(message);
-                    if message.get("finish").and_then(Value::as_str) == Some("stop") {
+                    if message.get("finish").is_some() {
                         idle_succeeded = true;
                     }
                 }
@@ -623,16 +617,9 @@ impl Harness for OpenCodeHarness {
         // says so, or when its answer has stopped changing. The answer is
         // recorded before this returns: the supervisor settles the message the
         // moment it does, and nothing read afterwards is kept.
-        // A message already settled is done at once; an accepted message after
-        // a restart is tracked as open so the first poll can settle it.
-        {
-            let mut state = self.lock();
-            if state.finished.contains(id) {
-                return true;
-            }
-            if !state.open.iter().any(|open| open == id) {
-                state.open.push(id.to_string());
-            }
+        // A message already settled is done at once.
+        if self.lock().finished.contains(id) {
+            return true;
         }
         let deadline = Instant::now() + patience;
         let mut last: Option<String> = None;
@@ -826,17 +813,17 @@ fn answer_of(messages: &[Value], id: &str) -> Option<String> {
         .pointer("/time/created")
         .and_then(Value::as_i64)
         .unwrap_or(0);
-    messages[..asked_at].iter().find_map(|message| {
-        if message.get("type").and_then(Value::as_str) != Some("assistant") {
-            return None;
-        }
-        let created = message.pointer("/time/created").and_then(Value::as_i64)?;
-        if created <= asked {
-            return None;
-        }
-        let text = text_of(message);
-        (!text.is_empty()).then_some(text)
-    })
+    messages[..asked_at]
+        .iter()
+        .find(|message| {
+            message.get("type").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .pointer("/time/created")
+                    .and_then(Value::as_i64)
+                    .is_some_and(|created| created > asked)
+        })
+        .map(text_of)
+        .filter(|text| !text.is_empty())
 }
 
 /// An assistant message's text parts, joined. Reasoning parts are skipped.

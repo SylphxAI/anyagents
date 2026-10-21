@@ -12,7 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use anyagents_agent::{DeliveryLoop, RunOutcome, is_recorded_answer};
+use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
 };
@@ -1032,50 +1032,47 @@ impl<H: Harness + 'static> Session<H> {
     /// token counts once its turn stands still. The answer is already on the
     /// harness, so the message counts as done.
     fn settle_quiet(&mut self) {
-        loop {
-            let Some(delivery) = self.delivery.as_ref() else {
-                return;
-            };
-            if delivery.harness().ends_on_quiet().is_none() {
-                return;
-            }
-            let Ok(accepted) = delivery.store().accepted_cursor(&self.id) else {
-                return;
-            };
-            let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-                return;
-            };
-            if accepted <= processed {
-                return;
-            }
-            let Ok(messages) = delivery.store().inbox(&self.id, Some(processed)) else {
-                return;
-            };
-            // An answer is not asked of the harness again, so it never holds the turn.
-            let Some(open) = messages
-                .into_iter()
-                .find(|message| message.seq > processed && !is_recorded_answer(message))
-            else {
-                return;
-            };
-            if !delivery
-                .harness()
-                .quiet_for(open.id.as_str(), ANSWER_QUIET, ANSWER_PATIENCE)
-            {
-                return;
-            }
-            // The answer is the reply; then the message itself is done.
-            let agent = self.agent.clone();
-            if let Some(delivery) = self.delivery.as_ref() {
-                let _ = delivery.record_answer(&agent);
-            }
-            // A second loop in the same store may already have settled it.
-            let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-                return;
-            };
-            if open.seq <= processed {
-                return;
-            }
+        let Some(delivery) = self.delivery.as_ref() else {
+            return;
+        };
+        if delivery.harness().ends_on_quiet().is_none() {
+            return;
+        }
+        let Ok(accepted) = delivery.store().accepted_cursor(&self.id) else {
+            return;
+        };
+        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
+            return;
+        };
+        if accepted <= processed {
+            return;
+        }
+        let Ok(messages) = delivery.store().inbox(&self.id, Some(processed)) else {
+            return;
+        };
+        // An answer is not asked of the harness again, so it never holds the turn.
+        let Some(open) = messages
+            .into_iter()
+            .find(|message| message.seq > processed && message.reply_to.is_none())
+        else {
+            return;
+        };
+        if !delivery
+            .harness()
+            .quiet_for(open.id.as_str(), ANSWER_QUIET, ANSWER_PATIENCE)
+        {
+            return;
+        }
+        // The answer is the reply; then the message itself is done.
+        let agent = self.agent.clone();
+        if let Some(delivery) = self.delivery.as_ref() {
+            let _ = delivery.record_answer(&agent);
+        }
+        // A second loop in the same store may already have settled it.
+        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
+            return;
+        };
+        if open.seq > processed {
             // The answer's own reply row sits right after the line it answers.
             // It is already accepted, so the cursor moves over it in the same
             // step instead of leaving it to a later pass that never comes.
@@ -1084,8 +1081,7 @@ impl<H: Harness + 'static> Session<H> {
                 && let Ok(after) = delivery.store().inbox(&self.id, Some(open.seq))
             {
                 for next in after {
-                    if next.seq == through + 1 && next.seq <= accepted && is_recorded_answer(&next)
-                    {
+                    if next.seq == through + 1 && next.seq <= accepted && next.reply_to.is_some() {
                         through = next.seq;
                     } else if next.seq > through {
                         break;
@@ -1093,10 +1089,7 @@ impl<H: Harness + 'static> Session<H> {
                 }
             }
             self.settled = through;
-            if !self.mark_processed(through) {
-                return;
-            }
-            self.woken.store(true, Ordering::SeqCst);
+            self.mark_processed(through);
         }
     }
 
