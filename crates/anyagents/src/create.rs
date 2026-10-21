@@ -13,6 +13,8 @@ pub struct CreateRequest {
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<PathBuf>,
+    /// The working directory an owner agent gets when none is named.
+    pub workdir_default: Option<PathBuf>,
     pub instructions: Option<String>,
 }
 
@@ -41,7 +43,16 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             std::fs::create_dir_all(path)?;
             std::path::absolute(path)?
         }
-        None => std::path::absolute(&managed)?,
+        // Every owner agent hosted by AnyAgents works in one shared checkout,
+        // so it loads the same company rules and skills as the owner sessions
+        // the desk has always run. A caller can still name its own directory.
+        None => match &request.workdir_default {
+            Some(shared) => {
+                std::fs::create_dir_all(shared)?;
+                std::path::absolute(shared)?
+            }
+            None => std::path::absolute(&managed)?,
+        },
     };
     let command = std::env::current_exe()?;
     let args = vec![

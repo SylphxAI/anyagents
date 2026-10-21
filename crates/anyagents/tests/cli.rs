@@ -114,7 +114,7 @@ fn create_send_inbox_and_usage() {
     );
     assert!(usage.stdout.is_empty());
 
-    // A room reaches every agent but the sender, one line each with its own id.
+    // A named group reaches its own members, and nobody else.
     let beta = bin_in(dir.path())
         .args(["agents", "create", "beta"])
         .output()
@@ -124,6 +124,19 @@ fn create_send_inbox_and_usage() {
         "{}",
         String::from_utf8_lossy(&beta.stderr)
     );
+    for member in ["alpha", "beta"] {
+        let joined = bin()
+            .arg("--data")
+            .arg(dir.path())
+            .args(["groups", "join", "crew", member])
+            .output()
+            .unwrap();
+        assert!(
+            joined.status.success(),
+            "{}",
+            String::from_utf8_lossy(&joined.stderr)
+        );
+    }
     let room = bin()
         .arg("--data")
         .arg(dir.path())
@@ -162,7 +175,8 @@ fn create_send_inbox_and_usage() {
     let alpha_text = String::from_utf8(alpha_inbox.stdout).unwrap();
     assert!(!alpha_text.contains("room line"), "{alpha_text}");
 
-    // A room with nobody in it fails rather than silently delivering nothing.
+    // A name the server does not know is not a room: it reaches nobody, and the
+    // send says so rather than fanning out to every agent.
     // A fresh data directory has no agents at all, so the room is empty.
     let lonely = bin()
         .arg("--data")

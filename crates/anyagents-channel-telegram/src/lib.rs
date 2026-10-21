@@ -26,6 +26,9 @@ pub struct Inbound {
     /// The chat the message belongs to: a private chat, a group, or a forum
     /// supergroup (a forum topic is not a chat of its own).
     pub chat_id: i64,
+    /// The chat's kind: `private`, `group`, `supergroup` or `channel`. Only a
+    /// group is a room.
+    pub chat_type: String,
     /// The `message_thread_id` of a forum topic. `None` outside a topic.
     pub thread_id: Option<i64>,
     /// The Telegram message id, which a reply names.
@@ -50,6 +53,13 @@ pub enum Routed {
         outbound_id: i64,
         text: String,
     },
+    /// This bot joined or left a chat: record the membership, deliver nothing.
+    Membership {
+        agent: String,
+        chat_id: i64,
+        chat_type: Option<String>,
+        joined: bool,
+    },
     /// Already seen: the same update, or our own post coming back.
     Dropped,
 }
@@ -58,6 +68,20 @@ pub enum Routed {
 struct Update {
     update_id: i64,
     message: Option<TgMessage>,
+    /// The bot's own membership in a chat changed. This is how a bot learns it
+    /// was added to, or removed from, a group.
+    my_chat_member: Option<ChatMemberUpdate>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChatMemberUpdate {
+    chat: TgChat,
+    new_chat_member: ChatMember,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct ChatMember {
+    status: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -88,6 +112,9 @@ impl TgMessage {
 #[derive(Clone, Debug, Deserialize)]
 struct TgChat {
     id: i64,
+    /// `private`, `group`, `supergroup` or `channel`.
+    #[serde(default, rename = "type")]
+    kind: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -133,6 +160,10 @@ pub struct ChatLink {
     pub chat_id: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Telegram's chat type: `private`, `group`, `supergroup` or `channel`.
+    /// Only a group is a room; a private chat is one person and one agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_type: Option<String>,
 }
 
 impl Memory {
@@ -147,17 +178,51 @@ impl Memory {
 
     /// Record that `agent` answers in `chat`, keeping a title already learned.
     pub fn attach(&mut self, agent: &str, chat_id: i64) {
-        if !self
+        self.attach_typed(agent, chat_id, None)
+    }
+
+    /// Attach an agent to a chat, keeping the chat's kind so a private chat is
+    /// never treated as a room.
+    pub fn attach_typed(&mut self, agent: &str, chat_id: i64, chat_type: Option<&str>) {
+        if let Some(link) = self
             .chats
+            .iter_mut()
+            .find(|link| link.agent == agent && link.chat_id == chat_id)
+        {
+            if link.chat_type.is_none() {
+                link.chat_type = chat_type.map(str::to_string);
+            }
+            return;
+        }
+        self.chats.push(ChatLink {
+            agent: agent.to_string(),
+            chat_id,
+            title: None,
+            chat_type: chat_type.map(str::to_string),
+        });
+    }
+
+    /// Forget that this agent answers in a chat.
+    pub fn detach(&mut self, agent: &str, chat_id: i64) {
+        self.chats
+            .retain(|link| !(link.agent == agent && link.chat_id == chat_id));
+    }
+
+    /// Whether this agent is known to answer in this chat.
+    pub fn is_attached(&self, agent: &str, chat_id: i64) -> bool {
+        self.chats
             .iter()
             .any(|link| link.agent == agent && link.chat_id == chat_id)
-        {
-            self.chats.push(ChatLink {
-                agent: agent.to_string(),
-                chat_id,
-                title: None,
-            });
-        }
+    }
+
+    /// Whether this chat is a room: a group or a supergroup. A private chat is
+    /// one person and one agent, so nothing fans out from it.
+    pub fn is_room(&self, chat_id: i64) -> bool {
+        self.chats
+            .iter()
+            .filter(|link| link.chat_id == chat_id)
+            .filter_map(|link| link.chat_type.as_deref())
+            .any(|kind| kind == "group" || kind == "supergroup")
     }
 
     /// The title of `chat`, when this bot has learned it.
@@ -229,6 +294,21 @@ impl Poll {
             if update.update_id >= self.offset {
                 self.offset = update.update_id + 1;
             }
+            // A membership change is how a bot learns it is in, or out of, a
+            // group. It carries no message and is recorded, not delivered.
+            if let Some(member) = update.my_chat_member {
+                let joined = matches!(
+                    member.new_chat_member.status.as_str(),
+                    "member" | "administrator" | "creator"
+                );
+                out.push(Routed::Membership {
+                    agent: agent.to_string(),
+                    chat_id: member.chat.id,
+                    chat_type: Some(member.chat.kind.clone()),
+                    joined,
+                });
+                continue;
+            }
             let Some(message) = update.message else {
                 // An edited message, a membership change, a callback: nothing
                 // for a mailbox.
@@ -262,6 +342,7 @@ impl Poll {
                 inbound: Inbound {
                     source_key: key,
                     chat_id: message.chat.id,
+                    chat_type: message.chat.kind.clone(),
                     thread_id: message.message_thread_id,
                     message_id: message.message_id,
                     sender_name: message.from.as_ref().map(TgUser::display_name),
@@ -293,7 +374,7 @@ impl Poll {
             body: serde_json::json!({
                 "offset": self.offset,
                 "timeout": timeout_s,
-                "allowed_updates": ["message"],
+                "allowed_updates": ["message", "my_chat_member"],
             }),
         }
     }
@@ -404,6 +485,8 @@ pub fn deliver_to_mailbox(
 ) -> Result<(), anyagents_core::Error> {
     match routed {
         Routed::Dropped => Ok(()),
+        // Membership is recorded by the caller, which owns the channel state.
+        Routed::Membership { .. } => Ok(()),
         Routed::ToAgent { agent, inbound } => {
             let agent_id = anyagents_core::AgentId::parse(agent)?;
             store.receive(&agent_id, incoming_from(inbound))?;
@@ -720,5 +803,51 @@ mod tests {
 
     fn tempfile_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+}
+
+#[cfg(test)]
+mod membership_tests {
+    use super::*;
+
+    #[test]
+    fn a_membership_update_attaches_and_detaches_without_a_message() {
+        let mut poll = Poll::resume(0);
+        let joined = r#"[{"update_id":1,"my_chat_member":{"chat":{"id":-100,"type":"supergroup"},
+            "new_chat_member":{"status":"member"}}}]"#;
+        let routed = poll.route("77", "ada", joined).unwrap();
+        match &routed[0] {
+            Routed::Membership {
+                agent,
+                chat_id,
+                chat_type,
+                joined,
+            } => {
+                assert_eq!(agent, "ada");
+                assert_eq!(*chat_id, -100);
+                assert_eq!(chat_type.as_deref(), Some("supergroup"));
+                assert!(joined);
+            }
+            other => panic!("expected membership, got {other:?}"),
+        }
+
+        let left = r#"[{"update_id":2,"my_chat_member":{"chat":{"id":-100,"type":"supergroup"},
+            "new_chat_member":{"status":"left"}}}]"#;
+        let routed = poll.route("77", "ada", left).unwrap();
+        assert!(matches!(
+            &routed[0],
+            Routed::Membership { joined: false, .. }
+        ));
+    }
+
+    #[test]
+    fn a_private_chat_is_not_a_room_and_a_group_is() {
+        let mut memory = Memory::default();
+        memory.attach_typed("ada", 5, Some("private"));
+        memory.attach_typed("ada", -6, Some("supergroup"));
+        assert!(!memory.is_room(5), "a private chat is not a room");
+        assert!(memory.is_room(-6), "a supergroup is a room");
+        memory.detach("ada", -6);
+        assert!(!memory.is_attached("ada", -6));
     }
 }

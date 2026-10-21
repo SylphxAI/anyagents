@@ -81,6 +81,14 @@ pub struct DeliveryLoop<H: Harness> {
     quota_reset_at_ms: Option<i64>,
 }
 
+/// Whether `message` is an agent reply row written by [`DeliveryLoop::record_answer`].
+pub fn is_recorded_answer(message: &Message) -> bool {
+    message
+        .source_key
+        .as_deref()
+        .is_some_and(|key| key.starts_with("answer:"))
+}
+
 /// The vendor echoes the marked prompt as the first line. The marker line is
 /// not part of the answer.
 fn answer_text(text: &str) -> String {
@@ -144,11 +152,7 @@ impl<H: Harness> DeliveryLoop<H> {
             // is settled here and the loop moves on. Handing it over opened a
             // phantom turn in the harness that the supervisor never settled,
             // and every real line behind it waited out the turn patience.
-            if message
-                .source_key
-                .as_deref()
-                .is_some_and(|key| key.starts_with("answer:"))
-            {
+            if is_recorded_answer(&message) {
                 // Only settle the answer when nothing before it is still in
                 // turn. Advancing past an earlier line would mark it processed
                 // before its own answer was recorded.
@@ -279,7 +283,7 @@ impl<H: Harness> DeliveryLoop<H> {
             .store
             .inbox(&self.agent_id, Some(seq))?
             .into_iter()
-            .find(|message| message.seq > seq && message.reply_to.is_none())
+            .find(|message| message.seq > seq && !is_recorded_answer(message))
         else {
             return Ok(());
         };
@@ -703,5 +707,52 @@ mod tests {
             loop_.store().processed_cursor(&id).unwrap() < 2,
             "the answer row carried the cursor over line 2"
         );
+    }
+
+    #[test]
+    fn record_answer_handles_inbound_channel_message_with_reply_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("alpha", "opencode"))
+            .unwrap();
+        let id = agent.id.clone();
+        let harness = Answering {
+            given: Vec::new(),
+            delivered: Vec::new(),
+            finished: false,
+        };
+        let mut loop_ = DeliveryLoop::start(store, id.clone(), harness).unwrap();
+
+        let anyagents_core::ReceiveOutcome::New(msg) = loop_
+            .store()
+            .receive(
+                &id,
+                Incoming {
+                    text: "ping from telegram".into(),
+                    sender: Some("telegram:user:1951959493:14199".into()),
+                    source_time_ms: Some(1_000),
+                    source_key: Some("bot:1".into()),
+                    reply_to: Some("telegram:chat:-1003544170260".into()),
+                    received_at_ms: None,
+                },
+            )
+            .unwrap()
+        else {
+            panic!("unexpected duplicate");
+        };
+        loop_.run_once().unwrap();
+        loop_.harness_mut().finished = true;
+        let agent = loop_.store().agent(&id).unwrap();
+        loop_.record_answer(&agent).unwrap();
+
+        let answer = loop_
+            .store()
+            .inbox(&id, None)
+            .unwrap()
+            .into_iter()
+            .find(is_recorded_answer)
+            .expect("the answer was recorded even when inbound message had reply_to");
+        assert_eq!(answer.reply_to.as_deref(), Some(msg.id.as_str()));
     }
 }

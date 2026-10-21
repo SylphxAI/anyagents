@@ -504,16 +504,28 @@ impl Store {
 
     /// Who a room reaches, when the room names a chat. `None` is a room that is
     /// not a chat: every agent, as a group by name always was.
+    /// Who a room reaches.
+    ///
+    /// A chat (`<id>`, `chat:<id>`, `telegram:chat:<id>[:thread]`) reaches the
+    /// agents whose own bot is attached to that chat. A named group reaches its
+    /// own members, and nobody else. A room that is neither is empty rather
+    /// than everyone: a name we do not know must never fan out to the world.
     pub fn room_members(&self, room: &str) -> Result<Option<Vec<String>>, Error> {
-        // `telegram:chat:<id>[:<thread>]`, `chat:<id>`, or a bare chat id.
         let named = room
             .strip_prefix("telegram:chat:")
             .or_else(|| room.strip_prefix("chat:"))
             .unwrap_or(room);
         // A forum topic follows the chat id; the chat is the same either way.
-        let Ok(chat_id) = named.split(':').next().unwrap_or(named).parse::<i64>() else {
-            return Ok(None);
-        };
+        if let Ok(chat_id) = named.split(':').next().unwrap_or(named).parse::<i64>() {
+            return Ok(Some(self.chat_members(chat_id)?));
+        }
+        let name = room.strip_prefix("group:").unwrap_or(room);
+        let members = self.group_members(name)?;
+        Ok(Some(members))
+    }
+
+    /// The agents whose own bot is attached to one chat.
+    pub fn chat_members(&self, chat_id: i64) -> Result<Vec<String>, Error> {
         let mut members = Vec::new();
         for channel in self.list_channels()? {
             for agent_id in &channel.agents {
@@ -531,7 +543,50 @@ impl Store {
                 }
             }
         }
-        Ok(Some(members))
+        Ok(members)
+    }
+
+    /// Put one agent in a named group. A group exists once it has a member.
+    pub fn join_group(&self, name: &str, agent_id: &AgentId) -> Result<(), Error> {
+        if name.is_empty() || name.contains(':') || name.chars().any(char::is_whitespace) {
+            return Err(Error::Message(format!("invalid group name: {name}")));
+        }
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "INSERT OR IGNORE INTO groups (name, created_at_ms) VALUES (?1, ?2)",
+            params![name, now_ms()],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO group_agents (group_name, agent_id) VALUES (?1, ?2)",
+            params![name, agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Take one agent out of a named group.
+    pub fn leave_group(&self, name: &str, agent_id: &AgentId) -> Result<(), Error> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM group_agents WHERE group_name = ?1 AND agent_id = ?2",
+            params![name, agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// The agents in a named group, by name. An unknown group is empty.
+    pub fn group_members(&self, name: &str) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT a.name FROM group_agents AS g JOIN agents AS a ON a.id = g.agent_id
+             WHERE g.group_name = ?1 ORDER BY a.name",
+        )?;
+        let mut rows = stmt.query([name])?;
+        let mut members = Vec::new();
+        while let Some(row) = rows.next()? {
+            members.push(row.get(0)?);
+        }
+        Ok(members)
     }
 
     pub fn create_channel(&self, new: NewChannel) -> Result<Channel, Error> {
@@ -1608,15 +1663,12 @@ mod tests {
             .unwrap();
         assert!(delivered.is_empty(), "{delivered:?}");
 
-        // A room that is not a chat keeps its old meaning: every other agent.
+        // A room that is neither a chat nor a group reaches nobody. A name the
+        // server does not know must never fan out to every agent.
         let delivered = store
             .receive_room("crew", one("everyone", "agent:alice"))
             .unwrap();
-        let names: Vec<&str> = delivered
-            .iter()
-            .map(|(agent, _)| agent.name.as_str())
-            .collect();
-        assert_eq!(names, vec!["bob", "carol"], "{names:?}");
+        assert!(delivered.is_empty(), "{delivered:?}");
     }
 
     #[test]
@@ -1941,5 +1993,98 @@ mod tests {
             day: day.into(),
             recorded_at_ms: 0,
         }
+    }
+
+    /// A named group has its own membership: a line reaches its members, a
+    /// non-member receives nothing, and an unknown name reaches nobody.
+    #[test]
+    fn a_named_group_reaches_only_its_own_members() {
+        let (_dir, store) = setup();
+        let alice = agent(&store, "alice");
+        let bob = agent(&store, "bob");
+        let carol = agent(&store, "carol");
+        store.join_group("crew", &alice.id).unwrap();
+        store.join_group("crew", &bob.id).unwrap();
+
+        let one = |text: &str, from: &str| Incoming {
+            text: text.to_string(),
+            sender: Some(from.to_string()),
+            source_time_ms: None,
+            source_key: None,
+            reply_to: None,
+            received_at_ms: None,
+        };
+
+        // A human line reaches every member.
+        let delivered = store
+            .receive_room("group:crew", one("hi all", "telegram:user:1"))
+            .unwrap();
+        let names: Vec<&str> = delivered
+            .iter()
+            .map(|(agent, _)| agent.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["alice", "bob"], "{names:?}");
+        assert!(
+            !store
+                .inbox(&carol.id, None)
+                .unwrap()
+                .iter()
+                .any(|m| m.text == "hi all")
+        );
+
+        // An agent line reaches the other member, never the author.
+        let delivered = store
+            .receive_room("crew", one("from alice", "agent:alice"))
+            .unwrap();
+        let names: Vec<&str> = delivered
+            .iter()
+            .map(|(agent, _)| agent.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["bob"], "{names:?}");
+
+        // An unknown group reaches nobody rather than everybody.
+        let delivered = store
+            .receive_room("group:nobody", one("lost", "agent:alice"))
+            .unwrap();
+        assert!(delivered.is_empty(), "{delivered:?}");
+    }
+
+    /// A named group survives a restart: membership is stored, not held in
+    /// memory, and a message already stored is still readable afterwards.
+    #[test]
+    fn a_group_message_survives_a_restart() {
+        let (dir, store) = setup();
+        let alice = agent(&store, "alice");
+        let bob = agent(&store, "bob");
+        store.join_group("crew", &alice.id).unwrap();
+        store.join_group("crew", &bob.id).unwrap();
+        store
+            .receive_room(
+                "group:crew",
+                Incoming {
+                    text: "kept".to_string(),
+                    sender: Some("agent:alice".to_string()),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    received_at_ms: None,
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let reopened = Store::open(dir.path().join("state.db")).unwrap();
+        assert_eq!(
+            reopened.group_members("crew").unwrap(),
+            vec!["alice", "bob"]
+        );
+        let bob_id = reopened.agent_by_name("bob").unwrap().id;
+        assert!(
+            reopened
+                .inbox(&bob_id, None)
+                .unwrap()
+                .iter()
+                .any(|message| message.text == "kept")
+        );
     }
 }

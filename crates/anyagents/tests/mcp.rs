@@ -268,6 +268,20 @@ async fn mcp_tools_use_the_server_socket() {
     );
 
     // A room reaches every other agent, and not the sender.
+    // A named group reaches its own members.
+    for name in ["alpha", "beta"] {
+        let joined = bin()
+            .arg("--data")
+            .arg(dir.path())
+            .args(["groups", "join", "crew", name])
+            .output()
+            .unwrap();
+        assert!(
+            joined.status.success(),
+            "{}",
+            String::from_utf8_lossy(&joined.stderr)
+        );
+    }
     let room: SendResponse = ok_json(
         call(
             &alpha,

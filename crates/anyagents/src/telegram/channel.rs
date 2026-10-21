@@ -93,8 +93,28 @@ fn poll_channel(
                 .chats
                 .iter()
                 .any(|link| link.agent == agent_id.as_str() && link.chat_id == inbound.chat_id);
-            memory.attach(agent_id.as_str(), inbound.chat_id);
+            memory.attach_typed(agent_id.as_str(), inbound.chat_id, Some(&inbound.chat_type));
+            if !known && probe_members(&token, inbound.chat_id, memory.bot.as_deref().unwrap_or(""))
+            {
+                // Confirmed by Telegram rather than inferred from a message.
+                memory.attach_typed(agent_id.as_str(), inbound.chat_id, Some(&inbound.chat_type));
+            }
             grew |= !known;
+        }
+        // The bot was added to, or removed from, a chat.
+        if let Routed::Membership {
+            chat_id,
+            chat_type,
+            joined,
+            ..
+        } = &one
+        {
+            if *joined {
+                memory.attach_typed(agent_id.as_str(), *chat_id, chat_type.as_deref());
+            } else {
+                memory.detach(agent_id.as_str(), *chat_id);
+            }
+            grew = true;
         }
         let peers = peer_ids(store, &poll, &one, agent_id.as_str(), &attached)?;
         deliver_to_mailbox(store, &one, &peers)?;
@@ -106,6 +126,16 @@ fn poll_channel(
         store.set_channel_state(&channel.id, &memory.to_state())?;
     }
     Ok(())
+}
+
+/// Whether this bot is in the chat, asked of Telegram at cold start. A chat
+/// first seen after a restart has no `my_chat_member` update to replay, so the
+/// membership is read directly instead of inferred.
+fn probe_members(token: &str, chat_id: i64, bot: &str) -> bool {
+    let Some(user) = bot.split(':').next().and_then(|id| id.parse::<i64>().ok()) else {
+        return false;
+    };
+    crate::telegram::chat_member_is_in(token, chat_id, user)
 }
 
 /// The other agents on a chat a peer's post belongs to, with that chat.
@@ -206,7 +236,95 @@ pub fn post_text(
         &outbound.credential_ref,
     )?;
     let response = call_api(&token, &outbound.call, SHORT_TIMEOUT_S)?;
-    sent_message_id(&response).map_err(|err| anyagents_core::Error::Message(err.to_string()))
+    let message_id = sent_message_id(&response)
+        .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+    // The post is already on the wire, so everything after it is local only.
+    // A failure now must never post a second time: the receipt is the message
+    // id Telegram returned, and the local step is retried from it.
+    deliver_locally(store, from, chat_id, message_id, text);
+    Ok(message_id)
+}
+
+/// Ask Telegram whether this bot is a member of a chat. The answer is the
+/// membership; a failed call is not membership.
+pub fn chat_member_is_in(token: &str, chat_id: i64, user_id: i64) -> bool {
+    let call = BotCall {
+        method: "getChatMember".to_string(),
+        body: serde_json::json!({"chat_id": chat_id, "user_id": user_id}),
+    };
+    let Ok(body) = call_api(token, &call, SHORT_TIMEOUT_S) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&body) else {
+        return false;
+    };
+    matches!(
+        value
+            .pointer("/result/status")
+            .and_then(serde_json::Value::as_str),
+        Some("member" | "administrator" | "creator")
+    )
+}
+
+/// The local half of one post: remember the chat, and copy the message into the
+/// room when the chat is a group. Nothing here posts; it can be retried from the
+/// receipt alone, and a repeated fan-out is one row.
+pub fn deliver_locally(
+    store: &Store,
+    from: Option<&str>,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) {
+    let Some(agent) = from else {
+        return;
+    };
+    if record_chat(store, agent, chat_id).is_err() {
+        // One retry: the store may have been busy on the first attempt.
+        let _ = record_chat(store, agent, chat_id);
+    }
+    // Only a group is a room. A private chat is one person and one agent, so a
+    // direct message never reaches another agent.
+    if chat_is_room(store, chat_id) && fan_out(store, agent, chat_id, message_id, text).is_err() {
+        let _ = fan_out(store, agent, chat_id, message_id, text);
+    }
+}
+
+/// Whether any bot remembers this chat as a group or supergroup.
+pub fn chat_is_room(store: &Store, chat_id: i64) -> bool {
+    store
+        .list_channels()
+        .unwrap_or_default()
+        .into_iter()
+        .any(|channel| Memory::from_state(&channel.state).is_room(chat_id))
+}
+
+/// Put one posted chat message into every other member's mailbox.
+///
+/// A post made by one bot reaches the other agents on the chat through
+/// AnyAgents' own mailboxes, not by relying on Telegram delivering a bot's
+/// message to another bot. The source key is the chat and the Telegram message
+/// id, so a repeated fan-out is one row.
+pub fn fan_out(
+    store: &Store,
+    from: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+) -> Result<usize, anyagents_core::Error> {
+    let room = format!("telegram:chat:{chat_id}");
+    let incoming = anyagents_core::Incoming {
+        text: text.to_string(),
+        // The convention the agent loop uses: `agent:<name>`. `receive_room`
+        // skips its author, so the posting agent is never a recipient of its
+        // own message.
+        sender: Some(format!("agent:{from}")),
+        source_time_ms: None,
+        source_key: Some(format!("tg-out:{chat_id}:{message_id}")),
+        reply_to: Some(room.clone()),
+        received_at_ms: None,
+    };
+    Ok(store.receive_room(&room, incoming)?.len())
 }
 
 /// Record that `agent` answers in `chat`, and learn the chat's title if the
