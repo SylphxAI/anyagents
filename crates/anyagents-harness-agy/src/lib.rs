@@ -35,23 +35,6 @@ impl AgyHarness {
         Ok(Self { inner, spec })
     }
 
-    /// Start one child and resume `session_id` when the vendor takes it.
-    ///
-    /// The new server's step: a child starts, then the stored session is
-    /// resumed on it. A vendor that says nothing and writes nothing did not
-    /// take a session it was given, so a new child starts a new conversation
-    /// and stderr says the resume failed. Any line means the resumed
-    /// conversation ran, whatever it reported.
-    pub fn start_after_restart(
-        program: impl Into<PathBuf>,
-        session_id: Option<&str>,
-        environment: &[(&str, &str)],
-    ) -> Result<Self, HarnessError> {
-        let mut harness = Self::start(program, None, environment)?;
-        harness.resume_or_start(session_id, true)?;
-        Ok(harness)
-    }
-
     pub fn written_ids(&self) -> Vec<String> {
         self.inner.written_ids()
     }
@@ -61,48 +44,6 @@ impl AgyHarness {
     pub fn session_id(&self) -> Option<String> {
         self.inner.session_id()
     }
-
-    /// The arguments the current child was started with.
-    pub fn args(&self) -> Vec<String> {
-        self.inner.args().to_vec()
-    }
-
-    /// Start a new child, resumed with `session`.
-    ///
-    /// A vendor that answers nothing to a session it was given did not take it.
-    /// A caller that passes `restart` gets a child without that session
-    /// instead, and stderr says why: a conversation that had to be left behind
-    /// is never dropped silently. A vendor that spoke on its own was running,
-    /// whatever it reported.
-    pub fn resume_or_start(
-        &mut self,
-        session: Option<&str>,
-        restart: bool,
-    ) -> Result<(), HarnessError> {
-        if let Some(said) = self.inner.resume_or_start(session, restart)? {
-            eprintln!("{said}");
-        }
-        Ok(())
-    }
-
-    /// The launch just started printed nothing and its vendor wrote nothing
-    /// to its inbox: it did not take what it was given.
-    pub fn silent_start(&self) -> Option<bool> {
-        self.inner.silent_start()
-    }
-
-    /// Whether the vendor child is running.
-    pub fn is_alive_for_test(&self) -> bool {
-        self.inner.health().process_alive
-    }
-
-    /// End the launch in flight as a vendor crash does: the child is killed and
-    /// its reader reaches the end.
-    #[cfg(feature = "double")]
-    pub fn end_launch(&mut self) {
-        self.inner.end_launch();
-    }
-
     pub fn wait_finished(&self, id: &str, timeout: std::time::Duration) -> bool {
         self.inner.wait_finished(id, timeout)
     }
