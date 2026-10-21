@@ -15,8 +15,8 @@ pub struct AgentView {
     pub delivery_mode: String,
     pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
-    pub oldest_unaccepted_age_ms: Option<i64>,
-    pub oldest_unprocessed_age_ms: Option<i64>,
+    /// Age of the oldest message the harness has not taken yet.
+    pub oldest_undelivered_age_ms: Option<i64>,
     /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
     /// has been installed yet, and what stopped it.
     pub install: String,
@@ -59,16 +59,11 @@ pub struct MessageView {
     pub reply_to: Option<String>,
     pub source_time_ms: Option<i64>,
     pub received_at_ms: i64,
+    /// `received` (committed to the mailbox) or `delivered` (the harness took it).
     pub ack: String,
-    /// Whether the harness has taken this message. A message that is received
-    /// only has not been written to the vendor yet; a hook that delivers input
-    /// mid-turn hands over exactly these.
-    #[serde(default)]
-    pub accepted: bool,
-    /// Why the last turn on this message failed, when it did. The message stays
-    /// accepted and is offered to the next turn.
+    /// When the harness took it, when it has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failed_reason: Option<String>,
+    pub delivered_at_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

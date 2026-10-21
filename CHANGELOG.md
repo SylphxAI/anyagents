@@ -13,7 +13,7 @@ the first release will move it under a version heading.
 ### Added
 
 - **A durable per-agent mailbox.** Every message goes through an ordered,
-  idempotent log with a sequence number and three acknowledgements, and the
+  idempotent log with a sequence number and one delivery cursor, and the
   delivery loop resumes cleanly across a restart. The guarantees are covered by
   a crash-injection suite, not by convention.
 - **One local server, one binary.** `anyagents serve` is a single long-lived
@@ -36,6 +36,23 @@ the first release will move it under a version heading.
   provider stored for the chosen model.
 - **The npm launcher.** `@sylphx/anyagents` runs the native binary for the
   current platform, with one platform package per supported target.
+
+### Changed
+
+- **The switchboard no longer models a harness's turns.** A line is delivered
+  when the harness's own input or steer API takes it, and that is the only
+  cursor. OpenCode, Codex, Claude Code and Muse all take a line mid-turn, so
+  every one of them steers; only Antigravity and the contract double wait for a
+  turn to end. There is no turn-end detection, no answer scraping and no reply
+  written back into the agent's own inbox: an agent replies with its MCP `send`.
+- **OpenCode agents drain continuously.** The adapter wrote one prompt per turn
+  and waited for a turn it could not reliably observe the end of, so its mailbox
+  stalled after the first turn. Every line is now a prompt with
+  `delivery: "steer"`, accepted when the prompt API answers.
+- **One cursor, migrated.** `mailbox_cursors` collapses to `delivered_seq`, the
+  higher of the old two cursors; the `processed_at_delivery` flag and the
+  `failed_turns` table are dropped, and the stale `answer:<id>` rows are
+  removed.
 
 ### Not yet
 

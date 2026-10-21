@@ -75,7 +75,7 @@ fn crash_after_accept_before_cursor_dedupes_replay() {
     loop_.deliver_next_without_commit().unwrap();
     assert_eq!(loop_.harness().written_ids(), &[message.id.to_string()]);
     assert_eq!(loop_.harness().turns_started(), 1);
-    assert_eq!(loop_.store().accepted_cursor(&world.agent).unwrap(), 0);
+    assert_eq!(loop_.delivered_cursor().unwrap(), 0);
     let harness = loop_.into_harness();
 
     let store = open(&world.dir);
@@ -84,10 +84,7 @@ fn crash_after_accept_before_cursor_dedupes_replay() {
     assert_eq!(loop_.harness().written_ids().len(), 1);
     assert_eq!(loop_.harness().turns_started(), 1);
     assert_eq!(loop_.harness().given_ids().len(), 2);
-    assert_eq!(
-        loop_.store().accepted_cursor(&world.agent).unwrap(),
-        message.seq
-    );
+    assert_eq!(loop_.delivered_cursor().unwrap(), message.seq);
 }
 
 #[test]
@@ -147,31 +144,24 @@ fn interleaved_sources_deliver_in_receipt_order() {
 }
 
 #[test]
-fn health_reports_oldest_unaccepted_and_unprocessed_age() {
+fn health_reports_the_oldest_line_the_harness_has_not_taken() {
     let world = world();
     let mut incoming = Incoming::new("waiting");
     incoming.received_at_ms = Some(1_000);
-    let message = receive(&world.store, &world.agent, incoming);
+    receive(&world.store, &world.agent, incoming);
     let mut loop_ = DeliveryLoop::start(
         world.store,
         world.agent.clone(),
         FakeHarness::new(DeliveryMode::Steer),
     )
     .unwrap();
-    let health = loop_.health(6_000).unwrap();
-    assert_eq!(health.oldest_unaccepted_age_ms, Some(5_000));
-    assert_eq!(health.oldest_unprocessed_age_ms, Some(5_000));
+    assert_eq!(
+        loop_.health(6_000).unwrap().oldest_undelivered_age_ms,
+        Some(5_000)
+    );
 
     loop_.run_once().unwrap();
-    let health = loop_.health(6_000).unwrap();
-    assert_eq!(health.oldest_unaccepted_age_ms, None);
-    assert_eq!(health.oldest_unprocessed_age_ms, Some(5_000));
-
-    assert_eq!(loop_.harness_mut().complete_turn(), Some(message.seq));
-    loop_.mark_processed_through(message.seq).unwrap();
-    let health = loop_.health(6_000).unwrap();
-    assert_eq!(health.oldest_unaccepted_age_ms, None);
-    assert_eq!(health.oldest_unprocessed_age_ms, None);
+    assert_eq!(loop_.health(6_000).unwrap().oldest_undelivered_age_ms, None);
 }
 
 #[test]
@@ -193,7 +183,7 @@ fn quota_fault_keeps_receiving_and_reports_reset_time() {
         }
     );
     assert_eq!(loop_.harness().given_ids().len(), 1);
-    assert_eq!(loop_.store().accepted_cursor(&world.agent).unwrap(), 0);
+    assert_eq!(loop_.delivered_cursor().unwrap(), 0);
     assert_eq!(loop_.health(0).unwrap().quota_reset_at_ms, Some(9_000_000));
 
     receive(loop_.store(), &world.agent, Incoming::new("second"));
@@ -203,6 +193,7 @@ fn quota_fault_keeps_receiving_and_reports_reset_time() {
     loop_.run_once().unwrap();
     assert_eq!(loop_.harness().written_ids().len(), 2);
     assert_eq!(loop_.harness().turns_started(), 1);
+    assert_eq!(loop_.delivered_cursor().unwrap(), 2);
 }
 
 #[test]
@@ -256,7 +247,7 @@ fn killed_harness_keeps_the_message_for_a_new_process() {
     loop_.harness_mut().kill();
     let err = loop_.run_once().unwrap_err();
     assert!(matches!(err, Error::HarnessDown));
-    assert_eq!(loop_.store().accepted_cursor(&world.agent).unwrap(), 0);
+    assert_eq!(loop_.delivered_cursor().unwrap(), 0);
     drop(loop_);
 
     let mut loop_ = DeliveryLoop::start(

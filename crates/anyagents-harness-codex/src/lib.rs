@@ -506,8 +506,27 @@ impl Harness for CodexHarness {
         }
     }
 
-    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
-        CodexHarness::usage_for(self, id)
+    fn turns_served(&self) -> u32 {
+        lock(&self.shared).usages.len() as u32
+    }
+
+    /// The total of every turn this process has finished, read when the
+    /// mailbox has drained.
+    fn served_usage(&self) -> TurnUsage {
+        let state = lock(&self.shared);
+        let mut total = TurnUsage::default();
+        for (_, usage) in &state.usages {
+            total.input_tokens += usage.input_tokens;
+            total.output_tokens += usage.output_tokens;
+            total.cache_read_tokens += usage.cache_read_tokens;
+            total.cache_write_tokens += usage.cache_write_tokens;
+            total.reported_cost_micros =
+                match (total.reported_cost_micros, usage.reported_cost_micros) {
+                    (Some(total), Some(one)) => Some(total + one),
+                    (total, one) => total.or(one),
+                };
+        }
+        total
     }
 
     fn clear_quota(&mut self) {
