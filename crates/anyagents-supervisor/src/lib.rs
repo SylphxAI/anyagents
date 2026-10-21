@@ -180,6 +180,8 @@ fn fnv1a(text: &str) -> u64 {
 #[derive(Clone, Debug)]
 pub struct LaunchRequest {
     pub agent: Agent,
+    /// The AnyAgents data directory: where installed harnesses live.
+    pub data_dir: std::path::PathBuf,
     pub config_dir: PathBuf,
     pub work_dir: PathBuf,
     pub extra_env: Vec<(String, String)>,
@@ -191,6 +193,9 @@ pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Syn
 /// counted as done, and how long to watch for that.
 const ANSWER_QUIET: Duration = Duration::from_millis(500);
 const ANSWER_PATIENCE: Duration = Duration::from_millis(120_000);
+
+/// How soon a worker comes back to a message it deferred behind an open turn.
+const DEFERRED_RETRY_MS: i64 = 1_000;
 
 /// Supervisor view of one agent. Ages stay on the mailbox; this is the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,12 +224,19 @@ impl HealthBoard {
     }
 }
 
-/// Catalog delivery when no process is up. Codex steers; other harnesses follow up.
+/// Catalog delivery when no process is up. Codex steers inside the turn;
+/// Claude Code and Antigravity take input between model steps through a
+/// steering channel; every other harness follows up after the turn.
+///
+/// Claude Code writes a new line into the running conversation (stream-json on
+/// stdin, acknowledged by its replay echo); Antigravity takes an `injectSteps`
+/// answer from a before-step hook; OpenCode takes a prompt with
+/// `delivery=steer`.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
-    if harness == "codex" {
-        (DeliveryMode::Steer, SteerSupport::Yes)
-    } else {
-        (DeliveryMode::Followup, SteerSupport::Unproven)
+    match harness {
+        "codex" => (DeliveryMode::Steer, SteerSupport::Yes),
+        "claude-code" | "agy" => (DeliveryMode::Followup, SteerSupport::Yes),
+        _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
 
@@ -651,6 +663,7 @@ impl<H: Harness + 'static> Session<H> {
         let _ = fs::create_dir_all(&self.paths.work_dir);
         (self.inner.launch)(LaunchRequest {
             agent: self.agent.clone(),
+            data_dir: self.inner.store.data_dir().to_path_buf(),
             config_dir: self.paths.config_dir.clone(),
             work_dir: self.paths.work_dir.clone(),
             extra_env: self.inner.extra_env.clone(),
@@ -845,8 +858,31 @@ impl<H: Harness + 'static> Session<H> {
         };
         match outcome {
             Ok(RunOutcome::Quota { .. }) => false,
-            Ok(RunOutcome::Idle | RunOutcome::Delivered { .. } | RunOutcome::Deferred { .. }) => {
+            // A deferred message waits for the open turn to settle, and the turn
+            // closing does not wake this worker. It comes back on a short timer
+            // so the next line is handed over as soon as the turn is done.
+            Ok(RunOutcome::Deferred { .. }) => {
                 self.settle();
+                // A turn that ended during the hand-over is settled here, or the
+                // sleep below waits for the next arrival with the answer unread.
+                self.settle_quiet();
+                if self.quota_is_ahead() {
+                    return false;
+                }
+                self.inner
+                    .clock
+                    .wait(Some(anyagents_core::now_ms() + DEFERRED_RETRY_MS), &self.woken);
+                false
+            }
+            Ok(RunOutcome::Idle
+            | RunOutcome::Delivered { .. }
+            | RunOutcome::Steered { .. }) => {
+                self.settle();
+                // The just-delivered turn is settled before the worker sleeps.
+                // Without this a harness that prints nothing when its HTTP turn
+                // ends leaves `woken` false, and the answer waits for the next
+                // message to arrive.
+                self.settle_quiet();
                 if self.quota_is_ahead() {
                     return false;
                 }
@@ -1038,8 +1074,23 @@ impl<H: Harness + 'static> Session<H> {
             return;
         };
         if open.seq > processed {
-            self.settled = open.seq;
-            self.mark_processed(open.seq);
+            // The answer's own reply row sits right after the line it answers.
+            // It is already accepted, so the cursor moves over it in the same
+            // step instead of leaving it to a later pass that never comes.
+            let mut through = open.seq;
+            if let Ok(accepted) = delivery.store().accepted_cursor(&self.id)
+                && let Ok(after) = delivery.store().inbox(&self.id, Some(open.seq))
+            {
+                for next in after {
+                    if next.seq == through + 1 && next.seq <= accepted && next.reply_to.is_some() {
+                        through = next.seq;
+                    } else if next.seq > through {
+                        break;
+                    }
+                }
+            }
+            self.settled = through;
+            self.mark_processed(through);
         }
     }
 

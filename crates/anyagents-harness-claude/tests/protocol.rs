@@ -243,3 +243,75 @@ fn an_errored_result_is_a_failed_turn_with_no_usage() {
     );
     assert_eq!(harness.turns_started(), 2);
 }
+
+#[test]
+fn the_child_is_asked_to_replay_the_lines_it_reads() {
+    let dir = TempDir::new().unwrap();
+    let harness = start(&dir, "hold", None);
+    // The child logs its argv as its first act; wait for it rather than racing.
+    assert!(wait_log(&log_path(&dir), "argv:"));
+    assert!(
+        read_log(&log_path(&dir)).contains("--replay-user-messages"),
+        "{}",
+        read_log(&log_path(&dir))
+    );
+    drop(harness);
+}
+
+#[test]
+fn a_line_steered_mid_turn_is_echoed_and_never_written_twice() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "steer", Some("sess-1"));
+    harness.deliver(&msg("m1")).unwrap();
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
+    assert!(harness.wait_echoed("m1", Duration::from_secs(5)));
+    // The turn is still open after the echo: the agent is working.
+    assert!(!harness.is_finished("m1"));
+    let steered = harness.deliver(&msg("m2")).unwrap();
+    assert_eq!(steered, DeliverOutcome::Accepted { turn_finished: false });
+    assert!(harness.wait_echoed("m2", Duration::from_secs(5)));
+    assert_eq!(harness.turns_started(), 1);
+    // Running the mailbox again, or a replay after a crash, writes nothing.
+    harness.deliver(&msg("m2")).unwrap();
+    assert_eq!(
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    // The child logs each line it reads. Each was written to it exactly once:
+    // the echo proves the child took it, and `written_ids` above proves the
+    // hand-over was not repeated.
+    assert!(wait_log(&log_path(&dir), "anyagents-message:m2"));
+    let text = read_log(&log_path(&dir));
+    assert_eq!(text.matches("anyagents-message:m1").count(), 1, "{text}");
+    assert_eq!(text.matches("anyagents-message:m2").count(), 1, "{text}");
+    // Closing stdin lets the child exit; the turn ends with the child.
+    drop(harness);
+}
+
+#[test]
+fn a_pushed_line_is_injected_once_and_settled_on_its_echo() {
+    use anyagents_harness::SteerQueue;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("steer.jsonl");
+    std::fs::write(
+        &path,
+        "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n",
+    )
+    .unwrap();
+    let queue = SteerQueue::new(&path, 4);
+    let mut harness = start(&dir, "steer", None).with_steer(queue.clone());
+    harness.deliver(&msg("m1")).unwrap();
+    let item = harness.poll_steer().unwrap().expect("taken");
+    // Still held while nothing is settled: it is not taken a second time into
+    // the same turn.
+    assert!(harness.poll_steer().unwrap().is_none());
+    // Once the host releases it, the line goes back on the queue and is offered
+    // again rather than being lost.
+    harness.release_steer("settled-elsewhere");
+    let lines = std::fs::read_to_string(&path).unwrap();
+    assert!(lines.contains("\"m7\""), "{lines}");
+    let again = harness.poll_steer().unwrap().expect("offered again");
+    assert_eq!(again.message.id, "m7");
+    let _ = item;
+}

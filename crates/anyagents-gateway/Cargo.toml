@@ -10,7 +10,7 @@ description = "Loopback protocol gateway between harness APIs and model provider
 axum = { version = "0.8", features = ["json"] }
 bytes = "1"
 futures = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
@@ -18,6 +18,6 @@ tokio = { version = "1", features = ["macros", "rt", "sync"] }
 
 [dev-dependencies]
 axum = { version = "0.8", features = ["json"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time"] }

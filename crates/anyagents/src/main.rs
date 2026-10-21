@@ -13,11 +13,16 @@ use anyagents_core::{
 use anyagents_supervisor::{declared, mode_name, steer_name};
 use clap::{Parser, Subcommand};
 
+mod agy_config;
 mod api;
 mod create;
 mod fake_opencode;
+mod gateway;
+mod harness_double;
+mod install;
 mod mcp;
 mod mcp_config;
+mod muse_config;
 mod opencode_config;
 mod server;
 mod signin;
@@ -58,6 +63,20 @@ enum Command {
         #[command(subcommand)]
         action: AgentsCommand,
     },
+    /// Store the provider key an agent's model runs on (API key mode).
+    Model {
+        /// The agent name.
+        agent: String,
+        /// The provider origin, for example https://api.deepseek.com.
+        #[arg(long = "base-url")]
+        base_url: String,
+        /// The model id the provider serves, for example deepseek-chat.
+        #[arg(long)]
+        model: String,
+        /// A file holding the key, on its own line. The key is never an argument.
+        #[arg(long = "key-file")]
+        key_file: PathBuf,
+    },
     /// Append a message to an agent's mailbox.
     Send {
         /// `agent:<name>`, a bare name, `group:<name>`, or a telegram target.
@@ -96,6 +115,23 @@ enum Command {
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
     FakeOpencode,
+    /// Test double for a harness: obeys the adapter contract for the harness
+    /// named in `<config>`, an agent's `adapter.json`.
+    #[command(hide = true)]
+    Harness {
+        /// The `adapter.json` the agent was created with.
+        config: PathBuf,
+    },
+    /// Body of the Antigravity steering hook: reads the CLI's event on stdin and
+    /// writes the hook's answer on stdout. Reads the mailbox, prints no secret.
+    #[command(hide = true)]
+    AgyHook {
+        #[arg(long)]
+        agent: String,
+        /// The conversation the CLI reports; an event from any other is ignored.
+        #[arg(long, default_value = "")]
+        conversation: String,
+    },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
         #[command(subcommand)]
@@ -166,7 +202,18 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         },
         Command::Mcp { agent } => mcp::run(&cli.data, &agent),
         Command::FakeOpencode => fake_opencode::run(),
+        Command::Harness { config } => harness_double::run(&config),
+        Command::AgyHook { agent, conversation } => {
+            agy_hook(&cli.data, &agent, &conversation);
+            Ok(())
+        }
         Command::Agents { action } => agents(&cli.data, action),
+        Command::Model {
+            agent,
+            base_url,
+            model,
+            key_file,
+        } => store_key(&cli.data, &agent, &base_url, &model, &key_file),
         Command::Send {
             to,
             text,
@@ -200,6 +247,99 @@ fn list_harnesses() {
             signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
         );
     }
+}
+
+/// Store an agent's provider key. The key is read from a file, kept 0600 under
+/// the agent's directory, and never printed. The next turn then runs through the
+/// server's gateway on that provider.
+fn store_key(
+    data: &Path,
+    agent: &str,
+    base_url: &str,
+    model: &str,
+    key_file: &Path,
+) -> Result<(), anyagents_core::Error> {
+    let raw = std::fs::read_to_string(key_file)?;
+    let key = raw.trim();
+    if key.is_empty() {
+        return Err(anyagents_core::Error::Message(format!(
+            "{} holds no key",
+            key_file.display()
+        )));
+    }
+    if key.contains(char::is_whitespace) {
+        return Err(anyagents_core::Error::Message(format!(
+            "{} does not hold one key on its own line",
+            key_file.display()
+        )));
+    }
+    let store = open(data)?;
+    let recorded = store.agent_by_name(agent)?;
+    let data = std::path::absolute(data)?;
+    gateway::store_key(&data, &recorded, base_url, model, key)?;
+    println!("key stored\t{}\t{}", recorded.name, model);
+    Ok(())
+}
+
+/// The Antigravity steering hook. The CLI runs it before every model call; it
+/// answers with the mailbox messages the server has not written to this turn.
+///
+/// Everything it can fail to read answers `{}`, so a hook never breaks a turn.
+/// The server is reached through its socket only; the store is not opened here.
+fn agy_hook(data: &Path, agent: &str, conversation: &str) {
+    use std::io::{Read, Write};
+    let mut stdout = std::io::stdout().lock();
+    let mut event = String::new();
+    let _ = std::io::stdin().lock().read_to_string(&mut event);
+    let event: serde_json::Value = serde_json::from_str(&event).unwrap_or(serde_json::Value::Null);
+    if event
+        .get("invocationNum")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0)
+        == 0
+    {
+        let _ = writeln!(stdout, "{{}}");
+        return;
+    }
+    if !conversation.is_empty()
+        && event
+            .get("conversationId")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id != conversation)
+    {
+        let _ = writeln!(stdout, "{{}}");
+        return;
+    }
+    let before = match mcp::get_json_sync::<api::InboxResponse>(
+        &server::socket_path(data),
+        "GET",
+        &format!("/v1/agents/{agent}/inbox"),
+    ) {
+        Ok(value) => value,
+        Err(_) => {
+            let _ = writeln!(stdout, "{{}}");
+            return;
+        }
+    };
+    // The mailbox is in sequence order, oldest first. Only what the harness has
+    // not taken counts: a message the server wrote is the turn's own prompt, and
+    // the server moves its cursor when it writes it.
+    let lines: Vec<api::MessageView> = before
+        .messages
+        .into_iter()
+        .filter(|line| !line.accepted)
+        .collect();
+    if lines.is_empty() {
+        let _ = writeln!(stdout, "{{}}");
+        return;
+    }
+    let mut used = String::from("New messages arrived while you were working (delivered mid-turn):");
+    for line in lines.iter().take(40) {
+        used.push_str("\n\n");
+        used.push_str(&anyagents_harness::marked_message(&line.id, &line.text));
+    }
+    let answer = serde_json::json!({"injectSteps": [{"userMessage": used}]});
+    let _ = writeln!(stdout, "{answer}");
 }
 
 /// The installer's sign-in, run against the agent's own config directory. This
@@ -408,13 +548,56 @@ fn send(
     let address = Address::parse(to)?;
     let name = match address {
         Address::Agent(name) => name,
-        Address::Group(_) => {
-            return Err(anyagents_core::Error::NotImplemented(
-                "send to a group".into(),
-            ));
+        Address::Group(room) => {
+            let store = open(data)?;
+            let delivered = store.receive_room(
+                &room,
+                Incoming {
+                    text,
+                    sender: from,
+                    source_time_ms,
+                    source_key,
+                    reply_to,
+                    received_at_ms: None,
+                },
+            )?;
+            if delivered.is_empty() {
+                return Err(anyagents_core::Error::Message(format!(
+                    "room {room} has no agent to deliver to"
+                )));
+            }
+            // One line per recipient: the message id and its sequence in that
+            // agent's mailbox, so a caller can read each one back.
+            for (agent, outcome) in delivered {
+                let message = match outcome {
+                    ReceiveOutcome::New(message) => message,
+                    ReceiveOutcome::Duplicate(message) => message,
+                };
+                println!("{}\t{}\t{}", agent.name, message.id, message.seq);
+            }
+            return Ok(());
         }
-        Address::TelegramChat(id) | Address::TelegramUser(id) => {
-            return send_telegram(data, &id, &text, reply_to.as_deref(), from.as_deref());
+        Address::TelegramChat { chat, thread } => {
+            return send_telegram(
+                data,
+                &chat,
+                thread.as_deref(),
+                &text,
+                reply_to.as_deref(),
+                None,
+                from.as_deref(),
+            );
+        }
+        Address::TelegramUser { user, message } => {
+            return send_telegram(
+                data,
+                &user,
+                None,
+                &text,
+                reply_to.as_deref(),
+                message.as_deref(),
+                from.as_deref(),
+            );
         }
     };
     let store = open(data)?;
@@ -439,26 +622,37 @@ fn send(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_telegram(
     data: &Path,
     chat: &str,
+    thread: Option<&str>,
     text: &str,
     reply_to: Option<&str>,
+    address_reply: Option<&str>,
     from: Option<&str>,
 ) -> Result<(), anyagents_core::Error> {
     let chat_id: i64 = chat
         .parse()
         .map_err(|_| anyagents_core::Error::Message("telegram chat id is not a number".into()))?;
-    let reply_to = match reply_to {
+    let thread_id = match thread {
         None => None,
-        Some(raw) => Some(raw.parse().map_err(|_| {
-            anyagents_core::Error::Message("reply_to is not a telegram message id".into())
-        })?),
+        Some(raw) => Some(parse_id(raw, "telegram topic id")?),
+    };
+    let reply_to = match reply_to.or(address_reply) {
+        None => None,
+        Some(raw) => Some(parse_id(raw, "reply_to is not a telegram message id")?),
     };
     let store = open(data)?;
-    let message_id = telegram::post_text(&store, data, from, chat_id, text, reply_to)?;
+    let message_id =
+        telegram::post_text(&store, data, from, chat_id, text, reply_to, thread_id)?;
     println!("{message_id}");
     Ok(())
+}
+
+fn parse_id(raw: &str, what: &'static str) -> Result<i64, anyagents_core::Error> {
+    raw.parse()
+        .map_err(|_| anyagents_core::Error::Message(what.into()))
 }
 
 fn inbox(

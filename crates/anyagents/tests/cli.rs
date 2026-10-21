@@ -2,8 +2,43 @@ use std::process::Command;
 
 use anyagents_core::{BillingMode, NewUsage, Store};
 
+/// A `PATH` where `claude` is this binary and `npm` fails, so creating an agent
+/// records the vendor tool the machine already has and downloads nothing.
+fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let launcher = bin.join("claude");
+    if !launcher.exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
+    }
+    let npm = bin.join("npm");
+    if !npm.exists() {
+        // A create installs its harness; these tests run none of it. `view`
+        // answers a version and an install does nothing.
+        std::fs::write(
+            &npm,
+            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::join_paths([bin]).unwrap()
+}
+
 fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_anyagents"))
+}
+
+/// A command in a fresh data directory whose harness needs no download.
+fn bin_in(dir: &std::path::Path) -> Command {
+    let mut command = bin();
+    command
+        .env("PATH", machine_path(dir))
+        .env("ANYAGENTS_CLAUDE_BIN", env!("CARGO_BIN_EXE_anyagents"))
+        .arg("--data")
+        .arg(dir);
+    command
 }
 
 #[test]
@@ -25,9 +60,7 @@ fn mcp_without_a_server_fails() {
 #[test]
 fn create_send_inbox_and_usage() {
     let dir = tempfile::tempdir().unwrap();
-    let create = bin()
-        .args(["--data"])
-        .arg(dir.path())
+    let create = bin_in(dir.path())
         .args(["agents", "create", "alpha"])
         .output()
         .unwrap();
@@ -81,15 +114,65 @@ fn create_send_inbox_and_usage() {
     );
     assert!(usage.stdout.is_empty());
 
-    let group = bin()
+    // A room reaches every agent but the sender, one line each with its own id.
+    let beta = bin_in(dir.path())
+        .args(["agents", "create", "beta"])
+        .output()
+        .unwrap();
+    assert!(
+        beta.status.success(),
+        "{}",
+        String::from_utf8_lossy(&beta.stderr)
+    );
+    let room = bin()
         .arg("--data")
         .arg(dir.path())
+        .args(["send", "group:crew", "room line", "--from", "agent:alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        room.status.success(),
+        "{}",
+        String::from_utf8_lossy(&room.stderr)
+    );
+    let room_out = String::from_utf8(room.stdout).unwrap();
+    // One line per recipient, each naming that agent first.
+    let names: Vec<&str> = room_out
+        .lines()
+        .map(|line| line.split('\t').next().unwrap())
+        .collect();
+    assert!(names.contains(&"beta"), "{room_out}");
+    // The author is not sent its own room message.
+    assert!(!names.contains(&"alpha"), "{room_out}");
+    let beta_inbox = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["inbox", "beta"])
+        .output()
+        .unwrap();
+    let beta_text = String::from_utf8(beta_inbox.stdout).unwrap();
+    assert!(beta_text.contains("room line"), "{beta_text}");
+    assert!(beta_text.contains("received"), "{beta_text}");
+    let alpha_inbox = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["inbox", "alpha"])
+        .output()
+        .unwrap();
+    let alpha_text = String::from_utf8(alpha_inbox.stdout).unwrap();
+    assert!(!alpha_text.contains("room line"), "{alpha_text}");
+
+    // A room with nobody in it fails rather than silently delivering nothing.
+    // A fresh data directory has no agents at all, so the room is empty.
+    let lonely = bin()
+        .arg("--data")
+        .arg(dir.path().join("empty"))
         .args(["send", "group:crew", "hello"])
         .output()
         .unwrap();
-    assert!(!group.status.success());
-    let stderr = String::from_utf8(group.stderr).unwrap();
-    assert!(stderr.contains("not implemented yet"), "{stderr}");
+    assert!(!lonely.status.success());
+    let stderr = String::from_utf8(lonely.stderr).unwrap();
+    assert!(stderr.contains("has no agent"), "{stderr}");
 }
 
 #[test]
@@ -103,10 +186,8 @@ fn create_registers_mcp_only_in_the_agent_config() {
     std::fs::write(&codex_sentinel, b"sentinel-codex").unwrap();
     let custom = dir.path().join("custom-work");
 
-    let created = bin()
+    let created = bin_in(dir.path())
         .env("HOME", &home)
-        .arg("--data")
-        .arg(dir.path())
         .args([
             "agents",
             "create",
@@ -169,10 +250,8 @@ fn create_registers_mcp_only_in_the_agent_config() {
     assert!(args.iter().any(|arg| arg == "mcp"));
     assert!(args.iter().any(|arg| arg == "alpha"));
 
-    let codex = bin()
+    let codex = bin_in(dir.path())
         .env("HOME", &home)
-        .arg("--data")
-        .arg(dir.path())
         .args(["agents", "create", "beta", "--harness", "codex"])
         .output()
         .unwrap();
@@ -207,9 +286,7 @@ fn create_registers_mcp_only_in_the_agent_config() {
 fn usage_sums_by_agent_and_day() {
     let dir = tempfile::tempdir().unwrap();
     for name in ["alpha", "beta"] {
-        let created = bin()
-            .arg("--data")
-            .arg(dir.path())
+        let created = bin_in(dir.path())
             .args(["agents", "create", name])
             .output()
             .unwrap();
@@ -295,9 +372,7 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
     use std::os::unix::fs::PermissionsExt;
 
     let dir = tempfile::tempdir().unwrap();
-    let created = bin()
-        .arg("--data")
-        .arg(dir.path())
+    let created = bin_in(dir.path())
         .args(["agents", "create", "alpha"])
         .output()
         .unwrap();

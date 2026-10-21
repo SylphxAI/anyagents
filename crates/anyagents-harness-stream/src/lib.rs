@@ -16,11 +16,15 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod rpc;
+
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, HarnessError, HarnessHealth, OutboundMessage, SteerSupport,
     TurnState, TurnUsage, message_id_in_text,
 };
 use serde_json::Value;
+
+pub use rpc::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 
 /// What an adapter does with one line the child printed.
 pub struct LineEffect {
@@ -71,6 +75,8 @@ struct State {
     alive: bool,
     epoch: u64,
     seen: HashSet<String>,
+    /// The same ids, in the order they were first seen.
+    seen_order: Vec<String>,
     written: Vec<String>,
     open: Vec<String>,
     followups: Vec<String>,
@@ -83,6 +89,8 @@ struct State {
     text: Option<(String, Vec<String>)>,
     /// The last open turn ended on quiet rather than on a result line.
     finished_quiet: HashSet<String>,
+    /// Per finished id, the closing line the turn ended on.
+    results: Vec<(String, Value)>,
 }
 
 impl StreamHarness {
@@ -107,6 +115,13 @@ impl StreamHarness {
         };
         harness.spawn()?;
         Ok(harness)
+    }
+
+    /// Add one environment variable for every child this harness starts from
+    /// now on, including a restart after a resume.
+    pub fn set_env(&mut self, key: &str, value: &str) {
+        self.environment.retain(|(item, _)| item != key);
+        self.environment.push((key.to_string(), value.to_string()));
     }
 
     pub fn program(&self) -> &Path {
@@ -135,6 +150,21 @@ impl StreamHarness {
             .map(|(_, usage)| usage.clone())
     }
 
+    pub fn finished(&self, id: &str) -> bool {
+        lock(&self.shared).finished.contains(id)
+    }
+
+    /// The last line the adapter closed a turn with while `id` was open, for an
+    /// adapter that reads how the turn ended from that line.
+    pub fn result_for(&self, id: &str) -> Option<Value> {
+        lock(&self.shared)
+            .results
+            .iter()
+            .rev()
+            .find(|(item, _)| item == id)
+            .map(|(_, value)| value.clone())
+    }
+
     /// The last open turn for `id` ended on quiet, not on a result line.
     pub fn finished_quiet(&self, id: &str) -> bool {
         lock(&self.shared).finished_quiet.contains(id)
@@ -146,6 +176,17 @@ impl StreamHarness {
 
     pub fn seen(&self, id: &str) -> bool {
         lock(&self.shared).seen.contains(id)
+    }
+
+    /// Every id written or echoed back, in the order it was first seen.
+    pub fn seen_ids(&self) -> Vec<String> {
+        lock(&self.shared).seen_order.clone()
+    }
+
+    /// The mailbox id seen last. A channel that hands over what comes after it
+    /// cannot repeat a line the host has already written.
+    pub fn highest_id(&self) -> Option<String> {
+        self.seen_ids().into_iter().next_back()
     }
 
     pub fn wait_seen(&self, id: &str, timeout: Duration) -> bool {
@@ -230,7 +271,7 @@ impl StreamHarness {
         } else {
             state.followups.push(message.id.clone());
         }
-        state.seen.insert(message.id.clone());
+        note_seen(&mut state, &message.id);
         state.written.push(message.id.clone());
         Ok(DeliverOutcome::Accepted {
             turn_finished: false,
@@ -346,6 +387,7 @@ impl StreamHarness {
     }
 
     fn spawn_command(&mut self, mut command: Command) -> Result<(), HarnessError> {
+        close_inherited_files(&mut command);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -446,6 +488,38 @@ impl Drop for StreamHarness {
     }
 }
 
+/// A vendor child inherits this process's open files by default, including the
+/// server socket. Then the server never sees the child exit: EOF waits for a
+/// socket only the server itself closes, and a dead vendor looks alive and holds
+/// its mailbox forever. Every child starts without them.
+#[cfg(target_os = "linux")]
+fn close_inherited_files(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // `pre_exec` answers the command it was given: the call must land on it, so
+    // the closure runs in the child just before `exec`. One `close_range` call
+    // closes every descriptor above stderr; nothing else is touched. The server
+    // runs no other program, so nothing it keeps is lost.
+    let linked = unsafe {
+        command.pre_exec(|| {
+            let closed = libc::close_range(3, u32::MAX, 0);
+            if closed != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    };
+    let _ = linked;
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_inherited_files(_command: &mut Command) {}
+
+/// The same rule, for a test that starts something else.
+#[cfg(target_os = "linux")]
+pub fn close_inherited_for_test(command: &mut Command) {
+    close_inherited_files(command)
+}
+
 impl State {
     fn new(session_id: Option<&str>) -> Self {
         Self {
@@ -453,6 +527,7 @@ impl State {
             alive: false,
             epoch: 0,
             seen: HashSet::new(),
+            seen_order: Vec::new(),
             written: Vec::new(),
             open: Vec::new(),
             followups: Vec::new(),
@@ -463,6 +538,7 @@ impl State {
             usages: Vec::new(),
             text: None,
             finished_quiet: HashSet::new(),
+            results: Vec::new(),
         }
     }
 }
@@ -502,7 +578,7 @@ fn read_stdout(
                 }
             }
             if effect.finishes_turn {
-                finish_open(&mut state, effect.usage.unwrap_or_default());
+                finish_open(&mut state, effect.usage.unwrap_or_default(), &value);
             }
             state.epoch = state.epoch.wrapping_add(1);
         }
@@ -539,13 +615,14 @@ fn id_for_quiet(state: &mut State, id: &str) {
     state.text = text;
 }
 
-fn finish_open(state: &mut State, usage: TurnUsage) {
+fn finish_open(state: &mut State, usage: TurnUsage, line: &Value) {
     if state.open.is_empty() {
         return;
     }
     for id in state.open.drain(..) {
         state.finished.insert(id.clone());
-        state.usages.push((id, usage.clone()));
+        state.usages.push((id.clone(), usage.clone()));
+        state.results.push((id, line.clone()));
     }
     if !state.followups.is_empty() {
         state.turns_started += 1;
@@ -553,11 +630,18 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
 }
 
+/// Remember a mailbox id the child sent back, once, in the order it arrived.
+fn note_seen(state: &mut State, id: &str) {
+    if !id.is_empty() && state.seen.insert(id.to_string()) {
+        state.seen_order.push(id.to_string());
+    }
+}
+
 fn note_markers(state: &mut State, value: &Value) {
     match value {
         Value::String(text) => {
             if let Some(id) = message_id_in_text(text) {
-                state.seen.insert(id.to_string());
+                note_seen(state, id);
             }
         }
         Value::Array(items) => {

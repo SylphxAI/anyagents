@@ -6,10 +6,17 @@ license.workspace = true
 rust-version.workspace = true
 description = "Antigravity stream adapter"
 
+[[bin]]
+name = "anyagents-steer-hook"
+path = "src/bin/anyagents-steer-hook.rs"
+
 [dependencies]
 anyagents-harness = { path = "../anyagents-harness" }
 anyagents-harness-stream = { path = "../anyagents-harness-stream" }
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
+serde_json = "1"
 tempfile = "3"
+

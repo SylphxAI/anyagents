@@ -30,7 +30,9 @@ pub(super) struct App<R, U> {
     http: Client,
 }
 
-/// Routes `POST /v1/messages` and `POST /v1/chat/completions`.
+/// Routes `POST /v1/messages` and `POST /v1/chat/completions`. A route table
+/// that is cheap to share (such as [`crate::MemoryRoutes`]) carries changes made
+/// after the gateway started.
 pub fn router<R, U>(routes: R, usage: U) -> Router
 where
     R: RouteResolver + 'static,

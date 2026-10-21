@@ -8,6 +8,7 @@ members = [
     "crates/anyagents-harness-codex",
     "crates/anyagents-harness-opencode",
     "crates/anyagents-harness-agy",
+    "crates/anyagents-harness-muse",
     "crates/anyagents-harness-omp",
     "crates/anyagents-agent",
     "crates/anyagents-supervisor",

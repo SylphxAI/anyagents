@@ -38,7 +38,7 @@ An agent is configured on three independent choices:
 
 | Axis | Values (first version) | Notes |
 | --- | --- | --- |
-| Harness | `claude-code`, `codex`, `opencode`, `gemini-cli`, `omp`, and more by adapter | Installed lazily when first chosen. |
+| Harness | `claude-code`, `codex`, `opencode`, `agy`, `muse`, `gemini-cli`, `omp`, and more by adapter | Installed lazily when first chosen. |
 | Model | Claude, GPT, Gemini, DeepSeek, Grok, MiMo and any model a configured provider serves | Chosen separately from the harness. |
 | Auth | `subscription` or `api-key` | Decides which (harness, model) pairs are valid. |
 
@@ -112,12 +112,17 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 
 | Mode | Meaning | Example |
 | --- | --- | --- |
-| `steer` | Input enters the active turn, including while a tool runs. | Codex `app-server` `turn/steer`. |
-| `followup` | The tool takes the input now and acts on it when the current turn ends. | OpenCode `serve`; a harness with a long-lived stream that reads the next line after the result. |
+| `steer` | Input enters the active turn, including while a tool runs. | Codex `app-server` `turn/steer`; Muse `turn/start` with `ifBusy: "steer"`. |
+| `followup` | The tool takes the input now and acts on it when the current turn ends. | OpenCode `serve`; Antigravity `--input-format stream-json`, which reads the next NDJSON line after a result; any harness with a long-lived stream that reads the next line after the result. |
 | `followup`, ending on quiet | The tool streams the answer and never prints a closing result line, so the turn is over once the stream has been silent for half a second. | None yet: the OpenCode adapter still ends a turn on its `result` line, so an agent on it is recorded only when the vendor sends one. |
 | `queue` | The tool cannot take input during a turn. The adapter holds the message (it is already durable in the mailbox) and delivers it when the turn ends. | Any harness with only one-shot runs. |
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
+
+### Antigravity and Muse
+
+- **Antigravity (`agy`).** One `agy --print --input-format stream-json --output-format stream-json` child, resumed with `--conversation <id>`. A `result` event closes the turn; a `result` that reports an error (`is_error`, or a subtype other than `success`) is a failed turn that carries the vendor's own text. Delivery mode is followup. Mid-turn input is the CLI's own hook: it runs the `PreInvocation` command in `settings.json` in its config directory before every model call, and a hook may answer `{"injectSteps":[{"userMessage": ...}]}`. `anyagents agy-hook` is that command; it reads the mailbox through the socket and answers with every message the harness has not taken yet, in sequence order and unfiltered, so a message that arrives while a turn runs is seen at the next step. `AGY_CONFIG_DIR` points the CLI at the agent's config directory.
+- **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Delivery mode is steer: `turn/start` when no turn is open, and `turn/start` with `ifBusy: "steer"` during one. `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
 
 ## Mailbox: one log per agent
 
@@ -149,13 +154,19 @@ These are invariants with tests (`tests/invariants/`), run against a scripted fa
 
 A channel adapter has an inbound side (a stream of events, each with its source key), an outbound side (post or reply to a target), and an identity (which bot or account it is). The built-in agent bus, which carries `send` between agents on the server, is not a channel adapter; it writes straight to mailboxes.
 
-**Telegram (first version).** One bot per agent, created by the user with BotFather; the token is stored like any other secret above. A local server usually has no public URL, so the adapter long-polls `getUpdates` by default; a webhook is an option when the server is reachable. Telegram groups have one limit that shapes the design: a bot generally does not receive messages sent by other bots ([bot FAQ](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)), and recent Bot API versions deliver only some of them. So when an agent posts into a chat through its bot, the server also delivers that post into the mailbox of every other agent attached to the same chat, keyed by the outbound message id; if Telegram also delivers the same post, the copy is dropped by that key. The sender does not receive its own post.
+**Telegram (first version).** One bot per agent, created by the user with BotFather and recorded with `anyagents channels add telegram --agent <name> --token-file <path>`; the token is copied into AnyAgents' own credential store at `secrets/channels/<channel id>` (mode 0600) and never into the database, a log or a command line. `getMe` names the bot once, so the channel shows which bot it is.
+
+- **Long polling.** A local server usually has no public URL, so the transport is `getUpdates` long polling, one poll per bot at a time on a thread that stops with the server. A webhook is the option for a server that is reachable; it is not built yet.
+- **What one update becomes.** A typed message, or a media message with a caption, becomes one mailbox message. Its source key is the bot and the update id, so the same update stored twice is one row. `sender` is `telegram:user:<id>:<message id>`. `reply_to` is the target a bare reply goes to: `telegram:chat:<chat id>`, or `telegram:chat:<chat id>:<message thread id>` for a forum topic, so a reply lands in the same chat and the same topic. Stickers, edited messages and membership changes are not delivered.
+- **Poll offset.** The next update id lives in the channel's `state` JSON and is saved only after the updates it covers are in the mailbox, so a restart asks for what it has not stored.
+- **Sending.** The `send` tool takes `telegram:chat:<id>[:<topic>]`, and `telegram:user:<id>[:<message>]` where the message is what the reply answers, plus `reply_to` for an explicit Telegram message id. A forum post carries its `message_thread_id`. The returned id is the Telegram message id.
+- **Bot to bot.** A bot generally does not receive messages sent by other bots ([bot FAQ](https://core.telegram.org/bots/faq#what-messages-will-my-bot-get)), and recent Bot API versions deliver only some of them. So a chat an agent's bot deals in is remembered in the channel state, and when an agent posts into a chat through its bot the server also delivers that post into the mailbox of every other agent on the same chat, keyed by the outbound message id; if Telegram also delivers the same post, the copy is dropped by its source key. The sender does not receive its own post.
 
 ## Send, inbox and agents (the MCP tools)
 
 `anyagents mcp --agent <name>` is the MCP server registered into each agent's harness. It holds a capability bound to that one agent, so an agent can only send as itself.
 
-- `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>`, `telegram:user:<id>`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
+- `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 

@@ -1,8 +1,7 @@
 //! The server on an OpenCode agent: create, one send, one answer on the mailbox.
 //!
-//! The vendor is `anyagents fake-opencode`, which is this binary in its
-//! test-double mode: it answers a prompt with text and no result line, as a
-//! streaming vendor does, and records its argv and stdin.
+//! The vendor is the scripted `opencode` the adapter's tests use: it holds a
+//! service and answers `opencode api` calls, as the real CLI does.
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -10,6 +9,17 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyagents_core::Store;
+
+/// The scripted `opencode` this crate builds beside the server binary.
+fn scripted_opencode() -> std::path::PathBuf {
+    let exe = std::path::Path::new(env!("CARGO_BIN_EXE_anyagents"));
+    let dir = exe.parent().expect("the test binary has a directory");
+    let candidate = dir.join("scripted_opencode");
+    if candidate.is_file() {
+        return candidate;
+    }
+    panic!("no scripted opencode at {}", candidate.display());
+}
 use serde_json::{Value, json};
 
 /// A server child that is killed when this value drops.
@@ -20,8 +30,8 @@ struct Server {
 impl Server {
     fn start(dir: &Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-            .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
-            .env("ANYAGENTS_FAKE_OPENCODE", "1")
+            // The scripted CLI, which speaks `serve` and `api` as the real one does.
+            .env("ANYAGENTS_OPENCODE_BIN", scripted_opencode())
             .env("ANYAGENTS_FAKE_LOG", dir.join("fake.log"))
             .arg("--data")
             .arg(dir)
@@ -140,9 +150,10 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     }
 
     let log = std::fs::read_to_string(data.join("fake.log")).unwrap_or_default();
-    assert!(log.contains("argv:fake-opencode"), "{log}");
+    // The line reached the service as a prompt on its real endpoint, carrying
+    // its mailbox id; the answer came back as a reply, never as a prompt.
+    assert!(log.contains("api:POST /api/session/"), "{log}");
     assert!(log.contains("anyagents-message:"), "{log}");
-    // The answer is a reply, not a prompt: it is never handed back.
-    assert!(!log.contains("pong from opencode\\n\""), "{log}");
+    assert!(!log.contains("\"text\":\"pong from opencode\""), "{log}");
     drop(server);
 }

@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
+use anyagents_gateway::MemoryRoutes;
 use anyagents_installer::{CommandRunner, InstallError, LineSink, builtin_catalog, sign_in};
 use anyagents_supervisor::{HealthBoard, Supervisor, SystemClock, declared, mode_name, steer_name};
 use axum::body::Body;
@@ -69,7 +70,11 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
             "socket path is longer than {MAX_SOCKET_PATH} bytes"
         )));
     }
+    // The API is bound before any vendor starts: an agent that is slow, silent
+    // or wedged must never stop the server from answering.
     prepare_socket(&path)?;
+    let api_listener = tokio::net::UnixListener::bind(&path)?;
+    set_socket_mode(&path)?;
     let supervisor = Supervisor::<VendorHarness>::start(
         Arc::clone(&store),
         Arc::new(SystemClock::new()),
@@ -77,19 +82,15 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         vendor::child_env(),
     )
     .map_err(Error::Message)?;
+    crate::gateway::start(data)?;
     let state = AppState {
-        store,
+        store: Arc::clone(&store),
         health: supervisor.board(),
         sign_in,
     };
-    let listener = tokio::net::UnixListener::bind(&path)?;
-    set_socket_mode(&path)?;
-    let (poll_stop_tx, poll_stop_rx) = tokio::sync::watch::channel(false);
-    let poller = tokio::spawn(crate::telegram::run(
-        Arc::clone(&state.store),
-        data.to_path_buf(),
-        poll_stop_rx,
-    ));
+    let listener = api_listener;
+    let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
+        .map_err(Error::Message)?;
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
@@ -105,11 +106,37 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
             }
         })
         .await;
-    let _ = poll_stop_tx.send(true);
-    poller.abort();
+    poller.stop();
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// A loopback port the operating system picked, held open until the caller
+/// serves on it, or why none could be bound.
+pub fn listen_on_loopback() -> Result<(u16, tokio::net::TcpListener), Error> {
+    // A non-blocking listener before it joins the runtime; the runtime makes it
+    // blocking-polled itself.
+    let address = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+    address.set_nonblocking(true)?;
+    let listener = tokio::net::TcpListener::from_std(address)?;
+    let port = listener.local_addr()?.port();
+    Ok((port, listener))
+}
+
+/// Serve the gateway on the loopback listener it was given, for the life of the
+/// process. Each harness reaches it with its own token; nothing else can. It
+/// runs on the server's runtime, so the caller must be inside one.
+pub fn serve_gateway(
+    listener: tokio::net::TcpListener,
+    routes: MemoryRoutes,
+    usage: anyagents_gateway::MemoryUsage,
+) -> Result<(), Error> {
+    let app = anyagents_gateway::router(routes, usage);
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok(())
 }
 
 fn prepare_socket(path: &Path) -> Result<(), Error> {
@@ -261,7 +288,10 @@ fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> 
     for agent in state.store.list_agents().map_err(ApiError::from_store)? {
         agents.push(agent_view(&state.store, &state.health, &agent)?);
     }
-    Ok(Json(AgentsResponse { agents }))
+    Ok(Json(AgentsResponse {
+        agents,
+        gateway: crate::gateway::origin(),
+    }))
 }
 
 fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
@@ -293,7 +323,18 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         quota_reset_at_ms: quota,
         oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
         oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
+        install: install_state(agent),
     })
+}
+
+/// `installed` once this harness is on the machine, `needed` when the reason it
+/// is not, `pending` when nothing has been recorded yet.
+fn install_state(agent: &Agent) -> String {
+    match crate::install::recorded(&agent.harness) {
+        Some(Ok(())) => "installed".to_string(),
+        Some(Err(reason)) => reason,
+        None => "pending".to_string(),
+    }
 }
 
 async fn create_agent_route(
@@ -350,6 +391,7 @@ fn inbox_sync(
             reply_to: message.reply_to,
             source_time_ms: message.source_time_ms,
             received_at_ms: message.received_at_ms,
+            accepted: message.ack != anyagents_core::Ack::Received,
             ack: message.ack.to_string(),
             failed_reason: message.failed_reason,
         })
@@ -373,7 +415,13 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
     }
     enum Target {
         Agent(String),
-        Telegram { address: String, chat: String },
+        Room(String),
+        Telegram {
+            address: String,
+            chat: String,
+            thread: Option<String>,
+            reply: Option<String>,
+        },
     }
     let mut targets = Vec::with_capacity(body.to.len());
     for raw in &body.to {
@@ -382,17 +430,26 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
             .map_err(ApiError::from_store)?
         {
             Address::Agent(name) => targets.push(Target::Agent(name)),
-            Address::TelegramChat(id) | Address::TelegramUser(id) => {
+            Address::TelegramChat { chat, thread } => {
                 targets.push(Target::Telegram {
                     address: raw.clone(),
-                    chat: id,
+                    chat,
+                    thread,
+                    reply: None,
                 });
             }
-            Address::Group(_) => {
-                return Err(ApiError::from_store(Error::NotImplemented(
-                    "send to a group".into(),
-                )));
+            Address::TelegramUser {
+                user,
+                message: reply,
+            } => {
+                targets.push(Target::Telegram {
+                    address: raw.clone(),
+                    chat: user,
+                    thread: None,
+                    reply,
+                });
             }
+            Address::Group(room) => targets.push(Target::Room(room)),
         }
     }
     for target in &targets {
@@ -400,8 +457,23 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
             Target::Agent(name) => {
                 store.agent_by_name(name).map_err(ApiError::from_store)?;
             }
-            Target::Telegram { chat, .. } => {
-                prepare_telegram(store, &body, chat)?;
+            // Counted without writing, so an empty room fails the whole send
+            // instead of silently delivering nothing.
+            Target::Room(room) => {
+                if room_recipients(store, &body, room).is_empty() {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("room {room} has no agent to deliver to"),
+                    ));
+                }
+            }
+            Target::Telegram {
+                chat,
+                thread,
+                reply,
+                ..
+            } => {
+                prepare_telegram(store, &body, chat, thread.as_deref(), reply.as_deref())?;
             }
         }
     }
@@ -409,11 +481,88 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
     for target in targets {
         let delivery = match target {
             Target::Agent(name) => deliver_agent(store, &body, &name)?,
-            Target::Telegram { address, chat } => deliver_telegram(store, &body, &address, &chat)?,
+            Target::Room(room) => {
+                let mut all = deliver_room(store, &body, &room)?;
+                deliveries.append(&mut all);
+                continue;
+            }
+            Target::Telegram {
+                address,
+                chat,
+                thread,
+                reply,
+            } => deliver_telegram(
+                store,
+                &body,
+                &address,
+                &chat,
+                thread.as_deref(),
+                reply.as_deref(),
+            )?,
         };
         deliveries.push(delivery);
     }
     Ok(Json(SendResponse { deliveries }))
+}
+
+/// Everyone a room message will reach, without writing anything: the room's
+/// members (its chat, when it names one) minus the sender.
+fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> {
+    let sender = body
+        .sender
+        .as_deref()
+        .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+    let members = match store.room_members(room) {
+        Ok(members) => members,
+        Err(_) => return Vec::new(),
+    };
+    store
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+        .filter(|agent| {
+            members
+                .as_ref()
+                .is_none_or(|members| members.iter().any(|name| name == &agent.name))
+        })
+        .collect()
+}
+
+/// One room message, one delivery per recipient.
+fn deliver_room(
+    store: &Store,
+    body: &SendRequest,
+    room: &str,
+) -> Result<Vec<Delivery>, ApiError> {
+    let delivered = store
+        .receive_room(
+            room,
+            Incoming {
+                text: body.text.clone(),
+                sender: body.sender.clone(),
+                source_time_ms: None,
+                source_key: None,
+                reply_to: body.reply_to.clone(),
+                received_at_ms: None,
+            },
+        )
+        .map_err(ApiError::from_store)?;
+    Ok(delivered
+        .into_iter()
+        .map(|(agent, outcome)| {
+            let (message, duplicate) = match outcome {
+                ReceiveOutcome::New(message) => (message, false),
+                ReceiveOutcome::Duplicate(message) => (message, true),
+            };
+            Delivery {
+                to: format!("agent:{}", agent.name),
+                id: message.id.to_string(),
+                seq: message.seq,
+                duplicate,
+            }
+        })
+        .collect())
 }
 
 fn deliver_agent(store: &Store, body: &SendRequest, name: &str) -> Result<Delivery, ApiError> {
@@ -443,28 +592,59 @@ fn deliver_agent(store: &Store, body: &SendRequest, name: &str) -> Result<Delive
     })
 }
 
-/// Resolve the bot and the chat before any mailbox write. This does not post.
-fn prepare_telegram(store: &Store, body: &SendRequest, chat: &str) -> Result<(), ApiError> {
-    let chat_id: i64 = chat
-        .parse()
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "telegram chat id is not a number"))?;
-    let reply_to = telegram_reply(body)?;
+/// Resolve the bot, the chat, the topic and the reply before any mailbox
+/// write. This does not post.
+fn prepare_telegram(
+    store: &Store,
+    body: &SendRequest,
+    chat: &str,
+    thread: Option<&str>,
+    reply: Option<&str>,
+) -> Result<(), ApiError> {
+    let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
     let from =
         crate::telegram::bound_sender(body.sender.as_deref()).map_err(ApiError::from_store)?;
-    crate::telegram::outbound_call(store, from.as_deref(), chat_id, &body.text, reply_to)
-        .map_err(ApiError::from_store)?;
+    crate::telegram::outbound_call(
+        store,
+        from.as_deref(),
+        chat_id,
+        &body.text,
+        reply_to,
+        thread_id,
+    )
+    .map_err(ApiError::from_store)?;
     Ok(())
 }
 
-fn telegram_reply(body: &SendRequest) -> Result<Option<i64>, ApiError> {
-    match body.reply_to.as_deref() {
+/// The chat, forum topic and replied-to message as numbers. The explicit
+/// `reply_to` wins over the one an address names.
+fn telegram_target(
+    chat: &str,
+    thread: Option<&str>,
+    reply: Option<&str>,
+    body: &SendRequest,
+) -> Result<(i64, Option<i64>, Option<i64>), ApiError> {
+    let chat_id: i64 = chat
+        .parse()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "telegram chat id is not a number"))?;
+    let thread_id = match thread {
+        None => None,
+        Some(value) => Some(number(value, "telegram topic id is not a number")?),
+    };
+    let reply_to = telegram_reply(body, reply)?;
+    Ok((chat_id, thread_id, reply_to))
+}
+
+fn number(value: &str, what: &'static str) -> Result<i64, ApiError> {
+    value
+        .parse()
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, what))
+}
+
+fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>, ApiError> {
+    match body.reply_to.as_deref().or(reply) {
         None => Ok(None),
-        Some(value) => Ok(Some(value.parse().map_err(|_| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "reply_to is not a telegram message id",
-            )
-        })?)),
+        Some(value) => number(value, "reply_to is not a telegram message id").map(Some),
     }
 }
 
@@ -474,11 +654,10 @@ fn deliver_telegram(
     body: &SendRequest,
     address: &str,
     chat: &str,
+    thread: Option<&str>,
+    reply: Option<&str>,
 ) -> Result<Delivery, ApiError> {
-    let chat_id: i64 = chat
-        .parse()
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "telegram chat id is not a number"))?;
-    let reply_to = telegram_reply(body)?;
+    let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
     let from =
         crate::telegram::bound_sender(body.sender.as_deref()).map_err(ApiError::from_store)?;
     let message_id = crate::telegram::post_text(
@@ -488,8 +667,14 @@ fn deliver_telegram(
         chat_id,
         &body.text,
         reply_to,
+        thread_id,
     )
     .map_err(ApiError::from_store)?;
+    // Remember the chat this agent answers in, so a post it makes there reaches
+    // the other agents on that chat as a mailbox message.
+    if let Some(sender) = from.as_deref() {
+        crate::telegram::record_chat(store, sender, chat_id).map_err(ApiError::from_store)?;
+    }
     Ok(Delivery {
         to: address.to_string(),
         id: message_id.to_string(),
