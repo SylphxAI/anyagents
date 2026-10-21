@@ -5,24 +5,35 @@
 //! store: a channel added while the server runs gets its thread, and a channel
 //! removed has its thread stopped. Dropping the poller stops every thread and
 //! waits for the call each one is in.
+//!
+//! A long poll cannot be cancelled from this process: it ends when Telegram
+//! answers, or when another process calls the same bot. Shutdown therefore ends
+//! every poll rather than abandoning it: it sends `getUpdates` to each bot with
+//! the shortest timeout and no offset, which makes Telegram release the poll the
+//! bot holds and answer both calls at once. The held poll comes back with any
+//! update it carried, the last offset is written, and only then does the server
+//! stop. A bot that does not answer within the bound keeps the stopping process
+//! in its poller join: a poller left behind would be a second poller for the
+//! same bot beside the next server's, so the handoff is never declared finished
+//! early.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use anyagents_core::{Channel, Store};
+use anyagents_core::{Channel, FileCredentialStore, Store};
 
 use super::channel::{LONG_POLL_S, poll_channel_once};
-use anyagents_core::FileCredentialStore;
-
-/// The poll timeout used once a shutdown has been asked for, so the call in
-/// hand comes back promptly instead of holding the join for a full long poll.
-const SHUTDOWN_POLL_S: u64 = 1;
 
 /// How often the supervisor looks for channels that were added or removed.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
+
+/// The timeout the shutdown's own call carries, so the held long poll and this
+/// one both come back now that Telegram has answered them.
+const RELEASE_POLL_S: u64 = 1;
 
 /// A running poller. Dropping it stops every thread and waits for them.
 pub struct Poller {
@@ -52,7 +63,11 @@ impl Poller {
         })
     }
 
-    /// Ask every thread to stop and wait for them. Called at server shutdown.
+    /// Stop every bot's poll and wait for its last offset to be written. The
+    /// server releases every held poll first (see [`release_every_bot`]), so
+    /// each thread's call comes back at once and its state is committed before
+    /// the join returns. The join has no timeout: a poller left behind would be
+    /// a second poller for the same bot beside the next server's.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::SeqCst);
         let handles = lock(&self.supervisors).drain(..).collect::<Vec<_>>();
@@ -127,7 +142,9 @@ fn supervise(
         }
     }
 
-    // Shutdown: every channel's thread stops and is waited for.
+    // Shutdown: every bot's poll ends and its last offset is written before its
+    // thread returns. The stop was released through Telegram already, so this
+    // join returns as soon as that call has been stored.
     let running = std::mem::take(&mut *lock(&bots));
     for (_, bot) in running {
         bot.stop.store(true, Ordering::SeqCst);
@@ -153,7 +170,7 @@ fn run_channel(store: Arc<Store>, data_dir: std::path::PathBuf, id: String, stop
         // The timeout is capped so a shutdown never waits out a full long poll:
         // Telegram answers at once when the timeout is short.
         let timeout = if stop.load(Ordering::SeqCst) {
-            SHUTDOWN_POLL_S
+            RELEASE_POLL_S
         } else {
             LONG_POLL_S
         };
@@ -165,6 +182,61 @@ fn run_channel(store: Arc<Store>, data_dir: std::path::PathBuf, id: String, stop
             sleep_a_moment(&stop);
         }
     }
+}
+
+/// End every bot poll that is waiting on Telegram, and wait for each bot to
+/// write its last offset. Telegram releases a held long poll when the next call
+/// to that bot arrives, so each bot gets one call with the shortest timeout; the
+/// held poll and this one are then both answered. An error the bot itself
+/// reports (a competing poller, a dead token) is passed on: it is not hidden.
+/// An update the bot had already routed before the stop is stored on the way
+/// out, so the release also waits for the last offset to be committed.
+pub fn release_every_bot(
+    store: &Store,
+    data_dir: &std::path::Path,
+    within: Duration,
+) -> Result<(), String> {
+    let channels = channels_to_poll(store);
+    let (done_tx, done_rx) = mpsc::channel();
+    let mut waiting = 0;
+    for channel in channels {
+        let secrets = FileCredentialStore::new(data_dir);
+        let done = done_tx.clone();
+        let id = channel.id.to_string();
+        // One pass per bot, on its own thread: every bot is released at the
+        // same time, not one after another.
+        let data_dir = data_dir.to_path_buf();
+        std::thread::spawn(move || {
+            let store = match Store::open(data_dir.join("state.db")) {
+                Ok(store) => store,
+                Err(err) => {
+                    let _ = done.send((id, Err(err.to_string())));
+                    return;
+                }
+            };
+            let result = poll_channel_once(&store, &secrets, &channel, RELEASE_POLL_S);
+            let _ = done.send((id, result.map_err(|err| err.to_string())));
+        });
+        waiting += 1;
+    }
+    drop(done_tx);
+    let deadline = Instant::now() + within;
+    while waiting > 0 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "{waiting} bot(s) did not release their poll within {}s",
+                within.as_secs()
+            ));
+        }
+        match done_rx.recv_timeout(left.min(Duration::from_millis(200))) {
+            Ok((_, Err(reason))) => return Err(reason),
+            Ok((_, Ok(()))) => waiting -= 1,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    Ok(())
 }
 
 /// The channels this server should be polling: a Telegram channel with a

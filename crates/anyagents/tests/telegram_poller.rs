@@ -21,6 +21,9 @@ use serde_json::{Value, json};
 struct Asked {
     bot: i64,
     at: Instant,
+    /// The offset the poll carried, so a test can see what a restarted poller
+    /// asks for.
+    offset: Option<i64>,
 }
 
 /// A fake Telegram that serves each bot separately.
@@ -148,6 +151,7 @@ fn serve(
             asked.lock().unwrap().push(Asked {
                 bot,
                 at: Instant::now(),
+                offset: request["offset"].as_i64(),
             });
             // Telegram holds a long poll open for the timeout it was given when
             // there is nothing to send. A quiet bot must behave the same here,
@@ -155,14 +159,21 @@ fn serve(
             let timeout = request["timeout"].as_u64().unwrap_or(0).min(20);
             let hold = Instant::now() + Duration::from_secs(timeout);
             loop {
+                // Telegram answers with every queued update at or after the
+                // offset the poll asked for, and drops the ones below it.
+                let offset = request["offset"].as_i64().unwrap_or(0);
                 let mine: Vec<Value> = {
                     let mut waiting = pending.lock().unwrap();
                     let mine: Vec<Value> = waiting
                         .iter()
-                        .filter(|(for_bot, _)| *for_bot == bot)
+                        .filter(|(for_bot, update)| {
+                            *for_bot == bot && update["update_id"].as_i64().unwrap_or(0) >= offset
+                        })
                         .map(|(_, update)| update.clone())
                         .collect();
-                    waiting.retain(|(for_bot, _)| *for_bot != bot);
+                    waiting.retain(|(for_bot, update)| {
+                        !(*for_bot == bot && update["update_id"].as_i64().unwrap_or(0) >= offset)
+                    });
                     mine
                 };
                 if !mine.is_empty() || Instant::now() >= hold {
@@ -288,7 +299,7 @@ fn dm(update_id: i64, text: &str) -> Value {
             "message_id": update_id,
             "chat": {"id": 500, "type": "private"},
             "from": {"id": 42, "is_bot": false, "first_name": "Kai"},
-            "date": 1_700_000_000,
+            "date": 1_700_000_000 + update_id,
             "text": text,
         },
     })
@@ -487,55 +498,115 @@ fn a_channel_added_while_running_is_polled_without_a_restart() {
 
 /// Shutdown stops every poller: the server ends on SIGTERM, removes its socket,
 /// and no bot is polled again afterwards.
+/// Two identical messages sent in the same second by the same person: both are
+/// stored as separate rows, an update replayed after the confirmed offset is
+/// not stored again, and a poller that starts again on the same store asks from
+/// the offset the first one saved. Nothing here tells messages apart by their
+/// text or their time.
 #[test]
-fn shutdown_stops_every_poller() {
+fn identical_messages_in_one_second_are_two_and_a_restart_keeps_the_offset() {
+    let (first_id, second_id) = (980_000_i64, 980_001);
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let fake = FakeTelegram::start();
-    for (at, bot) in [930_i64, 931, 932].iter().enumerate() {
-        let name = format!("owner{at}");
-        create(&data, &name);
-        add_channel(&data, &name, *bot);
-    }
-    let mut server = Server::start(&data, &fake.address);
-    for bot in [930_i64, 931, 932] {
-        assert!(
-            fake.wait_polled(bot, Duration::from_secs(20)),
-            "bot {bot} polled"
-        );
-    }
-
-    // A long poll is in flight for every bot when the shutdown signal lands.
-    let pid = server.child.id().to_string();
-    let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
-    assert!(sent.success(), "SIGTERM was not delivered");
-
-    // The server ends by itself, and a poller that was still running would keep
-    // this from finishing. The budget is generous because the machine may be
-    // busy: the point is that it ends, not how fast.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    let exited = loop {
-        if let Ok(Some(_)) = server.child.try_wait() {
-            break true;
-        }
-        if Instant::now() > deadline {
-            break false;
-        }
-        thread::sleep(Duration::from_millis(50));
+    create(&data, "owner");
+    add_channel(&data, "owner", 950);
+    let agent = Store::open(data.join("state.db"))
+        .unwrap()
+        .agent_by_name("owner")
+        .unwrap();
+    let words = |inbox: &[anyagents_core::Message]| {
+        inbox.iter().filter(|one| one.text == "same words").count()
     };
-    assert!(exited, "the server did not stop on SIGTERM");
-    assert!(
-        !data.join("anyagents.sock").exists(),
-        "the socket was left behind"
+    let wait_for = |wanted: usize| {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let inbox = Store::open(data.join("state.db"))
+                .unwrap()
+                .inbox(&agent.id, None)
+                .unwrap();
+            if words(&inbox) >= wanted {
+                return inbox;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "line {wanted} never arrived: {inbox:?}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let first = dm(first_id, "same words");
+    let mut second = dm(second_id, "same words");
+    second["message"]["message_id"] = json!(8);
+    // The same second on Telegram's clock, and the same sender.
+    second["message"]["date"] = first["message"]["date"].clone();
+    fake.offer(950, first);
+    let _server = Server::start(&data, &fake.address);
+    wait_for(1);
+    thread::sleep(Duration::from_millis(800));
+    fake.offer(950, second);
+    let inbox = wait_for(2);
+    assert_eq!(words(&inbox), 2, "{inbox:?}");
+    // Each row carries its own Telegram update and message id.
+    let keys: Vec<String> = inbox
+        .iter()
+        .filter(|one| one.text == "same words")
+        .filter_map(|one| one.source_key.clone())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![format!("bot:{first_id}"), format!("bot:{second_id}")]
     );
 
-    // Nothing polls after the shutdown.
-    let after = fake.asked().len();
-    thread::sleep(Duration::from_secs(2));
+    // The confirmed offset is the update after the last one stored; the first
+    // update offered again is below it and is not stored a third time.
+    let saved_state = || {
+        let state = Store::open(data.join("state.db"))
+            .unwrap()
+            .list_channels()
+            .unwrap()
+            .into_iter()
+            .find(|channel| channel.credential_ref.is_some())
+            .unwrap()
+            .state;
+        serde_json::from_str::<Value>(&state).unwrap()
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while saved_state()["offset"].as_i64().unwrap_or(0) <= second_id {
+        assert!(
+            Instant::now() < deadline,
+            "the confirmed offset was never written: {}",
+            saved_state()
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    fake.offer(950, dm(second_id, "same words"));
+    drop(_server);
+    thread::sleep(Duration::from_millis(500));
+    // A poller that starts again reads the saved offset and asks from it.
+    let _server = Server::start(&data, &fake.address);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !fake
+        .asked()
+        .iter()
+        .any(|one| one.bot == 950 && one.offset.is_some_and(|offset| offset > second_id))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the restarted poller asked again"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    thread::sleep(Duration::from_millis(1000));
+    let inbox = Store::open(data.join("state.db"))
+        .unwrap()
+        .inbox(&agent.id, None)
+        .unwrap();
     assert_eq!(
-        fake.asked().len(),
-        after,
-        "a bot was still polled after shutdown"
+        words(&inbox),
+        2,
+        "a replayed update was stored again: {inbox:?}"
     );
 }

@@ -163,22 +163,31 @@ fn answer(
             "result": {"id": 777, "is_bot": true, "first_name": "Ada", "username": "ada_bot"},
         }),
         "getUpdates" => {
-            let mut pending = pending.lock().unwrap();
-            let mut served = served.lock().unwrap();
-            // The first call hands over everything and, as Telegram may after
-            // a restart, the same update twice.
-            let batch = if *served == 0 {
-                let mut batch = pending.clone();
-                if let Some(first) = pending.first().cloned() {
-                    batch.push(first);
-                }
-                *served = 1;
-                batch
+            // A short poll is the server releasing a held long poll: it hands
+            // over nothing and no update is lost by it.
+            if request["timeout"]
+                .as_u64()
+                .is_some_and(|timeout| timeout <= 1)
+            {
+                json!({"ok": true, "result": []})
             } else {
-                pending.clone()
-            };
-            pending.clear();
-            json!({"ok": true, "result": batch})
+                let mut pending = pending.lock().unwrap();
+                let mut served = served.lock().unwrap();
+                // The first call hands over everything and, as Telegram may after
+                // a restart, the same update twice.
+                let batch = if *served == 0 {
+                    let mut batch = pending.clone();
+                    if let Some(first) = pending.first().cloned() {
+                        batch.push(first);
+                    }
+                    *served = 1;
+                    batch
+                } else {
+                    pending.clone()
+                };
+                pending.clear();
+                json!({"ok": true, "result": batch})
+            }
         }
         "sendMessage" => {
             sent.lock().unwrap().push(Sent {

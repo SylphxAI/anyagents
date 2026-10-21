@@ -62,6 +62,11 @@ the first release will move it under a version heading.
   clear it. Every line is now a prompt with `delivery: "steer"`, taken when the
   prompt API answers, so the session's own inbox decides whether it joins the
   running turn or starts the next one.
+- **Shutdown no longer abandons a Telegram long poll.** A held `getUpdates`
+  blocks the bot, so the server now releases every bot's poll before it stops
+  (one call with the shortest timeout and no offset), and each bot's thread
+  joins only after its last offset is written. A poller is never left behind
+  polling beside the next server.
 
 ### Not yet
 

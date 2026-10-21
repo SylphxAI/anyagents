@@ -109,6 +109,16 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
             }
         })
         .await;
+    // A long poll ends at Telegram, not here: it is released for every bot
+    // before the poller is stopped, so each bot's last offset is written by the
+    // process that still owns it.
+    if let Err(reason) = crate::telegram::poller::release_every_bot(
+        &store,
+        store.data_dir(),
+        std::time::Duration::from_secs(30),
+    ) {
+        eprintln!("anyagents-telegram: shutdown did not release every bot: {reason}");
+    }
     poller.stop();
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
