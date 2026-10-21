@@ -591,7 +591,7 @@ impl Harness for OpenCodeHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: DeliveryMode::Followup,
+            delivery_mode: DeliveryMode::Steer,
             steer_support: SteerSupport::Yes,
             quota_reset_at_ms: None,
             sign_in_fault: None,
