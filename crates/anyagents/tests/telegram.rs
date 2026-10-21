@@ -435,24 +435,28 @@ fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
 
     let sent = fake.sent();
     assert_eq!(sent.len(), 2, "{sent:?}");
-    assert_eq!(sent[0], Sent {
-        chat_id: 100,
-        text: "pong in the dm".into(),
-        reply_to: Some(5),
-        thread: None,
-    });
-    assert_eq!(sent[1], Sent {
-        chat_id: -1007,
-        text: "pong in the topic".into(),
-        reply_to: Some(55),
-        thread: Some(3),
-    });
+    assert_eq!(
+        sent[0],
+        Sent {
+            chat_id: 100,
+            text: "pong in the dm".into(),
+            reply_to: Some(5),
+            thread: None,
+        }
+    );
+    assert_eq!(
+        sent[1],
+        Sent {
+            chat_id: -1007,
+            text: "pong in the topic".into(),
+            reply_to: Some(55),
+            thread: Some(3),
+        }
+    );
     drop(server);
 
     // The token is only in its own 0600 file, never in the channel row.
-    let secret = secrets
-        .read(&format!("channels/{channel_id}"))
-        .unwrap();
+    let secret = secrets.read(&format!("channels/{channel_id}")).unwrap();
     assert_eq!(secret.as_str().unwrap(), "777:fake-token-not-real");
 }
 
@@ -476,10 +480,7 @@ fn a_bad_topic_id_is_refused_before_anything_is_posted() {
     );
     assert!(refused["error"].is_string(), "{refused}");
     assert!(fake.sent().is_empty());
-    wait_for(
-        || fake.asked_for_updates(),
-        "the bot was never polled",
-    );
+    wait_for(|| fake.asked_for_updates(), "the bot was never polled");
     assert_eq!(fake.waiting(), 0, "the bot did not ask for its update");
     drop(server);
 }
@@ -520,7 +521,9 @@ fn a_room_reaches_only_the_bots_on_the_same_chat() {
         store
             .set_channel_state(
                 &channel.id,
-                &format!("{{\"offset\":0,\"chats\":[{{\"agent\":\"{name}\",\"chat_id\":{chat}}}]}}"),
+                &format!(
+                    "{{\"offset\":0,\"chats\":[{{\"agent\":\"{name}\",\"chat_id\":{chat}}}]}}"
+                ),
             )
             .unwrap();
     }
@@ -539,7 +542,10 @@ fn a_room_reaches_only_the_bots_on_the_same_chat() {
             },
         )
         .unwrap();
-    let names: Vec<&str> = delivered.iter().map(|(agent, _)| agent.name.as_str()).collect();
+    let names: Vec<&str> = delivered
+        .iter()
+        .map(|(agent, _)| agent.name.as_str())
+        .collect();
     assert_eq!(names, vec!["ada", "bea"], "{names:?}");
 
     let cy_id = store.agent_by_name("cy").unwrap().id;

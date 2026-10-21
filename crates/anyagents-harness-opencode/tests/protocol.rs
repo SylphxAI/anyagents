@@ -80,7 +80,10 @@ fn a_delivered_line_is_a_prompt_carrying_its_mailbox_id() {
     harness.deliver(&msg("m1")).unwrap();
     let text = log_of(&dir);
     // The prompt is the real endpoint, and the line carries its id first.
-    assert!(text.contains("api:POST /api/session/ses_fake/prompt"), "{text}");
+    assert!(
+        text.contains("api:POST /api/session/ses_fake/prompt"),
+        "{text}"
+    );
     assert!(text.contains("anyagents-message:m1"), "{text}");
     // A turn handed over while another is open still goes as a prompt.
     assert!(text.contains("\"delivery\":\"queue\""), "{text}");
@@ -134,13 +137,8 @@ fn a_failed_turn_is_a_failed_report() {
 fn a_steered_line_joins_the_open_turn() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("steer.jsonl");
-    std::fs::write(
-        &path,
-        "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n",
-    )
-    .unwrap();
-    let mut harness = start(&dir, "steer")
-        .with_steer(anyagents_harness::SteerQueue::new(&path, 4));
+    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
+    let mut harness = start(&dir, "steer").with_steer(anyagents_harness::SteerQueue::new(&path, 4));
     harness.deliver(&msg("m1")).unwrap();
     let item = harness.poll_steer().unwrap().expect("taken");
     assert_eq!(item.message.id, "m7");
@@ -149,7 +147,11 @@ fn a_steered_line_joins_the_open_turn() {
     assert!(text.contains("steered:anyagents-message:m7"), "{text}");
     assert!(text.contains("\"delivery\":\"steer\""), "{text}");
     // One turn, not two: the steer joined the open one.
-    assert_eq!(text.matches("api:POST /api/session/ses_fake/prompt").count(), 2);
+    assert_eq!(
+        text.matches("api:POST /api/session/ses_fake/prompt")
+            .count(),
+        2
+    );
 }
 
 #[test]
@@ -181,7 +183,11 @@ fn an_earlier_turns_answer_does_not_close_this_turn() {
     harness.deliver(&msg("m1")).unwrap();
     // The session holds an old completed turn; this one has not finished.
     assert!(!harness.wait_finished("m1", Duration::from_secs(2)));
-    assert_eq!(harness.answer("m1"), None, "an old answer is not this turn's");
+    assert_eq!(
+        harness.answer("m1"),
+        None,
+        "an old answer is not this turn's"
+    );
 }
 
 #[test]
@@ -267,11 +273,17 @@ fn a_second_line_is_deferred_while_a_turn_is_open() {
             turn_finished: false
         }
     );
-    assert_eq!(harness.deliver(&msg("m2")).unwrap(), DeliverOutcome::Deferred);
+    assert_eq!(
+        harness.deliver(&msg("m2")).unwrap(),
+        DeliverOutcome::Deferred
+    );
     // Only the first line reached the service.
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
     let text = log_of(&dir);
-    let prompts = text.lines().filter(|line| line.starts_with("prompt:")).count();
+    let prompts = text
+        .lines()
+        .filter(|line| line.starts_with("prompt:"))
+        .count();
     assert_eq!(prompts, 1, "{text}");
     assert!(!text.contains("anyagents-message:m2"), "{text}");
 }

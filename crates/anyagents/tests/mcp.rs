@@ -276,14 +276,11 @@ async fn mcp_tools_use_the_server_socket() {
         )
         .await,
     );
-    let to: Vec<&str> = room
-        .deliveries
-        .iter()
-        .map(|one| one.to.as_str())
-        .collect();
+    let to: Vec<&str> = room.deliveries.iter().map(|one| one.to.as_str()).collect();
     assert!(to.contains(&"agent:beta"), "{to:?}");
     assert!(!to.contains(&"agent:alpha"), "{to:?}");
-    let in_room: InboxResponse = ok_json(call(&beta, "inbox", serde_json::json!({"since": 0})).await);
+    let in_room: InboxResponse =
+        ok_json(call(&beta, "inbox", serde_json::json!({"since": 0})).await);
     assert!(
         in_room.messages.iter().any(|line| line.text == "room line"),
         "{:?}",

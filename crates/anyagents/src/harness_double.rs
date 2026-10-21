@@ -145,8 +145,11 @@ mod tool_server {
             &mut stdout,
             r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"contract","version":"0"}}}"#,
         )?;
-        writeln!(stdin, r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#)
-            .map_err(|err| err.to_string())?;
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+        )
+        .map_err(|err| err.to_string())?;
         let call = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
@@ -173,7 +176,9 @@ mod tool_server {
         writeln!(stdin, "{line}").map_err(|err| err.to_string())?;
         stdin.flush().map_err(|err| err.to_string())?;
         let mut reply = String::new();
-        let read = stdout.read_line(&mut reply).map_err(|err| err.to_string())?;
+        let read = stdout
+            .read_line(&mut reply)
+            .map_err(|err| err.to_string())?;
         if read == 0 {
             return Err("tool server closed".to_string());
         }

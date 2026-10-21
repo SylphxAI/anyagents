@@ -6,6 +6,6 @@
 mod channel;
 pub mod poller;
 
-pub use channel::{post_text, record_chat};
 pub(crate) use channel::{bound_sender, outbound_call};
+pub use channel::{post_text, record_chat};
 pub use poller::Poller;

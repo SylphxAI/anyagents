@@ -1589,9 +1589,18 @@ mod tests {
         let delivered = store
             .receive_room(&(-1001_i64).to_string(), one("in A", "agent:alice"))
             .unwrap();
-        let names: Vec<&str> = delivered.iter().map(|(agent, _)| agent.name.as_str()).collect();
+        let names: Vec<&str> = delivered
+            .iter()
+            .map(|(agent, _)| agent.name.as_str())
+            .collect();
         assert_eq!(names, vec!["bob"], "{names:?}");
-        assert!(!store.inbox(&carol.id, None).unwrap().iter().any(|m| m.text == "in A"));
+        assert!(
+            !store
+                .inbox(&carol.id, None)
+                .unwrap()
+                .iter()
+                .any(|m| m.text == "in A")
+        );
 
         // A post in chat B reaches only its own bot.
         let delivered = store
@@ -1603,7 +1612,10 @@ mod tests {
         let delivered = store
             .receive_room("crew", one("everyone", "agent:alice"))
             .unwrap();
-        let names: Vec<&str> = delivered.iter().map(|(agent, _)| agent.name.as_str()).collect();
+        let names: Vec<&str> = delivered
+            .iter()
+            .map(|(agent, _)| agent.name.as_str())
+            .collect();
         assert_eq!(names, vec!["bob", "carol"], "{names:?}");
     }
 
@@ -1639,7 +1651,10 @@ mod tests {
             .unwrap();
         assert_eq!(mode, "wal");
         // The newest migration's number, bumped whenever one is added.
-        let newest = migrate::MIGRATIONS.last().map(|(version, _)| *version).unwrap();
+        let newest = migrate::MIGRATIONS
+            .last()
+            .map(|(version, _)| *version)
+            .unwrap();
         let version = migrate::current_version(&store.conn()).unwrap();
         assert_eq!(version, newest);
         let again = Store::open(dir.path().join("state.db")).unwrap();

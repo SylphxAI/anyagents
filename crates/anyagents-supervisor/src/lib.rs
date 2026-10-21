@@ -869,14 +869,13 @@ impl<H: Harness + 'static> Session<H> {
                 if self.quota_is_ahead() {
                     return false;
                 }
-                self.inner
-                    .clock
-                    .wait(Some(anyagents_core::now_ms() + DEFERRED_RETRY_MS), &self.woken);
+                self.inner.clock.wait(
+                    Some(anyagents_core::now_ms() + DEFERRED_RETRY_MS),
+                    &self.woken,
+                );
                 false
             }
-            Ok(RunOutcome::Idle
-            | RunOutcome::Delivered { .. }
-            | RunOutcome::Steered { .. }) => {
+            Ok(RunOutcome::Idle | RunOutcome::Delivered { .. } | RunOutcome::Steered { .. }) => {
                 self.settle();
                 // The just-delivered turn is settled before the worker sleeps.
                 // Without this a harness that prints nothing when its HTTP turn

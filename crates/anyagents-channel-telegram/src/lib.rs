@@ -308,7 +308,12 @@ pub struct BotCall {
 
 /// `sendMessage` for one chat. `reply_to` is a Telegram message id, when the
 /// agent was answering one. `thread` keeps the post in its forum topic.
-pub fn send_message(chat_id: i64, text: &str, reply_to: Option<i64>, thread: Option<i64>) -> BotCall {
+pub fn send_message(
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
     let mut body = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
@@ -548,7 +553,11 @@ mod tests {
             .unwrap();
         let mut poll = Poll::default();
         let routed = poll
-            .route("bot_a", agent.id.as_str(), &group_update(11, -1007, 55, 3, "deploy?"))
+            .route(
+                "bot_a",
+                agent.id.as_str(),
+                &group_update(11, -1007, 55, 3, "deploy?"),
+            )
             .unwrap();
         let Routed::ToAgent { inbound, .. } = &routed[0] else {
             panic!("{routed:?}");
@@ -592,7 +601,8 @@ mod tests {
     #[test]
     fn media_with_a_caption_is_delivered_and_a_sticker_is_not() {
         let photo = r#"[{"update_id":30,"message":{"message_id":70,"chat":{"id":100},"date":1700000000,"caption":"look"}}]"#;
-        let sticker = r#"[{"update_id":31,"message":{"message_id":71,"chat":{"id":100},"date":1700000000}}]"#;
+        let sticker =
+            r#"[{"update_id":31,"message":{"message_id":71,"chat":{"id":100},"date":1700000000}}]"#;
         let edited = r#"[{"update_id":32,"edited_message":{"message_id":72,"chat":{"id":100},"date":1700000000,"text":"x"}}]"#;
         let mut poll = Poll::default();
         let routed = poll.route("bot_a", "ada", photo).unwrap();

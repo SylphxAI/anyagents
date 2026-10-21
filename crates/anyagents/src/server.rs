@@ -530,11 +530,7 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
 }
 
 /// One room message, one delivery per recipient.
-fn deliver_room(
-    store: &Store,
-    body: &SendRequest,
-    room: &str,
-) -> Result<Vec<Delivery>, ApiError> {
+fn deliver_room(store: &Store, body: &SendRequest, room: &str) -> Result<Vec<Delivery>, ApiError> {
     let delivered = store
         .receive_room(
             room,

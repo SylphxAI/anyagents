@@ -10,7 +10,7 @@
 
 mod rpc;
 
-pub use rpc::{NotificationEffect, RpcChild, RpcFail, RpcLaunch, RequestHandler};
+pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};

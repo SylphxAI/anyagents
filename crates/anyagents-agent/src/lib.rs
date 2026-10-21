@@ -203,7 +203,9 @@ impl<H: Harness> DeliveryLoop<H> {
         loop {
             let item = self.harness.poll_steer().map_err(inject_error)?;
             match item {
-                Some(item) if item.message.id != message.id.as_str() && pushed < PUSHED_AHEAD_LIMIT => {
+                Some(item)
+                    if item.message.id != message.id.as_str() && pushed < PUSHED_AHEAD_LIMIT =>
+                {
                     pushed += 1;
                     self.inject_pushed(item)?;
                 }
@@ -577,13 +579,23 @@ mod tests {
             .into_iter()
             .find(|message| message.reply_to.is_some())
             .expect("the answer was recorded");
-        assert!(answer.source_key.as_deref().unwrap_or("").starts_with("answer:"));
+        assert!(
+            answer
+                .source_key
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("answer:")
+        );
 
         // The next pass steps over the answer instead of prompting it again.
         let before = loop_.harness().given.len();
         loop_.run_once().unwrap();
         let after = loop_.harness().given.clone();
-        assert_eq!(before, after.len(), "the agent's own answer was handed back");
+        assert_eq!(
+            before,
+            after.len(),
+            "the agent's own answer was handed back"
+        );
         assert!(
             !after.contains(&answer.id.to_string()),
             "the answer row was given to the harness"
@@ -678,7 +690,11 @@ mod tests {
             .into_iter()
             .map(|message| (message.seq, message.reply_to.is_some()))
             .collect();
-        assert_eq!(rows, vec![(1, false), (2, false), (3, true)], "the live shape");
+        assert_eq!(
+            rows,
+            vec![(1, false), (2, false), (3, true)],
+            "the live shape"
+        );
 
         // Line 2 has no answer of its own, so it is not done.
         loop_.harness_mut().finished = false;

@@ -202,7 +202,10 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Mcp { agent } => mcp::run(&cli.data, &agent),
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness { config } => harness_double::run(&config),
-        Command::AgyHook { agent, conversation } => {
+        Command::AgyHook {
+            agent,
+            conversation,
+        } => {
             agy_hook(&cli.data, &agent, &conversation);
             Ok(())
         }
@@ -332,7 +335,8 @@ fn agy_hook(data: &Path, agent: &str, conversation: &str) {
         let _ = writeln!(stdout, "{{}}");
         return;
     }
-    let mut used = String::from("New messages arrived while you were working (delivered mid-turn):");
+    let mut used =
+        String::from("New messages arrived while you were working (delivered mid-turn):");
     for line in lines.iter().take(40) {
         used.push_str("\n\n");
         used.push_str(&anyagents_harness::marked_message(&line.id, &line.text));
@@ -643,8 +647,7 @@ fn send_telegram(
         Some(raw) => Some(parse_id(raw, "reply_to is not a telegram message id")?),
     };
     let store = open(data)?;
-    let message_id =
-        telegram::post_text(&store, data, from, chat_id, text, reply_to, thread_id)?;
+    let message_id = telegram::post_text(&store, data, from, chat_id, text, reply_to, thread_id)?;
     println!("{message_id}");
     Ok(())
 }

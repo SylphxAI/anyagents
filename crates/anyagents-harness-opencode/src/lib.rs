@@ -193,7 +193,9 @@ impl OpenCodeHarness {
         for (key, value) in &self.environment {
             command.env(key, value);
         }
-        let mut child = command.spawn().map_err(|err| HarnessError::Failed(err.to_string()))?;
+        let mut child = command
+            .spawn()
+            .map_err(|err| HarnessError::Failed(err.to_string()))?;
         if let Some(stdout) = child.stdout.take() {
             use std::io::{BufRead, BufReader, Read};
             use std::sync::mpsc;
@@ -271,7 +273,10 @@ impl OpenCodeHarness {
                         }
                         Err(err) => {
                             let text = err.to_string();
-                            state = if text.contains("404") || text.contains("not found") || text.contains("NotFound") {
+                            state = if text.contains("404")
+                                || text.contains("not found")
+                                || text.contains("NotFound")
+                            {
                                 Missing::Gone
                             } else {
                                 Missing::Unknown
@@ -289,7 +294,9 @@ impl OpenCodeHarness {
         };
         if !usable {
             if let Some(session) = &wanted {
-                eprintln!("anyagents-opencode: session {session} is gone from this agent's store; starting a new one");
+                eprintln!(
+                    "anyagents-opencode: session {session} is gone from this agent's store; starting a new one"
+                );
             }
             let fresh = self.api("POST", "/api/session", Some(json!({})))?;
             if let Some(id) = fresh.pointer("/data/id").and_then(Value::as_str) {
@@ -401,7 +408,12 @@ impl OpenCodeHarness {
                     // The newest assistant message is the answer; an earlier one
                     // belonged to a turn already settled.
                     text.clear();
-                    for part in message.get("content").and_then(Value::as_array).into_iter().flatten() {
+                    for part in message
+                        .get("content")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                    {
                         // Only a `text` part is the answer; a `reasoning` part is
                         // the model's own thinking and is never recorded.
                         if part.get("type").and_then(Value::as_str) != Some("text") {
@@ -463,7 +475,9 @@ impl OpenCodeHarness {
     /// parts are never the answer.
     pub fn answer_in_session(&self, id: &str) -> Option<String> {
         let session = self.lock().session.clone()?;
-        let listing = self.api("GET", &format!("/api/session/{session}/message"), None).ok()?;
+        let listing = self
+            .api("GET", &format!("/api/session/{session}/message"), None)
+            .ok()?;
         answer_of(listing.get("data")?.as_array()?, id)
     }
 
@@ -534,7 +548,11 @@ impl Harness for OpenCodeHarness {
         };
         let text = marked_message(&message.id, &message.text);
         let body = json!({"text": text, "delivery": "queue"});
-        let answer = self.api("POST", &format!("/api/session/{session}/prompt"), Some(body))?;
+        let answer = self.api(
+            "POST",
+            &format!("/api/session/{session}/prompt"),
+            Some(body),
+        )?;
         if answer.get("data").is_none() {
             return Err(HarnessError::Failed(format!(
                 "prompt was not taken: {answer}"
@@ -564,7 +582,11 @@ impl Harness for OpenCodeHarness {
         let Some(session) = self.lock().session.clone() else {
             return Ok(());
         };
-        let _ = self.api("POST", &format!("/api/session/{session}/interrupt"), Some(json!({})));
+        let _ = self.api(
+            "POST",
+            &format!("/api/session/{session}/interrupt"),
+            Some(json!({})),
+        );
         Ok(())
     }
 
@@ -683,7 +705,11 @@ impl Harness for OpenCodeHarness {
             "text": marked_message(&message.id, &message.text),
             "delivery": "steer"
         });
-        match self.api("POST", &format!("/api/session/{session}/prompt"), Some(body)) {
+        match self.api(
+            "POST",
+            &format!("/api/session/{session}/prompt"),
+            Some(body),
+        ) {
             Ok(answer) => {
                 if answer.get("data").is_some() {
                     self.lock().written.push(message.id.clone());
@@ -803,7 +829,12 @@ fn answer_of(messages: &[Value], id: &str) -> Option<String> {
 /// An assistant message's text parts, joined. Reasoning parts are skipped.
 fn text_of(message: &Value) -> String {
     let mut text = String::new();
-    for part in message.get("content").and_then(Value::as_array).into_iter().flatten() {
+    for part in message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
         if part.get("type").and_then(Value::as_str) != Some("text") {
             continue;
         }

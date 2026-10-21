@@ -61,7 +61,8 @@ fn api(args: &[String]) {
     log(&format!("api:{method} {path} {body}"));
 
     let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_else(|_| "finish".into());
-    let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_else(|_| env::temp_dir().display().to_string());
+    let dir =
+        env::var("ANYAGENTS_FAKE_STATE").unwrap_or_else(|_| env::temp_dir().display().to_string());
     let _ = dir;
     match (method, path) {
         ("GET", "/api/session") => {
@@ -76,7 +77,11 @@ fn api(args: &[String]) {
             print!("{{\"data\":{{\"id\":\"ses_fake\",\"title\":\"fake\"}}}}");
         }
         ("POST", "/api/session") => {
-            let id = if mode == "gone" { "ses_fresh" } else { "ses_fake" };
+            let id = if mode == "gone" {
+                "ses_fresh"
+            } else {
+                "ses_fake"
+            };
             print!("{{\"data\":{{\"id\":\"{id}\"}}}}");
         }
         ("POST", p) if p.ends_with("/prompt") => {
@@ -97,7 +102,8 @@ fn api(args: &[String]) {
             // The user message this service last received, as JSON, so the
             // listing can carry its mailbox marker like the real one.
             let state_dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
-            let prompt = std::fs::read_to_string(format!("{state_dir}/last-prompt")).unwrap_or_default();
+            let prompt =
+                std::fs::read_to_string(format!("{state_dir}/last-prompt")).unwrap_or_default();
             let prompt = serde_json::to_string(&prompt).unwrap_or_else(|_| "\"\"".into());
             // A finished turn from earlier in the session, with its own answer
             // and idle. It must not close the turn being waited for.
@@ -136,9 +142,7 @@ fn api(args: &[String]) {
                 return;
             }
             if mode == "failed" {
-                print!(
-                    "{{\"data\":[{{\"type\":\"idle\",\"outcome\":\"failed\"}}]}}"
-                );
+                print!("{{\"data\":[{{\"type\":\"idle\",\"outcome\":\"failed\"}}]}}");
                 return;
             }
             let text = scripted_answer();

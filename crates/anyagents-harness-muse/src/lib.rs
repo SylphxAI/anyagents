@@ -167,9 +167,7 @@ impl MuseHarness {
             json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
             RPC_WAIT,
         )?;
-        self.rpc
-            .notify("initialized", json!({}))
-            .map_err(fail)?;
+        self.rpc.notify("initialized", json!({})).map_err(fail)?;
         let wanted = lock(&self.shared).wanted_session.clone();
         let (method, params) = match &wanted {
             Some(session) => (

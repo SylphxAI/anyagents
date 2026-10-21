@@ -124,7 +124,11 @@ fn create_asker(dir: &Path) {
         .args(["agents", "create", "kind", "--harness", "claude-code"])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn call(socket: &Path, request: &str) -> Value {
@@ -197,7 +201,10 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     // The Muse config carries the tool server, written by create before the
     // server was up. The Antigravity CLI keeps its own config.
     let agy_config = data.join("agents").join(&agy_id).join("config");
-    assert!(agy_config.is_dir(), "the agy agent has its config directory");
+    assert!(
+        agy_config.is_dir(),
+        "the agy agent has its config directory"
+    );
     let muse_config = data
         .join("agents")
         .join(&muse_id)

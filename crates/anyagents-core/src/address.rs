@@ -12,9 +12,15 @@ pub enum Address {
     Agent(String),
     Group(String),
     /// A chat, and the forum topic inside it when the address names one.
-    TelegramChat { chat: String, thread: Option<String> },
+    TelegramChat {
+        chat: String,
+        thread: Option<String>,
+    },
     /// A person, and the message being answered when the address names one.
-    TelegramUser { user: String, message: Option<String> },
+    TelegramUser {
+        user: String,
+        message: Option<String>,
+    },
 }
 
 /// Why an address string was rejected.
@@ -171,7 +177,9 @@ mod tests {
             }
         );
         assert_eq!(
-            Address::parse("telegram:chat:-100123:7").unwrap().canonical(),
+            Address::parse("telegram:chat:-100123:7")
+                .unwrap()
+                .canonical(),
             "telegram:chat:-100123:7"
         );
         assert_eq!(

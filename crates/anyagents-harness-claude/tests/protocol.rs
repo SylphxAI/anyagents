@@ -268,7 +268,12 @@ fn a_line_steered_mid_turn_is_echoed_and_never_written_twice() {
     // The turn is still open after the echo: the agent is working.
     assert!(!harness.is_finished("m1"));
     let steered = harness.deliver(&msg("m2")).unwrap();
-    assert_eq!(steered, DeliverOutcome::Accepted { turn_finished: false });
+    assert_eq!(
+        steered,
+        DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
     assert!(harness.wait_echoed("m2", Duration::from_secs(5)));
     assert_eq!(harness.turns_started(), 1);
     // Running the mailbox again, or a replay after a crash, writes nothing.
@@ -294,11 +299,7 @@ fn a_pushed_line_is_injected_once_and_settled_on_its_echo() {
 
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("steer.jsonl");
-    std::fs::write(
-        &path,
-        "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n",
-    )
-    .unwrap();
+    std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
     let queue = SteerQueue::new(&path, 4);
     let mut harness = start(&dir, "steer", None).with_steer(queue.clone());
     harness.deliver(&msg("m1")).unwrap();

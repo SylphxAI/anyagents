@@ -149,18 +149,13 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         // The agent's own config directory carries the steering hook, so a
         // message reaches the running turn instead of waiting for the next one.
-        let harness = AgyHarness::start(&program, None, &pairs(&env))
-            .map_err(|err| err.to_string())?;
+        let harness =
+            AgyHarness::start(&program, None, &pairs(&env)).map_err(|err| err.to_string())?;
         Ok(VendorHarness::Agy(Box::new(harness)))
     } else if request.agent.harness == "muse" {
         let program = std::env::var("ANYAGENTS_MUSE_BIN").unwrap_or_else(|_| "muse".to_string());
-        let harness = MuseHarness::start_in(
-            &program,
-            None,
-            &pairs(&env),
-            Some(&request.work_dir),
-        )
-        .map_err(|err| err.to_string())?;
+        let harness = MuseHarness::start_in(&program, None, &pairs(&env), Some(&request.work_dir))
+            .map_err(|err| err.to_string())?;
         Ok(VendorHarness::Muse(Box::new(harness)))
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
@@ -173,10 +168,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             "XDG_CONFIG_HOME".to_string(),
             request.config_dir.display().to_string(),
         ));
-        env.push((
-            "XDG_DATA_HOME".to_string(),
-            data_home.display().to_string(),
-        ));
+        env.push(("XDG_DATA_HOME".to_string(), data_home.display().to_string()));
         env.push((
             "XDG_STATE_HOME".to_string(),
             request.config_dir.join("state-home").display().to_string(),

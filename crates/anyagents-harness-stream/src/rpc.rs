@@ -161,12 +161,7 @@ impl RpcChild {
     }
 
     /// Send one request and wait for the answer to that id.
-    pub fn request(
-        &self,
-        method: &str,
-        params: Value,
-        wait: Duration,
-    ) -> Result<Value, RpcFail> {
+    pub fn request(&self, method: &str, params: Value, wait: Duration) -> Result<Value, RpcFail> {
         let id = {
             let mut state = lock(&self.shared);
             if !state.alive {

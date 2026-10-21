@@ -211,11 +211,7 @@ pub fn post_text(
 
 /// Record that `agent` answers in `chat`, and learn the chat's title if the
 /// adapter has one. The state stays the sender's own memory.
-pub fn record_chat(
-    store: &Store,
-    agent: &str,
-    chat_id: i64,
-) -> Result<(), anyagents_core::Error> {
+pub fn record_chat(store: &Store, agent: &str, chat_id: i64) -> Result<(), anyagents_core::Error> {
     for channel in store.list_channels()? {
         let memory = Memory::from_state(&channel.state);
         if memory.chats.iter().any(|link| link.chat_id == chat_id) {
@@ -312,11 +308,7 @@ pub(crate) fn updates_payload(response: &str) -> Result<String, anyagents_core::
     }
 }
 
-fn call_api(
-    token: &str,
-    call: &BotCall,
-    timeout_s: u64,
-) -> Result<String, anyagents_core::Error> {
+fn call_api(token: &str, call: &BotCall, timeout_s: u64) -> Result<String, anyagents_core::Error> {
     let url = format!("{}/bot{token}/{}", api_base(), call.method);
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(timeout_s)))

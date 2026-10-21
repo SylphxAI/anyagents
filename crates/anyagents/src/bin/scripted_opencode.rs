@@ -61,7 +61,8 @@ fn api(args: &[String]) {
     log(&format!("api:{method} {path} {body}"));
 
     let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_else(|_| "finish".into());
-    let dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_else(|_| env::temp_dir().display().to_string());
+    let dir =
+        env::var("ANYAGENTS_FAKE_STATE").unwrap_or_else(|_| env::temp_dir().display().to_string());
     let _ = dir;
     match (method, path) {
         ("GET", "/api/session") => {
@@ -89,9 +90,7 @@ fn api(args: &[String]) {
                 return;
             }
             if mode == "failed" {
-                print!(
-                    "{{\"data\":[{{\"type\":\"idle\",\"outcome\":\"failed\"}}]}}"
-                );
+                print!("{{\"data\":[{{\"type\":\"idle\",\"outcome\":\"failed\"}}]}}");
                 return;
             }
             let text = scripted_answer();

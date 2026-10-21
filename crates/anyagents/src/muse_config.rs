@@ -56,7 +56,7 @@ pub fn point_vendor_home(dir: &Path) -> Result<(), Error> {
     return std::os::windows::fs::symlink_dir(&target, &link)
         .map_err(|err| Error::Message(format!("linking the Muse home: {err}")));
     #[cfg(not(windows))]
-    return Ok(())
+    return Ok(());
 }
 
 /// Write `settings.json` in `dir`, keeping its own agent's settings: the MCP
@@ -113,7 +113,11 @@ mod tests {
             r#"{"schema_version":1,"tui":{"x":true}}"#,
         )
         .unwrap();
-        let args = vec!["--data".to_string(), "/tmp/d".to_string(), "mcp".to_string()];
+        let args = vec![
+            "--data".to_string(),
+            "/tmp/d".to_string(),
+            "mcp".to_string(),
+        ];
         write(
             dir.path(),
             Some("muse-wonder-full-1.0"),

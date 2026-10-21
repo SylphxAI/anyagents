@@ -14,9 +14,6 @@ fn a_child_starts_without_the_listening_socket() {
     anyagents_harness_stream::close_inherited_for_test(&mut command);
     let out = command.output().unwrap();
     let held = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        !held.contains("socket:"),
-        "the child kept a socket: {held}"
-    );
+    assert!(!held.contains("socket:"), "the child kept a socket: {held}");
     assert!(listener.local_addr().is_ok());
 }

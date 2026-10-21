@@ -35,7 +35,11 @@ fn main() {
         match method {
             "initialize" => answer(&mut stdout, &id, r#"{"protocolVersion":1}"#),
             "initialized" | "noop" => {}
-            "session/start" => answer(&mut stdout, &id, r#"{"session":{"sessionId":"sess-from-vendor"}}"#),
+            "session/start" => answer(
+                &mut stdout,
+                &id,
+                r#"{"session":{"sessionId":"sess-from-vendor"}}"#,
+            ),
             "session/resume" => answer(
                 &mut stdout,
                 &id,
@@ -61,7 +65,10 @@ fn main() {
                 // A turn stays open until its approval is answered, even while
                 // its `turn/start` reply is still queued: `open` is the truth.
                 if params.get("ifBusy").is_some() && open.is_some() {
-                    let user = params["input"][0]["text"].as_str().unwrap_or("").to_string();
+                    let user = params["input"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     collected.push(user);
                     let turn = open.take().unwrap_or_default();
                     // The host learns the steer was accepted before the turn
@@ -83,43 +90,65 @@ fn main() {
                 users += 1;
                 let turn = format!("turn-{users}");
                 if mode == "finish" {
-                    let user = params["input"][0]["text"].as_str().unwrap_or("").to_string();
+                    let user = params["input"][0]["text"]
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
                     let text = user
                         .split_once('\n')
                         .map(|(_, text)| text)
                         .unwrap_or("")
                         .to_string();
-                    notify(&mut stdout, &format!(
+                    notify(
+                        &mut stdout,
+                        &format!(
                             r#"{{"jsonrpc":"2.0","method":"turn/started","params":{{"turnId":"{turn}"}}}}"#
-                        ));
-                    notify(&mut stdout, &format!(
+                        ),
+                    );
+                    notify(
+                        &mut stdout,
+                        &format!(
                             r#"{{"jsonrpc":"2.0","method":"turn/completed","params":{{"turnId":"{turn}","status":"completed","usage":{{"inputTokens":11,"outputTokens":7,"cachedInputTokens":3}},"items":[{{"type":"text","text":"pong from muse: {text}"}}]}}}}"#
-                        ));
+                        ),
+                    );
                     answer(
                         &mut stdout,
                         &id,
-                        &format!(r#"{{"status":"accepted","disposition":"started","turnId":"{turn}"}}"#),
+                        &format!(
+                            r#"{{"status":"accepted","disposition":"started","turnId":"{turn}"}}"#
+                        ),
                     );
                     continue;
                 }
                 if mode == "failed" {
-                    notify(&mut stdout, &format!(
+                    notify(
+                        &mut stdout,
+                        &format!(
                             r#"{{"jsonrpc":"2.0","method":"turn/started","params":{{"turnId":"{turn}"}}}}"#
-                        ));
-                    notify(&mut stdout, &format!(
+                        ),
+                    );
+                    notify(
+                        &mut stdout,
+                        &format!(
                             r#"{{"jsonrpc":"2.0","method":"turn/completed","params":{{"turnId":"{turn}","status":"failed","error":{{"message":"provider returned 500"}}}}}}"#
-                        ));
+                        ),
+                    );
                     answer(
                         &mut stdout,
                         &id,
-                        &format!(r#"{{"status":"accepted","disposition":"started","turnId":"{turn}"}}"#),
+                        &format!(
+                            r#"{{"status":"accepted","disposition":"started","turnId":"{turn}"}}"#
+                        ),
                     );
                     continue;
                 }
                 // hold: the turn stays open until the host answers the approval.
-                notify(&mut stdout, &format!(
+                notify(
+                    &mut stdout,
+                    &format!(
                         r#"{{"jsonrpc":"2.0","method":"turn/started","params":{{"turnId":"{turn}"}}}}"#
-                    ));
+                    ),
+                );
                 pending.push_back(serde_json::json!({
                     "jsonrpc": "2.0",
                     "id": id,
@@ -134,7 +163,10 @@ fn main() {
                 open = Some(turn);
                 let _ = steer;
                 // A tool approval exchange inside the open turn.
-                notify(&mut stdout, r#"{"jsonrpc":"2.0","method":"approval/request","id":900,"params":{"approvalId":"a1","toolName":"shell","availableChoices":[{"choiceId":"c1","decision":"approved"}]}}"#);
+                notify(
+                    &mut stdout,
+                    r#"{"jsonrpc":"2.0","method":"approval/request","id":900,"params":{"approvalId":"a1","toolName":"shell","availableChoices":[{"choiceId":"c1","decision":"approved"}]}}"#,
+                );
             }
             _ => {
                 // Our answer to the vendor's approval request: the turn carries
