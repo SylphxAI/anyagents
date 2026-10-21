@@ -128,6 +128,9 @@ pub fn resolve(
     }
     // An address the tool takes, or nothing: a bare number or message id is
     // metadata, and posting it somewhere would be a guess.
+    if !reply_to.contains(':') {
+        return Ok(None);
+    }
     let Ok(address) = Address::parse(reply_to) else {
         return Ok(None);
     };
@@ -149,6 +152,7 @@ pub fn resolve(
 }
 
 /// Where an answer to `message` goes, from the record that stored it.
+#[cfg(test)]
 pub fn destination_of(principal: &Principal, message: &Message) -> Result<Destination, String> {
     destination_through(principal, message, &|_| Ok(None))
 }

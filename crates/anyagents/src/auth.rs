@@ -202,13 +202,13 @@ pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, Aut
 
 /// The agent a route names: a name or an id, resolved in the store.
 fn agent_named(store: &Store, route: &str) -> Result<Principal, AuthError> {
-    if let Ok(id) = AgentId::parse(route.trim()) {
-        if let Ok(agent) = store.agent(&id) {
-            return Ok(Principal::Agent {
-                agent_id: agent.id,
-                name: agent.name,
-            });
-        }
+    if let Ok(id) = AgentId::parse(route.trim())
+        && let Ok(agent) = store.agent(&id)
+    {
+        return Ok(Principal::Agent {
+            agent_id: agent.id,
+            name: agent.name,
+        });
     }
     agent_by_name(store, route)
 }

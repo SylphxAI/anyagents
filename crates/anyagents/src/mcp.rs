@@ -61,12 +61,12 @@ pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
         // differ.
-        if let Ok(named) = std::env::var("ANYAGENTS_AGENT_ID") {
-            if named.trim() != who.id.as_str() {
-                return Err(Error::Message(
-                    "this config directory belongs to another agent".into(),
-                ));
-            }
+        if let Ok(named) = std::env::var("ANYAGENTS_AGENT_ID")
+            && named.trim() != who.id.as_str()
+        {
+            return Err(Error::Message(
+                "this config directory belongs to another agent".into(),
+            ));
         }
         let service = AgentMcp { agent: who, client }
             .serve(rmcp::transport::io::stdio())

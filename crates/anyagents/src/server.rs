@@ -77,10 +77,10 @@ pub(crate) struct AppState {
 /// it reads share the same key.
 fn capability_key() -> Result<String, Error> {
     use std::io::Read as _;
-    if let Ok(named) = std::env::var("ANYAGENTS_CAPABILITY_KEY") {
-        if named.len() >= 32 {
-            return Ok(named);
-        }
+    if let Ok(named) = std::env::var("ANYAGENTS_CAPABILITY_KEY")
+        && named.len() >= 32
+    {
+        return Ok(named);
     }
     let mut bytes = [0u8; 32];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
@@ -692,16 +692,12 @@ fn plan_send(
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
     let mut plan = SendPlan::parse(store, body)?;
-    let reply = match crate::reply::resolve(
+    let reply = crate::reply::resolve(
         principal,
         |id| own_message(store, principal, id),
         body.reply_to.as_deref(),
     )
-    .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?
-    {
-        Some(destination) => Some(destination),
-        None => None,
-    };
+    .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
     if let Some(destination) = reply {
         // A reply names where it goes, and the record decides that: the
         // addresses are only checked against it when the caller wrote some.
@@ -1095,7 +1091,7 @@ fn prepare_telegram(
 }
 
 /// The bot a send posts through: always the authenticated actor's own.
-fn telegram_sender<'a>(actor: &'a Actor) -> Result<&'a str, ApiError> {
+fn telegram_sender(actor: &Actor) -> Result<&str, ApiError> {
     match actor {
         Actor::Agent(name) => Ok(name),
         Actor::Operator(_) => Err(ApiError::forbidden(
