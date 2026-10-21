@@ -95,10 +95,9 @@ pub fn operator_digest(token: &str) -> String {
 }
 
 fn same_dir(left: &Path, right: &Path) -> bool {
-    matches!(
-        (std::path::absolute(left).ok(), std::path::absolute(right).ok()),
-        (Some(a), Some(b)) if a == b
-    )
+    let left = std::fs::canonicalize(left).or_else(|_| std::path::absolute(left));
+    let right = std::fs::canonicalize(right).or_else(|_| std::path::absolute(right));
+    matches!((left.ok(), right.ok()), (Some(a), Some(b)) if a == b)
 }
 
 impl Mode {

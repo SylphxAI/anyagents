@@ -290,6 +290,12 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
 }
 
 fn post(socket: &Path, request: &Value) -> Value {
+    let agent_header = request
+        .get("sender")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.strip_prefix("agent:"))
+        .map(|name| format!("x-anyagents-agent-id: {name}\r\n"))
+        .unwrap_or_default();
     let request = request.to_string();
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
     stream
@@ -298,7 +304,7 @@ fn post(socket: &Path, request: &Value) -> Value {
     stream
         .write_all(
             format!(
-                "POST /v1/send HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}",
+                "POST /v1/send HTTP/1.1\r\nHost: local\r\n{agent_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}",
                 request.len()
             )
             .as_bytes(),

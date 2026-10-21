@@ -52,7 +52,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
 /// `agents create`. The server owns it when it is there, so one process makes
 /// the agent, mints its capability and starts it.
 fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
-    if server::socket_path(data).exists() {
+    if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
         let answered = client::call::<AgentView>(
             data,
             "POST",
