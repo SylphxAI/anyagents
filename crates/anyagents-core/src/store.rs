@@ -37,6 +37,9 @@ pub struct Agent {
     pub instructions: Option<String>,
     pub state: String,
     pub created_at_ms: i64,
+    /// The gateway origin and this agent's own gateway token, set at create.
+    /// Never a provider key.
+    pub launch_env: Vec<(String, String)>,
 }
 
 /// Fields for `agents.create`. The harness value is a catalog key.
@@ -72,6 +75,9 @@ pub struct Channel {
     /// Adapter settings, as JSON. Never a secret.
     pub config: String,
     pub credential_ref: Option<String>,
+    /// Adapter memory, as JSON: a poll offset, the chats an agent answers in.
+    /// Never a secret.
+    pub state: String,
     pub created_at_ms: i64,
     /// Agents attached to this channel, in attach order.
     pub agents: Vec<AgentId>,
@@ -381,6 +387,7 @@ impl Store {
             instructions: new.instructions,
             state: "created".into(),
             created_at_ms: now_ms(),
+            launch_env: Vec::new(),
         };
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -422,7 +429,7 @@ impl Store {
         let conn = self.conn();
         let found = conn
             .query_row(
-                "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+                "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
                  FROM agents WHERE name = ?1",
                 [name],
                 agent_from_row,
@@ -434,7 +441,7 @@ impl Store {
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
              FROM agents ORDER BY name",
         )?;
         let mut rows = stmt.query([])?;
@@ -443,6 +450,88 @@ impl Store {
             agents.push(agent_from_row(row)?);
         }
         Ok(agents)
+    }
+
+    /// Append one message to every agent in a room: all of them except the
+    /// sender, because a room message is not echoed back to its author.
+    ///
+    /// Each agent gets its own row with its own sequence, so a room message is
+    /// one message per mailbox and every guarantee stays per mailbox. A
+    /// `source_key` is namespaced per agent, so replaying the same room line is
+    /// idempotent per recipient.
+    ///
+    /// A room named as a Telegram chat (`<chat id>` or `telegram:chat:<id>`)
+    /// reaches only the agents whose own bot is attached to that chat, so one
+    /// chat's posts never arrive in another chat's mailboxes. Membership comes
+    /// from the channel state each bot saved, never from a hand-kept list.
+    pub fn receive_room(
+        &self,
+        room: &str,
+        incoming: Incoming,
+    ) -> Result<Vec<(Agent, ReceiveOutcome)>, Error> {
+        let sender = incoming.sender.clone();
+        // A sender may name itself `alpha` or `agent:alpha`; both are the author.
+        let author = sender
+            .as_deref()
+            .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+        let members = self.room_members(room)?;
+        let mut delivered = Vec::new();
+        for agent in self.list_agents()? {
+            if author.as_deref() == Some(agent.name.as_str()) {
+                continue;
+            }
+            if let Some(members) = &members
+                && !members.iter().any(|name| name == &agent.name)
+            {
+                continue;
+            }
+            let one = Incoming {
+                text: incoming.text.clone(),
+                sender: sender.clone(),
+                source_time_ms: incoming.source_time_ms,
+                source_key: incoming
+                    .source_key
+                    .as_ref()
+                    .map(|key| format!("room:{room}:{key}")),
+                reply_to: incoming.reply_to.clone(),
+                received_at_ms: incoming.received_at_ms,
+            };
+            let outcome = self.receive(&agent.id, one)?;
+            delivered.push((agent, outcome));
+        }
+        Ok(delivered)
+    }
+
+    /// Who a room reaches, when the room names a chat. `None` is a room that is
+    /// not a chat: every agent, as a group by name always was.
+    pub fn room_members(&self, room: &str) -> Result<Option<Vec<String>>, Error> {
+        // `telegram:chat:<id>[:<thread>]`, `chat:<id>`, or a bare chat id.
+        let named = room
+            .strip_prefix("telegram:chat:")
+            .or_else(|| room.strip_prefix("chat:"))
+            .unwrap_or(room);
+        // A forum topic follows the chat id; the chat is the same either way.
+        let Ok(chat_id) = named.split(':').next().unwrap_or(named).parse::<i64>() else {
+            return Ok(None);
+        };
+        let mut members = Vec::new();
+        for channel in self.list_channels()? {
+            for agent_id in &channel.agents {
+                // The bot's own saved links say which chats it answers in.
+                let linked = telegram_chat_links(&channel.state)
+                    .iter()
+                    .any(|(_, linked)| *linked == chat_id);
+                if !linked {
+                    continue;
+                }
+                if let Ok(agent) = self.agent(agent_id)
+                    && !members.contains(&agent.name)
+                {
+                    members.push(agent.name);
+                }
+            }
+        }
+        Ok(Some(members))
     }
 
     pub fn create_channel(&self, new: NewChannel) -> Result<Channel, Error> {
@@ -459,18 +548,20 @@ impl Store {
                 new.config
             },
             credential_ref: new.credential_ref,
+            state: "{}".to_string(),
             created_at_ms: now_ms(),
             agents: Vec::new(),
         };
         self.conn().execute(
-            "INSERT INTO channels (id, kind, identity, config, credential_ref, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO channels (id, kind, identity, config, credential_ref, state, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 channel.id.as_str(),
                 channel.kind,
                 channel.identity,
                 channel.config,
                 channel.credential_ref,
+                channel.state,
                 channel.created_at_ms,
             ],
         )?;
@@ -481,7 +572,7 @@ impl Store {
     pub fn list_channels(&self) -> Result<Vec<Channel>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
-            "SELECT id, kind, identity, config, credential_ref, created_at_ms FROM channels
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels
              ORDER BY created_at_ms",
         )?;
         let mut rows = stmt.query([])?;
@@ -506,6 +597,20 @@ impl Store {
         let changed = self.conn().execute(
             "UPDATE channels SET credential_ref = ?2 WHERE id = ?1",
             params![channel_id.as_str(), credential_ref],
+        )?;
+        if changed == 0 {
+            return Err(Error::ChannelNotFound(channel_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Replace a channel's adapter memory.
+    pub fn set_channel_state(&self, channel_id: &ChannelId, state: &str) -> Result<(), Error> {
+        serde_json::from_str::<serde_json::Value>(state)
+            .map_err(|_| Error::Message("channel state is not json".into()))?;
+        let changed = self.conn().execute(
+            "UPDATE channels SET state = ?2 WHERE id = ?1",
+            params![channel_id.as_str(), state],
         )?;
         if changed == 0 {
             return Err(Error::ChannelNotFound(channel_id.to_string()));
@@ -574,6 +679,44 @@ impl Store {
             agent_id: agent_id.clone(),
         });
         Ok(ReceiveOutcome::New(message))
+    }
+
+    /// Store the environment the agent's harness is started with, and wake it
+    /// so the next start reads it. Never called with a provider key.
+    pub fn set_agent_launch_env(
+        &self,
+        id: &AgentId,
+        env: &[(String, String)],
+    ) -> Result<Agent, Error> {
+        let json = encode_env(env);
+        let changed = {
+            let conn = self.conn();
+            // A database written before this column existed still reads: the
+            // harness then keeps whatever sign-in it already has.
+            let updated = conn
+                .execute(
+                    "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+                    params![json, id.as_str()],
+                )
+                .map_err(|err| match err {
+                    rusqlite::Error::SqliteFailure(_, Some(ref text))
+                        if text.contains("no column named launch_env") =>
+                    {
+                        Error::Message(
+                            "this database has no launch environment column yet".to_string(),
+                        )
+                    }
+                    other => other.into(),
+                })?;
+            if updated == 0 {
+                return Err(Error::AgentNotFound(id.to_string()));
+            }
+            agent_by_id(&conn, id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(changed)
     }
 
     /// Store the work directory and mark the agent running.
@@ -1043,7 +1186,7 @@ fn validate_token(value: &str, what: &str) -> Result<(), Error> {
 fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
     let found = conn
         .query_row(
-            "SELECT id, kind, identity, config, credential_ref, created_at_ms FROM channels WHERE id = ?1",
+            "SELECT id, kind, identity, config, credential_ref, created_at_ms, state FROM channels WHERE id = ?1",
             [id.as_str()],
             channel_from_row,
         )
@@ -1054,13 +1197,139 @@ fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
 fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
     let found = conn
         .query_row(
-            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms
+            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
              FROM agents WHERE id = ?1",
             [id.as_str()],
             agent_from_row,
         )
         .optional()?;
     found.ok_or_else(|| Error::AgentNotFound(id.to_string()))
+}
+
+/// A launch environment is a list of name and value pairs, stored as JSON so a
+/// value with an `=` or a space survives. Values are never keys.
+/// The (agent, chat) links a Telegram bot saved in its channel state, read
+/// from the `chats` array without depending on the channel crate. Anything
+/// unreadable is no link, so a corrupt state closes a room rather than opening
+/// it to every agent.
+fn telegram_chat_links(state: &str) -> Vec<(String, i64)> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(state) else {
+        return Vec::new();
+    };
+    value
+        .get("chats")
+        .and_then(serde_json::Value::as_array)
+        .map(|links| {
+            links
+                .iter()
+                .filter_map(|link| {
+                    let agent = link.get("agent")?.as_str()?.to_string();
+                    let chat = link.get("chat_id")?.as_i64()?;
+                    Some((agent, chat))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn encode_env(env: &[(String, String)]) -> String {
+    // A flat list of names and values. `decode_env` reads exactly this shape,
+    // so the two are tested against each other.
+    let mut out = String::from("[");
+    for (index, (name, value)) in env.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&quote(name));
+        out.push(',');
+        out.push_str(&quote(value));
+    }
+    out.push(']');
+    out
+}
+
+fn quote(text: &str) -> String {
+    let mut out = String::from("\"");
+    for character in text.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            control if control < ' ' => out.push_str(&format!("\\u{:04x}", u32::from(control))),
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Read what [`encode_env`] wrote: a flat JSON array of quoted names and values,
+/// e.g. `["K","v","K2","v2"]`. Anything unreadable reads as no environment.
+fn decode_env(text: &str) -> Vec<(String, String)> {
+    let bytes = text.as_bytes();
+    let Some(open) = text.find('[') else {
+        return Vec::new();
+    };
+    let mut at = open + 1;
+    let mut env = Vec::new();
+    loop {
+        let Some((name, next)) = read_string(bytes, at) else {
+            return env;
+        };
+        let Some(comma) = text[next..].find(',') else {
+            return env;
+        };
+        let Some((value, end)) = read_string(bytes, next + comma + 1) else {
+            return env;
+        };
+        env.push((name, value));
+        // Skip the comma before the next name, if there is one.
+        let rest = &text[end..];
+        let Some(comma) = rest.find(',') else {
+            return env;
+        };
+        let after = end + comma + 1;
+        if !rest[comma + 1..].trim_start().starts_with('"') {
+            return env;
+        }
+        at = after + (rest[comma + 1..].len() - rest[comma + 1..].trim_start().len());
+    }
+}
+
+/// One JSON string starting at `at`, and where the closing quote is.
+fn read_string(bytes: &[u8], at: usize) -> Option<(String, usize)> {
+    if bytes.get(at) != Some(&b'"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut index = at + 1;
+    while let Some(&byte) = bytes.get(index) {
+        match byte {
+            b'"' => return Some((out, index + 1)),
+            b'\\' => {
+                match bytes.get(index + 1)? {
+                    b'n' => out.push('\n'),
+                    b't' => out.push('\t'),
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'u' => {
+                        let hex = std::str::from_utf8(bytes.get(index + 2..index + 6)?).ok()?;
+                        let code = u32::from_str_radix(hex, 16).ok()?;
+                        out.push(char::from_u32(code)?);
+                        index += 4;
+                    }
+                    other => out.push(char::from(*other)),
+                }
+                index += 2;
+            }
+            _ => {
+                let rest = std::str::from_utf8(&bytes[index..]).ok()?;
+                let ch = rest.chars().next()?;
+                out.push(ch);
+                index += ch.len_utf8();
+            }
+        }
+    }
+    None
 }
 
 fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
@@ -1076,6 +1345,10 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         instructions: row.get(5)?,
         state: row.get(6)?,
         created_at_ms: row.get(7)?,
+        launch_env: row
+            .get::<_, Option<String>>(8)?
+            .map(|json| decode_env(&json))
+            .unwrap_or_default(),
     })
 }
 
@@ -1089,6 +1362,7 @@ fn channel_from_row(row: &rusqlite::Row<'_>) -> Result<Channel, rusqlite::Error>
         config: row.get(3)?,
         credential_ref: row.get(4)?,
         created_at_ms: row.get(5)?,
+        state: row.get(6)?,
         agents: Vec::new(),
     })
 }
@@ -1275,6 +1549,100 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_room_reaches_only_the_agents_whose_bot_is_on_that_chat() {
+        let (_dir, store) = setup();
+        let alice = agent(&store, "alice");
+        let bob = agent(&store, "bob");
+        let carol = agent(&store, "carol");
+        // Two bots on chat A, one bot on chat B.
+        for (name, chat) in [(&alice, -1001_i64), (&bob, -1001), (&carol, -2002)] {
+            let channel = store
+                .create_channel(NewChannel {
+                    kind: "telegram".to_string(),
+                    identity: None,
+                    config: "{}".to_string(),
+                    credential_ref: None,
+                })
+                .unwrap();
+            store.attach_channel(&channel.id, &name.id).unwrap();
+            store
+                .set_channel_state(
+                    &channel.id,
+                    &format!(
+                        "{{\"chats\":[{{\"agent\":\"{}\",\"chat_id\":{chat}}}]}}",
+                        name.name
+                    ),
+                )
+                .unwrap();
+        }
+
+        let one = |text: &str, from: &str| Incoming {
+            text: text.to_string(),
+            sender: Some(from.to_string()),
+            source_time_ms: None,
+            source_key: None,
+            reply_to: None,
+            received_at_ms: None,
+        };
+
+        // A post in chat A reaches the other bot on chat A, and no one on B.
+        let delivered = store
+            .receive_room(&(-1001_i64).to_string(), one("in A", "agent:alice"))
+            .unwrap();
+        let names: Vec<&str> = delivered
+            .iter()
+            .map(|(agent, _)| agent.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["bob"], "{names:?}");
+        assert!(
+            !store
+                .inbox(&carol.id, None)
+                .unwrap()
+                .iter()
+                .any(|m| m.text == "in A")
+        );
+
+        // A post in chat B reaches only its own bot.
+        let delivered = store
+            .receive_room("telegram:chat:-2002", one("in B", "agent:carol"))
+            .unwrap();
+        assert!(delivered.is_empty(), "{delivered:?}");
+
+        // A room that is not a chat keeps its old meaning: every other agent.
+        let delivered = store
+            .receive_room("crew", one("everyone", "agent:alice"))
+            .unwrap();
+        let names: Vec<&str> = delivered
+            .iter()
+            .map(|(agent, _)| agent.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["bob", "carol"], "{names:?}");
+    }
+
+    #[test]
+    fn a_launch_environment_survives_a_round_trip() {
+        let env = vec![
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                "http://127.0.0.1:41727".to_string(),
+            ),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), "abc123".to_string()),
+            ("ANTHROPIC_MODEL".to_string(), "claude-sonnet".to_string()),
+        ];
+        assert_eq!(decode_env(&encode_env(&env)), env);
+
+        // And through the store, read back as an agent would see it.
+        let (_dir, store) = setup();
+        let alpha = agent(&store, "alpha");
+        store.set_agent_launch_env(&alpha.id, &env).unwrap();
+        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, env);
+
+        // A value with a quote, a backslash and a newline keeps its characters.
+        let awkward = vec![("K".to_string(), "a\"b\\c\nd".to_string())];
+        assert_eq!(decode_env(&encode_env(&awkward)), awkward);
+    }
+
+    #[test]
     fn opens_in_wal_and_migrates_once() {
         let (dir, store) = setup();
         let mode: String = store
@@ -1282,10 +1650,15 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+        // The newest migration's number, bumped whenever one is added.
+        let newest = migrate::MIGRATIONS
+            .last()
+            .map(|(version, _)| *version)
+            .unwrap();
         let version = migrate::current_version(&store.conn()).unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, newest);
         let again = Store::open(dir.path().join("state.db")).unwrap();
-        assert_eq!(migrate::current_version(&again.conn()).unwrap(), 3);
+        assert_eq!(migrate::current_version(&again.conn()).unwrap(), newest);
         assert_eq!(again.list_agents().unwrap(), store.list_agents().unwrap());
     }
 

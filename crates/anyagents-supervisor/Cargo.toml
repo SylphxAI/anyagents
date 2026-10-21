@@ -10,12 +10,17 @@ description = "Keeps one harness process running for each agent"
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }
 anyagents-harness = { path = "../anyagents-harness" }
+# `scripted_claude` below is a bin, and a bin links the crate's normal dependencies.
+anyagents-harness-claude = { path = "../anyagents-harness-claude" }
+serde_json = "1"
+
 
 [dev-dependencies]
 anyagents-agent = { path = "../anyagents-agent" }
 anyagents-core = { path = "../anyagents-core" }
 anyagents-harness = { path = "../anyagents-harness" }
 anyagents-harness-claude = { path = "../anyagents-harness-claude" }
+serde_json = "1"
 tempfile = "3"
 
 [[bin]]

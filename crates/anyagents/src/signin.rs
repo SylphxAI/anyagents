@@ -33,6 +33,8 @@ pub fn install_hint(harness: &str) -> Option<String> {
             InstallMethod::Npm { package } => format!("npm install -g {package}"),
             InstallMethod::VendorScript { url } => format!("curl -fsSL {url} | sh"),
             InstallMethod::ReleaseBinary { url, .. } => url,
+            // A tab separates the printed columns; keep the hint one word.
+            InstallMethod::Vendored => "machine-copy".to_string(),
         })
 }
 

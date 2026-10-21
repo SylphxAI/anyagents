@@ -12,10 +12,12 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-const MIGRATIONS: &[(i64, &str)] = &[
+pub const MIGRATIONS: &[(i64, &str)] = &[
     (1, include_str!("../migrations/001_init.sql")),
     (2, include_str!("../migrations/002_channel_credential.sql")),
     (3, include_str!("../migrations/003_failed_turns.sql")),
+    (4, include_str!("../migrations/004_channel_state.sql")),
+    (5, include_str!("../migrations/005_launch_env.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.

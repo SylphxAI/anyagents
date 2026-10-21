@@ -13,6 +13,28 @@ fn bin() -> Command {
     Command::new(env!("CARGO_BIN_EXE_anyagents"))
 }
 
+/// A `PATH` where creating an agent installs nothing: `npm` answers a version
+/// and a no-op install, and `claude` is this binary.
+fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let launcher = bin.join("claude");
+    if !launcher.exists() {
+        std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_anyagents"), &launcher).unwrap();
+    }
+    let npm = bin.join("npm");
+    if !npm.exists() {
+        std::fs::write(
+            &npm,
+            "#!/bin/sh\ncase \"$1\" in view) echo 0.0.0 ;; esac\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    std::env::join_paths([bin]).unwrap()
+}
+
 #[derive(Deserialize)]
 struct AgentsResponse {
     agents: Vec<AgentView>,
@@ -157,6 +179,7 @@ async fn mcp_tools_use_the_server_socket() {
     );
     for name in ["alpha", "beta"] {
         let created = bin()
+            .env("PATH", machine_path(dir.path()))
             .arg("--data")
             .arg(dir.path())
             .args(["agents", "create", name])
@@ -189,7 +212,7 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(alpha_row.harness, "claude-code");
     assert_eq!(alpha_row.state, "running");
     assert_eq!(alpha_row.delivery_mode, "followup");
-    assert_eq!(alpha_row.steer_support, "unproven");
+    assert_eq!(alpha_row.steer_support, "yes");
     assert!(alpha_row.process == "alive" || alpha_row.process == "down");
 
     let listed_cli = bin()
@@ -202,7 +225,7 @@ async fn mcp_tools_use_the_server_socket() {
     let text = String::from_utf8(listed_cli.stdout).unwrap();
     assert!(text.contains("running"), "{text}");
     assert!(text.contains("followup"), "{text}");
-    assert!(text.contains("unproven"), "{text}");
+    assert!(text.contains("yes"), "{text}");
 
     let sent: SendResponse = ok_json(
         call(
@@ -233,17 +256,38 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(got.messages.len(), 2);
     assert_eq!(got.messages[0].text, "hello");
     assert_eq!(got.messages[0].sender.as_deref(), Some("agent:alpha"));
-    assert_eq!(got.messages[0].ack, "received");
+    // The mailbox holds it as soon as it is received. Whether a turn has taken
+    // it depends on the vendor process, which this test does not run.
+    assert!(
+        matches!(
+            got.messages[0].ack.as_str(),
+            "received" | "accepted" | "processed"
+        ),
+        "{}",
+        got.messages[0].ack
+    );
 
-    let rejected = call(
-        &alpha,
-        "send",
-        serde_json::json!({"to": ["beta", "group:crew"], "text": "nope"}),
-    )
-    .await;
-    assert!(error_text(&rejected).contains("not implemented yet"));
-    let still: InboxResponse = ok_json(call(&beta, "inbox", serde_json::json!({"since": 0})).await);
-    assert_eq!(still.messages.len(), 2);
+    // A room reaches every other agent, and not the sender.
+    let room: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["group:crew"], "text": "room line"}),
+        )
+        .await,
+    );
+    let to: Vec<&str> = room.deliveries.iter().map(|one| one.to.as_str()).collect();
+    assert!(to.contains(&"agent:beta"), "{to:?}");
+    assert!(!to.contains(&"agent:alpha"), "{to:?}");
+    let in_room: InboxResponse =
+        ok_json(call(&beta, "inbox", serde_json::json!({"since": 0})).await);
+    assert!(
+        in_room.messages.iter().any(|line| line.text == "room line"),
+        "{:?}",
+        in_room.messages.len()
+    );
+    let own: InboxResponse = ok_json(call(&alpha, "inbox", serde_json::json!({"since": 0})).await);
+    assert!(!own.messages.iter().any(|line| line.text == "room line"));
 
     let missing = call(
         &alpha,
@@ -252,9 +296,11 @@ async fn mcp_tools_use_the_server_socket() {
     )
     .await;
     assert!(error_text(&missing).contains("agent not found"));
+    // beta holds the two addressed lines and the room line; `since` 1 leaves the
+    // later two. A failed send to a missing agent wrote nothing.
     let since: InboxResponse = ok_json(call(&beta, "inbox", serde_json::json!({"since": 1})).await);
-    assert_eq!(since.messages.len(), 1);
-    assert_eq!(since.messages[0].seq, 2);
+    assert_eq!(since.messages.len(), 2);
+    assert_eq!(since.messages[1].seq, 3);
 
     let empty = call(
         &alpha,
@@ -279,6 +325,8 @@ async fn mcp_tools_use_the_server_socket() {
         "{}",
         String::from_utf8_lossy(&inbox.stderr)
     );
+    // Two addressed lines and the room line, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 2, "{listed}");
+    assert_eq!(listed.lines().count(), 3, "{listed}");
+    assert!(listed.contains("room line"), "{listed}");
 }

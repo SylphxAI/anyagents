@@ -8,6 +8,10 @@
 //! (`anyagents-message:<id>`); an id already written, or echoed back, is not
 //! written again.
 
+mod rpc;
+
+pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
+
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -735,3 +739,32 @@ pub fn cancel_line(spec: &StreamSpec) -> Value {
 
 #[cfg(test)]
 mod tests;
+
+/// Close every descriptor above stderr in the child just before it starts, so a
+/// vendor never inherits the server's open files.
+#[cfg(target_os = "linux")]
+fn close_inherited_files(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // `pre_exec` answers the command it was given: the call must land on it, so
+    // the closure runs in the child just before `exec`. One `close_range` call
+    // closes every descriptor above stderr; nothing else is touched.
+    let linked = unsafe {
+        command.pre_exec(|| {
+            let closed = libc::close_range(3, u32::MAX, 0);
+            if closed != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+    };
+    let _ = linked;
+}
+
+#[cfg(not(target_os = "linux"))]
+fn close_inherited_files(_command: &mut Command) {}
+
+/// The same rule, for a test that starts something else.
+#[cfg(target_os = "linux")]
+pub fn close_inherited_for_test(command: &mut Command) {
+    close_inherited_files(command)
+}

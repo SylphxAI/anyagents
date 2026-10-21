@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use anyagents_core::{Agent, Error, NewAgent, Store, agent_config_dir, agent_work_dir};
 
-use crate::{mcp_config, opencode_config};
+use crate::{install, mcp_config, muse_config, opencode_config};
 
 pub struct CreateRequest {
     pub name: String,
@@ -17,20 +17,21 @@ pub struct CreateRequest {
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
-    if !matches!(
-        request.harness.as_str(),
-        "claude-code" | "codex" | "opencode"
-    ) {
-        return Err(Error::Message(format!(
-            "unknown harness: {}",
-            request.harness
-        )));
-    }
+    // A harness is installed only if an adapter can start it.
+    install::adapter(&request.harness)?;
     let mut new = NewAgent::new(request.name, request.harness);
     new.model = request.model;
     new.instructions = request.instructions;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
+    // Nothing is installed until an agent needs it: this is that moment. A
+    // failure is the reason the agent's first turn cannot start, reported here
+    // and never retried in a loop.
+    install::record(&data, &agent.harness).map_err(Error::Message)?;
+    // The gateway origin and this agent's own token, kept so a restart starts
+    // the same agent the same way.
+    let pairs = crate::gateway::agent_env(&data, &agent.id);
+    store.set_agent_launch_env(&agent.id, &pairs)?;
     let managed = agent_work_dir(&data, &agent.id);
     std::fs::create_dir_all(&managed)?;
     let config = agent_config_dir(&data, &agent.id);
@@ -54,8 +55,16 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         mcp_config::write_codex(&config.join("config.toml"), &command, &args)?;
     } else if agent.harness == "opencode" {
         opencode_config::write(&config, agent.model.as_deref(), &command, &args)?;
+    } else if agent.harness == "agy" {
+        // The Antigravity CLI writes its own config here; the MCP server needs
+        // the CLI's own `mcp add` consent flow, so the agent starts without it.
+    } else if agent.harness == "muse" {
+        muse_config::write(&config, agent.model.as_deref(), &command, &args)?;
+        muse_config::point_vendor_home(&config)?;
     } else {
         mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
     }
-    store.set_agent_running(&agent.id, &cwd.display().to_string())
+    let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
+    store.set_agent_launch_env(&agent.id, &pairs)?;
+    Ok(running)
 }

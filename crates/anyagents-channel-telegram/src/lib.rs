@@ -1,21 +1,39 @@
 //! One Telegram bot per agent, reached by long-polling `getUpdates`.
 //!
-//! A bot does not reliably receive messages that other bots send, so a post an
+//! An inbound update becomes one mailbox message with the chat it came from,
+//! the Telegram message id to reply to, and the forum topic it belongs to. A
+//! bot does not reliably receive messages that other bots send, so a post an
 //! agent makes is also handed to every other agent on the same chat by the
-//! server. If Telegram later delivers that same post, the copy is dropped by
-//! its outbound message id. The sender does not receive its own post.
+//! server, keyed by its outbound message id. If Telegram later delivers that
+//! same post, the copy is dropped by its source key. The sender does not
+//! receive its own post.
 //!
-//! The token never leaves the caller. This crate only sees update payloads.
+//! The token never leaves the caller. This crate only sees update payloads and
+//! the calls the server should make.
 
 use serde::{Deserialize, Serialize};
+
+/// The Bot API. A webhook is an option for a server with a public URL; a
+/// server on a private network only long-polls, so that is the one transport
+/// here.
+pub const API: &str = "https://api.telegram.org";
 
 /// One inbound event, already parsed out of an update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inbound {
     /// `bot id : update id`. The same update delivered twice is one event.
     pub source_key: String,
+    /// The chat the message belongs to: a private chat, a group, or a forum
+    /// supergroup (a forum topic is not a chat of its own).
     pub chat_id: i64,
+    /// The `message_thread_id` of a forum topic. `None` outside a topic.
+    pub thread_id: Option<i64>,
+    /// The Telegram message id, which a reply names.
     pub message_id: i64,
+    /// The person who wrote it, as Telegram names them.
+    pub sender_name: Option<String>,
+    /// The id of the person who wrote it, when Telegram sends one.
+    pub sender_id: Option<i64>,
     pub text: String,
     /// Telegram's `date`, seconds. Metadata only; it never orders delivery.
     pub source_time_s: i64,
@@ -47,12 +65,122 @@ struct TgMessage {
     message_id: i64,
     chat: TgChat,
     date: i64,
+    #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    caption: Option<String>,
+    #[serde(default)]
+    message_thread_id: Option<i64>,
+    #[serde(default)]
+    from: Option<TgUser>,
+}
+
+impl TgMessage {
+    /// The text of a typed message, else the caption of a media message.
+    fn body(&self) -> Option<&str> {
+        self.text
+            .as_deref()
+            .or(self.caption.as_deref())
+            .filter(|text| !text.is_empty())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct TgChat {
     id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgUser {
+    id: i64,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+}
+
+impl TgUser {
+    fn display_name(&self) -> String {
+        match (&self.first_name, &self.username) {
+            (Some(name), Some(username)) => format!("{name} (@{username})"),
+            (Some(name), None) => name.clone(),
+            (None, Some(username)) => format!("@{username}"),
+            (None, None) => self.id.to_string(),
+        }
+    }
+}
+
+/// What one bot remembers between runs, stored as the channel's `state` JSON.
+/// It holds no secret: the bot is named by its id and user name, never by token.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Memory {
+    /// The next update id to ask for. Only moves once the updates it covers
+    /// are in the mailbox.
+    #[serde(default)]
+    pub offset: i64,
+    /// The bot `getMe` last confirmed, as `id:username`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot: Option<String>,
+    /// The Telegram chats each agent answers in, and each chat's title.
+    #[serde(default)]
+    pub chats: Vec<ChatLink>,
+}
+
+/// One chat an agent answers in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatLink {
+    pub agent: String,
+    pub chat_id: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+}
+
+impl Memory {
+    /// Read a channel `state` value. A missing or unreadable state starts empty.
+    pub fn from_state(state: &str) -> Self {
+        serde_json::from_str(state).unwrap_or_default()
+    }
+
+    pub fn to_state(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// Record that `agent` answers in `chat`, keeping a title already learned.
+    pub fn attach(&mut self, agent: &str, chat_id: i64) {
+        if !self
+            .chats
+            .iter()
+            .any(|link| link.agent == agent && link.chat_id == chat_id)
+        {
+            self.chats.push(ChatLink {
+                agent: agent.to_string(),
+                chat_id,
+                title: None,
+            });
+        }
+    }
+
+    /// The title of `chat`, when this bot has learned it.
+    pub fn title_of(&self, chat_id: i64) -> Option<&str> {
+        self.chats
+            .iter()
+            .find(|link| link.chat_id == chat_id)?
+            .title
+            .as_deref()
+    }
+
+    /// The other agents on `chat`, which see a post `sender` made there.
+    pub fn peers(&self, chat_id: i64, sender: &str) -> Vec<&str> {
+        let mut peers: Vec<&str> = self
+            .chats
+            .iter()
+            .filter(|link| link.chat_id == chat_id && link.agent != sender)
+            .map(|link| link.agent.as_str())
+            .collect();
+        peers.sort_unstable();
+        peers.dedup();
+        peers
+    }
 }
 
 /// A post this server sent through a bot, remembered so the echo can be dropped.
@@ -74,6 +202,14 @@ pub struct Poll {
 }
 
 impl Poll {
+    /// A poll that starts after `offset`, as it was saved before a restart.
+    pub fn resume(offset: i64) -> Self {
+        Self {
+            offset,
+            ..Self::default()
+        }
+    }
+
     /// Remember a post this server sent, so its echo is not delivered twice.
     pub fn sent(&mut self, record: OutboundRecord) {
         self.outbound.push(record);
@@ -94,6 +230,8 @@ impl Poll {
                 self.offset = update.update_id + 1;
             }
             let Some(message) = update.message else {
+                // An edited message, a membership change, a callback: nothing
+                // for a mailbox.
                 continue;
             };
             let key = format!("{bot}:{}", update.update_id);
@@ -114,13 +252,21 @@ impl Poll {
                 });
                 continue;
             }
+            let Some(text) = message.body() else {
+                // A sticker, a photo with no caption, a location: recorded as
+                // seen so it is not re-routed, and not delivered.
+                continue;
+            };
             out.push(Routed::ToAgent {
                 agent: agent.to_string(),
                 inbound: Inbound {
                     source_key: key,
                     chat_id: message.chat.id,
+                    thread_id: message.message_thread_id,
                     message_id: message.message_id,
-                    text: message.text.unwrap_or_default(),
+                    sender_name: message.from.as_ref().map(TgUser::display_name),
+                    sender_id: message.from.as_ref().map(|user| user.id),
+                    text: text.to_string(),
                     source_time_s: message.date,
                 },
             });
@@ -161,8 +307,13 @@ pub struct BotCall {
 }
 
 /// `sendMessage` for one chat. `reply_to` is a Telegram message id, when the
-/// agent was answering one.
-pub fn send_message(chat_id: i64, text: &str, reply_to: Option<i64>) -> BotCall {
+/// agent was answering one. `thread` keeps the post in its forum topic.
+pub fn send_message(
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
     let mut body = serde_json::json!({
         "chat_id": chat_id,
         "text": text,
@@ -170,26 +321,77 @@ pub fn send_message(chat_id: i64, text: &str, reply_to: Option<i64>) -> BotCall 
     if let Some(id) = reply_to {
         body["reply_to_message_id"] = serde_json::json!(id);
     }
+    if let Some(id) = thread {
+        body["message_thread_id"] = serde_json::json!(id);
+    }
     BotCall {
         method: "sendMessage".to_string(),
         body,
     }
 }
 
+/// `getMe`: the bot's own id and user name, so a recorded token is shown as the
+/// bot it is before any message is posted with it.
+pub fn get_me() -> BotCall {
+    BotCall {
+        method: "getMe".to_string(),
+        body: serde_json::json!({}),
+    }
+}
+
+/// The bot's id and user name from a `getMe` response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BotIdentity {
+    pub id: i64,
+    pub username: String,
+}
+
+pub fn bot_identity(response: &str) -> Result<BotIdentity, PollError> {
+    let value = ok_result(response)?;
+    let id = value
+        .get("id")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| PollError::BadPayload("no result.id".to_string()))?;
+    let username = value
+        .get("username")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| PollError::BadPayload("no result.username".to_string()))?
+        .to_string();
+    Ok(BotIdentity { id, username })
+}
+
 /// The message id Telegram assigned to a `sendMessage` we made.
 pub fn sent_message_id(response: &str) -> Result<i64, PollError> {
-    let value: serde_json::Value =
-        serde_json::from_str(response).map_err(|e| PollError::BadPayload(e.to_string()))?;
-    value
-        .pointer("/result/message_id")
+    ok_result(response)?
+        .get("message_id")
         .and_then(serde_json::Value::as_i64)
         .ok_or_else(|| PollError::BadPayload("no result.message_id".to_string()))
+}
+
+/// `result` of a Bot API answer, which must say `ok: true`.
+fn ok_result(response: &str) -> Result<serde_json::Value, PollError> {
+    let value: serde_json::Value =
+        serde_json::from_str(response).map_err(|e| PollError::BadPayload(e.to_string()))?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        let description = value
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("telegram refused the call");
+        return Err(PollError::Refused(description.to_string()));
+    }
+    value
+        .get("result")
+        .cloned()
+        .ok_or_else(|| PollError::BadPayload("no result".to_string()))
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum PollError {
     #[error("telegram payload: {0}")]
     BadPayload(String),
+    /// Telegram answered `ok: false` and said why.
+    #[error("telegram refused: {0}")]
+    Refused(String),
 }
 
 /// Write one routed update into the mailbox. A duplicate source key is kept as
@@ -225,15 +427,34 @@ pub fn deliver_to_mailbox(
     }
 }
 
+/// The mailbox row for one inbound message: the reply target is the message
+/// itself, so a bare reply goes to the chat and, in a forum, to its topic.
 fn incoming_from(inbound: &Inbound) -> anyagents_core::Incoming {
     anyagents_core::Incoming {
         text: inbound.text.clone(),
-        sender: None,
+        sender: telegram_sender(inbound),
         source_time_ms: Some(inbound.source_time_s * 1000),
         source_key: Some(inbound.source_key.clone()),
-        reply_to: None,
+        reply_to: Some(reply_target(inbound)),
         received_at_ms: None,
     }
+}
+
+/// `telegram:chat:<id>` or `telegram:chat:<id>:<thread>`, which the send tool
+/// accepts as an address.
+pub fn reply_target(inbound: &Inbound) -> String {
+    match inbound.thread_id {
+        Some(thread) => format!("telegram:chat:{}:{thread}", inbound.chat_id),
+        None => format!("telegram:chat:{}", inbound.chat_id),
+    }
+}
+
+/// `telegram:user:<id>:<message id>` when Telegram names the writer, else the
+/// chat target. The message id names what a reply answers.
+pub fn telegram_sender(inbound: &Inbound) -> Option<String> {
+    inbound
+        .sender_id
+        .map(|id| format!("telegram:user:{id}:{}", inbound.message_id))
 }
 
 #[cfg(test)]
@@ -243,6 +464,12 @@ mod tests {
     fn payload(update_id: i64, chat: i64, message_id: i64, text: &str) -> String {
         format!(
             r#"[{{"update_id":{update_id},"message":{{"message_id":{message_id},"chat":{{"id":{chat}}},"date":1700000000,"text":"{text}"}}}}]"#
+        )
+    }
+
+    fn group_update(update_id: i64, chat: i64, message_id: i64, thread: i64, text: &str) -> String {
+        format!(
+            r#"[{{"update_id":{update_id},"message":{{"message_id":{message_id},"message_thread_id":{thread},"is_topic_message":true,"chat":{{"id":{chat},"type":"supergroup","is_forum":true}},"from":{{"id":42,"is_bot":false,"first_name":"Kai","username":"kai"}},"date":1700000000,"text":"{text}"}}}}]"#
         )
     }
 
@@ -314,6 +541,78 @@ mod tests {
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].text, "hi");
         assert_eq!(inbox[0].source_key.as_deref(), Some("bot_a:4"));
+        assert_eq!(inbox[0].reply_to.as_deref(), Some("telegram:chat:100"));
+    }
+
+    #[test]
+    fn a_group_message_keeps_its_chat_and_topic_and_can_be_answered_there() {
+        let dir = tempfile_dir();
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let mut poll = Poll::default();
+        let routed = poll
+            .route(
+                "bot_a",
+                agent.id.as_str(),
+                &group_update(11, -1007, 55, 3, "deploy?"),
+            )
+            .unwrap();
+        let Routed::ToAgent { inbound, .. } = &routed[0] else {
+            panic!("{routed:?}");
+        };
+        assert_eq!(inbound.chat_id, -1007);
+        assert_eq!(inbound.thread_id, Some(3));
+        assert_eq!(inbound.message_id, 55);
+        assert_eq!(inbound.sender_name.as_deref(), Some("Kai (@kai)"));
+        deliver_to_mailbox(&store, &routed[0], &[]).unwrap();
+        let inbox = store.inbox(&agent.id, None).unwrap();
+        assert_eq!(
+            inbox[0].reply_to.as_deref(),
+            Some("telegram:chat:-1007:3"),
+            "a reply goes back to the topic"
+        );
+        assert_eq!(inbox[0].sender.as_deref(), Some("telegram:user:42:55"));
+        let answer = send_message(-1007, "yes", Some(55), inbound.thread_id);
+        assert_eq!(answer.body["chat_id"], -1007);
+        assert_eq!(answer.body["reply_to_message_id"], 55);
+        assert_eq!(answer.body["message_thread_id"], 3);
+    }
+
+    #[test]
+    fn a_reply_in_telegram_is_delivered_as_new_text_that_answers_itself() {
+        // `reply_to_message` is Telegram quoting an older message. The mailbox
+        // reply target is the message the agent received, so the quoted one is
+        // not needed, and a quote of a long message is not copied in.
+        let update = r#"[{"update_id":20,"message":{"message_id":61,"chat":{"id":100},"from":{"id":42,"first_name":"Kai"},"reply_to_message":{"message_id":60,"chat":{"id":100},"date":1700000000,"text":"earlier"},"date":1700000001,"text":"that one"}}]"#;
+        let mut poll = Poll::default();
+        let routed = poll.route("bot_a", "ada", update).unwrap();
+        let Routed::ToAgent { inbound, .. } = &routed[0] else {
+            panic!("{routed:?}");
+        };
+        assert_eq!(inbound.message_id, 61);
+        assert_eq!(inbound.text, "that one");
+        // The message itself is the reply target; the quoted one is Telegram's
+        // own reference and is not needed to answer.
+        assert_eq!(reply_target(inbound), "telegram:chat:100");
+    }
+
+    #[test]
+    fn media_with_a_caption_is_delivered_and_a_sticker_is_not() {
+        let photo = r#"[{"update_id":30,"message":{"message_id":70,"chat":{"id":100},"date":1700000000,"caption":"look"}}]"#;
+        let sticker =
+            r#"[{"update_id":31,"message":{"message_id":71,"chat":{"id":100},"date":1700000000}}]"#;
+        let edited = r#"[{"update_id":32,"edited_message":{"message_id":72,"chat":{"id":100},"date":1700000000,"text":"x"}}]"#;
+        let mut poll = Poll::default();
+        let routed = poll.route("bot_a", "ada", photo).unwrap();
+        let Routed::ToAgent { inbound, .. } = &routed[0] else {
+            panic!("{routed:?}");
+        };
+        assert_eq!(inbound.text, "look");
+        assert!(poll.route("bot_a", "ada", sticker).unwrap().is_empty());
+        assert!(poll.route("bot_a", "ada", edited).unwrap().is_empty());
+        assert_eq!(poll.offset, 33);
     }
 
     #[test]
@@ -329,14 +628,64 @@ mod tests {
     }
 
     #[test]
+    fn the_channel_memory_round_trips_and_names_peers_without_a_secret() {
+        let mut memory = Memory::from_state("{}");
+        memory.offset = 41;
+        memory.bot = Some("777:ada_bot".into());
+        memory.attach("ada", 100);
+        memory.attach("bea", 100);
+        memory.attach("bea", 200);
+        memory.attach("bea", 100);
+        assert_eq!(memory.chats.len(), 3);
+        assert_eq!(memory.peers(100, "ada"), vec!["bea"]);
+        assert!(memory.peers(200, "bea").is_empty());
+        let state = memory.to_state();
+        assert_eq!(Memory::from_state(&state), memory);
+        assert_eq!(Memory::from_state("not json"), Memory::default());
+    }
+
+    #[test]
+    fn a_poll_resumes_after_the_saved_offset() {
+        let poll = Poll::resume(41);
+        assert_eq!(poll.get_updates(0).body["offset"], 41);
+    }
+
+    #[test]
     fn send_message_names_the_chat_and_keeps_the_token_out() {
-        let call = send_message(100, "hello", Some(5));
+        let call = send_message(100, "hello", Some(5), None);
         assert_eq!(call.method, "sendMessage");
         assert_eq!(call.body["chat_id"], 100);
         assert_eq!(call.body["text"], "hello");
         assert_eq!(call.body["reply_to_message_id"], 5);
+        assert!(call.body.get("message_thread_id").is_none());
         let id = sent_message_id(r#"{"ok":true,"result":{"message_id":9}}"#).unwrap();
         assert_eq!(id, 9);
+    }
+
+    #[test]
+    fn a_refused_call_reports_telegrams_own_words() {
+        let refused = sent_message_id(
+            r#"{"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}"#,
+        )
+        .unwrap_err();
+        assert!(matches!(refused, PollError::Refused(_)));
+        assert!(refused.to_string().contains("message thread not found"));
+    }
+
+    #[test]
+    fn get_me_names_the_bot_without_its_token() {
+        let identity = bot_identity(
+            r#"{"ok":true,"result":{"id":777,"is_bot":true,"first_name":"Ada","username":"ada_bot"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            identity,
+            BotIdentity {
+                id: 777,
+                username: "ada_bot".into()
+            }
+        );
+        assert_eq!(get_me().method, "getMe");
     }
 
     #[test]

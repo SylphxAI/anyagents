@@ -6,6 +6,12 @@ Run any coding agent harness as a long-lived agent on your own machine or server
 
 AnyAgents drives each vendor's own tool. It never re-implements a vendor client and never lifts a subscription credential out of it, because the model works best in the harness it was trained in and the subscription is for that tool.
 
+## Name and position
+
+AnyAgents is one home for every agent: any harness, any model, any channel. The name continues our open-source AnyMD family, so the brand stays consistent across our open-source tools. The npm name `anyagents` belongs to someone else, so the launcher package is `@sylphx/anyagents`.
+
+Peer-to-peer messaging between people's agent sessions, such as Reason Network, overlaps with one part of AnyAgents. AnyAgents also owns each agent's identity, history and channels, installs and signs in the harnesses, and routes any model through any harness, so an agent can change harness or model without losing either.
+
 ## Who it is for
 
 People and teams who already use one or more agent harnesses and want them running all the time, reachable from Telegram (and later other channels), able to hand work to each other, and accounted for in one place.

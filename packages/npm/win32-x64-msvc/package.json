@@ -1,0 +1,23 @@
+{
+  "name": "@sylphx/anyagents-win32-x64-msvc",
+  "version": "0.1.0",
+  "description": "anyagents native binary for win32-x64-msvc. Installed as an optional dependency of @sylphx/anyagents.",
+  "os": [
+    "win32"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "files": [
+    "anyagents.exe"
+  ],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SylphxAI/anyagents.git",
+    "directory": "packages/npm/win32-x64-msvc"
+  }
+}

@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
@@ -19,10 +19,10 @@ pub trait UsageSink: Send + Sync {
     fn record(&self, event: UsageEvent);
 }
 
-/// In-memory sink for tests.
-#[derive(Debug, Default)]
+/// In-memory sink: for tests, and for a server that keeps its own records.
+#[derive(Clone, Debug, Default)]
 pub struct MemoryUsage {
-    events: Mutex<Vec<UsageEvent>>,
+    events: Arc<Mutex<Vec<UsageEvent>>>,
 }
 
 impl MemoryUsage {

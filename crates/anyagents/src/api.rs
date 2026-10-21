@@ -17,6 +17,9 @@ pub struct AgentView {
     pub quota_reset_at_ms: Option<i64>,
     pub oldest_unaccepted_age_ms: Option<i64>,
     pub oldest_unprocessed_age_ms: Option<i64>,
+    /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
+    /// has been installed yet, and what stopped it.
+    pub install: String,
 }
 
 fn default_harness() -> String {
@@ -40,6 +43,11 @@ pub struct CreateAgentRequest {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AgentsResponse {
     pub agents: Vec<AgentView>,
+    /// The origin a harness points at for provider traffic, when the gateway is
+    /// running. A client stores a key against it so the agent reaches the
+    /// gateway on its next start.
+    #[serde(default)]
+    pub gateway: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -52,6 +60,11 @@ pub struct MessageView {
     pub source_time_ms: Option<i64>,
     pub received_at_ms: i64,
     pub ack: String,
+    /// Whether the harness has taken this message. A message that is received
+    /// only has not been written to the vendor yet; a hook that delivers input
+    /// mid-turn hands over exactly these.
+    #[serde(default)]
+    pub accepted: bool,
     /// Why the last turn on this message failed, when it did. The message stays
     /// accepted and is offered to the next turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]

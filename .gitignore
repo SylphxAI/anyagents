@@ -1,7 +1,11 @@
 /target
+node_modules/
+.sylphx/
 .anyagents/
 *.db
 *.db-wal
 *.db-shm
 *.sock
 .sylphx/
+pr-body.md
+target-release/

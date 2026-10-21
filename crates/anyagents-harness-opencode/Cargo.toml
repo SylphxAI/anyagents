@@ -14,6 +14,13 @@ serde_json = "1"
 [dev-dependencies]
 tempfile = "3"
 
+# A scripted `opencode` for this crate's tests. The server crate ships the same
+# program for its end-to-end test.
+[[bin]]
+name = "fake_opencode"
+path = "tests/bin/fake_opencode.rs"
+test = false
+
 # `cargo test --workspace --all-targets` reports the dependencies of a bin or a
 # test target as unused in that target. Only a workspace member that is built as
 # a linker root (like `anyagents`) is checked; an empty list keeps the ignore
