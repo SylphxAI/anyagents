@@ -64,31 +64,26 @@ fn main() {
                 }
                 // A turn stays open until its approval is answered, even while
                 // its `turn/start` reply is still queued: `open` is the truth.
+                // A steer into it is accepted into the same turn and does not
+                // close it: the vendor keeps working until it says so.
                 if params.get("ifBusy").is_some() && open.is_some() {
                     let user = params["input"][0]["text"]
                         .as_str()
                         .unwrap_or("")
                         .to_string();
                     collected.push(user);
-                    let turn = open.take().unwrap_or_default();
-                    // The host learns the steer was accepted before the turn
-                    // closes, so it can record the message as carried.
+                    // The host learns the steer was accepted while the turn is
+                    // still the open one.
                     answer(
                         &mut stdout,
                         &id,
                         r#"{"status":"accepted","disposition":"steered"}"#,
                     );
-                    // Both messages are carried now, so the turn closes.
-                    notify(
-                        &mut stdout,
-                        &format!(
-                            r#"{{"jsonrpc":"2.0","method":"turn/completed","params":{{"turnId":"{turn}","status":"completed","usage":{{"inputTokens":11,"outputTokens":7}}}}}}"#
-                        ),
-                    );
                     continue;
                 }
                 users += 1;
                 let turn = format!("turn-{users}");
+                open = Some(turn.clone());
                 if mode == "finish" {
                     let user = params["input"][0]["text"]
                         .as_str()

@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnReport, TurnState,
+    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
 };
 use anyagents_harness_claude::ClaudeHarness;
 use tempfile::TempDir;
@@ -71,8 +71,10 @@ fn finish_records_usage_and_dedupes() {
     assert_eq!(usage.reported_cost_micros, Some(500_000));
     assert_eq!(harness.session_id().as_deref(), Some("sess-from-vendor"));
     let health = harness.health();
-    assert_eq!(health.delivery_mode, DeliveryMode::Followup);
-    assert_eq!(health.steer_support, SteerSupport::Unproven);
+    // Claude Code reads a stream-json `user` line mid-turn, so the catalog
+    // steers rather than following up.
+    assert_eq!(health.delivery_mode, DeliveryMode::Steer);
+    assert_eq!(health.steer_support, SteerSupport::Yes);
     let again = harness.deliver(&msg("m1")).unwrap();
     assert!(matches!(
         again,
@@ -223,14 +225,11 @@ fn an_errored_result_is_a_failed_turn_with_no_usage() {
         "the errored result is still the end of its turn"
     );
     assert!(harness.usage_for("m1").is_none());
-    let report = harness.turn_report_for("m1").expect("report");
-    match report {
-        TurnReport::Failed(reason) => {
-            assert!(reason.contains("error_during_execution"), "{reason}");
-            assert!(reason.contains("Invalid API key"), "{reason}");
-        }
-        other => panic!("expected a failed turn, got {other:?}"),
-    }
+    // The vendor's own reason is kept on the harness and never shown to the
+    // switchboard: delivery does not depend on how the turn ended.
+    let reason = harness.failure_for("m1").expect("the vendor's reason");
+    assert!(reason.contains("error_during_execution"), "{reason}");
+    assert!(reason.contains("Invalid API key"), "{reason}");
     assert_eq!(harness.health().turn_state, TurnState::Idle);
     // Handing the failed message back writes it once more, because the turn that
     // succeeds has to carry it; the replay starts a second turn.
@@ -256,6 +255,69 @@ fn the_child_is_asked_to_replay_the_lines_it_reads() {
         read_log(&log_path(&dir))
     );
     drop(harness);
+}
+
+#[test]
+fn three_lines_written_while_a_turn_is_open_are_all_taken_by_the_running_stream() {
+    // The child holds its turn open and echoes every line it reads. All three
+    // mailbox lines must reach it mid-turn: the adapter writes each one the
+    // moment it arrives, and the child's echo proves the running conversation
+    // took it. None is written twice, and no line waits for the turn to end.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "steer", Some("sess-1"));
+    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
+    assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    for id in ["m1", "m2", "m3"] {
+        assert_eq!(
+            harness.deliver(&msg(id)).unwrap(),
+            DeliverOutcome::Accepted {
+                turn_finished: false
+            },
+            "{id} is taken without waiting for a turn to end"
+        );
+        assert!(
+            harness.wait_echoed(id, Duration::from_secs(5)),
+            "{id} was not read by the running stream"
+        );
+    }
+    assert_eq!(
+        harness.turns_started(),
+        1,
+        "one running turn took all three"
+    );
+    // A replay of any of them writes nothing.
+    for id in ["m1", "m2", "m3"] {
+        harness.deliver(&msg(id)).unwrap();
+    }
+    assert_eq!(
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+    );
+    let text = read_log(&log_path(&dir));
+    for id in ["m1", "m2", "m3"] {
+        assert_eq!(
+            text.matches(&format!("anyagents-message:{id}")).count(),
+            1,
+            "{id} is written exactly once: {text}"
+        );
+    }
+    drop(harness);
+}
+
+#[test]
+fn a_line_written_into_an_idle_stream_is_marked_idle_and_one_mid_turn_is_not() {
+    // The adapter writes each line into the stream-json child as it arrives and
+    // remembers whether a turn was open: the first line opens one, the second
+    // joins it.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "steer", Some("sess-1"));
+    harness.deliver(&msg("m1")).unwrap();
+    assert!(harness.wait_echoed("m1", Duration::from_secs(5)));
+    assert_eq!(harness.phase_of("m1"), Some("idle"));
+    harness.deliver(&msg("m2")).unwrap();
+    assert!(harness.wait_echoed("m2", Duration::from_secs(5)));
+    assert_eq!(harness.phase_of("m2"), Some("turn"));
+    assert_eq!(harness.turns_started(), 1);
 }
 
 #[test]

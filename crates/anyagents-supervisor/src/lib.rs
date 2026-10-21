@@ -1,7 +1,7 @@
 //! One process per running agent. The mailbox wakes it; a dead process waits out
 //! a capped backoff; a quota answer waits until its reset time.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
@@ -16,9 +16,7 @@ use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
 };
-use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnReport, TurnUsage,
-};
+use anyagents_harness::{DeliveryMode, Harness, SteerSupport, TurnUsage};
 
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
@@ -189,13 +187,9 @@ pub struct LaunchRequest {
 
 pub type Launch<H> = Arc<dyn Fn(LaunchRequest) -> Result<H, String> + Send + Sync>;
 
-/// How long a turn must stand still before a harness that never closes it is
-/// counted as done, and how long to watch for that.
-const ANSWER_QUIET: Duration = Duration::from_millis(500);
-const ANSWER_PATIENCE: Duration = Duration::from_millis(120_000);
-
-/// How soon a worker comes back to a message it deferred behind an open turn.
-const DEFERRED_RETRY_MS: i64 = 1_000;
+/// How often a worker with an empty mailbox looks again. One store read, so
+/// `flush` and a restarted process never leave a line waiting for an arrival.
+const IDLE_REVIEW_MS: i64 = 250;
 
 /// Supervisor view of one agent. Ages stay on the mailbox; this is the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,18 +218,25 @@ impl HealthBoard {
     }
 }
 
-/// Catalog delivery when no process is up. Codex steers inside the turn;
-/// Claude Code and Antigravity take input between model steps through a
-/// steering channel; every other harness follows up after the turn.
+/// Catalog delivery when no process is up. It matches what each adapter reports
+/// while it runs.
 ///
-/// Claude Code writes a new line into the running conversation (stream-json on
-/// stdin, acknowledged by its replay echo); Antigravity takes an `injectSteps`
-/// answer from a before-step hook; OpenCode takes a prompt with
-/// `delivery=steer`.
+/// Steer: Codex takes its `turn/start` while a turn is open and steers into it;
+/// Claude Code writes a new user message into the running stream-json child
+/// (acknowledged by its replay echo); Antigravity takes an `injectSteps` answer
+/// from a before-step hook; OpenCode takes a prompt with `delivery: "steer"`,
+/// and its own session inbox decides whether that joins the running turn or
+/// starts the next one. Muse's app-server takes `ifBusy: "steer"` on
+/// `turn/start`.
+///
+/// Followup: the contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per
+/// turn and answers with a `result`, so a line written mid-turn waits for that
+/// turn to end.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
     match harness {
-        "codex" => (DeliveryMode::Steer, SteerSupport::Yes),
-        "claude-code" | "agy" => (DeliveryMode::Followup, SteerSupport::Yes),
+        "codex" | "claude-code" | "agy" | "opencode" | "muse" => {
+            (DeliveryMode::Steer, SteerSupport::Yes)
+        }
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -533,9 +534,8 @@ fn run_agent<H: Harness + 'static>(
         attempt: 0,
         restart_at: None,
         delivery: None,
-        settled: 0,
-        stepped_aside: false,
-        last: HashMap::new(),
+        served: None,
+        written: 0,
     };
     session.run()
 }
@@ -581,20 +581,12 @@ struct Session<H: Harness> {
     attempt: u32,
     restart_at: Option<i64>,
     delivery: Option<DeliveryLoop<H>>,
-    settled: i64,
-    /// A turn ended in an error and a vendor process started before a later turn
-    /// proved the cause is gone. This one is stepped aside for a fresh one.
-    stepped_aside: bool,
-    /// Per id, the highest finished-turn number settled and what settled it.
-    last: HashMap<String, (u64, Settled)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Settled {
-    /// The turn succeeded and `processed` moved past it.
-    Processed,
-    /// The turn ended in an error and is recorded as a failed turn.
-    Failed,
+    /// What the harness had served when the last row was recorded. The next
+    /// row carries the difference, so a burst is charged once and an idle loop
+    /// adds nothing.
+    served: Option<TurnUsage>,
+    /// Lines this loop wrote since the last usage row.
+    written: u32,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -627,16 +619,11 @@ impl<H: Harness + 'static> Session<H> {
                 self.replace_process();
                 continue;
             }
-            self.settle();
-            self.settle_quiet();
             if self.quota_waiting() {
                 continue;
             }
             if self.deliver_once() {
                 return true;
-            }
-            if self.step_aside() {
-                continue;
             }
         }
     }
@@ -736,25 +723,14 @@ impl<H: Harness + 'static> Session<H> {
         match self.launch_harness() {
             Ok(mut harness) => {
                 harness.watch_activity(Arc::clone(&self.notify));
-                self.replay_into(&mut harness);
+                // A quota wait belonged to the process that is gone.
+                harness.clear_quota();
                 if let Some(delivery) = self.delivery.as_mut() {
                     delivery.replace_harness(harness);
                 }
                 self.restart_at = None;
             }
             Err(_) => self.restart_at = None,
-        }
-    }
-
-    /// Give a fresh vendor process the messages the failed turn had already
-    /// handed to its predecessor: they are replay, so the adapter drops them if
-    /// it has them and carries them again if it does not.
-    fn replay_into(&self, harness: &mut H) {
-        let Some(delivery) = self.delivery.as_ref() else {
-            return;
-        };
-        for message in delivery.store().failed_turns(&self.id).unwrap_or_default() {
-            let _ = harness.deliver(&outbound_of(&message));
         }
     }
 
@@ -777,79 +753,12 @@ impl<H: Harness + 'static> Session<H> {
         true
     }
 
+    /// One pass over the mailbox. Every line is handed to the harness's own
+    /// input or steer API, in sequence order; the cursor moves behind each one
+    /// it takes. Nothing here waits for a turn to end.
+    ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
-        // A message whose last turn failed is handed to the vendor once more on
-        // its next pass; the adapters drop an id they still hold.
-        let rehand: Vec<anyagents_core::Message> = self
-            .delivery
-            .as_ref()
-            .and_then(|delivery| delivery.store().failed_turns(&self.id).ok())
-            .unwrap_or_default();
-        // Two outcomes per failed id: a failure hands it to the vendor again, a
-        // success records the turn that just finished.
-        enum Next {
-            Hand(Box<anyagents_core::Message>),
-            Done(i64),
-        }
-        let mut next = Vec::new();
-        for message in &rehand {
-            let id = message.id.as_str().to_string();
-            let report = self
-                .delivery
-                .as_ref()
-                .and_then(|delivery| delivery.harness().turn_report_for(&id));
-            match report {
-                // The vendor still holds the failed turn: ask it to carry the
-                // message again. The adapter accepts an id it already wrote only
-                // when it remembers that turn failed.
-                Some(TurnReport::Failed(_)) => next.push(Next::Hand(Box::new(message.clone()))),
-                // The retry already succeeded: record the turn once and finish
-                // the message here instead of waiting for another turn.
-                Some(TurnReport::Succeeded(usage)) => {
-                    let agent = self.agent.clone();
-                    let clock = Arc::clone(&self.inner.clock);
-                    let recorded = self
-                        .delivery
-                        .as_ref()
-                        .is_some_and(|delivery| record_turn(delivery, &agent, &clock, &usage));
-                    if recorded {
-                        let held = self
-                            .delivery
-                            .as_ref()
-                            .map(|delivery| delivery.harness().turn_version(&id))
-                            .unwrap_or(0);
-                        self.last.insert(id, (held, Settled::Processed));
-                        next.push(Next::Done(message.seq));
-                    }
-                }
-                None => {}
-            }
-        }
-        for step in next {
-            let Some(delivery) = self.delivery.as_mut() else {
-                break;
-            };
-            match step {
-                Next::Hand(message) => {
-                    self.stepped_aside = false;
-                    if let Ok(DeliverOutcome::Accepted { turn_finished }) =
-                        delivery.harness_mut().deliver(&outbound_of(&message))
-                    {
-                        // Map the hand-over so the run pass right after this
-                        // writes the new turn, and never counts it processed on
-                        // the strength of the hand-over alone.
-                        let _ =
-                            delivery
-                                .store()
-                                .note_handover(&self.id, message.seq, turn_finished);
-                    }
-                }
-                Next::Done(seq) => {
-                    let _ = delivery.mark_processed_through(seq);
-                }
-            }
-        }
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 return false;
@@ -858,311 +767,87 @@ impl<H: Harness + 'static> Session<H> {
         };
         match outcome {
             Ok(RunOutcome::Quota { .. }) => false,
-            // A deferred message waits for the open turn to settle, and the turn
-            // closing does not wake this worker. It comes back on a short timer
-            // so the next line is handed over as soon as the turn is done.
-            Ok(RunOutcome::Deferred { .. }) => {
-                self.settle();
-                // A turn that ended during the hand-over is settled here, or the
-                // sleep below waits for the next arrival with the answer unread.
-                self.settle_quiet();
-                if self.quota_is_ahead() {
-                    return false;
-                }
-                self.inner.clock.wait(
-                    Some(anyagents_core::now_ms() + DEFERRED_RETRY_MS),
-                    &self.woken,
-                );
+            Ok(RunOutcome::Delivered { delivered }) => {
+                self.written = self
+                    .written
+                    .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
+                self.wake_unless_more();
                 false
             }
-            Ok(RunOutcome::Idle | RunOutcome::Delivered { .. } | RunOutcome::Steered { .. }) => {
-                self.settle();
-                // The just-delivered turn is settled before the worker sleeps.
-                // Without this a harness that prints nothing when its HTTP turn
-                // ends leaves `woken` false, and the answer waits for the next
-                // message to arrive.
-                self.settle_quiet();
-                if self.quota_is_ahead() {
-                    return false;
-                }
-                self.inner.clock.wait(None, &self.woken);
+            Ok(RunOutcome::Idle) => {
+                // The mailbox has drained, so whatever the vendor reported for
+                // this burst is read once and recorded.
+                self.record_usage();
+                self.wake_unless_more();
                 false
             }
-            Err(err) if err.agent_busy() => true,
-            Err(_) => {
-                if self.process_alive() && !self.wait_backoff() {
+            Err(anyagents_agent::Error::HarnessDown) => {
+                if !self.wait_backoff() {
                     return false;
                 }
-                if self.process_alive() {
-                    self.replace_process();
-                }
+                self.replace_process();
                 false
             }
-        }
-    }
-
-    /// Give the failed turn a vendor process that has not already swallowed it.
-    /// Only a process proven stuck is replaced: its first turn after stepping
-    /// aside has to hand the failed ids over again and still fail. A failed turn
-    /// that succeeds on its next attempt keeps the same process.
-    fn step_aside(&mut self) -> bool {
-        let Some(delivery) = self.delivery.as_ref() else {
-            return false;
-        };
-        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-            return false;
-        };
-        let Ok(failed) = delivery.store().failed_turns(&self.id) else {
-            return false;
-        };
-        if failed.iter().all(|message| message.seq <= processed) {
-            self.stepped_aside = false;
-            return false;
-        }
-        if !self.stepped_aside {
-            self.stepped_aside = true;
-            return false;
-        }
-        // The failed ids have now failed twice on this process, so they go back
-        // to it as a replay; anything else still open has to be carried by the
-        // replacement process.
-        let failed_ids: HashSet<String> = failed
-            .iter()
-            .map(|message| message.id.as_str().to_string())
-            .collect();
-        let handover: Vec<String> = delivery
-            .pending_ids()
-            .into_iter()
-            .filter(|id| !failed_ids.contains(id))
-            .collect();
-        // A live process is only swapped out through the same wait-then-replace
-        // path a crash takes, so the health board shows the gap.
-        self.wait_backoff();
-        self.replace_process();
-        if let Some(delivery) = self.delivery.as_mut() {
-            for id in handover {
-                if let Ok(Some(message)) = delivery.store().message(&self.id, &id) {
-                    let _ = delivery.harness_mut().deliver(&outbound_of(&message));
+            Err(anyagents_agent::Error::HarnessFailed(_)) => {
+                if !self.wait_backoff() {
+                    return false;
                 }
+                self.replace_process();
+                false
             }
-        }
-        self.stepped_aside = false;
-        true
-    }
-
-    fn quota_is_ahead(&self) -> bool {
-        let Some(delivery) = self.delivery.as_ref() else {
-            return false;
-        };
-        match delivery.harness().health().quota_reset_at_ms {
-            Some(reset_at) => self.inner.clock.now_ms() < reset_at,
-            None => false,
+            Err(_) => true,
         }
     }
 
-    /// Move the cursors for turns that have finished. A turn that ended in an
-    /// error records a failed turn and leaves the processed cursor where it was,
-    /// so the same messages go to the next turn.
-    fn settle(&mut self) {
-        let pending = self.finished_turns();
-        let agent = self.agent.clone();
-        let clock = Arc::clone(&self.inner.clock);
-        let mut failures: Vec<String> = Vec::new();
-        let mut furthest = None;
-        for (seq, id, report) in pending {
-            // Every report is one finished turn. A replay of a message that once
-            // failed is a later turn, not a duplicate of the failed one, so the
-            // count rises for successes and failures alike.
-            let held = self
-                .delivery
-                .as_ref()
-                .map(|delivery| delivery.harness().turn_version(&id))
-                .unwrap_or(0);
-            // A turn is handled once. The one exception is a failed turn whose
-            // message starts a new turn later: only a success proves it.
-            let settled = self.last.get(&id).copied();
-            let handled = match settled {
-                // The turn asked the vendor to carry this message again.
-                Some((_, Settled::Failed)) => true,
-                Some((last, Settled::Processed)) => last >= held,
-                None => false,
-            };
-            if handled {
-                continue;
-            }
-            let version = held;
-            let recorded = match &report {
-                TurnReport::Succeeded(usage) => self
-                    .delivery
-                    .as_ref()
-                    .is_some_and(|delivery| record_turn(delivery, &agent, &clock, usage)),
-                TurnReport::Failed(_) => true,
-            };
-            if !recorded {
-                break;
-            }
-            furthest = Some(seq);
-            if let TurnReport::Failed(reason) = &report {
-                failures.push(reason.clone());
-                self.last.insert(id, (version, Settled::Failed));
-                break;
-            }
-            if !self.mark_processed(seq) {
-                break;
-            }
-            self.last.insert(id, (version, Settled::Processed));
-            self.settled = seq;
-        }
-        if failures.is_empty() {
-            return;
-        }
-        let Some(seq) = furthest else {
-            return;
-        };
-        let reason = failures.join("; ");
-        if let Some(delivery) = self.delivery.as_ref()
-            && delivery.record_failed_turn(seq, &reason).is_ok()
-            && let Ok(store) = Store::open(self.inner.store.data_dir().join("state.db"))
-        {
-            let _ = store.clear_failed_turns(&self.id, self.settled);
-        }
-    }
-
-    /// A harness that never closes its turn records a finished message with no
-    /// token counts once its turn stands still. The answer is already on the
-    /// harness, so the message counts as done.
-    fn settle_quiet(&mut self) {
+    /// Record the usage the harness served since the last row. It is read when
+    /// the mailbox has drained, never holds a line back, and adds nothing while
+    /// the harness has served nothing new.
+    fn record_usage(&mut self) {
         let Some(delivery) = self.delivery.as_ref() else {
             return;
         };
-        if delivery.harness().ends_on_quiet().is_none() {
-            return;
-        }
-        let Ok(accepted) = delivery.store().accepted_cursor(&self.id) else {
-            return;
-        };
-        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-            return;
-        };
-        if accepted <= processed {
-            return;
-        }
-        let Ok(messages) = delivery.store().inbox(&self.id, Some(processed)) else {
-            return;
-        };
-        // An answer is not asked of the harness again, so it never holds the turn.
-        let Some(open) = messages
-            .into_iter()
-            .find(|message| message.seq > processed && message.reply_to.is_none())
-        else {
-            return;
-        };
-        if !delivery
-            .harness()
-            .quiet_for(open.id.as_str(), ANSWER_QUIET, ANSWER_PATIENCE)
-        {
-            return;
-        }
-        // The answer is the reply; then the message itself is done.
-        let agent = self.agent.clone();
-        if let Some(delivery) = self.delivery.as_ref() {
-            let _ = delivery.record_answer(&agent);
-        }
-        // A second loop in the same store may already have settled it.
-        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-            return;
-        };
-        if open.seq > processed {
-            // The answer's own reply row sits right after the line it answers.
-            // It is already accepted, so the cursor moves over it in the same
-            // step instead of leaving it to a later pass that never comes.
-            let mut through = open.seq;
-            if let Ok(accepted) = delivery.store().accepted_cursor(&self.id)
-                && let Ok(after) = delivery.store().inbox(&self.id, Some(open.seq))
-            {
-                for next in after {
-                    if next.seq == through + 1 && next.seq <= accepted && next.reply_to.is_some() {
-                        through = next.seq;
-                    } else if next.seq > through {
-                        break;
-                    }
-                }
-            }
-            self.settled = through;
-            self.mark_processed(through);
-        }
-    }
+        let served = delivery.harness().last_usage();
+        let before = self.served.clone().unwrap_or_default();
 
-    fn mark_processed(&self, seq: i64) -> bool {
-        let Some(delivery) = self.delivery.as_ref() else {
-            return false;
-        };
-        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-            return false;
-        };
-        if seq <= processed {
-            return true;
+        if served == before {
+            return;
         }
-        delivery
-            .store()
-            .advance_processed_through(&self.id, seq)
-            .is_ok_and(|_| delivery.store().clear_failed_turns(&self.id, seq).is_ok())
-    }
-
-    fn finished_turns(&self) -> Vec<(i64, String, TurnReport)> {
-        let Some(delivery) = self.delivery.as_ref() else {
-            return Vec::new();
-        };
-        let Ok(accepted) = delivery.store().accepted_cursor(&self.id) else {
-            return Vec::new();
-        };
-        let Ok(processed) = delivery.store().processed_cursor(&self.id) else {
-            return Vec::new();
-        };
-        let Ok(messages) = delivery.store().inbox(&self.id, None) else {
-            return Vec::new();
-        };
-        // A hand-over that found its turn already finished is settled by the
-        // host, so it is read even when `processed` has moved past it.
-        // A failed turn that has already been recorded is not new work: its
-        // successor may have advanced the cursor past it, and the message stays
-        // listed until that successor succeeds.
-        let recorded: HashSet<i64> = delivery
-            .store()
-            .failed_turns(&self.id)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|message| message.seq)
-            .collect();
-        let mut pending = Vec::new();
-        for message in messages {
-            let settled_here = message.processed_at_delivery;
-            if !settled_here
-                && (message.seq <= processed
-                    || message.seq > accepted
-                    || recorded.contains(&message.seq))
-            {
-                continue;
-            }
-            let id = message.id.as_str().to_string();
-            let report = delivery.harness().turn_report_for(&id);
-            let Some(report) = report else {
+        // One row for each unit the vendor charged: its turns, or as many as
+        // the lines that were written here.
+        let turns = delivery.harness().turns_served().max(self.written.max(1));
+        let unit = owned_share(served.difference(before), turns);
+        let mut recorded = true;
+        for _ in 0..turns {
+            if unit.input_tokens == 0 && unit.output_tokens == 0 {
                 break;
-            };
-            pending.push((message.seq, id, report));
+            }
+            recorded &= record_turn(delivery, &self.agent, &self.inner.clock, &unit);
         }
-        pending
+        if recorded {
+            self.served = Some(served);
+            self.written = 0;
+        }
     }
-}
 
-fn outbound_of(message: &anyagents_core::Message) -> OutboundMessage {
-    OutboundMessage {
-        id: message.id.as_str().to_string(),
-        seq: message.seq,
-        text: message.text.clone(),
-        sender: message.sender.clone(),
-        reply_to: message.reply_to.clone(),
-        source_time_ms: message.source_time_ms,
+    /// Sleep until a new line arrives, unless one arrived while this pass ran:
+    /// then the next pass runs at once, so two lines in flight are both written.
+    fn wake_unless_more(&mut self) {
+        let more = self.delivery.as_ref().is_some_and(|delivery| {
+            match delivery.store().next_undelivered(&self.id) {
+                Ok(next) => next.is_some(),
+                Err(_) => false,
+            }
+        });
+        if more {
+            return;
+        }
+        // With no line to hand over, a short timer is the backstop: a line read
+        // by `flush` while this worker was restarting is picked up from the next
+        // process without waiting for another arrival.
+        self.inner.clock.wait(
+            Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
+            &self.woken,
+        );
     }
 }
 
@@ -1172,23 +857,37 @@ fn record_turn<H: Harness>(
     clock: &Arc<dyn Clock>,
     usage: &TurnUsage,
 ) -> bool {
-    delivery
-        .store()
-        .record_usage(NewUsage {
-            agent_id: agent.id.clone(),
-            harness: agent.harness.clone(),
-            model: agent.model.clone(),
-            input_tokens: tokens(usage.input_tokens),
-            output_tokens: tokens(usage.output_tokens),
-            cache_read_tokens: tokens(usage.cache_read_tokens),
-            cache_write_tokens: tokens(usage.cache_write_tokens),
-            reported_cost_micros: usage.reported_cost_micros,
-            estimated_cost_micros: None,
-            billing_mode: BillingMode::Subscription,
-            quota_state: None,
-            day: utc_day(clock.now_ms()),
-        })
-        .is_ok()
+    let result = delivery.store().record_usage(NewUsage {
+        agent_id: agent.id.clone(),
+        harness: agent.harness.clone(),
+        model: agent.model.clone(),
+        input_tokens: tokens(usage.input_tokens),
+        output_tokens: tokens(usage.output_tokens),
+        cache_read_tokens: tokens(usage.cache_read_tokens),
+        cache_write_tokens: tokens(usage.cache_write_tokens),
+        reported_cost_micros: usage.reported_cost_micros,
+        estimated_cost_micros: None,
+        billing_mode: BillingMode::Subscription,
+        quota_state: None,
+        day: utc_day(clock.now_ms()),
+    });
+    result.is_ok()
+}
+
+/// One unit's share of a difference, spread over `turns` units so the sum of
+/// the rows is the total the vendor reported.
+fn owned_share(difference: TurnUsage, turns: u32) -> TurnUsage {
+    let turns = u64::from(turns.max(1));
+    let share = |value: u64| value / turns;
+    TurnUsage {
+        input_tokens: share(difference.input_tokens),
+        output_tokens: share(difference.output_tokens),
+        cache_read_tokens: share(difference.cache_read_tokens),
+        cache_write_tokens: share(difference.cache_write_tokens),
+        reported_cost_micros: difference
+            .reported_cost_micros
+            .map(|cost| cost / turns as i64),
+    }
 }
 
 fn tokens(value: u64) -> i64 {

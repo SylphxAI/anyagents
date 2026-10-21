@@ -131,6 +131,13 @@ enum Command {
         #[arg(long, default_value = "")]
         conversation: String,
     },
+    /// Put one agent's mailbox into its harness now, if the running server has
+    /// not. Reads the store directly, so it also covers a server that was just
+    /// upgraded and is still inside its restart backoff.
+    Flush {
+        /// The agent name, or `all`.
+        agent: String,
+    },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
         #[command(subcommand)]
@@ -225,6 +232,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             Ok(())
         }
         Command::Agents { action } => agents(&cli.data, action),
+        Command::Flush { agent } => flush(&cli.data, &agent),
         Command::Model {
             agent,
             base_url,
@@ -340,12 +348,12 @@ fn agy_hook(data: &Path, agent: &str, conversation: &str) {
         }
     };
     // The mailbox is in sequence order, oldest first. Only what the harness has
-    // not taken counts: a message the server wrote is the turn's own prompt, and
-    // the server moves its cursor when it writes it.
+    // not taken counts: `received` means the server committed it and the
+    // harness's own input API has not been given it.
     let lines: Vec<api::MessageView> = before
         .messages
         .into_iter()
-        .filter(|line| !line.accepted)
+        .filter(|line| line.ack == "received")
         .collect();
     if lines.is_empty() {
         let _ = writeln!(stdout, "{{}}");
@@ -470,6 +478,78 @@ fn list_channels(data: &Path) -> Result<(), anyagents_core::Error> {
     Ok(())
 }
 
+/// Hand every line the running server may have left to the harness, through the
+/// vendor's own input API. A line the harness already took is not written again:
+/// the adapter remembers the ids in the session it resumed.
+fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
+    let store = open(data)?;
+    let agents = if name == "all" {
+        store.list_agents()?
+    } else {
+        vec![store.agent_by_name(name)?]
+    };
+    for agent in agents {
+        if agent.state != "running" {
+            continue;
+        }
+        let config_dir = anyagents_core::agent_config_dir(data, &agent.id);
+        let work_dir = agent
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &agent.id));
+        let request = anyagents_supervisor::LaunchRequest {
+            agent: agent.clone(),
+            data_dir: data.to_path_buf(),
+            config_dir,
+            work_dir,
+            extra_env: Vec::new(),
+        };
+        let mut harness = match vendor::vendor_launch(request) {
+            Ok(harness) => harness,
+            Err(reason) => {
+                println!("{}\tskipped\t{reason}", agent.name);
+                continue;
+            }
+        };
+        let mut flushed = 0u32;
+        let mut failure = None;
+        loop {
+            let message = store.next_undelivered(&agent.id)?;
+            let Some(message) = message else {
+                break;
+            };
+            match anyagents_harness::Harness::deliver(&mut harness, &outbound(&message)) {
+                Ok(_) => {
+                    store.note_delivered(&agent.id, message.seq)?;
+                    flushed += 1;
+                }
+                Err(err) => {
+                    failure = Some(err.to_string());
+                    break;
+                }
+            }
+        }
+        let cursor = store.delivered_cursor(&agent.id)?;
+        match failure {
+            Some(reason) => println!("{}\tstopped\t{cursor}\t{flushed}\t{reason}", agent.name),
+            None => println!("{}\tdelivered\t{cursor}\t{flushed}", agent.name),
+        }
+    }
+    Ok(())
+}
+
+fn outbound(message: &anyagents_core::Message) -> anyagents_harness::OutboundMessage {
+    anyagents_harness::OutboundMessage {
+        id: message.id.as_str().to_string(),
+        seq: message.seq,
+        text: message.text.clone(),
+        sender: message.sender.clone(),
+        reply_to: message.reply_to.clone(),
+        source_time_ms: message.source_time_ms,
+    }
+}
+
 fn open(data: &std::path::Path) -> Result<Store, anyagents_core::Error> {
     Store::open(data.join("state.db"))
 }
@@ -515,8 +595,7 @@ fn list_agents(data: &Path) -> Result<(), anyagents_core::Error> {
                 process: &agent.process,
                 mode: &agent.delivery_mode,
                 steer: &agent.steer_support,
-                unaccepted: agent.oldest_unaccepted_age_ms,
-                unprocessed: agent.oldest_unprocessed_age_ms,
+                undelivered: agent.oldest_undelivered_age_ms,
                 quota: agent.quota_reset_at_ms,
             });
         }
@@ -535,8 +614,7 @@ fn list_agents(data: &Path) -> Result<(), anyagents_core::Error> {
             process: "down",
             mode: mode_name(mode),
             steer: steer_name(steer),
-            unaccepted: lag.oldest_unaccepted_age_ms,
-            unprocessed: lag.oldest_unprocessed_age_ms,
+            undelivered: lag.oldest_undelivered_age_ms,
             quota: None,
         });
     }
@@ -551,14 +629,13 @@ struct AgentLine<'a> {
     process: &'a str,
     mode: &'a str,
     steer: &'a str,
-    unaccepted: Option<i64>,
-    unprocessed: Option<i64>,
+    undelivered: Option<i64>,
     quota: Option<i64>,
 }
 
 fn print_agent(agent: AgentLine<'_>) {
     println!(
-        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
         agent.id,
         agent.name,
         agent.harness,
@@ -566,8 +643,7 @@ fn print_agent(agent: AgentLine<'_>) {
         agent.process,
         agent.mode,
         agent.steer,
-        show_optional(agent.unaccepted),
-        show_optional(agent.unprocessed),
+        show_optional(agent.undelivered),
         show_optional(agent.quota),
     );
 }
@@ -704,10 +780,7 @@ fn inbox(
     let store = open(data)?;
     let agent = store.agent_by_name(agent)?;
     for message in store.inbox(&agent.id, since)? {
-        let ack = match &message.failed_reason {
-            Some(reason) => format!("failed ({reason})"),
-            None => message.ack.to_string(),
-        };
+        let ack = message.ack.to_string();
         println!(
             "{}\t{}\t{}\t{}",
             message.seq, ack, message.received_at_ms, message.text

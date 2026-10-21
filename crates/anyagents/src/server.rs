@@ -324,8 +324,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         delivery_mode: mode.to_string(),
         steer_support: steer.to_string(),
         quota_reset_at_ms: quota,
-        oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
-        oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
+        oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: install_state(agent),
     })
 }
@@ -395,9 +394,8 @@ fn inbox_sync(
             reply_to: message.reply_to,
             source_time_ms: message.source_time_ms,
             received_at_ms: message.received_at_ms,
-            accepted: message.ack != anyagents_core::Ack::Received,
+            delivered_at_ms: message.delivered_at_ms,
             ack: message.ack.to_string(),
-            failed_reason: message.failed_reason,
         })
         .collect();
     Ok(Json(InboxResponse { messages }))

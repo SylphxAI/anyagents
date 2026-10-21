@@ -286,25 +286,14 @@ impl Harness for VendorHarness {
         }
     }
 
-    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
+    fn last_usage(&self) -> TurnUsage {
         match self {
-            Self::Claude(harness) => harness.usage_for(id),
-            Self::Codex(harness) => harness.usage_for(id),
-            Self::OpenCode(harness) => harness.usage_for(id),
-            Self::Agy(harness) => harness.usage_for(id),
-            Self::Muse(harness) => harness.usage_for(id),
-            Self::Contract(harness) => harness.usage_for(id),
-        }
-    }
-
-    fn answer_for(&self, id: &str) -> Option<String> {
-        match self {
-            Self::Claude(harness) => harness.answer_for(id),
-            Self::Codex(harness) => harness.answer_for(id),
-            Self::OpenCode(harness) => harness.answer_for(id),
-            Self::Agy(harness) => harness.answer_for(id),
-            Self::Muse(harness) => harness.answer_for(id),
-            Self::Contract(harness) => harness.answer_for(id),
+            Self::Claude(harness) => harness.last_usage(),
+            Self::Codex(harness) => harness.last_usage(),
+            Self::OpenCode(harness) => harness.last_usage(),
+            Self::Agy(harness) => harness.last_usage(),
+            Self::Muse(harness) => harness.last_usage(),
+            Self::Contract(harness) => harness.last_usage(),
         }
     }
 
@@ -327,18 +316,6 @@ impl Harness for VendorHarness {
             Self::Agy(harness) => harness.ends_on_quiet(),
             Self::Muse(harness) => harness.ends_on_quiet(),
             Self::Contract(harness) => harness.ends_on_quiet(),
-        }
-    }
-
-    /// An agy or Muse turn that reported an error stays a failed turn, so the
-    /// supervisor never marks its message processed on a guess.
-    fn turn_report_for(&self, id: &str) -> Option<anyagents_harness::TurnReport> {
-        match self {
-            Self::Agy(harness) => anyagents_harness::Harness::turn_report_for(harness.as_ref(), id),
-            Self::Muse(harness) => {
-                anyagents_harness::Harness::turn_report_for(harness.as_ref(), id)
-            }
-            _ => None,
         }
     }
 

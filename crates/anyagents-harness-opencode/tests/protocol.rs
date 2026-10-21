@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnReport, TurnState,
+    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
 };
 use anyagents_harness_opencode::OpenCodeHarness;
 use tempfile::TempDir;
@@ -68,6 +68,13 @@ fn start_with_config(dir: &TempDir, mode: &str, config: &Path) -> OpenCodeHarnes
     .expect("start")
 }
 
+/// What a line the prompt API took is reported as.
+fn accepted() -> DeliverOutcome {
+    DeliverOutcome::Accepted {
+        turn_finished: false,
+    }
+}
+
 fn log_of(dir: &TempDir) -> String {
     std::fs::read_to_string(dir.path().join("log")).unwrap_or_default()
 }
@@ -85,56 +92,105 @@ fn a_delivered_line_is_a_prompt_carrying_its_mailbox_id() {
         "{text}"
     );
     assert!(text.contains("anyagents-message:m1"), "{text}");
-    // A turn handed over while another is open still goes as a prompt.
-    assert!(text.contains("\"delivery\":\"queue\""), "{text}");
+    // Every line is a steer: the session's inbox decides whether it joins the
+    // running turn or starts the next one.
+    assert!(text.contains("\"delivery\":\"steer\""), "{text}");
+    assert!(!text.contains("\"delivery\":\"queue\""), "{text}");
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
 }
 
 #[test]
-fn a_finished_turn_records_its_answer_and_usage() {
+fn a_finished_turn_reports_its_answer_from_the_session() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(10)));
+    assert!(harness.wait_answered("m1", Duration::from_secs(10)));
     assert_eq!(harness.answer("m1").as_deref(), Some("pong from opencode"));
-    let report = harness.turn_report_for("m1").expect("a report");
-    match report {
-        TurnReport::Succeeded(usage) => {
-            assert_eq!(usage.input_tokens, 11);
-            assert_eq!(usage.output_tokens, 7);
-            assert_eq!(usage.cache_read_tokens, 3);
-            assert_eq!(usage.cache_write_tokens, 2);
-            assert_eq!(usage.reported_cost_micros, Some(100));
-        }
-        other => panic!("expected success, got {other:?}"),
-    }
 }
 
 #[test]
-fn a_turn_the_service_never_finishes_stays_open() {
+fn an_open_turn_never_blocks_the_next_line() {
+    // The service holds its turn open forever. The adapter reports steer, not
+    // followup: the second line is written at once, not deferred behind a turn
+    // the adapter cannot see the end of.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "hold");
-    harness.deliver(&msg("m1")).unwrap();
-    assert!(!harness.wait_finished("m1", Duration::from_secs(1)));
-    assert_eq!(harness.health().turn_state, TurnState::InTurn);
-    assert_eq!(harness.health().delivery_mode, DeliveryMode::Followup);
+    assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
+    assert_eq!(harness.deliver(&msg("m2")).unwrap(), accepted());
+    assert_eq!(harness.health().turn_state, TurnState::Idle);
+    assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
     assert_eq!(harness.health().steer_support, SteerSupport::Yes);
+    assert_eq!(
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string()]
+    );
+    let text = log_of(&dir);
+    assert_eq!(
+        text.matches("api:POST /api/session/ses_fake/prompt")
+            .count(),
+        2,
+        "{text}"
+    );
 }
 
 #[test]
-fn a_failed_turn_is_a_failed_report() {
+fn three_lines_sent_while_a_turn_is_open_are_all_taken_at_once_and_never_twice() {
+    // The session's turn is open for the whole test. Each mailbox line must go
+    // to the session as a prompt with `delivery: steer`, be accepted when the
+    // prompt API answers, and be written exactly once even when handed over
+    // again.
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "inbox");
+    for id in ["m1", "m2", "m3"] {
+        assert_eq!(harness.deliver(&msg(id)).unwrap(), accepted(), "{id}");
+    }
+    assert!(harness.wait_seen("m3", Duration::from_secs(5)));
+    // A replay of every line writes nothing more.
+    for id in ["m1", "m2", "m3"] {
+        assert_eq!(harness.deliver(&msg(id)).unwrap(), accepted(), "{id}");
+    }
+    assert_eq!(
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
+    );
+    let text = log_of(&dir);
+    for id in ["m1", "m2", "m3"] {
+        let written = text
+            .matches("api:POST /api/session/ses_fake/prompt")
+            .count();
+        assert_eq!(written, 3, "one prompt per line, none twice: {text}");
+        assert_eq!(
+            text.matches(&format!("accepted:anyagents-message:{id}"))
+                .count(),
+            1,
+            "{id} reached the session exactly once: {text}"
+        );
+    }
+    let prompts = std::fs::read_to_string(dir.path().join("prompts")).unwrap();
+    assert_eq!(prompts.lines().count(), 3, "{prompts}");
+    assert!(
+        text.lines()
+            .all(|line| !line.starts_with("api:POST") || line.contains("\"delivery\":\"steer\"")),
+        "every prompt is a steer: {text}"
+    );
+}
+
+#[test]
+fn a_delivered_line_is_taken_even_when_the_session_reports_a_failed_turn() {
+    // Delivery is the prompt API taking the line, and nothing after it: a turn
+    // the session later reports failed does not hold the next line back.
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "failed");
-    harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(10)));
-    assert!(matches!(
-        harness.turn_report_for("m1"),
-        Some(TurnReport::Failed(_))
-    ));
+    assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
+    assert_eq!(harness.deliver(&msg("m2")).unwrap(), accepted());
+    assert_eq!(
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string()]
+    );
 }
 
 #[test]
-fn a_steered_line_joins_the_open_turn() {
+fn a_pushed_line_joins_the_open_turn() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("steer.jsonl");
     std::fs::write(&path, "{\"id\":\"m7\",\"seq\":7,\"message\":\"later\"}\n").unwrap();
@@ -143,6 +199,8 @@ fn a_steered_line_joins_the_open_turn() {
     let item = harness.poll_steer().unwrap().expect("taken");
     assert_eq!(item.message.id, "m7");
     assert!(harness.inject(&item.message).unwrap());
+    // A mailbox line the prompt API already took is taken, not written again.
+    assert!(harness.inject(&msg("m1")).unwrap());
     let text = log_of(&dir);
     assert!(text.contains("steered:anyagents-message:m7"), "{text}");
     assert!(text.contains("\"delivery\":\"steer\""), "{text}");
@@ -168,7 +226,7 @@ fn the_duplicate_delivery_is_not_written_twice() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(10)));
+    assert!(harness.wait_answered("m1", Duration::from_secs(10)));
     let before = log_of(&dir).matches("anyagents-message:m1").count();
     harness.deliver(&msg("m1")).unwrap();
     let after = log_of(&dir).matches("anyagents-message:m1").count();
@@ -182,7 +240,7 @@ fn an_earlier_turns_answer_does_not_close_this_turn() {
     let mut harness = start(&dir, "history");
     harness.deliver(&msg("m1")).unwrap();
     // The session holds an old completed turn; this one has not finished.
-    assert!(!harness.wait_finished("m1", Duration::from_secs(2)));
+    assert!(!harness.wait_answered("m1", Duration::from_secs(2)));
     assert_eq!(
         harness.answer("m1"),
         None,
@@ -195,7 +253,7 @@ fn only_the_newest_answer_is_the_turns_answer() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "two-turns");
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     assert_eq!(harness.answer("m1").as_deref(), Some("second answer"));
 }
 
@@ -208,10 +266,9 @@ fn an_answer_from_before_the_turn_is_never_returned() {
     let mut harness = start(&dir, "history");
     harness.deliver(&msg("m1")).unwrap();
     assert!(
-        harness.answer_for("m1").is_none(),
+        harness.answer("m1").is_none(),
         "an old answer is not this turn's"
     );
-    assert!(harness.answer_in_session("m1").is_none());
 }
 
 #[test]
@@ -243,7 +300,7 @@ fn the_models_thinking_is_never_the_answer() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "reasoning");
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     assert_eq!(harness.answer("m1").as_deref(), Some("the real answer"));
 }
 
@@ -252,40 +309,13 @@ fn each_message_is_answered_by_the_message_that_follows_it() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     assert_eq!(harness.answer("m1").as_deref(), Some("pong from opencode"));
     // The session now holds m1's prompt and answer. A second message is
     // answered by its own turn, not by m1's.
     harness.deliver(&msg("m2")).unwrap();
-    assert!(harness.wait_finished("m2", Duration::from_secs(5)));
+    assert!(harness.wait_answered("m2", Duration::from_secs(5)));
     assert_eq!(harness.answer("m2").as_deref(), Some("pong from opencode"));
-}
-
-#[test]
-fn a_second_line_is_deferred_while_a_turn_is_open() {
-    // `hold` keeps the first turn open. The second line must stay in the
-    // mailbox, or the vendor answers both in one batched reply.
-    let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "hold");
-    assert_eq!(
-        harness.deliver(&msg("m1")).unwrap(),
-        DeliverOutcome::Accepted {
-            turn_finished: false
-        }
-    );
-    assert_eq!(
-        harness.deliver(&msg("m2")).unwrap(),
-        DeliverOutcome::Deferred
-    );
-    // Only the first line reached the service.
-    assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
-    let text = log_of(&dir);
-    let prompts = text
-        .lines()
-        .filter(|line| line.starts_with("prompt:"))
-        .count();
-    assert_eq!(prompts, 1, "{text}");
-    assert!(!text.contains("anyagents-message:m2"), "{text}");
 }
 
 #[test]
@@ -295,7 +325,7 @@ fn a_retried_line_does_not_hold_the_turn_open() {
     let dir = TempDir::new().unwrap();
     let mut harness = start(&dir, "finish");
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert!(harness.wait_answered("m1", Duration::from_secs(5)));
     harness.deliver(&msg("m1")).unwrap();
     // A new line is delivered, not deferred behind a re-opened turn.
     assert_eq!(

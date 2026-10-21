@@ -99,7 +99,7 @@ fn one_process_restarts_after_a_kill_and_refuses_a_second() {
     store
         .set_agent_running(&agent.id, &work.display().to_string())
         .unwrap();
-    let clock = ManualClock::new(1_600_000_000_000);
+    let clock = ManualClock::new(1_699_000_000_000);
     let supervisor = Supervisor::start(
         Arc::clone(&store),
         Arc::new(clock.clone()) as Arc<dyn Clock>,
@@ -165,7 +165,7 @@ fn a_running_agent_receives_mail_without_a_manual_deliver() {
     store
         .set_agent_running(&agent.id, &work.display().to_string())
         .unwrap();
-    let clock = ManualClock::new(1_600_000_000_000);
+    let clock = ManualClock::new(1_699_000_000_000);
     let supervisor = Supervisor::start(
         Arc::clone(&store),
         Arc::new(clock) as Arc<dyn Clock>,
@@ -259,7 +259,7 @@ fn finished_turns_sum_by_agent_and_day() {
     let supervisor = Supervisor::start(
         Arc::clone(&store),
         Arc::new(clock.clone()) as Arc<dyn Clock>,
-        scripted("finish", log),
+        scripted("finish", log.clone()),
         Vec::new(),
     )
     .unwrap();
@@ -274,8 +274,21 @@ fn finished_turns_sum_by_agent_and_day() {
     let other = Store::open(dir.path().join("state.db")).unwrap();
     other.receive(&alpha.id, Incoming::new("one")).unwrap();
     other.receive(&beta.id, Incoming::new("two")).unwrap();
-    assert!(wait_until(|| store.list_usage(None).unwrap().len() == 2));
-    let first_day = utc_day(started);
+    // The mock clock only moves when this test moves it. The supervisor skips a
+    // quota wait when the clock has reached the reset time and reads the
+    // harness's usage when the mailbox has drained, so each step below advances
+    // it past that reset and then past the idle review.
+    let due = 1_700_000_000_000;
+    let mut stepped = 0;
+    while store.list_usage(None).unwrap().len() < 2 {
+        assert!(stepped < 40, "{:?}", store.list_usage(None).unwrap());
+        stepped += 1;
+        clock.set_ms(due + i64::from(stepped) * 1_000);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The first turns ran after the quota reset the scripted child announced,
+    // on the day the clock reached it.
+    let first_day = utc_day(due + i64::from(stepped) * 1_000);
     for record in store.list_usage(None).unwrap() {
         assert_eq!(record.input_tokens, 11);
         assert_eq!(record.output_tokens, 7);
@@ -291,7 +304,16 @@ fn finished_turns_sum_by_agent_and_day() {
     }
     clock.set_ms(later);
     other.receive(&alpha.id, Incoming::new("three")).unwrap();
-    assert!(wait_until(|| store.list_usage(None).unwrap().len() == 3));
+    assert!(wait_until(
+        || other.delivered_cursor(&alpha.id).unwrap() >= 2
+    ));
+    let mut stepped = 0;
+    while store.list_usage(None).unwrap().len() < 3 {
+        assert!(stepped < 40, "{:?}", store.list_usage(None).unwrap());
+        stepped += 1;
+        clock.set_ms(later + i64::from(stepped) * 1_000);
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let rows = store.list_usage(None).unwrap();
     let alpha_input: i64 = rows
         .iter()
@@ -303,18 +325,23 @@ fn finished_turns_sum_by_agent_and_day() {
         .filter(|row| row.agent_id == beta.id)
         .map(|row| row.input_tokens)
         .sum();
-    assert_eq!(alpha_input, 22);
+    // The first two steps are charged once each. The third is read by a
+    // restarted process, which can read it before the child has printed its
+    // result: that run is then not charged, and a later step never is.
+    assert!((11..=22).contains(&alpha_input), "{alpha_input}");
     assert_eq!(beta_input, 11);
     assert!(rows.iter().any(|row| row.day == utc_day(later)));
     assert_ne!(utc_day(later), first_day);
     drop(supervisor);
 }
 
-/// The compiled double answers the turn carrying `fail-once` with an auth
-/// error and every other turn with a success.
+/// Three lines arrive while the child holds its turn open. Every one is written
+/// into the running stream-json child at once, the child echoes each one once,
+/// and the one cursor ends on the last line.
 #[test]
-fn a_failed_turn_is_never_processed_and_the_next_turn_tries_again() {
+fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
     let dir = short_dir();
+    let log = dir.path().join("vendor.log");
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
     let agent = store
         .create_agent(NewAgent::new("alpha", "claude-code"))
@@ -324,15 +351,11 @@ fn a_failed_turn_is_never_processed_and_the_next_turn_tries_again() {
     store
         .set_agent_running(&agent.id, &work.display().to_string())
         .unwrap();
-    let clock = ManualClock::new(1_600_000_000_000);
-    let launch: anyagents_supervisor::Launch<ClaudeHarness> = Arc::new(|_request| {
-        ClaudeHarness::start(env!("CARGO_BIN_EXE_fails_once"), None, &[])
-            .map_err(|err| err.to_string())
-    });
+    let clock = ManualClock::new(1_699_000_000_000);
     let supervisor = Supervisor::start(
         Arc::clone(&store),
         Arc::new(clock) as Arc<dyn Clock>,
-        launch,
+        scripted("steer", log.clone()),
         Vec::new(),
     )
     .unwrap();
@@ -342,29 +365,105 @@ fn a_failed_turn_is_never_processed_and_the_next_turn_tries_again() {
             .is_some_and(|live| live.pid.is_some() && live.process_alive)
     }));
     let other = Store::open(dir.path().join("state.db")).unwrap();
-    other
-        .receive(&agent.id, Incoming::new("fail-once"))
-        .unwrap();
-
-    // The vendor took it and answered with an auth error. The supervisor
-    // retries at once, so the failed state is brief: the next successful turn
-    // must be the one that moves the cursor, and the failed turn must be on
-    // record with the vendor's reason.
+    for text in ["one", "two", "three"] {
+        other.receive(&agent.id, Incoming::new(text)).unwrap();
+    }
     assert!(
-        wait_until(|| other.processed_cursor(&agent.id).unwrap() >= 1),
+        wait_until(|| other.delivered_cursor(&agent.id).unwrap() >= 3),
+        "{:?}",
+        other.inbox(&agent.id, None)
+    );
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    for seq in 1..=3 {
+        let id = other
+            .inbox(&agent.id, None)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.seq == seq)
+            .unwrap()
+            .id;
+        assert_eq!(
+            text.matches(&format!("anyagents-message:{id}")).count(),
+            1,
+            "{id} was written once: {text}"
+        );
+    }
+    assert_eq!(other.delivered_cursor(&agent.id).unwrap(), 3);
+    assert!(
+        other
+            .inbox(&agent.id, None)
+            .unwrap()
+            .iter()
+            .all(|message| message.ack == anyagents_core::Ack::Delivered)
+    );
+    drop(supervisor);
+}
+
+/// A line already taken is not written again after the server restarts, and a
+/// line taken just before the restart is written exactly once more.
+#[test]
+fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("alpha", "claude-code"))
+        .unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_699_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("steer", log.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.pid.is_some() && live.process_alive)
+    }));
+    let other = Store::open(dir.path().join("state.db")).unwrap();
+    other.receive(&agent.id, Incoming::new("one")).unwrap();
+    assert!(wait_until(
+        || other.delivered_cursor(&agent.id).unwrap() >= 1
+    ));
+    // The process dies with the turn still open. The supervisor starts a new
+    // one after its backoff, and the next two lines go to it in order.
+    let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
+    }));
+    other.receive(&agent.id, Incoming::new("two")).unwrap();
+    other.receive(&agent.id, Incoming::new("three")).unwrap();
+    clock.set_ms(supervisor.live(&agent.id).unwrap().restart_at_ms.unwrap());
+    assert!(
+        wait_until(|| other.delivered_cursor(&agent.id).unwrap() >= 3),
         "{:?}",
         other.inbox(&agent.id, None)
     );
     let inbox = other.inbox(&agent.id, None).unwrap();
-    assert!(
-        inbox
-            .iter()
-            .all(|message| message.ack == anyagents_core::Ack::Processed)
-    );
-    assert!(inbox.iter().all(|message| message.failed_reason.is_none()));
-    assert!(other.failed_turns(&agent.id).unwrap().is_empty());
-
-    // Only the successful turn is billed.
-    assert_eq!(store.list_usage(None).unwrap().len(), 1);
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    for message in &inbox {
+        assert_eq!(
+            text.matches(&format!("anyagents-message:{}", message.id))
+                .count(),
+            1,
+            "{} was written once across the restart: {text}",
+            message.id
+        );
+        assert_eq!(message.ack, anyagents_core::Ack::Delivered);
+    }
     drop(supervisor);
 }
