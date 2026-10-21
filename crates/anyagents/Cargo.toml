@@ -26,6 +26,7 @@ http-body-util = "0.1"
 hyper = { version = "1", features = ["client", "http1"] }
 futures = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
+libc = "0.2"
 rmcp = { version = "3.5", features = [
     "client",
     "macros",

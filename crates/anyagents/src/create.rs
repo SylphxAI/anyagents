@@ -55,12 +55,14 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         },
     };
     let command = std::env::current_exe()?;
+    // The tool server is pointed at the agent's own config directory, where its
+    // capability is; a name on a command line is never an identity.
     let args = vec![
         "--data".to_string(),
         data.display().to_string(),
         "mcp".to_string(),
-        "--agent".to_string(),
-        agent.name.clone(),
+        "--config".to_string(),
+        config.display().to_string(),
     ];
     if agent.harness == "codex" {
         mcp_config::write_codex(&config.join("config.toml"), &command, &args)?;

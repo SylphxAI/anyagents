@@ -3,8 +3,7 @@
 //! harness without starting the vendor tool itself.
 //!
 //! The config file is the `adapter.json` the agent was created with:
-//! `{"harness": "agy", "reply_with": "<binary> --data <dir> mcp",
-//! "agent_file": "<path>"}`. Each user line is answered through the tool server
+//! `{"harness": "agy", "reply_with": "<binary> --data <dir> mcp --config <dir>"}`. Each user line is answered through the tool server
 //! `reply_with` names, as an agent's model does — to whoever sent the message —
 //! and the turn then ends with a `result` line.
 
@@ -127,12 +126,13 @@ mod tool_server {
         if server.is_empty() {
             return Err("no tool server".to_string());
         }
+        let _ = agent;
         let mut parts = server.split_whitespace();
         let program = parts.next().ok_or("no program")?;
+        // The tool server reads its capability from the deployment the server
+        // exported to this process; a name would only be a check.
         let mut child = Command::new(program)
             .args(parts)
-            .arg("--agent")
-            .arg(agent)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

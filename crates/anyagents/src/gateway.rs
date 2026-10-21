@@ -115,12 +115,15 @@ pub fn store_key(
 /// that has no gateway of its own.
 fn published_origin(data: &Path) -> Option<String> {
     let data = std::path::absolute(data).unwrap_or_else(|_| data.to_path_buf());
-    crate::mcp::get_json_sync::<crate::api::AgentsResponse>(
-        &crate::server::socket_path(&data),
+    crate::client::call::<crate::api::AgentsResponse>(
+        &data,
         "GET",
         "/v1/agents",
+        None,
+        &crate::client::authority(),
     )
     .ok()
+    .flatten()
     .and_then(|listed| listed.gateway)
 }
 

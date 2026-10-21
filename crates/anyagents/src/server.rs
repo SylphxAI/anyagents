@@ -1,4 +1,9 @@
 //! HTTP/JSON mailbox API on a user-only unix socket.
+//!
+//! Every call is authenticated before it is routed: an agent instance presents
+//! the mailbox capability the server minted for it, and the operator presents
+//! its own token. A sender, an inbox, a bot or an agent name in a body is a
+//! destination, never an identity.
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::FileTypeExt;
@@ -23,7 +28,9 @@ use crate::api::{
     AgentView, AgentsResponse, CreateAgentRequest, Delivery, InboxResponse, MessageView,
     SendRequest, SendResponse,
 };
+use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
+use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
 const SOCKET_NAME: &str = "anyagents.sock";
@@ -56,14 +63,43 @@ pub fn run_with(
 }
 
 #[derive(Clone)]
-struct AppState {
-    store: Arc<Store>,
-    health: HealthBoard,
-    sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
+pub(crate) struct AppState {
+    /// This deployment's idempotency namespace for one agent's sends. It never
+    /// leaves the process, so a key names one call of this server.
+    pub(crate) send_namespace: String,
+    pub(crate) store: Arc<Store>,
+    pub(crate) health: HealthBoard,
+    pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
+    pub(crate) auth: auth::Mode,
+}
+
+/// This process's capability key. Tests name one so a server and the fixture
+/// it reads share the same key.
+fn capability_key() -> Result<String, Error> {
+    use std::io::Read as _;
+    if let Ok(named) = std::env::var("ANYAGENTS_CAPABILITY_KEY") {
+        if named.len() >= 32 {
+            return Ok(named);
+        }
+    }
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
     let store = Arc::new(Store::open(data.join("state.db"))?);
+    store.hold_capability_key(&capability_key()?)?;
+    let auth = auth::Mode::from_env();
+    // The boundary contract is written and read back before the socket is
+    // bound, so a client never reaches an API whose boundary is not in place.
+    let boundary = anyagents_core::boundary::write(data)?;
+    if !auth.is_confined() {
+        let data = data.display();
+        eprintln!(
+            "warning: single-user route: an unauthenticated call acts as the agent it names on {data}; start with an operator token for the identity boundary"
+        );
+    }
     let path = socket_path(data);
     if path.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(Error::Message(format!(
@@ -87,10 +123,13 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     )
     .map_err(Error::Message)?;
     let state = AppState {
+        send_namespace: capability_key()?[..16].to_string(),
         store: Arc::clone(&store),
         health: supervisor.board(),
         sign_in,
+        auth,
     };
+    let _ = boundary;
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
@@ -99,6 +138,9 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/send", post(send))
         .route("/v1/harnesses/{id}/sign-in", post(sign_in_route))
+        .route("/v1/operator/agents/{name}/capability", post(mint_capability))
+        .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
+        .route("/v1/whoami", get(whoami))
         .with_state(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = axum::serve(listener, app)
@@ -113,6 +155,80 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// Mint an agent's capability after its instance was made (a create, a new
+/// sign-in), so its harness starts with one and the last one is retired.
+fn capability_mark(data_dir: &Path) -> impl Fn() -> Result<(), Error> + Send + Sync + 'static {
+    let data_dir = data_dir.to_path_buf();
+    move || {
+        let store = Store::open(data_dir.join("state.db"))?;
+        let agents = store.list_agents()?;
+        for agent in &agents {
+            crate::operator::mint(&store, &agent.id)?;
+        }
+        Ok(())
+    }
+}
+
+/// `POST /v1/operator/agents/{name}/capability`: the operator gives one agent a
+/// fresh capability, retiring the last one. The value is written into that
+/// agent's own config directory and never returned.
+async fn mint_capability(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_operator(&principal)?;
+    let agent = state
+        .store
+        .agent_by_name(&name)
+        .map_err(ApiError::from_store)?;
+    operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
+    Ok(Json(serde_json::json!({ "agent": agent.name, "minted": true })))
+}
+
+/// `GET /v1/whoami`: the agent this capability authenticates, as the server
+/// resolved it. A tool server reads its own identity here and nowhere else.
+async fn whoami(principal: Principal) -> Result<Json<serde_json::Value>, ApiError> {
+    match principal {
+        Principal::Agent { agent_id, name } => Ok(Json(serde_json::json!({
+            "agent_id": agent_id.as_str(),
+            "name": name,
+        }))),
+        Principal::Operator => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "the operator authenticated, but this call names an agent",
+        )),
+    }
+}
+
+/// `GET /v1/operator/agents/{name}/inbox`: any agent's mailbox, for the
+/// operator's own reading. A different path from the agent's own route, so a
+/// name can never be taken for an identity.
+async fn operator_inbox(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<Since>,
+) -> Result<Json<InboxResponse>, ApiError> {
+    require_operator(&principal)?;
+    let agent = state
+        .store
+        .agent_by_name(&name)
+        .map_err(ApiError::from_store)?;
+    spawn_store(move || inbox_of(&state.store, &agent.id, query.since)).await
+}
+
+/// Only the operator administers the deployment.
+fn require_operator(principal: &Principal) -> Result<(), ApiError> {
+    if principal.is_operator() {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden(
+            "an agent session cannot administer the server",
+        ))
+    }
 }
 
 /// A loopback port the operating system picked, held open until the caller
@@ -174,12 +290,15 @@ struct SignInLine {
 /// command runs. Each link or code is one JSON line, and the last line is the
 /// outcome. The credential never appears here.
 async fn sign_in_route(
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Response, ApiError> {
+    require_operator(&principal)?;
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
     let runner = Arc::clone(&state.sign_in);
     let root = state.store.data_dir().to_path_buf();
+    let mark = capability_mark(state.store.data_dir());
     let spawned = tokio::task::spawn_blocking(move || {
         let mut sink = ChannelSink { tx };
         let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());
@@ -192,10 +311,17 @@ async fn sign_in_route(
             &mut sink,
         );
         let line = match &result {
-            Ok(outcome) => SignInLine {
-                kind: "done",
-                text: outcome.account.clone().unwrap_or_default(),
-            },
+            Ok(outcome) => {
+                // A new sign-in is a new instance: the harness restarts with a
+                // capability this sign-in minted, and the last one is retired.
+                if let Err(err) = mark() {
+                    eprintln!("capability after sign-in: {err}");
+                }
+                SignInLine {
+                    kind: "done",
+                    text: outcome.account.clone().unwrap_or_default(),
+                }
+            }
             Err(err) => SignInLine {
                 kind: "error",
                 text: err.to_string(),
@@ -282,8 +408,21 @@ impl CommandRunner for ProcessRunner {
     }
 }
 
-async fn list_agents(State(state): State<AppState>) -> Result<Json<AgentsResponse>, ApiError> {
-    spawn_store(move || list_agents_sync(&state)).await
+async fn list_agents(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<AgentsResponse>, ApiError> {
+    // Any authenticated principal may see who is on the server. The operator
+    // sees the gateway origin; an agent learns it from its own start.
+    let operator = principal.is_operator();
+    spawn_store(move || {
+        let mut listed = list_agents_sync(&state)?;
+        if !operator {
+            listed.0.gateway = None;
+        }
+        Ok(listed)
+    })
+    .await
 }
 
 fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> {
@@ -341,9 +480,11 @@ fn install_state(agent: &Agent) -> String {
 }
 
 async fn create_agent_route(
+    principal: Principal,
     State(state): State<AppState>,
     Json(body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
+    require_operator(&principal)?;
     spawn_store(move || {
         let agent = create::create(
             &state.store,
@@ -370,21 +511,40 @@ struct Since {
 }
 
 async fn inbox(
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    spawn_store(move || inbox_sync(&state.store, &name, query.since)).await
+    // The name in the path is a check, never an identity: a call reads its own
+    // mailbox, and the operator reads any agent's by naming it explicitly.
+    let agent_id = match &principal {
+        Principal::Operator => state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?
+            .id,
+        Principal::Agent { agent_id, name: own } => {
+            if *own != name {
+                let forbidden = auth::AuthError::Forbidden(
+                    "a session reads its own inbox, not another agent's".to_string(),
+                );
+                return Err(ApiError::from_auth(&forbidden));
+            }
+            agent_id.clone()
+        }
+    };
+    spawn_store(move || inbox_of(&state.store, &agent_id, query.since)).await
 }
 
-fn inbox_sync(
+/// One agent's messages past `since`, in sequence order.
+fn inbox_of(
     store: &Store,
-    name: &str,
+    agent_id: &anyagents_core::AgentId,
     since: Option<i64>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let messages = store
-        .inbox(&agent.id, since)
+        .inbox(agent_id, since)
         .map_err(ApiError::from_store)?
         .into_iter()
         .map(|message| MessageView {
@@ -404,59 +564,109 @@ fn inbox_sync(
 }
 
 async fn send(
+    principal: Principal,
     State(state): State<AppState>,
     Json(body): Json<SendRequest>,
 ) -> Result<Json<SendResponse>, ApiError> {
-    spawn_store(move || send_sync(&state.store, body)).await
+    // The authenticated principal decides who the message is from; a body
+    // `sender` is only a check, and a disagreement is refused with no write.
+    let actor = match &principal {
+        Principal::Agent { name, .. } => {
+            if let Some(named) = body.sender.as_deref() {
+                Actor::parse(named).and_then(|named| {
+                    if named.as_address() == Actor::Agent(name.clone()).as_address() {
+                        Ok(())
+                    } else {
+                        Err(ApiError::forbidden(
+                            "a session sends as itself, not as the sender it names",
+                        ))
+                    }
+                })?;
+            }
+            Actor::Agent(name.clone())
+        }
+        Principal::Operator => {
+            let sender = body.sender.as_deref().ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "an operator send needs an explicit sender",
+                )
+            })?;
+            Actor::parse(sender)?
+        }
+    };
+    let body = SendRequest {
+        sender: Some(actor.as_address()),
+        ..body
+    };
+    let key = send_key(&state.send_namespace, &body);
+    let store = Arc::clone(&state.store);
+    spawn_store(move || send_sync(&store, &actor, body, key)).await
 }
 
-fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, ApiError> {
-    if body.to.is_empty() {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "send needs an address",
-        ));
-    }
-    enum Target {
-        Agent(String),
-        Room(String),
-        Telegram {
-            address: String,
-            chat: String,
-            thread: Option<String>,
-            reply: Option<String>,
-        },
-    }
-    let mut targets = Vec::with_capacity(body.to.len());
-    for raw in &body.to {
-        match Address::parse(raw)
-            .map_err(Error::from)
-            .map_err(ApiError::from_store)?
-        {
-            Address::Agent(name) => targets.push(Target::Agent(name)),
-            Address::TelegramChat { chat, thread } => {
-                targets.push(Target::Telegram {
-                    address: raw.clone(),
-                    chat,
-                    thread,
-                    reply: None,
-                });
-            }
-            Address::TelegramUser {
-                user,
-                message: reply,
-            } => {
-                targets.push(Target::Telegram {
-                    address: raw.clone(),
-                    chat: user,
-                    thread: None,
-                    reply,
-                });
-            }
-            Address::Group(room) => targets.push(Target::Room(room)),
+/// One send, resolved to the destinations it will write, before any of them is
+/// validated or posted.
+struct SendPlan {
+    targets: Vec<Target>,
+}
+
+enum Target {
+    Agent(String),
+    Room(String),
+    Telegram {
+        address: String,
+        chat: String,
+        thread: Option<String>,
+        reply: Option<String>,
+    },
+}
+
+impl SendPlan {
+    fn parse(store: &Store, body: &SendRequest) -> Result<Self, ApiError> {
+        if body.to.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "send needs an address",
+            ));
         }
+        let mut targets = Vec::with_capacity(body.to.len());
+        for raw in &body.to {
+            match Address::parse(raw)
+                .map_err(Error::from)
+                .map_err(ApiError::from_store)?
+            {
+                Address::Agent(name) => targets.push(Target::Agent(name)),
+                Address::TelegramChat { chat, thread } => {
+                    targets.push(Target::Telegram {
+                        address: raw.clone(),
+                        chat,
+                        thread,
+                        reply: None,
+                    });
+                }
+                Address::TelegramUser {
+                    user,
+                    message: reply,
+                } => {
+                    targets.push(Target::Telegram {
+                        address: raw.clone(),
+                        chat: user,
+                        thread: None,
+                        reply,
+                    });
+                }
+                Address::Group(room) => targets.push(Target::Room(room)),
+            }
+        }
+        let _ = store;
+        Ok(Self { targets })
     }
-    for target in &targets {
+}
+
+/// Every destination is checked before any write, so a refused address never
+/// leaves half a send behind.
+fn check_targets(store: &Store, actor: &Actor, body: &SendRequest, plan: &SendPlan) -> Result<(), ApiError> {
+    for target in &plan.targets {
         match target {
             Target::Agent(name) => {
                 store.agent_by_name(name).map_err(ApiError::from_store)?;
@@ -464,7 +674,7 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
             // Counted without writing, so an empty room fails the whole send
             // instead of silently delivering nothing.
             Target::Room(room) => {
-                if room_recipients(store, &body, room).is_empty() {
+                if room_recipients(store, body, room).is_empty() {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         format!("room {room} has no agent to deliver to"),
@@ -477,36 +687,103 @@ fn send_sync(store: &Store, body: SendRequest) -> Result<Json<SendResponse>, Api
                 reply,
                 ..
             } => {
-                prepare_telegram(store, &body, chat, thread.as_deref(), reply.as_deref())?;
+                prepare_telegram(store, actor, body, chat, thread.as_deref(), reply.as_deref())?;
             }
         }
     }
-    let mut deliveries = Vec::with_capacity(targets.len());
-    for target in targets {
-        let delivery = match target {
-            Target::Agent(name) => deliver_agent(store, &body, &name)?,
+    Ok(())
+}
+
+fn send_sync(
+    store: &Store,
+    actor: &Actor,
+    body: SendRequest,
+    key: Option<String>,
+) -> Result<Json<SendResponse>, ApiError> {
+    let plan = SendPlan::parse(store, &body)?;
+    check_targets(store, actor, &body, &plan)?;
+    let mut deliveries = Vec::with_capacity(plan.targets.len());
+    for target in &plan.targets {
+        match target {
+            Target::Agent(name) => {
+                deliveries.push(deliver_agent(store, &body, name, key.as_deref())?)
+            }
             Target::Room(room) => {
-                let mut all = deliver_room(store, &body, &room)?;
+                let mut all = deliver_room(store, &body, room, key.as_deref())?;
                 deliveries.append(&mut all);
-                continue;
             }
             Target::Telegram {
                 address,
                 chat,
                 thread,
                 reply,
-            } => deliver_telegram(
+            } => deliveries.push(deliver_telegram(
                 store,
+                actor,
                 &body,
-                &address,
-                &chat,
+                address,
+                chat,
                 thread.as_deref(),
                 reply.as_deref(),
-            )?,
-        };
-        deliveries.push(delivery);
+            )?),
+        }
     }
     Ok(Json(SendResponse { deliveries }))
+}
+
+/// The idempotency key of one call. The same call repeated after a lost
+/// answer keeps the key its tool call was given; two identical calls without
+/// one are two messages, so a key never comes from the text.
+fn send_key(namespace: &str, body: &SendRequest) -> Option<String> {
+    let idempotency = body.idempotency_key.as_deref()?.trim();
+    if idempotency.is_empty() {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    for part in [namespace, idempotency] {
+        bytes.extend_from_slice(part.as_bytes());
+        bytes.push(0);
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in &bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Some(format!("send:{hash:016x}"))
+}
+
+/// Who writes a message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Actor {
+    Agent(String),
+    /// The operator, as an explicit principal: `operator`, `telegram:user:<id>`
+    /// or `telegram:chat:<id>`.
+    Operator(String),
+}
+
+impl Actor {
+    fn parse(raw: &str) -> Result<Self, ApiError> {
+        match anyagents_core::Address::parse(raw) {
+            Ok(anyagents_core::Address::Agent(name)) => Ok(Self::Agent(name)),
+            Ok(address @ (anyagents_core::Address::TelegramUser { .. }
+            | anyagents_core::Address::TelegramChat { .. })) => {
+                Ok(Self::Operator(address.canonical()))
+            }
+            Ok(other) => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("{other} cannot write a message"),
+            )),
+            Err(err) => Err(ApiError::new(StatusCode::BAD_REQUEST, err.to_string())),
+        }
+    }
+
+    /// The sender stored with the message.
+    fn as_address(&self) -> String {
+        match self {
+            Self::Agent(name) => format!("agent:{name}"),
+            Self::Operator(raw) => raw.clone(),
+        }
+    }
 }
 
 /// Everyone a room message will reach, without writing anything: the room's
@@ -534,7 +811,12 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
 }
 
 /// One room message, one delivery per recipient.
-fn deliver_room(store: &Store, body: &SendRequest, room: &str) -> Result<Vec<Delivery>, ApiError> {
+fn deliver_room(
+    store: &Store,
+    body: &SendRequest,
+    room: &str,
+    key: Option<&str>,
+) -> Result<Vec<Delivery>, ApiError> {
     let delivered = store
         .receive_room(
             room,
@@ -542,8 +824,9 @@ fn deliver_room(store: &Store, body: &SendRequest, room: &str) -> Result<Vec<Del
                 text: body.text.clone(),
                 sender: body.sender.clone(),
                 source_time_ms: None,
-                source_key: None,
+                source_key: key.map(str::to_string),
                 reply_to: body.reply_to.clone(),
+                quote: body.quote.clone(),
                 received_at_ms: None,
             },
         )
@@ -565,7 +848,12 @@ fn deliver_room(store: &Store, body: &SendRequest, room: &str) -> Result<Vec<Del
         .collect())
 }
 
-fn deliver_agent(store: &Store, body: &SendRequest, name: &str) -> Result<Delivery, ApiError> {
+fn deliver_agent(
+    store: &Store,
+    body: &SendRequest,
+    name: &str,
+    key: Option<&str>,
+) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     let outcome = store
         .receive(
@@ -574,8 +862,9 @@ fn deliver_agent(store: &Store, body: &SendRequest, name: &str) -> Result<Delive
                 text: body.text.clone(),
                 sender: body.sender.clone(),
                 source_time_ms: None,
-                source_key: None,
+                source_key: key.map(str::to_string),
                 reply_to: body.reply_to.clone(),
+                quote: body.quote.clone(),
                 received_at_ms: None,
             },
         )
@@ -592,28 +881,31 @@ fn deliver_agent(store: &Store, body: &SendRequest, name: &str) -> Result<Delive
     })
 }
 
-/// Resolve the bot, the chat, the topic and the reply before any mailbox
-/// write. This does not post.
+/// Resolve the bot, the chat, the topic and the reply before any network
+/// call. This does not post.
 fn prepare_telegram(
     store: &Store,
+    actor: &Actor,
     body: &SendRequest,
     chat: &str,
     thread: Option<&str>,
     reply: Option<&str>,
 ) -> Result<(), ApiError> {
+    let from = telegram_sender(actor)?;
     let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
-    let from =
-        crate::telegram::bound_sender(body.sender.as_deref()).map_err(ApiError::from_store)?;
-    crate::telegram::outbound_call(
-        store,
-        from.as_deref(),
-        chat_id,
-        &body.text,
-        reply_to,
-        thread_id,
-    )
-    .map_err(ApiError::from_store)?;
+    crate::telegram::outbound_call(store, from, chat_id, &body.text, reply_to, thread_id)
+        .map_err(ApiError::from_store)?;
     Ok(())
+}
+
+/// The bot a send posts through: always the authenticated actor's own.
+fn telegram_sender<'a>(actor: &'a Actor) -> Result<&'a str, ApiError> {
+    match actor {
+        Actor::Agent(name) => Ok(name),
+        Actor::Operator(_) => Err(ApiError::forbidden(
+            "a post to a channel needs an agent's own bot",
+        )),
+    }
 }
 
 /// The chat, forum topic and replied-to message as numbers. The explicit
@@ -649,21 +941,22 @@ fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>
 }
 
 /// `id` is the Telegram message id. This delivery has no mailbox sequence.
+#[allow(clippy::too_many_arguments)]
 fn deliver_telegram(
     store: &Store,
+    actor: &Actor,
     body: &SendRequest,
     address: &str,
     chat: &str,
     thread: Option<&str>,
     reply: Option<&str>,
 ) -> Result<Delivery, ApiError> {
+    let from = telegram_sender(actor)?;
     let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
-    let from =
-        crate::telegram::bound_sender(body.sender.as_deref()).map_err(ApiError::from_store)?;
     let message_id = crate::telegram::post_text(
         store,
         store.data_dir(),
-        from.as_deref(),
+        from,
         chat_id,
         &body.text,
         reply_to,
@@ -672,9 +965,7 @@ fn deliver_telegram(
     .map_err(ApiError::from_store)?;
     // Remember the chat this agent answers in, so a post it makes there reaches
     // the other agents on that chat as a mailbox message.
-    if let Some(sender) = from.as_deref() {
-        crate::telegram::record_chat(store, sender, chat_id).map_err(ApiError::from_store)?;
-    }
+    crate::telegram::record_chat(store, from, chat_id).map_err(ApiError::from_store)?;
     Ok(Delivery {
         to: address.to_string(),
         id: message_id.to_string(),
@@ -706,6 +997,14 @@ impl ApiError {
             status,
             message: message.into(),
         }
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
+    }
+
+    fn from_auth(err: &auth::AuthError) -> Self {
+        Self::new(err.status(), err.message())
     }
 
     fn from_store(err: Error) -> Self {
@@ -761,8 +1060,13 @@ mod tests {
         }
     }
 
+    /// These tests start a server in this process, so the environment they set
+    /// is read under this lock and put back before the next one runs.
+    static ENV: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_sign_in_streams_the_link_before_the_outcome() {
+        let _env = ENV.lock().unwrap_or_else(|err| err.into_inner());
         let data = tempfile::tempdir().unwrap();
         let socket = socket_path(data.path());
         let dir = Arc::new(Mutex::new(None));
@@ -770,6 +1074,14 @@ mod tests {
             dir: Arc::clone(&dir),
         }));
         let data_path = data.path().to_path_buf();
+        // This deployment has an operator, so the sign-in presents one.
+        let token_file = data.path().join("operator-token");
+        std::fs::write(&token_file, "an-operator-token-0123456789abcdef\n").unwrap();
+        // SAFETY: the test process sets these before the server thread reads
+        // them, and sets them for its own duration only.
+        unsafe {
+            std::env::set_var("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_file);
+        }
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let server = std::thread::spawn(move || run_with(&data_path, runner, stop_rx));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -781,7 +1093,13 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         stream
-            .write_all(b"POST /v1/harnesses/codex/sign-in HTTP/1.1\r\nHost: local\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .write_all(
+                format!(
+                    "POST /v1/harnesses/codex/sign-in HTTP/1.1\r\nHost: local\r\n{}: an-operator-token-0123456789abcdef\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    crate::operator::HEADER
+                )
+                .as_bytes(),
+            )
             .unwrap();
         let mut buf = String::new();
         let mut chunk = [0u8; 256];
@@ -803,5 +1121,71 @@ mod tests {
         drop(stream);
         let _ = stop_tx.send(());
         let _ = server.join();
+        // SAFETY: as above, for this test only.
+        unsafe {
+            std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN_FILE");
+        }
+    }
+
+    /// A sign-in call from an agent's own capability is refused, and no vendor
+    /// command runs.
+    #[test]
+    fn an_agent_capability_cannot_sign_a_harness_in() {
+        let _env = ENV.lock().unwrap_or_else(|err| err.into_inner());
+        let data = tempfile::tempdir().unwrap();
+        let socket = socket_path(data.path());
+        let dir = Arc::new(Mutex::new(None));
+        let runner = Arc::new(Mutex::new(Scripted {
+            dir: Arc::clone(&dir),
+        }));
+        let data_path = data.path().to_path_buf();
+        let token_file = data.path().join("operator-token");
+        std::fs::write(&token_file, "an-operator-token-0123456789abcdef\n").unwrap();
+        // SAFETY: the test process sets these before the server thread reads
+        // them, and sets them for its own duration only.
+        unsafe {
+            std::env::set_var("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_file);
+            std::env::set_var("ANYAGENTS_CAPABILITY_KEY", "0123456789abcdef0123456789abcdef");
+        }
+        let store = Store::open(data.path().join("state.db")).unwrap();
+        let configured = "0123456789abcdef0123456789abcdef";
+        store.hold_capability_key(configured).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
+            .unwrap();
+        let capability = store.issue_capability(&agent.id).unwrap();
+        drop(store);
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || run_with(&data_path, runner, stop_rx));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !socket.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "POST /v1/harnesses/codex/sign-in HTTP/1.1\r\nHost: local\r\n{}: {capability}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    crate::operator::AGENT_HEADER
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut buf = String::new();
+        let _ = stream.read_to_string(&mut buf);
+        assert!(buf.starts_with("HTTP/1.1 403"), "{buf}");
+        assert!(buf.contains("cannot administer"), "{buf}");
+        assert!(dir.lock().unwrap().is_none(), "the vendor command ran");
+        drop(stream);
+        let _ = stop_tx.send(());
+        let _ = server.join();
+        // SAFETY: as above, under `ENV`.
+        unsafe {
+            std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN_FILE");
+            std::env::remove_var("ANYAGENTS_CAPABILITY_KEY");
+        }
     }
 }

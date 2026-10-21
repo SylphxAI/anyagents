@@ -4,7 +4,7 @@
 //! contiguous prefix.
 
 use std::fs::{File, OpenOptions};
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
@@ -16,6 +16,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
+use crate::quote::Quote;
 use crate::migrate::{self, now_ms as clock_now_ms};
 
 /// Milliseconds since the Unix epoch. A clock that is before the epoch reads as 0.
@@ -100,6 +101,9 @@ pub struct Incoming {
     pub source_time_ms: Option<i64>,
     pub source_key: Option<String>,
     pub reply_to: Option<String>,
+    /// The message this one quotes, when the provider sent one. It is rendered
+    /// into the stored body; an agent's text cannot forge it.
+    pub quote: Option<Quote>,
     /// Overrides the receive clock so tests can age a message without sleeping.
     pub received_at_ms: Option<i64>,
 }
@@ -112,8 +116,15 @@ impl Incoming {
             source_time_ms: None,
             source_key: None,
             reply_to: None,
+            quote: None,
             received_at_ms: None,
         }
+    }
+
+    /// The body as it is stored, or handed to a harness: the text, then any
+    /// trusted quote.
+    pub fn body(&self) -> String {
+        crate::quote::compose(&self.text, self.quote.as_ref())
     }
 }
 
@@ -260,7 +271,11 @@ pub struct Store {
     conn: Mutex<Connection>,
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
+    capabilities: Mutex<Option<String>>,
 }
+
+/// A capability is 32 random bytes, written in hex.
+const CAPABILITY_BYTES: usize = 32;
 
 impl Store {
     /// Open or create the database, turn on WAL, and apply pending migrations.
@@ -289,11 +304,114 @@ impl Store {
             conn: Mutex::new(conn),
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
+            capabilities: Mutex::new(None),
         })
+    }
+
+    /// Hold this process's mailbox capability key, so it can mint and check
+    /// capabilities. The server sets it at start; the key never leaves memory.
+    pub fn hold_capability_key(&self, key: &str) -> Result<(), Error> {
+        if key.len() < 32 {
+            return Err(Error::Message("the capability key is too short".into()));
+        }
+        *self
+            .capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(key.to_string());
+        Ok(())
     }
 
     pub fn data_dir(&self) -> &Path {
         &self.data_dir
+    }
+
+    /// A mailbox capability for one agent instance: an opaque value, stored as
+    /// a hash, bound to the agent's immutable id and to the generation of its
+    /// current session. Only the server that minted it reads it back.
+    pub fn issue_capability(&self, agent_id: &AgentId) -> Result<String, Error> {
+        let key = self
+            .capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+            .ok_or_else(|| Error::Message("this server holds no mailbox capability key".into()))?;
+        let mut bytes = [0u8; CAPABILITY_BYTES];
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+        let token = hex(&bytes);
+        let now = now_ms();
+        {
+            let mut conn = self.conn();
+            agent_by_id(&conn, agent_id)?;
+            let tx = conn.transaction()?;
+            // A new instance replaces the old one: the generation moves, and
+            // every capability minted before it stops authenticating.
+            let generation: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM agent_capabilities WHERE agent_id = ?1",
+                [agent_id.as_str()],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO agent_capabilities (token_hash, agent_id, generation, created_at_ms, revoked_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                params![hash(&key, &token), agent_id.as_str(), generation, now],
+            )?;
+            tx.execute(
+                "UPDATE agent_capabilities SET revoked_at_ms = ?1
+                 WHERE agent_id = ?2 AND generation < ?3 AND revoked_at_ms IS NULL",
+                params![now, agent_id.as_str(), generation],
+            )?;
+            tx.commit()?;
+        }
+        Ok(token)
+    }
+
+    /// The agent a presented capability authenticates, when the server minted
+    /// it and it was not replaced. The comparison is on the stored hash.
+    pub fn authenticate_capability(&self, token: &str) -> Result<AgentId, Error> {
+        let key = self
+            .capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+            .ok_or_else(|| Error::Message("this server holds no mailbox capability key".into()))?;
+        let digest = hash(&key, token);
+        let conn = self.conn();
+        let found = conn
+            .query_row(
+                "SELECT agent_id FROM agent_capabilities
+                 WHERE token_hash = ?1 AND revoked_at_ms IS NULL",
+                [digest.as_str()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        match found {
+            Some(id) => AgentId::parse(&id),
+            None => Err(Error::Message("the session is not authenticated".into())),
+        }
+    }
+
+    /// Whether a capability was ever minted on this deployment. Once one has
+    /// been, the deployment has an identity boundary.
+    pub fn ever_authenticated(&self) -> bool {
+        let conn = self.conn();
+        conn.query_row("SELECT COUNT(*) FROM agent_capabilities", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map(|count| count > 0)
+        .unwrap_or(false)
+    }
+
+    /// Replace an agent's instance: its generation moves, so every capability
+    /// minted for the last instance stops authenticating at once.
+    pub fn retire_capabilities(&self, agent_id: &AgentId) -> Result<(), Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "UPDATE agent_capabilities SET revoked_at_ms = ?1
+             WHERE agent_id = ?2 AND revoked_at_ms IS NULL",
+            params![now_ms(), agent_id.as_str()],
+        )?;
+        Ok(())
     }
 
     /// A channel for later mailbox inserts and running transitions.
@@ -485,7 +603,7 @@ impl Store {
             {
                 continue;
             }
-            let one = Incoming {
+            let mut one = Incoming {
                 text: incoming.text.clone(),
                 sender: sender.clone(),
                 source_time_ms: incoming.source_time_ms,
@@ -494,8 +612,12 @@ impl Store {
                     .as_ref()
                     .map(|key| format!("room:{room}:{key}")),
                 reply_to: incoming.reply_to.clone(),
+                quote: incoming.quote.clone(),
                 received_at_ms: incoming.received_at_ms,
             };
+            // The body is built once, so every recipient reads the same text.
+            one.text = one.body();
+            one.quote = None;
             let outcome = self.receive(&agent.id, one)?;
             delivered.push((agent, outcome));
         }
@@ -687,6 +809,7 @@ impl Store {
     /// Append one message, or return the row already stored for this source key.
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
+        let body = incoming.body();
         let source_key = incoming.source_key.filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let mut conn = self.conn();
@@ -701,7 +824,7 @@ impl Store {
             id: MessageId::generate(),
             agent_id: agent_id.clone(),
             seq: next_seq(&tx, agent_id)?,
-            text: incoming.text,
+            text: body,
             sender: incoming.sender,
             source_time_ms: incoming.source_time_ms,
             source_key,
@@ -1221,6 +1344,34 @@ pub fn sum_usage(records: &[UsageRecord], by_day: bool) -> Vec<UsageTotal> {
     totals.into_values().collect()
 }
 
+/// A capability as it is stored: a digest under this server's key, which lives
+/// only in the server's memory. The table is useless to anyone who reads it,
+/// and a different key never reproduces the digest.
+fn hash(key: &str, token: &str) -> String {
+    let mut bytes = Vec::with_capacity(key.len() + token.len() + 1);
+    bytes.extend_from_slice(key.as_bytes());
+    bytes.push(0);
+    bytes.extend_from_slice(token.as_bytes());
+    format!("{:016x}", fnv1a(&bytes))
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
 fn data_dir_for(path: &Path) -> PathBuf {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -1637,6 +1788,7 @@ mod tests {
             source_time_ms: None,
             source_key: None,
             reply_to: None,
+            quote: None,
             received_at_ms: None,
         };
 
@@ -2012,6 +2164,7 @@ mod tests {
             source_time_ms: None,
             source_key: None,
             reply_to: None,
+            quote: None,
             received_at_ms: None,
         };
 
@@ -2067,6 +2220,7 @@ mod tests {
                     source_time_ms: None,
                     source_key: None,
                     reply_to: None,
+                    quote: None,
                     received_at_ms: None,
                 },
             )

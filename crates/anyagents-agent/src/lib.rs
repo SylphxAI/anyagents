@@ -302,6 +302,7 @@ impl<H: Harness> DeliveryLoop<H> {
                 source_time_ms: None,
                 source_key: Some(format!("answer:{}", message.id)),
                 reply_to: Some(message.id.to_string()),
+                quote: None,
                 received_at_ms: None,
             },
         )?;
@@ -734,6 +735,7 @@ mod tests {
                     source_time_ms: Some(1_000),
                     source_key: Some("bot:1".into()),
                     reply_to: Some("telegram:chat:-1003544170260".into()),
+                    quote: None,
                     received_at_ms: None,
                 },
             )
