@@ -4,10 +4,11 @@
 //! id is the first line of the user text (`anyagents-message:<id>`). An id already
 //! written, or echoed back on stdout, is not written again.
 //!
-//! Declared delivery mode is followup. Steer support is unproven: a message written
-//! while a turn is open waits for the next result. `turn_finished` becomes true when
-//! a `result` event closes the open turn. Token counts and `total_cost_usd` from
-//! that event are kept on the finished ids.
+//! Declared delivery mode is steer. A stream-json child reads a `user` message
+//! at any point, mid-turn included, so every mailbox line is written the moment
+//! it arrives and the running conversation takes it. `turn_finished` becomes
+//! true when a `result` event closes the open turn. Token counts and
+//! `total_cost_usd` from that event are kept on the finished ids.
 //!
 //! Mid-turn delivery: with `--replay-user-messages` the child echoes back every
 //! line written to its stdin as a `user` event, which is the harness's own
@@ -35,7 +36,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnReport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerQueue, SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -94,6 +95,8 @@ struct State {
     request_seq: u64,
     /// Ids an echoed `user` event proved the child took.
     echoed: HashSet<String>,
+    /// For each written id, whether no turn was open when it was written.
+    phases: std::collections::HashMap<String, &'static str>,
 }
 
 impl ClaudeHarness {
@@ -223,7 +226,7 @@ impl ClaudeHarness {
 
     /// The create input line Claude Code reads: one `user` event whose text is
     /// the marked message. Its echo is the acknowledgement.
-    pub fn create_input(message: &OutboundMessage) -> Value {
+    pub fn steer_input_line(message: &OutboundMessage) -> Value {
         json!({
             "type": "user",
             "message": {
@@ -236,9 +239,16 @@ impl ClaudeHarness {
         })
     }
 
-    /// The `user` event one line of the between-steps channel carries.
-    pub fn steer_input(message: &OutboundMessage) -> Value {
-        Self::create_input(message)
+    /// The `user` message a mailbox line becomes: one per line, whether the
+    /// child is idle or busy. A stream-json child reads it either way.
+    pub fn create_input(message: &OutboundMessage) -> Value {
+        Self::steer_input_line(message)
+    }
+
+    /// When a mailbox line reached the child: `"idle"` when no turn was open,
+    /// `"turn"` when it joined the open one.
+    pub fn phase_of(&self, id: &str) -> Option<&'static str> {
+        lock(&self.shared).phases.get(id).copied()
     }
 
     /// Whether the child echoed `id` back as a `user` event.
@@ -274,13 +284,6 @@ impl ClaudeHarness {
             .iter()
             .rev()
             .find(|(item, _)| item == id)
-            .map(|(_, usage)| usage.clone())
-    }
-
-    fn usage_at(&self, at: usize) -> Option<TurnUsage> {
-        lock(&self.shared)
-            .usages
-            .get(at)
             .map(|(_, usage)| usage.clone())
     }
 
@@ -483,12 +486,18 @@ impl Harness for ClaudeHarness {
         if let Some(reset_at_ms) = state.quota_reset_at_ms {
             return Ok(DeliverOutcome::Quota { reset_at_ms });
         }
+        let phase = if state.open.is_empty() {
+            "idle"
+        } else {
+            "turn"
+        };
         let line = Self::create_input(message);
         if write_stdin(&self.stdin, &line).is_err() {
             state.alive = false;
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
+        state.phases.insert(message.id.clone(), phase);
         accept_message(&mut state, &message.id);
         Ok(DeliverOutcome::Accepted {
             turn_finished: state.finished.contains(&message.id)
@@ -546,46 +555,37 @@ impl Harness for ClaudeHarness {
             } else {
                 TurnState::InTurn
             },
-            delivery_mode: DeliveryMode::Followup,
-            steer_support: SteerSupport::Unproven,
+            delivery_mode: DeliveryMode::Steer,
+            steer_support: SteerSupport::Yes,
             quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: None,
         }
     }
 
-    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
-        ClaudeHarness::usage_for(self, id)
+    fn turns_served(&self) -> u32 {
+        lock(&self.shared).usages.len() as u32
     }
 
-    fn turn_version(&self, id: &str) -> u64 {
-        lock(&self.shared).turns.get(id).copied().unwrap_or(0)
-    }
+    /// The total of every turn this process has finished. A total rather than
+    /// the newest turn: the host reads it when the mailbox has drained, and a
+    /// burst is several turns.
+    fn served_usage(&self) -> TurnUsage {
+        let state = lock(&self.shared);
 
-    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
-        let (failed_at, usage_at) = {
-            let state = lock(&self.shared);
-            (
-                state.failures.iter().rposition(|(item, _)| item == id),
-                state.usages.iter().rposition(|(item, _)| item == id),
-            )
-        };
-        // The most recent result decides, so a replay that succeeds replaces
-        // the turn that had failed. A line the child echoed after that failure
-        // is taken by the open turn, whose result settles it.
-        if self.echoed(id) && !self.is_finished(id) {
-            return None;
+        let mut total = TurnUsage::default();
+
+        for (_, usage) in &state.usages {
+            total.input_tokens += usage.input_tokens;
+            total.output_tokens += usage.output_tokens;
+            total.cache_read_tokens += usage.cache_read_tokens;
+            total.cache_write_tokens += usage.cache_write_tokens;
+            total.reported_cost_micros =
+                match (total.reported_cost_micros, usage.reported_cost_micros) {
+                    (Some(total), Some(one)) => Some(total + one),
+                    (total, one) => total.or(one),
+                };
         }
-        match (failed_at, usage_at) {
-            (Some(failed), Some(usage)) if usage > failed => {
-                self.usage_at(usage).map(TurnReport::Succeeded)
-            }
-            (Some(failed), _) => lock(&self.shared)
-                .failures
-                .get(failed)
-                .map(|(_, reason)| TurnReport::Failed(reason.clone())),
-            (None, Some(usage)) => self.usage_at(usage).map(TurnReport::Succeeded),
-            (None, None) => None,
-        }
+        total
     }
 
     fn clear_quota(&mut self) {
@@ -635,7 +635,7 @@ impl Harness for ClaudeHarness {
         } else {
             state.followups.push(message.id.clone());
         }
-        let line = Self::steer_input(message);
+        let line = Self::steer_input_line(message);
         if write_stdin(&self.stdin, &line).is_err() {
             state.alive = false;
             self.wake.notify_all();

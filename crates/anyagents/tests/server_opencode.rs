@@ -22,6 +22,33 @@ fn scripted_opencode() -> std::path::PathBuf {
 }
 use serde_json::{Value, json};
 
+/// Speak the least an MCP client needs to the agent's own tool server: start
+/// it, initialize, and send one reply to the ask. This is how an agent answers,
+/// exactly as its model would through the `send` tool.
+fn mcp_send_once(mut child: Child) -> std::io::Result<std::process::Output> {
+    use std::io::BufRead;
+    let mut stdin = child.stdin.take().expect("stdin");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("stdout"));
+    let mut line = String::new();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"2025-06-18","capabilities":{{}},"clientInfo":{{"name":"opencode-test","version":"0"}}}}}}"#
+    )?;
+    stdout.read_line(&mut line)?;
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
+    )?;
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"send","arguments":{{"to":["agent:owner"],"text":"pong from opencode"}}}}}}"#
+    )?;
+    line.clear();
+    stdout.read_line(&mut line)?;
+    drop(stdin);
+    child.wait_with_output()
+}
+
 /// A server child that is killed when this value drops.
 struct Server {
     child: Child,
@@ -124,36 +151,60 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         &socket,
         &json!({"to": ["alpha"], "text": "ping", "sender": "agent:owner"}).to_string(),
     );
-    let sent_text = sent.to_string();
-    let sent_id = sent["deliveries"][0]["id"].as_str().expect(&sent_text);
-
     let store = Store::open(data.join("state.db")).unwrap();
     let agent = store.agent_by_name("alpha").unwrap();
+    // The ask reaches the session as one steer prompt carrying its mailbox id,
+    // and the ask is delivered once the prompt API has taken it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let asked = sent["deliveries"][0]["seq"].as_i64().unwrap();
+    while store.delivered_cursor(&agent.id).unwrap() < asked {
+        assert!(Instant::now() < deadline, "messages not delivered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // The agent replies with its own MCP `send`, not through anything the
+    // session printed: the adapter scrapes no answer and writes no reply row.
+    // To a second agent, so the reply is the switchboard's routing of the
+    // agent's own tool call.
+    let other = create(&data, "owner");
+    assert!(other.status.success(), "{other:?}");
+    let answered = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .args(["--data", data.to_str().unwrap(), "mcp", "--agent", "alpha"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .and_then(mcp_send_once)
+        .expect("the agent's tool server runs");
+    assert!(answered.status.success(), "{answered:?}");
+    // The reply is the agent's own `send`, routed by the switchboard: the
+    // owner's mailbox holds it, and nothing was read from the session.
+    let owner = store.agent_by_name("owner").unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     let reply = loop {
-        let inbox = store.inbox(&agent.id, None).unwrap();
+        let inbox = store.inbox(&owner.id, None).unwrap();
         assert!(Instant::now() < deadline, "no reply: {inbox:?}");
-        if let Some(reply) = inbox.iter().find(|message| message.reply_to.is_some()) {
+        if let Some(reply) = inbox.iter().find(|message| message.sender.is_some()) {
             break reply.clone();
         }
         std::thread::sleep(Duration::from_millis(50));
     };
     assert_eq!(reply.sender.as_deref(), Some("agent:alpha"));
-    assert_eq!(reply.reply_to.as_deref(), Some(sent_id));
     assert!(reply.text.contains("pong from opencode"), "{}", reply.text);
-    // The ask is done once its answer is recorded.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let asked = sent["deliveries"][0]["seq"].as_i64().unwrap();
-    while store.processed_cursor(&agent.id).unwrap() < asked {
-        assert!(Instant::now() < deadline, "messages not done");
-        std::thread::sleep(Duration::from_millis(50));
-    }
-
+    // The agent's own inbox holds the ask and no answer row.
+    assert!(
+        store
+            .inbox(&agent.id, None)
+            .unwrap()
+            .iter()
+            .all(|message| message.reply_to.is_none())
+    );
     let log = std::fs::read_to_string(data.join("fake.log")).unwrap_or_default();
-    // The line reached the service as a prompt on its real endpoint, carrying
-    // its mailbox id; the answer came back as a reply, never as a prompt.
+    // The line reached the service as a steer prompt on its real endpoint,
+    // carrying its mailbox id. The answer never went through the session: it is
+    // the agent's own `send`, so no prompt carries it.
     assert!(log.contains("api:POST /api/session/"), "{log}");
+    assert!(log.contains("\"delivery\":\"steer\""), "{log}");
     assert!(log.contains("anyagents-message:"), "{log}");
-    assert!(!log.contains("\"text\":\"pong from opencode\""), "{log}");
+    assert!(!log.contains("pong from opencode"), "{log}");
     drop(server);
 }

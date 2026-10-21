@@ -211,7 +211,8 @@ async fn mcp_tools_use_the_server_socket() {
         .expect("alpha");
     assert_eq!(alpha_row.harness, "claude-code");
     assert_eq!(alpha_row.state, "running");
-    assert_eq!(alpha_row.delivery_mode, "followup");
+    // Claude Code takes a user line mid-turn, so the catalog steers.
+    assert_eq!(alpha_row.delivery_mode, "steer");
     assert_eq!(alpha_row.steer_support, "yes");
     assert!(alpha_row.process == "alive" || alpha_row.process == "down");
 
@@ -224,7 +225,7 @@ async fn mcp_tools_use_the_server_socket() {
     assert!(listed_cli.status.success());
     let text = String::from_utf8(listed_cli.stdout).unwrap();
     assert!(text.contains("running"), "{text}");
-    assert!(text.contains("followup"), "{text}");
+    assert!(text.contains("steer"), "{text}");
     assert!(text.contains("yes"), "{text}");
 
     let sent: SendResponse = ok_json(
@@ -256,13 +257,10 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(got.messages.len(), 2);
     assert_eq!(got.messages[0].text, "hello");
     assert_eq!(got.messages[0].sender.as_deref(), Some("agent:alpha"));
-    // The mailbox holds it as soon as it is received. Whether a turn has taken
-    // it depends on the vendor process, which this test does not run.
+    // The mailbox holds it as soon as it is received. Whether the harness has
+    // taken it depends on the vendor process, which this test does not run.
     assert!(
-        matches!(
-            got.messages[0].ack.as_str(),
-            "received" | "accepted" | "processed"
-        ),
+        matches!(got.messages[0].ack.as_str(), "received" | "delivered"),
         "{}",
         got.messages[0].ack
     );

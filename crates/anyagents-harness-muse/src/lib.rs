@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnReport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
@@ -56,7 +56,6 @@ struct State {
     finished: HashSet<String>,
     turns_started: usize,
     usages: Vec<(String, TurnUsage)>,
-    reports: Vec<(String, TurnReport)>,
     quota_reset_at_ms: Option<i64>,
     last_usage: Option<TurnUsage>,
 }
@@ -169,6 +168,11 @@ impl MuseHarness {
     /// Turns opened with `turn/start`.
     pub fn turns_started(&self) -> usize {
         lock(&self.shared).turns_started
+    }
+
+    /// Whether a turn is still open.
+    pub fn in_turn(&self) -> bool {
+        lock(&self.shared).turn.is_some()
     }
 
     /// The session this host drives.
@@ -483,18 +487,27 @@ impl Harness for MuseHarness {
         }
     }
 
-    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
-        MuseHarness::usage_for(self, id)
+    fn turns_served(&self) -> u32 {
+        lock(&self.shared).usages.len() as u32
     }
 
-    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
+    /// The total of every turn this process has finished, read when the
+    /// mailbox has drained.
+    fn served_usage(&self) -> TurnUsage {
         let state = lock(&self.shared);
-        state
-            .reports
-            .iter()
-            .rev()
-            .find(|(item, _)| item == id)
-            .map(|(_, report)| report.clone())
+        let mut total = TurnUsage::default();
+        for (_, usage) in &state.usages {
+            total.input_tokens += usage.input_tokens;
+            total.output_tokens += usage.output_tokens;
+            total.cache_read_tokens += usage.cache_read_tokens;
+            total.cache_write_tokens += usage.cache_write_tokens;
+            total.reported_cost_micros =
+                match (total.reported_cost_micros, usage.reported_cost_micros) {
+                    (Some(total), Some(one)) => Some(total + one),
+                    (total, one) => total.or(one),
+                };
+        }
+        total
     }
 
     fn clear_quota(&mut self) {
@@ -573,7 +586,9 @@ fn finish_turn(state: &mut State, params: &Value) {
         .map(usage_of)
         .or_else(|| state.last_usage.clone())
         .unwrap_or_default();
-    let failed = params
+    // The vendor's own error, kept so a reader of the session can see why the
+    // turn failed. Delivery does not depend on it.
+    let _failed = params
         .get("error")
         .filter(|error| !error.is_null())
         .map(|error| {
@@ -597,12 +612,7 @@ fn finish_turn(state: &mut State, params: &Value) {
     };
     for id in carried {
         state.finished.insert(id.clone());
-        state.usages.push((id.clone(), usage.clone()));
-        let report = match &failed {
-            Some(reason) => TurnReport::Failed(reason.clone()),
-            None => TurnReport::Succeeded(usage.clone()),
-        };
-        state.reports.push((id, report));
+        state.usages.push((id, usage.clone()));
     }
     state.turn = None;
 }

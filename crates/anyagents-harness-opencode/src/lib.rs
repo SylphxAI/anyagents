@@ -5,18 +5,20 @@
 //!
 //! - the session is a fixed id (`--session`), resumed across restarts;
 //! - a mailbox line is a prompt: `POST /api/session/{id}/prompt` with the text
-//!   `anyagents-message:<id>` on its first line and `delivery: "queue"` (or
-//!   `"steer"` to join the running turn);
-//! - the turn is over when the session reports an `idle` message with
-//!   `outcome: "succeeded"`, or an assistant message whose `finish` is set;
-//! - the answer is the assistant message's text.
+//!   `anyagents-message:<id>` on its first line and `delivery: "steer"`;
+//! - the session takes the prompt as accepted as soon as the API answers with
+//!   `data`, and its own inbox decides whether that joins the running turn or
+//!   starts the next one. The host does not wait for a turn to end: there is
+//!   nothing here to wait for, and a mailbox that stopped until an idle would
+//!   stop for good one the frame that carries it was missed;
+//! - the answer is the assistant text that followed the prompt, which the agent
+//!   itself usually sends through its MCP `send` tool.
 //!
 //! The mailbox id travels in the prompt text, so the agent's own `send` (its
 //! MCP tool) is the reply path and the server records it against the same
-//! agent. Nothing here reads a credential: `opencode api` uses the service the
-//! machine already runs, or the private one this adapter starts.
+//! agent. Nothing here reads a credential: the service's address and password
+//! come from the private service this adapter starts for this agent.
 
-use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -24,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnReport, TurnState, TurnUsage, marked_message,
+    SteerQueue, SteerSupport, TurnState, TurnUsage, marked_message,
 };
 use serde_json::{Value, json};
 
@@ -56,20 +58,10 @@ pub struct OpenCodeHarness {
 struct State {
     session: Option<String>,
     alive: bool,
-    /// Ids handed to the prompt endpoint, in the order they were written.
+    /// Ids the prompt API took, in the order they were written.
     written: Vec<String>,
-    /// Every id seen in an answer or an idle message.
-    finished: HashSet<String>,
-    /// The turn's answer and usage, by owning message id.
-    answers: BTreeMap<String, String>,
-    usages: BTreeMap<String, TurnUsage>,
-    /// The message id the open turn belongs to.
-    open: Vec<String>,
-    /// When the current turn's prompt was accepted, so the poll reads only the
-    /// messages after it. A session keeps its whole history; without this, an
-    /// earlier turn's idle and answer would close this one.
-    turn_since: Option<i64>,
-    failure: Option<String>,
+    /// Turns the session reported failed, by message id.
+    failures: Vec<(String, String)>,
     /// The service this adapter started, and the password it printed. A
     /// separate `opencode api` must be pointed at that address, or it talks to
     /// whatever service the machine happens to run.
@@ -140,41 +132,39 @@ impl OpenCodeHarness {
         self
     }
 
+    /// Ids the prompt API took, in the order they were written.
     pub fn written_ids(&self) -> Vec<String> {
         self.lock().written.clone()
-    }
-    pub fn turns_started(&self) -> usize {
-        self.lock().open.len()
     }
     pub fn session_id(&self) -> Option<String> {
         self.lock().session.clone()
     }
+    /// Whether the prompt API has taken `id`.
     pub fn seen(&self, id: &str) -> bool {
-        let state = self.lock();
-        state.written.iter().any(|written| written == id) || state.finished.contains(id)
+        self.lock().written.iter().any(|written| written == id)
     }
     pub fn wait_seen(&self, id: &str, timeout: Duration) -> bool {
         self.wait(timeout, |state| {
-            state.written.iter().any(|written| written == id) || state.finished.contains(id)
+            state.written.iter().any(|written| written == id)
         })
     }
-    pub fn wait_finished(&self, id: &str, timeout: Duration) -> bool {
-        self.wait(timeout, |state| state.finished.contains(id))
-    }
-    pub fn answer(&self, id: &str) -> Option<String> {
-        self.lock().answers.get(id).cloned()
-    }
-    pub fn usage_for(&self, id: &str) -> Option<TurnUsage> {
-        self.lock().usages.get(id).cloned()
-    }
-    pub fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
-        let state = self.lock();
-        if let Some(reason) = &state.failure
-            && state.finished.contains(id)
-        {
-            return Some(TurnReport::Failed(reason.clone()));
+    /// Whether the session has answered `id`, as read from the session.
+    pub fn wait_answered(&self, id: &str, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.answer(id).is_some() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            let _ = self.poll();
+            std::thread::sleep(Duration::from_millis(100));
         }
-        state.usages.get(id).cloned().map(TurnReport::Succeeded)
+    }
+    /// The answer the session holds for `id`, as read from the session now.
+    pub fn answer(&self, id: &str) -> Option<String> {
+        self.answer_in_session(id)
     }
 
     /// Start the service, wait until it answers, and resume the session.
@@ -375,7 +365,9 @@ impl OpenCodeHarness {
         }
     }
 
-    /// Read the session's messages and record what the newest turn says.
+    /// Read the session's newest messages and record a turn it reported failed.
+    /// A delivery never waits for this: the session takes every prompt on its
+    /// own, and the answer is read from the session when it is asked for.
     fn poll(&self) -> Result<(), HarnessError> {
         let Some(session) = self.lock().session.clone() else {
             return Ok(());
@@ -384,85 +376,30 @@ impl OpenCodeHarness {
         let Some(messages) = listing.get("data").and_then(Value::as_array) else {
             return Ok(());
         };
+        // Only the newest turn is read: the listing is newest first, and an
+        // older idle frame belongs to a turn that is already settled.
+        let Some(outcome) = messages.iter().find_map(|message| {
+            (message.get("type").and_then(Value::as_str) == Some("idle"))
+                .then(|| {
+                    message
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .flatten()
+        }) else {
+            return Ok(());
+        };
+        if outcome != "failed" && outcome != "interrupted" {
+            return Ok(());
+        }
+        // The idle frame marks the end of the newest turn; every line the
+        // session has taken and not answered belongs to it.
         let mut state = self.lock();
-        // The floor is the prompt of the turn being waited for. A message handed
-        // over again after its turn already ran is settled from what the session
-        // holds, so it is not bounded by a newer floor.
-        let since = state.turn_since;
-        let mut text = String::new();
-        let mut idle_succeeded = false;
-        let mut failed = None;
-        let mut usage = TurnUsage::default();
-        for message in messages {
-            // Only this turn's messages count. A session keeps its history, so
-            // an earlier turn's answer or idle would otherwise close this one.
-            let created = message
-                .pointer("/time/created")
-                .and_then(Value::as_i64)
-                .unwrap_or(i64::MAX);
-            if since.is_some_and(|since| created < since) {
-                continue;
+        for id in state.written.clone() {
+            if !state.failures.iter().any(|(item, _)| item == &id) {
+                state.failures.push((id, outcome.clone()));
             }
-            match message.get("type").and_then(Value::as_str) {
-                Some("assistant") => {
-                    // The newest assistant message is the answer; an earlier one
-                    // belonged to a turn already settled.
-                    text.clear();
-                    for part in message
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                    {
-                        // Only a `text` part is the answer; a `reasoning` part is
-                        // the model's own thinking and is never recorded.
-                        if part.get("type").and_then(Value::as_str) != Some("text") {
-                            continue;
-                        }
-                        if let Some(part) = part.get("text").and_then(Value::as_str) {
-                            text.push_str(part);
-                        }
-                    }
-                    usage = usage_of(message);
-                    if message.get("finish").is_some() {
-                        idle_succeeded = true;
-                    }
-                }
-                Some("idle") => match message.get("outcome").and_then(Value::as_str) {
-                    Some("succeeded") | None => idle_succeeded = true,
-                    Some(other) => failed = Some(other.to_string()),
-                },
-                _ => {}
-            }
-        }
-        // Each open message is settled on its own evidence: its own answer in
-        // the session, or the idle frame of the turn it belongs to. One stale
-        // entry must never hold the turn open and defer every line behind it.
-        let open_now: Vec<String> = state.open.clone();
-        let anchored = self.answers_for(messages, &open_now).unwrap_or_default();
-        let mut settled = Vec::new();
-        for id in &open_now {
-            if let Some((_, answer)) = anchored.iter().find(|(one, _)| one == id) {
-                state.answers.insert(id.clone(), answer.clone());
-                state.usages.insert(id.clone(), usage.clone());
-                settled.push(id.clone());
-            } else if idle_succeeded || failed.is_some() {
-                if !text.is_empty() {
-                    state.answers.insert(id.clone(), text.clone());
-                }
-                state.usages.insert(id.clone(), usage.clone());
-                settled.push(id.clone());
-            }
-        }
-        for id in &settled {
-            state.finished.insert(id.clone());
-            if let Some(reason) = &failed {
-                state.failure = Some(reason.clone());
-            }
-        }
-        state.open.retain(|id| !settled.contains(id));
-        if state.open.is_empty() {
-            state.turn_since = None;
         }
         Ok(())
     }
@@ -479,17 +416,6 @@ impl OpenCodeHarness {
             .api("GET", &format!("/api/session/{session}/message"), None)
             .ok()?;
         answer_of(listing.get("data")?.as_array()?, id)
-    }
-
-    /// The answer for each of `ids` that the session already holds.
-    fn answers_for(&self, messages: &[Value], ids: &[String]) -> Option<Vec<(String, String)>> {
-        let mut found = Vec::new();
-        for id in ids {
-            if let Some(answer) = answer_of(messages, id) {
-                found.push((id.clone(), answer));
-            }
-        }
-        (!found.is_empty()).then_some(found)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -516,38 +442,31 @@ impl OpenCodeHarness {
 }
 
 impl Harness for OpenCodeHarness {
+    /// Write one mailbox line into the session's inbox as a prompt with
+    /// `delivery: "steer"`, and accept it when the prompt API answers with
+    /// `data`.
+    ///
+    /// The session owns the turn: the prompt joins the running turn or starts
+    /// the next one, whichever its inbox decides. Nothing here waits for a turn
+    /// to end, so a missed idle frame cannot hold every line behind it.
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
         if !self.lock().alive {
             return Err(HarnessError::Dead);
         }
         // An id already written is not written again: a replay after a crash
         // must not prompt the agent twice.
-        {
-            let state = self.lock();
-            if state.written.iter().any(|written| written == &message.id) {
-                // Already written: report where its turn stands. It is never
-                // re-opened here, or every retry would hold the turn open and
-                // defer every line behind it.
-                return Ok(DeliverOutcome::Accepted {
-                    turn_finished: state.finished.contains(&message.id),
-                });
-            }
-        }
-        // One prompt per turn. While a turn is still open the message stays in
-        // the mailbox: `run_once` stops here and hands it over after the open
-        // turn settles. Without this every waiting line is prompted at once and
-        // the vendor answers them together as one batched reply.
-        if !self.lock().open.is_empty() {
-            let _ = self.poll();
-            if !self.lock().open.is_empty() {
-                return Ok(DeliverOutcome::Deferred);
-            }
+        if self.lock().written.iter().any(|one| one == &message.id) {
+            return Ok(DeliverOutcome::Accepted {
+                turn_finished: false,
+            });
         }
         let Some(session) = self.lock().session.clone() else {
             return Err(HarnessError::Failed("no session".into()));
         };
-        let text = marked_message(&message.id, &message.text);
-        let body = json!({"text": text, "delivery": "queue"});
+        let body = json!({
+            "text": marked_message(&message.id, &message.text),
+            "delivery": "steer",
+        });
         let answer = self.api(
             "POST",
             &format!("/api/session/{session}/prompt"),
@@ -558,14 +477,9 @@ impl Harness for OpenCodeHarness {
                 "prompt was not taken: {answer}"
             )));
         }
-        let mut state = self.lock();
-        // This prompt's own write is the floor: nothing created before it can
-        // close this turn, and a retry moves the floor with it.
-        state.turn_since = Some(now_ms());
-        state.written.push(message.id.clone());
-        state.open.push(message.id.clone());
+        self.lock().written.push(message.id.clone());
         Ok(DeliverOutcome::Accepted {
-            turn_finished: state.finished.contains(&message.id),
+            turn_finished: false,
         })
     }
 
@@ -594,96 +508,47 @@ impl Harness for OpenCodeHarness {
         let state = self.lock();
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() {
-                TurnState::Idle
-            } else {
-                TurnState::InTurn
-            },
-            delivery_mode: DeliveryMode::Followup,
+            // The adapter never holds a turn open: a line is written and
+            // forgotten, and the session runs it. What a line is doing lives in
+            // the session's own inbox, not here.
+            turn_state: TurnState::Idle,
+            delivery_mode: DeliveryMode::Steer,
             steer_support: SteerSupport::Yes,
             quota_reset_at_ms: None,
             sign_in_fault: None,
         }
     }
 
-    /// The service prints no closing line, so a turn that has gone quiet is
-    /// over. The desk's own worker treats session idle the same way.
-    fn ends_on_quiet(&self) -> Option<Duration> {
-        Some(Duration::from_millis(500))
-    }
-
-    fn quiet_for(&self, id: &str, quiet: Duration, patience: Duration) -> bool {
-        // The service prints no closing line, so a turn is over when the session
-        // says so, or when its answer has stopped changing. The answer is
-        // recorded before this returns: the supervisor settles the message the
-        // moment it does, and nothing read afterwards is kept.
-        // A message already settled is done at once.
-        if self.lock().finished.contains(id) {
-            return true;
+    /// The session's own running totals, read from the session itself rather
+    /// than from anything this adapter kept. The host records the difference.
+    fn served_usage(&self) -> TurnUsage {
+        let Some(session) = self.lock().session.clone() else {
+            return TurnUsage::default();
+        };
+        let Ok(info) = self.api("GET", &format!("/api/session/{session}"), None) else {
+            return TurnUsage::default();
+        };
+        let Some(info) = info.get("data") else {
+            return TurnUsage::default();
+        };
+        let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
+        let number = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+        TurnUsage {
+            input_tokens: number("input"),
+            output_tokens: number("output"),
+            cache_read_tokens: tokens
+                .pointer("/cache/read")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            cache_write_tokens: tokens
+                .pointer("/cache/write")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            reported_cost_micros: info
+                .get("cost")
+                .and_then(Value::as_f64)
+                .map(|cost| (cost * 1_000_000.0) as i64),
         }
-        let deadline = Instant::now() + patience;
-        let mut last: Option<String> = None;
-        let mut still_since = Instant::now();
-        loop {
-            let _ = self.poll();
-            {
-                let state = self.lock();
-                if state.finished.contains(id) {
-                    return true;
-                }
-            }
-            // Only this message's own answer ends its turn. The CLI streams the
-            // text as it goes, so an answer is final once it has stood still.
-            let answer = self.answer(id).or_else(|| self.answer_in_session(id));
-            if answer != last {
-                last = answer;
-                still_since = Instant::now();
-            } else if still_since.elapsed() >= quiet && last.is_some() {
-                // Stand still with an answer in hand: this turn is done.
-                let mut state = self.lock();
-                let text = last.clone();
-                let mut settled = state.open.clone();
-                if settled.is_empty() {
-                    settled.push(id.to_string());
-                }
-                for open in settled {
-                    state.finished.insert(open.clone());
-                    if let Some(text) = &text {
-                        state.answers.insert(open.clone(), text.clone());
-                    }
-                    state.usages.insert(open.clone(), TurnUsage::default());
-                }
-                state.open.clear();
-                state.turn_since = None;
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    }
-
-    fn answer_for(&self, id: &str) -> Option<String> {
-        // The turn may have ended since the last poll; read the session before
-        // answering so the answer the vendor sent is the one recorded.
-        if self.answer(id).is_none() {
-            let _ = self.poll();
-        }
-        if let Some(answer) = self.answer(id) {
-            return Some(answer);
-        }
-        // Not recorded against this id yet: read the answer the session holds
-        // for exactly this message.
-        self.answer_in_session(id)
-    }
-
-    fn usage_for(&self, id: &str) -> Option<TurnUsage> {
-        OpenCodeHarness::usage_for(self, id)
-    }
-
-    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
-        OpenCodeHarness::turn_report_for(self, id)
     }
 
     fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {
@@ -694,13 +559,18 @@ impl Harness for OpenCodeHarness {
     }
 
     fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        if self.steer.is_none() || self.seen(&message.id) {
-            return Ok(false);
+        // A mailbox line already written is not written a second time. The
+        // prompt API told the session it has it, so this is a success.
+        if self.seen(&message.id) {
+            return Ok(true);
+        }
+        if !self.lock().alive {
+            return Err(HarnessError::Dead);
         }
         let Some(session) = self.lock().session.clone() else {
             return Ok(false);
         };
-        // A prompt written while the turn is open joins it.
+        // The same prompt `deliver` writes: the session decides where it goes.
         let body = json!({
             "text": marked_message(&message.id, &message.text),
             "delivery": "steer"
@@ -754,40 +624,6 @@ impl Drop for OpenCodeHarness {
             let _ = child.wait();
         }
     }
-}
-
-fn usage_of(message: &Value) -> TurnUsage {
-    let usage = message.get("tokens").cloned().unwrap_or(Value::Null);
-    let number = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    let cache = number("cache");
-    TurnUsage {
-        input_tokens: number("input"),
-        output_tokens: number("output"),
-        cache_read_tokens: if cache > 0 {
-            cache
-        } else {
-            usage
-                .pointer("/cache/read")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-        },
-        cache_write_tokens: usage
-            .pointer("/cache/write")
-            .and_then(Value::as_u64)
-            .unwrap_or(0),
-        reported_cost_micros: message
-            .get("cost")
-            .and_then(Value::as_f64)
-            .map(|cost| (cost * 1_000_000.0) as i64),
-    }
-}
-
-/// Milliseconds since the Unix epoch.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// What the service said about a stored session.

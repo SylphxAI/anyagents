@@ -33,24 +33,15 @@ fn api_base() -> String {
 /// One poll cycle for every telegram channel, waiting up to `timeout_s` for
 /// each. A channel with no secret is skipped. It returns when every channel has
 /// answered, so a runner that is about to stop does not wait out a long poll.
-pub fn poll_once(
+/// Poll one channel once. Each bot runs this on its own thread, so a quiet bot
+/// never delays another bot's update.
+pub fn poll_channel_once(
     store: &Store,
-    data_dir: &std::path::Path,
+    secrets: &FileCredentialStore,
+    channel: &Channel,
     timeout_s: u64,
 ) -> Result<(), anyagents_core::Error> {
-    let secrets = FileCredentialStore::new(data_dir);
-    let mut failure = None;
-    for channel in store.list_channels()? {
-        if let Err(err) = poll_channel(store, &secrets, &channel, timeout_s)
-            && failure.is_none()
-        {
-            failure = Some(err);
-        }
-    }
-    match failure {
-        Some(err) => Err(err),
-        None => Ok(()),
-    }
+    poll_channel(store, secrets, channel, timeout_s)
 }
 
 fn poll_channel(
@@ -466,7 +457,12 @@ mod tests {
                 credential_ref: None,
             })
             .unwrap();
-        poll_once(&store, dir.path(), 0).unwrap();
+        // A channel with no credential is not polled; the per-channel call is
+        // what skipped it.
+        let secrets = FileCredentialStore::new(dir.path());
+        for channel in store.list_channels().unwrap() {
+            poll_channel_once(&store, &secrets, &channel, 0).unwrap();
+        }
     }
 
     #[test]

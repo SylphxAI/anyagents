@@ -88,34 +88,40 @@ A harness is data: a catalog entry per vendor tool, shipped with the binary and 
 
 `agents.create(harness = "claude-code", name, model?, workdir?, instructions?, channels?)` is one call. It records the agent, ensures the harness is installed and signed in, registers the AnyAgents MCP server into that agent's harness configuration (so the agent has `send`, `inbox` and `agents` from its first turn), and starts the agent's vendor process.
 
+AnyAgents is a message switchboard plus a process supervisor. It never models a harness's agent loop: it does not track turns, wait for one to end, or read a vendor's answer at the end of one.
+
 Each agent is one long-lived vendor process in its programmatic mode, run under a supervisor:
 
 - A per-agent lock: a second process for the same agent is refused, never started beside the first.
 - Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden. Every harness keeps the id its vendor named beside its config (`<harness>-session-id`) and passes it back on the next start: the agent's own state, never only the vendor's memory. A vendor that refuses the stored id (a session it no longer has) starts a new conversation, keeps the new id, and says why on the server's stderr.
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
-- A turn that ends in an error leaves its messages accepted, never processed. If the very next turn fails on the same messages, the process that swallowed them is replaced once, so a process that is stuck in an error state cannot hold the mailbox forever.
+- A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
 ### The adapter contract
 
-One adapter per harness, five calls. A new harness is an adapter plus a catalog entry; the mailbox, channels, `send` and usage do not change.
+One adapter per harness. A new harness is an adapter plus a catalog entry; the mailbox, channels, `send` and usage do not change.
 
 | Call | Obligation |
 | --- | --- |
-| `deliver(message)` | Put one mailbox message into the live vendor process in that harness's best mode, carrying its message id. Return `accepted` once the harness has taken it (its echo or acknowledgement), or the reason it could not. |
+| `deliver(message)` | Put one mailbox message into the live vendor process through that harness's own input or steer API. Return `accepted` once the vendor has taken it (its acknowledgement, echo or written line), or the reason it could not. |
 | `background()` | Ask the vendor tool to move running work off the turn, where the tool supports it. Never wrap the tool's own tools. |
 | `resume(session)` | Reattach to the same vendor session id. |
 | `cancel()` | The vendor's own interrupt for the current turn. |
-| `health()` | Process alive, turn state, declared delivery mode, steer support (yes, no or unproven), and any current quota or sign-in fault. |
-| `turn_report_for(id)` | How the finished turn that carried `id` ended: a success with its usage, or a failure with the vendor's own error text. An adapter that cannot tell returns nothing, and the turn counts as a success. |
+| `health()` | Process alive, declared delivery mode, steer support (yes, no or unproven), and any current quota or sign-in fault. |
+| `last_usage()` | Tokens and cost the vendor reported for the runs this process made, read once when the mailbox has drained. Never part of delivery. |
 
-Every harness is admitted. The delivery mode is whatever that tool does best, declared rather than hidden:
+Every harness is admitted. The delivery mode is whatever that tool does best, declared rather than hidden. Every line is written the moment it arrives; the vendor decides whether it joins the running turn or starts the next one.
 
-| Mode | Meaning | Example |
+| Harness | Mode | How a line reaches it |
 | --- | --- | --- |
-| `steer` | Input enters the active turn, including while a tool runs. | Codex `app-server` `turn/steer`; Muse `turn/start` with `ifBusy: "steer"`. |
-| `followup` | The tool takes the input now and acts on it when the current turn ends. | OpenCode `serve`; Antigravity `--input-format stream-json`, which reads the next NDJSON line after a result; any harness with a long-lived stream that reads the next line after the result. |
-| `followup`, ending on quiet | The tool streams the answer and never prints a closing result line, so the turn is over once the stream has been silent for half a second. | None yet: the OpenCode adapter still ends a turn on its `result` line, so an agent on it is recorded only when the vendor sends one. |
-| `queue` | The tool cannot take input during a turn. The adapter holds the message (it is already durable in the mailbox) and delivers it when the turn ends. | Any harness with only one-shot runs. |
+| `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
+| `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
+| `claude-code` | `steer` | A `user` message on the stream-json child's stdin, at any point; the child echoes it, which is the acknowledgement. |
+| `muse` | `steer` | `turn/start` with `ifBusy: "steer"`. |
+| `agy` | `followup` | The CLI reads its next NDJSON line only after a result, so the adapter holds the line until then; mid-turn input is its `PreInvocation` hook (below). |
+| `followup` mode | `followup` | The contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per turn and answers with a `result`; a line written mid-turn waits for that turn to end. |
+
+No harness here uses `queue`: none of them is a one-shot run that must wait.
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
 
@@ -129,26 +135,24 @@ The per-harness programmatic modes, sign-in methods and usage fields are listed 
 Every input to an agent (a Telegram message, another agent's `send`, a CLI or TUI message) is appended to that agent's mailbox. The mailbox is the only path into a harness.
 
 - **Sequence.** On durable receive the server assigns the next per-agent sequence number. Delivery, acknowledgement and replay key on that sequence. A message's source time (the Telegram `date`, the sender's clock) is kept as metadata and shown, but never used to order: a late, older event gets the next sequence and is not inserted behind messages already delivered.
-- **Three acknowledgements**, each with its own cursor and lag:
-  1. `received`: committed to the database. From here the message survives a crash.
-  2. `accepted`: the adapter reports the harness took it.
-  3. `processed`: a turn that included it has **succeeded**. A turn that ends in an error (a sign-in failure, a vendor error, a crash after the write) records a failed turn for every message it carried: those stay `accepted`, `inbox` shows the vendor's reason, and the next turn carries them again. Only success moves this cursor.
-- **Contiguous cursors.** Each cursor advances only over a contiguous prefix of the sequence, so one stuck message is visible as the oldest unaccepted one rather than skipped.
-- **Idempotent delivery.** After a crash, messages past the `accepted` cursor are delivered again. The adapter carries the message id into the harness and drops an id it has already written, so a replay never starts a second turn. The Claude Code and Codex adapters put that id on the first line of the user text as `anyagents-message:<id>`, and Codex also sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
-- **Retention.** Processed messages are kept for a configurable period for `inbox` and audit, then compacted.
+- **One delivery cursor.** A row is `received` when its insert commits, and `delivered` when the harness's own input or steer API has taken it. There is no second cursor and no turn bookkeeping: a row is done the moment the vendor has it.
+- **Contiguous cursor.** It advances only over a contiguous prefix of the sequence, one row at a time, so one row the harness did not take is visible as the oldest undelivered one rather than skipped.
+- **Idempotent delivery.** After a crash, rows past the cursor are handed over again. Each adapter remembers the ids its session holds and drops one it has already written, so a replay never reaches the agent twice. Claude Code and Codex also carry the id in the line itself, and Codex sends it as `clientUserMessageId`. Inbound channel events dedupe on their source key (for Telegram, the bot and its update id).
+- **Egress is the agent's own `send`.** An agent replies by calling its MCP `send` tool, or a channel tool; the switchboard routes that immediately. A reply to a Telegram message carries that chat as its target, so the agent's `send` reaches the same chat. Nothing reads a vendor's transcript to find an answer.
+- **Retention.** Delivered messages are kept for a configurable period for `inbox` and audit, then compacted.
 
 ### Guarantees
 
 These are invariants with tests (`tests/invariants/`), run against a scripted fake harness that implements each delivery mode and can be killed at any point:
 
 1. No message that reached `received` is lost across a server or harness crash.
-2. No message starts two turns, including after a crash between `accepted` and its acknowledgement.
+2. No message reaches the agent twice, including after a crash between the harness taking it and the cursor recording it.
 3. Per agent, delivery follows sequence order. A late event never reorders what was already delivered.
 4. No source starves another: order is receipt order, not a priority among channels.
-5. Lag is always visible: `health` reports the age of the oldest message not yet accepted and not yet processed, per agent.
+5. Lag is always visible: `health` reports the age of the oldest message the harness has not taken, per agent.
 6. A quota fault is a reported state with a reset time, and the server keeps the mailbox growing durably while it lasts.
 7. One vendor process per agent.
-8. No inbound line is lost to a failed turn: a turn that ends in an error leaves its messages accepted and readable as failed in `inbox`, and a later successful turn processes each of them once.
+8. A line is handed over once per burst: never twice across a restart, never lost across one.
 
 ## Channels
 

@@ -3,9 +3,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{
-    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnReport,
-};
+use anyagents_harness::{DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport};
 use anyagents_harness_muse::MuseHarness;
 use tempfile::TempDir;
 
@@ -43,14 +41,13 @@ fn a_completed_turn_records_usage_and_dedupes() {
     assert_eq!(harness.health().steer_support, SteerSupport::Yes);
     harness.deliver(&msg("m1")).unwrap();
     assert!(harness.wait_finished("m1", Duration::from_secs(5)));
-    let usage = harness.usage_for("m1").expect("usage");
+    // The vendor's own turn reports its tokens, and the harness offers the last
+    // of them to the host.
+    assert!(harness.usage_for("m1").is_some());
+    let usage = harness.last_usage();
     assert_eq!(usage.input_tokens, 11);
     assert_eq!(usage.output_tokens, 7);
     assert_eq!(usage.cache_read_tokens, 3);
-    assert_eq!(
-        harness.turn_report_for("m1"),
-        Some(TurnReport::Succeeded(usage))
-    );
     assert_eq!(harness.turns_started(), 1);
     harness.deliver(&msg("m1")).unwrap();
     assert_eq!(harness.written_ids(), vec!["m1".to_string()]);
@@ -83,9 +80,8 @@ fn a_message_during_a_turn_steers_into_it_in_order() {
         harness.written_ids(),
         vec!["m1".to_string(), "m2".to_string()]
     );
-    // The turn closes once both are carried.
-    assert!(harness.wait_finished("m2", Duration::from_secs(5)));
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    // Both lines are in the one turn, which the vendor has not closed.
+    assert!(harness.in_turn());
     // The steer joined the open turn as one `turn/start` with `ifBusy`, not a
     // second turn, and the host held the approval it was asked for.
     let log = std::fs::read_to_string(dir.path().join("log")).unwrap_or_default();
@@ -95,15 +91,30 @@ fn a_message_during_a_turn_steers_into_it_in_order() {
 }
 
 #[test]
-fn a_failed_turn_is_a_failed_report_with_the_vendors_reason() {
+fn three_lines_written_during_a_turn_are_all_steered_into_it() {
+    // The vendor keeps the turn open; each line is a `turn/start` with
+    // `ifBusy: "steer"`, so all three join the one running turn.
     let dir = TempDir::new().unwrap();
-    let mut harness = start(&dir, "failed", None);
+    let mut harness = start(&dir, "hold", None);
     harness.deliver(&msg("m1")).unwrap();
-    assert!(harness.wait_finished("m1", Duration::from_secs(5)));
+    assert!(harness.wait_in_turn(Duration::from_secs(5)));
+    for id in ["m2", "m3"] {
+        assert!(matches!(
+            harness.deliver(&msg(id)).unwrap(),
+            DeliverOutcome::Accepted { .. }
+        ));
+    }
+    assert_eq!(harness.turns_started(), 1, "a steer is not a new turn");
+    assert!(harness.in_turn(), "the turn is still running");
     assert_eq!(
-        harness.turn_report_for("m1"),
-        Some(TurnReport::Failed("provider returned 500".to_string()))
+        harness.written_ids(),
+        vec!["m1".to_string(), "m2".to_string(), "m3".to_string()]
     );
+    // A replay writes nothing.
+    for id in ["m1", "m2", "m3"] {
+        harness.deliver(&msg(id)).unwrap();
+    }
+    assert_eq!(harness.written_ids().len(), 3);
 }
 
 #[test]
