@@ -55,6 +55,8 @@ pub struct RpcChild {
 struct State {
     child: Option<Child>,
     alive: bool,
+    /// Notifications the current launch printed, for a restart's outcome.
+    lines: usize,
     epoch: u64,
     next_id: i64,
     pending: HashMap<i64, Answer>,
@@ -117,23 +119,82 @@ impl RpcChild {
             wake: Arc::new(Condvar::new()),
             reader: None,
         };
-        child.spawn()?;
-        let shared = Arc::clone(&child.shared);
-        let wake = Arc::clone(&child.wake);
-        let stdin = Arc::clone(&child.stdin);
-        let name = launch.name;
-        let stdout = lock(&child.shared).take_stdout();
+        child.spawn(&on_line, &on_request)?;
+        Ok(child)
+    }
+
+    /// Start the child again, reading it exactly as the first launch did. Only
+    /// a child that is no longer running starts; a running one is never doubled.
+    pub fn restart(
+        &mut self,
+        on_line: &Arc<dyn Fn(&Value) -> NotificationEffect + Send + Sync>,
+        on_request: &RequestHandler,
+    ) -> Result<(), HarnessError> {
+        self.spawn(on_line, on_request)
+    }
+
+    fn spawn(
+        &mut self,
+        on_line: &Arc<dyn Fn(&Value) -> NotificationEffect + Send + Sync>,
+        on_request: &RequestHandler,
+    ) -> Result<(), HarnessError> {
+        if self.alive() {
+            return Err(HarnessError::Failed(
+                "the child is still running; it is not started twice".into(),
+            ));
+        }
+        let mut command = Command::new(&self.program);
+        crate::close_inherited_files(&mut command);
+        command
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        if let Some(dir) = &self.work_dir {
+            command.current_dir(dir);
+        }
+        for (key, value) in &self.environment {
+            command.env(key, value);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|err| HarnessError::Failed(err.to_string()))?;
+        let Some(child_stdin) = child.stdin.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::Failed("child stdin missing".into()));
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::Failed("child stdout missing".into()));
+        };
+        {
+            let mut state = lock(&self.shared);
+            state.child = Some(child);
+            state.stdout = Some(stdout);
+            state.alive = true;
+            state.lines = 0;
+        }
+        *lock(&self.stdin) = Some(child_stdin);
+        let shared = Arc::clone(&self.shared);
+        let wake = Arc::clone(&self.wake);
+        let stdin = Arc::clone(&self.stdin);
+        let line = Arc::clone(on_line);
+        let request = Arc::clone(on_request);
+        let name = format!("{}-reader", self.program.display());
+        let stdout = lock(&self.shared).take_stdout();
         match thread::Builder::new()
             .name(name)
-            .spawn(move || read_stdout(stdout, shared, wake, stdin, on_line, on_request))
+            .spawn(move || read_stdout(stdout, shared, wake, stdin, line, request))
         {
-            Ok(handle) => child.reader = Some(handle),
+            Ok(handle) => self.reader = Some(handle),
             Err(err) => {
-                child.stop_child();
+                self.stop_child();
                 return Err(HarnessError::Failed(err.to_string()));
             }
         }
-        Ok(child)
+        Ok(())
     }
 
     pub fn program(&self) -> &Path {
@@ -154,6 +215,13 @@ impl RpcChild {
 
     pub fn epoch(&self) -> u64 {
         lock(&self.shared).epoch
+    }
+
+    /// Notifications the current launch printed. An answer to one of our own
+    /// requests is not counted: only the vendor speaking on its own proves it
+    /// took the session it was given.
+    pub fn lines(&self) -> usize {
+        lock(&self.shared).lines
     }
 
     pub fn process_id(&self) -> Option<u32> {
@@ -325,43 +393,6 @@ impl RpcChild {
         }
         state.alive = false;
     }
-
-    fn spawn(&mut self) -> Result<(), HarnessError> {
-        let mut command = Command::new(&self.program);
-        crate::close_inherited_files(&mut command);
-        command
-            .args(&self.args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
-        if let Some(dir) = &self.work_dir {
-            command.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            command.env(key, value);
-        }
-        let mut child = command
-            .spawn()
-            .map_err(|err| HarnessError::Failed(err.to_string()))?;
-        let Some(child_stdin) = child.stdin.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(HarnessError::Failed("child stdin missing".into()));
-        };
-        let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(HarnessError::Failed("child stdout missing".into()));
-        };
-        {
-            let mut state = lock(&self.shared);
-            state.child = Some(child);
-            state.stdout = Some(stdout);
-            state.alive = true;
-        }
-        *lock(&self.stdin) = Some(child_stdin);
-        Ok(())
-    }
 }
 
 impl Drop for RpcChild {
@@ -427,6 +458,9 @@ fn read_stdout(
         }
         {
             let mut state = lock(&shared);
+            if method.is_some() && value.get("id").is_none() {
+                state.lines += 1;
+            }
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();

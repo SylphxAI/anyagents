@@ -93,7 +93,7 @@ AnyAgents is a message switchboard plus a process supervisor. It never models a 
 Each agent is one long-lived vendor process in its programmatic mode, run under a supervisor:
 
 - A per-agent lock: a second process for the same agent is refused, never started beside the first.
-- Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden.
+- Restart with exponential backoff and jitter after a crash, resuming the same vendor session id. Starting a new session in place of a failed resume is reported as a failed resume, not hidden. Every harness keeps the id its vendor named beside its config (`<harness>-session-id`) and passes it back on the next start: the agent's own state, never only the vendor's memory. A vendor that refuses the stored id (a session it no longer has) starts a new conversation, keeps the new id, and says why on the server's stderr.
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
