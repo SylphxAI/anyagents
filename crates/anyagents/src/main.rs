@@ -24,6 +24,7 @@ mod mcp_config;
 mod muse_config;
 mod opencode_config;
 mod operator;
+mod reply;
 mod sandbox;
 mod server;
 mod signin;
@@ -112,9 +113,10 @@ enum Command {
     /// Speak MCP for one agent. Its capability comes from its config
     /// directory, never from a name.
     Mcp {
-        /// The agent's own config directory.
+        /// The agent's own config directory. The server names it to every
+        /// harness it starts, so a harness that omits it is read from there.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
     /// Start one agent command inside the deployment's OS boundary, or refuse
     /// and name the admission it needs. Never starts it unisolated.
@@ -149,6 +151,13 @@ enum Command {
         /// The conversation the CLI reports; an event from any other is ignored.
         #[arg(long, default_value = "")]
         conversation: String,
+    },
+    /// Put one agent's mailbox into its harness now, if the running server has
+    /// not. Reads the store directly, so it also covers a server that was just
+    /// upgraded and is still inside its restart backoff.
+    Flush {
+        /// The agent name, or `all`.
+        agent: String,
     },
     /// Record a channel. The secret is copied into the credential store.
     Channels {
@@ -233,7 +242,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 Ok(())
             }
         },
-        Command::Mcp { config } => mcp::run(&cli.data, &config),
+        Command::Mcp { config } => mcp::run(&cli.data, config.as_deref()),
         Command::AgentRun { config, command } => {
             sandbox::run(&cli.data, config.as_deref(), &command)
         }
@@ -248,6 +257,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             Ok(())
         }
         Command::Agents { action } => agent::agents(&cli.data, action),
+        Command::Flush { agent } => agent::flush(&cli.data, &agent),
         Command::Model {
             agent,
             base_url,
@@ -276,14 +286,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 agent::UsageError::Store(err) => err,
                 agent::UsageError::Refused(text) => anyagents_core::Error::Message(text),
             }),
-        Command::Channels { action } => match action {
-            ChannelsCommand::Add {
-                kind,
-                agent,
-                token_file,
-            } => channel::add_channel(&cli.data, &kind, &agent, &token_file),
-            ChannelsCommand::List => channel::list_channels(&cli.data),
-        },
+        Command::Channels { action } => channel::channels(&cli.data, action),
         Command::Groups { action } => groups(&cli.data, action),
     }
 }
@@ -391,12 +394,11 @@ fn agy_hook(data: &Path, agent: &str, conversation: &str) {
         return;
     };
     // The mailbox is in sequence order, oldest first. Only what the harness has
-    // not taken counts: a message the server wrote is the turn's own prompt, and
-    // the server moves its cursor when it writes it.
+    // A hook only offers what the harness has not taken: `received`.
     let lines: Vec<MessageView> = before
         .messages
         .into_iter()
-        .filter(|line| !line.accepted)
+        .filter(|line| line.ack == "received")
         .collect();
     if lines.is_empty() {
         let _ = writeln!(stdout, "{{}}");
@@ -462,3 +464,4 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
     }
     Ok(())
 }
+

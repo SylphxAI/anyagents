@@ -90,16 +90,13 @@ fn capability_key() -> Result<String, Error> {
 async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
     let store = Arc::new(Store::open(data.join("state.db"))?);
     store.hold_capability_key(&capability_key()?)?;
-    let auth = auth::Mode::from_env();
+    let auth = deployment_mode(data);
+    if !auth.is_confined() {
+        not_confined_note(data);
+    }
     // The boundary contract is written and read back before the socket is
     // bound, so a client never reaches an API whose boundary is not in place.
     let boundary = anyagents_core::boundary::write(data)?;
-    if !auth.is_confined() {
-        let data = data.display();
-        eprintln!(
-            "warning: single-user route: an unauthenticated call acts as the agent it names on {data}; start with an operator token for the identity boundary"
-        );
-    }
     let path = socket_path(data);
     if path.as_os_str().len() > MAX_SOCKET_PATH {
         return Err(Error::Message(format!(
@@ -157,6 +154,41 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     result.map_err(Error::from)
 }
 
+/// How this server authenticates. A machine started without an operator token
+/// serves the agents on its own machine, and names them by the route it serves:
+/// its data directory, as a start script exports it to every harness. With an
+/// operator token the server is the identity boundary and reads nothing from a
+/// name.
+fn deployment_mode(data: &Path) -> auth::Mode {
+    match auth::Mode::from_env() {
+        auth::Mode::Confined {
+            operator_digest: None,
+        } => match std::fs::canonicalize(data) {
+            Ok(dir) => {
+                let dir = dir.display().to_string();
+                // [`not_confined_note`] says it once, on stderr, and the note
+                // names no secret.
+                auth::Mode::Trusted {
+                    data_dir: std::path::PathBuf::from(dir),
+                }
+            }
+            Err(_) => auth::Mode::Confined {
+                operator_digest: None,
+            },
+        },
+        other => other,
+    }
+}
+
+/// The one line a single-user deployment says at start.
+pub fn not_confined_note(data: &Path) {
+    let dir = std::fs::canonicalize(data).unwrap_or_else(|_| data.to_path_buf());
+    eprintln!(
+        "warning: single-user route: an unauthenticated call acts as the agent it names on {}; start with an operator token for the identity boundary",
+        dir.display()
+    );
+}
+
 /// Mint an agent's capability after its instance was made (a create, a new
 /// sign-in), so its harness starts with one and the last one is retired.
 fn capability_mark(data_dir: &Path) -> impl Fn() -> Result<(), Error> + Send + Sync + 'static {
@@ -188,10 +220,11 @@ async fn mint_capability(
     Ok(Json(serde_json::json!({ "agent": agent.name, "minted": true })))
 }
 
-/// `GET /v1/whoami`: the agent this capability authenticates, as the server
-/// resolved it. A tool server reads its own identity here and nowhere else.
-async fn whoami(principal: Principal) -> Result<Json<serde_json::Value>, ApiError> {
-    match principal {
+/// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
+/// speaks for anyone, and gets the id the server resolved from the capability,
+/// never the name a caller wrote.
+async fn whoami(ctx: Whoami) -> Result<Json<serde_json::Value>, ApiError> {
+    match ctx.principal {
         Principal::Agent { agent_id, name } => Ok(Json(serde_json::json!({
             "agent_id": agent_id.as_str(),
             "name": name,
@@ -200,6 +233,43 @@ async fn whoami(principal: Principal) -> Result<Json<serde_json::Value>, ApiErro
             StatusCode::BAD_REQUEST,
             "the operator authenticated, but this call names an agent",
         )),
+    }
+}
+
+/// The principal a `whoami` call resolved, from the capability header or, on a
+/// deployment without the boundary, from the credential the tool server reads.
+struct Whoami {
+    principal: Principal,
+}
+
+impl axum::extract::FromRequestParts<AppState> for Whoami {
+    type Rejection = auth::AuthRejection;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if state.auth.is_trusted()
+            && parts
+                .headers
+                .get(crate::operator::AGENT_HEADER)
+                .is_none()
+            && let Some(id) = parts
+                .headers
+                .get("x-anyagents-agent-id")
+                .and_then(|value| value.to_str().ok())
+        {
+            // A machine without the boundary: the tool server says which agent
+            // its own config directory belongs to, and the server checks that
+            // the agent exists. Only here, and only for this read.
+            let principal = auth::agent_by_name(&state.store, id.trim())
+                .map_err(auth::AuthRejection)?;
+            return Ok(Self { principal });
+        }
+        use axum::extract::FromRequestParts;
+        let principal = <Principal as FromRequestParts<AppState>>::from_request_parts(parts, state)
+            .await?;
+        Ok(Self { principal })
     }
 }
 
@@ -463,8 +533,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         delivery_mode: mode.to_string(),
         steer_support: steer.to_string(),
         quota_reset_at_ms: quota,
-        oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
-        oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
+        oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: install_state(agent),
     })
 }
@@ -524,8 +593,11 @@ async fn inbox(
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?
             .id,
-        Principal::Agent { agent_id, name: own } => {
-            if *own != name {
+        // A session reads the mailbox its capability names. The id in the path
+        // is a check that it named its own, so an inbox is never chosen by a
+        // string the model wrote.
+        Principal::Agent { agent_id, .. } => {
+            if name != agent_id.as_str() {
                 let forbidden = auth::AuthError::Forbidden(
                     "a session reads its own inbox, not another agent's".to_string(),
                 );
@@ -555,9 +627,8 @@ fn inbox_of(
             reply_to: message.reply_to,
             source_time_ms: message.source_time_ms,
             received_at_ms: message.received_at_ms,
-            accepted: message.ack != anyagents_core::Ack::Received,
+            delivered_at_ms: message.delivered_at_ms,
             ack: message.ack.to_string(),
-            failed_reason: message.failed_reason,
         })
         .collect();
     Ok(Json(InboxResponse { messages }))
@@ -601,13 +672,82 @@ async fn send(
     };
     let key = send_key(&state.send_namespace, &body);
     let store = Arc::clone(&state.store);
-    spawn_store(move || send_sync(&store, &actor, body, key)).await
+    let principal_for_plan = principal.clone();
+    let body_for_plan = body.clone();
+    let plan = spawn_store(move || plan_send(&store, &principal_for_plan, &body_for_plan)).await?;
+    let store = Arc::clone(&state.store);
+    spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
+}
+
+/// One send, resolved to the destinations it will write, before any of them is
+/// validated or posted. `reply_to` is a mailbox reference the server resolves
+/// against this agent's own mailbox, or a destination written plainly.
+fn plan_send(store: &Store, principal: &Principal, body: &SendRequest) -> Result<SendPlan, ApiError> {
+    let mut plan = SendPlan::parse(store, body)?;
+    let reply = match crate::reply::resolve(principal, |id| own_message(store, principal, id), body.reply_to.as_deref())
+        .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?
+    {
+        Some(destination) => Some(destination),
+        None => None,
+    };
+    if let Some(destination) = reply {
+        // A reply names where it goes, and the record decides that: the
+        // addresses are only checked against it when the caller wrote some.
+        // An agent message names the agent, and an address may say so as a
+        // bare name or as `agent:<name>`.
+        let wanted = destination.address();
+        let bare = wanted.strip_prefix("agent:").unwrap_or(&wanted).to_string();
+        let named: Vec<String> = plan.targets.iter().map(Target::address).collect();
+        if !plan.targets.is_empty()
+            && !named
+                .iter()
+                .any(|one| *one == wanted || one.strip_prefix("agent:") == Some(bare.as_str()))
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "this reply names one place, and the addresses name another",
+            ));
+        }
+        plan.targets = vec![target_of(&destination)];
+        plan.reply = destination.reply().map(str::to_string);
+    }
+    Ok(plan)
+}
+
+/// One message of this agent's own mailbox, by id.
+fn own_message(
+    store: &Store,
+    principal: &Principal,
+    id: &str,
+) -> Result<Option<anyagents_core::Message>, String> {
+    let agent_id = match principal {
+        Principal::Agent { agent_id, .. } => agent_id.clone(),
+        Principal::Operator => return Ok(None),
+    };
+    store
+        .message(&agent_id, id)
+        .map_err(|err| err.to_string())
+}
+
+fn target_of(destination: &crate::reply::Destination) -> Target {
+    match destination {
+        crate::reply::Destination::Telegram { chat, thread, .. } => Target::Telegram {
+            address: destination.address(),
+            chat: chat.clone(),
+            thread: thread.clone(),
+            reply: None,
+        },
+        crate::reply::Destination::Agent(name) => Target::Agent(name.clone()),
+        crate::reply::Destination::Group(name) => Target::Room(name.clone()),
+    }
 }
 
 /// One send, resolved to the destinations it will write, before any of them is
 /// validated or posted.
 struct SendPlan {
     targets: Vec<Target>,
+    /// The provider message id a reply answers, when the reply named one.
+    reply: Option<String>,
 }
 
 enum Target {
@@ -621,9 +761,20 @@ enum Target {
     },
 }
 
+impl Target {
+    /// The address this target is written as.
+    fn address(&self) -> String {
+        match self {
+            Self::Agent(name) => format!("agent:{name}"),
+            Self::Room(room) => format!("group:{room}"),
+            Self::Telegram { address, .. } => address.clone(),
+        }
+    }
+}
+
 impl SendPlan {
     fn parse(store: &Store, body: &SendRequest) -> Result<Self, ApiError> {
-        if body.to.is_empty() {
+        if body.to.is_empty() && body.reply_to.is_none() {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "send needs an address",
@@ -659,7 +810,10 @@ impl SendPlan {
             }
         }
         let _ = store;
-        Ok(Self { targets })
+        Ok(Self {
+            targets,
+            reply: None,
+        })
     }
 }
 
@@ -698,9 +852,19 @@ fn send_sync(
     store: &Store,
     actor: &Actor,
     body: SendRequest,
+    plan: SendPlan,
     key: Option<String>,
 ) -> Result<Json<SendResponse>, ApiError> {
-    let plan = SendPlan::parse(store, &body)?;
+    // A call repeated after its answer was lost is the same delivery: the
+    // receipt it already produced comes back unchanged.
+    if let Some(key) = key.as_deref()
+        && let Some(text) = store.send_receipt(key).map_err(ApiError::from_store)?
+    {
+        let receipt: SendResponse = serde_json::from_str(&text)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        return Ok(Json(receipt));
+    }
+    let reply = plan.reply.clone();
     check_targets(store, actor, &body, &plan)?;
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
@@ -716,7 +880,7 @@ fn send_sync(
                 address,
                 chat,
                 thread,
-                reply,
+                reply: address_reply,
             } => deliveries.push(deliver_telegram(
                 store,
                 actor,
@@ -724,11 +888,19 @@ fn send_sync(
                 address,
                 chat,
                 thread.as_deref(),
-                reply.as_deref(),
+                address_reply.as_deref().or(reply.as_deref()),
             )?),
         }
     }
-    Ok(Json(SendResponse { deliveries }))
+    let response = SendResponse { deliveries };
+    if let Some(key) = key.as_deref() {
+        let text = serde_json::to_string(&response)
+            .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        store
+            .record_send_receipt(key, &text)
+            .map_err(ApiError::from_store)?;
+    }
+    Ok(Json(response))
 }
 
 /// The idempotency key of one call. The same call repeated after a lost
@@ -827,6 +999,7 @@ fn deliver_room(
                 source_key: key.map(str::to_string),
                 reply_to: body.reply_to.clone(),
                 quote: body.quote.clone(),
+                origin: None,
                 received_at_ms: None,
             },
         )
@@ -865,6 +1038,7 @@ fn deliver_agent(
                 source_key: key.map(str::to_string),
                 reply_to: body.reply_to.clone(),
                 quote: body.quote.clone(),
+                origin: None,
                 received_at_ms: None,
             },
         )

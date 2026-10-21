@@ -40,7 +40,12 @@ pub fn send(
     if server::socket_path(data).exists() {
         let body = SendRequest {
             sender: from.clone(),
-            to: vec![to.to_string()],
+            // A reply names where it goes; the address is only what was typed.
+            to: if reply_to.is_some() {
+                Vec::new()
+            } else {
+                vec![to.to_string()]
+            },
             text: text.clone(),
             reply_to: reply_to.clone(),
             quote: None,
@@ -101,6 +106,7 @@ fn send_stored(
                     source_key,
                     reply_to,
                     quote: None,
+                    origin: None,
                     received_at_ms: None,
                 },
             )?;
@@ -152,6 +158,7 @@ fn send_stored(
             source_key,
             reply_to,
             quote: None,
+            origin: None,
             received_at_ms: None,
         },
     )?;
@@ -200,11 +207,9 @@ fn parse_id(raw: &str, what: &'static str) -> Result<i64, Error> {
 }
 
 pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> {
-    if server::socket_path(data).exists() {
-        let who = match client::agent_identity() {
-            Some(id) => id,
-            None => named(data, agent)?.id,
-        };
+    if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
+        let who = named(data, agent)?.id;
+        let _ = &who;
         let path = match since {
             Some(since) => format!("/v1/agents/{who}/inbox?since={since}"),
             None => format!("/v1/agents/{who}/inbox"),
@@ -230,9 +235,8 @@ pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> 
                 reply_to: message.reply_to,
                 source_time_ms: message.source_time_ms,
                 received_at_ms: message.received_at_ms,
-                accepted: message.ack != anyagents_core::Ack::Received,
                 ack: message.ack.to_string(),
-                failed_reason: message.failed_reason,
+                delivered_at_ms: message.delivered_at_ms,
             })
             .collect(),
     });
@@ -241,14 +245,23 @@ pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> 
 
 fn print_messages(read: InboxResponse) {
     for message in read.messages {
-        let ack = match &message.failed_reason {
-            Some(reason) => format!("failed ({reason})"),
-            None => message.ack.clone(),
-        };
+        let ack = message.ack.clone();
         println!(
             "{}\t{}\t{}\t{}",
             message.seq, ack, message.received_at_ms, message.text
         );
+    }
+}
+
+/// `channels add` and `channels list`.
+pub fn channels(data: &Path, action: crate::ChannelsCommand) -> Result<(), Error> {
+    match action {
+        crate::ChannelsCommand::Add {
+            kind,
+            agent,
+            token_file,
+        } => add_channel(data, &kind, &agent, &token_file),
+        crate::ChannelsCommand::List => list_channels(data),
     }
 }
 

@@ -28,11 +28,13 @@ pub(crate) enum Authority {
 /// The authority this process may present: the agent's own capability when it
 /// runs inside an agent, else the operator's token.
 pub(crate) fn authority() -> Authority {
-    if let Some(id) = agent_identity() {
-        return Authority::Agent(id);
-    }
+    // Inside an agent its own capability is the only authority it has; a
+    // command run by the operator presents the operator's token.
     if crate::operator::operator_token().is_some() {
         return Authority::Operator;
+    }
+    if let Some(id) = agent_identity() {
+        return Authority::Agent(id);
     }
     Authority::None
 }

@@ -619,6 +619,14 @@ fn incoming_from(inbound: &Inbound) -> anyagents_core::Incoming {
         source_key: Some(inbound.source_key.clone()),
         reply_to: Some(reply_target(inbound)),
         quote: inbound.quote.clone(),
+        // The provider's own coordinates of this message: a bare answer is
+        // resolved against these, so a group message is answered in its group
+        // and its topic, at the message that arrived.
+        origin: Some(anyagents_core::Origin {
+            chat_id: Some(inbound.chat_id),
+            thread_id: inbound.thread_id,
+            message_id: Some(inbound.message_id),
+        }),
         received_at_ms: None,
     }
 }

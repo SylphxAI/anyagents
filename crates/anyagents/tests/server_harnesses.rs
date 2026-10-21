@@ -10,6 +10,8 @@
 //! harnesses. The vendor protocols themselves are covered by each adapter's
 //! protocol tests.
 
+mod support;
+
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -139,7 +141,8 @@ fn call(socket: &Path, request: &str) -> Value {
     stream
         .write_all(
             format!(
-                "POST /v1/send HTTP/1.1\r\nHost: local\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}",
+                "POST /v1/send HTTP/1.1\r\nHost: local\r\n{}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{request}",
+                support::header(),
                 request.len()
             )
             .as_bytes(),
@@ -187,9 +190,11 @@ fn one_round(data: &Path, name: &str, harness: &str) {
 
 #[test]
 fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
+    support::operator(&data);
     // The agent that asks: the answers come back to it.
     create_asker(&data);
     let (agy_file, muse_file) = (data.join("agent-argon"), data.join("agent-calliope"));

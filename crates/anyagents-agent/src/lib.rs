@@ -1,18 +1,9 @@
-//! Delivery loop. It hands each message past the accepted cursor to the harness,
-//! in sequence order, and moves the cursors only after the harness answers.
+//! Delivery loop. It hands each message past the delivery cursor to the
+//! harness, in sequence order, and moves the cursor only after the harness's
+//! own input or steer API has taken the message. It never looks at a turn.
 
-use anyagents_core::{Agent, AgentId, Incoming, Message, Store};
-use anyagents_harness::{
-    DeliverOutcome, Harness, HarnessError, OutboundMessage, SteerItem, message_id_in_text,
-};
-
-/// How many pushed lines ahead of the mailbox message are injected first.
-const PUSHED_AHEAD_LIMIT: usize = 64;
-
-/// A mid-turn injection did not happen: the adapter took the message and did not
-/// write it. The work stands still and the supervisor asks again later.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Held;
+use anyagents_core::{AgentId, Message, Store};
+use anyagents_harness::{DeliverOutcome, Harness, HarnessError, OutboundMessage, SteerItem};
 
 pub use anyagents_harness::{DeliveryMode, SteerSupport, TurnState};
 
@@ -25,8 +16,6 @@ pub enum Error {
     HarnessDown,
     #[error("harness failed: {0}")]
     HarnessFailed(String),
-    #[error("mid-turn input is held for the next step")]
-    Held,
 }
 
 impl Error {
@@ -39,22 +28,14 @@ impl Error {
 /// What one pass over the mailbox did.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RunOutcome {
+    /// The mailbox has nothing the harness has not taken.
     Idle,
+    /// Every new line was handed over; `delivered` is how many.
     Delivered {
-        accepted: u64,
-        /// Highest sequence marked processed during this pass, or 0 when no turn finished.
-        processed_through: i64,
-    },
-    Deferred {
-        seq: i64,
+        delivered: u64,
     },
     Quota {
         reset_at_ms: i64,
-    },
-    /// A new mailbox message reached the running turn and was taken by the
-    /// vendor; the cursor advanced exactly once. The turn is still open.
-    Steered {
-        seq: i64,
     },
 }
 
@@ -67,8 +48,7 @@ pub struct AgentHealth {
     pub steer_support: SteerSupport,
     pub quota_reset_at_ms: Option<i64>,
     pub sign_in_fault: Option<String>,
-    pub oldest_unaccepted_age_ms: Option<i64>,
-    pub oldest_unprocessed_age_ms: Option<i64>,
+    pub oldest_undelivered_age_ms: Option<i64>,
 }
 
 /// One running agent: the mailbox, the per-agent lock, and its harness.
@@ -79,28 +59,6 @@ pub struct DeliveryLoop<H: Harness> {
     // Held so the process lock stays until this loop is dropped.
     _lock: anyagents_core::AgentLock,
     quota_reset_at_ms: Option<i64>,
-}
-
-/// Whether `message` is an agent reply row written by [`DeliveryLoop::record_answer`].
-pub fn is_recorded_answer(message: &Message) -> bool {
-    message
-        .source_key
-        .as_deref()
-        .is_some_and(|key| key.starts_with("answer:"))
-}
-
-/// The vendor echoes the marked prompt as the first line. The marker line is
-/// not part of the answer.
-fn answer_text(text: &str) -> String {
-    let mut lines = text.lines();
-    let Some(first) = lines.next() else {
-        return String::new();
-    };
-    if message_id_in_text(first).is_some() {
-        lines.collect::<Vec<_>>().join("\n").trim().to_string()
-    } else {
-        text.trim().to_string()
-    }
 }
 
 impl<H: Harness> DeliveryLoop<H> {
@@ -117,10 +75,11 @@ impl<H: Harness> DeliveryLoop<H> {
         })
     }
 
-    /// Hand the next unaccepted message to the harness and do not move a cursor.
-    /// Dropping the loop after this is the crash between accept and its commit.
+    /// Hand the next undelivered message to the harness and do not move the
+    /// cursor. Dropping the loop after this is the crash between the harness
+    /// taking the line and the cursor recording it.
     pub fn deliver_next_without_commit(&mut self) -> Result<Option<DeliverOutcome>, Error> {
-        let Some(message) = self.store.next_unaccepted(&self.agent_id)? else {
+        let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
             return Ok(None);
         };
         match self.harness.deliver(&outbound(&message)) {
@@ -130,54 +89,36 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// Deliver every unaccepted message until the mailbox is caught up, the harness
-    /// defers, or it reports a quota reset. A quota answer is returned, not retried.
+    /// Hand every undelivered message to the harness in sequence order, moving
+    /// the cursor after each one its native input or steer API has taken. A
+    /// quota answer is returned, not retried.
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
-        let mut accepted = 0u64;
-        let mut processed_through = 0i64;
+        let mut delivered = 0u64;
         loop {
-            let Some(message) = self.store.next_unaccepted(&self.agent_id)? else {
-                return Ok(if accepted == 0 {
+            let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
+                return Ok(if delivered == 0 {
                     RunOutcome::Idle
                 } else {
-                    RunOutcome::Delivered {
-                        accepted,
-                        processed_through,
-                    }
+                    RunOutcome::Delivered { delivered }
                 });
             };
             let seq = message.seq;
-            // The agent's own answer is never handed back as a turn. It was
-            // written by `record_answer` for a turn that already finished, so it
-            // is settled here and the loop moves on. Handing it over opened a
-            // phantom turn in the harness that the supervisor never settled,
-            // and every real line behind it waited out the turn patience.
-            if is_recorded_answer(&message) {
-                // Only settle the answer when nothing before it is still in
-                // turn. Advancing past an earlier line would mark it processed
-                // before its own answer was recorded.
-                let caught_up = self.store.processed_cursor(&self.agent_id)? + 1 == seq;
-                self.store.note_handover(&self.agent_id, seq, true)?;
-                self.store.note_delivery(&self.agent_id, seq, caught_up)?;
-                accepted += 1;
-                if caught_up {
-                    processed_through = seq;
-                }
-                continue;
-            }
             match self.harness.deliver(&outbound(&message)) {
-                Ok(DeliverOutcome::Accepted { turn_finished }) => {
-                    self.store
-                        .note_handover(&self.agent_id, seq, turn_finished)?;
-                    self.store
-                        .note_delivery(&self.agent_id, seq, turn_finished)?;
-                    accepted += 1;
-                    if turn_finished {
-                        processed_through = seq;
-                    }
+                Ok(DeliverOutcome::Accepted { .. }) => {
+                    self.store.note_delivered(&self.agent_id, seq)?;
+                    delivered += 1;
                     self.quota_reset_at_ms = None;
                 }
-                Ok(DeliverOutcome::Deferred) => return Ok(RunOutcome::Deferred { seq }),
+                // A harness that could not take the line leaves it where it is.
+                // The pass ends with what it did take, never with the line
+                // claimed as delivered.
+                Ok(DeliverOutcome::Deferred) => {
+                    return Ok(if delivered == 0 {
+                        RunOutcome::Idle
+                    } else {
+                        RunOutcome::Delivered { delivered }
+                    });
+                }
                 Ok(DeliverOutcome::Quota { reset_at_ms }) => {
                     self.quota_reset_at_ms = Some(reset_at_ms);
                     return Ok(RunOutcome::Quota { reset_at_ms });
@@ -188,138 +129,44 @@ impl<H: Harness> DeliveryLoop<H> {
         }
     }
 
-    /// Put every new mailbox message into the running turn through the
-    /// adapter's between-steps channel, in sequence order.
-    ///
-    /// The message is still written by [`DeliveryLoop::deliver_next_without_commit`]
-    /// and committed by [`DeliveryLoop::run_once`] when `inject` reports the
-    /// vendor took it, so a replay after a crash either sees the id held by the
-    /// adapter (not written twice) or writes it as a fresh turn. The cursor
-    /// holds while the adapter does not take the message.
+    /// Put every new mailbox message into the harness through its between-steps
+    /// channel, in sequence order, and move the cursor behind each one it takes.
     pub fn steer_next(&mut self) -> Result<Option<SteerItem>, Error> {
-        let Some(message) = self.store.next_unaccepted(&self.agent_id)? else {
+        let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
             return Ok(None);
         };
-        // The vendor's channel may hold lines the mailbox does not have yet; an
-        // older line is injected as itself and the mailbox message waits for
-        // the line the channel pushed for it, or is written when none comes.
-        let mut pushed = 0;
-        loop {
-            let item = self.harness.poll_steer().map_err(inject_error)?;
-            match item {
-                Some(item)
-                    if item.message.id != message.id.as_str() && pushed < PUSHED_AHEAD_LIMIT =>
-                {
-                    pushed += 1;
-                    self.inject_pushed(item)?;
-                }
-                Some(item) if item.message.id == message.id.as_str() => {
-                    if self.inject(item, true)? {
-                        return Ok(Some(SteerItem {
-                            order: 0,
-                            message: outbound(&message),
-                        }));
-                    }
-                    return Err(Error::Held);
-                }
-                _ => break,
+        // An older line the channel pushed before the mailbox stored it is
+        // written first; anything else waits for its own turn.
+        if let Some(item) = self.harness.poll_steer().map_err(inject_error)?
+            && item.message.id != message.id.as_str()
+        {
+            let id = item.message.id.clone();
+            match self.harness.inject(&item.message) {
+                Ok(true) => {}
+                Ok(false) => self.harness.release_steer(&id),
+                Err(HarnessError::Dead) => return Err(Error::HarnessDown),
+                Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
             }
         }
         let item = SteerItem {
             order: 0,
             message: outbound(&message),
         };
-        if self.inject(item.clone(), false)? {
-            Ok(Some(item))
-        } else {
-            Err(Error::Held)
-        }
-    }
-
-    /// Write one message into the running turn. `true` when the vendor took it;
-    /// `false` when the adapter holds it for the next step.
-    ///
-    /// A message the vendor took is accepted once, and its turn is the open turn
-    /// that will settle it: the processed cursor does not move on the hand-over.
-    pub fn inject(&mut self, item: SteerItem, pushed: bool) -> Result<bool, Error> {
-        let id = item.message.id.clone();
-        let seq = item.message.seq;
         let taken = match self.harness.inject(&item.message) {
             Ok(taken) => taken,
             Err(HarnessError::Dead) => return Err(Error::HarnessDown),
             Err(HarnessError::Failed(reason)) => return Err(Error::HarnessFailed(reason)),
         };
         if !taken {
-            self.harness.release_steer(&id);
-            return Ok(false);
+            self.harness.release_steer(message.id.as_str());
+            return Ok(None);
         }
-        self.store.note_handover(&self.agent_id, seq, false)?;
-        // A line only the channel pushed still moves the accepted cursor, so the
-        // open turn settles it like any other message.
-        if pushed {
-            self.store.note_delivery(&self.agent_id, seq, false)?;
-        }
-        Ok(true)
+        self.store.note_delivered(&self.agent_id, message.seq)?;
+        Ok(Some(item))
     }
 
-    fn inject_pushed(&mut self, item: SteerItem) -> Result<(), Error> {
-        let id = item.message.id.clone();
-        match self.harness.inject(&item.message) {
-            Ok(true) => Ok(()),
-            Ok(false) => {
-                self.harness.release_steer(&id);
-                Ok(())
-            }
-            Err(HarnessError::Dead) => Err(Error::HarnessDown),
-            Err(HarnessError::Failed(reason)) => Err(Error::HarnessFailed(reason)),
-        }
-    }
-
-    /// Record the harness's latest answer to the first message past the
-    /// processed cursor, as a reply from the agent. A repeated answer is one row.
-    pub fn record_answer(&self, agent: &Agent) -> Result<(), Error> {
-        let seq = self.store.processed_cursor(&self.agent_id)?;
-        let Some(message) = self
-            .store
-            .inbox(&self.agent_id, Some(seq))?
-            .into_iter()
-            .find(|message| message.seq > seq && !is_recorded_answer(message))
-        else {
-            return Ok(());
-        };
-        let Some(text) = self.harness.answer_for(message.id.as_str()) else {
-            return Ok(());
-        };
-        let text = answer_text(&text);
-        if text.is_empty() {
-            return Ok(());
-        }
-        self.store.receive(
-            &self.agent_id,
-            Incoming {
-                text,
-                sender: Some(format!("agent:{}", agent.name)),
-                source_time_ms: None,
-                source_key: Some(format!("answer:{}", message.id)),
-                reply_to: Some(message.id.to_string()),
-                quote: None,
-                received_at_ms: None,
-            },
-        )?;
-        Ok(())
-    }
-
-    pub fn mark_processed_through(&self, seq: i64) -> Result<(), Error> {
-        self.store.advance_processed_through(&self.agent_id, seq)?;
-        self.store.clear_failed_turns(&self.agent_id, seq)?;
-        Ok(())
-    }
-
-    /// Record that the turn ending at `seq` failed. The processed cursor stays.
-    pub fn record_failed_turn(&self, seq: i64, reason: &str) -> Result<(), Error> {
-        self.store
-            .record_failed_turn(&self.agent_id, seq, reason, anyagents_core::now_ms())?;
-        Ok(())
+    pub fn delivered_cursor(&self) -> Result<i64, Error> {
+        Ok(self.store.delivered_cursor(&self.agent_id)?)
     }
 
     pub fn health(&self, now_ms: i64) -> Result<AgentHealth, Error> {
@@ -332,31 +179,13 @@ impl<H: Harness> DeliveryLoop<H> {
             steer_support: harness.steer_support,
             quota_reset_at_ms: harness.quota_reset_at_ms.or(self.quota_reset_at_ms),
             sign_in_fault: harness.sign_in_fault,
-            oldest_unaccepted_age_ms: lag.oldest_unaccepted_age_ms,
-            oldest_unprocessed_age_ms: lag.oldest_unprocessed_age_ms,
+            oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         })
     }
 
     /// Drop the store and the lock, keeping the harness so a restarted loop can dedupe.
     pub fn into_harness(self) -> H {
         self.harness
-    }
-
-    /// The ids the harness has taken and whose turn has not finished.
-    pub fn pending_ids(&self) -> Vec<String> {
-        let Ok(accepted) = self.store.accepted_cursor(&self.agent_id) else {
-            return Vec::new();
-        };
-        let Ok(messages) = self.store.inbox(&self.agent_id, None) else {
-            return Vec::new();
-        };
-        messages
-            .into_iter()
-            .filter(|message| {
-                message.seq <= accepted && message.ack != anyagents_core::Ack::Processed
-            })
-            .map(|message| message.id.as_str().to_string())
-            .collect()
     }
 
     pub fn agent_id(&self) -> AgentId {
@@ -409,7 +238,7 @@ pub(crate) fn outbound(message: &Message) -> OutboundMessage {
 #[cfg(test)]
 mod tests {
     use anyagents_core::{Incoming, NewAgent, Store};
-    use anyagents_harness::{DeliveryMode, FakeHarness, HarnessHealth, TurnUsage};
+    use anyagents_harness::{DeliveryMode, FakeHarness};
 
     use super::*;
 
@@ -432,329 +261,137 @@ mod tests {
     }
 
     #[test]
-    fn queue_holds_the_second_message_until_the_turn_ends() {
-        let (_dir, mut loop_, id) = setup(DeliveryMode::Queue);
-        let first = recv(loop_.store(), &id, "one");
-        let second = recv(loop_.store(), &id, "two");
-        assert_eq!(
-            loop_.run_once().unwrap(),
-            RunOutcome::Deferred { seq: second }
-        );
-        assert_eq!(loop_.harness().turns_started(), 1);
-        assert_eq!(loop_.harness().written_ids().len(), 1);
-        assert_eq!(loop_.harness_mut().complete_turn(), Some(first));
-        loop_.mark_processed_through(first).unwrap();
-        loop_.run_once().unwrap();
-        assert_eq!(loop_.harness().written_ids().len(), 2);
-        assert_eq!(loop_.harness().turns_started(), 2);
-        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), second);
-    }
-
-    #[test]
-    fn a_steered_message_enters_the_open_turn_once() {
-        // The fake steers on `deliver`, which is what the mailbox pass does.
+    fn three_lines_sent_while_a_turn_is_open_are_all_delivered_once() {
+        // The harness holds its turn open for the whole test. Every line is
+        // still handed over as it arrives, and the one cursor moves behind it.
         let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
-        let first = recv(loop_.store(), &id, "one");
-        loop_.run_once().unwrap();
-        let second = recv(loop_.store(), &id, "two");
-        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), first);
-        loop_.run_once().unwrap();
-        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), second);
-        assert_eq!(loop_.harness().written_ids().len(), 2);
-        assert_eq!(loop_.harness().turns_started(), 1);
-    }
-
-    #[test]
-    fn a_followup_message_is_held_until_the_turn_ends() {
-        let (_dir, mut loop_, id) = setup(DeliveryMode::Followup);
-        recv(loop_.store(), &id, "one");
-        loop_.run_once().unwrap();
-        recv(loop_.store(), &id, "two");
-        assert!(matches!(loop_.steer_next(), Err(Error::Held)));
-        assert_eq!(loop_.harness().written_ids().len(), 1);
-        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), 1);
-    }
-
-    #[test]
-    fn steer_puts_both_messages_in_one_turn() {
-        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
-        recv(loop_.store(), &id, "one");
-        let second = recv(loop_.store(), &id, "two");
-        let outcome = loop_.run_once().unwrap();
-        assert_eq!(
-            outcome,
-            RunOutcome::Delivered {
-                accepted: 2,
-                processed_through: 0,
-            }
-        );
-        assert_eq!(loop_.harness().turns_started(), 1);
-        assert_eq!(loop_.harness_mut().complete_turn(), Some(second));
-    }
-
-    #[test]
-    fn followup_accepts_during_the_turn_and_promotes_after() {
-        let (_dir, mut loop_, id) = setup(DeliveryMode::Followup);
-        let first = recv(loop_.store(), &id, "one");
-        let second = recv(loop_.store(), &id, "two");
-        loop_.run_once().unwrap();
-        assert_eq!(loop_.harness().turns_started(), 1);
-        assert_eq!(loop_.harness().written_ids().len(), 2);
-        assert_eq!(loop_.store().accepted_cursor(&id).unwrap(), second);
-        assert_eq!(loop_.harness_mut().complete_turn(), Some(first));
-        assert_eq!(
-            loop_.harness().open_ids(),
-            vec![loop_.harness().written_ids()[1].clone()]
-        );
-        assert_eq!(loop_.harness().turns_started(), 2);
-    }
-
-    /// A harness that takes every line, keeps the turn open, and answers it.
-    struct Answering {
-        given: Vec<String>,
-        delivered: Vec<String>,
-        finished: bool,
-    }
-
-    impl Harness for Answering {
-        fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-            if self.given.contains(&message.id) {
-                return Ok(DeliverOutcome::Accepted {
-                    turn_finished: true,
-                });
-            }
-            self.given.push(message.id.clone());
-            self.delivered.push(message.id.clone());
-            Ok(DeliverOutcome::Accepted {
-                turn_finished: self.finished,
-            })
-        }
-        fn background(&mut self) -> Result<(), HarnessError> {
-            Ok(())
-        }
-        fn resume(&mut self, _session: &str) -> Result<(), HarnessError> {
-            Ok(())
-        }
-        fn cancel(&mut self) -> Result<(), HarnessError> {
-            Ok(())
-        }
-        fn health(&self) -> HarnessHealth {
-            HarnessHealth {
-                process_alive: true,
-                turn_state: TurnState::Idle,
-                delivery_mode: DeliveryMode::Queue,
-                steer_support: SteerSupport::Unproven,
-                quota_reset_at_ms: None,
-                sign_in_fault: None,
-            }
-        }
-        fn answer_for(&self, _id: &str) -> Option<String> {
-            Some("the answer".to_string())
-        }
-        fn usage_for(&self, _id: &str) -> Option<TurnUsage> {
-            Some(TurnUsage::default())
-        }
-    }
-
-    #[test]
-    fn a_recorded_answer_is_never_handed_to_the_harness() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("alpha", "claude-code"))
-            .unwrap();
-        let id = agent.id.clone();
-        let harness = Answering {
-            given: Vec::new(),
-            delivered: Vec::new(),
-            finished: false,
-        };
-        let mut loop_ = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
-
-        recv(loop_.store(), &id, "one");
-        loop_.run_once().unwrap();
-        // The turn ends with its answer, which is written as a reply.
-        loop_.harness_mut().finished = true;
-        let agent = loop_.store().agent(&id).unwrap();
-        loop_.record_answer(&agent).unwrap();
-        let answer = loop_
-            .store()
-            .inbox(&id, None)
-            .unwrap()
-            .into_iter()
-            .find(|message| message.reply_to.is_some())
-            .expect("the answer was recorded");
-        assert!(
-            answer
-                .source_key
-                .as_deref()
-                .unwrap_or("")
-                .starts_with("answer:")
-        );
-
-        // The next pass steps over the answer instead of prompting it again.
-        let before = loop_.harness().given.len();
-        loop_.run_once().unwrap();
-        let after = loop_.harness().given.clone();
-        assert_eq!(
-            before,
-            after.len(),
-            "the agent's own answer was handed back"
-        );
-        assert!(
-            !after.contains(&answer.id.to_string()),
-            "the answer row was given to the harness"
-        );
-        // The reply is accepted at once and settled without being prompted.
-        assert!(loop_.store().accepted_cursor(&id).unwrap() >= answer.seq);
-        // Its progress waits behind any earlier line still in turn: the answer
-        // must never carry the processed cursor over a line that is unanswered.
-        assert!(
-            loop_.store().processed_cursor(&id).unwrap() <= answer.seq,
-            "the answer skipped an earlier line"
-        );
-    }
-
-    #[test]
-    fn an_answer_never_carries_the_cursor_over_an_unanswered_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("alpha", "claude-code"))
-            .unwrap();
-        let id = agent.id.clone();
-        let harness = Answering {
-            given: Vec::new(),
-            delivered: Vec::new(),
-            finished: false,
-        };
-        let mut loop_ = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
-
-        // Line 1 is delivered. Its turn is still open when line 2 arrives, so
-        // line 2 is seq 2 and line 1's answer row becomes seq 3: the live case.
-        recv(loop_.store(), &id, "one");
-        loop_.run_once().unwrap();
-        let second = recv(loop_.store(), &id, "two");
-        assert_eq!(second, 2, "the second line lands before the answer");
-        loop_.harness_mut().finished = true;
-        let agent = loop_.store().agent(&id).unwrap();
-        loop_.record_answer(&agent).unwrap();
-        let answer = loop_
-            .store()
-            .inbox(&id, None)
-            .unwrap()
-            .into_iter()
-            .find(|message| message.reply_to.is_some())
-            .expect("the answer was recorded");
-        assert_eq!(answer.seq, 3);
-
-        // Stepping over the answer must not carry the cursor over line 2,
-        // whose own turn has produced nothing yet.
-        loop_.run_once().unwrap();
-        // Stepping over the answer row must not, by itself, carry the cursor
-        // past line 2. Whatever moves it past line 2 has to be line 2's own
-        // turn ending, so the cursor is never ahead of an unanswered line.
-        let answered = loop_
-            .store()
-            .inbox(&id, None)
-            .unwrap()
+        let seqs: Vec<i64> = ["one", "two", "three"]
             .iter()
-            .filter(|message| message.reply_to.is_some())
-            .count();
-        assert_eq!(answered, 1, "only line 1 has an answer");
-    }
-
-    #[test]
-    fn an_answer_row_behind_a_line_in_turn_does_not_move_the_cursor() {
-        // The live order: line 1 is delivered, line 2 arrives before line 1's
-        // answer is recorded, so the answer row ends up after line 2. Stepping
-        // over that answer must not mark line 2 as done.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let agent = store
-            .create_agent(NewAgent::new("alpha", "claude-code"))
-            .unwrap();
-        let id = agent.id.clone();
-        let harness = Answering {
-            given: Vec::new(),
-            delivered: Vec::new(),
-            finished: false,
-        };
-        let mut loop_ = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
-
-        recv(loop_.store(), &id, "one");
-        loop_.run_once().unwrap();
-        recv(loop_.store(), &id, "two");
-        loop_.harness_mut().finished = true;
-        let agent = loop_.store().agent(&id).unwrap();
-        loop_.record_answer(&agent).unwrap();
-        let rows: Vec<(i64, bool)> = loop_
-            .store()
-            .inbox(&id, None)
-            .unwrap()
-            .into_iter()
-            .map(|message| (message.seq, message.reply_to.is_some()))
+            .map(|text| recv(loop_.store(), &id, text))
             .collect();
         assert_eq!(
-            rows,
-            vec![(1, false), (2, false), (3, true)],
-            "the live shape"
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 3 }
         );
+        assert_eq!(loop_.harness().turns_started(), 1);
+        assert_eq!(loop_.harness().written_ids().len(), 3);
+        assert_eq!(loop_.delivered_cursor().unwrap(), *seqs.last().unwrap());
+        // A second pass has nothing left to hand over.
+        assert_eq!(loop_.run_once().unwrap(), RunOutcome::Idle);
+        let written = loop_.harness().written_ids();
+        assert_eq!(written.len(), 3, "{written:?}");
+    }
 
-        // Line 2 has no answer of its own, so it is not done.
-        loop_.harness_mut().finished = false;
+    #[test]
+    fn a_line_the_harness_did_not_take_leaves_the_cursor_where_it_was() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        loop_.harness_mut().kill();
+        recv(loop_.store(), &id, "one");
+        assert!(matches!(loop_.run_once(), Err(Error::HarnessDown)));
+        assert_eq!(loop_.delivered_cursor().unwrap(), 0);
+        // The same line goes to the process that comes back: it was never taken.
+        loop_.harness_mut().revive();
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 1 }
+        );
+        let written = loop_.harness().written_ids();
+        assert_eq!(written.len(), 1, "{written:?}");
+    }
+
+    #[test]
+    fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
+        // A crash between the harness taking a line and the cursor recording it
+        // replays that line to the restarted process. The line before it is not
+        // written again, and the line after it still follows.
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        recv(loop_.store(), &id, "one");
+        recv(loop_.store(), &id, "two");
+        let third = recv(loop_.store(), &id, "three");
         loop_.run_once().unwrap();
-        assert!(
-            loop_.store().processed_cursor(&id).unwrap() < 2,
-            "the answer row carried the cursor over line 2"
+        assert_eq!(loop_.delivered_cursor().unwrap(), third);
+        let path = loop_.store().data_dir().join("state.db");
+        let harness = loop_.into_harness();
+        let store = Store::open(path).unwrap();
+        // Only the first line's cursor was committed; the other two were taken
+        // and not recorded when the process died.
+        store.rewind_for_test(&id, 1);
+        let mut restarted = DeliveryLoop::start(store, id.clone(), harness).unwrap();
+        assert_eq!(
+            restarted.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 2 }
+        );
+        assert_eq!(restarted.delivered_cursor().unwrap(), third);
+        let written = restarted.harness().written_ids();
+        assert_eq!(written.len(), 3, "{written:?}");
+    }
+
+    #[test]
+    fn a_quota_answer_stops_the_pass_without_moving_the_cursor() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        loop_.harness_mut().set_quota(Some(1_700_000_000_000));
+        recv(loop_.store(), &id, "one");
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Quota {
+                reset_at_ms: 1_700_000_000_000
+            }
+        );
+        assert_eq!(loop_.delivered_cursor().unwrap(), 0);
+    }
+
+    #[test]
+    fn every_line_the_harness_takes_moves_the_one_cursor() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        recv(loop_.store(), &id, "one");
+        recv(loop_.store(), &id, "two");
+        assert_eq!(
+            loop_.run_once().unwrap(),
+            RunOutcome::Delivered { delivered: 2 }
+        );
+        // The cursor is the last line taken, and the inbox agrees from it on.
+        let last = loop_.delivered_cursor().unwrap();
+        assert_eq!(last, 2);
+        let delivered = loop_.store().inbox(&id, None).unwrap();
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|m| m.ack == anyagents_core::Ack::Delivered)
+                .count(),
+            2
         );
     }
 
     #[test]
-    fn record_answer_handles_inbound_channel_message_with_reply_to() {
+    fn lag_reports_the_oldest_line_the_harness_has_not_taken() {
+        let (_dir, mut loop_, id) = setup(DeliveryMode::Steer);
+        let mut incoming = Incoming::new("held");
+        incoming.received_at_ms = Some(1_000);
+        loop_.store().receive(&id, incoming).unwrap();
+        assert_eq!(
+            loop_.health(6_000).unwrap().oldest_undelivered_age_ms,
+            Some(5_000)
+        );
+        loop_.run_once().unwrap();
+        assert_eq!(loop_.health(6_000).unwrap().oldest_undelivered_age_ms, None);
+    }
+
+    #[test]
+    fn an_agent_on_another_harness_is_refused_a_second_loop() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("alpha", "opencode"))
             .unwrap();
-        let id = agent.id.clone();
-        let harness = Answering {
-            given: Vec::new(),
-            delivered: Vec::new(),
-            finished: false,
-        };
-        let mut loop_ = DeliveryLoop::start(store, id.clone(), harness).unwrap();
-
-        let anyagents_core::ReceiveOutcome::New(msg) = loop_
-            .store()
-            .receive(
-                &id,
-                Incoming {
-                    text: "ping from telegram".into(),
-                    sender: Some("telegram:user:1951959493:14199".into()),
-                    source_time_ms: Some(1_000),
-                    source_key: Some("bot:1".into()),
-                    reply_to: Some("telegram:chat:-1003544170260".into()),
-                    quote: None,
-                    received_at_ms: None,
-                },
-            )
-            .unwrap()
-        else {
-            panic!("unexpected duplicate");
-        };
-        loop_.run_once().unwrap();
-        loop_.harness_mut().finished = true;
-        let agent = loop_.store().agent(&id).unwrap();
-        loop_.record_answer(&agent).unwrap();
-
-        let answer = loop_
-            .store()
-            .inbox(&id, None)
-            .unwrap()
-            .into_iter()
-            .find(is_recorded_answer)
-            .expect("the answer was recorded even when inbound message had reply_to");
-        assert_eq!(answer.reply_to.as_deref(), Some(msg.id.as_str()));
+        let _first = DeliveryLoop::start(
+            Store::open(dir.path().join("state.db")).unwrap(),
+            agent.id.clone(),
+            FakeHarness::new(DeliveryMode::Steer),
+        )
+        .unwrap();
+        match DeliveryLoop::start(store, agent.id, FakeHarness::new(DeliveryMode::Steer)) {
+            Err(err) => assert!(err.agent_busy()),
+            Ok(_) => panic!("a second loop was accepted"),
+        }
     }
 }

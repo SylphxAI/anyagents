@@ -1,7 +1,7 @@
 //! SQLite mailbox. A message is received when its insert commits, and that
 //! commit assigns the next per-agent sequence. Source time is stored and never
-//! used to order delivery. The accepted and processed cursors move only over a
-//! contiguous prefix.
+//! used to order delivery. The delivery cursor moves only over a contiguous
+//! prefix.
 
 use std::fs::{File, OpenOptions};
 use std::io::{ErrorKind, Read};
@@ -17,6 +17,14 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
 use crate::quote::Quote;
+
+/// A line's provider coordinates: the chat, the forum topic and the message id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Origin {
+    pub chat_id: Option<i64>,
+    pub thread_id: Option<i64>,
+    pub message_id: Option<i64>,
+}
 use crate::migrate::{self, now_ms as clock_now_ms};
 
 /// Milliseconds since the Unix epoch. A clock that is before the epoch reads as 0.
@@ -25,7 +33,7 @@ pub fn now_ms() -> i64 {
 }
 
 const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
-     reply_to, received_at_ms, delivered_at_ms, processed_at_delivery";
+     reply_to, received_at_ms, delivered_at_ms";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -104,6 +112,10 @@ pub struct Incoming {
     /// The message this one quotes, when the provider sent one. It is rendered
     /// into the stored body; an agent's text cannot forge it.
     pub quote: Option<Quote>,
+    /// For a line from a channel: the provider chat and forum topic it is in,
+    /// and the provider id of the message itself. These are what a bare answer
+    /// is resolved against.
+    pub origin: Option<Origin>,
     /// Overrides the receive clock so tests can age a message without sleeping.
     pub received_at_ms: Option<i64>,
 }
@@ -117,6 +129,7 @@ impl Incoming {
             source_key: None,
             reply_to: None,
             quote: None,
+            origin: None,
             received_at_ms: None,
         }
     }
@@ -128,21 +141,20 @@ impl Incoming {
     }
 }
 
-/// How far a message has moved through the three cursors.
+/// How far a message has moved: committed, or taken by the harness's own input
+/// or steer API.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ack {
     Received,
-    Accepted,
-    Processed,
+    Delivered,
 }
 
 impl std::fmt::Display for Ack {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Received => "received",
-            Self::Accepted => "accepted",
-            Self::Processed => "processed",
+            Self::Delivered => "delivered",
         })
     }
 }
@@ -160,14 +172,8 @@ pub struct Message {
     pub reply_to: Option<String>,
     pub received_at_ms: i64,
     pub ack: Ack,
-    /// Why the last turn that included this message ended in an error, if it did.
-    /// Such a message stays `accepted` and is never counted as processed.
-    pub failed_reason: Option<String>,
-    /// When the message was last handed to a vendor process.
+    /// When the message was handed to the vendor process.
     pub delivered_at_ms: Option<i64>,
-    /// The hand-over already found its turn finished. Only then may a delivery
-    /// move `processed` directly; a turn settled by the host is recorded there.
-    pub processed_at_delivery: bool,
 }
 
 /// A new insert, or the row already stored for this source key.
@@ -177,11 +183,11 @@ pub enum ReceiveOutcome {
     Duplicate(Message),
 }
 
-/// Age of the oldest message past each cursor. `None` means that cursor is caught up.
+/// Age of the oldest message the harness has not taken. `None` means the agent
+/// has caught up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Lag {
-    pub oldest_unaccepted_age_ms: Option<i64>,
-    pub oldest_unprocessed_age_ms: Option<i64>,
+    pub oldest_undelivered_age_ms: Option<i64>,
 }
 
 /// How this turn was paid for.
@@ -310,6 +316,8 @@ impl Store {
 
     /// Hold this process's mailbox capability key, so it can mint and check
     /// capabilities. The server sets it at start; the key never leaves memory.
+    /// A process naming its own key makes every capability it minted useless to
+    /// any other process, which is why only the one server should.
     pub fn hold_capability_key(&self, key: &str) -> Result<(), Error> {
         if key.len() < 32 {
             return Err(Error::Message("the capability key is too short".into()));
@@ -329,12 +337,7 @@ impl Store {
     /// a hash, bound to the agent's immutable id and to the generation of its
     /// current session. Only the server that minted it reads it back.
     pub fn issue_capability(&self, agent_id: &AgentId) -> Result<String, Error> {
-        let key = self
-            .capabilities
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-            .ok_or_else(|| Error::Message("this server holds no mailbox capability key".into()))?;
+        let key = self.capability_key()?;
         let mut bytes = [0u8; CAPABILITY_BYTES];
         std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
         let token = hex(&bytes);
@@ -368,12 +371,7 @@ impl Store {
     /// The agent a presented capability authenticates, when the server minted
     /// it and it was not replaced. The comparison is on the stored hash.
     pub fn authenticate_capability(&self, token: &str) -> Result<AgentId, Error> {
-        let key = self
-            .capabilities
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .clone()
-            .ok_or_else(|| Error::Message("this server holds no mailbox capability key".into()))?;
+        let key = self.capability_key()?;
         let digest = hash(&key, token);
         let conn = self.conn();
         let found = conn
@@ -388,6 +386,44 @@ impl Store {
             Some(id) => AgentId::parse(&id),
             None => Err(Error::Message("the session is not authenticated".into())),
         }
+    }
+
+    /// A receipt one named send already produced, or `None`.
+    pub fn send_receipt(&self, id: &str) -> Result<Option<String>, Error> {
+        let conn = self.conn();
+        Ok(conn
+            .query_row("SELECT receipt FROM sends WHERE id = ?1", [id], |row| {
+                row.get(0)
+            })
+            .optional()?)
+    }
+
+    /// Keep one named send's receipt after it was delivered.
+    pub fn record_send_receipt(&self, id: &str, receipt: &str) -> Result<(), Error> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO sends (id, receipt, created_at_ms) VALUES (?1, ?2, ?3)
+             ON CONFLICT (id) DO NOTHING",
+            params![id, receipt, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// This process's capability key. A command that starts before the server
+    /// reads the key from `ANYAGENTS_CAPABILITY_KEY` (the test and repair path),
+    /// else from the stored key the server wrote, else its own.
+    fn capability_key(&self) -> Result<String, Error> {
+        if let Some(key) = self
+            .capabilities
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+        {
+            return Ok(key);
+        }
+        Err(Error::Message(
+            "this process holds no mailbox capability key".into(),
+        ))
     }
 
     /// Whether a capability was ever minted on this deployment. Once one has
@@ -532,7 +568,7 @@ impl Store {
             ],
         )?;
         tx.execute(
-            "INSERT INTO mailbox_cursors (agent_id, accepted_seq, processed_seq) VALUES (?1, 0, 0)",
+            "INSERT INTO mailbox_cursors (agent_id, delivered_seq) VALUES (?1, 0)",
             [agent.id.as_str()],
         )?;
         tx.commit()?;
@@ -613,6 +649,7 @@ impl Store {
                     .map(|key| format!("room:{room}:{key}")),
                 reply_to: incoming.reply_to.clone(),
                 quote: incoming.quote.clone(),
+                origin: incoming.origin,
                 received_at_ms: incoming.received_at_ms,
             };
             // The body is built once, so every recipient reads the same text.
@@ -831,9 +868,7 @@ impl Store {
             reply_to: incoming.reply_to,
             received_at_ms,
             ack: Ack::Received,
-            failed_reason: None,
             delivered_at_ms: None,
-            processed_at_delivery: false,
         };
         tx.execute(
             "INSERT INTO messages (
@@ -920,7 +955,11 @@ impl Store {
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
-        let mut stmt = self.prepare_inbox(&conn, since.unwrap_or(0))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, agent_id, seq, source_time_ms, source_key, sender, body,
+             reply_to, received_at_ms, delivered_at_ms
+             FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq",
+        )?;
         let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(0)])?;
         let mut messages = Vec::new();
         while let Some(row) = rows.next()? {
@@ -929,33 +968,16 @@ impl Store {
         Ok(messages)
     }
 
-    /// An inbox query: everything when `since` is 0, otherwise the messages a
-    /// change since `since` can have touched (a hand-over records when it was
-    /// handed over and whether its turn was already finished).
-    fn prepare_inbox<'c>(
-        &self,
-        conn: &'c Connection,
-        since: i64,
-    ) -> Result<rusqlite::Statement<'c>, Error> {
-        const ALL: &str = "SELECT id, agent_id, seq, source_time_ms, source_key, sender, body,
-             reply_to, received_at_ms, delivered_at_ms, processed_at_delivery
-             FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq";
-        const CHANGED: &str = "SELECT id, agent_id, seq, source_time_ms, source_key, sender, body,
-             reply_to, received_at_ms, delivered_at_ms, processed_at_delivery
-             FROM messages WHERE agent_id = ?1 AND (seq > ?2 OR delivered_at_ms > ?2)
-             ORDER BY seq";
-        Ok(conn.prepare(if since <= 0 { ALL } else { CHANGED })?)
-    }
-
-    /// The message at `accepted + 1`, or `None` when delivery has caught up.
-    pub fn next_unaccepted(&self, agent_id: &AgentId) -> Result<Option<Message>, Error> {
-        let accepted = self.accepted_cursor(agent_id)?;
-        let next = accepted + 1;
+    /// The next message the harness has not taken, or `None` when delivery has
+    /// caught up.
+    pub fn next_undelivered(&self, agent_id: &AgentId) -> Result<Option<Message>, Error> {
+        let delivered = self.delivered_cursor(agent_id)?;
+        let next = delivered + 1;
         if let Some(message) = self.message_at(agent_id, next)? {
             return Ok(Some(message));
         }
         let received = self.received_cursor(agent_id)?;
-        if received > accepted {
+        if received > delivered {
             return Err(Error::Message(format!(
                 "mailbox sequence has a hole at {next}"
             )));
@@ -974,140 +996,50 @@ impl Store {
         Ok(seq)
     }
 
-    pub fn accepted_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
+    /// The one delivery cursor: the last sequence the harness took.
+    pub fn delivered_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
-        Ok(cursors(&conn, agent_id)?.0)
+        cursor(&conn, agent_id)
     }
 
-    pub fn processed_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
-        Ok(cursors(&conn, agent_id)?.1)
-    }
-
-    /// Move `accepted` to `seq`. `seq` must be exactly one past the current cursor.
-    pub fn advance_accepted(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
+    /// Move the delivery cursor to `seq`. `seq` must be exactly one past the
+    /// current cursor, so nothing is skipped.
+    pub fn advance_delivered(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         agent_by_id(&tx, agent_id)?;
-        bump_accepted(&tx, agent_id, seq)?;
+        bump_delivered(&tx, agent_id, seq)?;
         tx.commit()?;
         Ok(seq)
     }
 
-    /// Move `processed` through `seq`. Every message in the skipped range must exist,
-    /// and `seq` must already be accepted.
-    pub fn advance_processed_through(&self, agent_id: &AgentId, seq: i64) -> Result<i64, Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        agent_by_id(&tx, agent_id)?;
-        bump_processed(&tx, agent_id, seq)?;
-        tx.commit()?;
-        Ok(seq)
-    }
-
-    /// Record acceptance, and processing when the turn already finished, in one commit.
-    pub fn note_delivery(
-        &self,
-        agent_id: &AgentId,
-        seq: i64,
-        turn_finished: bool,
-    ) -> Result<(), Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        agent_by_id(&tx, agent_id)?;
-        bump_accepted(&tx, agent_id, seq)?;
-        // A turn that finished before this hand-over was seen is only counted as
-        // processed when the host has settled it: the app records the turn and
-        // advances `processed` itself.
-        let seen_finished: bool = tx
-            .query_row(
-                "SELECT processed_at_delivery FROM messages WHERE agent_id = ?1 AND seq = ?2",
-                params![agent_id.as_str(), seq],
-                |row| row.get::<_, i64>(0),
-            )
-            .ok()
-            .is_some_and(|flag| flag != 0);
-        if turn_finished && seen_finished {
-            bump_processed(&tx, agent_id, seq)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Note that `seq` was handed to a vendor process. `turn_finished` says the
-    /// adapter found its turn already finished at that moment.
-    pub fn note_handover(
-        &self,
-        agent_id: &AgentId,
-        seq: i64,
-        turn_finished: bool,
-    ) -> Result<(), Error> {
+    /// Move the cursor back to `seq` for a test that simulates a crash between
+    /// the harness taking a line and the commit recording it.
+    #[doc(hidden)]
+    pub fn rewind_for_test(&self, agent_id: &AgentId, seq: i64) {
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
         conn.execute(
-            "UPDATE messages SET delivered_at_ms = ?1, processed_at_delivery = ?2
-             WHERE agent_id = ?3 AND seq = ?4",
-            params![now_ms(), i64::from(turn_finished), agent_id.as_str(), seq],
-        )?;
-        Ok(())
+            "UPDATE mailbox_cursors SET delivered_seq = ?1 WHERE agent_id = ?2",
+            params![seq, agent_id.as_str()],
+        )
+        .unwrap();
     }
 
-    /// Record that a turn ending at `seq` failed. The failed range starts at the
-    /// first accepted message past the processed cursor. The processed cursor does
-    /// not move, so the same messages are offered to the next turn.
-    pub fn record_failed_turn(
-        &self,
-        agent_id: &AgentId,
-        seq: i64,
-        reason: &str,
-        failed_at_ms: i64,
-    ) -> Result<Vec<Message>, Error> {
+    /// Record that the harness took `seq`, and when, in one commit.
+    pub fn note_delivered(&self, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         agent_by_id(&tx, agent_id)?;
-        let (accepted, processed) = cursors(&tx, agent_id)?;
-        if seq <= processed || seq > accepted {
-            return Err(Error::CursorGap {
-                cursor: "failed",
-                at: processed,
-                attempted: seq,
-            });
-        }
-        let messages = {
-            let mut stmt = tx.prepare(&format!(
-                "SELECT {MESSAGE_COLS} FROM messages
-                 WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3 ORDER BY seq"
-            ))?;
-            let mut rows = stmt.query(params![agent_id.as_str(), processed, seq])?;
-            let mut messages = Vec::new();
-            while let Some(row) = rows.next()? {
-                messages.push(message_from_row(&tx, row)?);
-            }
-            messages
-        };
-        for message in &messages {
-            tx.execute(
-                "INSERT INTO failed_turns (message_id, agent_id, seq, reason, failed_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (message_id) DO UPDATE SET
-                     reason = excluded.reason,
-                     failed_at_ms = excluded.failed_at_ms",
-                params![
-                    message.id.as_str(),
-                    agent_id.as_str(),
-                    message.seq,
-                    reason,
-                    failed_at_ms,
-                ],
-            )?;
-        }
+        bump_delivered(&tx, agent_id, seq)?;
+        tx.execute(
+            "UPDATE messages SET delivered_at_ms = ?1 WHERE agent_id = ?2 AND seq = ?3",
+            params![now_ms(), agent_id.as_str(), seq],
+        )?;
         tx.commit()?;
-        Ok(messages)
+        Ok(())
     }
 
-    /// One stored message by id, with its current ack.
     pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
@@ -1121,42 +1053,12 @@ impl Store {
         found.transpose()
     }
 
-    /// Failed turns for one agent: accepted, not processed, and last seen failing.
-    pub fn failed_turns(&self, agent_id: &AgentId) -> Result<Vec<Message>, Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
-        let (_, processed) = cursors(&conn, agent_id)?;
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS} FROM messages AS m
-             WHERE m.agent_id = ?1 AND m.seq > ?2
-               AND m.id IN (SELECT message_id FROM failed_turns WHERE agent_id = ?1)
-             ORDER BY m.seq"
-        ))?;
-        let mut rows = stmt.query(params![agent_id.as_str(), processed])?;
-        let mut messages = Vec::new();
-        while let Some(row) = rows.next()? {
-            messages.push(message_from_row(&conn, row)?);
-        }
-        Ok(messages)
-    }
-
-    /// Drop the failed-turn rows a turn has since processed.
-    pub fn clear_failed_turns(&self, agent_id: &AgentId, through: i64) -> Result<(), Error> {
-        let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
-        conn.execute(
-            "DELETE FROM failed_turns WHERE agent_id = ?1 AND seq <= ?2",
-            params![agent_id.as_str(), through],
-        )?;
-        Ok(())
-    }
-
+    /// Age of the oldest message the harness has not taken.
+    /// Age of the oldest message the harness has not taken.
     pub fn lag(&self, agent_id: &AgentId, now_ms: i64) -> Result<Lag, Error> {
-        let accepted = self.accepted_cursor(agent_id)?;
-        let processed = self.processed_cursor(agent_id)?;
+        let delivered = self.delivered_cursor(agent_id)?;
         Ok(Lag {
-            oldest_unaccepted_age_ms: self.age_at(agent_id, accepted + 1, now_ms)?,
-            oldest_unprocessed_age_ms: self.age_at(agent_id, processed + 1, now_ms)?,
+            oldest_undelivered_age_ms: self.age_at(agent_id, delivered + 1, now_ms)?,
         })
     }
 
@@ -1613,17 +1515,7 @@ fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Messag
     let id: String = row.get(0)?;
     let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
     let seq: i64 = row.get(2)?;
-    let (accepted, processed) = cursors(conn, &agent_id)?;
-    let failed_reason: Option<String> = if seq > processed {
-        conn.query_row(
-            "SELECT reason FROM failed_turns WHERE message_id = ?1",
-            [id.as_str()],
-            |row| row.get(0),
-        )
-        .optional()?
-    } else {
-        None
-    };
+    let delivered = cursor(conn, &agent_id)?;
     Ok(Message {
         id: MessageId::parse(&id)?,
         agent_id,
@@ -1634,16 +1526,12 @@ fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Messag
         text: row.get(6)?,
         reply_to: row.get(7)?,
         received_at_ms: row.get(8)?,
-        ack: if seq <= processed {
-            Ack::Processed
-        } else if seq <= accepted {
-            Ack::Accepted
+        ack: if seq <= delivered {
+            Ack::Delivered
         } else {
             Ack::Received
         },
-        failed_reason,
         delivered_at_ms: row.get(9)?,
-        processed_at_delivery: row.get::<_, i64>(10)? != 0,
     })
 }
 
@@ -1674,56 +1562,28 @@ fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     Ok(seq)
 }
 
-fn cursors(conn: &Connection, agent_id: &AgentId) -> Result<(i64, i64), Error> {
+fn cursor(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     let found = conn
         .query_row(
-            "SELECT accepted_seq, processed_seq FROM mailbox_cursors WHERE agent_id = ?1",
+            "SELECT delivered_seq FROM mailbox_cursors WHERE agent_id = ?1",
             [agent_id.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )
         .optional()?;
-    found.ok_or_else(|| Error::Message(format!("mailbox cursors missing for {agent_id}")))
+    found.ok_or_else(|| Error::Message(format!("mailbox cursor missing for {agent_id}")))
 }
 
-fn bump_accepted(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
-    let (accepted, _) = cursors(conn, agent_id)?;
-    if seq != accepted + 1 || !message_exists(conn, agent_id, seq)? {
+fn bump_delivered(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
+    let delivered = cursor(conn, agent_id)?;
+    if seq != delivered + 1 || !message_exists(conn, agent_id, seq)? {
         return Err(Error::CursorGap {
-            cursor: "accepted",
-            at: accepted,
+            cursor: "delivered",
+            at: delivered,
             attempted: seq,
         });
     }
     conn.execute(
-        "UPDATE mailbox_cursors SET accepted_seq = ?1 WHERE agent_id = ?2",
-        params![seq, agent_id.as_str()],
-    )?;
-    Ok(())
-}
-
-fn bump_processed(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<(), Error> {
-    let (accepted, processed) = cursors(conn, agent_id)?;
-    if seq <= processed || seq > accepted {
-        return Err(Error::CursorGap {
-            cursor: "processed",
-            at: processed,
-            attempted: seq,
-        });
-    }
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3",
-        params![agent_id.as_str(), processed, seq],
-        |row| row.get(0),
-    )?;
-    if count != seq - processed {
-        return Err(Error::CursorGap {
-            cursor: "processed",
-            at: processed,
-            attempted: seq,
-        });
-    }
-    conn.execute(
-        "UPDATE mailbox_cursors SET processed_seq = ?1 WHERE agent_id = ?2",
+        "UPDATE mailbox_cursors SET delivered_seq = ?1 WHERE agent_id = ?2",
         params![seq, agent_id.as_str()],
     )?;
     Ok(())
@@ -1789,6 +1649,7 @@ mod tests {
             source_key: None,
             reply_to: None,
             quote: None,
+            origin: None,
             received_at_ms: None,
         };
 
@@ -1918,42 +1779,103 @@ mod tests {
     }
 
     #[test]
-    fn cursors_refuse_a_gap_and_inbox_is_exclusive() {
+    fn one_delivery_cursor_refuses_a_gap_and_inbox_is_exclusive() {
         let (_dir, store) = setup();
         let agent = agent(&store, "alpha");
-        let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("a")).unwrap()
-        else {
-            panic!("new");
-        };
+        store.receive(&agent.id, Incoming::new("a")).unwrap();
         let ReceiveOutcome::New(second) = store.receive(&agent.id, Incoming::new("b")).unwrap()
         else {
             panic!("new");
         };
-        assert!(store.advance_accepted(&agent.id, 2).is_err());
-        assert_eq!(store.advance_accepted(&agent.id, 1).unwrap(), 1);
-        assert!(store.advance_processed_through(&agent.id, 2).is_err());
-        store.advance_accepted(&agent.id, 2).unwrap();
-        assert_eq!(store.advance_processed_through(&agent.id, 2).unwrap(), 2);
+        // A cursor always moves one step: it never skips a message, never moves
+        // back, and never moves to a row that is not there.
+        assert!(store.advance_delivered(&agent.id, 2).is_err());
+        assert!(store.advance_delivered(&agent.id, 3).is_err());
+        store.note_delivered(&agent.id, 1).unwrap();
+        assert!(store.delivered_cursor(&agent.id).unwrap() == 1);
         let all = store.inbox(&agent.id, None).unwrap();
-        assert_eq!(all.len(), 2);
-        assert_eq!(all[0].ack, Ack::Processed);
-        assert_eq!(all[1].id, second.id);
-        let rest = store.inbox(&agent.id, Some(first.seq)).unwrap();
-        assert_eq!(rest.len(), 1);
-        assert_eq!(rest[0].seq, 2);
-        assert!(store.next_unaccepted(&agent.id).unwrap().is_none());
+        assert!(all.len() == 2);
+        assert!(all[0].ack == Ack::Delivered);
+        assert!(all[1].ack == Ack::Received);
+        assert!(all[1].id == second.id);
+        // The next line to hand over is the one after the cursor.
+        let next = store.next_undelivered(&agent.id).unwrap().expect("a line");
+        assert!(next.seq == 2);
+        assert!(next.ack == Ack::Received);
+        assert!(store.advance_delivered(&agent.id, 2).unwrap() == 2);
+        assert!(store.delivered_cursor(&agent.id).unwrap() == 2);
+        assert!(store.advance_delivered(&agent.id, 2).is_err());
     }
 
+    /// The live-desk shape before this migration: two cursors, a turn-state
+    /// flag on every message, and the agent's own answers written back into its
+    /// inbox. The upgrade must leave one cursor, no stale answer rows, and a
+    /// cursor that still points at a row that exists.
     #[test]
-    fn note_delivery_commits_both_cursors_when_the_turn_finished() {
-        let (_dir, store) = setup();
-        let agent = agent(&store, "alpha");
-        store.receive(&agent.id, Incoming::new("a")).unwrap();
-        // The turn finished before the hand-over was seen.
-        store.note_handover(&agent.id, 1, true).unwrap();
-        store.note_delivery(&agent.id, 1, true).unwrap();
-        assert_eq!(store.accepted_cursor(&agent.id).unwrap(), 1);
-        assert_eq!(store.processed_cursor(&agent.id).unwrap(), 1);
+    fn upgrading_a_two_cursor_store_keeps_one_cursor_and_drops_the_answer_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in migrate::MIGRATIONS.iter().take(6) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, 0)",
+                [version],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO agents (id, name, harness, state, created_at_ms)
+                 VALUES ('agt_01h455vb4pex5vsknk084sn02q', 'juno', 'opencode', 'running', 1);
+             INSERT INTO mailbox_cursors (agent_id, accepted_seq, processed_seq)
+                 VALUES ('agt_01h455vb4pex5vsknk084sn02q', 4, 2);
+             INSERT INTO messages (id, agent_id, seq, source_key, body, received_at_ms, delivered_at_ms, processed_at_delivery)
+                 VALUES ('msg_01h455vb4pex5vsknk084sn02q', 'agt_01h455vb4pex5vsknk084sn02q', 1, NULL, 'one', 1, 5, 0);
+             INSERT INTO messages (id, agent_id, seq, source_key, body, received_at_ms, delivered_at_ms, processed_at_delivery)
+                 VALUES ('msg_01h455vb4pex5vsknk084sn02r', 'agt_01h455vb4pex5vsknk084sn02q', 2, NULL, 'two', 1, 6, 0);
+             INSERT INTO messages (id, agent_id, seq, source_key, body, received_at_ms, delivered_at_ms, processed_at_delivery)
+                 VALUES ('msg_01h455vb4pex5vsknk084sn02s', 'agt_01h455vb4pex5vsknk084sn02q', 3, 'answer:msg_01h455vb4pex5vsknk084sn02q', 'pong', 1, 7, 0);
+             INSERT INTO messages (id, agent_id, seq, source_key, body, received_at_ms, delivered_at_ms, processed_at_delivery)
+                 VALUES ('msg_01h455vb4pex5vsknk084sn02t', 'agt_01h455vb4pex5vsknk084sn02q', 4, NULL, 'four', 1, 8, 1);
+             INSERT INTO failed_turns (message_id, agent_id, seq, reason, failed_at_ms)
+                 VALUES ('msg_01h455vb4pex5vsknk084sn02t', 'agt_01h455vb4pex5vsknk084sn02q', 4, 'boom', 9);",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Store::open(&path).unwrap();
+        let agent = store.agent_by_name("juno").unwrap();
+        // delivered = the higher of the two old cursors: 4 is kept even though
+        // the answer row at 3 was removed, so the upgrade never re-sends what a
+        // harness already took.
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 4);
+        let inbox = store.inbox(&agent.id, None).unwrap();
+        let seqs: Vec<i64> = inbox.iter().map(|message| message.seq).collect();
+        assert_eq!(seqs, vec![1, 2, 4]);
+        assert!(inbox.iter().all(|message| {
+            !message
+                .source_key
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("answer:")
+        }));
+        assert!(matches!(
+            store.message(&agent.id, "msg_01h455vb4pex5vsknk084sn02s"),
+            Ok(None)
+        ));
+        let columns: Vec<String> = store
+            .conn()
+            .prepare("SELECT name FROM pragma_table_info('mailbox_cursors')")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(columns, vec!["agent_id", "delivered_seq"]);
+        assert!(migrate::current_version(&store.conn()).unwrap() >= 7);
     }
 
     #[test]
@@ -2037,8 +1959,15 @@ mod tests {
         incoming.received_at_ms = Some(1_000);
         store.receive(&agent.id, incoming).unwrap();
         let lag = store.lag(&agent.id, 6_000).unwrap();
-        assert_eq!(lag.oldest_unaccepted_age_ms, Some(5_000));
-        assert_eq!(lag.oldest_unprocessed_age_ms, Some(5_000));
+        assert_eq!(lag.oldest_undelivered_age_ms, Some(5_000));
+        store.advance_delivered(&agent.id, 1).unwrap();
+        assert_eq!(
+            store
+                .lag(&agent.id, 6_000)
+                .unwrap()
+                .oldest_undelivered_age_ms,
+            None
+        );
     }
 
     #[test]
@@ -2165,6 +2094,7 @@ mod tests {
             source_key: None,
             reply_to: None,
             quote: None,
+            origin: None,
             received_at_ms: None,
         };
 
@@ -2221,6 +2151,7 @@ mod tests {
                     source_key: None,
                     reply_to: None,
                     quote: None,
+                    origin: None,
                     received_at_ms: None,
                 },
             )

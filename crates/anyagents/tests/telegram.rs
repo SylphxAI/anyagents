@@ -539,6 +539,7 @@ fn a_room_reaches_only_the_bots_on_the_same_chat() {
                 source_key: None,
                 reply_to: None,
                 quote: None,
+                origin: None,
                 received_at_ms: None,
             },
         )
@@ -599,6 +600,7 @@ fn a_private_chat_reaches_no_peer() {
                 source_key: Some("tg-out:100:5".to_string()),
                 reply_to: Some("telegram:chat:100".to_string()),
                 quote: None,
+                origin: None,
                 received_at_ms: None,
             },
         )
@@ -650,6 +652,7 @@ fn a_local_retry_after_a_post_is_one_row() {
                     source_key: Some("tg-out:-1009:4242".to_string()),
                     reply_to: Some("telegram:chat:-1009".to_string()),
                     quote: None,
+                    origin: None,
                     received_at_ms: None,
                 },
             )

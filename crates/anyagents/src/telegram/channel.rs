@@ -312,6 +312,11 @@ pub fn fan_out(
         source_key: Some(format!("tg-out:{chat_id}:{message_id}")),
         reply_to: Some(room.clone()),
         quote: None,
+        origin: Some(anyagents_core::Origin {
+            chat_id: Some(chat_id),
+            thread_id: None,
+            message_id: Some(message_id),
+        }),
         received_at_ms: None,
     };
     Ok(store.receive_room(&room, incoming)?.len())

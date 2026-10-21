@@ -123,6 +123,11 @@ impl Mode {
         matches!(self, Self::Confined { .. })
     }
 
+    /// Whether this deployment trusts its own machine's agent route.
+    pub fn is_trusted(&self) -> bool {
+        matches!(self, Self::Trusted { .. })
+    }
+
     /// Decide who is calling, before any route runs.
     pub fn principal(&self, store: &Store, parts: &Parts) -> Result<Principal, AuthError> {
         let agent_token = header(parts, operator::AGENT_HEADER);
@@ -152,18 +157,29 @@ impl Mode {
             return Ok(Principal::Operator);
         }
         if let Some(token) = agent_token {
+            // A machine without the boundary knows no capabilities: its route
+            // is the agent the tool server reads from its own config directory,
+            // which the server resolves to an existing agent and nothing else.
+            if self.is_trusted()
+                && let Some(id) = header(parts, AGENT_ID_HEADER)
+            {
+                return agent_named(store, &id);
+            }
             return agent_for_capability(store, &token);
         }
         match self {
             Self::Trusted { data_dir } if same_dir(data_dir, store.data_dir()) => {
-                let name = parts
+                let named = parts
                     .extensions
                     .get::<RouteAgent>()
                     .map(|route| route.0.clone())
-                    .ok_or_else(|| {
-                        AuthError::Unauthenticated("this call names no agent".to_string())
-                    })?;
-                agent_by_name(store, &name)
+                    .or_else(|| header(parts, AGENT_ID_HEADER));
+                match named {
+                    Some(route) => agent_named(store, &route),
+                    None => Err(AuthError::Unauthenticated(
+                        "this call names no agent".to_string(),
+                    )),
+                }
             }
             _ => Err(AuthError::Unauthenticated(
                 "the session is not authenticated".to_string(),
@@ -184,6 +200,19 @@ pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, Aut
     Ok(Principal::Agent { agent_id, name })
 }
 
+/// The agent a route names: a name or an id, resolved in the store.
+fn agent_named(store: &Store, route: &str) -> Result<Principal, AuthError> {
+    if let Ok(id) = AgentId::parse(route.trim()) {
+        if let Ok(agent) = store.agent(&id) {
+            return Ok(Principal::Agent {
+                agent_id: agent.id,
+                name: agent.name,
+            });
+        }
+    }
+    agent_by_name(store, route)
+}
+
 /// The agent a name resolves to, read from the store.
 pub fn agent_by_name(store: &Store, name: &str) -> Result<Principal, AuthError> {
     let agent = store
@@ -194,6 +223,11 @@ pub fn agent_by_name(store: &Store, name: &str) -> Result<Principal, AuthError> 
         name: agent.name,
     })
 }
+
+/// The agent id a tool server was given at start. On a deployment without the
+/// boundary it names the one route; with the boundary it is a no-op header,
+/// and only the operator token may follow it.
+pub const AGENT_ID_HEADER: &str = "x-anyagents-agent-id";
 
 /// The agent name a request's body or path names, put in place by the route
 /// layer so the single-user route can find it. On the identity boundary it is

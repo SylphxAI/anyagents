@@ -19,7 +19,9 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (4, include_str!("../migrations/004_channel_state.sql")),
     (5, include_str!("../migrations/005_launch_env.sql")),
     (6, include_str!("../migrations/006_groups.sql")),
-    (7, include_str!("../migrations/007_capabilities.sql")),
+    (7, include_str!("../migrations/008_one_delivery_cursor.sql")),
+    (8, include_str!("../migrations/009_capabilities.sql")),
+    (9, include_str!("../migrations/010_sends.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.

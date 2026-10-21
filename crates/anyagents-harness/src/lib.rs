@@ -4,7 +4,10 @@
 //! mailbox and the delivery loop do not change between modes. Adapters carry
 //! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
+mod compose;
 mod fake;
+
+pub use compose::{CONTEXT_BEGIN, CONTEXT_END, Envelope, compose, ref_message, reply_ref};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -99,11 +102,6 @@ pub trait Harness: Send {
     fn cancel(&mut self) -> Result<(), HarnessError>;
     fn health(&self) -> HarnessHealth;
 
-    /// Answer text the vendor sent for `id`, when it sends text before a result.
-    fn answer_for(&self, _id: &str) -> Option<String> {
-        None
-    }
-
     /// How long a turn must stay silent before its answer stands still, for a
     /// vendor that streams text and never closes a turn with a result line.
     /// `None` means the vendor always closes its turn.
@@ -117,24 +115,23 @@ pub trait Harness: Send {
         false
     }
 
-    /// Usage recorded for a finished turn, if this adapter kept it.
-    fn usage_for(&self, _id: &str) -> Option<TurnUsage> {
-        None
+    /// Usage the vendor reported for this process, as of now, for the turns it
+    /// finished. Served totals, not the newest turn: a burst is several turns,
+    /// and the host reads the difference. It is never part of delivery.
+    fn served_usage(&self) -> TurnUsage {
+        TurnUsage::default()
     }
 
-    /// Which finished turn this is for `id`, counting from 1. A message that
-    /// fails and is handed over again reports 2, so the host can tell the retry
-    /// from the failure it already recorded. `None` means the adapter does not
-    /// count, and every report is treated as the same turn.
-    fn turn_version(&self, _id: &str) -> u64 {
+    /// How many turns this process has served so far. The host records one
+    /// usage row per turn; an adapter that does not count reports 0.
+    fn turns_served(&self) -> u32 {
         0
     }
 
-    /// How the finished turn that included `id` ended. `None` means the adapter
-    /// cannot tell, and the turn counts as a success. An adapter that reports a
-    /// failure keeps the message accepted, never processed.
-    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
-        self.usage_for(id).map(TurnReport::Succeeded)
+    /// Usage the vendor reported for the turns this process ran, as of now. The
+    /// host reads it once per burst and records it; it is never part of delivery.
+    fn last_usage(&self) -> TurnUsage {
+        self.served_usage()
     }
 
     /// Forget a quota wait so delivery can resume after the reset time.
@@ -174,6 +171,27 @@ pub trait Harness: Send {
     fn watch_activity(&self, _notify: std::sync::Arc<dyn Fn() + Send + Sync>) {}
 }
 
+impl TurnUsage {
+    /// What was served between `after` and this reading.
+    pub fn difference(&self, after: TurnUsage) -> TurnUsage {
+        TurnUsage {
+            input_tokens: self.input_tokens.saturating_sub(after.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(after.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(after.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_sub(after.cache_write_tokens),
+            reported_cost_micros: match (self.reported_cost_micros, after.reported_cost_micros) {
+                (Some(now), Some(before)) => Some(now - before),
+                (Some(now), None) => Some(now),
+                _ => None,
+            },
+        }
+    }
+}
+
 /// Token and cost totals one vendor turn reported.
 ///
 /// Cost is in millionths of the vendor's currency unit when the vendor reports
@@ -185,16 +203,6 @@ pub struct TurnUsage {
     pub cache_read_tokens: u64,
     pub cache_write_tokens: u64,
     pub reported_cost_micros: Option<i64>,
-}
-
-/// How a finished turn ended, as the vendor reported it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TurnReport {
-    /// The turn completed. Its usage is recorded.
-    Succeeded(TurnUsage),
-    /// The turn ended in an error. The message is not processed and is offered
-    /// to the next turn. `reason` comes from the vendor's own error text.
-    Failed(String),
 }
 
 /// One line handed over by a between-steps channel: the mailbox id, its

@@ -19,7 +19,7 @@ pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
 pub use store::{
-    Ack, Agent, AgentLock, BillingMode, Channel, Incoming, Lag, Message, NewAgent, NewChannel,
+    Ack, Agent, AgentLock, BillingMode, Channel, Incoming, Lag, Message, NewAgent, NewChannel, Origin,
     NewUsage, ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake, agent_config_dir,
     agent_work_dir, now_ms, sum_usage, utc_day,
 };

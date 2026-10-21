@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use crate::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnReport, TurnState, TurnUsage,
+    SteerSupport, TurnState,
 };
 
 #[derive(Clone, Debug)]
@@ -56,6 +56,16 @@ impl FakeHarness {
     /// Later `deliver` calls fail and write nothing.
     pub fn kill(&mut self) {
         self.alive = false;
+    }
+
+    /// The process is up again, holding nothing it took before. A restarted
+    /// loop that replays a line writes it once.
+    pub fn revive(&mut self) {
+        self.alive = true;
+        self.seen.clear();
+        self.open.clear();
+        self.followups.clear();
+        self.finished.clear();
     }
 
     pub fn set_quota(&mut self, reset_at_ms: Option<i64>) {
@@ -178,19 +188,6 @@ impl Harness for FakeHarness {
         }
         self.resumed.push(session.to_string());
         Ok(())
-    }
-
-    fn turn_version(&self, id: &str) -> u64 {
-        self.turns.get(id).copied().unwrap_or(0)
-    }
-
-    fn turn_report_for(&self, id: &str) -> Option<TurnReport> {
-        if let Some((_, reason)) = self.failed.iter().rev().find(|(item, _)| item == id) {
-            return Some(TurnReport::Failed(reason.clone()));
-        }
-        self.finished
-            .contains(id)
-            .then(|| TurnReport::Succeeded(TurnUsage::default()))
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {

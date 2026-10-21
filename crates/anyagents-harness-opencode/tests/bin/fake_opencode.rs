@@ -12,6 +12,10 @@
 //! - `failed`: the turn ends `idle` with `outcome: failed`;
 //! - `steer`: like `finish`, and a prompt with `delivery: steer` is accepted
 //!   into the open turn.
+//! - `inbox`: every accepted prompt is appended to `ANYAGENTS_FAKE_STATE/prompts`
+//!   and the session lists all of them, with no answer and no idle until the
+//!   test's own file says the turn ended. This is a turn that is open for the
+//!   whole test, so a prompt written mid-turn stays in the session's inbox.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -91,6 +95,19 @@ fn api(args: &[String]) {
             if !dir.is_empty() {
                 let _ = std::fs::write(format!("{dir}/last-prompt"), &text);
             }
+            if mode == "inbox" && !dir.is_empty() {
+                log(&format!("accepted:{}", text.lines().next().unwrap_or("")));
+                let timestamp = now_ms();
+                let line = format!(
+                    "{{\"type\":\"user\",\"text\":{},\"time\":{{\"created\":{timestamp}}}}}\n",
+                    serde_json::to_string(&text).unwrap_or_else(|_| "\"\"".into())
+                );
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(format!("{dir}/prompts"))
+                    .and_then(|mut file| file.write_all(line.as_bytes()));
+            }
             if mode == "steer" && steered {
                 log(&format!("steered:{text}"));
             } else {
@@ -102,6 +119,23 @@ fn api(args: &[String]) {
             // The user message this service last received, as JSON, so the
             // listing can carry its mailbox marker like the real one.
             let state_dir = env::var("ANYAGENTS_FAKE_STATE").unwrap_or_default();
+            if mode == "inbox" {
+                // Every prompt the session took, and nothing else: the turn is
+                // still open, so there is no answer and no idle frame yet.
+                let listed =
+                    std::fs::read_to_string(format!("{state_dir}/prompts")).unwrap_or_default();
+                print!(
+                    "{{\"data\":[{}]}}",
+                    listed
+                        .lines()
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join(",")
+                );
+                return;
+            }
             let prompt =
                 std::fs::read_to_string(format!("{state_dir}/last-prompt")).unwrap_or_default();
             let prompt = serde_json::to_string(&prompt).unwrap_or_else(|_| "\"\"".into());
@@ -130,10 +164,12 @@ fn api(args: &[String]) {
             // An answer with the model's thinking beside it: only the `text`
             // part is recorded, never the `reasoning` part.
             if mode == "reasoning" {
+                let now = now_ms();
                 print!(
-                    "{{\"data\":[{{\"type\":\"assistant\",\"content\":[{{\"type\":\"reasoning\",\"text\":\"I should think carefully\"}},{{\"type\":\"text\",\"text\":\"the real answer\"}}],\"finish\":\"stop\",\"time\":{{\"created\":{}}}}},{{\"type\":\"idle\",\"outcome\":\"succeeded\",\"time\":{{\"created\":{}}}}}]}}",
-                    now_ms(),
-                    now_ms()
+                    "{{\"data\":[{{\"type\":\"assistant\",\"content\":[{{\"type\":\"reasoning\",\"text\":\"I should think carefully\"}},{{\"type\":\"text\",\"text\":\"the real answer\"}}],\"finish\":\"stop\",\"time\":{{\"created\":{}}}}},{{\"type\":\"user\",\"text\":{prompt},\"time\":{{\"created\":{}}}}},{{\"type\":\"idle\",\"outcome\":\"succeeded\",\"time\":{{\"created\":{}}}}}]}}",
+                    now + 1,
+                    now,
+                    now + 2
                 );
                 return;
             }
@@ -146,17 +182,20 @@ fn api(args: &[String]) {
                 return;
             }
             let text = scripted_answer();
+            // One clock reading for the whole listing: the answer is created
+            // after the prompt it answers, and the idle after both, so a fast
+            // test can never read two messages out of order.
+            let now = now_ms();
             let answer = format!(
                 "{{\"type\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"{text}\"}}],\"finish\":\"stop\",\"cost\":0.0001,\"time\":{{\"created\":{}}},\"tokens\":{{\"input\":11,\"output\":7,\"cache\":{{\"read\":3,\"write\":2}}}}}}",
-                now_ms()
+                now + 1
             );
             // Newest first, as the real service lists them: the answer, the
             // user message carrying its mailbox marker, then the idle.
-            let created = now_ms();
             print!(
                 "{{\"data\":[{answer},{{\"type\":\"user\",\"text\":{prompt},\"time\":{{\"created\":{}}}}},{{\"type\":\"idle\",\"outcome\":\"succeeded\",\"time\":{{\"created\":{}}}}}]}}",
-                created - 1,
-                created
+                now,
+                now + 2
             );
         }
         _ => {
