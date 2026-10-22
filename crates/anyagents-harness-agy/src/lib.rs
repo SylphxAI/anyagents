@@ -5,10 +5,12 @@
 //! crate is the thin name the supervisor starts it by. Its launch shape, closing
 //! line and usage come from `StreamSpec::for_program("agy")`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use anyagents_harness::{DeliverOutcome, Harness, HarnessError, HarnessHealth, TurnUsage};
-use anyagents_harness_stream::{StreamHarness, StreamSpec, cancel_line, message_line};
+use anyagents_harness::{
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, SteerSupport, TurnUsage,
+};
+use anyagents_harness_stream::{Launch, StreamHarness, StreamSpec, cancel_line, message_line};
 
 /// One long-lived Antigravity child.
 pub struct AgyHarness {
@@ -26,12 +28,42 @@ impl AgyHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
     ) -> Result<Self, HarnessError> {
+        let spec = StreamSpec::for_program("agy");
+        Self::start_with_spec(spec, program, session_id, environment, None)
+    }
+
+    /// Start one child with a custom `StreamSpec` and optional working directory.
+    pub fn start_with_spec(
+        spec: StreamSpec,
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
         let environment = environment
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        let spec = StreamSpec::for_program("agy");
-        let inner = StreamHarness::open(spec.clone(), program, session_id, environment)?;
+        let mut args = spec.args.clone();
+        if let Some(id) = session_id {
+            args.push(spec.resume_flag.to_string());
+            args.push(id.to_string());
+        }
+        let (mode, steer) = if work_dir.is_some() {
+            (DeliveryMode::Steer, SteerSupport::Yes)
+        } else {
+            (DeliveryMode::Followup, SteerSupport::Unproven)
+        };
+        let inner = StreamHarness::launch(Launch {
+            spec: spec.clone(),
+            program: program.into(),
+            args,
+            environment,
+            work_dir: work_dir.map(Path::to_path_buf),
+            session_id: session_id.map(str::to_string),
+            mode,
+            steer,
+        })?;
         Ok(Self { inner, spec })
     }
 
@@ -82,7 +114,23 @@ impl Harness for AgyHarness {
         self.inner.cancel(&cancel_line(&self.spec))
     }
 
+    fn input_ready(&self) -> bool {
+        self.inner.input_ready()
+    }
+
     fn health(&self) -> HarnessHealth {
         self.inner.health()
+    }
+
+    fn clear_quota(&mut self) {
+        self.inner.clear_quota();
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.inner.process_id()
+    }
+
+    fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.inner.watch_activity(notify);
     }
 }

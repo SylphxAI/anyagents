@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyagents_harness::{
+use anyagents_harness::{Context, 
     DeliverOutcome, DeliveryMode, Harness, HarnessError, OutboundMessage, SteerSupport, TurnState,
 };
 use anyagents_harness_codex::CodexHarness;
@@ -17,8 +17,9 @@ fn msg(id: &str) -> OutboundMessage {
         sender: None,
         reply_to: None,
         source_time_ms: None,
+            context: Context::default(),
+        }
     }
-}
 
 fn log_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join("log")

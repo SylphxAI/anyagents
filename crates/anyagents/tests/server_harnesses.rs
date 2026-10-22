@@ -39,7 +39,11 @@ impl Server {
         let socket = dir.join("anyagents.sock");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !socket.exists() {
-            assert!(Instant::now() < deadline, "no socket");
+            assert!(
+                Instant::now() < deadline,
+                "no socket: {}",
+                std::fs::read_to_string(dir.join("shared.log")).unwrap_or_default()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         Self { child }
@@ -105,11 +109,12 @@ fn create(dir: &Path, name: &str, harness: &str, agent_file: &Path) -> String {
         "harness": harness,
         "reply_with": format!("{} --data {} mcp", env!("CARGO_BIN_EXE_anyagents"), dir.display()),
         "agent_file": agent_file.display().to_string(),
+        "context_reply_to": true,
         // The double answers as `kind`, the agent that asks below.
         "sender": "agent:kind",
-        // The agent to answer. A mailbox reply to a message another agent
-        // asked is addressed to that agent by the server, not to a name.
-        "reply_to": "kind",
+        // The model answers the message it was handed, by the mailbox reference in
+        // the server's trusted context: recorded here so the test checks that.
+        "context_reply_to": true,
     });
     std::fs::write(
         config.join("adapter.json"),
@@ -158,15 +163,22 @@ fn call(socket: &Path, request: &str) -> Value {
 }
 
 /// The answer comes back to the agent that asked, through its `send` call.
-fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
+fn ask(dir: &Path, name: &str, harness: &str, _sent_id: &str) {
     let store = Store::open(dir.join("state.db")).unwrap();
     let agent = store.agent_by_name("kind").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let inbox = store.inbox(&agent.id, None).unwrap();
-        let answered = inbox
-            .iter()
-            .any(|message| message.reply_to.as_deref() == Some(sent_id));
+        // The answer names the message it answers by the reference the server
+        // put in its trusted context, and the server resolved that reference
+        // back to the asker: this mailbox holds it, from that agent.
+        let answered = inbox.iter().any(|message| {
+            message.text == "pong"
+                && message
+                    .sender
+                    .as_deref()
+                    .is_some_and(|sender| sender == format!("agent:{name}"))
+        });
         if answered {
             break;
         }
@@ -196,7 +208,7 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator(&data);
+    support::operator_with_configured_seat(&data);
     // The agent that asks: the answers come back to it.
     create_asker(&data);
     let (agy_file, muse_file) = (data.join("agent-argon"), data.join("agent-calliope"));

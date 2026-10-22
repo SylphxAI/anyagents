@@ -5,8 +5,6 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
-use crate::api::{InboxResponse, MessageView};
-
 mod agent;
 mod api;
 mod auth;
@@ -141,16 +139,6 @@ enum Command {
         /// The `adapter.json` the agent was created with.
         config: PathBuf,
     },
-    /// Body of the Antigravity steering hook: reads the CLI's event on stdin and
-    /// writes the hook's answer on stdout. Reads the mailbox, prints no secret.
-    #[command(hide = true)]
-    AgyHook {
-        #[arg(long)]
-        agent: String,
-        /// The conversation the CLI reports; an event from any other is ignored.
-        #[arg(long, default_value = "")]
-        conversation: String,
-    },
     /// Put one agent's mailbox into its harness now, if the running server has
     /// not. Reads the store directly, so it also covers a server that was just
     /// upgraded and is still inside its restart backoff.
@@ -248,13 +236,6 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Boundary => print_boundary(&cli.data),
         Command::FakeOpencode => fake_opencode::run(),
         Command::Harness { config } => harness_double::run(&config),
-        Command::AgyHook {
-            agent,
-            conversation,
-        } => {
-            agy_hook(&cli.data, &agent, &conversation);
-            Ok(())
-        }
         Command::Agents { action } => agent::agents(&cli.data, action),
         Command::Flush { agent } => agent::flush(&cli.data, &agent),
         Command::Model {
@@ -341,76 +322,6 @@ fn store_key(
     gateway::store_key(&data, &recorded, base_url, model, key)?;
     println!("key stored\t{}\t{}", recorded.name, model);
     Ok(())
-}
-
-/// The Antigravity steering hook. The CLI runs it before every model call; it
-/// answers with the mailbox messages the server has not written to this turn.
-///
-/// Everything it can fail to read answers `{}`, so a hook never breaks a turn.
-/// The server is reached through its socket only; the store is not opened here.
-fn agy_hook(data: &Path, agent: &str, conversation: &str) {
-    use std::io::{Read, Write};
-    let mut stdout = std::io::stdout().lock();
-    let mut event = String::new();
-    let _ = std::io::stdin().lock().read_to_string(&mut event);
-    let event: serde_json::Value = serde_json::from_str(&event).unwrap_or(serde_json::Value::Null);
-    if event
-        .get("invocationNum")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0)
-        == 0
-    {
-        let _ = writeln!(stdout, "{{}}");
-        return;
-    }
-    if !conversation.is_empty()
-        && event
-            .get("conversationId")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|id| id != conversation)
-    {
-        let _ = writeln!(stdout, "{{}}");
-        return;
-    }
-    let before = match client::agent_identity() {
-        Some(id) => client::call::<InboxResponse>(
-            data,
-            "GET",
-            &format!("/v1/agents/{id}/inbox"),
-            None,
-            &client::Authority::Agent(id),
-        ),
-        None => client::call::<InboxResponse>(
-            data,
-            "GET",
-            &format!("/v1/agents/{agent}/inbox"),
-            None,
-            &client::Authority::None,
-        ),
-    };
-    let Ok(Some(before)) = before else {
-        let _ = writeln!(stdout, "{{}}");
-        return;
-    };
-    // The mailbox is in sequence order, oldest first. Only what the harness has
-    // A hook only offers what the harness has not taken: `received`.
-    let lines: Vec<MessageView> = before
-        .messages
-        .into_iter()
-        .filter(|line| line.ack == "received")
-        .collect();
-    if lines.is_empty() {
-        let _ = writeln!(stdout, "{{}}");
-        return;
-    }
-    let mut used =
-        String::from("New messages arrived while you were working (delivered mid-turn):");
-    for line in lines.iter().take(40) {
-        used.push_str("\n\n");
-        used.push_str(&anyagents_harness::marked_message(&line.id, &line.text));
-    }
-    let answer = serde_json::json!({"injectSteps": [{"userMessage": used}]});
-    let _ = writeln!(stdout, "{answer}");
 }
 
 /// The installer's sign-in, run against the agent's own config directory. This

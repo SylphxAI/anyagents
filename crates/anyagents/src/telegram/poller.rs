@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_core::{Channel, FileCredentialStore, Store};
 
-use super::channel::{LONG_POLL_S, poll_channel_once};
+use super::channel::{LONG_POLL_S, delete_webhook, ensure_webhook, poll_channel_once};
 
 /// How often the supervisor looks for channels that were added or removed.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
@@ -61,6 +61,13 @@ impl Poller {
             stop,
             supervisors: Mutex::new(vec![handle]),
         })
+    }
+
+    /// Signal every polling thread to stop so that when [`release_every_bot`]
+    /// interrupts an in-flight long poll, the thread commits its offset and
+    /// exits instead of starting a new 30-second poll.
+    pub fn signal_stop(&self) {
+        self.stop.store(true, Ordering::SeqCst);
     }
 
     /// Stop every bot's poll and wait for its last offset to be written. The
@@ -118,12 +125,13 @@ fn supervise(
             }
             let bot_stop = Arc::new(AtomicBool::new(false));
             let flag = Arc::clone(&bot_stop);
+            let global_stop = Arc::clone(&stop);
             let store = Arc::clone(&store);
             let dir = data_dir.clone();
             let channel_id = channel.id.to_string();
             let started = std::thread::Builder::new()
                 .name(format!("anyagents-telegram-{id}"))
-                .spawn(move || run_channel(store, dir, channel_id, flag));
+                .spawn(move || run_channel(store, dir, channel_id, flag, global_stop));
             if let Ok(handle) = started {
                 lock(&bots).insert(
                     id,
@@ -152,10 +160,44 @@ fn supervise(
     }
 }
 
-/// One channel's own loop: long-poll it, and never another channel's.
-fn run_channel(store: Arc<Store>, data_dir: std::path::PathBuf, id: String, stop: Arc<AtomicBool>) {
+fn configured_webhook_base() -> Option<String> {
+    std::env::var("ANYAGENTS_WEBHOOK_URL")
+        .ok()
+        .map(|v| v.trim().trim_end_matches('/').to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn webhook_origin_ready(base: &str) -> bool {
+    if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some() {
+        return true;
+    }
+    let url = format!("{}/v1/webhooks/healthz", base.trim_end_matches('/'));
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .build()
+        .new_agent();
+    agent
+        .get(&url)
+        .call()
+        .map(|resp| resp.status().as_u16() == 200)
+        .unwrap_or(false)
+}
+
+/// One channel's own loop: register its webhook when a live webhook origin is
+/// configured, otherwise long-poll it.
+fn run_channel(
+    store: Arc<Store>,
+    data_dir: std::path::PathBuf,
+    id: String,
+    stop: Arc<AtomicBool>,
+    global_stop: Arc<AtomicBool>,
+) {
     let secrets = FileCredentialStore::new(&data_dir);
-    while !stop.load(Ordering::SeqCst) {
+    let mut webhook_registered_for: Option<String> = None;
+    while !stop.load(Ordering::SeqCst) && !global_stop.load(Ordering::SeqCst) {
         // The channel is re-read each pass: its saved offset and chats are what
         // this thread's own writes produced, so a stale copy would write an old
         // state back over them.
@@ -167,9 +209,24 @@ fn run_channel(store: Arc<Store>, data_dir: std::path::PathBuf, id: String, stop
         let Some(channel) = channel else {
             return;
         };
+        if let Some(base) = configured_webhook_base()
+            && webhook_origin_ready(&base)
+        {
+            if webhook_registered_for.as_deref() != Some(base.as_str()) {
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    ensure_webhook(&store, &secrets, &channel, &base)
+                }));
+                if matches!(outcome, Ok(Ok(()))) {
+                    webhook_registered_for = Some(base);
+                }
+            }
+            sleep_a_moment(&stop, &global_stop);
+            continue;
+        }
+        webhook_registered_for = None;
         // The timeout is capped so a shutdown never waits out a full long poll:
         // Telegram answers at once when the timeout is short.
-        let timeout = if stop.load(Ordering::SeqCst) {
+        let timeout = if stop.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
             RELEASE_POLL_S
         } else {
             LONG_POLL_S
@@ -177,9 +234,14 @@ fn run_channel(store: Arc<Store>, data_dir: std::path::PathBuf, id: String, stop
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             poll_channel_once(&store, &secrets, &channel, timeout)
         }));
+        if let Ok(Err(ref err)) = outcome
+            && err.to_string().contains("Conflict: webhook is active")
+        {
+            let _ = delete_webhook(&secrets, &channel);
+        }
         // A failed poll waits a moment; a good one asks again at once.
         if !matches!(outcome, Ok(Ok(()))) {
-            sleep_a_moment(&stop);
+            sleep_a_moment(&stop, &global_stop);
         }
     }
 }
@@ -196,6 +258,11 @@ pub fn release_every_bot(
     data_dir: &std::path::Path,
     within: Duration,
 ) -> Result<(), String> {
+    if let Some(base) = configured_webhook_base()
+        && webhook_origin_ready(&base)
+    {
+        return Ok(());
+    }
     let channels = channels_to_poll(store);
     let (done_tx, done_rx) = mpsc::channel();
     let mut waiting = 0;
@@ -254,10 +321,10 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poison| poison.into_inner())
 }
 
-fn sleep_a_moment(flag: &AtomicBool) {
+fn sleep_a_moment(flag: &AtomicBool, global_stop: &AtomicBool) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
-        if flag.load(Ordering::SeqCst) {
+        if flag.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
             return;
         }
         std::thread::sleep(Duration::from_millis(50));

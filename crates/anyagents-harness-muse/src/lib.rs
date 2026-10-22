@@ -23,13 +23,19 @@ use std::time::Duration;
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerSupport, TurnState, TurnUsage, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
 
 /// How long one request may take to come back.
-const RPC_WAIT: Duration = Duration::from_secs(5);
+fn rpc_wait() -> Duration {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+        Duration::from_secs(5)
+    } else {
+        Duration::from_secs(60)
+    }
+}
 /// A cold resume can take much longer than a request.
 const RESUME_WAIT: Duration = Duration::from_secs(180);
 
@@ -80,13 +86,26 @@ impl MuseHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
+        Self::start_in_with_args(program, &[], session_id, environment, work_dir)
+    }
+
+    /// Start one child with extra CLI arguments after `serve`.
+    pub fn start_in_with_args(
+        program: impl Into<PathBuf>,
+        extra_args: &[String],
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
         let shared = Arc::new(Mutex::new(State::default()));
         let on_shared = Arc::clone(&shared);
+        let mut args = vec!["serve".to_string()];
+        args.extend(extra_args.iter().cloned());
         let rpc = RpcChild::launch(
             RpcLaunch {
                 name: "anyagents-muse".to_string(),
                 program: program.into(),
-                args: vec!["serve".to_string()],
+                args,
                 environment: environment
                     .iter()
                     .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -169,7 +188,7 @@ impl MuseHarness {
         self.call(
             "initialize",
             json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
-            RPC_WAIT,
+            rpc_wait(),
         )?;
         self.rpc.notify("initialized", json!({})).map_err(fail)?;
         let wanted = lock(&self.shared).wanted_session.clone();
@@ -184,7 +203,22 @@ impl MuseHarness {
             ),
             None => ("session/start", json!({"commandId": command_id()})),
         };
-        let result = self.call(method, params, RESUME_WAIT)?;
+        let result = match self.call(method, params, RESUME_WAIT) {
+            Ok(result) => result,
+            Err(err)
+                if wanted.is_some()
+                    && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+                    && (err.to_string().contains("not found")
+                        || err.to_string().contains("sessionNotFound")) =>
+            {
+                self.call(
+                    "session/start",
+                    json!({"commandId": command_id()}),
+                    RESUME_WAIT,
+                )?
+            }
+            Err(err) => return Err(err),
+        };
         let session = result
             .pointer("/session/sessionId")
             .and_then(Value::as_str)
@@ -208,7 +242,7 @@ impl MuseHarness {
                 "mode": "allowAll",
                 "sessionId": session
             }),
-            RPC_WAIT,
+            rpc_wait(),
         )?;
         Ok(())
     }
@@ -245,7 +279,11 @@ impl Harness for MuseHarness {
         let mut params = json!({
             "commandId": command_id(),
             "sessionId": session,
-            "input": [{"type": "text", "text": marked_message(&message.id, &message.text)}],
+            // One user step: the ID line and the server's trusted context first, so
+        // the model reads who wrote it and where a bare answer goes.
+        // One user step: the ID line first, then the server's trusted context
+        // when it wrote one, then the body.
+        "input": [{"type": "text", "text": compose_text(message)}],
             "reasoningEffort": "max",
         });
         if in_turn {
@@ -260,7 +298,7 @@ impl Harness for MuseHarness {
                 state.open.push(message.id.clone());
             }
         }
-        match self.rpc.request("turn/start", params, RPC_WAIT) {
+        match self.rpc.request("turn/start", params, rpc_wait()) {
             Ok(result) => {
                 let mut state = lock(&self.shared);
                 state.written.push(message.id.clone());
@@ -341,7 +379,7 @@ impl Harness for MuseHarness {
                     "sessionId": session,
                     "turnId": turn
                 }),
-                RPC_WAIT,
+                rpc_wait(),
             )?;
         }
         let mut state = lock(&self.shared);
@@ -574,6 +612,19 @@ fn note_ids(state: &mut State, value: &Value) {
 }
 
 /// A uuid7 command id, the shape the vendor's own commands use.
+/// The user step one mailbox message becomes.
+fn compose_text(message: &anyagents_harness::OutboundMessage) -> String {
+    let context = &message.context;
+    let known = context.sender.is_some()
+        || context.chat_id.is_some()
+        || context.message_id.is_some()
+        || context.destination.is_some();
+    if !known {
+        return anyagents_harness::marked_message(&message.id, &message.text);
+    }
+    anyagents_harness::compose_message(&message.id, context, &message.text)
+}
+
 fn command_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()

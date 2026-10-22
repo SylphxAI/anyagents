@@ -118,7 +118,7 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
 | `claude-code` | `steer` | A `user` message on the stream-json child's stdin, at any point; the child echoes it, which is the acknowledgement. |
 | `muse` | `steer` | `turn/start` with `ifBusy: "steer"`. |
-| `agy` | `followup` | The CLI reads its next NDJSON line only after a result, so the adapter holds the line until then; mid-turn input is its `PreInvocation` hook (below). |
+| `agy` | `followup` | The CLI runs a turn per NDJSON input line. Pipe acceptance does not establish model consumption; native hook delivery is not wired (below). |
 | `followup` mode | `followup` | The contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per turn and answers with a `result`; a line written mid-turn waits for that turn to end. |
 
 No harness here uses `queue`: none of them is a one-shot run that must wait.
@@ -127,7 +127,7 @@ The per-harness programmatic modes, sign-in methods and usage fields are listed 
 
 ### Antigravity and Muse
 
-- **Antigravity (`agy`).** One `agy --print --input-format stream-json --output-format stream-json` child, resumed with `--conversation <id>`. A `result` event closes the turn; a `result` that reports an error (`is_error`, or a subtype other than `success`) is a failed turn that carries the vendor's own text. Delivery mode is followup. Mid-turn input is the CLI's own hook: it runs the `PreInvocation` command in `settings.json` in its config directory before every model call, and a hook may answer `{"injectSteps":[{"userMessage": ...}]}`. `anyagents agy-hook` is that command; it reads the mailbox through the socket and answers with every message the harness has not taken yet, in sequence order and unfiltered, so a message that arrives while a turn runs is seen at the next step. `AGY_CONFIG_DIR` points the CLI at the agent's config directory.
+- **Antigravity (`agy`).** The installed CLI documents a turn per stream-json input line and `--conversation <id>` for resume. The adapter reports followup/unproven. Its hook helpers are not wired to a confirmed customization root and have no vendor consumption acknowledgement. AGY 1.4.5's embedded lifecycle documentation specifies `hooks.json` in a customization root (for example `.agents/hooks.json`), with a named hook's flat `PreInvocation` command array and output `{"injectSteps":[{"userMessage":"..."}]}`. It does not specify the durable acceptance/replay contract needed to commit the mailbox cursor across hook abort or process restart. The existing `agy-hook` helper only offers `received` rows, while stream pipe writes already mark rows delivered; it cannot establish native mid-turn delivery. Do not advertise steer support or install a hook bound to a seat in a shared workspace until isolated hook discovery and consumption/recovery semantics are verified.
 - **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Delivery mode is steer: `turn/start` when no turn is open, and `turn/start` with `ifBusy: "steer"` during one. `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
 
 ## Mailbox: one log per agent
@@ -168,7 +168,33 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 
 ## Send, inbox and agents (the MCP tools)
 
-`anyagents mcp --agent <name>` is the MCP server registered into each agent's harness. It holds a capability bound to that one agent, so an agent can only send as itself.
+`anyagents mcp --config <agent config dir>` is the MCP server registered into each agent's harness. It holds one opaque capability, minted by the server for one agent instance, so the agent acts as exactly that agent and nothing a tool argument says.
+
+## Identity: one authenticated connection per agent session
+
+A capability is 32 random bytes the server mints for one agent instance. The server keeps only its hash, beside the agent's immutable id and a generation: minting a new one revokes the last, so a replaced session stops working at once. The capability is written 0640 into the agent's own config directory (`agents/<id>/config/mcp-capability`), in that agent's own OS group, so its harness reads it and no other seat can. It is never an argument, a tool argument, an environment value or a log line.
+
+The server decides the principal before any route runs:
+
+- **An agent** is whatever agent the presented capability names, read from the store. A `sender`, an inbox path, a bot, a session id or an environment value never establishes identity. A body that names another sender is refused with no write.
+- **The operator** is the deployment's own authority, for its administrative calls only: creating agents, signing a harness in, minting a capability, reading any agent's inbox. It presents a token from a file the environment names, and the server keeps only a digest of it.
+- **A machine without an operator token** is the single-user route: it acts as the agent a call names, and says so once at start. It is not the identity boundary.
+
+## The OS boundary
+
+A server started with an operator token is the identity boundary, and it only serves that way when every harness it starts is inside the agent's own OS seat: a distinct managed uid per agent, placed by an installed launcher (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). The uid comes from the deployment's own start line, never from anything an agent writes.
+
+`anyagents agent-run --config <dir> -- <command>` starts one agent command inside that seat, or refuses and prints the one admission it needs. Before a command starts, it asserts what the new process is: its effective uid is the configured one and not the server's, `NoNewPrivs` is 1, the server's database, secrets, socket and token and a peer's config are denied, and its own config is writable. A successful probe alone proves nothing.
+
+Every harness adapter, and every process an adapter starts, takes the seat from the launch environment the server set for that one agent.
+
+## Replies and quotes
+
+Each stored message carries the context the server authenticated for it: the author, the channel, the chat and forum topic, the mailbox reference a bare answer names, the destination that answer goes to, and the message it quotes. Every harness shows its model that context before the body, composed in one place (`anyagents_harness::compose_message`); the body's own text is never read as part of it.
+
+`reply_to` is a mailbox reference (`anyagents:reply:<message id>`), a bare message id, or an address. A reference is resolved from the stored record, so a group message is answered in its group and its topic at the incoming message, and a direct message in its own chat. An address is used as written, which is how an agent starts a new conversation on purpose. A message naming a destination no record names is refused.
+
+A message from Telegram keeps the message it quotes: the quoted author, as Telegram marked it (bot or person), its text or caption, and the ids that name it. The quoted text is fenced and neutralised, so a modelled line cannot forge a quoted author.
 
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
@@ -183,9 +209,10 @@ A subscription harness often reports tokens but no price; its record says `subsc
 ## Security model
 
 - The API listens on a Unix socket readable only by the user. A TCP listener is opt-in and requires a bearer token.
-- Each agent's MCP capability is scoped to that agent.
-- Secrets (channel tokens, API keys) live in the OS keychain or a 0600 file, never in the database, logs or usage records.
-- Agents run as the user who runs the server, with each vendor tool's own permission settings. Isolating agents from each other is out of scope for the first version.
+- Each agent's MCP capability is scoped to that agent, and minted fresh for each of its instances; the last one stops working at once.
+- The operator's authority is its own token, never an agent's.
+- Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
+- On a deployment with an operator token, every harness runs in its own OS seat: a distinct managed uid, no new privileges, and no read of the server's files or a peer's config. A deployment without that seat refuses to start as the boundary.
 
 ## Storage
 

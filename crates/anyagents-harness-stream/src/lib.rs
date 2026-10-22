@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, HarnessError, HarnessHealth, OutboundMessage, SteerSupport,
-    TurnState, TurnUsage, marked_message, message_id_in_text,
+    TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
 };
 use serde_json::{Value, json};
 
@@ -128,7 +128,9 @@ impl StreamSpec {
     }
 
     fn usage_of(&self, value: &Value) -> TurnUsage {
-        let usage = value.get("usage");
+        let usage = value
+            .get("usage")
+            .or_else(|| value.pointer("/result/usage"));
         TurnUsage {
             input_tokens: number(usage, "input_tokens"),
             output_tokens: number(usage, "output_tokens"),
@@ -184,6 +186,18 @@ pub struct StreamHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
+    pending: Option<PendingWrite>,
+    #[cfg(target_os = "linux")]
+    readiness: Option<JoinHandle<()>>,
+}
+
+// Only the delivery owner advances this buffer. A partial line remains in
+// mailbox custody (Deferred) until every byte reaches this process's pipe.
+struct PendingWrite {
+    id: String,
+    bytes: Vec<u8>,
+    offset: usize,
+    generation: u64,
 }
 
 /// Shared by every harness over one child: the owner and any reader.
@@ -191,6 +205,8 @@ struct State {
     child: Option<Child>,
     alive: bool,
     epoch: u64,
+    generation: u64,
+    input_blocked: bool,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
@@ -223,6 +239,9 @@ impl StreamHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
+            pending: None,
+            #[cfg(target_os = "linux")]
+            readiness: None,
         };
         harness.spawn()?;
         Ok(harness)
@@ -342,41 +361,6 @@ impl StreamHarness {
     }
 
     /// Write one line for `message`, unless that id was already written or echoed.
-    pub fn deliver(
-        &mut self,
-        message: &OutboundMessage,
-        line: &Value,
-    ) -> Result<DeliverOutcome, HarnessError> {
-        let mut state = lock(&self.shared);
-        if !state.alive {
-            return Err(HarnessError::Dead);
-        }
-        if state.seen.contains(&message.id) {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: state.finished.contains(&message.id),
-            });
-        }
-        if let Some(reset_at_ms) = state.quota_reset_at_ms {
-            return Ok(DeliverOutcome::Quota { reset_at_ms });
-        }
-        if write_stdin(&self.stdin, line).is_err() {
-            state.alive = false;
-            self.wake.notify_all();
-            return Err(HarnessError::Dead);
-        }
-        if state.open.is_empty() {
-            state.turns_started += 1;
-            state.open.push(message.id.clone());
-        } else {
-            state.followups.push(message.id.clone());
-        }
-        state.seen.insert(message.id.clone());
-        state.written.push(message.id.clone());
-        Ok(DeliverOutcome::Accepted {
-            turn_finished: false,
-        })
-    }
-
     pub fn background(&self) -> Result<(), HarnessError> {
         if lock(&self.shared).alive {
             Ok(())
@@ -402,11 +386,20 @@ impl StreamHarness {
 
     /// Write `line` and drop the open turn. The vendor decides what the line means.
     pub fn cancel(&mut self, line: &Value) -> Result<(), HarnessError> {
-        let mut state = lock(&self.shared);
-        if !state.alive {
+        if !lock(&self.shared).alive {
             return Err(HarnessError::Dead);
         }
-        if write_stdin(&self.stdin, line).is_err() {
+        // A cancel must never split an unfinished JSON line. Keep the message
+        // pending for a retry rather than claiming cancellation or delivery.
+        if self.pending.is_some() {
+            return Err(HarnessError::Failed("stdin delivery pending".into()));
+        }
+        let result = write_stdin(&self.stdin, line);
+        let mut state = lock(&self.shared);
+        if let Err(err) = result {
+            if err.kind() == std::io::ErrorKind::WouldBlock {
+                return Err(HarnessError::Failed("stdin backpressure".into()));
+            }
             state.alive = false;
             self.wake.notify_all();
             return Err(HarnessError::Dead);
@@ -440,6 +433,85 @@ impl StreamHarness {
         lock(&self.shared).child.as_ref().map(Child::id)
     }
 
+    /// Write one line into the child and record it as taken.
+    pub fn deliver(
+        &mut self,
+        message: &OutboundMessage,
+        line: &Value,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        let bytes = self
+            .pending
+            .is_none()
+            .then(|| format!("{line}\n").into_bytes());
+        {
+            let mut state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            if let Some(pending) = &self.pending {
+                if pending.id != message.id {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+            } else {
+                if state.seen.contains(&message.id) {
+                    return Ok(DeliverOutcome::Accepted {
+                        turn_finished: state.finished.contains(&message.id),
+                    });
+                }
+                if let Some(reset_at_ms) = state.quota_reset_at_ms {
+                    return Ok(DeliverOutcome::Quota { reset_at_ms });
+                }
+                // Associate even an immediate result with its owner before the
+                // first byte is visible to the child. This is not acceptance.
+                if state.open.is_empty() {
+                    state.turns_started += 1;
+                    state.open.push(message.id.clone());
+                } else {
+                    state.followups.push(message.id.clone());
+                }
+                self.pending = Some(PendingWrite {
+                    id: message.id.clone(),
+                    bytes: bytes.expect("new write"),
+                    offset: 0,
+                    generation: state.generation,
+                });
+            }
+        }
+        // Never hold shared state across pipe I/O. On Linux stdin is
+        // nonblocking: backpressure returns custody to the mailbox immediately.
+        let pending = self.pending.as_mut().expect("reserved above");
+        let result = write_pending(&self.stdin, pending);
+        let mut state = lock(&self.shared);
+        if state.generation != pending.generation || !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        match result {
+            Ok(false) => {
+                state.input_blocked = true;
+                self.wake.notify_all();
+                Ok(DeliverOutcome::Deferred)
+            }
+            Ok(true) => {
+                state.input_blocked = false;
+                let pending = self.pending.take().expect("completed write");
+                state.seen.insert(pending.id.clone());
+                state.written.push(pending.id);
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: state.finished.contains(&message.id),
+                })
+            }
+            Err(_) => {
+                state.alive = false;
+                self.wake.notify_all();
+                Err(HarnessError::Dead)
+            }
+        }
+    }
+
+    pub fn input_ready(&self) -> bool {
+        !lock(&self.shared).input_blocked
+    }
+
     pub fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
@@ -467,7 +539,9 @@ impl StreamHarness {
     }
 
     fn spawn(&mut self) -> Result<(), HarnessError> {
-        let mut command = Command::new(&self.program);
+        // The seat the server configured for this agent: the child starts as
+        // the agent's own uid, and no server-only key reaches it.
+        let mut command = spawn_command(&self.program, &self.environment);
         command.args(&self.args);
         command
             .stdin(Stdio::piped())
@@ -492,13 +566,55 @@ impl StreamHarness {
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
-        {
+        if let Err(err) = nonblocking_stdin(&child_stdin) {
+            anyagents_harness::kill_child(&mut child, &self.environment);
+            let _ = child.wait();
+            return Err(HarnessError::Failed(err.to_string()));
+        }
+        let generation = {
             let mut state = lock(&self.shared);
+            state.generation = state.generation.wrapping_add(1);
+            // Pipe acceptance belongs to this process, never its replacement.
+            state.input_blocked = false;
+            state.seen.clear();
+            state.written.clear();
+            state.finished.clear();
+            state.finished_quiet.clear();
+            state.usages.clear();
+            state.quota_reset_at_ms = None;
             state.child = Some(child);
             state.alive = true;
             state.open.clear();
             state.followups.clear();
             state.text = None;
+            state.generation
+        };
+        self.pending = None;
+        #[cfg(target_os = "linux")]
+        {
+            // A dup keeps poll's descriptor valid even while stop closes the
+            // owner's copy. Killing our child wakes poll with POLLERR.
+            use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+            let fd = unsafe { libc::fcntl(child_stdin.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 3) };
+            if fd < 0 {
+                self.stop_child();
+                return Err(HarnessError::Failed(
+                    std::io::Error::last_os_error().to_string(),
+                ));
+            }
+            let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+            let shared = Arc::clone(&self.shared);
+            let wake = Arc::clone(&self.wake);
+            self.readiness = match thread::Builder::new()
+                .name(format!("{}-stdin", self.spec.name))
+                .spawn(move || watch_writable(fd, shared, wake, generation))
+            {
+                Ok(handle) => Some(handle),
+                Err(err) => {
+                    self.stop_child();
+                    return Err(HarnessError::Failed(err.to_string()));
+                }
+            };
         }
         *lock(&self.stdin) = Some(child_stdin);
         let shared = Arc::clone(&self.shared);
@@ -506,7 +622,7 @@ impl StreamHarness {
         let spec = self.spec.clone();
         match thread::Builder::new()
             .name(spec.name.clone())
-            .spawn(move || read_stdout(stdout, shared, wake, spec))
+            .spawn(move || read_stdout(stdout, shared, wake, spec, generation))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
@@ -518,22 +634,28 @@ impl StreamHarness {
     }
 
     fn stop_child(&mut self) {
+        self.pending = None;
         *lock(&self.stdin) = None;
-        {
+        let mut child = {
             let mut state = lock(&self.shared);
             state.alive = false;
-            if let Some(child) = state.child.as_mut() {
-                let _ = child.kill();
-            }
-        }
+            state.child.take()
+        };
         self.wake.notify_all();
+        if let Some(child) = child.as_mut() {
+            anyagents_harness::kill_child(child, &self.environment);
+        }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
-        let mut state = lock(&self.shared);
-        if let Some(mut child) = state.child.take() {
+        #[cfg(target_os = "linux")]
+        if let Some(handle) = self.readiness.take() {
+            let _ = handle.join();
+        }
+        if let Some(mut child) = child {
             let _ = child.wait();
         }
+        let mut state = lock(&self.shared);
         state.open.clear();
         state.followups.clear();
         state.text = None;
@@ -575,6 +697,8 @@ impl State {
             child: None,
             alive: false,
             epoch: 0,
+            generation: 0,
+            input_blocked: false,
             seen: HashSet::new(),
             written: Vec::new(),
             open: Vec::new(),
@@ -595,6 +719,7 @@ fn read_stdout(
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
     spec: StreamSpec,
+    generation: u64,
 ) {
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
@@ -607,6 +732,9 @@ fn read_stdout(
         let effect = spec.effect(&value);
         {
             let mut state = lock(&shared);
+            if state.generation != generation {
+                return;
+            }
             note_markers(&mut state, &value);
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
@@ -633,6 +761,9 @@ fn read_stdout(
     }
     {
         let mut state = lock(&shared);
+        if state.generation != generation {
+            return;
+        }
         state.alive = false;
         state.epoch = state.epoch.wrapping_add(1);
     }
@@ -697,12 +828,102 @@ fn note_markers(state: &mut State, value: &Value) {
     }
 }
 
+// Event-driven pipe readiness, not a mailbox poller or delivery queue.
+#[cfg(target_os = "linux")]
+fn watch_writable(
+    fd: std::os::fd::OwnedFd,
+    shared: Arc<Mutex<State>>,
+    wake: Arc<Condvar>,
+    generation: u64,
+) {
+    use std::os::fd::AsRawFd;
+    loop {
+        let state = lock(&shared);
+        let state = wake
+            .wait_while(state, |state| {
+                state.alive && state.generation == generation && !state.input_blocked
+            })
+            .unwrap_or_else(|err| err.into_inner());
+        if !state.alive || state.generation != generation {
+            return;
+        }
+        drop(state);
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let result = unsafe { libc::poll(&mut poll, 1, -1) };
+        if result < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        let mut state = lock(&shared);
+        if !state.alive || state.generation != generation {
+            return;
+        }
+        state.input_blocked = false;
+        if result < 0 || poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+            state.alive = false;
+        }
+        state.epoch = state.epoch.wrapping_add(1);
+        drop(state);
+        wake.notify_all();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn nonblocking_stdin(stdin: &ChildStdin) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let fd = stdin.as_raw_fd();
+    // This descriptor is owned here, not inherited by the child as its stdin.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nonblocking_stdin(_stdin: &ChildStdin) -> std::io::Result<()> {
+    Ok(())
+}
+
+fn write_pending(
+    slot: &Mutex<Option<ChildStdin>>,
+    pending: &mut PendingWrite,
+) -> std::io::Result<bool> {
+    let mut guard = lock(slot);
+    let stdin = guard
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("stdin closed"))?;
+    while pending.offset < pending.bytes.len() {
+        match stdin.write(&pending.bytes[pending.offset..]) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(count) => pending.offset += count,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+            Err(err) => return Err(err),
+        }
+    }
+    stdin.flush()?;
+    Ok(true)
+}
+
 fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Result<()> {
     let mut guard = lock(slot);
     let Some(stdin) = guard.as_mut() else {
         return Err(std::io::Error::other("stdin closed"));
     };
-    writeln!(stdin, "{value}")?;
+    // One small control line must be one pipe write: write_fmt can split a
+    // JSON value and leave a corrupt prefix behind on WouldBlock.
+    let bytes = format!("{value}\n").into_bytes();
+    #[cfg(target_os = "linux")]
+    if bytes.len() > libc::PIPE_BUF {
+        return Err(std::io::Error::other(
+            "control line exceeds atomic pipe write",
+        ));
+    }
+    stdin.write_all(&bytes)?;
     stdin.flush()
 }
 
@@ -726,15 +947,28 @@ fn quota_of(value: &Value) -> Option<i64> {
 
 /// The line that puts one message into the child.
 pub fn message_line(spec: &StreamSpec, message: &OutboundMessage) -> Value {
+    // The trusted header the server wrote, then the body: one composition
+    // for every harness. Carries both top-level `type`/`text` and the
+    // `event`/`message` envelope that `agy --input-format stream-json` decodes.
+    let text = compose_message(&message.id, &message.context, &message.text);
     json!({
         "type": spec.start_line,
-        "text": marked_message(&message.id, &message.text)
+        "event": spec.start_line,
+        "text": text,
+        "message": {
+            "role": "user",
+            "content": text
+        }
     })
 }
 
 /// The line that stops the current turn.
 pub fn cancel_line(spec: &StreamSpec) -> Value {
-    json!({"type": spec.cancel})
+    json!({
+        "type": spec.cancel,
+        "event": "control_request",
+        "request": { "subtype": spec.cancel }
+    })
 }
 
 #[cfg(test)]

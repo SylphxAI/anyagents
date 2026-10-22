@@ -8,7 +8,7 @@
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::FileTypeExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use anyagents_core::{Address, Agent, Error, Incoming, ReceiveOutcome, Store, now_ms};
@@ -89,7 +89,45 @@ fn capability_key() -> Result<String, Error> {
 
 async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
     let store = Arc::new(Store::open(data.join("state.db"))?);
-    store.hold_capability_key(&capability_key()?)?;
+    let key = capability_key()?;
+    store.hold_capability_key(&key)?;
+    let agents = store.list_agents()?;
+    let mut mint_failures = Vec::new();
+    for agent in &agents {
+        if let Err(err) = crate::operator::mint(&store, &agent.id) {
+            mint_failures.push(format!("{}: {err}", agent.name));
+        }
+    }
+    if !mint_failures.is_empty() {
+        eprintln!(
+            "warning: a capability was not minted for {}",
+            mint_failures.join(", ")
+        );
+    }
+    if crate::sandbox::seat_named() && crate::sandbox::configured_seat().is_none() {
+        return Err(Error::Message(
+            "a seat is named without its group: set ANYAGENTS_AGENT_UID, ANYAGENTS_AGENT_GID and \
+             ANYAGENTS_SOCKET_GID together, or none"
+                .into(),
+        ));
+    }
+    // An operator token is the identity boundary; it holds only when every
+    // harness it starts is in its own OS seat. Otherwise the boundary contract
+    // says so, and no run claims it.
+    let seats: Vec<String> = store
+        .list_agents()?
+        .into_iter()
+        .map(|agent| agent.name)
+        .collect();
+    if operator::operator_token(data).is_some() && !crate::sandbox::launch_boundary(&seats) {
+        return Err(Error::Message(
+            "this server has an operator token, so it is the identity boundary, but no OS seat is \
+             in place for its agents: configure ANYAGENTS_AGENT_UID, ANYAGENTS_AGENT_GID and \
+             ANYAGENTS_SOCKET_GID and install /usr/local/bin/anyagents-setpriv, or start it without \
+             an operator token on a single-user machine"
+                .into(),
+        ));
+    }
     let auth = deployment_mode(data);
     if !auth.is_confined() {
         not_confined_note(data);
@@ -130,6 +168,25 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
+    if let Some(addr) = webhook_listen_addr() {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(tcp_listener) => {
+                if let Ok(local) = tcp_listener.local_addr() {
+                    let _ = std::fs::write(data.join("webhook.addr"), format!("{local}\n"));
+                }
+                let webhook_app = Router::new()
+                    .route("/v1/webhooks/healthz", get(webhook_healthz))
+                    .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+                    .with_state(state.clone());
+                tokio::spawn(async move {
+                    let _ = axum::serve(tcp_listener, webhook_app).await;
+                });
+            }
+            Err(err) => {
+                eprintln!("warning: webhook TCP listener ({addr}) did not bind: {err}");
+            }
+        }
+    }
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
@@ -141,6 +198,8 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         )
         .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/webhooks/healthz", get(webhook_healthz))
+        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .with_state(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = axum::serve(listener, app)
@@ -151,9 +210,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
             }
         })
         .await;
-    // A long poll ends at Telegram, not here: it is released for every bot
-    // before the poller is stopped, so each bot's last offset is written by the
-    // process that still owns it.
+    // A long poll ends at Telegram, not here: signal the poller to stop first
+    // so released long polls exit instead of re-entering a 30s wait, then
+    // release every bot so each bot's last offset is written before shutdown.
+    poller.signal_stop();
     if let Err(reason) = crate::telegram::poller::release_every_bot(
         &store,
         store.data_dir(),
@@ -173,7 +233,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
 /// operator token the server is the identity boundary and reads nothing from a
 /// name.
 fn deployment_mode(data: &Path) -> auth::Mode {
-    match auth::Mode::from_env() {
+    match auth::Mode::from_env(data) {
         auth::Mode::Confined {
             operator_digest: None,
         } => match std::fs::canonicalize(data) {
@@ -233,6 +293,69 @@ async fn mint_capability(
     Ok(Json(
         serde_json::json!({ "agent": agent.name, "minted": true }),
     ))
+}
+
+/// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
+/// webhook listener (`https://desk.kylet.se/v1/webhooks/healthz`).
+async fn webhook_healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
+/// Telegram, verifies `X-Telegram-Bot-Api-Secret-Token` against the channel's
+/// derived HMAC-SHA256 secret, and routes the update into the durable mailbox.
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    AxumPath(channel_id): AxumPath<String>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        crate::telegram::receive_webhook(
+            &store,
+            store.data_dir(),
+            &channel_id,
+            secret.as_deref(),
+            &payload,
+        )
+        .map_err(|err| match err {
+            crate::telegram::WebhookError::Unauthorized => {
+                ApiError::new(StatusCode::UNAUTHORIZED, "invalid webhook secret token")
+            }
+            crate::telegram::WebhookError::NotFound(why) => {
+                ApiError::new(StatusCode::NOT_FOUND, why)
+            }
+            crate::telegram::WebhookError::BadRequest(why) => {
+                ApiError::new(StatusCode::BAD_REQUEST, why)
+            }
+            crate::telegram::WebhookError::Store(why) => {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why)
+            }
+        })?;
+        Ok(Json(serde_json::json!({ "ok": true })))
+    })
+    .await
+}
+
+fn webhook_listen_addr() -> Option<String> {
+    if let Ok(addr) = std::env::var("ANYAGENTS_WEBHOOK_LISTEN") {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+        || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
+    {
+        return None;
+    }
+    Some("0.0.0.0:8788".to_string())
 }
 
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
@@ -461,15 +584,16 @@ impl CommandRunner for ProcessRunner {
         env: &[(&str, &str)],
         on_line: &mut dyn LineSink,
     ) -> Result<(), InstallError> {
-        let mut command = Command::new(program);
+        let env_pairs: Vec<(String, String)> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let mut command = anyagents_harness::spawn_command(Path::new(program), &env_pairs);
         command
             .args(args)
             .current_dir(dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        for (key, value) in env {
-            command.env(key, value);
-        }
         let mut child = command
             .spawn()
             .map_err(|err| InstallError::Failed(err.to_string()))?;
@@ -656,8 +780,20 @@ async fn send(
 ) -> Result<Json<SendResponse>, ApiError> {
     // The authenticated principal decides who the message is from; a body
     // `sender` is only a check, and a disagreement is refused with no write.
-    let actor = match &principal {
-        Principal::Agent { name, .. } => {
+    // On a machine without the boundary, its own agent route names the sender;
+    // that is the one place a body chooses the author, and an inbox is still
+    // only ever its own.
+    let route_named = match &principal {
+        Principal::Agent { name, .. } if state.auth.is_trusted() => body
+            .sender
+            .as_deref()
+            .and_then(|named| Actor::parse(named).ok())
+            .filter(|named| named.as_address() != Actor::Agent(name.clone()).as_address()),
+        _ => None,
+    };
+    let actor = match (&principal, route_named) {
+        (_, Some(named)) => named,
+        (Principal::Agent { name, .. }, None) => {
             if let Some(named) = body.sender.as_deref() {
                 Actor::parse(named).and_then(|named| {
                     if named.as_address() == Actor::Agent(name.clone()).as_address() {
@@ -671,7 +807,7 @@ async fn send(
             }
             Actor::Agent(name.clone())
         }
-        Principal::Operator => {
+        (Principal::Operator, _) => {
             let sender = body.sender.as_deref().ok_or_else(|| {
                 ApiError::new(
                     StatusCode::BAD_REQUEST,
@@ -688,8 +824,11 @@ async fn send(
     let key = send_key(&state.send_namespace, &body);
     let store = Arc::clone(&state.store);
     let principal_for_plan = principal.clone();
+    let actor_for_plan = actor.clone();
     let body_for_plan = body.clone();
-    let plan = spawn_store(move || plan_send(&store, &principal_for_plan, &body_for_plan)).await?;
+    let plan =
+        spawn_store(move || plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan))
+            .await?;
     let store = Arc::clone(&state.store);
     spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
 }
@@ -700,12 +839,13 @@ async fn send(
 fn plan_send(
     store: &Store,
     principal: &Principal,
+    actor: &Actor,
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
     let mut plan = SendPlan::parse(store, body)?;
     let reply = crate::reply::resolve(
         principal,
-        |id| own_message(store, principal, id),
+        |id| own_message(store, principal, actor, id),
         body.reply_to.as_deref(),
     )
     .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
@@ -733,26 +873,36 @@ fn plan_send(
     Ok(plan)
 }
 
-/// One message of this agent's own mailbox, by id.
+/// One message of the mailbox a reply speaks for, by id: the calling agent's
+/// own mailbox, or, for the operator, the agent it is sending as.
 fn own_message(
     store: &Store,
     principal: &Principal,
+    actor: &Actor,
     id: &str,
 ) -> Result<Option<anyagents_core::Message>, String> {
-    let agent_id = match principal {
-        Principal::Agent { agent_id, .. } => agent_id.clone(),
-        Principal::Operator => return Ok(None),
+    let agent_id = match (principal, actor) {
+        (Principal::Agent { agent_id, .. }, _) => agent_id.clone(),
+        (_, Actor::Agent(name)) => store
+            .agent_by_name(name)
+            .map_err(|err| err.to_string())?
+            .id,
+        (Principal::Operator, Actor::Operator(_)) => return Ok(None),
     };
     store.message(&agent_id, id).map_err(|err| err.to_string())
 }
 
 fn target_of(destination: &crate::reply::Destination) -> Target {
     match destination {
-        crate::reply::Destination::Telegram { chat, thread, .. } => Target::Telegram {
+        crate::reply::Destination::Telegram {
+            chat,
+            thread,
+            reply,
+        } => Target::Telegram {
             address: destination.address(),
             chat: chat.clone(),
             thread: thread.clone(),
-            reply: None,
+            reply: reply.clone(),
         },
         crate::reply::Destination::Agent(name) => Target::Agent(name.clone()),
         crate::reply::Destination::Group(name) => Target::Room(name.clone()),
@@ -893,7 +1043,18 @@ fn send_sync(
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
         return Ok(Json(receipt));
     }
+    // The request's `reply_to` is a reference, not a Telegram id; a Telegram
+    // target carries the id the reference resolved to instead.
     let reply = plan.reply.clone();
+    let body = SendRequest {
+        // A reply the caller resolved to a message id, or a reference the
+        // server resolved to one, is what this post answers.
+        reply_to: reply.clone().or_else(|| {
+            body.reply_to
+                .filter(|v| crate::reply::ref_message(v).is_none())
+        }),
+        ..body
+    };
     check_targets(store, actor, &body, &plan)?;
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
@@ -940,8 +1101,18 @@ fn send_key(namespace: &str, body: &SendRequest) -> Option<String> {
     if idempotency.is_empty() {
         return None;
     }
+    let sender = body.sender.as_deref().unwrap_or("");
+    let reply_to = body.reply_to.as_deref().unwrap_or("");
+    let to_joined = body.to.join("\x1f");
     let mut bytes = Vec::new();
-    for part in [namespace, idempotency] {
+    for part in [
+        namespace,
+        sender,
+        idempotency,
+        to_joined.as_str(),
+        reply_to,
+        body.text.as_str(),
+    ] {
         bytes.extend_from_slice(part.as_bytes());
         bytes.push(0);
     }
@@ -1137,7 +1308,12 @@ fn number(value: &str, what: &'static str) -> Result<i64, ApiError> {
 }
 
 fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>, ApiError> {
-    match body.reply_to.as_deref().or(reply) {
+    let candidate = reply.or_else(|| {
+        body.reply_to
+            .as_deref()
+            .filter(|v| crate::reply::ref_message(v).is_none() && Address::parse(v).is_err())
+    });
+    match candidate {
         None => Ok(None),
         Some(value) => number(value, "reply_to is not a telegram message id").map(Some),
     }
@@ -1237,9 +1413,10 @@ pub fn owner_workdir() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
+    use std::sync::MutexGuard;
 
     /// Answers one sign-in with two lines and records where it ran.
     struct Scripted {
@@ -1267,9 +1444,15 @@ mod tests {
     /// is read under this lock and put back before the next one runs.
     static ENV: Mutex<()> = Mutex::new(());
 
+    /// One lock for every test that sets this process's environment, so a
+    /// server started by one never reads another's settings.
+    pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
+        ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
     #[test]
     fn a_sign_in_streams_the_link_before_the_outcome() {
-        let _env = ENV.lock().unwrap_or_else(|err| err.into_inner());
+        let _env = env_lock();
         let data = tempfile::tempdir().unwrap();
         let socket = socket_path(data.path());
         let dir = Arc::new(Mutex::new(None));
@@ -1284,13 +1467,32 @@ mod tests {
         // them, and sets them for its own duration only.
         unsafe {
             std::env::set_var("ANYAGENTS_OPERATOR_TOKEN_FILE", &token_file);
+            // One OS seat is all this host has: this process's own, kept out of
+            // root by the launcher check.
+            std::env::set_var("ANYAGENTS_AGENT_UID", libc::getuid().to_string());
+            std::env::set_var("ANYAGENTS_AGENT_GID", libc::getgid().to_string());
+            std::env::set_var("ANYAGENTS_SOCKET_GID", libc::getgid().to_string());
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
         }
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let server = std::thread::spawn(move || run_with(&data_path, runner, stop_rx));
+        let started = Arc::new(Mutex::new(None));
+        let outcome = Arc::clone(&started);
+        let server = std::thread::spawn(move || {
+            let result = run_with(&data_path, runner, stop_rx);
+            if let Err(err) = &result {
+                *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+            }
+            result
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !socket.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        assert!(
+            socket.exists(),
+            "the server did not start: {:?}",
+            started.lock().unwrap_or_else(|e| e.into_inner())
+        );
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -1327,6 +1529,11 @@ mod tests {
         // SAFETY: as above, for this test only.
         unsafe {
             std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN_FILE");
+            std::env::remove_var("ANYAGENTS_AGENT_UID");
+            std::env::remove_var("ANYAGENTS_AGENT_GID");
+            std::env::remove_var("ANYAGENTS_SOCKET_GID");
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+            std::env::remove_var("ANYAGENTS_LAUNCHER");
         }
     }
 
@@ -1334,7 +1541,7 @@ mod tests {
     /// command runs.
     #[test]
     fn an_agent_capability_cannot_sign_a_harness_in() {
-        let _env = ENV.lock().unwrap_or_else(|err| err.into_inner());
+        let _env = env_lock();
         let data = tempfile::tempdir().unwrap();
         let socket = socket_path(data.path());
         let dir = Arc::new(Mutex::new(None));
@@ -1353,20 +1560,51 @@ mod tests {
                 "0123456789abcdef0123456789abcdef",
             );
         }
+        // SAFETY: as above, for this test's own duration under the lock.
+        unsafe {
+            std::env::set_var("ANYAGENTS_AGENT_UID", libc::getuid().to_string());
+            std::env::set_var("ANYAGENTS_AGENT_GID", libc::getgid().to_string());
+            std::env::set_var("ANYAGENTS_SOCKET_GID", libc::getgid().to_string());
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
         let store = Store::open(data.path().join("state.db")).unwrap();
         let configured = "0123456789abcdef0123456789abcdef";
         store.hold_capability_key(configured).unwrap();
         let agent = store
             .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
             .unwrap();
-        let capability = store.issue_capability(&agent.id).unwrap();
         drop(store);
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
-        let server = std::thread::spawn(move || run_with(&data_path, runner, stop_rx));
+        let started = Arc::new(Mutex::new(None));
+        let outcome = Arc::clone(&started);
+        let server = std::thread::spawn(move || {
+            let result = run_with(&data_path, runner, stop_rx);
+            if let Err(err) = &result {
+                *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.to_string());
+            }
+            result
+        });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !socket.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        assert!(
+            socket.exists(),
+            "the server did not start: {:?}",
+            started.lock().unwrap_or_else(|e| e.into_inner())
+        );
+        // The server mints each agent's capability when it starts, so this test
+        // reads the one it left and the server recognises.
+        let capability = std::fs::read_to_string(
+            data.path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("config")
+                .join(crate::operator::CAPABILITY_FILE),
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
@@ -1392,6 +1630,11 @@ mod tests {
         unsafe {
             std::env::remove_var("ANYAGENTS_OPERATOR_TOKEN_FILE");
             std::env::remove_var("ANYAGENTS_CAPABILITY_KEY");
+            std::env::remove_var("ANYAGENTS_AGENT_UID");
+            std::env::remove_var("ANYAGENTS_AGENT_GID");
+            std::env::remove_var("ANYAGENTS_SOCKET_GID");
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+            std::env::remove_var("ANYAGENTS_LAUNCHER");
         }
     }
 }

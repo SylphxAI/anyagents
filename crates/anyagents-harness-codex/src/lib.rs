@@ -21,21 +21,28 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
-const RPC_WAIT: Duration = Duration::from_secs(3);
+fn rpc_wait() -> Duration {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+        Duration::from_secs(3)
+    } else {
+        Duration::from_secs(60)
+    }
+}
 
 /// One long-lived Codex app-server child.
 pub struct CodexHarness {
+    environment: Vec<(String, String)>,
     shared: Arc<Mutex<State>>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
@@ -194,13 +201,18 @@ impl CodexHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
+        let env_pairs: Vec<(String, String)> = environment
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
         let harness = Self {
+            environment: env_pairs.clone(),
             shared: Arc::new(Mutex::new(State::default())),
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
         };
-        let mut cmd = Command::new(program);
+        let mut cmd = anyagents_harness::spawn_command(&program, &env_pairs);
         cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -215,12 +227,12 @@ impl CodexHarness {
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let Some(child_stdin) = child.stdin.take() else {
-            let _ = child.kill();
+            anyagents_harness::kill_child(&mut child, &env_pairs);
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdin missing".into()));
         };
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            anyagents_harness::kill_child(&mut child, &env_pairs);
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
@@ -232,9 +244,10 @@ impl CodexHarness {
         *lock(&harness.stdin) = Some(child_stdin);
         let shared = Arc::clone(&harness.shared);
         let wake = Arc::clone(&harness.wake);
+        let stdin = Arc::clone(&harness.stdin);
         let handle = thread::Builder::new()
             .name("anyagents-codex".into())
-            .spawn(move || read_stdout(stdout, shared, wake))
+            .spawn(move || read_stdout(stdout, shared, wake, stdin))
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         // The reader handle has to live on the struct. Rebuild is awkward because
         // `harness` was not mut and spawn failure must still kill the child.
@@ -248,10 +261,30 @@ impl CodexHarness {
             json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
         )?;
         self.notify("initialized", json!({}))?;
+        let fake = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
         let (method, params) = if let Some(session) = session {
-            ("thread/resume", json!({"threadId": session}))
-        } else {
+            if fake {
+                ("thread/resume", json!({"threadId": session}))
+            } else {
+                (
+                    "thread/resume",
+                    json!({
+                        "threadId": session,
+                        "approvalPolicy": "never",
+                        "sandbox": "danger-full-access"
+                    }),
+                )
+            }
+        } else if fake {
             ("thread/start", json!({}))
+        } else {
+            (
+                "thread/start",
+                json!({
+                    "approvalPolicy": "never",
+                    "sandbox": "danger-full-access"
+                }),
+            )
         };
         let result = self.rpc(method, params)?;
         let thread_id = result
@@ -302,7 +335,7 @@ impl CodexHarness {
             self.mark_dead();
             return Err(CallFail::Dead);
         }
-        let deadline = Instant::now() + RPC_WAIT;
+        let deadline = Instant::now() + rpc_wait();
         let mut state = lock(&self.shared);
         loop {
             if let Some(ready) = take_ready(&mut state, id) {
@@ -342,21 +375,22 @@ impl CodexHarness {
 
     fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        {
+        let mut child = {
             let mut state = lock(&self.shared);
             state.alive = false;
-            if let Some(child) = state.child.as_mut() {
-                let _ = child.kill();
-            }
-        }
+            state.child.take()
+        };
         self.wake.notify_all();
+        if let Some(child) = child.as_mut() {
+            anyagents_harness::kill_child(child, &self.environment);
+        }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
-        let mut state = lock(&self.shared);
-        if let Some(mut child) = state.child.take() {
+        if let Some(mut child) = child {
             let _ = child.wait();
         }
+        let mut state = lock(&self.shared);
         state.open.clear();
         state.turn_id = None;
         state.alive = false;
@@ -398,7 +432,7 @@ impl Harness for CodexHarness {
         };
         let input = json!([{
             "type": "text",
-            "text": marked_message(&message.id, &message.text)
+            "text": compose_message(&message.id, &message.context, &message.text)
         }]);
         let (method, params) = if let Some(turn_id) = &steering {
             (
@@ -457,7 +491,16 @@ impl Harness for CodexHarness {
         if !lock(&self.shared).alive {
             return Err(HarnessError::Dead);
         }
-        let result = self.rpc("thread/resume", json!({"threadId": session}))?;
+        let params = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+            json!({"threadId": session})
+        } else {
+            json!({
+                "threadId": session,
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access"
+            })
+        };
+        let result = self.rpc("thread/resume", params)?;
         let thread_id = result
             .pointer("/thread/id")
             .and_then(Value::as_str)
@@ -591,7 +634,12 @@ fn take_ready(state: &mut State, id: i64) -> Option<Ready> {
     }
 }
 
-fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
+fn read_stdout(
+    stdout: ChildStdout,
+    shared: Arc<Mutex<State>>,
+    wake: Arc<Condvar>,
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+) {
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -600,6 +648,18 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        if value.get("method").is_some()
+            && let Some(id) = value.get("id")
+            && value.get("result").is_none()
+            && value.get("error").is_none()
+        {
+            let reply = json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {"decision": "approved", "approved": true}
+            });
+            let _ = write_stdin(&stdin, &reply);
+        }
         {
             let mut state = lock(&shared);
             apply_line(&mut state, &value);
@@ -610,6 +670,9 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
     {
         let mut state = lock(&shared);
         state.alive = false;
+        if let Some(child) = state.child.as_mut() {
+            let _ = child.try_wait();
+        }
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();

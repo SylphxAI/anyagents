@@ -221,6 +221,7 @@ impl Harness for FakeHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Context;
 
     fn message(id: &str, seq: i64) -> OutboundMessage {
         OutboundMessage {
@@ -230,6 +231,7 @@ mod tests {
             sender: None,
             reply_to: None,
             source_time_ms: None,
+            context: Context::default(),
         }
     }
 

@@ -20,13 +20,21 @@ pub const AGENT_HEADER: &str = "x-anyagents-agent";
 /// config directory.
 pub const CAPABILITY_FILE: &str = "mcp-capability";
 
-/// The operator token, when the environment names a non-empty file holding it.
-pub fn operator_token() -> Option<String> {
-    let path = std::env::var_os("ANYAGENTS_OPERATOR_TOKEN_FILE")?;
-    let text = std::fs::read_to_string(Path::new(&path)).ok()?;
+/// The operator token, when this deployment has one: the environment names
+/// the file (`ANYAGENTS_OPERATOR_TOKEN_FILE`), else the data directory holds
+/// the one file a start script wrote before the server started.
+pub fn operator_token(data: &std::path::Path) -> Option<String> {
+    let path = match std::env::var_os("ANYAGENTS_OPERATOR_TOKEN_FILE") {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => data.join(TOKEN_FILE),
+    };
+    let text = std::fs::read_to_string(path).ok()?;
     let token = text.trim();
     (!token.is_empty()).then(|| token.to_string())
 }
+
+/// The operator's token file in a data directory.
+pub const TOKEN_FILE: &str = "operator-token";
 
 /// The agent's config directory: `agents/<id>/config`.
 fn config_dir(data_dir: &Path, agent_id: &str) -> std::path::PathBuf {
@@ -54,6 +62,21 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
         file.write_all(b"\n")?;
     }
     std::fs::rename(&temp, &path)?;
+    // The capability belongs to this agent's own seat group, 0640, and is read
+    // back: no other seat can read it. A seat group that is the server's own
+    // group adds nothing, so that file stays 0600.
+    if let Ok(agent) = store.agent(agent_id)
+        && let Some((_, seat_uid, gid, _)) = crate::sandbox::seat_for_agent(&agent.name)
+        && seat_uid != crate::sandbox::server_uid()
+        && gid != crate::sandbox::server_gid()
+    {
+        crate::sandbox::share_capability_with_seat(&path, gid).map_err(|err| {
+            anyagents_core::Error::Message(format!(
+                "the capability for {} is not shared with its seat: {err}",
+                agent.name
+            ))
+        })?;
+    }
     Ok(())
 }
 
@@ -65,6 +88,7 @@ mod tests {
 
     #[test]
     fn a_minted_capability_is_a_private_file_and_replaces_the_last_one() {
+        let _env = crate::server::tests::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         store

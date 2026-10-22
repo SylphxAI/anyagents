@@ -20,13 +20,13 @@
 //! come from the private service this adapter starts for this agent.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnState, TurnUsage, marked_message,
+    SteerQueue, SteerSupport, TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
@@ -171,7 +171,7 @@ impl OpenCodeHarness {
     fn begin(&mut self) -> Result<(), HarnessError> {
         // The service prints its address and password on stdout, so it is read
         // here and every later call is pointed at exactly this one.
-        let mut command = Command::new(&self.program);
+        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment);
         command
             .args(["serve", "--port", "0"])
             .stdin(Stdio::null())
@@ -310,7 +310,7 @@ impl OpenCodeHarness {
     /// One `opencode api` call. Its own process, so a hung vendor call cannot
     /// hold the adapter, and a failure names the call and never a secret.
     fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, HarnessError> {
-        let mut command = Command::new(&self.program);
+        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment);
         // `opencode api --server <url> <METHOD> <path>`, as the CLI reads it:
         // the subcommand comes first, then its flags.
         command.arg("api");
@@ -464,7 +464,7 @@ impl Harness for OpenCodeHarness {
             return Err(HarnessError::Failed("no session".into()));
         };
         let body = json!({
-            "text": marked_message(&message.id, &message.text),
+            "text": compose_message(&message.id, &message.context, &message.text),
             "delivery": "steer",
         });
         let answer = self.api(
@@ -572,7 +572,7 @@ impl Harness for OpenCodeHarness {
         };
         // The same prompt `deliver` writes: the session decides where it goes.
         let body = json!({
-            "text": marked_message(&message.id, &message.text),
+            "text": compose_message(&message.id, &message.context, &message.text),
             "delivery": "steer"
         });
         match self.api(
@@ -605,9 +605,7 @@ impl Drop for OpenCodeHarness {
         if let Some(mut child) = self.child.take() {
             // The exact child, never a pattern or a group: a shared desk refuses
             // a group signal it does not own, and it is right to.
-            let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status();
+            anyagents_harness::kill_pid(child.id(), "-TERM", &self.environment);
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
@@ -616,7 +614,7 @@ impl Drop for OpenCodeHarness {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     _ => {
-                        let _ = child.kill();
+                        anyagents_harness::kill_child(&mut child, &self.environment);
                         break;
                     }
                 }

@@ -120,7 +120,7 @@ fn published_origin(data: &Path) -> Option<String> {
         "GET",
         "/v1/agents",
         None,
-        &crate::client::authority(),
+        &crate::client::authority(&data),
     )
     .ok()
     .flatten()
