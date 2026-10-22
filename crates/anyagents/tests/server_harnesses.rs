@@ -163,7 +163,7 @@ fn call(socket: &Path, request: &str) -> Value {
 }
 
 /// The answer comes back to the agent that asked, through its `send` call.
-fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
+fn ask(dir: &Path, name: &str, harness: &str, _sent_id: &str) {
     let store = Store::open(dir.join("state.db")).unwrap();
     let agent = store.agent_by_name("kind").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);

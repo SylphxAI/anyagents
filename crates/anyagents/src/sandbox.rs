@@ -152,10 +152,10 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     let configured = configured_seat();
     let agents = std::env::var("ANYAGENTS_AGENTS").unwrap_or_default();
     let explicit = configured.is_some() && agents.trim() == agent_name;
-    if let Some((uid, gid, sock_gid)) = configured {
-        if explicit || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-            return Some((agent_name.to_string(), uid, gid, sock_gid));
-        }
+    if let Some((uid, gid, sock_gid)) = configured
+        && (explicit || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some())
+    {
+        return Some((agent_name.to_string(), uid, gid, sock_gid));
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
         return None;

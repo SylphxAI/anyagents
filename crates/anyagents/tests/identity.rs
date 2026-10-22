@@ -79,7 +79,10 @@ fn create(data: &Path, name: &str) -> String {
         &json!({"name": name, "harness": "claude-code"}).to_string(),
     );
     assert!(status.contains("201"), "{status} {body}");
-    body["id"].as_str().expect(&body.to_string()).to_string()
+    body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{body}"))
+        .to_string()
 }
 
 #[test]
@@ -142,7 +145,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     assert!(!agents.contains("gamma"), "{agents}");
 
     // A replaced session stops working at once.
-    let re_minted = support::call_raw(&socket, "POST", &format!("/v1/operator/agents/alpha/capability"), "{}", &support::header());
+    let re_minted = support::call_raw(&socket, "POST", "/v1/operator/agents/alpha/capability", "{}", &support::header());
     assert!(re_minted.contains("minted"), "{re_minted}");
     let old = support::call_raw(&socket, "GET", "/v1/agents", "", &alpha_auth);
     assert!(old.starts_with("HTTP/1.1 401"), "{old}");

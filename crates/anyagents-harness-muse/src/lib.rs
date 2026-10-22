@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
+    SteerSupport, TurnState, TurnUsage, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};

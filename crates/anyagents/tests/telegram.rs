@@ -814,7 +814,7 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
         .to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let (_, read) = support::call(&socket, "GET", &format!("/v1/operator/agents/ada/inbox"), "");
+        let (_, read) = support::call(&socket, "GET", "/v1/operator/agents/ada/inbox", "");
         let text = read["messages"][0]["text"].as_str().unwrap_or_default().to_string();
         if text.contains("ship it") {
             break;

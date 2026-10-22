@@ -25,6 +25,7 @@ pub const REPLY_PREFIX: &str = "anyagents:reply:";
 /// The reply reference a message names. A whole agent's answer resolves to a
 /// mailbox reference, not to a chat id, so an answer can never land in another
 /// conversation.
+#[allow(dead_code)]
 pub fn reply_ref(message_id: &str) -> String {
     anyagents_harness::reply_ref(message_id)
 }
