@@ -62,12 +62,20 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
         file.write_all(b"\n")?;
     }
     std::fs::rename(&temp, &path)?;
+    // The capability belongs to this agent's own seat group, 0640, and is read
+    // back: no other seat can read it. A seat group that is the server's own
+    // group adds nothing, so that file stays 0600.
     if let Ok(agent) = store.agent(agent_id)
-        && let Some((_, _, _, gid)) = crate::sandbox::seat_for_agent(&agent.name)
+        && let Some((_, seat_uid, gid, _)) = crate::sandbox::seat_for_agent(&agent.name)
+        && seat_uid != crate::sandbox::server_uid()
+        && gid != crate::sandbox::server_gid()
     {
-        // 0640 in this agent's own seat group, read back. A capability any
-        // other seat can read stops the mint.
-        crate::sandbox::share_capability_with_seat(&path, gid)?;
+        crate::sandbox::share_capability_with_seat(&path, gid).map_err(|err| {
+            anyagents_core::Error::Message(format!(
+                "the capability for {} is not shared with its seat: {err}",
+                agent.name
+            ))
+        })?;
     }
     Ok(())
 }

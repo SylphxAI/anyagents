@@ -132,28 +132,10 @@ pub fn operator_with_configured_seat(data: &Path) -> PathBuf {
         std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
         std::env::set_var("ANYAGENTS_SOCKET_GID", gid.to_string());
         std::env::set_var("ANYAGENTS_LAUNCHER", launcher);
-        // The host's own accounts, for an agent this test process is not.
-        let _ = (uid, gid);
-        // The deployment's own start line names its agents, in order, with the
-        // uid each one runs as: `<agent>=<uid>` before every serve.
-        let agents = [
-            ("alpha", "2101"),
-            ("beta", "2102"),
-            ("ada", "2103"),
-            ("bea", "2104"),
-            ("cy", "2105"),
-            ("kind", "2106"),
-            ("argon", "2107"),
-            ("calliope", "2108"),
-        ];
-        std::env::set_var(
-            "ANYAGENTS_AGENTS",
-            agents
-                .iter()
-                .map(|(name, seat)| format!("{name}={seat}"))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
+        std::env::set_var("ANYAGENTS_AGENTS", agents_line());
+        // A test machine is its own single seat: the deployment gives every
+        // agent the uid this process runs as.
+        std::env::set_var("ANYAGENTS_TESTS", "own-seat");
     }
     path
 }

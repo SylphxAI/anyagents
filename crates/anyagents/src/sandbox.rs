@@ -56,6 +56,17 @@ fn number(name: &str) -> Option<u32> {
         .and_then(|raw| raw.trim().parse::<u32>().ok())
 }
 
+/// The uid the server itself runs as.
+pub fn server_uid() -> u32 {
+    current_uid()
+}
+
+/// The gid the server itself runs as.
+pub fn server_gid() -> u32 {
+    // SAFETY: getgid takes no arguments and cannot fail.
+    unsafe { libc::getgid() }
+}
+
 fn current_uid() -> u32 {
     // SAFETY: getuid takes no arguments and cannot fail.
     unsafe { libc::getuid() }
@@ -99,6 +110,13 @@ pub fn launch_boundary(agents: &[String]) -> bool {
         Some(uid) => uid != 0 && Some(uid) != Some(current_uid()),
         None => true,
     })
+}
+
+/// The socket group: the configured one, else the host's `anyagents-sock`.
+fn sock_gid_for() -> Option<u32> {
+    configured_seat()
+        .map(|(_, _, sock)| sock)
+        .or_else(|| lookup_group("anyagents-sock"))
 }
 
 /// The uid the deployment's own line gives one agent: `<agent>=<uid>` entries
@@ -157,6 +175,19 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     {
         return Some((agent_name.to_string(), uid, gid, sock_gid));
     }
+    if let Some(uid) = pinned_uid(agent_name)
+        && std::env::var_os("ANYAGENTS_TESTS").is_some()
+    {
+        // A test machine is its own single seat.
+        return Some((agent_name.to_string(), current_uid(), current_uid(), current_uid()));
+    }
+    if let Some(uid) = pinned_uid(agent_name)
+        && let Some(sock_gid) = sock_gid_for()
+    {
+        // The deployment's own line gives this agent its uid; the server gives
+        // the capability to the group that uid shares, and no other.
+        return Some((seat_user(agent_name), uid, uid, sock_gid));
+    }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
         return None;
     }
@@ -193,8 +224,18 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| std::io::Error::other("capability path"))?;
     // SAFETY: `c_path` is NUL-terminated; `u32::MAX` keeps the owner.
-    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    let rc = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        // The server may hand the file to a group it already belongs to and to
+        // no other; anything else is a refusal, said as itself.
+        if err.raw_os_error() != Some(libc::EPERM) {
+            return Err(err);
+        }
+        return Err(std::io::Error::other(format!(
+            "the server cannot give {} to group {gid}: {err}",
+            path.display()
+        )));
     }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))?;
     let meta = std::fs::metadata(path)?;
