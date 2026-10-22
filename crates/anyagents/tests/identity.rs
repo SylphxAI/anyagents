@@ -155,3 +155,28 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
 
     drop(server);
 }
+
+/// Each agent's capability opens that agent's mailbox and no other.
+#[test]
+fn each_agents_capability_opens_only_its_own_mailbox() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let first = start_server(&data);
+    let socket = data.join("anyagents.sock");
+    let alpha = create(&data, "alpha");
+    let beta = create(&data, "beta");
+    let alpha_token = capability(&data, &alpha);
+    let beta_token = capability(&data, &beta);
+    assert_ne!(alpha_token, beta_token);
+    // The operator's own token creates and reads; an agent's reads only its own.
+    let as_alpha = format!("x-anyagents-agent: {alpha_token}\r\n");
+    let as_beta = format!("x-anyagents-agent: {beta_token}\r\n");
+    let own = support::call_raw(&socket, "GET", &format!("/v1/agents/{alpha}/inbox"), "", &as_alpha);
+    assert!(own.starts_with("HTTP/1.1 200"), "{own}");
+    let peer = support::call_raw(&socket, "GET", &format!("/v1/agents/{alpha}/inbox"), "", &as_beta);
+    assert!(peer.starts_with("HTTP/1.1 403"), "{peer}");
+    drop(first);
+}
