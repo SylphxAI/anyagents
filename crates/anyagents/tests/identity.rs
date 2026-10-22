@@ -180,3 +180,49 @@ fn each_agents_capability_opens_only_its_own_mailbox() {
     assert!(peer.starts_with("HTTP/1.1 403"), "{peer}");
     drop(first);
 }
+
+/// A capability a deployment's own config directory holds is exactly one
+/// agent's: another agent's tool server reads its own file, and the server
+/// answers with that agent, never with a name the model wrote.
+#[test]
+fn the_capability_file_of_one_agent_never_opens_another() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let server = start_server(&data);
+    let _ = server;
+    let socket = data.join("anyagents.sock");
+    let alpha = create(&data, "alpha");
+    let beta = create(&data, "beta");
+
+    // Each config directory holds one file, mode 0600 or 0640, and nothing else.
+    for id in [&alpha, &beta] {
+        let path = data
+            .join("agents")
+            .join(id)
+            .join("config")
+            .join("mcp-capability");
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777
+        };
+        assert!(mode == 0o600 || mode == 0o640, "{path:?} is {mode:o}");
+    }
+
+    // The whoma answer is the capability's agent, and its inbox cannot be the
+    // peer's.
+    let alpha_auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &alpha));
+    let who = support::call_raw(&socket, "GET", "/v1/whoami", "", &alpha_auth);
+    assert!(who.contains(&alpha), "{who}");
+    assert!(!who.contains(&beta), "{who}");
+    let peer = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{beta}/inbox"),
+        "",
+        &alpha_auth,
+    );
+    assert!(peer.starts_with("HTTP/1.1 403"), "{peer}");
+}

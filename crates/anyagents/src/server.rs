@@ -119,7 +119,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .into_iter()
         .map(|agent| agent.name)
         .collect();
-    if operator::operator_token().is_some() && !crate::sandbox::launch_boundary(&seats) {
+    if operator::operator_token(data).is_some() && !crate::sandbox::launch_boundary(&seats) {
         return Err(Error::Message(
             "this server has an operator token, so it is the identity boundary, but no OS seat is \
              in place for its agents: configure ANYAGENTS_AGENT_UID, ANYAGENTS_AGENT_GID and \
@@ -211,7 +211,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
 /// operator token the server is the identity boundary and reads nothing from a
 /// name.
 fn deployment_mode(data: &Path) -> auth::Mode {
-    match auth::Mode::from_env() {
+    match auth::Mode::from_env(data) {
         auth::Mode::Confined {
             operator_digest: None,
         } => match std::fs::canonicalize(data) {

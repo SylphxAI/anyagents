@@ -52,13 +52,13 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
 /// `agents create`. The server owns it when it is there, so one process makes
 /// the agent, mints its capability and starts it.
 fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
-    if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
+    if server::socket_path(data).exists() && crate::operator::operator_token(data).is_some() {
         let answered = client::call::<AgentView>(
             data,
             "POST",
             "/v1/agents",
             Some(body.to_string().into_bytes()),
-            &client::authority(),
+            &client::authority(data),
         )?;
         return answered.ok_or_else(|| "the server answered nothing".to_string());
     }
@@ -103,9 +103,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
 
 /// `agents list`: the server's view when it is there, else the stored rows.
 fn list(data: &Path) -> Result<(), Error> {
-    if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
+    if server::socket_path(data).exists() && crate::operator::operator_token(data).is_some() {
         let listed =
-            client::call::<AgentsResponse>(data, "GET", "/v1/agents", None, &client::authority())
+            client::call::<AgentsResponse>(data, "GET", "/v1/agents", None, &client::authority(data))
                 .map_err(Error::Message)?;
         if let Some(listed) = listed {
             for agent in listed.agents {
@@ -172,9 +172,9 @@ pub fn open(data: &Path) -> Result<Store, Error> {
 
 /// One agent by name, from the socket when the server is there.
 pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
-    if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
+    if server::socket_path(data).exists() && crate::operator::operator_token(data).is_some() {
         let listed =
-            client::call::<AgentsResponse>(data, "GET", "/v1/agents", None, &client::authority())
+            client::call::<AgentsResponse>(data, "GET", "/v1/agents", None, &client::authority(data))
                 .map_err(Error::Message)?;
         if let Some(listed) = listed
             && let Some(found) = listed.agents.into_iter().find(|row| row.name == agent)

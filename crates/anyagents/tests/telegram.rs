@@ -224,6 +224,11 @@ impl Server {
             .env("ANYAGENTS_FAKE_OPENCODE", "1")
             .env("ANYAGENTS_FAKE_LOG", dir.join("fake.log"))
             .env("ANYAGENTS_TELEGRAM_API", api)
+            .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+            .env("ANYAGENTS_AGENTS", support::agents_line())
+            // The server reads its operator's token from this file, the one
+            // every call in the test presents.
+            .env("ANYAGENTS_OPERATOR_TOKEN_FILE", dir.join(support::TOKEN_FILE))
             .arg("--data")
             .arg(dir)
             .arg("serve")
@@ -256,8 +261,13 @@ impl Drop for Server {
 
 fn create(dir: &Path, name: &str) -> String {
     let created = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", dir.join(support::TOKEN_FILE))
+        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+        .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
         .arg(dir)
+        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+        .env("ANYAGENTS_AGENTS", support::agents_line())
         .args(["agents", "create", name, "--harness", "opencode", "--model"])
         .arg("opencode/big-pickle")
         .output()
@@ -282,6 +292,9 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
     let token_file = dir.join("bot-token");
     std::fs::write(&token_file, token).unwrap();
     let added = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", dir.join(support::TOKEN_FILE))
+        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+        .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
         .arg(dir)
         .args(["channels", "add", "telegram", "--agent", agent])
@@ -307,8 +320,12 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
 }
 
 fn post(socket: &Path, request: &Value) -> Value {
-    // The operator sends as the agent it names, with its own token.
-    let agent_header = support::header();
+    post_with(socket, request, &support::header())
+}
+
+/// One post that presents `agent_header`: the operator's own token, read from
+/// the file the server that answers reads.
+fn post_with(socket: &Path, request: &Value, agent_header: &str) -> Value {
     let request = request.to_string();
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
     stream
@@ -368,9 +385,13 @@ fn wait_for(mut ready: impl FnMut() -> bool, why: &str) {
 
 #[test]
 fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
+    // The operator is the server's own: its token file, pointed at here, and
+    // the same one every call presents.
+    let operator_header = support::operator_at(&data);
     let fake = FakeTelegram::start(vec![
         dm(10, 100, 5, "hello from a dm"),
         topic(11, -1007, 55, 3, "and a topic"),
@@ -429,26 +450,30 @@ fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
     assert!(chats.iter().any(|link| link["chat_id"] == 100));
     assert!(chats.iter().any(|link| link["chat_id"] == -1007));
 
-    // The agent answers the DM and the topic through its own bot.
+    // The agent answers the DM by its mailbox reference, resolved to that chat
+    // and that message, and the topic by the message id the caller names.
     let socket = data.join("anyagents.sock");
-    let to_dm = post(
+    let dm_id = inbox[0].id.to_string();
+    let to_dm = post_with(
         &socket,
         &json!({
             "sender": "agent:ada",
-            "to": ["telegram:chat:100"],
+            "to": [],
             "text": "pong in the dm",
-            "reply_to": "5",
+            "reply_to": format!("anyagents:reply:{dm_id}"),
         }),
+        &operator_header,
     );
     assert_eq!(to_dm["deliveries"][0]["id"], "901", "{to_dm}");
-    let to_topic = post(
+    let to_topic = post_with(
         &socket,
         &json!({
             "sender": "agent:ada",
             "to": ["telegram:chat:-1007:3"],
             "text": "pong in the topic",
-            "reply_to": "55",
+            "reply_to": format!("anyagents:reply:{}", inbox[1].id),
         }),
+        &operator_header,
     );
     assert_eq!(to_topic["deliveries"][0]["id"], "902", "{to_topic}");
 
@@ -481,9 +506,11 @@ fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
 
 #[test]
 fn a_bad_topic_id_is_refused_before_anything_is_posted() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
+    support::operator_at(&data);
     let fake = FakeTelegram::start(Vec::new());
     create(&data, "ada");
     add_channel(&data, "ada", "777:fake-token-not-real");
@@ -508,6 +535,7 @@ fn a_bad_topic_id_is_refused_before_anything_is_posted() {
 /// another chat is sent nothing.
 #[test]
 fn a_room_reaches_only_the_bots_on_the_same_chat() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -584,6 +612,7 @@ fn a_room_reaches_only_the_bots_on_the_same_chat() {
 /// A private chat is one person and one agent: nothing fans out from it.
 #[test]
 fn a_private_chat_reaches_no_peer() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -637,6 +666,7 @@ fn a_private_chat_reaches_no_peer() {
 /// local only, and a repeated fan-out is one row.
 #[test]
 fn a_local_retry_after_a_post_is_one_row() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
@@ -692,9 +722,11 @@ fn a_local_retry_after_a_post_is_one_row() {
 /// local step adding no second send and no second row.
 #[test]
 fn one_post_reaches_every_member_once_and_never_the_poster() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
+    let operator_header = support::operator_at(&data);
     let fake = FakeTelegram::start(vec![]);
     for name in ["ada", "bea", "cy"] {
         create(&data, name);
@@ -729,9 +761,10 @@ fn one_post_reaches_every_member_once_and_never_the_poster() {
     // A post into the group: bea is reached, ada is not, cy is not.
     // The fake fails the first post's local step by refusing the third send, so
     // the retry path is exercised without a second Telegram call.
-    let posted = post(
+    let posted = post_with(
         &socket,
         &json!({"sender": "agent:ada", "to": ["telegram:chat:-1011"], "text": "hello room"}),
+        &operator_header,
     );
     assert!(posted["deliveries"][0]["id"].is_string(), "{posted}");
     assert_eq!(fake.sent().len(), 1, "exactly one Telegram send");
@@ -757,9 +790,10 @@ fn one_post_reaches_every_member_once_and_never_the_poster() {
     );
 
     // A private chat fans out to no peer.
-    let private = post(
+    let private = post_with(
         &socket,
         &json!({"sender": "agent:cy", "to": ["telegram:chat:300"], "text": "just us"}),
+        &operator_header,
     );
     assert!(private["deliveries"][0]["id"].is_string(), "{private}");
     let store = Store::open(data.join("state.db")).unwrap();

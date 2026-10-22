@@ -20,8 +20,8 @@ use crate::telegram;
 
 /// The operator's authority when it holds one, else none: only a deployment
 /// without the boundary answers an unauthenticated call.
-fn authority() -> client::Authority {
-    match crate::operator::operator_token() {
+fn authority(data: &Path) -> client::Authority {
+    match crate::operator::operator_token(data) {
         Some(_) => client::Authority::Operator,
         None => client::Authority::None,
     }
@@ -56,7 +56,7 @@ pub fn send(
             "POST",
             "/v1/send",
             Some(serde_json::to_vec(&body).map_err(|err| Error::Message(err.to_string()))?),
-            &authority(),
+            &authority(data),
         )
         .map_err(Error::Message)?;
         if let Some(sent) = sent {
@@ -198,14 +198,14 @@ fn parse_id(raw: &str, what: &'static str) -> Result<i64, Error> {
 }
 
 pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> {
-    if server::socket_path(data).exists() && crate::operator::operator_token().is_some() {
+    if server::socket_path(data).exists() && crate::operator::operator_token(data).is_some() {
         let who = named(data, agent)?.id;
         let _ = &who;
         let path = match since {
             Some(since) => format!("/v1/agents/{who}/inbox?since={since}"),
             None => format!("/v1/agents/{who}/inbox"),
         };
-        let read = client::call::<InboxResponse>(data, "GET", &path, None, &authority())
+        let read = client::call::<InboxResponse>(data, "GET", &path, None, &authority(data))
             .map_err(Error::Message)?;
         if let Some(read) = read {
             print_messages(read);

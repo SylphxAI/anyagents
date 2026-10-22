@@ -101,9 +101,10 @@ fn same_dir(left: &Path, right: &Path) -> bool {
 }
 
 impl Mode {
-    /// This process's mode, from its environment.
-    pub fn from_env() -> Self {
-        if let Some(token) = operator::operator_token() {
+    /// This process's mode, from its environment and the data directory it
+    /// serves.
+    pub fn from_env(data: &std::path::Path) -> Self {
+        if let Some(token) = operator::operator_token(data) {
             return Self::Confined {
                 operator_digest: Some(operator_digest(&token)),
             };

@@ -22,6 +22,44 @@ pub fn lock() -> MutexGuard<'static, ()> {
 /// The operator token a test deployment uses. It is not a real secret.
 pub const TOKEN: &str = "test-operator-token-0123456789abcdef";
 
+/// The token file a server reads, in the data directory every test names.
+pub const TOKEN_FILE: &str = "operator-token";
+
+/// The same token in a data directory, and the header that presents it with
+/// its path: a test starts its own server by that path and every call it makes
+/// presents the token from it, so no environment and no lock is shared.
+pub fn operator_at(data: &Path) -> String {
+    let path = data.join(TOKEN_FILE);
+    std::fs::write(&path, format!("{TOKEN}\n")).expect("operator token");
+    header_at(&path)
+}
+
+/// The deployment's own start line: `<agent>=<uid>` for the agents a test
+/// deployment names, before every serve.
+pub fn agents_line() -> String {
+    [
+        ("alpha", "2101"),
+        ("beta", "2102"),
+        ("ada", "2103"),
+        ("bea", "2104"),
+        ("cy", "2105"),
+        ("kind", "2106"),
+        ("argon", "2107"),
+        ("calliope", "2108"),
+    ]
+    .iter()
+    .map(|(name, seat)| format!("{name}={seat}"))
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+/// The operator header naming one token file. A digest of the token and of the
+/// path is all the server needs: the file is read once, here.
+pub fn header_at(path: &Path) -> String {
+    let _ = path;
+    format!("x-anyagents-operator: {TOKEN}\r\n")
+}
+
 /// The capability key a test server and its fixtures share.
 pub const CAPABILITY_KEY: &str = "test-capability-key-0123456789abcdef";
 

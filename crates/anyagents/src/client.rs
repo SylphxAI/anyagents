@@ -27,10 +27,10 @@ pub(crate) enum Authority {
 
 /// The authority this process may present: the agent's own capability when it
 /// runs inside an agent, else the operator's token.
-pub(crate) fn authority() -> Authority {
+pub(crate) fn authority(data: &Path) -> Authority {
     // Inside an agent its own capability is the only authority it has; a
     // command run by the operator presents the operator's token.
-    if crate::operator::operator_token().is_some() {
+    if crate::operator::operator_token(data).is_some() {
         return Authority::Operator;
     }
     if let Some(id) = agent_identity() {
@@ -63,7 +63,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     authority: &Authority,
 ) -> Result<Option<T>, String> {
     let (agent_token, operator_token) = match authority {
-        Authority::Operator => (None, crate::operator::operator_token()),
+        Authority::Operator => (None, crate::operator::operator_token(data)),
         Authority::Agent(id) => (capability(id), None),
         Authority::None => (None, None),
     };
