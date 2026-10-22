@@ -150,6 +150,24 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         "MUSE_CONFIG_HOME".to_string(),
         request.config_dir.display().to_string(),
     ));
+    // The OS seat this one agent runs in, from the operator's configuration
+    // and the host's own accounts. Its config and work directories go to that
+    // seat's group; the harness is started inside it by the adapter.
+    if let Some((seat_user, _, _, gid)) = crate::sandbox::seat_for_agent(&request.agent.name) {
+        crate::sandbox::share_config_with_seat(&request.config_dir, gid);
+        let cache_home = request.config_dir.join("cache-home");
+        let _ = std::fs::create_dir_all(&cache_home);
+        env.push(("HOME".to_string(), request.config_dir.display().to_string()));
+        env.push(("USER".to_string(), seat_user.clone()));
+        env.push(("LOGNAME".to_string(), seat_user));
+        env.push((
+            "XDG_CACHE_HOME".to_string(),
+            cache_home.display().to_string(),
+        ));
+    }
+    if let Some((_, spec)) = crate::sandbox::seat_launch_spec(&request.agent.name) {
+        env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec));
+    }
     if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
         let program =
             std::env::var("ANYAGENTS_HARNESS_BIN").unwrap_or_else(|_| "anyagents-harness".into());

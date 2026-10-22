@@ -4,10 +4,7 @@
 //! mailbox and the delivery loop do not change between modes. Adapters carry
 //! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
-mod compose;
 mod fake;
-
-pub use compose::{CONTEXT_BEGIN, CONTEXT_END, Envelope, compose, ref_message, reply_ref};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -15,6 +12,133 @@ use std::time::Duration;
 use serde_json::Value;
 
 pub use fake::FakeHarness;
+
+/// Internal environment key the server sets when an agent has an OS seat. It
+/// carries `<launcher>\t<uid>\t<gid>\t<groups>` and is removed from the child's
+/// environment before it starts, so a harness never passes it on.
+pub const SEAT_LAUNCH_ENV: &str = "ANYAGENTS_SEAT_LAUNCH";
+
+/// The line that names the mailbox message a bare answer reaches, in the user
+/// text every harness shows its model. The server writes it from the record it
+/// stored; a model cannot forge it, and a reply that names it is resolved by the
+/// server against that record.
+pub const REPLY_HINT_PREFIX: &str = "answer with reply_to: ";
+
+/// The reply reference a message names: `anyagents:reply:<message id>`.
+pub fn reply_ref(message_id: &str) -> String {
+    format!("anyagents:reply:{message_id}")
+}
+
+/// The mailbox reference a reply names, when it is one.
+pub fn ref_message(reference: &str) -> Option<&str> {
+    let id = reference.strip_prefix("anyagents:reply:")?;
+    (!id.is_empty() && !id.contains(':')).then_some(id)
+}
+
+/// The text one stored message becomes for every harness: the ID line, then the
+/// server's trusted context — who wrote it, which channel, which chat and topic,
+/// the reference a bare answer names, where it goes, and what it quotes — then
+/// the body exactly as stored.
+pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
+    format!("{}{id}\n{}\n{body}", MESSAGE_MARKER_PREFIX, context.lines(id))
+}
+
+/// The trusted header of one message, as the server wrote it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Context {
+    /// The authenticated author: `agent:<name>`, `telegram:user:<id>`, ...
+    pub sender: Option<String>,
+    /// The channel it arrived through, when it came by one.
+    pub channel: Option<String>,
+    /// The provider chat, when the message is one.
+    pub chat_id: Option<i64>,
+    /// The forum topic inside that chat.
+    pub thread_id: Option<i64>,
+    /// The provider id of the incoming message a bare answer reaches.
+    pub message_id: Option<i64>,
+    /// Where a bare answer goes, as the send tool takes it.
+    pub destination: Option<String>,
+}
+
+impl Context {
+    /// The lines a model reads, in a fixed order. The reply reference is this
+    /// message's own id, so it is always there.
+    pub fn lines(&self, id: &str) -> String {
+        let mut out = String::from("----- message -----\n");
+        out.push_str(&format!(
+            "from: {}\n",
+            self.sender.as_deref().unwrap_or("unknown")
+        ));
+        if let Some(channel) = &self.channel {
+            out.push_str(&format!("channel: {channel}\n"));
+        }
+        if let Some(chat) = self.chat_id {
+            out.push_str(&format!("chat: {chat}\n"));
+        }
+        if let Some(thread) = self.thread_id {
+            out.push_str(&format!("topic: {thread}\n"));
+        }
+        if let Some(message) = self.message_id {
+            out.push_str(&format!("message: {message}\n"));
+        }
+        out.push_str(&format!("{REPLY_HINT_PREFIX}{}\n", reply_ref(id)));
+        if let Some(destination) = &self.destination {
+            out.push_str(&format!("answer to: {destination}\n"));
+        }
+        out.push_str("----- end of message -----");
+        out
+    }
+}
+
+/// The server-only keys a harness process never inherits: the seat spec, the
+/// operator's token path, the capability key and the seat configuration.
+pub const SERVER_ONLY_ENV: &[&str] = &[
+    SEAT_LAUNCH_ENV,
+    "ANYAGENTS_OPERATOR_TOKEN_FILE",
+    "ANYAGENTS_CAPABILITY_KEY",
+    "ANYAGENTS_AGENT_UID",
+    "ANYAGENTS_AGENT_GID",
+    "ANYAGENTS_SOCKET_GID",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+];
+
+/// Build the command that starts a harness process. When `environment` names a
+/// seat, the process is started inside it with `setpriv --reuid … --no-new-privs`,
+/// and no server-only key reaches it.
+pub fn spawn_command(
+    program: &std::path::Path,
+    environment: &[(String, String)],
+) -> std::process::Command {
+    let seat = environment
+        .iter()
+        .find(|(key, _)| key == SEAT_LAUNCH_ENV)
+        .map(|(_, value)| value.as_str());
+    let mut command = match seat {
+        Some(spec) => match spec.split('\t').collect::<Vec<_>>().as_slice() {
+            [launcher, uid, gid, groups] => {
+                let mut command = std::process::Command::new(launcher);
+                command.args([
+                    "--reuid", uid, "--regid", gid, "--groups", groups, "--no-new-privs", "--",
+                ]);
+                command.arg(program);
+                command
+            }
+            _ => std::process::Command::new(program),
+        },
+        None => std::process::Command::new(program),
+    };
+    for key in SERVER_ONLY_ENV {
+        command.env_remove(key);
+    }
+    for (key, value) in environment {
+        if key == SEAT_LAUNCH_ENV {
+            continue;
+        }
+        command.env(key, value);
+    }
+    command
+}
 
 /// How a harness takes input that arrives during a turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +186,9 @@ pub struct OutboundMessage {
     pub sender: Option<String>,
     pub reply_to: Option<String>,
     pub source_time_ms: Option<i64>,
+    /// The server's trusted header for this message: author, channel, chat,
+    /// topic, the reply a bare answer names and where it goes.
+    pub context: Context,
 }
 
 /// Result of one `deliver` call.
@@ -279,7 +406,8 @@ impl SteerQueue {
                     sender: None,
                     reply_to: None,
                     source_time_ms: None,
-                },
+            context: Context::default(),
+        },
             })
             .collect();
         held.first().cloned()

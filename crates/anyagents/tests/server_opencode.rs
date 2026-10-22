@@ -66,13 +66,19 @@ impl Server {
             .arg(dir)
             .arg("serve")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(dir.join("server.stderr")).expect("stderr"),
+            ))
             .spawn()
             .expect("server");
         let socket = dir.join("anyagents.sock");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !socket.exists() {
-            assert!(Instant::now() < deadline, "no socket");
+            assert!(
+                Instant::now() < deadline,
+                "no socket: {}",
+                std::fs::read_to_string(dir.join("server.stderr")).unwrap_or_default()
+            );
             std::thread::sleep(Duration::from_millis(20));
         }
         Self { child }
@@ -124,7 +130,7 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    support::operator(&data);
+    support::operator_with_configured_seat(&data);
 
     let server = Server::start(&data);
     let created = create(&data, "alpha");

@@ -52,7 +52,14 @@ pub fn run(config: &std::path::Path) -> Result<(), Error> {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .to_string();
-    // A name the mailbox resolves; the double sends to it for a reply.
+    // Who the double answers: the mailbox reference in the trusted context the
+    // server wrote, else the target its config names for a plain line.
+    // Whether the double answers the reference in the trusted context, or the
+    // target its config names.
+    let context_reply_to = value
+        .get("context_reply_to")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
     let reply_target = value
         .get("reply_to")
         .and_then(serde_json::Value::as_str)
@@ -89,7 +96,15 @@ pub fn run(config: &std::path::Path) -> Result<(), Error> {
             .map(|name| name.trim().to_string())
             .unwrap_or_default();
         // The agent answers through the tool server, and the id proves which turn.
-        let sent = tool_server::send(&reply_with, &agent, &sender, &reply_target, &id);
+        let sent = tool_server::send(
+            &reply_with,
+            &agent,
+            &sender,
+            &reply_target,
+            &id,
+            user,
+            context_reply_to,
+        );
         note(&format!("answer {sent:?}"));
         let result = match sent {
             Ok(()) => serde_json::json!({"type": "result", "session_id": "sess-1"}),
@@ -116,12 +131,15 @@ mod tool_server {
     use std::io::{BufRead, BufReader, Write};
     use std::process::{Command, Stdio};
 
+    #[allow(clippy::too_many_arguments)]
     pub fn send(
         server: &str,
         agent: &str,
         sender: &str,
         target: &str,
         reply_to: &str,
+        user: &str,
+        context_reply_to: bool,
     ) -> Result<(), String> {
         if server.is_empty() {
             return Err("no tool server".to_string());
@@ -150,13 +168,33 @@ mod tool_server {
             r#"{{"jsonrpc":"2.0","method":"notifications/initialized"}}"#
         )
         .map_err(|err| err.to_string())?;
+        // The model answers the message it was handed: by the mailbox
+        // reference in the server's trusted context when its config says so, as
+        // a real model does, else by the target its config names.
+        let hinted = user
+            .lines()
+            .find_map(|line| line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX))
+            .map(str::to_string)
+            .filter(|hint| !hint.is_empty());
+        let configured = (!reply_to.is_empty()).then(|| reply_to.to_string());
+        let reference = if context_reply_to {
+            hinted.or(configured)
+        } else {
+            configured.or(hinted)
+        }
+        .unwrap_or_default();
         let call = serde_json::json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/call",
             "params": {
                 "name": "send",
-                "arguments": {"to": [target], "text": "pong", "sender": sender, "reply_to": reply_to}
+                "arguments": {
+                    "to": if target.is_empty() { Vec::new() } else { vec![target.to_string()] },
+                    "text": "pong",
+                    "sender": sender,
+                    "reply_to": reference
+                }
             }
         });
         let done = exchange(&mut stdin, &mut stdout, &call.to_string())?;

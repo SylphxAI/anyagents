@@ -14,12 +14,12 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use anyagents_harness::HarnessError;
+use anyagents_harness::{HarnessError, spawn_command};
 use serde_json::{Value, json};
 
 /// What an adapter makes of one notification.
@@ -327,7 +327,7 @@ impl RpcChild {
     }
 
     fn spawn(&mut self) -> Result<(), HarnessError> {
-        let mut command = Command::new(&self.program);
+        let mut command = spawn_command(&self.program, &self.environment);
         crate::close_inherited_files(&mut command);
         command
             .args(&self.args)

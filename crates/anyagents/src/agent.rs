@@ -308,7 +308,8 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 sender: message.sender.clone(),
                 reply_to: message.reply_to.clone(),
                 source_time_ms: message.source_time_ms,
-            };
+            context: anyagents_harness::Context::default(),
+        };
             match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
                 Ok(_) => {
                     store.note_delivered(&agent.id, message.seq)?;

@@ -19,6 +19,26 @@ use anyagents_core::{Address, Message, Origin};
 
 use crate::auth::Principal;
 
+/// The prefix of a mailbox reference: `anyagents:reply:<message id>`.
+pub const REPLY_PREFIX: &str = "anyagents:reply:";
+
+/// The reply reference a message names. A whole agent's answer resolves to a
+/// mailbox reference, not to a chat id, so an answer can never land in another
+/// conversation.
+pub fn reply_ref(message_id: &str) -> String {
+    anyagents_harness::reply_ref(message_id)
+}
+
+/// The message id a reply reference names, when it is one.
+pub fn ref_message(reference: &str) -> Option<&str> {
+    let id = reference.strip_prefix(REPLY_PREFIX)?;
+    if id.is_empty() || id.contains(':') {
+        None
+    } else {
+        Some(id)
+    }
+}
+
 /// Where one answer goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Destination {
@@ -121,13 +141,35 @@ pub fn resolve(
     let Some(reply_to) = reply_to.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
-    if let Some(name) = anyagents_harness::ref_message(reply_to) {
+    if let Some(name) = ref_message(reply_to) {
         let message =
             own(name)?.ok_or_else(|| "that reply names no message in this mailbox".to_string())?;
         return destination_through(principal, &message, &own).map(Some);
     }
-    // An address the tool takes, or nothing: a bare number or message id is
-    // metadata, and posting it somewhere would be a guess.
+    // A bare message id names a message this agent holds. It is answered where
+    // that message came from, exactly like a reference.
+    if !reply_to.contains(':')
+        && let Some(message) = own(reply_to)?
+    {
+        return destination_through(principal, &message, &own).map(Some);
+    }
+    // A bare message id names a message this agent holds: it is resolved like a
+    // reference, so an answer goes where that message came from.
+    if !reply_to.contains(':') {
+        if let Some(message) = own(reply_to)? {
+            return destination_through(principal, &message, &own).map(Some);
+        }
+        return Ok(None);
+    }
+    // A destination written in full.
+    let Ok(Address::Agent(name)) = Address::parse(reply_to) else {
+        return plain_destination(reply_to);
+    };
+    Ok(Some(Destination::Agent(name)))
+}
+
+/// A destination written in full.
+fn plain_destination(reply_to: &str) -> Result<Option<Destination>, String> {
     if !reply_to.contains(':') {
         return Ok(None);
     }
@@ -224,6 +266,7 @@ mod tests {
             ack: anyagents_core::Ack::Received,
             delivered_at_ms: None,
             origin: None,
+            context: anyagents_harness::Context::default(),
         }
     }
 
@@ -286,7 +329,7 @@ mod tests {
     fn a_reference_is_resolved_from_the_stored_record_and_unknown_is_refused() {
         let incoming = message(Some("telegram:user:42:61"), Some("telegram:chat:-100:3"));
         let id = incoming.id.to_string();
-        let reference = anyagents_harness::reply_ref(&id);
+        let reference = reply_ref(&id);
         let resolved = resolve(
             &agent(),
             |name| Ok((name == id).then(|| incoming.clone())),

@@ -33,7 +33,7 @@ pub fn now_ms() -> i64 {
 }
 
 const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
-     reply_to, received_at_ms, delivered_at_ms, origin";
+     reply_to, received_at_ms, delivered_at_ms, origin, context";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +176,10 @@ pub struct Message {
     pub delivered_at_ms: Option<i64>,
     /// The provider coordinates the channel stored with it.
     pub origin: Option<Origin>,
+    /// The trusted header a harness shows its model: the authenticated author,
+    /// the channel, the chat and topic, the reply a bare answer names, and the
+    /// destination that answer goes to.
+    pub context: anyagents_harness::Context,
 }
 
 /// A new insert, or the row already stored for this source key.
@@ -849,6 +853,21 @@ impl Store {
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
         let body = incoming.body();
+        // The trusted header is built from the record that arrives, before any
+        // field is moved into the row: the author, the channel, the chat and
+        // topic, and the reply a bare answer reaches.
+        let context = anyagents_harness::Context {
+            sender: incoming.sender.clone(),
+            channel: incoming
+                .sender
+                .as_deref()
+                .filter(|sender| sender.starts_with("telegram:"))
+                .map(|_| "telegram".to_string()),
+            chat_id: incoming.origin.and_then(|origin| origin.chat_id),
+            thread_id: incoming.origin.and_then(|origin| origin.thread_id),
+            message_id: incoming.origin.and_then(|origin| origin.message_id),
+            destination: incoming.reply_to.clone(),
+        };
         let source_key = incoming.source_key.filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let mut conn = self.conn();
@@ -872,11 +891,12 @@ impl Store {
             ack: Ack::Received,
             delivered_at_ms: None,
             origin: incoming.origin,
+            context,
         };
         tx.execute(
             "INSERT INTO messages (
-                id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms, origin
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to, received_at_ms, origin, context
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 message.id.as_str(),
                 message.agent_id.as_str(),
@@ -890,6 +910,7 @@ impl Store {
                 message
                     .origin
                     .map(|origin| serde_json::to_string(&origin).unwrap_or_default()),
+                serde_json::to_string(&message.context).ok(),
             ],
         )?;
         tx.commit()?;
@@ -1540,6 +1561,10 @@ fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Messag
         origin: row
             .get::<_, Option<String>>(10)?
             .and_then(|text| serde_json::from_str(&text).ok()),
+        context: row
+            .get::<_, Option<String>>(11)?
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default(),
     })
 }
 

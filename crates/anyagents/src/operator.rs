@@ -54,6 +54,13 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
         file.write_all(b"\n")?;
     }
     std::fs::rename(&temp, &path)?;
+    if let Ok(agent) = store.agent(agent_id)
+        && let Some((_, _, _, gid)) = crate::sandbox::seat_for_agent(&agent.name)
+    {
+        // 0640 in this agent's own seat group, read back. A capability any
+        // other seat can read stops the mint.
+        crate::sandbox::share_capability_with_seat(&path, gid)?;
+    }
     Ok(())
 }
 
@@ -65,6 +72,7 @@ mod tests {
 
     #[test]
     fn a_minted_capability_is_a_private_file_and_replaces_the_last_one() {
+        let _env = crate::server::tests::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         store

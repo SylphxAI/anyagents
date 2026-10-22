@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 
 use anyagents_harness::{DeliverOutcome, Harness, HarnessError, HarnessHealth, TurnUsage};
-use anyagents_harness_stream::{StreamHarness, StreamSpec, cancel_line, message_line};
+use anyagents_harness_stream::{StreamHarness, StreamSpec, apply_line, cancel_line, message_line};
 
 /// One long-lived Antigravity child.
 pub struct AgyHarness {
@@ -66,8 +66,11 @@ impl Harness for AgyHarness {
         &mut self,
         message: &anyagents_harness::OutboundMessage,
     ) -> Result<DeliverOutcome, HarnessError> {
+        // A message that arrives while a turn is open steers it, as the CLI's
+        // own `injectSteps` does; a quiet agent takes it as its next turn.
+        let _ = &self.spec;
         self.inner
-            .deliver(message, &message_line(&self.spec, message))
+            .deliver_with(message, &message_line(&self.spec, message), &apply_line(message))
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {

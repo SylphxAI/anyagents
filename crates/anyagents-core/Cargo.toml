@@ -7,6 +7,7 @@ rust-version = "1.98"
 description = "Identifiers, address grammar, and the durable mailbox"
 
 [dependencies]
+anyagents-harness = { path = "../anyagents-harness" }
 libc = "0.2"
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

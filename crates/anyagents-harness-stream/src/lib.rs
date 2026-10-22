@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, HarnessError, HarnessHealth, OutboundMessage, SteerSupport,
-    TurnState, TurnUsage, marked_message, message_id_in_text,
+    TurnState, TurnUsage, compose_message, message_id_in_text, spawn_command,
 };
 use serde_json::{Value, json};
 
@@ -342,41 +342,6 @@ impl StreamHarness {
     }
 
     /// Write one line for `message`, unless that id was already written or echoed.
-    pub fn deliver(
-        &mut self,
-        message: &OutboundMessage,
-        line: &Value,
-    ) -> Result<DeliverOutcome, HarnessError> {
-        let mut state = lock(&self.shared);
-        if !state.alive {
-            return Err(HarnessError::Dead);
-        }
-        if state.seen.contains(&message.id) {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: state.finished.contains(&message.id),
-            });
-        }
-        if let Some(reset_at_ms) = state.quota_reset_at_ms {
-            return Ok(DeliverOutcome::Quota { reset_at_ms });
-        }
-        if write_stdin(&self.stdin, line).is_err() {
-            state.alive = false;
-            self.wake.notify_all();
-            return Err(HarnessError::Dead);
-        }
-        if state.open.is_empty() {
-            state.turns_started += 1;
-            state.open.push(message.id.clone());
-        } else {
-            state.followups.push(message.id.clone());
-        }
-        state.seen.insert(message.id.clone());
-        state.written.push(message.id.clone());
-        Ok(DeliverOutcome::Accepted {
-            turn_finished: false,
-        })
-    }
-
     pub fn background(&self) -> Result<(), HarnessError> {
         if lock(&self.shared).alive {
             Ok(())
@@ -440,6 +405,70 @@ impl StreamHarness {
         lock(&self.shared).child.as_ref().map(Child::id)
     }
 
+    /// Write one line into the child and record it as taken.
+    pub fn deliver(
+        &mut self,
+        message: &OutboundMessage,
+        line: &Value,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        self.write(message, line, &Value::Null)
+    }
+
+    /// Write one line into the child; a message that arrives while a turn is
+    /// open becomes `mid_turn` instead, which the vendor's own mid-step input
+    /// takes.
+    pub fn deliver_with(
+        &mut self,
+        message: &OutboundMessage,
+        line: &Value,
+        mid_turn: &Value,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        self.write(message, line, mid_turn)
+    }
+
+    fn write(
+        &mut self,
+        message: &OutboundMessage,
+        line: &Value,
+        mid_turn: &Value,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        let mut state = lock(&self.shared);
+        if !state.alive {
+            return Err(HarnessError::Dead);
+        }
+        if state.seen.contains(&message.id) {
+            return Ok(DeliverOutcome::Accepted {
+                turn_finished: state.finished.contains(&message.id),
+            });
+        }
+        if let Some(reset_at_ms) = state.quota_reset_at_ms {
+            return Ok(DeliverOutcome::Quota { reset_at_ms });
+        }
+        // A mid-turn message uses the vendor's own mid-step input; one that
+        // arrives while the agent is quiet starts its own turn.
+        let chosen = if state.open.is_empty() || mid_turn.is_null() {
+            line
+        } else {
+            mid_turn
+        };
+        if write_stdin(&self.stdin, chosen).is_err() {
+            state.alive = false;
+            self.wake.notify_all();
+            return Err(HarnessError::Dead);
+        }
+        if state.open.is_empty() {
+            state.turns_started += 1;
+            state.open.push(message.id.clone());
+        } else {
+            state.followups.push(message.id.clone());
+        }
+        state.seen.insert(message.id.clone());
+        state.written.push(message.id.clone());
+        Ok(DeliverOutcome::Accepted {
+            turn_finished: false,
+        })
+    }
+
     pub fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
@@ -467,7 +496,9 @@ impl StreamHarness {
     }
 
     fn spawn(&mut self) -> Result<(), HarnessError> {
-        let mut command = Command::new(&self.program);
+        // The seat the server configured for this agent: the child starts as
+        // the agent's own uid, and no server-only key reaches it.
+        let mut command = spawn_command(&self.program, &self.environment);
         command.args(&self.args);
         command
             .stdin(Stdio::piped())
@@ -728,8 +759,15 @@ fn quota_of(value: &Value) -> Option<i64> {
 pub fn message_line(spec: &StreamSpec, message: &OutboundMessage) -> Value {
     json!({
         "type": spec.start_line,
-        "text": marked_message(&message.id, &message.text)
+        // The trusted header the server wrote, then the body: one composition
+        // for every harness.
+        "text": compose_message(&message.id, &message.context, &message.text)
     })
+}
+
+/// The step a mid-turn message becomes.
+pub fn apply_line(message: &OutboundMessage) -> Value {
+    json!({"injectSteps": [{"userMessage": compose_message(&message.id, &message.context, &message.text)}]})
 }
 
 /// The line that stops the current turn.

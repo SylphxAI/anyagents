@@ -232,6 +232,9 @@ pub(crate) fn outbound(message: &Message) -> OutboundMessage {
         sender: message.sender.clone(),
         reply_to: message.reply_to.clone(),
         source_time_ms: message.source_time_ms,
+        // The trusted header the server wrote with this message: the author, the
+        // channel, the chat and topic, and the reply a bare answer names.
+        context: message.context.clone(),
     }
 }
 

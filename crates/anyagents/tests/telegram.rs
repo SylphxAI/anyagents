@@ -12,6 +12,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod support;
+
 use anyagents_core::{CredentialStore, FileCredentialStore, Store};
 use serde_json::{Value, json};
 
@@ -226,13 +228,19 @@ impl Server {
             .arg(dir)
             .arg("serve")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(dir.join("server.stderr")).expect("stderr"),
+            ))
             .spawn()
             .expect("server");
         let socket = dir.join("anyagents.sock");
         let deadline = Instant::now() + Duration::from_secs(10);
         while !socket.exists() {
-            assert!(Instant::now() < deadline, "no socket");
+            assert!(
+                Instant::now() < deadline,
+                "no socket: {}",
+                std::fs::read_to_string(dir.join("server.stderr")).unwrap_or_default()
+            );
             thread::sleep(Duration::from_millis(20));
         }
         Self { child }
@@ -299,12 +307,8 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
 }
 
 fn post(socket: &Path, request: &Value) -> Value {
-    let agent_header = request
-        .get("sender")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.strip_prefix("agent:"))
-        .map(|name| format!("x-anyagents-agent-id: {name}\r\n"))
-        .unwrap_or_default();
+    // The operator sends as the agent it names, with its own token.
+    let agent_header = support::header();
     let request = request.to_string();
     let mut stream = std::os::unix::net::UnixStream::connect(socket).unwrap();
     stream
@@ -764,4 +768,95 @@ fn one_post_reaches_every_member_once_and_never_the_poster() {
         !in_ada.iter().any(|m| m.text == "just us"),
         "a private chat reaches no peer"
     );
+}
+
+/// One group, one person quoting an agent there: the agent reads who wrote it,
+/// in which group and topic, and what it quotes; a bare answer goes back to
+/// that group, that topic and that message, and never to the person's own chat.
+#[test]
+fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    // Kyle (42) quotes Sage's message (60) in group -1007, topic 3, at message
+    // 61; the bot Ada received it.
+    let quoting = json!({
+        "update_id": 30,
+        "message": {
+            "message_id": 61,
+            "message_thread_id": 3,
+            "is_topic_message": true,
+            "chat": {"id": -1007, "type": "supergroup", "is_forum": true},
+            "from": {"id": 42, "is_bot": false, "first_name": "Kyle"},
+            "reply_to_message": {
+                "message_id": 60,
+                "chat": {"id": -1007, "type": "supergroup"},
+                "from": {"id": 900, "is_bot": true, "first_name": "Sage", "username": "sage_bot"},
+                "date": 1_700_000_000,
+                "text": "the schema is ready",
+            },
+            "date": 1_700_000_001,
+            "text": "ship it",
+        },
+    });
+    let fake = FakeTelegram::start(vec![quoting]);
+    create(&data, "ada");
+    add_channel(&data, "ada", "777:fake-token-not-real");
+    support::operator_with_configured_seat(&data);
+    let server = Server::start(&data, &fake.address);
+    let socket = data.join("anyagents.sock");
+
+    // The agent reads the line with its trusted context and its quote.
+    let agent_id = support::call(&socket, "GET", "/v1/agents", "")
+        .1["agents"][0]["id"]
+        .as_str()
+        .expect("ada")
+        .to_string();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let (_, read) = support::call(&socket, "GET", &format!("/v1/operator/agents/ada/inbox"), "");
+        let text = read["messages"][0]["text"].as_str().unwrap_or_default().to_string();
+        if text.contains("ship it") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the quote never arrived: {read}");
+        thread::sleep(Duration::from_millis(50));
+    }
+    let (_, read) = support::call(&socket, "GET", "/v1/operator/agents/ada/inbox", "");
+    let text = read["messages"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("ship it\n\n----- quoted message -----"), "{text}");
+    assert!(text.contains("replied to Sage (@sage_bot):"), "{text}");
+    assert!(text.contains("\"the schema is ready\""), "{text}");
+    assert_eq!(read["messages"][0]["sender"], "telegram:user:42:61");
+    let _ = agent_id;
+
+    // The agent answers the message it was sent, by its mailbox reference.
+    let message_id = read["messages"][0]["id"].as_str().unwrap().to_string();
+    let (status, answer) = support::call(
+        &socket,
+        "POST",
+        "/v1/send",
+        &json!({
+            "sender": "agent:ada",
+            "to": [],
+            "text": "done",
+            "reply_to": format!("anyagents:reply:{message_id}"),
+        })
+        .to_string(),
+    );
+    assert!(status.contains("200"), "{status} {answer}");
+
+    let sent = fake.sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(
+        sent[0],
+        Sent {
+            chat_id: -1007,
+            text: "done".into(),
+            reply_to: Some(61),
+            thread: Some(3),
+        },
+        "the answer stays in the group and its topic"
+    );
+    drop(server);
 }

@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use anyagents_harness_stream::{NotificationEffect, RpcChild, RpcFail, RpcLaunch};
 use serde_json::{Value, json};
@@ -245,7 +245,11 @@ impl Harness for MuseHarness {
         let mut params = json!({
             "commandId": command_id(),
             "sessionId": session,
-            "input": [{"type": "text", "text": marked_message(&message.id, &message.text)}],
+            // One user step: the ID line and the server's trusted context first, so
+        // the model reads who wrote it and where a bare answer goes.
+        // One user step: the ID line first, then the server's trusted context
+        // when it wrote one, then the body.
+        "input": [{"type": "text", "text": compose_text(message)}],
             "reasoningEffort": "max",
         });
         if in_turn {
@@ -574,6 +578,19 @@ fn note_ids(state: &mut State, value: &Value) {
 }
 
 /// A uuid7 command id, the shape the vendor's own commands use.
+/// The user step one mailbox message becomes.
+fn compose_text(message: &anyagents_harness::OutboundMessage) -> String {
+    let context = &message.context;
+    let known = context.sender.is_some()
+        || context.chat_id.is_some()
+        || context.message_id.is_some()
+        || context.destination.is_some();
+    if !known {
+        return anyagents_harness::marked_message(&message.id, &message.text);
+    }
+    anyagents_harness::compose_message(&message.id, context, &message.text)
+}
+
 fn command_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let nanos = SystemTime::now()

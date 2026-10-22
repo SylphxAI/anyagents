@@ -21,14 +21,14 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -200,7 +200,11 @@ impl CodexHarness {
             wake: Arc::new(Condvar::new()),
             reader: None,
         };
-        let mut cmd = Command::new(program);
+        let env_pairs: Vec<(String, String)> = environment
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        let mut cmd = anyagents_harness::spawn_command(&program, &env_pairs);
         cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -398,7 +402,7 @@ impl Harness for CodexHarness {
         };
         let input = json!([{
             "type": "text",
-            "text": marked_message(&message.id, &message.text)
+            "text": compose_message(&message.id, &message.context, &message.text)
         }]);
         let (method, params) = if let Some(turn_id) = &steering {
             (

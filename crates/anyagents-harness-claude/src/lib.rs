@@ -26,14 +26,14 @@
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage, SteerItem,
-    SteerQueue, SteerSupport, TurnState, TurnUsage, marked_message, message_id_in_text,
+    SteerQueue, SteerSupport, TurnState, TurnUsage, compose_message, message_id_in_text,
 };
 use serde_json::{Value, json};
 
@@ -125,7 +125,7 @@ impl ClaudeHarness {
                 "role": "user",
                 "content": [{
                     "type": "text",
-                    "text": marked_message(&message.id, &message.text)
+                    "text": compose_message(&message.id, &message.context, &message.text)
                 }]
             }
         })
@@ -248,7 +248,7 @@ impl ClaudeHarness {
     }
 
     fn launch(&mut self, session_id: Option<&str>) -> Result<(), HarnessError> {
-        let mut cmd = Command::new(&self.program);
+        let mut cmd = anyagents_harness::spawn_command(&self.program, &self.environment);
         cmd.arg("-p")
             .arg("--input-format")
             .arg("stream-json")
