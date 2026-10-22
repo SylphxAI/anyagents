@@ -894,3 +894,106 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
     );
     drop(server);
 }
+
+#[test]
+fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_at(&data);
+    let fake = FakeTelegram::start(Vec::new());
+    let agent = create(&data, "ada");
+    let channel_id = add_channel(&data, "ada", "777:fake-token-not-real");
+
+    let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
+        .env("ANYAGENTS_FAKE_OPENCODE", "1")
+        .env("ANYAGENTS_FAKE_LOG", data.join("fake.log"))
+        .env("ANYAGENTS_TELEGRAM_API", &fake.address)
+        .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
+        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(&data))
+        .env("ANYAGENTS_AGENTS", support::agents_line())
+        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", data.join(support::TOKEN_FILE))
+        .arg("--data")
+        .arg(&data)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("server");
+    let server = Server { child };
+    let addr_file = data.join("webhook.addr");
+    wait_for(|| addr_file.exists(), "webhook listener did not bind");
+    let webhook_addr = std::fs::read_to_string(&addr_file).unwrap().trim().to_string();
+
+    // Readiness check on the TCP webhook listener.
+    let mut health_stream = TcpStream::connect(&webhook_addr).unwrap();
+    write!(
+        health_stream,
+        "GET /v1/webhooks/healthz HTTP/1.1\r\nHost: desk.kylet.se\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut health_resp = String::new();
+    health_stream.read_to_string(&mut health_resp).unwrap();
+    assert!(health_resp.starts_with("HTTP/1.1 200"), "{health_resp}");
+    assert!(health_resp.contains("\"ok\":true"), "{health_resp}");
+
+    // Control-plane routes are NOT exposed on the TCP webhook listener.
+    let mut forbidden_stream = TcpStream::connect(&webhook_addr).unwrap();
+    write!(
+        forbidden_stream,
+        "GET /v1/agents HTTP/1.1\r\nHost: desk.kylet.se\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut forbidden_resp = String::new();
+    forbidden_stream.read_to_string(&mut forbidden_resp).unwrap();
+    assert!(forbidden_resp.starts_with("HTTP/1.1 404"), "{forbidden_resp}");
+
+    // Wrong secret is rejected with 401.
+    let payload = dm(99, 100, 77, "instant webhook message").to_string();
+    let mut bad_stream = TcpStream::connect(&webhook_addr).unwrap();
+    write!(
+        bad_stream,
+        "POST /v1/webhooks/telegram/{channel_id} HTTP/1.1\r\nHost: desk.kylet.se\r\nX-Telegram-Bot-Api-Secret-Token: wrong\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    )
+    .unwrap();
+    let mut bad_resp = String::new();
+    bad_stream.read_to_string(&mut bad_resp).unwrap();
+    assert!(bad_resp.starts_with("HTTP/1.1 401"), "{bad_resp}");
+
+    // Compute the HMAC-SHA256 secret token via python3 to verify interoperability with standard HMAC-SHA256.
+    let secret = String::from_utf8(
+        Command::new("python3")
+            .args([
+                "-c",
+                &format!(
+                    "import hmac, hashlib; print(hmac.new(b'777:fake-token-not-real', b'anyagents-telegram-webhook:{channel_id}', hashlib.sha256).hexdigest(), end='')"
+                ),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+
+    let mut good_stream = TcpStream::connect(&webhook_addr).unwrap();
+    write!(
+        good_stream,
+        "POST /v1/webhooks/telegram/{channel_id} HTTP/1.1\r\nHost: desk.kylet.se\r\nX-Telegram-Bot-Api-Secret-Token: {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        payload.len()
+    )
+    .unwrap();
+    let mut good_resp = String::new();
+    good_stream.read_to_string(&mut good_resp).unwrap();
+    assert!(good_resp.starts_with("HTTP/1.1 200"), "{good_resp}");
+
+    let agent_id = anyagents_core::AgentId::parse(&agent).unwrap();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let inbox = store.inbox(&agent_id, None).unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].text, "instant webhook message");
+    assert_eq!(inbox[0].source_key.as_deref(), Some("bot:99"));
+    drop(server);
+}

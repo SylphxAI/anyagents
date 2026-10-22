@@ -20,7 +20,7 @@
 //! come from the private service this adapter starts for this agent.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -605,9 +605,7 @@ impl Drop for OpenCodeHarness {
         if let Some(mut child) = self.child.take() {
             // The exact child, never a pattern or a group: a shared desk refuses
             // a group signal it does not own, and it is right to.
-            let _ = Command::new("kill")
-                .args(["-TERM", &child.id().to_string()])
-                .status();
+            anyagents_harness::kill_pid(child.id(), "-TERM", &self.environment);
             let deadline = Instant::now() + Duration::from_secs(5);
             loop {
                 match child.try_wait() {
@@ -616,7 +614,7 @@ impl Drop for OpenCodeHarness {
                         std::thread::sleep(Duration::from_millis(50));
                     }
                     _ => {
-                        let _ = child.kill();
+                        anyagents_harness::kill_child(&mut child, &self.environment);
                         break;
                     }
                 }

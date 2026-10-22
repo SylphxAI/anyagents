@@ -9,7 +9,7 @@ use anyagents_harness_claude::ClaudeHarness;
 use anyagents_supervisor::{Clock, LaunchRequest, ManualClock, Supervisor};
 
 fn short_dir() -> tempfile::TempDir {
-    tempfile::TempDir::new_in("/tmp").unwrap()
+    tempfile::tempdir().unwrap()
 }
 
 fn scripted(mode: &'static str, log: PathBuf) -> anyagents_supervisor::Launch<ClaudeHarness> {
@@ -465,5 +465,115 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         );
         assert_eq!(message.ack, anyagents_core::Ack::Delivered);
     }
+    drop(supervisor);
+}
+
+#[test]
+fn backpressure_parks_until_the_input_activity_notification() {
+    use anyagents_harness::{
+        DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    };
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    };
+
+    type Notify = Arc<dyn Fn() + Send + Sync>;
+    struct Input {
+        ready: Arc<AtomicBool>,
+        calls: Arc<AtomicUsize>,
+        notify: Arc<Mutex<Option<Notify>>>,
+        inner: FakeHarness,
+    }
+    impl Harness for Input {
+        fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if !self.input_ready() {
+                return Ok(DeliverOutcome::Deferred);
+            }
+            self.inner.deliver(message)
+        }
+        fn input_ready(&self) -> bool {
+            self.ready.load(Ordering::SeqCst)
+        }
+        fn watch_activity(&self, notify: Notify) {
+            *self.notify.lock().unwrap() = Some(notify);
+        }
+        fn background(&mut self) -> Result<(), HarnessError> {
+            self.inner.background()
+        }
+        fn resume(&mut self, session: &str) -> Result<(), HarnessError> {
+            self.inner.resume(session)
+        }
+        fn cancel(&mut self) -> Result<(), HarnessError> {
+            self.inner.cancel()
+        }
+        fn health(&self) -> HarnessHealth {
+            self.inner.health()
+        }
+    }
+    struct ParkClock {
+        inner: ManualClock,
+        calls: Arc<AtomicUsize>,
+        parked: mpsc::Sender<usize>,
+    }
+    impl Clock for ParkClock {
+        fn now_ms(&self) -> i64 {
+            self.inner.now_ms()
+        }
+        fn wait(&self, deadline: Option<i64>, woken: &AtomicBool) {
+            let _ = self.parked.send(self.calls.load(Ordering::SeqCst));
+            self.inner.wait(deadline, woken);
+        }
+        fn poke(&self) {
+            self.inner.poke();
+        }
+    }
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store.create_agent(NewAgent::new("blocked", "agy")).unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().display().to_string())
+        .unwrap();
+    store.receive(&agent.id, Incoming::new("pending")).unwrap();
+    let ready = Arc::new(AtomicBool::new(false));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let notify: Arc<Mutex<Option<Notify>>> = Arc::new(Mutex::new(None));
+    let (tx, rx) = mpsc::channel();
+    let clock = Arc::new(ParkClock {
+        inner: ManualClock::new(0),
+        calls: Arc::clone(&calls),
+        parked: tx,
+    });
+    let launch = {
+        let ready = Arc::clone(&ready);
+        let calls = Arc::clone(&calls);
+        let notify = Arc::clone(&notify);
+        Arc::new(move |_: LaunchRequest| {
+            Ok(Input {
+                ready: Arc::clone(&ready),
+                calls: Arc::clone(&calls),
+                notify: Arc::clone(&notify),
+                inner: FakeHarness::new(DeliveryMode::Followup),
+            })
+        })
+    };
+    let supervisor = Supervisor::start(Arc::clone(&store), clock, launch, vec![]).unwrap();
+    loop {
+        if rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("backpressure must reach clock wait")
+            > 0
+        {
+            break;
+        }
+    }
+    assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 0);
+    ready.store(true, Ordering::SeqCst);
+    notify.lock().unwrap().as_ref().unwrap()();
+    assert!(wait_until(
+        || store.delivered_cursor(&agent.id).unwrap() == 1
+    ));
     drop(supervisor);
 }

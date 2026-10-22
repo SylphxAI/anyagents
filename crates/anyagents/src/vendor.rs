@@ -96,6 +96,22 @@ impl anyagents_harness::Harness for ContractHarness {
     fn health(&self) -> HarnessHealth {
         self.inner.health()
     }
+
+    fn input_ready(&self) -> bool {
+        self.inner.input_ready()
+    }
+
+    fn clear_quota(&mut self) {
+        self.inner.clear_quota()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.inner.process_id()
+    }
+
+    fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.inner.watch_activity(notify)
+    }
 }
 
 pub fn child_env() -> Vec<(String, String)> {
@@ -109,10 +125,25 @@ pub fn child_env() -> Vec<(String, String)> {
 }
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    // Strip any untrusted launch or authority variables from caller/stored env.
+    let mut env: Vec<(String, String)> = request
+        .extra_env
+        .into_iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                anyagents_harness::SEAT_LAUNCH_ENV
+                    | "ANYAGENTS_AGENT_UID"
+                    | "ANYAGENTS_OPERATOR_TOKEN_FILE"
+                    | "ANYAGENTS_CAPABILITY_KEY"
+                    | "LD_PRELOAD"
+                    | "LD_LIBRARY_PATH"
+            )
+        })
+        .collect();
     // The data directory the deployment serves, so an agent's tools find the
     // one socket and one config directory that hold its capability. Never a
     // secret: the capability itself stays in a file only this agent reads.
-    let mut env = request.extra_env;
     env.push((
         "ANYAGENTS_DATA".to_string(),
         request.data_dir.display().to_string(),
@@ -140,7 +171,23 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     }
     // An agent's own launch environment: the gateway origin for the API it
     // speaks, and this agent's own token. Never a provider key.
-    let mut launch_env = request.agent.launch_env.clone();
+    let mut launch_env: Vec<(String, String)> = request
+        .agent
+        .launch_env
+        .iter()
+        .filter(|(k, _)| {
+            !matches!(
+                k.as_str(),
+                anyagents_harness::SEAT_LAUNCH_ENV
+                    | "ANYAGENTS_AGENT_UID"
+                    | "ANYAGENTS_OPERATOR_TOKEN_FILE"
+                    | "ANYAGENTS_CAPABILITY_KEY"
+                    | "LD_PRELOAD"
+                    | "LD_LIBRARY_PATH"
+            )
+        })
+        .cloned()
+        .collect();
     env.append(&mut launch_env);
     env.push((
         "AGY_CONFIG_DIR".to_string(),
@@ -150,23 +197,23 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         "MUSE_CONFIG_HOME".to_string(),
         request.config_dir.display().to_string(),
     ));
-    // The OS seat this one agent runs in, from the operator's configuration
-    // and the host's own accounts. Its config and work directories go to that
-    // seat's group; the harness is started inside it by the adapter.
-    if let Some((seat_user, _, _, gid)) = crate::sandbox::seat_for_agent(&request.agent.name) {
-        crate::sandbox::share_config_with_seat(&request.config_dir, gid);
+    let seat_spec = crate::sandbox::seat_launch_spec(&request.agent.name);
+    if let Some((ref seat_user, _)) = seat_spec {
+        if let Some((_, _, gid, _)) = crate::sandbox::seat_for_agent(&request.agent.name) {
+            crate::sandbox::share_config_with_seat(&request.config_dir, gid);
+        }
         let cache_home = request.config_dir.join("cache-home");
         let _ = std::fs::create_dir_all(&cache_home);
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
-        env.push(("LOGNAME".to_string(), seat_user));
+        env.push(("LOGNAME".to_string(), seat_user.clone()));
         env.push((
             "XDG_CACHE_HOME".to_string(),
             cache_home.display().to_string(),
         ));
     }
-    if let Some((_, spec)) = crate::sandbox::seat_launch_spec(&request.agent.name) {
-        env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec));
+    if let Some((_, ref spec)) = seat_spec {
+        env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec.clone()));
     }
     if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
         let program =
@@ -181,16 +228,82 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         return Ok(VendorHarness::Contract(Box::new(harness)));
     }
     if request.agent.harness == "agy" {
+        ensure_agy_steering_settings(&request.config_dir);
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
-        // The agent's own config directory carries the steering hook, so a
-        // message reaches the running turn instead of waiting for the next one.
-        let harness =
-            AgyHarness::start(&program, None, &pairs(&env)).map_err(|err| err.to_string())?;
+        let session = session_from_file(&request.config_dir, "agy-session-id");
+        let harness = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+            AgyHarness::start(&program, session.as_deref(), &pairs(&env))
+                .map_err(|err| err.to_string())?
+        } else {
+            let mut spec = anyagents_harness_stream::StreamSpec::for_program("agy");
+            spec.args = vec![
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--dangerously-skip-permissions".to_string(),
+            ];
+            if let Some(model) = request
+                .agent
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
+                spec.args.push("--model".to_string());
+                spec.args.push(model.to_string());
+            }
+            spec.resume_flag = "--conversation";
+            AgyHarness::start_with_spec(
+                spec,
+                &program,
+                session.as_deref(),
+                &pairs(&env),
+                Some(&request.work_dir),
+            )
+            .map_err(|err| err.to_string())?
+        };
         Ok(VendorHarness::Agy(Box::new(harness)))
     } else if request.agent.harness == "muse" {
+        env.push((
+            "XDG_CONFIG_HOME".to_string(),
+            request.config_dir.display().to_string(),
+        ));
+        env.push(("MUSE_NO_AUTO_UPDATE".to_string(), "1".to_string()));
         let program = std::env::var("ANYAGENTS_MUSE_BIN").unwrap_or_else(|_| "muse".to_string());
-        let harness = MuseHarness::start_in(&program, None, &pairs(&env), Some(&request.work_dir))
-            .map_err(|err| err.to_string())?;
+        let session = session_from_file(&request.config_dir, "muse-session-id");
+        let extra_args = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+            Vec::new()
+        } else {
+            let model = request
+                .agent
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .unwrap_or("muse-wonder-1.0")
+                .to_string();
+            vec![
+                "--provider".to_string(),
+                "meta".to_string(),
+                "--model".to_string(),
+                model,
+                "--disable-request-user-input".to_string(),
+                "--trust-workspace".to_string(),
+                "-c".to_string(),
+                "context.foreign_personal_rules=false".to_string(),
+                "-c".to_string(),
+                "context.foreign_personal_skills=false".to_string(),
+            ]
+        };
+        let harness = MuseHarness::start_in_with_args(
+            &program,
+            &extra_args,
+            session.as_deref(),
+            &pairs(&env),
+            Some(&request.work_dir),
+        )
+        .map_err(|err| err.to_string())?;
         Ok(VendorHarness::Muse(Box::new(harness)))
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
@@ -211,7 +324,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         let program = crate::install::program(&root, &request.agent.harness);
         // The session this agent last ran is kept beside its config, so a
         // restart resumes that exact conversation instead of starting one.
-        let session = opencode_session(&request.config_dir);
+        let session = session_from_file(&request.config_dir, "opencode-session-id");
         // The service speaks HTTP; the adapter drives it with `opencode api`.
         let harness = OpenCodeHarness::start_in_config(
             &program,
@@ -227,36 +340,108 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             "CODEX_HOME".to_string(),
             request.config_dir.display().to_string(),
         ));
+        let session = session_from_file(&request.config_dir, "codex-session-id");
         let program = crate::install::program(&root, &request.agent.harness);
-        let harness = start_codex(&program.display().to_string(), &env, &request.work_dir)?;
+        let harness = start_codex(
+            &program.display().to_string(),
+            session.as_deref(),
+            &env,
+            &request.work_dir,
+        )?;
         Ok(VendorHarness::Codex(Box::new(harness)))
     } else {
         env.push((
             "CLAUDE_CONFIG_DIR".to_string(),
             request.config_dir.display().to_string(),
         ));
+        let session = session_from_file(&request.config_dir, "claude-session-id");
+        let extra_args = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+            Vec::new()
+        } else {
+            let mut args = vec!["--dangerously-skip-permissions".to_string()];
+            if let Some(model) = request
+                .agent
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+            {
+                args.push("--model".to_string());
+                args.push(model.to_string());
+            }
+            args.push("--effort".to_string());
+            args.push("medium".to_string());
+            args.push("--name".to_string());
+            args.push(request.agent.name.clone());
+            let mcp_cfg = request.config_dir.join("mcp.json");
+            let claude_cfg = request.config_dir.join(".claude.json");
+            if mcp_cfg.is_file() {
+                args.push("--strict-mcp-config".to_string());
+                args.push("--mcp-config".to_string());
+                args.push(mcp_cfg.display().to_string());
+            } else if claude_cfg.is_file() {
+                args.push("--mcp-config".to_string());
+                args.push(claude_cfg.display().to_string());
+            }
+            args
+        };
         let program = crate::install::program(&root, &request.agent.harness);
-        let harness = start_claude(&program.display().to_string(), &env, &request.work_dir)?;
+        let harness = start_claude(
+            &program.display().to_string(),
+            &extra_args,
+            session.as_deref(),
+            &env,
+            &request.work_dir,
+        )?;
         Ok(VendorHarness::Claude(Box::new(harness)))
+    }
+}
+
+/// Ensures `agy`'s native `"queuedMessages": "send-immediately"` setting is
+/// active in the agent's config directory so messages written to stdin during
+/// a turn are injected by `agy` at its next tool step without custom hooks.
+fn ensure_agy_steering_settings(config_dir: &Path) {
+    let dir = config_dir.join(".gemini").join("antigravity-cli");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let path = dir.join("settings.json");
+    let mut map = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).ok())
+        .unwrap_or_default();
+    if map.get("queuedMessages").and_then(|v| v.as_str()) == Some("send-immediately") {
+        return;
+    }
+    map.insert(
+        "queuedMessages".to_string(),
+        serde_json::Value::String("send-immediately".to_string()),
+    );
+    if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+        let _ = std::fs::write(&path, format!("{body}\n"));
     }
 }
 
 fn start_claude(
     program: &str,
+    extra_args: &[String],
+    session: Option<&str>,
     env: &[(String, String)],
     work_dir: &Path,
 ) -> Result<ClaudeHarness, String> {
     let pairs = pairs(env);
-    ClaudeHarness::start_in(program, None, &pairs, Some(work_dir)).map_err(|err| err.to_string())
+    ClaudeHarness::start_in_with_args(program, extra_args, session, &pairs, Some(work_dir))
+        .map_err(|err| err.to_string())
 }
 
 fn start_codex(
     program: &str,
+    session: Option<&str>,
     env: &[(String, String)],
     work_dir: &Path,
 ) -> Result<CodexHarness, String> {
     let pairs = pairs(env);
-    CodexHarness::start_in(program, None, &pairs, Some(work_dir)).map_err(|err| err.to_string())
+    CodexHarness::start_in(program, session, &pairs, Some(work_dir)).map_err(|err| err.to_string())
 }
 
 fn pairs(env: &[(String, String)]) -> Vec<(&str, &str)> {
@@ -318,6 +503,17 @@ impl Harness for VendorHarness {
             Self::Agy(harness) => harness.health(),
             Self::Muse(harness) => harness.health(),
             Self::Contract(harness) => harness.health(),
+        }
+    }
+
+    fn input_ready(&self) -> bool {
+        match self {
+            Self::Claude(harness) => harness.input_ready(),
+            Self::Codex(harness) => harness.input_ready(),
+            Self::OpenCode(harness) => harness.input_ready(),
+            Self::Agy(harness) => harness.input_ready(),
+            Self::Muse(harness) => harness.input_ready(),
+            Self::Contract(harness) => harness.input_ready(),
         }
     }
 
@@ -388,9 +584,9 @@ impl Harness for VendorHarness {
     }
 }
 
-/// The OpenCode session id this agent last ran, kept beside its config.
-fn opencode_session(config_dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(config_dir.join("opencode-session-id")).ok()?;
+/// The session id this agent last ran, kept beside its config.
+fn session_from_file(config_dir: &Path, file_name: &str) -> Option<String> {
+    let text = std::fs::read_to_string(config_dir.join(file_name)).ok()?;
     let id = text.trim();
     (!id.is_empty()).then(|| id.to_string())
 }

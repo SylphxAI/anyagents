@@ -308,21 +308,22 @@ impl RpcChild {
 
     pub fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        {
+        let mut child = {
             let mut state = lock(&self.shared);
             state.alive = false;
-            if let Some(child) = state.child.as_mut() {
-                let _ = child.kill();
-            }
-        }
+            state.child.take()
+        };
         self.wake.notify_all();
+        if let Some(child) = child.as_mut() {
+            anyagents_harness::kill_child(child, &self.environment);
+        }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
-        let mut state = lock(&self.shared);
-        if let Some(mut child) = state.child.take() {
+        if let Some(mut child) = child {
             let _ = child.wait();
         }
+        let mut state = lock(&self.shared);
         state.alive = false;
     }
 
@@ -344,12 +345,12 @@ impl RpcChild {
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let Some(child_stdin) = child.stdin.take() else {
-            let _ = child.kill();
+            anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdin missing".into()));
         };
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
@@ -434,6 +435,9 @@ fn read_stdout(
     {
         let mut state = lock(&shared);
         state.alive = false;
+        if let Some(child) = state.child.as_mut() {
+            let _ = child.try_wait();
+        }
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();

@@ -88,6 +88,14 @@ impl Harness for OmpHarness {
         self.inner.cancel(&cancel_line(&self.spec))
     }
 
+    fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
+        self.inner.watch_activity(notify)
+    }
+
+    fn input_ready(&self) -> bool {
+        self.inner.input_ready()
+    }
+
     fn health(&self) -> HarnessHealth {
         self.inner.health()
     }

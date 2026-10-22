@@ -223,20 +223,18 @@ impl HealthBoard {
 ///
 /// Steer: Codex takes its `turn/start` while a turn is open and steers into it;
 /// Claude Code writes a new user message into the running stream-json child
-/// (acknowledged by its replay echo); Antigravity takes an `injectSteps` answer
-/// from a before-step hook; OpenCode takes a prompt with `delivery: "steer"`,
+/// (acknowledged by its replay echo); OpenCode takes a prompt with `delivery: "steer"`,
 /// and its own session inbox decides whether that joins the running turn or
 /// starts the next one. Muse's app-server takes `ifBusy: "steer"` on
 /// `turn/start`.
 ///
 /// Followup: the contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per
 /// turn and answers with a `result`, so a line written mid-turn waits for that
-/// turn to end.
+/// turn to end. AGY's stream input also starts a turn per line; its hook helpers
+/// have no wired, confirmed consumption acknowledgement.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
     match harness {
-        "codex" | "claude-code" | "agy" | "opencode" | "muse" => {
-            (DeliveryMode::Steer, SteerSupport::Yes)
-        }
+        "codex" | "claude-code" | "opencode" | "muse" => (DeliveryMode::Steer, SteerSupport::Yes),
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -834,7 +832,7 @@ impl<H: Harness + 'static> Session<H> {
     fn wake_unless_more(&mut self) {
         let more = self.delivery.as_ref().is_some_and(|delivery| {
             match delivery.store().next_undelivered(&self.id) {
-                Ok(next) => next.is_some(),
+                Ok(next) => next.is_some() && delivery.harness().input_ready(),
                 Err(_) => false,
             }
         });
@@ -900,6 +898,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn agy_catalog_does_not_claim_unwired_native_steering() {
+        assert_eq!(
+            super::declared("agy"),
+            (super::DeliveryMode::Followup, super::SteerSupport::Unproven)
+        );
+    }
+
     use super::*;
 
     #[test]

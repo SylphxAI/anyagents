@@ -12,6 +12,7 @@ anyagents-harness = { path = "../anyagents-harness" }
 thiserror = "2"
 
 [dev-dependencies]
+anyagents-harness-agy = { path = "../anyagents-harness-agy" }
 tempfile = "3"
 
 # `cargo test --workspace --all-targets` reports the dependencies of a bin or a

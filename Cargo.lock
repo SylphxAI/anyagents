@@ -107,6 +107,7 @@ version = "0.1.0"
 dependencies = [
  "anyagents-core",
  "anyagents-harness",
+ "anyagents-harness-agy",
  "tempfile",
  "thiserror",
 ]
@@ -126,6 +127,7 @@ dependencies = [
 name = "anyagents-core"
 version = "0.1.0"
 dependencies = [
+ "anyagents-harness",
  "libc",
  "rusqlite",
  "serde",

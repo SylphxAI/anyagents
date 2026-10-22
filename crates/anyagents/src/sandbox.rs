@@ -82,9 +82,11 @@ pub fn configured_seat() -> Option<(u32, u32, u32)> {
     ))
 }
 
-/// Whether any part of a seat is configured.
+/// Whether a single-agent seat override (`ANYAGENTS_AGENT_UID` or
+/// `ANYAGENTS_AGENT_GID`) is configured. `ANYAGENTS_SOCKET_GID` may be set on
+/// its own alongside host `seat-<name>` accounts.
 pub fn seat_named() -> bool {
-    ["ANYAGENTS_AGENT_UID", "ANYAGENTS_AGENT_GID", "ANYAGENTS_SOCKET_GID"]
+    ["ANYAGENTS_AGENT_UID", "ANYAGENTS_AGENT_GID"]
         .iter()
         .any(|name| std::env::var_os(name).is_some())
 }
@@ -114,9 +116,7 @@ pub fn launch_boundary(agents: &[String]) -> bool {
 
 /// The socket group: the configured one, else the host's `anyagents-sock`.
 fn sock_gid_for() -> Option<u32> {
-    configured_seat()
-        .map(|(_, _, sock)| sock)
-        .or_else(|| lookup_group("anyagents-sock"))
+    number("ANYAGENTS_SOCKET_GID").or_else(|| lookup_group("anyagents-sock"))
 }
 
 /// The uid the deployment's own line gives one agent: `<agent>=<uid>` entries
@@ -191,12 +191,19 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
         return None;
     }
-    // The uid this deployment gives the agent; the name is only how the OS
-    // account is displayed.
+    // The uid this deployment gives the agent, or the host's provisioned
+    // `seat-<name>` account when `ANYAGENTS_AGENTS` is not explicitly set.
     let user = seat_user(agent_name);
-    let uid = pinned_uid(agent_name)?;
-    let gid = lookup_user(&user).map(|(_, gid)| gid).unwrap_or(uid);
-    let sock_gid = configured.map(|(_, _, sock)| sock).or_else(|| lookup_group("anyagents-sock"))?;
+    let (uid, gid) = match pinned_uid(agent_name) {
+        Some(uid) => (uid, lookup_user(&user).map(|(_, gid)| gid).unwrap_or(uid)),
+        None => {
+            if cfg!(test) || std::env::var_os("ANYAGENTS_TESTS").is_some() {
+                return None;
+            }
+            lookup_user(&user)?
+        }
+    };
+    let sock_gid = sock_gid_for()?;
     if uid == 0 || uid == current_uid() {
         return None;
     }
@@ -263,15 +270,21 @@ pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
 }
 
 fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes())
-        .map_err(|_| std::io::Error::other("path"))?;
-    // SAFETY: `c_path` is NUL-terminated; the owner is kept.
-    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } != 0 {
-        return Err(std::io::Error::last_os_error());
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    let me = current_uid();
+    if let Ok(meta) = std::fs::metadata(dir)
+        && meta.uid() == me
+    {
+        if let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
+            // SAFETY: `c_path` is NUL-terminated; the owner is kept.
+            let _ = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
+        }
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
     }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770))?;
-    for entry in std::fs::read_dir(dir)?.flatten() {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
         let path = entry.path();
         let Ok(kind) = entry.file_type() else {
             continue;
@@ -280,22 +293,26 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             continue;
         }
         let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
-        let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        if kind.is_dir() {
+            let _ = give_tree(&path, gid);
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
             continue;
         };
-        // SAFETY: as above.
-        let _ = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
-        if kind.is_dir() {
-            give_tree(&path, gid)?;
-        } else if name == crate::operator::CAPABILITY_FILE {
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640))?;
+        if meta.uid() != me {
+            continue;
+        }
+        if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
+            // SAFETY: as above.
+            let _ = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
+        }
+        if name == crate::operator::CAPABILITY_FILE {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640));
         } else {
-            let exec = entry
-                .metadata()
-                .map(|meta| meta.permissions().mode() & 0o100 != 0)
-                .unwrap_or(false);
+            let exec = meta.permissions().mode() & 0o100 != 0;
             let mode = if exec { 0o770 } else { 0o660 };
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))?;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
         }
     }
     Ok(())

@@ -398,3 +398,71 @@ mod tests {
         }
     }
 }
+
+// This uses real OS pipes and a real store, rather than FakeHarness's custody
+// simulation. Only the incomplete write is tested across replacement: a full
+// pipe write still does not prove vendor/model consumption.
+#[cfg(all(test, target_os = "linux"))]
+mod stream_custody_tests {
+    use super::*;
+    use anyagents_core::{Incoming, NewAgent};
+    use anyagents_harness_agy::AgyHarness;
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn partial_pipe_write_survives_loop_and_process_replacement_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let program = dir.path().join("vendor");
+        fs::write(
+            &program,
+            "#!/usr/bin/python3\nimport signal\nsignal.pause()\n",
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = Store::open(&db).unwrap();
+        let agent = store.create_agent(NewAgent::new("custody", "agy")).unwrap();
+        let mut incoming = Incoming::new("x".repeat(2 * 1024 * 1024));
+        incoming.sender = Some("original-sender".into());
+        incoming.reply_to = Some("original-reply".into());
+        store.receive(&agent.id, incoming).unwrap();
+        store.receive(&agent.id, Incoming::new("second")).unwrap();
+        let harness = AgyHarness::start(&program, None, &[]).unwrap();
+        let mut delivery = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
+        assert_eq!(delivery.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(delivery.delivered_cursor().unwrap(), 0);
+        assert!(delivery.harness().written_ids().is_empty());
+        drop(delivery);
+
+        fs::write(&program, "#!/usr/bin/python3\nimport sys\nfor line in sys.stdin:\n print('{\"type\":\"result\"}', flush=True)\n").unwrap();
+        let store = Store::open(&db).unwrap();
+        let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
+        assert_eq!(pending.sender.as_deref(), Some("original-sender"));
+        assert_eq!(pending.reply_to.as_deref(), Some("original-reply"));
+        let ids: Vec<String> = store
+            .inbox(&agent.id, None)
+            .unwrap()
+            .iter()
+            .map(|m| m.id.as_str().to_string())
+            .collect();
+        let harness = AgyHarness::start(&program, None, &[]).unwrap();
+        let mut delivery = DeliveryLoop::start(store, agent.id, harness).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while delivery.delivered_cursor().unwrap() < 2 {
+            delivery.run_once().unwrap();
+            assert!(
+                Instant::now() < deadline,
+                "replacement must drain pending messages"
+            );
+            thread::yield_now();
+        }
+        assert_eq!(delivery.harness().written_ids(), ids);
+        assert_eq!(delivery.run_once().unwrap(), RunOutcome::Idle);
+        assert_eq!(delivery.harness().written_ids(), ids);
+    }
+}

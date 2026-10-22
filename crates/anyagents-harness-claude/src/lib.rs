@@ -40,6 +40,7 @@ use serde_json::{Value, json};
 /// One long-lived Claude Code child.
 pub struct ClaudeHarness {
     program: PathBuf,
+    extra_args: Vec<String>,
     environment: Vec<(String, String)>,
     work_dir: Option<PathBuf>,
     shared: Arc<Mutex<State>>,
@@ -93,8 +94,20 @@ impl ClaudeHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
+        Self::start_in_with_args(program, &[], session_id, environment, work_dir)
+    }
+
+    /// Start one child with extra CLI arguments.
+    pub fn start_in_with_args(
+        program: impl Into<PathBuf>,
+        extra_args: &[String],
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             program: program.into(),
+            extra_args: extra_args.to_vec(),
             environment: environment
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
@@ -256,6 +269,7 @@ impl ClaudeHarness {
             .arg("stream-json")
             .arg("--verbose")
             .arg("--replay-user-messages");
+        cmd.args(&self.extra_args);
         if let Some(session_id) = session_id {
             cmd.arg("--resume").arg(session_id);
         }
@@ -272,12 +286,12 @@ impl ClaudeHarness {
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
         let Some(child_stdin) = child.stdin.take() else {
-            let _ = child.kill();
+            anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdin missing".into()));
         };
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill();
+            anyagents_harness::kill_child(&mut child, &self.environment);
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
@@ -309,21 +323,22 @@ impl ClaudeHarness {
 
     fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        {
+        let mut child = {
             let mut state = lock(&self.shared);
             state.alive = false;
-            if let Some(child) = state.child.as_mut() {
-                let _ = child.kill();
-            }
-        }
+            state.child.take()
+        };
         self.wake.notify_all();
+        if let Some(child) = child.as_mut() {
+            anyagents_harness::kill_child(child, &self.environment);
+        }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
-        let mut state = lock(&self.shared);
-        if let Some(mut child) = state.child.take() {
+        if let Some(mut child) = child {
             let _ = child.wait();
         }
+        let mut state = lock(&self.shared);
         state.open.clear();
         state.followups.clear();
         state.alive = false;
@@ -338,33 +353,37 @@ impl Drop for ClaudeHarness {
 
 impl Harness for ClaudeHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let mut state = lock(&self.shared);
-        if !state.alive {
-            return Err(HarnessError::Dead);
-        }
-        // A message whose last turn failed is not a duplicate: the turn that
-        // succeeds has to carry it. The adapter remembers it failed, so the
-        // host handing it over again always means a new attempt.
-        let failed_before = state.failures.iter().any(|(item, _)| item == &message.id);
-        if !failed_before
-            && (state.seen.contains(&message.id)
-                || state.open.contains(&message.id)
-                || state.followups.contains(&message.id))
-        {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: state.finished.contains(&message.id),
-            });
-        }
-        if let Some(reset_at_ms) = state.quota_reset_at_ms {
-            return Ok(DeliverOutcome::Quota { reset_at_ms });
-        }
-        let phase = if state.open.is_empty() {
-            "idle"
-        } else {
-            "turn"
+        let phase = {
+            let state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            // A message whose last turn failed is not a duplicate: the turn that
+            // succeeds has to carry it. The adapter remembers it failed, so the
+            // host handing it over again always means a new attempt.
+            let failed_before = state.failures.iter().any(|(item, _)| item == &message.id);
+            if !failed_before
+                && (state.seen.contains(&message.id)
+                    || state.open.contains(&message.id)
+                    || state.followups.contains(&message.id))
+            {
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: state.finished.contains(&message.id),
+                });
+            }
+            if let Some(reset_at_ms) = state.quota_reset_at_ms {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
+            if state.open.is_empty() {
+                "idle"
+            } else {
+                "turn"
+            }
         };
         let line = Self::create_input(message);
-        if write_stdin(&self.stdin, &line).is_err() {
+        let write_res = write_stdin(&self.stdin, &line);
+        let mut state = lock(&self.shared);
+        if write_res.is_err() {
             state.alive = false;
             self.wake.notify_all();
             return Err(HarnessError::Dead);
@@ -398,18 +417,22 @@ impl Harness for ClaudeHarness {
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
+        let line = {
+            let mut state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            state.request_seq += 1;
+            let request_id = state.request_seq.to_string();
+            json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": {"subtype": "interrupt"}
+            })
+        };
+        let write_res = write_stdin(&self.stdin, &line);
         let mut state = lock(&self.shared);
-        if !state.alive {
-            return Err(HarnessError::Dead);
-        }
-        state.request_seq += 1;
-        let request_id = state.request_seq.to_string();
-        let line = json!({
-            "type": "control_request",
-            "request_id": request_id,
-            "request": {"subtype": "interrupt"}
-        });
-        if write_stdin(&self.stdin, &line).is_err() {
+        if write_res.is_err() {
             state.alive = false;
             self.wake.notify_all();
             return Err(HarnessError::Dead);
@@ -487,17 +510,27 @@ impl Harness for ClaudeHarness {
     }
 
     fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
+        {
+            let state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            if state.echoed.contains(&message.id) || state.finished.contains(&message.id) {
+                return Ok(true);
+            }
+            // An id the mailbox already handed over is not written twice. The line
+            // stays held for the step where the host settles it.
+            if state.seen.contains(&message.id) {
+                return Ok(false);
+            }
+        }
+        let line = Self::steer_input_line(message);
+        let write_res = write_stdin(&self.stdin, &line);
         let mut state = lock(&self.shared);
-        if !state.alive {
+        if write_res.is_err() {
+            state.alive = false;
+            self.wake.notify_all();
             return Err(HarnessError::Dead);
-        }
-        if state.echoed.contains(&message.id) || state.finished.contains(&message.id) {
-            return Ok(true);
-        }
-        // An id the mailbox already handed over is not written twice. The line
-        // stays held for the step where the host settles it.
-        if state.seen.contains(&message.id) {
-            return Ok(false);
         }
         state.seen.insert(message.id.clone());
         state.written.push(message.id.clone());
@@ -506,12 +539,6 @@ impl Harness for ClaudeHarness {
             state.open.push(message.id.clone());
         } else {
             state.followups.push(message.id.clone());
-        }
-        let line = Self::steer_input_line(message);
-        if write_stdin(&self.stdin, &line).is_err() {
-            state.alive = false;
-            self.wake.notify_all();
-            return Err(HarnessError::Dead);
         }
         Ok(true)
     }

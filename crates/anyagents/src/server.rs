@@ -168,6 +168,25 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
+    if let Some(addr) = webhook_listen_addr() {
+        match tokio::net::TcpListener::bind(&addr).await {
+            Ok(tcp_listener) => {
+                if let Ok(local) = tcp_listener.local_addr() {
+                    let _ = std::fs::write(data.join("webhook.addr"), format!("{local}\n"));
+                }
+                let webhook_app = Router::new()
+                    .route("/v1/webhooks/healthz", get(webhook_healthz))
+                    .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+                    .with_state(state.clone());
+                tokio::spawn(async move {
+                    let _ = axum::serve(tcp_listener, webhook_app).await;
+                });
+            }
+            Err(err) => {
+                eprintln!("warning: webhook TCP listener ({addr}) did not bind: {err}");
+            }
+        }
+    }
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
@@ -179,6 +198,8 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         )
         .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/webhooks/healthz", get(webhook_healthz))
+        .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
         .with_state(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = axum::serve(listener, app)
@@ -189,9 +210,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
             }
         })
         .await;
-    // A long poll ends at Telegram, not here: it is released for every bot
-    // before the poller is stopped, so each bot's last offset is written by the
-    // process that still owns it.
+    // A long poll ends at Telegram, not here: signal the poller to stop first
+    // so released long polls exit instead of re-entering a 30s wait, then
+    // release every bot so each bot's last offset is written before shutdown.
+    poller.signal_stop();
     if let Err(reason) = crate::telegram::poller::release_every_bot(
         &store,
         store.data_dir(),
@@ -271,6 +293,69 @@ async fn mint_capability(
     Ok(Json(
         serde_json::json!({ "agent": agent.name, "minted": true }),
     ))
+}
+
+/// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
+/// webhook listener (`https://desk.kylet.se/v1/webhooks/healthz`).
+async fn webhook_healthz() -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "ok": true }))
+}
+
+/// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
+/// Telegram, verifies `X-Telegram-Bot-Api-Secret-Token` against the channel's
+/// derived HMAC-SHA256 secret, and routes the update into the durable mailbox.
+async fn telegram_webhook(
+    State(state): State<AppState>,
+    AxumPath(channel_id): AxumPath<String>,
+    headers: axum::http::HeaderMap,
+    Json(payload): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let secret = headers
+        .get("x-telegram-bot-api-secret-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        crate::telegram::receive_webhook(
+            &store,
+            store.data_dir(),
+            &channel_id,
+            secret.as_deref(),
+            &payload,
+        )
+        .map_err(|err| match err {
+            crate::telegram::WebhookError::Unauthorized => {
+                ApiError::new(StatusCode::UNAUTHORIZED, "invalid webhook secret token")
+            }
+            crate::telegram::WebhookError::NotFound(why) => {
+                ApiError::new(StatusCode::NOT_FOUND, why)
+            }
+            crate::telegram::WebhookError::BadRequest(why) => {
+                ApiError::new(StatusCode::BAD_REQUEST, why)
+            }
+            crate::telegram::WebhookError::Store(why) => {
+                ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, why)
+            }
+        })?;
+        Ok(Json(serde_json::json!({ "ok": true })))
+    })
+    .await
+}
+
+fn webhook_listen_addr() -> Option<String> {
+    if let Ok(addr) = std::env::var("ANYAGENTS_WEBHOOK_LISTEN") {
+        let trimmed = addr.trim();
+        if trimmed.is_empty() || trimmed == "0" || trimmed.eq_ignore_ascii_case("off") {
+            return None;
+        }
+        return Some(trimmed.to_string());
+    }
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+        || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
+    {
+        return None;
+    }
+    Some("0.0.0.0:8788".to_string())
 }
 
 /// `GET /v1/whoami`: the agent this call acts as. A tool server asks before it
@@ -809,11 +894,15 @@ fn own_message(
 
 fn target_of(destination: &crate::reply::Destination) -> Target {
     match destination {
-        crate::reply::Destination::Telegram { chat, thread, .. } => Target::Telegram {
+        crate::reply::Destination::Telegram {
+            chat,
+            thread,
+            reply,
+        } => Target::Telegram {
             address: destination.address(),
             chat: chat.clone(),
             thread: thread.clone(),
-            reply: None,
+            reply: reply.clone(),
         },
         crate::reply::Destination::Agent(name) => Target::Agent(name.clone()),
         crate::reply::Destination::Group(name) => Target::Room(name.clone()),
@@ -960,7 +1049,10 @@ fn send_sync(
     let body = SendRequest {
         // A reply the caller resolved to a message id, or a reference the
         // server resolved to one, is what this post answers.
-        reply_to: reply.clone().or(body.reply_to),
+        reply_to: reply.clone().or_else(|| {
+            body.reply_to
+                .filter(|v| crate::reply::ref_message(v).is_none())
+        }),
         ..body
     };
     check_targets(store, actor, &body, &plan)?;
@@ -1009,8 +1101,18 @@ fn send_key(namespace: &str, body: &SendRequest) -> Option<String> {
     if idempotency.is_empty() {
         return None;
     }
+    let sender = body.sender.as_deref().unwrap_or("");
+    let reply_to = body.reply_to.as_deref().unwrap_or("");
+    let to_joined = body.to.join("\x1f");
     let mut bytes = Vec::new();
-    for part in [namespace, idempotency] {
+    for part in [
+        namespace,
+        sender,
+        idempotency,
+        to_joined.as_str(),
+        reply_to,
+        body.text.as_str(),
+    ] {
         bytes.extend_from_slice(part.as_bytes());
         bytes.push(0);
     }
@@ -1206,7 +1308,12 @@ fn number(value: &str, what: &'static str) -> Result<i64, ApiError> {
 }
 
 fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>, ApiError> {
-    match body.reply_to.as_deref().or(reply) {
+    let candidate = reply.or_else(|| {
+        body.reply_to
+            .as_deref()
+            .filter(|v| crate::reply::ref_message(v).is_none() && Address::parse(v).is_err())
+    });
+    match candidate {
         None => Ok(None),
         Some(value) => number(value, "reply_to is not a telegram message id").map(Some),
     }

@@ -140,6 +140,45 @@ pub fn spawn_command(
     command
 }
 
+/// Send `signal` (e.g. `"-TERM"` or `"-KILL"`) to a harness child process PID,
+/// running as the child's seat UID when `environment` names one.
+pub fn kill_pid(pid: u32, signal: &str, environment: &[(String, String)]) {
+    let seat = environment
+        .iter()
+        .find(|(k, _)| k == SEAT_LAUNCH_ENV)
+        .map(|(_, v)| v.as_str());
+    if let Some(spec) = seat
+        && let [launcher, uid, gid, _] = spec.split('\t').collect::<Vec<_>>().as_slice()
+    {
+        let _ = std::process::Command::new(launcher)
+            .args([
+                "--reuid",
+                uid,
+                "--regid",
+                gid,
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "/bin/kill",
+                signal,
+                &pid.to_string(),
+            ])
+            .status();
+    } else {
+        let _ = std::process::Command::new("kill")
+            .args([signal, &pid.to_string()])
+            .status();
+    }
+}
+
+/// Kill `child` inside its seat UID boundary when `environment` names one.
+pub fn kill_child(child: &mut std::process::Child, environment: &[(String, String)]) {
+    let pid = child.id();
+    kill_pid(pid, "-TERM", environment);
+    kill_pid(pid, "-KILL", environment);
+    let _ = child.kill();
+}
+
 /// How a harness takes input that arrives during a turn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DeliveryMode {
@@ -197,7 +236,7 @@ pub enum DeliverOutcome {
     /// The harness has the message. `turn_finished` means the turn that
     /// contained it has already completed.
     Accepted { turn_finished: bool },
-    /// Queue mode: a turn is open, so the message stays in the mailbox.
+    /// Input cannot take the complete message yet; it stays in the mailbox.
     Deferred,
     /// The vendor asked us to wait. Not a failure and not a restart.
     Quota { reset_at_ms: i64 },
@@ -228,6 +267,12 @@ pub trait Harness: Send {
     fn resume(&mut self, session: &str) -> Result<(), HarnessError>;
     fn cancel(&mut self) -> Result<(), HarnessError>;
     fn health(&self) -> HarnessHealth;
+
+    /// False while transport backpressure prevents input. watch_activity must
+    /// notify the owner when input becomes writable again.
+    fn input_ready(&self) -> bool {
+        true
+    }
 
     /// How long a turn must stay silent before its answer stands still, for a
     /// vendor that streams text and never closes a turn with a result line.
