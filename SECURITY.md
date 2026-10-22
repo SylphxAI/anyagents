@@ -55,6 +55,11 @@ report can normally touch:
   store. Each harness process reaches the built-in gateway through a per-agent
   token, and the gateway is bound to loopback so only the processes AnyAgents
   started can use it.
+- **Each session is its own capability.** The server mints an opaque capability
+  for one agent instance and keeps only its hash; a session acts as exactly that
+  agent, and a replaced session's capability stops working at once. An agent
+  cannot create agents, sign a harness in or mint a capability; that is the
+  operator's own token.
 - **The mailbox is durable and local.** Messages, transcripts and usage are
   stored in one embedded database under the data directory (`--data`, default
   `.anyagents`). Protect that directory as you would any file holding your
@@ -66,6 +71,9 @@ report can normally touch:
   transcripts and usage.
 - Prefer the default Unix-socket API. When you enable a network listener,
   require a token and place it behind a network you control.
+- Start the server with an operator token only on a host where each agent has
+  its own OS seat: `anyagents agent-run` refuses to start an agent without one,
+  and the server refuses to be the boundary without it.
 - Treat a harness install as code execution: AnyAgents downloads a harness from
   its vendor's official channel, and you should review the harness you enable.
 - Redact agent transcripts, personal paths and tokens before sharing logs in a

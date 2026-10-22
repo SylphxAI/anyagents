@@ -22,7 +22,7 @@ People and teams who already use one or more agent harnesses and want them runni
 2. **Agents.** Create an agent on any harness in one step (Claude Code by default). A harness can run many agents. Harness, model and auth are separate choices: with an API key any model runs in any harness through the built-in protocol gateway; with a subscription, the vendor's own models run in the vendor's own tool.
 3. **AnyAgents owns the state.** An agent's identity, instructions, history, mailbox, channels and credentials live in AnyAgents, so an agent can switch harness or model and keep its history and its channels.
 4. **Channels.** Each agent can be attached to channels, or to none. The first version ships Telegram, behind a channel adapter interface that later channels implement.
-5. **Agents see each other.** Every agent on a server can list the others and message them through one `send` tool, with no external channel needed.
+5. **Agents see each other.** Every agent on a server can list the others and message them through one `send` tool, with no external channel needed. Every session is authenticated as exactly one agent, and an answer names the message it answers, so a group conversation stays in its group and its topic.
 6. **Cost and usage.** Tokens, reported cost and quota state per agent, harness, model and day.
 
 ## Boundaries
@@ -38,7 +38,9 @@ People and teams who already use one or more agent harnesses and want them runni
 - Running a model. (The protocol gateway calls model providers only in API-key mode, with the user's key.)
 - Channels other than Telegram.
 - A TUI or GUI (the API is designed for them).
-- Several hosts sharing one server, and sandboxing agents from each other.
+- Several hosts sharing one server.
+- A sandbox beyond the agent's own OS seat (uid, no new privileges, its own config):
+  filesystem or network isolation beyond what that seat denies.
 
 ## Target metrics
 

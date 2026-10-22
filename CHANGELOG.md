@@ -68,6 +68,28 @@ the first release will move it under a version heading.
   joins only after its last offset is written. A poller is never left behind
   polling beside the next server.
 
+### Changed
+
+- **One authenticated capability per agent session.** The server mints a
+  capability for each agent instance and keeps only its hash; the tool server
+  read the agent's name from its config before, so any process on the machine
+  could send as anyone. A replaced session's capability stops working at once,
+  and an agent can no longer create agents, sign a harness in or mint a
+  capability: those are the operator's own token.
+- **Each message carries its trusted context.** Every harness shows its model
+  who wrote the message, through which channel, in which chat and topic, the
+  reply a bare answer names and where it goes, and what it quotes. A bare
+  answer stays in the conversation: before this, an answer to a group message
+  could be posted to the author's own chat, and a quote was dropped.
+- **Telegram quotes are kept.** A message that quotes another keeps the quoted
+  author, text and ids, fenced so a model cannot forge them.
+- **A named send is one send.** A retry after a lost answer replays its receipt
+  instead of delivering twice, and two identical messages stay two.
+- **The OS seat is asserted, not assumed.** A server with an operator token
+  starts only when each agent has its own uid and the launcher, and
+  `anyagents agent-run` checks the effective uid, `NoNewPrivs` and the denied
+  paths before any command runs.
+
 ### Not yet
 
 - Telegram sign-in, the MCP registry entry, and a published release.
