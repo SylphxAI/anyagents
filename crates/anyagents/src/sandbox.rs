@@ -175,7 +175,7 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     {
         return Some((agent_name.to_string(), uid, gid, sock_gid));
     }
-    if let Some(uid) = pinned_uid(agent_name)
+    if pinned_uid(agent_name).is_some()
         && std::env::var_os("ANYAGENTS_TESTS").is_some()
     {
         // A test machine is its own single seat.
