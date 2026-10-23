@@ -841,7 +841,7 @@ async fn create_agent_route(
 }
 
 async fn archive_agent_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AgentView>, ApiError> {
@@ -850,6 +850,12 @@ async fn archive_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        if matches!(principal, Principal::Agent { .. }) && found.parent_id.is_none() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "only an operator can archive a root agent; pass a sub-agent name or id in `agent`",
+            ));
+        }
         let agent = state
             .store
             .set_agent_state(&found.id, "archived")

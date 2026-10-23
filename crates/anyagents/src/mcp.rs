@@ -299,13 +299,20 @@ struct ArchiveArgs {
     /// Agent name or `agt_...` ID to archive (scales process to zero while keeping
     /// its permanent `agt_...` ID, mailbox, and session on disk so any future message
     /// or `wake` call resumes it). Defaults to this agent itself when omitted.
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "id",
+        alias = "name",
+        alias = "agent_id",
+        alias = "target"
+    )]
     agent: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WakeArgs {
     /// Agent name or `agt_...` ID to wake and resume from `archived` state.
+    #[serde(alias = "id", alias = "name", alias = "agent_id", alias = "target")]
     agent: String,
 }
 

@@ -666,7 +666,12 @@ impl<H: Harness + 'static> Session<H> {
                         self.restart_at = None;
                         self.delivery = Some(*delivery);
                     }
-                    Boot::Busy => return true,
+                    Boot::Busy => {
+                        self.delivery = None;
+                        self.restart_at = None;
+                        self.publish();
+                        return true;
+                    }
                     Boot::Retry => {
                         if !self.wait_backoff() {
                             self.delivery = None;
@@ -693,18 +698,21 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             if self.deliver_once() {
+                self.delivery = None;
+                self.restart_at = None;
+                self.publish();
                 return true;
             }
         }
     }
 
     fn boot(&self) -> Boot<H> {
-        let harness = match self.launch_harness() {
-            Ok(harness) => harness,
-            Err(_) => return Boot::Retry,
-        };
         let store = match Store::open(self.inner.store.data_dir().join("state.db")) {
             Ok(store) => store,
+            Err(_) => return Boot::Retry,
+        };
+        let harness = match self.launch_harness() {
+            Ok(harness) => harness,
             Err(_) => return Boot::Retry,
         };
         match DeliveryLoop::start(store, self.id.clone(), harness) {
@@ -751,7 +759,11 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         self.restart_at
                     },
-                    pid: delivery.harness().process_id(),
+                    pid: if health.process_alive {
+                        delivery.harness().process_id()
+                    } else {
+                        None
+                    },
                 }
             }
             None => {
@@ -869,7 +881,11 @@ impl<H: Harness + 'static> Session<H> {
                 self.replace_process();
                 false
             }
-            Err(_) => true,
+            Err(err) if err.agent_busy() => true,
+            Err(_) => {
+                self.wake_unless_more();
+                false
+            }
         }
     }
 

@@ -166,6 +166,7 @@ pub fn spawn_command(
 /// Send `signal` (e.g. `"-TERM"` or `"-KILL"`) to a harness child process PID,
 /// running as the child's seat UID when `environment` names one.
 pub fn kill_pid(pid: u32, signal: &str, environment: &[(String, String)]) {
+    use std::process::Stdio;
     let seat = environment
         .iter()
         .find(|(k, _)| k == SEAT_LAUNCH_ENV)
@@ -186,18 +187,30 @@ pub fn kill_pid(pid: u32, signal: &str, environment: &[(String, String)]) {
                 signal,
                 &pid.to_string(),
             ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     } else {
         let _ = std::process::Command::new("kill")
             .args([signal, &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
     }
 }
 
 /// Kill `child` inside its seat UID boundary when `environment` names one.
 pub fn kill_child(child: &mut std::process::Child, environment: &[(String, String)]) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     let pid = child.id();
     kill_pid(pid, "-TERM", environment);
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
     kill_pid(pid, "-KILL", environment);
     let _ = child.kill();
 }
