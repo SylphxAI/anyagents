@@ -235,7 +235,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     let seat_spec =
         crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, parent_name.as_deref());
     if request.agent.harness == "agy" {
-        ensure_agy_steering_settings(&request.config_dir);
+        ensure_agy_steering_settings(&request.config_dir, &request.work_dir);
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         let _ = crate::install::record(&root, &request.agent.harness);
@@ -254,6 +254,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 &request.agent,
                 &request.config_dir,
             );
+            let _ = crate::operator::ensure(&store, &request.agent.id);
             if request.agent.harness == "opencode"
                 && let Ok(exe) = std::env::current_exe()
             {
@@ -283,6 +284,21 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 let _ = crate::mcp_config::write_codex_with_model(
                     &request.config_dir.join("config.toml"),
                     request.agent.model.as_deref(),
+                    &exe,
+                    &mcp_args,
+                );
+            } else if request.agent.harness == "agy"
+                && let Ok(exe) = std::env::current_exe()
+            {
+                let mcp_args = vec![
+                    "--data".to_string(),
+                    request.data_dir.display().to_string(),
+                    "mcp".to_string(),
+                    "--config".to_string(),
+                    request.config_dir.display().to_string(),
+                ];
+                let _ = crate::mcp_config::write_claude(
+                    &request.config_dir.join(".gemini/config/mcp_config.json"),
                     &exe,
                     &mcp_args,
                 );
@@ -652,12 +668,13 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     }
 }
 
-/// Ensures `agy`'s `"queuedMessages": "send-immediately"` setting is active in
-/// the agent's config directory and removes any legacy file-hook steering
-/// files (`anyagents-steer-hook.sh`, `steer.jsonl`, and the `"anyagents-steer"`
-/// entry in `hooks.json`), since `AgyHarness` steers natively via
+/// Ensures `agy`'s `"queuedMessages": "send-immediately"`, `"mcp(anyagents/*)"`
+/// tool permission, and `work_dir` workspace trust are active in the agent's
+/// config directory and removes any legacy file-hook steering files
+/// (`anyagents-steer-hook.sh`, `steer.jsonl`, and the `"anyagents-steer"` entry
+/// in `hooks.json`), since `AgyHarness` steers natively via
 /// `LanguageServerService/SendUserCascadeMessage`.
-fn ensure_agy_steering_settings(config_dir: &Path) {
+pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
     let dir = config_dir.join(".gemini").join("antigravity-cli");
     if std::fs::create_dir_all(&dir).is_ok() {
         let path = dir.join("settings.json");
@@ -667,14 +684,58 @@ fn ensure_agy_steering_settings(config_dir: &Path) {
                 serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&text).ok()
             })
             .unwrap_or_default();
+        let mut changed = false;
         if map.get("queuedMessages").and_then(|v| v.as_str()) != Some("send-immediately") {
             map.insert(
                 "queuedMessages".to_string(),
                 serde_json::Value::String("send-immediately".to_string()),
             );
-            if let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
-                let _ = std::fs::write(&path, format!("{body}\n"));
+            changed = true;
+        }
+        let perms = map
+            .entry("permissions".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !perms.is_object() {
+            *perms = serde_json::json!({});
+            changed = true;
+        }
+        if let Some(perms_obj) = perms.as_object_mut() {
+            let allow = perms_obj
+                .entry("allow".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !allow.is_array() {
+                *allow = serde_json::json!([]);
+                changed = true;
             }
+            if let Some(allow_arr) = allow.as_array_mut()
+                && !allow_arr
+                    .iter()
+                    .any(|v| v.as_str() == Some("mcp(anyagents/*)"))
+            {
+                allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
+                changed = true;
+            }
+        }
+        let work_dir_str = work_dir.display().to_string();
+        if !work_dir_str.is_empty() {
+            let trusted = map
+                .entry("trustedWorkspaces".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !trusted.is_array() {
+                *trusted = serde_json::json!([]);
+                changed = true;
+            }
+            if let Some(trusted_arr) = trusted.as_array_mut()
+                && !trusted_arr
+                    .iter()
+                    .any(|v| v.as_str() == Some(work_dir_str.as_str()))
+            {
+                trusted_arr.push(serde_json::Value::String(work_dir_str));
+                changed = true;
+            }
+        }
+        if changed && let Ok(body) = serde_json::to_string_pretty(&serde_json::Value::Object(map)) {
+            let _ = std::fs::write(&path, format!("{body}\n"));
         }
     }
     let hook_dir = config_dir.join(".gemini").join("config");
@@ -904,4 +965,42 @@ fn session_from_file(config_dir: &Path, file_name: &str) -> Option<String> {
     let text = std::fs::read_to_string(config_dir.join(file_name)).ok()?;
     let id = text.trim();
     (!id.is_empty()).then(|| id.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_agy_steering_settings_populates_permissions_and_trusted_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("config");
+        let work_dir = dir.path().join("work");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&work_dir).unwrap();
+
+        ensure_agy_steering_settings(&config_dir, &work_dir);
+
+        let settings_path = config_dir
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("settings.json");
+        let text = std::fs::read_to_string(&settings_path).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(json["queuedMessages"], "send-immediately");
+        assert_eq!(
+            json["permissions"]["allow"],
+            serde_json::json!(["mcp(anyagents/*)"])
+        );
+        assert_eq!(
+            json["trustedWorkspaces"],
+            serde_json::json!([work_dir.display().to_string()])
+        );
+
+        // Calling a second time is idempotent and does not duplicate entries.
+        ensure_agy_steering_settings(&config_dir, &work_dir);
+        let text2 = std::fs::read_to_string(&settings_path).unwrap();
+        let json2: serde_json::Value = serde_json::from_str(&text2).unwrap();
+        assert_eq!(json2, json);
+    }
 }

@@ -353,16 +353,93 @@ fn server_has_gid(target_gid: u32) -> bool {
     }
     // SAFETY: getgroups(0, null) returns the supplementary group count.
     let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count <= 0 {
-        return false;
+    if count > 0 {
+        let mut gids = vec![0 as libc::gid_t; count as usize];
+        // SAFETY: `gids` has capacity `count`.
+        let read = unsafe { libc::getgroups(count, gids.as_mut_ptr()) };
+        if read > 0 && gids[..read as usize].contains(&target_gid) {
+            return true;
+        }
     }
-    let mut gids = vec![0 as libc::gid_t; count as usize];
-    // SAFETY: `gids` has capacity `count`.
-    let read = unsafe { libc::getgroups(count, gids.as_mut_ptr()) };
-    if read <= 0 {
+    !is_isolated_test_env() && server_user_in_group_db(target_gid) && launcher().is_file()
+}
+
+fn server_user_in_group_db(target_gid: u32) -> bool {
+    let me = current_uid();
+    let Some(my_name) = lookup_user_name(me) else {
         return false;
+    };
+    let Ok(text) = std::fs::read_to_string("/etc/group") else {
+        return false;
+    };
+    for line in text.lines() {
+        let mut parts = line.split(':');
+        let (Some(_group_name), Some(_pw), Some(gid_s), Some(members)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if gid_s.trim().parse::<u32>().ok() == Some(target_gid) {
+            return members.split(',').any(|m| m.trim() == my_name);
+        }
     }
-    gids[..read as usize].contains(&target_gid)
+    false
+}
+
+fn lookup_user_name(uid: u32) -> Option<String> {
+    // SAFETY: `getpwuid` takes a numeric uid and returns a static pointer or null.
+    unsafe {
+        let entry = libc::getpwuid(uid);
+        if entry.is_null() || (*entry).pw_name.is_null() {
+            None
+        } else {
+            Some(
+                std::ffi::CStr::from_ptr((*entry).pw_name)
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        }
+    }
+}
+
+fn chown_to_seat_group(path: &Path, gid: u32) -> std::io::Result<()> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+        .map_err(|_| std::io::Error::other("seat path"))?;
+    // SAFETY: `c_path` is NUL-terminated; `u32::MAX` keeps the owner.
+    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::EPERM)
+        && !is_isolated_test_env()
+        && server_user_in_group_db(gid)
+        && launcher().is_file()
+    {
+        let me = current_uid().to_string();
+        let my_gid = server_gid().to_string();
+        let target_gid = gid.to_string();
+        if let Ok(status) = std::process::Command::new(launcher())
+            .args([
+                "--reuid",
+                &me,
+                "--regid",
+                &my_gid,
+                "--groups",
+                &target_gid,
+                "--no-new-privs",
+                "--",
+                "chgrp",
+                "-h",
+                &target_gid,
+            ])
+            .arg(path)
+            .status()
+            && status.success()
+        {
+            return Ok(());
+        }
+    }
+    Err(err)
 }
 
 /// The launch spec a harness adapter carries for this agent:
@@ -391,12 +468,7 @@ pub fn seat_launch_spec_with_hint(
 /// any other seat could read is a refusal.
 pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| std::io::Error::other("capability path"))?;
-    // SAFETY: `c_path` is NUL-terminated; `u32::MAX` keeps the owner.
-    let rc = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
+    if let Err(err) = chown_to_seat_group(path, gid) {
         // The server may hand the file to a group it already belongs to and to
         // no other; anything else is a refusal, said as itself.
         if err.raw_os_error() != Some(libc::EPERM) {
@@ -449,11 +521,7 @@ pub fn share_socket_with_seats(path: &Path) {
     if gid == server_gid() {
         return;
     }
-    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
-        return;
-    };
-    // SAFETY: `c_path` is NUL-terminated; `u32::MAX` keeps the owner.
-    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } == 0 {
+    if chown_to_seat_group(path, gid).is_ok() {
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
     }
 }
@@ -464,10 +532,7 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
     if let Ok(meta) = std::fs::metadata(dir)
         && meta.uid() == me
     {
-        if let Ok(c_path) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) {
-            // SAFETY: `c_path` is NUL-terminated; the owner is kept.
-            let _ = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
-        }
+        let _ = chown_to_seat_group(dir, gid);
         let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -480,7 +545,7 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
         };
         if kind.is_symlink() {
             continue;
-        }
+        };
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
@@ -495,10 +560,7 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
         if meta.uid() != me {
             continue;
         }
-        if let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) {
-            // SAFETY: as above.
-            let _ = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) };
-        }
+        let _ = chown_to_seat_group(&path, gid);
         if name == crate::operator::CAPABILITY_FILE {
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640));
         } else {
