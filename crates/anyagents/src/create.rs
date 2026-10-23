@@ -93,6 +93,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             &command,
             &args,
         );
+        crate::vendor::ensure_agy_steering_settings(&config, &cwd);
     } else if agent.harness == "muse" {
         muse_config::write(&config, agent.model.as_deref(), &command, &args)?;
         muse_config::point_vendor_home(&config)?;
