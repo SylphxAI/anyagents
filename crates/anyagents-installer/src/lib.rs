@@ -109,6 +109,34 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             vec!["muse-wonder-full-1.0".to_string()],
             "",
         ),
+        entry(
+            "omp",
+            InstallMethod::Vendored,
+            vec!["omp".to_string(), "login".to_string()],
+            Some("OPENAI_API_KEY".to_string()),
+            vec![],
+            "",
+        ),
+        entry(
+            "dsh",
+            InstallMethod::Vendored,
+            vec![
+                "dsh".to_string(),
+                "--profile".to_string(),
+                "web".to_string(),
+            ],
+            Some("DEEPSEEK_API_KEY".to_string()),
+            vec!["deepseek-v3.2-exp-think".to_string()],
+            "",
+        ),
+        entry(
+            "grok",
+            InstallMethod::Vendored,
+            vec!["grok".to_string(), "login".to_string()],
+            Some("XAI_API_KEY".to_string()),
+            vec!["grok-4.20".to_string()],
+            "",
+        ),
     ]
 }
 
@@ -365,6 +393,8 @@ pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
         "codex" => Some("CODEX_HOME"),
         "agy" => Some("AGY_CONFIG_DIR"),
         "muse" => Some("MUSE_CONFIG_HOME"),
+        "omp" => Some("PI_CODING_AGENT_DIR"),
+        "dsh" | "grok" => Some("HOME"),
         _ => None,
     }
 }

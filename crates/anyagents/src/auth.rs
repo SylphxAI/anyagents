@@ -42,6 +42,7 @@ impl Principal {
 
 /// A call that is authenticated but not allowed to do this.
 #[derive(Debug)]
+#[allow(dead_code)]
 pub enum AuthError {
     /// Nothing was presented, or what was presented is not valid.
     Unauthenticated(String),

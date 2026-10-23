@@ -24,6 +24,8 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (9, include_str!("../migrations/010_sends.sql")),
     (10, include_str!("../migrations/011_message_origin.sql")),
     (11, include_str!("../migrations/012_message_context.sql")),
+    (12, include_str!("../migrations/013_agent_parent.sql")),
+    (13, include_str!("../migrations/014_outbound_messages.sql")),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.

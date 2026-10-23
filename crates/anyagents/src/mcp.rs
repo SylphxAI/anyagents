@@ -20,7 +20,11 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-use crate::api::{AgentsResponse, InboxResponse, SendRequest, SendResponse};
+use crate::api::{
+    AgentView, AgentsResponse, ConversationResponse, CreateAgentRequest, GroupActionRequest,
+    GroupView, GroupsResponse, InboxResponse, InteractRequest, InteractResponse, SendArticle,
+    SendChecklist, SendLocation, SendMedia, SendPoll, SendRequest, SendResponse,
+};
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
 
@@ -54,9 +58,14 @@ pub fn run(data: &Path, config: Option<&Path>) -> Result<(), Error> {
     };
     let socket = server::socket_path(data);
     let capability = capability_of(config)?;
+    let config_buf = config.to_path_buf();
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let client = Client { socket, capability };
+        let client = Client {
+            socket,
+            config: config_buf,
+            capability,
+        };
         let who = client.whoami().await.map_err(Error::Message)?;
         // A harness names the agent id it was given; the server already
         // answered with the agent this session acts as, and the two may not
@@ -102,19 +111,25 @@ fn capability_of(config: &Path) -> Result<String, Error> {
 #[derive(Clone)]
 struct Client {
     socket: PathBuf,
+    config: PathBuf,
     capability: String,
 }
 
 impl Client {
+    fn current_capability(&self) -> String {
+        capability_of(&self.config).unwrap_or_else(|_| self.capability.clone())
+    }
+
     /// The agent this capability authenticates, as the server resolved it.
     async fn whoami(&self) -> Result<AgentRef, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
+        let cap = self.current_capability();
         let who: serde_json::Value = request_naming(
             &self.socket,
             "GET",
             "/v1/whoami",
             None,
-            Some(&self.capability),
+            Some(&cap),
             None,
             named.as_deref(),
         )
@@ -147,12 +162,13 @@ impl Client {
     ) -> Result<T, String> {
         let method = if body.is_some() { "POST" } else { "GET" };
         let named = crate::client::agent_identity().map(|id| id.to_string());
+        let cap = self.current_capability();
         let (status, bytes) = request_naming(
             &self.socket,
             method,
             path,
             body,
-            Some(&self.capability),
+            Some(&cap),
             None,
             named.as_deref(),
         )
@@ -169,13 +185,43 @@ struct AgentMcp {
     client: Client,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SendArgs {
-    /// Agent names or `agent:<name>` addresses. There is no default.
+    /// Destinations: agent names or IDs (`sage`, `agent:sage`, `agt_...`, `parent`,
+    /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
+    /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
+    /// `telegram:user:<user_id>[:<message_id>]`). Sending to an archived agent's
+    /// name or `agt_...` ID automatically wakes and resumes its session. May be
+    /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`).
+    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     to: Vec<String>,
+    /// Message text or caption (Markdown is automatically rendered as rich HTML on Telegram).
+    /// May be omitted when sending `media`, `location`, or `poll`.
+    #[serde(default)]
     text: String,
+    /// Optional reply target: `anyagents:reply:<msg_id>` from the message header
+    /// (answers in the same chat/topic/agent), or a plain destination address.
     #[serde(default)]
     reply_to: Option<String>,
+    /// Optional quoted substring or message text to attach as a quote.
+    #[serde(default)]
+    quote: Option<String>,
+    /// Optional media attachment (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`)
+    /// by local file path, `https://` URL, or Telegram `file_id` (plus optional `title` and `performer` for `music`/`audio`).
+    #[serde(default)]
+    media: Option<SendMedia>,
+    /// Optional GPS coordinates or venue (`latitude`, `longitude`, optional `title` and `address`).
+    #[serde(default)]
+    location: Option<SendLocation>,
+    /// Optional interactive poll (`question`, `options`, optional `is_anonymous` and `allows_multiple_answers`).
+    #[serde(default)]
+    poll: Option<SendPoll>,
+    /// Optional interactive checklist (`title`, `tasks`, optional `business_connection_id`).
+    #[serde(default)]
+    checklist: Option<SendChecklist>,
+    /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
+    #[serde(default)]
+    article: Option<SendArticle>,
     /// Names this send. Send it again with the same value only when an earlier
     /// attempt got no answer.
     #[serde(default)]
@@ -184,18 +230,149 @@ struct SendArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct InboxArgs {
-    /// Exclusive sequence cursor. Omit to read from the start.
+    /// Exclusive sequence cursor. Omit to read from the start (or the latest `limit` messages).
     #[serde(default)]
     since: Option<i64>,
+    /// Optional maximum number of messages to return (when `since` is omitted,
+    /// returns the most recent `limit` messages).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ConversationArgs {
+    /// Agent name or `agt_...` ID whose complete two-way (`in` + `out`) conversation
+    /// to read. Defaults to this agent when omitted. Any agent can read any peer's
+    /// or sub-agent's conversation across users, channels, groups, and other agents.
+    #[serde(default)]
+    agent: Option<String>,
+    /// Optional peer filter (e.g. `alice`, `telegram:user:42`, `telegram:chat:-1001234567890`,
+    /// `group:crew`, or `agent:beta`).
+    #[serde(default)]
+    with: Option<String>,
+    /// Optional exclusive timestamp cursor in milliseconds (`timestamp_ms > since_ms`).
+    #[serde(default)]
+    since_ms: Option<i64>,
+    /// Optional maximum number of turns to return (when `since_ms` is omitted,
+    /// returns the most recent `limit` turns). Defaults to 50 when omitted.
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct AgentsArgs {
+    /// Optional state filter: `"running"`, `"archived"`, or `"all"` (default `"all"`).
+    #[serde(default)]
+    state: Option<String>,
+    /// Optional parent filter: agent name, `agt_...` ID, `"self"` (children of this agent),
+    /// or `"root"` (persistent root agents with no parent).
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SpawnArgs {
+    /// Optional short agent name (`[a-z0-9][a-z0-9_-]*`). If omitted, a unique
+    /// `<caller>-sub-<id>` name is generated automatically.
+    #[serde(default)]
+    name: Option<String>,
+    /// Harness catalog ID (`claude-code`, `codex`, `opencode`, `muse`). Defaults to
+    /// the caller's own harness (or `claude-code` when the caller runs on `agy`).
+    #[serde(default)]
+    harness: Option<String>,
+    /// Optional model override.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional working directory path.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Optional system instructions for the spawned agent.
+    #[serde(default)]
+    instructions: Option<String>,
+    /// Optional initial task/message to deliver immediately to the spawned agent.
+    #[serde(default)]
+    prompt: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ArchiveArgs {
+    /// Agent name or `agt_...` ID to archive (scales process to zero while keeping
+    /// its permanent `agt_...` ID, mailbox, and session on disk so any future message
+    /// or `wake` call resumes it). Defaults to this agent itself when omitted.
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+struct WakeArgs {
+    /// Agent name or `agt_...` ID to wake and resume from `archived` state.
+    agent: String,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct GroupsArgs {
+    /// Action: `"list"` (list all groups and members), `"members"` (list one group's
+    /// members), `"join"` (create/join an internal group), or `"leave"` (leave a group).
+    #[serde(default)]
+    action: Option<String>,
+    /// Group name (e.g. `"owners"`, `"review-team"`). Required for `"join"`, `"leave"`, `"members"`.
+    #[serde(default)]
+    group: Option<String>,
+    /// Optional agent name or `agt_...` ID to add/remove (defaults to this agent).
+    #[serde(default)]
+    agent: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct InteractArgs {
+    /// Channel/message action: `"react"` (set/clear emoji reaction on a message),
+    /// `"vote"` (cast a ballot on a poll), `"edit"` (edit message text),
+    /// `"delete"` (delete a message), `"pin"` (pin a message), `"unpin"` (unpin a message),
+    /// or `"stop_poll"` (close an active poll).
+    action: String,
+    /// Target message: `anyagents:reply:msg_...` from the message header, `msg_...`,
+    /// or `telegram:chat:<chat_id>:<message_id>`.
+    target: String,
+    /// Emoji reaction when `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, `"🎉"`, or `""` to clear).
+    #[serde(default)]
+    emoji: Option<String>,
+    /// Selected poll option(s) when `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text).
+    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    options: Vec<String>,
+    /// New message text when `action = "edit"`, or optional rationale/comment when `action = "vote"`.
+    #[serde(default)]
+    text: Option<String>,
+}
+
+fn generate_subagent_name(parent_name: &str) -> String {
+    let raw = AgentId::generate().to_string();
+    let short = raw
+        .strip_prefix("agt_")
+        .unwrap_or(&raw)
+        .chars()
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    format!("{parent_name}-sub-{short}")
 }
 
 #[tool_router(server_handler)]
 impl AgentMcp {
-    #[tool(description = "Send text to each address as this agent.")]
+    #[tool(
+        description = "Send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`)."
+    )]
     async fn send(
         &self,
         Parameters(args): Parameters<SendArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<SendResponse>, String> {
+        let quote =
+            args.quote
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .map(|t| anyagents_core::Quote {
+                    text: t.to_string(),
+                    ..anyagents_core::Quote::default()
+                });
         let body = SendRequest {
             // The server sends as this agent whatever this says, and refuses a
             // body that names anyone else.
@@ -203,7 +380,12 @@ impl AgentMcp {
             to: args.to,
             text: args.text,
             reply_to: args.reply_to,
-            quote: None,
+            quote,
+            media: args.media,
+            location: args.location,
+            poll: args.poll,
+            checklist: args.checklist,
+            article: args.article,
             idempotency_key: args.idempotency_key,
         };
         let response = self
@@ -216,31 +398,281 @@ impl AgentMcp {
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
-    #[tool(description = "Read this agent's own mailbox.")]
+    #[tool(
+        description = "Read this agent's own incoming mailbox (`since`, `limit`). To inspect another agent's full two-way (`in` + `out`) conversation with users, channels, groups, or other agents, use `conversation`."
+    )]
     async fn inbox(
         &self,
         Parameters(args): Parameters<InboxArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<InboxResponse>, String> {
-        // The server answers with its own agent id, so this path names the
-        // mailbox the capability owns; on a deployment without the boundary the
-        // route resolves it the same way.
-        let agent = match crate::client::agent_identity() {
-            Some(id) => id,
-            None => self.agent.id.clone(),
+        let target = match crate::client::agent_identity() {
+            Some(id) => id.to_string(),
+            None => self.agent.id.to_string(),
         };
-        let path = match args.since {
-            Some(since) => format!("/v1/agents/{agent}/inbox?since={since}"),
-            None => format!("/v1/agents/{agent}/inbox"),
+        let mut query = Vec::new();
+        if let Some(since) = args.since {
+            query.push(format!("since={since}"));
+        }
+        if let Some(limit) = args.limit {
+            query.push(format!("limit={limit}"));
+        }
+        let path = if query.is_empty() {
+            format!("/v1/agents/{target}/inbox")
+        } else {
+            format!("/v1/agents/{target}/inbox?{}", query.join("&"))
         };
         let response = self.client.get(&path, None).await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
-    #[tool(description = "List the agents on this server, with harness, state, and lag.")]
-    async fn agents(&self) -> Result<rmcp::handler::server::wrapper::Json<AgentsResponse>, String> {
-        let response = self.client.get("/v1/agents", None).await?;
+    #[tool(
+        description = "Read the complete two-way (`in` + `out`) conversation of any agent (`agent` by name or `agt_...` ID; defaults to this agent) with users, external channels, internal groups, and other agents. Supports optional `with` peer filter, `since_ms`, and `limit`."
+    )]
+    async fn conversation(
+        &self,
+        Parameters(args): Parameters<ConversationArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<ConversationResponse>, String> {
+        let default_agent = match crate::client::agent_identity() {
+            Some(id) => id.to_string(),
+            None => self.agent.id.to_string(),
+        };
+        let target = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .unwrap_or(default_agent);
+        let mut query = Vec::new();
+        if let Some(with_peer) = args
+            .with
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("with={}", urlencoding_simple(with_peer)));
+        }
+        if let Some(since_ms) = args.since_ms {
+            query.push(format!("since_ms={since_ms}"));
+        }
+        let limit = args.limit.unwrap_or(50);
+        query.push(format!("limit={limit}"));
+        let path = format!("/v1/agents/{target}/conversation?{}", query.join("&"));
+        let response = self.client.get(&path, None).await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
+
+    #[tool(
+        description = "List agents (persistent and sub-agents, running or archived) with their permanent `agt_...` ID, name, parent, harness, state, and lag. Supports optional `state` (`running` | `archived` | `all`) and `parent` (`self` | `root` | `<name/id>`) filters."
+    )]
+    async fn agents(
+        &self,
+        Parameters(args): Parameters<AgentsArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<AgentsResponse>, String> {
+        let mut response: AgentsResponse = self.client.get("/v1/agents", None).await?;
+        if let Some(state_filter) = args
+            .state
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+        {
+            response
+                .agents
+                .retain(|a| a.state.eq_ignore_ascii_case(state_filter));
+        }
+        if let Some(parent_filter) = args
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let cleaned = parent_filter
+                .strip_prefix("agent:")
+                .unwrap_or(parent_filter);
+            if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none") {
+                response.agents.retain(|a| a.parent.is_none());
+            } else {
+                let wanted_id = if cleaned.eq_ignore_ascii_case("self")
+                    || cleaned.eq_ignore_ascii_case(&self.agent.name)
+                    || cleaned == self.agent.id.as_str()
+                {
+                    Some(self.agent.id.to_string())
+                } else {
+                    response
+                        .agents
+                        .iter()
+                        .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
+                        .map(|a| a.id.clone())
+                        .or_else(|| Some(cleaned.to_string()))
+                };
+                if let Some(wid) = wanted_id {
+                    response
+                        .agents
+                        .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                }
+            }
+        }
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. When finished, the sub-agent can be archived via `archive` and later resumed at any time by sending a message to its ID/name or calling `wake`."
+    )]
+    async fn spawn(
+        &self,
+        Parameters(args): Parameters<SpawnArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<AgentView>, String> {
+        let name = args
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| generate_subagent_name(&self.agent.name));
+        let harness = args
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("")
+            .to_string();
+        let body = CreateAgentRequest {
+            name,
+            harness,
+            model: args.model,
+            workdir: args.workdir,
+            instructions: args.instructions,
+            parent: Some(self.agent.id.to_string()),
+            prompt: args.prompt,
+        };
+        let response = self
+            .client
+            .get(
+                "/v1/agents",
+                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so any future message or `wake` call resumes it."
+    )]
+    async fn archive(
+        &self,
+        Parameters(args): Parameters<ArchiveArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<AgentView>, String> {
+        let target = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .unwrap_or_else(|| self.agent.id.to_string());
+        let response = self
+            .client
+            .get(
+                &format!("/v1/agents/{target}/archive"),
+                Some(b"{}".to_vec()),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(description = "Wake and resume an archived agent by its `agt_...` ID or name.")]
+    async fn wake(
+        &self,
+        Parameters(args): Parameters<WakeArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<AgentView>, String> {
+        let target = args
+            .agent
+            .trim()
+            .strip_prefix("agent:")
+            .unwrap_or(args.agent.trim());
+        let response = self
+            .client
+            .get(&format!("/v1/agents/{target}/wake"), Some(b"{}".to_vec()))
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Create, join, leave, or list internal agent groups (`action`: `list` | `members` | `join` | `leave`). Agents can form internal groups without any external channel or human."
+    )]
+    async fn groups(
+        &self,
+        Parameters(args): Parameters<GroupsArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<GroupsResponse>, String> {
+        let action = args
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("list");
+        if action == "list" {
+            let response = self.client.get("/v1/groups", None).await?;
+            return Ok(rmcp::handler::server::wrapper::Json(response));
+        }
+        let group = args
+            .group
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("groups {action} requires a `group` name"))?
+            .to_string();
+        let body = GroupActionRequest {
+            action: action.to_string(),
+            group,
+            agent: args.agent,
+        };
+        let one: GroupView = self
+            .client
+            .get(
+                "/v1/groups",
+                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(GroupsResponse {
+            groups: vec![one],
+        }))
+    }
+
+    #[tool(
+        description = "Perform a rich IM channel or message interaction (`action`: `react` | `vote` | `edit` | `delete` | `pin` | `unpin` | `stop_poll`) on a target message (`anyagents:reply:msg_...` from the message header or `telegram:chat:<chat_id>:<message_id>`)."
+    )]
+    async fn interact(
+        &self,
+        Parameters(args): Parameters<InteractArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<InteractResponse>, String> {
+        let body = InteractRequest {
+            sender: Some(format!("agent:{}", self.agent.name)),
+            action: args.action,
+            target: args.target,
+            emoji: args.emoji,
+            options: args.options,
+            text: args.text,
+        };
+        let response = self
+            .client
+            .get(
+                "/v1/interact",
+                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+}
+
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 fn error_message(bytes: &[u8]) -> String {

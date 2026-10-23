@@ -44,8 +44,8 @@ pub fn agents_line() -> String {
         ("bea", "2104"),
         ("cy", "2105"),
         ("kind", "2106"),
-        ("argon", "2107"),
-        ("calliope", "2108"),
+        ("gamma", "2107"),
+        ("delta", "2108"),
     ]
     .iter()
     .map(|(name, seat)| format!("{name}={seat}"))
@@ -91,8 +91,8 @@ pub fn operator(data: &Path) -> PathBuf {
                 ("bea", "2104"),
                 ("cy", "2105"),
                 ("kind", "2106"),
-                ("argon", "2107"),
-                ("calliope", "2108"),
+                ("gamma", "2107"),
+                ("delta", "2108"),
             ]
             .iter()
             .map(|(name, seat)| format!("{name}={seat}"))
@@ -185,7 +185,10 @@ fn id_field(flag: &str) -> u32 {
         .arg(flag)
         .output()
         .expect("id");
-    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0)
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse()
+        .unwrap_or(0)
 }
 
 /// One call over the server's socket, answered in full: the raw answer.

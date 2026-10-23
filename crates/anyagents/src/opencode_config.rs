@@ -7,17 +7,44 @@ use std::path::Path;
 
 use anyagents_core::Error;
 
-/// Write `opencode.json` in `dir`. A model already set by the caller is kept
-/// and this file adds nothing to it.
+/// Write `opencode.json` and `opencode/opencode.json` in `dir`. When `XDG_CONFIG_HOME`
+/// is set to `dir`, OpenCode v2.0.29 reads `$XDG_CONFIG_HOME/opencode/opencode.json`
+/// (`<dir>/opencode/opencode.json`). Any existing `provider`, `agent`, or `$schema`
+/// entries seeded from a donor seat are preserved instead of overwritten.
 pub fn write(
     dir: &Path,
     model: Option<&str>,
     command: &Path,
     args: &[String],
 ) -> Result<(), Error> {
-    let mut root = serde_json::json!({});
-    if let Some(model) = model.filter(|model| !model.is_empty()) {
-        root["model"] = serde_json::Value::String(model.to_string());
+    let candidates = [
+        dir.join("opencode").join("opencode.json"),
+        dir.join(".config").join("opencode").join("opencode.json"),
+        dir.join("opencode.json"),
+    ];
+    let mut root = candidates
+        .iter()
+        .find_map(|path| {
+            let bytes = std::fs::read(path).ok()?;
+            let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+            val.get("provider").is_some().then_some(val)
+        })
+        .or_else(|| {
+            candidates.iter().find_map(|path| {
+                let bytes = std::fs::read(path).ok()?;
+                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
+            })
+        })
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    let has_sylphx_provider = root.get("provider").and_then(|p| p.get("sylphx")).is_some();
+    if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        let normalized = normalize_model(raw_model, has_sylphx_provider);
+        root["model"] = serde_json::Value::String(normalized);
+    } else if root.get("model").is_none() && has_sylphx_provider {
+        root["model"] = serde_json::Value::String("sylphx/openai/gpt-6.1-sol#medium".to_string());
     }
     root["mcp"] = serde_json::json!({
         "anyagents": {
@@ -27,8 +54,41 @@ pub fn write(
         }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(dir.join("opencode.json"), bytes)?;
+    std::fs::write(dir.join("opencode.json"), &bytes)?;
+    let xdg_opencode_dir = dir.join("opencode");
+    std::fs::create_dir_all(&xdg_opencode_dir)?;
+    std::fs::write(xdg_opencode_dir.join("opencode.json"), &bytes)?;
+    let home_opencode_dir = dir.join(".config").join("opencode");
+    std::fs::create_dir_all(&home_opencode_dir)?;
+    std::fs::write(home_opencode_dir.join("opencode.json"), &bytes)?;
     Ok(())
+}
+
+fn normalize_model(raw: &str, has_sylphx_provider: bool) -> String {
+    if !has_sylphx_provider {
+        return raw.to_string();
+    }
+    if raw.starts_with("sylphx/")
+        || raw.starts_with("minimax-code-plan/")
+        || raw.starts_with("kimi-code-plan/")
+        || raw.starts_with("glm-code-plan/")
+        || raw.starts_with("qwen-token-plan/")
+    {
+        return raw.to_string();
+    }
+    if raw.starts_with("openai/")
+        || raw.starts_with("anthropic/")
+        || raw.starts_with("google/")
+        || raw.starts_with("deepseek/")
+        || raw.starts_with("x-ai/")
+        || raw.starts_with("xiaomi/")
+    {
+        return format!("sylphx/{raw}");
+    }
+    if raw.starts_with("gpt-") {
+        return format!("sylphx/openai/{raw}");
+    }
+    raw.to_string()
 }
 
 fn command_args(command: &Path, args: &[String]) -> Vec<String> {

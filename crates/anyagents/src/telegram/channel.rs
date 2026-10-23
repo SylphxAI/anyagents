@@ -13,8 +13,10 @@
 use std::time::Duration;
 
 use anyagents_channel_telegram::{
-    BotCall, Memory, Poll, Routed, bot_identity, deliver_to_mailbox, get_me, send_message,
-    sent_message_id,
+    BotCall, MediaAttachment, Memory, Poll, Routed, bot_identity, delete_message,
+    deliver_to_mailbox, edit_message_text, file_path_of, format_checklist_markdown, get_file,
+    get_me, pin_chat_message, send_checklist, send_location, send_media_ref, send_message,
+    send_poll, sent_message_id, set_message_reaction, stop_poll, unpin_chat_message,
 };
 use anyagents_core::{Channel, CredentialStore, FileCredentialStore, Store};
 
@@ -94,7 +96,7 @@ pub fn ensure_webhook(
     };
     let mut memory = Memory::from_state(&channel.state);
     let token = token_of(secrets, credential_ref)?;
-    if memory.bot.is_none() {
+    if memory.bot.as_deref().unwrap_or("").is_empty() {
         let identity = bot_identity(&call_api(
             &token,
             &get_me(),
@@ -176,8 +178,8 @@ pub fn receive_webhook(
         )));
     };
     let secrets = FileCredentialStore::new(data_dir);
-    let token = token_of(&secrets, credential_ref)
-        .map_err(|err| WebhookError::Store(err.to_string()))?;
+    let token =
+        token_of(&secrets, credential_ref).map_err(|err| WebhookError::Store(err.to_string()))?;
     let expected = webhook_secret(&token, channel.id.as_str());
     if !verify_webhook_secret(&expected, secret_header) {
         return Err(WebhookError::Unauthorized);
@@ -188,7 +190,7 @@ pub fn receive_webhook(
         _ => {
             return Err(WebhookError::BadRequest(
                 "webhook payload must be a JSON object or array".into(),
-            ))
+            ));
         }
     };
     let mut memory = Memory::from_state(&channel.state);
@@ -221,7 +223,7 @@ fn poll_channel(
     };
     let mut memory = Memory::from_state(&channel.state);
     let token = token_of(secrets, credential_ref)?;
-    if memory.bot.is_none() {
+    if memory.bot.as_deref().unwrap_or("").is_empty() {
         let identity = bot_identity(&call_api(
             &token,
             &get_me(),
@@ -284,11 +286,12 @@ fn ingest_updates(
         )
     })?;
     let attached = attached_agents(store)?;
+    let own_bots = known_bot_identities(store, memory.bot.as_deref());
     let mut grew = false;
-    for one in routed {
+    for mut one in routed {
         // This bot answers in the chat its update came from, so a post it makes
         // there reaches the other agents on that chat.
-        if let Routed::ToAgent { inbound, .. } = &one {
+        if let Routed::ToAgent { inbound, .. } = &mut one {
             let known = memory
                 .chats
                 .iter()
@@ -299,7 +302,36 @@ fn ingest_updates(
                 // Confirmed by Telegram rather than inferred from a message.
                 memory.attach_typed(agent_id.as_str(), inbound.chat_id, Some(&inbound.chat_type));
             }
+            if !known && (inbound.chat_type == "group" || inbound.chat_type == "supergroup") {
+                discover_peer_bots_in_chat(
+                    store,
+                    token,
+                    &channel.id,
+                    inbound.chat_id,
+                    &inbound.chat_type,
+                );
+            }
             grew |= !known;
+            // Drop self-echo / peer-bot echo from Telegram when the sender is one
+            // of our own configured bots; `post_text` already fans out bot posts
+            // internally as authenticated `agent:<name>` messages.
+            if inbound.sender_is_bot
+                && is_own_bot(
+                    inbound.sender_id,
+                    inbound.sender_username.as_deref(),
+                    &own_bots,
+                )
+            {
+                continue;
+            }
+            if !inbound.media.is_empty() {
+                let downloaded =
+                    download_inbound_media(store.data_dir(), token, &channel.id, &inbound.media);
+                if !downloaded.is_empty() {
+                    inbound.text.push('\n');
+                    inbound.text.push_str(&downloaded.join("\n"));
+                }
+            }
         }
         // The bot was added to, or removed from, a chat.
         if let Routed::Membership {
@@ -318,12 +350,246 @@ fn ingest_updates(
         }
         let peers = peer_ids(store, &poll, &one, agent_id.as_str(), &attached)?;
         deliver_to_mailbox(store, &one, &peers)?;
+        if let Routed::ToAgent { inbound, .. } = &one
+            && (inbound.chat_type == "group" || inbound.chat_type == "supergroup")
+        {
+            let _ = relay_inbound_to_group_peers(store, agent_id, inbound);
+        }
     }
     // The offset and the chats are saved only once the updates are stored, so a
     // restart asks for what it did not keep and a repeat is one row.
     if poll.offset != before || grew {
         memory.offset = poll.offset.max(memory.offset);
         store.set_channel_state(&channel.id, &memory.to_state())?;
+    }
+    Ok(())
+}
+
+fn known_bot_identities(store: &Store, current_bot: Option<&str>) -> Vec<(Option<i64>, String)> {
+    let mut out = Vec::new();
+    let mut push_bot = |raw: &str| {
+        if let Some((id_str, username)) = raw.split_once(':') {
+            let id = id_str.trim().parse::<i64>().ok();
+            let user = username.trim().trim_start_matches('@').to_ascii_lowercase();
+            if id.is_some() || !user.is_empty() {
+                out.push((id, user));
+            }
+        }
+    };
+    if let Some(bot) = current_bot {
+        push_bot(bot);
+    }
+    if let Ok(channels) = store.list_channels() {
+        for ch in channels {
+            if ch.kind == "telegram" {
+                let mem = Memory::from_state(&ch.state);
+                if let Some(bot) = mem.bot.as_deref() {
+                    push_bot(bot);
+                }
+            }
+        }
+    }
+    out
+}
+
+fn is_own_bot(
+    sender_id: Option<i64>,
+    sender_username: Option<&str>,
+    own_bots: &[(Option<i64>, String)],
+) -> bool {
+    let uname = sender_username
+        .map(|u| u.trim().trim_start_matches('@').to_ascii_lowercase())
+        .filter(|u| !u.is_empty());
+    own_bots.iter().any(|(bot_id, bot_user)| {
+        (sender_id.is_some() && sender_id == *bot_id)
+            || (uname.is_some()
+                && !bot_user.is_empty()
+                && uname.as_deref() == Some(bot_user.as_str()))
+    })
+}
+
+fn download_inbound_media(
+    data_dir: &std::path::Path,
+    token: &str,
+    channel_id: &anyagents_core::ChannelId,
+    media: &[MediaAttachment],
+) -> Vec<String> {
+    let media_dir = data_dir.join("media");
+    let _ = std::fs::create_dir_all(&media_dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&media_dir, std::fs::Permissions::from_mode(0o755));
+    }
+    let mut notes = Vec::new();
+    for att in media {
+        if att.kind == "sticker" {
+            continue;
+        }
+        // Telegram Bot API `getFile` supports files up to 20 MB.
+        if att.file_size.is_some_and(|sz| sz > 20 * 1024 * 1024) {
+            continue;
+        }
+        let Ok(resp) = call_api(
+            token,
+            &get_file(&att.file_id),
+            SHORT_TIMEOUT_S,
+            Some(channel_id),
+        ) else {
+            continue;
+        };
+        let Ok(remote_path) = file_path_of(&resp) else {
+            continue;
+        };
+        let ext = std::path::Path::new(&remote_path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| !e.is_empty())
+            .unwrap_or(match att.kind.as_str() {
+                "photo" => "jpg",
+                "video" | "video_note" | "animation" => "mp4",
+                "voice" => "ogg",
+                "audio" => "mp3",
+                _ => "bin",
+            });
+        let base_id: String = att
+            .file_unique_id
+            .as_deref()
+            .unwrap_or(&att.file_id)
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(32)
+            .collect();
+        let file_name = match &att.file_name {
+            Some(orig) => {
+                let sanitized: String = orig
+                    .chars()
+                    .map(|c| {
+                        if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                            c
+                        } else {
+                            '_'
+                        }
+                    })
+                    .take(64)
+                    .collect();
+                format!("{base_id}_{sanitized}")
+            }
+            None => format!("{}_{base_id}.{ext}", att.kind),
+        };
+        let dest = media_dir.join(&file_name);
+        if !dest.is_file() {
+            let url = format!("{}/file/bot{token}/{remote_path}", api_base());
+            let agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(SHORT_TIMEOUT_S)))
+                .max_redirects(0)
+                .build()
+                .new_agent();
+            if let Ok(response) = agent.get(&url).call()
+                && response.status().as_u16() == 200
+            {
+                let mut reader = response.into_body().into_reader();
+                if let Ok(mut file) = std::fs::File::create(&dest) {
+                    let _ = std::io::copy(&mut reader, &mut file);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        let _ =
+                            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o644));
+                    }
+                }
+            }
+        }
+        if dest.is_file() {
+            notes.push(format!(
+                "[Local media ({}) file: {}]",
+                att.kind,
+                dest.display()
+            ));
+        }
+    }
+    notes
+}
+
+fn probed_chat_bots() -> &'static std::sync::Mutex<std::collections::HashSet<(i64, String)>> {
+    static PROBED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(i64, String)>>> =
+        std::sync::OnceLock::new();
+    PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Passively check whether any other configured Telegram bot is also a member
+/// of `chat_id`, and attach it so internal group relay reaches all member bots
+/// even before they receive a direct mention.
+fn discover_peer_bots_in_chat(
+    store: &Store,
+    token: &str,
+    current_channel_id: &anyagents_core::ChannelId,
+    chat_id: i64,
+    chat_type: &str,
+) {
+    let Ok(channels) = store.list_channels() else {
+        return;
+    };
+    for other in channels {
+        if other.id == *current_channel_id || other.kind != "telegram" {
+            continue;
+        }
+        let Some(other_agent_id) = other.agents.first() else {
+            continue;
+        };
+        let mut other_mem = Memory::from_state(&other.state);
+        if other_mem.chats.iter().any(|l| l.chat_id == chat_id) {
+            continue;
+        }
+        if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none() {
+            let key = (chat_id, other.id.to_string());
+            if let Ok(mut guard) = probed_chat_bots().lock()
+                && !guard.insert(key)
+            {
+                continue;
+            }
+        }
+        if let Some(bot) = other_mem.bot.as_deref()
+            && probe_members(token, chat_id, bot)
+        {
+            other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
+            let _ = store.set_channel_state(&other.id, &other_mem.to_state());
+        }
+    }
+}
+
+/// Relay an inbound group message to any other agent attached to `inbound.chat_id`
+/// so bots with Telegram Group Privacy enabled still receive every group message.
+/// `Store::receive` deduplicates by `(chat_id, message_id)` so a bot that also
+/// receives the update directly from Telegram stores it only once.
+fn relay_inbound_to_group_peers(
+    store: &Store,
+    receiver_id: &anyagents_core::AgentId,
+    inbound: &anyagents_channel_telegram::Inbound,
+) -> Result<(), anyagents_core::Error> {
+    let members = store.chat_members(inbound.chat_id)?;
+    for member_name in members {
+        let Ok(peer) = store.agent_by_name(&member_name) else {
+            continue;
+        };
+        if &peer.id == receiver_id || peer.state == "archived" {
+            continue;
+        }
+        let incoming = anyagents_core::Incoming {
+            text: inbound.text.clone(),
+            sender: anyagents_channel_telegram::telegram_sender(inbound),
+            source_time_ms: Some(inbound.source_time_s * 1000),
+            source_key: Some(format!("tg-in:{}:{}", inbound.chat_id, inbound.message_id)),
+            reply_to: Some(anyagents_channel_telegram::reply_target(inbound)),
+            quote: inbound.quote.clone(),
+            origin: Some(anyagents_core::Origin {
+                chat_id: Some(inbound.chat_id),
+                thread_id: inbound.thread_id,
+                message_id: Some(inbound.message_id),
+            }),
+            received_at_ms: None,
+        };
+        let _ = store.receive(&peer.id, incoming);
     }
     Ok(())
 }
@@ -371,20 +637,28 @@ fn attached_agents(store: &Store) -> Result<Vec<(String, i64)>, anyagents_core::
     let mut links: Vec<(String, i64)> = Vec::new();
     for one in store.list_channels()? {
         let memory = Memory::from_state(&one.state);
-        let names: Vec<String> = one
+        let channel_agents: Vec<(String, String)> = one
             .agents
             .iter()
-            .filter_map(|id| store.agent(id).ok().map(|agent| agent.name))
+            .filter_map(|id| {
+                store
+                    .agent(id)
+                    .ok()
+                    .map(|agent| (agent.name, agent.id.to_string()))
+            })
             .collect();
         for link in memory.chats {
-            if !names.iter().any(|name| name == &link.agent) {
+            let Some((canonical_name, _)) = channel_agents
+                .iter()
+                .find(|(name, id)| name == &link.agent || id == &link.agent)
+            else {
                 continue;
-            }
+            };
             if !links
                 .iter()
-                .any(|(agent, chat)| agent == &link.agent && *chat == link.chat_id)
+                .any(|(agent, chat)| agent == canonical_name && *chat == link.chat_id)
             {
-                links.push((link.agent, link.chat_id));
+                links.push((canonical_name.clone(), link.chat_id));
             }
         }
     }
@@ -421,6 +695,55 @@ pub(crate) fn outbound_call(
     })
 }
 
+/// Maximum characters per Telegram `sendMessage` chunk before HTML expansion.
+const MAX_TELEGRAM_CHUNK_CHARS: usize = 3800;
+
+/// Split a long message into chunks that stay within Telegram's 4096-character limit.
+fn split_telegram_chunks(text: &str) -> Vec<&str> {
+    if text.chars().count() <= MAX_TELEGRAM_CHUNK_CHARS {
+        return vec![text];
+    }
+    let mut chunks = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        if rest.chars().count() <= MAX_TELEGRAM_CHUNK_CHARS {
+            chunks.push(rest);
+            break;
+        }
+        let max_byte = rest
+            .char_indices()
+            .nth(MAX_TELEGRAM_CHUNK_CHARS)
+            .map(|(idx, _)| idx)
+            .unwrap_or(rest.len());
+        let window = &rest[..max_byte];
+        let split_at = window
+            .rfind("\n\n")
+            .filter(|&pos| pos >= max_byte / 2)
+            .map(|pos| pos + 2)
+            .or_else(|| {
+                window
+                    .rfind('\n')
+                    .filter(|&pos| pos >= max_byte / 2)
+                    .map(|pos| pos + 1)
+            })
+            .or_else(|| {
+                window
+                    .rfind(' ')
+                    .filter(|&pos| pos >= max_byte / 2)
+                    .map(|pos| pos + 1)
+            })
+            .unwrap_or(max_byte);
+        let (head, tail) = rest.split_at(split_at);
+        chunks.push(head.trim_end_matches('\n'));
+        rest = tail.trim_start_matches('\n');
+    }
+    if chunks.is_empty() {
+        vec![text]
+    } else {
+        chunks
+    }
+}
+
 /// Post one text through the agent's bot. The token is read for this call only.
 #[allow(clippy::too_many_arguments)]
 pub fn post_text(
@@ -432,33 +755,44 @@ pub fn post_text(
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> Result<i64, anyagents_core::Error> {
-    let outbound = outbound_call(store, from, chat_id, text, reply_to, thread)?;
-    let token = token_of(
-        &FileCredentialStore::new(data_dir),
-        &outbound.credential_ref,
-    )?;
-    let response = call_api(
-        &token,
-        &outbound.call,
-        SHORT_TIMEOUT_S,
-        Some(&outbound.channel_id),
-    )?;
-    let message_id = sent_message_id(&response).map_err(|_| {
-        api_error(
-            "sendMessage",
+    let chunks = split_telegram_chunks(text);
+    let mut first_message_id = None;
+    let mut first_response = String::new();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let chunk_reply = if idx == 0 { reply_to } else { None };
+        let outbound = outbound_call(store, from, chat_id, chunk, chunk_reply, thread)?;
+        let token = token_of(
+            &FileCredentialStore::new(data_dir),
+            &outbound.credential_ref,
+        )?;
+        let response = call_api(
+            &token,
+            &outbound.call,
+            SHORT_TIMEOUT_S,
             Some(&outbound.channel_id),
-            "invalid_response",
-            None,
-            None,
-            "Telegram response has no message receipt; delivery may be uncertain",
-            None,
-        )
-    })?;
+        )?;
+        let message_id = sent_message_id(&response).map_err(|_| {
+            api_error(
+                "sendMessage",
+                Some(&outbound.channel_id),
+                "invalid_response",
+                None,
+                None,
+                "Telegram response has no message receipt; delivery may be uncertain",
+                None,
+            )
+        })?;
+        if first_message_id.is_none() {
+            first_message_id = Some(message_id);
+            first_response = response;
+        }
+    }
+    let message_id = first_message_id.expect("at least one chunk");
     // Telegram accepted this post. Local retries below never issue another
     // API call. Crash-safe receipt custody is the server's responsibility.
     // Reuse the adapter's provider quote decoder, rather than trusting a caller
     // to supply a quoted author or message body.
-    let (provider_thread, quote) = sent_metadata(&response);
+    let (provider_thread, quote) = sent_metadata(&first_response);
     let thread = provider_thread.or(thread);
     deliver_locally_with_metadata(
         store,
@@ -470,6 +804,676 @@ pub fn post_text(
         quote.as_ref(),
     );
     Ok(message_id)
+}
+
+/// Post a GPS location or venue through the agent's bot.
+#[allow(clippy::too_many_arguments)]
+pub fn post_location(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    latitude: f64,
+    longitude: f64,
+    title: Option<&str>,
+    address: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> Result<i64, anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = send_location(
+        chat_id, latitude, longitude, title, address, reply_to, thread,
+    );
+    let response = match call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id)) {
+        Ok(resp) => resp,
+        Err(err)
+            if reply_to.is_some() && err.to_string().contains("\"class\":\"invalid_reply\"") =>
+        {
+            let retry = send_location(chat_id, latitude, longitude, title, address, None, thread);
+            call_api(&token, &retry, SHORT_TIMEOUT_S, Some(&channel.id))?
+        }
+        Err(err) => return Err(err),
+    };
+    let message_id = sent_message_id(&response).map_err(|_| {
+        api_error(
+            &call.method,
+            Some(&channel.id),
+            "invalid_response",
+            None,
+            None,
+            "Telegram response has no message receipt; delivery may be uncertain",
+            None,
+        )
+    })?;
+    let summary = match (title, address) {
+        (Some(t), Some(a)) if !t.is_empty() && !a.is_empty() => {
+            format!("[Venue: {t} — {a} (GPS: {latitude:.6}, {longitude:.6})]")
+        }
+        _ => format!("[Location GPS: latitude={latitude:.6}, longitude={longitude:.6}]"),
+    };
+    deliver_locally_with_metadata(store, from, chat_id, message_id, &summary, thread, None);
+    Ok(message_id)
+}
+
+/// Post an interactive poll through the agent's bot.
+#[allow(clippy::too_many_arguments)]
+pub fn post_poll(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    question: &str,
+    options: &[String],
+    is_anonymous: Option<bool>,
+    allows_multiple_answers: Option<bool>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> Result<i64, anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = send_poll(
+        chat_id,
+        question,
+        options,
+        is_anonymous,
+        allows_multiple_answers,
+        reply_to,
+        thread,
+    );
+    let response = match call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id)) {
+        Ok(resp) => resp,
+        Err(err)
+            if reply_to.is_some() && err.to_string().contains("\"class\":\"invalid_reply\"") =>
+        {
+            let retry = send_poll(
+                chat_id,
+                question,
+                options,
+                is_anonymous,
+                allows_multiple_answers,
+                None,
+                thread,
+            );
+            call_api(&token, &retry, SHORT_TIMEOUT_S, Some(&channel.id))?
+        }
+        Err(err) => return Err(err),
+    };
+    let message_id = sent_message_id(&response).map_err(|_| {
+        api_error(
+            "sendPoll",
+            Some(&channel.id),
+            "invalid_response",
+            None,
+            None,
+            "Telegram response has no message receipt; delivery may be uncertain",
+            None,
+        )
+    })?;
+    let summary = format!("[Poll: \"{question}\" | Options: {}]", options.join(" / "));
+    deliver_locally_with_metadata(store, from, chat_id, message_id, &summary, thread, None);
+    Ok(message_id)
+}
+
+/// Post a media item (photo, video, audio/music, voice, document, animation) through
+/// the agent's bot. Accepts an `https://` URL, an existing Telegram `file_id`,
+/// or a local filesystem path (uploaded via `multipart/form-data`).
+#[allow(clippy::too_many_arguments)]
+pub fn post_media(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    kind: &str,
+    source: &str,
+    caption: Option<&str>,
+    title: Option<&str>,
+    performer: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> Result<i64, anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let local_path = std::path::Path::new(source);
+    let response = if !source.starts_with("http://")
+        && !source.starts_with("https://")
+        && local_path.is_file()
+    {
+        match call_api_multipart(
+            &token,
+            &channel.id,
+            chat_id,
+            kind,
+            local_path,
+            caption,
+            title,
+            performer,
+            reply_to,
+            thread,
+        ) {
+            Ok(resp) => resp,
+            Err(err)
+                if reply_to.is_some()
+                    && err.to_string().contains("\"class\":\"invalid_reply\"") =>
+            {
+                call_api_multipart(
+                    &token,
+                    &channel.id,
+                    chat_id,
+                    kind,
+                    local_path,
+                    caption,
+                    title,
+                    performer,
+                    None,
+                    thread,
+                )?
+            }
+            Err(err) => return Err(err),
+        }
+    } else {
+        let call = send_media_ref(
+            chat_id, kind, source, caption, title, performer, reply_to, thread,
+        );
+        match call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id)) {
+            Ok(resp) => resp,
+            Err(err)
+                if reply_to.is_some()
+                    && err.to_string().contains("\"class\":\"invalid_reply\"") =>
+            {
+                let retry = send_media_ref(
+                    chat_id, kind, source, caption, title, performer, None, thread,
+                );
+                call_api(&token, &retry, SHORT_TIMEOUT_S, Some(&channel.id))?
+            }
+            Err(err) => return Err(err),
+        }
+    };
+    let message_id = sent_message_id(&response).map_err(|_| {
+        api_error(
+            "sendDocument",
+            Some(&channel.id),
+            "invalid_response",
+            None,
+            None,
+            "Telegram response has no message receipt; delivery may be uncertain",
+            None,
+        )
+    })?;
+    let summary = match caption.filter(|c| !c.trim().is_empty()) {
+        Some(cap) => format!("{cap}\n[Attachment ({kind}): {source}]"),
+        None => format!("[Attachment ({kind}): {source}]"),
+    };
+    deliver_locally_with_metadata(store, from, chat_id, message_id, &summary, thread, None);
+    Ok(message_id)
+}
+
+/// Post an interactive checklist through the agent's bot. Uses Telegram's native
+/// `sendChecklist` when `business_connection_id` is supplied; otherwise posts a
+/// rich interactive checklist that can be toggled in-place via `interact(action="check" | "uncheck")`.
+#[allow(clippy::too_many_arguments)]
+pub fn post_checklist(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    title: &str,
+    tasks: &[String],
+    business_connection_id: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> Result<i64, anyagents_core::Error> {
+    if let Some(bc_id) = business_connection_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let channel = channel_for(store, from)?;
+        let Some(credential_ref) = channel.credential_ref else {
+            return Err(anyagents_core::Error::Message(
+                "telegram channel has no credential".into(),
+            ));
+        };
+        let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+        let call = send_checklist(chat_id, bc_id, title, tasks, reply_to, thread);
+        if let Ok(resp) = call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))
+            && let Ok(message_id) = sent_message_id(&resp)
+        {
+            let formatted = format_checklist_markdown(title, tasks);
+            deliver_locally_with_metadata(
+                store, from, chat_id, message_id, &formatted, thread, None,
+            );
+            return Ok(message_id);
+        }
+    }
+    let formatted = format_checklist_markdown(title, tasks);
+    post_text(store, data_dir, from, chat_id, &formatted, reply_to, thread)
+}
+
+/// Post a rich Instant View article through the agent's bot. When `content` is
+/// supplied without `url`, publishes a Telegraph (`telegra.ph`) Instant View page
+/// and posts the resulting Instant View card to Telegram (falling back to inline
+/// formatted HTML if Telegraph is offline).
+#[allow(clippy::too_many_arguments)]
+pub fn post_article(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    title: &str,
+    content: Option<&str>,
+    url: Option<&str>,
+    author_name: Option<&str>,
+    caption: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> Result<i64, anyagents_core::Error> {
+    let resolved_url = match url.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(existing) => Some(existing.to_string()),
+        None => content
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|body| {
+                publish_telegraph_article(data_dir, title, body, author_name.or(Some(from)))
+            }),
+    };
+    let text = match resolved_url {
+        Some(ref page_url) => match caption.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(cap) => format!("📰 **{title}**\n{cap}\n{page_url}"),
+            None => format!("📰 [**{title}**]({page_url})"),
+        },
+        None => {
+            let body = content.unwrap_or_default().trim();
+            format!("📰 **{title}**\n\n{body}")
+        }
+    };
+    post_text(store, data_dir, from, chat_id, &text, reply_to, thread)
+}
+
+fn publish_telegraph_article(
+    data_dir: &std::path::Path,
+    title: &str,
+    markdown: &str,
+    author_name: Option<&str>,
+) -> Option<String> {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+        || std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
+    {
+        return None;
+    }
+    let token_path = data_dir.join("secrets").join("telegraph-token");
+    let access_token = std::fs::read_to_string(&token_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            let agent = ureq::Agent::config_builder()
+                .timeout_global(Some(Duration::from_secs(10)))
+                .build()
+                .new_agent();
+            let resp = agent
+                .get("https://api.telegra.ph/createAccount?short_name=AnyAgents&author_name=AnyAgents")
+                .call()
+                .ok()?;
+            let body = resp.into_body().read_to_string().ok()?;
+            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+            let tok = val
+                .pointer("/result/access_token")
+                .and_then(serde_json::Value::as_str)?
+                .to_string();
+            if let Some(parent) = token_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&token_path, &tok);
+            Some(tok)
+        })?;
+    let nodes: Vec<serde_json::Value> = markdown
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|para| {
+            if let Some(h) = para
+                .strip_prefix("### ")
+                .or_else(|| para.strip_prefix("#### "))
+            {
+                serde_json::json!({ "tag": "h4", "children": [h.trim()] })
+            } else if let Some(h) = para.strip_prefix("# ").or_else(|| para.strip_prefix("## ")) {
+                serde_json::json!({ "tag": "h3", "children": [h.trim()] })
+            } else if let Some(q) = para.strip_prefix("> ") {
+                serde_json::json!({ "tag": "blockquote", "children": [q.trim()] })
+            } else if para.starts_with("```") {
+                let code = para
+                    .trim_start_matches("```")
+                    .trim_end_matches("```")
+                    .trim();
+                serde_json::json!({ "tag": "pre", "children": [code] })
+            } else {
+                serde_json::json!({ "tag": "p", "children": [para] })
+            }
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "access_token": access_token,
+        "title": title,
+        "author_name": author_name.unwrap_or("AnyAgents"),
+        "content": if nodes.is_empty() {
+            vec![serde_json::json!({ "tag": "p", "children": [markdown] })]
+        } else {
+            nodes
+        },
+        "return_content": false
+    });
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .build()
+        .new_agent();
+    let resp = agent
+        .post("https://api.telegra.ph/createPage")
+        .header("content-type", "application/json")
+        .send(payload.to_string().as_bytes())
+        .ok()?;
+    let body = resp.into_body().read_to_string().ok()?;
+    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+    val.pointer("/result/url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Set or clear an emoji reaction on a Telegram message through the agent's bot,
+/// and fan out the reaction notice to peer agents in the room.
+pub fn react_message(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    message_id: i64,
+    emoji: Option<&str>,
+    thread: Option<i64>,
+) -> Result<(), anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = set_message_reaction(chat_id, message_id, emoji, None);
+    call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
+    if let Some(e) = emoji.map(str::trim).filter(|s| !s.is_empty()) {
+        let summary = format!("[Reaction {e} on message #{message_id}]");
+        let room = format!("telegram:chat:{chat_id}");
+        let reply_target = match thread {
+            Some(t) => format!("{room}:{t}"),
+            None => room.clone(),
+        };
+        if chat_is_room(store, chat_id) {
+            let incoming = anyagents_core::Incoming {
+                text: summary,
+                sender: Some(format!("agent:{from}")),
+                source_time_ms: None,
+                source_key: Some(format!(
+                    "tg-react:{chat_id}:{message_id}:{from}:{e}:{}",
+                    anyagents_core::now_ms()
+                )),
+                reply_to: Some(reply_target),
+                quote: None,
+                origin: Some(anyagents_core::Origin {
+                    chat_id: Some(chat_id),
+                    thread_id: thread,
+                    message_id: Some(message_id),
+                }),
+                received_at_ms: None,
+            };
+            let _ = store.receive_room(&room, incoming);
+        }
+    }
+    Ok(())
+}
+
+/// Edit the text of a Telegram message sent by this agent's bot.
+pub fn edit_message(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    message_id: i64,
+    text: &str,
+    thread: Option<i64>,
+) -> Result<(), anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = edit_message_text(chat_id, message_id, text);
+    if let Err(err) = call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id)) {
+        if err.to_string().contains("\"class\":\"invalid_entities\"") {
+            let plain = BotCall {
+                method: "editMessageText".to_string(),
+                body: serde_json::json!({
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                }),
+            };
+            call_api(&token, &plain, SHORT_TIMEOUT_S, Some(&channel.id))?;
+        } else {
+            return Err(err);
+        }
+    }
+    let _ = thread;
+    Ok(())
+}
+
+/// Delete a Telegram message in `chat_id`.
+pub fn delete_chat_message(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<(), anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = delete_message(chat_id, message_id);
+    call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
+    Ok(())
+}
+
+/// Pin or unpin a Telegram message in `chat_id`.
+pub fn pin_message(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    message_id: i64,
+    pin: bool,
+) -> Result<(), anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = if pin {
+        pin_chat_message(chat_id, message_id, Some(true))
+    } else {
+        unpin_chat_message(chat_id, message_id)
+    };
+    call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
+    Ok(())
+}
+
+/// Close an active Telegram poll message.
+pub fn close_poll(
+    store: &Store,
+    data_dir: &std::path::Path,
+    from: &str,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<(), anyagents_core::Error> {
+    let channel = channel_for(store, from)?;
+    let Some(credential_ref) = channel.credential_ref else {
+        return Err(anyagents_core::Error::Message(
+            "telegram channel has no credential".into(),
+        ));
+    };
+    let token = token_of(&FileCredentialStore::new(data_dir), &credential_ref)?;
+    let call = stop_poll(chat_id, message_id);
+    call_api(&token, &call, SHORT_TIMEOUT_S, Some(&channel.id))?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn call_api_multipart(
+    token: &str,
+    channel_id: &anyagents_core::ChannelId,
+    chat_id: i64,
+    kind: &str,
+    file_path: &std::path::Path,
+    caption: Option<&str>,
+    title: Option<&str>,
+    performer: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> Result<String, anyagents_core::Error> {
+    let (method, field) = match kind {
+        "photo" | "image" => ("sendPhoto", "photo"),
+        "video" => ("sendVideo", "video"),
+        "audio" | "music" => ("sendAudio", "audio"),
+        "voice" => ("sendVoice", "voice"),
+        "animation" | "gif" => ("sendAnimation", "animation"),
+        _ => ("sendDocument", "document"),
+    };
+    let file_bytes = std::fs::read(file_path)?;
+    let file_name = file_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment.bin")
+        .replace('"', "_");
+    let boundary = format!("----anyagents-tg-{}", anyagents_core::MessageId::generate());
+    let mut payload: Vec<u8> = Vec::with_capacity(file_bytes.len() + 1024);
+    let mut add_field = |name: &str, val: &str| {
+        payload.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n"
+            )
+            .as_bytes(),
+        );
+    };
+    add_field("chat_id", &chat_id.to_string());
+    if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+        let html = anyagents_channel_telegram::markdown_to_telegram_html(cap);
+        add_field("caption", &html);
+        add_field("parse_mode", "HTML");
+    }
+    if field == "audio" {
+        if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            add_field("title", t);
+        }
+        if let Some(p) = performer.map(str::trim).filter(|s| !s.is_empty()) {
+            add_field("performer", p);
+        }
+    }
+    if let Some(id) = reply_to {
+        add_field("reply_to_message_id", &id.to_string());
+    }
+    if let Some(id) = thread {
+        add_field("message_thread_id", &id.to_string());
+    }
+    payload.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    payload.extend_from_slice(&file_bytes);
+    payload.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    let url = format!("{}/bot{token}/{method}", api_base());
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(SHORT_TIMEOUT_S)))
+        .http_status_as_error(false)
+        .max_redirects(0)
+        .max_redirects_will_error(false)
+        .build()
+        .new_agent();
+    let content_type = format!("multipart/form-data; boundary={boundary}");
+    let response = agent
+        .post(&url)
+        .header("content-type", &content_type)
+        .send(&payload[..])
+        .map_err(|_| {
+            api_error(
+                method,
+                Some(channel_id),
+                "transport",
+                None,
+                None,
+                "Telegram multipart upload failed; delivery may be uncertain",
+                None,
+            )
+        })?;
+    let status = response.status().as_u16();
+    let body = response.into_body().read_to_string().map_err(|_| {
+        api_error(
+            method,
+            Some(channel_id),
+            "response_read",
+            Some(status),
+            None,
+            "Telegram response could not be read; delivery may be uncertain",
+            None,
+        )
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+        api_error(
+            method,
+            Some(channel_id),
+            "invalid_response",
+            Some(status),
+            None,
+            "Telegram response is not JSON; delivery may be uncertain",
+            None,
+        )
+    })?;
+    if value.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(body);
+    }
+    let code = value.get("error_code").and_then(serde_json::Value::as_i64);
+    let description = value.get("description").and_then(serde_json::Value::as_str);
+    let (class, safe_description) = provider_description(description);
+    Err(api_error(
+        method,
+        Some(channel_id),
+        class,
+        Some(status),
+        code,
+        safe_description,
+        None,
+    ))
 }
 
 /// Ask Telegram whether this bot is a member of a chat. The answer is the
@@ -515,6 +1519,13 @@ fn deliver_locally_with_metadata(
     if record_chat(store, agent, chat_id).is_err() {
         // One retry: the store may have been busy on the first attempt.
         let _ = record_chat(store, agent, chat_id);
+    }
+    if chat_id < 0
+        && let Ok(ch) = channel_for(store, agent)
+        && let Some(ref cred) = ch.credential_ref
+        && let Ok(token) = token_of(&FileCredentialStore::new(store.data_dir()), cred)
+    {
+        discover_peer_bots_in_chat(store, &token, &ch.id, chat_id, "supergroup");
     }
     // Only a group is a room. A private chat is one person and one agent, so a
     // direct message never reaches another agent.
@@ -590,22 +1601,28 @@ fn fan_out_with_metadata(
 /// Record that `agent` answers in `chat`, and learn the chat's title if the
 /// adapter has one. The state stays the sender's own memory.
 pub fn record_chat(store: &Store, agent: &str, chat_id: i64) -> Result<(), anyagents_core::Error> {
+    let default_kind = if chat_id < 0 {
+        Some("supergroup")
+    } else {
+        None
+    };
     for channel in store.list_channels()? {
-        let memory = Memory::from_state(&channel.state);
-        if memory.chats.iter().any(|link| link.chat_id == chat_id) {
-            continue;
-        }
         let ours = channel
             .agents
             .iter()
             .filter_map(|id| store.agent(id).ok())
-            .any(|row| row.name == agent);
-        if ours {
-            let mut memory = memory;
-            memory.attach(agent, chat_id);
-            store.set_channel_state(&channel.id, &memory.to_state())?;
-            return Ok(());
+            .any(|row| row.name == agent || row.id.as_str() == agent);
+        if !ours {
+            continue;
         }
+        let mut memory = Memory::from_state(&channel.state);
+        let before = memory.to_state();
+        memory.attach_typed(agent, chat_id, default_kind);
+        let after = memory.to_state();
+        if after != before {
+            store.set_channel_state(&channel.id, &after)?;
+        }
+        return Ok(());
     }
     Ok(())
 }
@@ -663,18 +1680,17 @@ fn sent_metadata(response: &str) -> (Option<i64>, Option<anyagents_core::Quote>)
         return (None, None);
     };
     let result = &value["result"];
-    let thread = result
-        .get("message_thread_id")
-        .and_then(serde_json::Value::as_i64);
     let payload = serde_json::json!([{"update_id": 1, "message": result}]).to_string();
     let mut poll = Poll::resume(0);
-    let quote = poll.route("sent", "", &payload).ok().and_then(|items| {
-        items.into_iter().find_map(|item| match item {
-            Routed::ToAgent { inbound, .. } => inbound.quote,
-            _ => None,
+    poll.route("sent", "", &payload)
+        .ok()
+        .and_then(|items| {
+            items.into_iter().find_map(|item| match item {
+                Routed::ToAgent { inbound, .. } => Some((inbound.thread_id, inbound.quote)),
+                _ => None,
+            })
         })
-    });
-    (thread, quote)
+        .unwrap_or((None, None))
 }
 
 /// Errors expose stable fields, never ureq's URL-bearing Display/Debug or a
@@ -691,8 +1707,9 @@ fn api_error(
 ) -> anyagents_core::Error {
     // BotCall is internal today, but do not make that a redaction dependency.
     let method = match method {
-        "sendMessage" | "getUpdates" | "getMe" | "getChatMember" | "setWebhook"
-        | "deleteWebhook" => method,
+        "sendMessage" | "sendPhoto" | "sendVideo" | "sendAudio" | "sendVoice" | "sendDocument"
+        | "sendAnimation" | "sendLocation" | "sendVenue" | "sendPoll" | "getFile"
+        | "getUpdates" | "getMe" | "getChatMember" | "setWebhook" | "deleteWebhook" => method,
         _ => "unknown",
     };
     anyagents_core::Error::Message(format!(
@@ -853,11 +1870,29 @@ fn provider_description(description: Option<&str>) -> (&'static str, &'static st
         ),
         Some(
             "bad request: not enough rights to send text messages to the chat"
-            | "bad request: chat_write_forbidden",
+            | "bad request: chat_write_forbidden"
+            | "bad request: have no rights to send a message"
+            | "forbidden: not enough rights to send text messages to the chat",
         ) => (
             "send_forbidden",
             "Bad Request: not enough rights to send text messages to the chat",
         ),
+        Some("bad request: message is too long") => {
+            ("message_too_long", "Bad Request: message is too long")
+        }
+        Some("bad request: message text is empty" | "bad request: text must be non-empty") => {
+            ("empty_message", "Bad Request: message text is empty")
+        }
+        Some(s) if s.starts_with("bad request: can't parse entities") => {
+            ("invalid_entities", "Bad Request: can't parse entities")
+        }
+        Some("bad request: group chat was upgraded to a supergroup chat") => (
+            "chat_migrated",
+            "Bad Request: group chat was upgraded to a supergroup chat",
+        ),
+        Some("bad request: peer_id_invalid" | "bad request: user not found") => {
+            ("chat_not_found", "Bad Request: peer_id_invalid")
+        }
         Some(
             "conflict: terminated by other getupdates request; make sure that only one bot instance is running",
         ) => (
@@ -1150,7 +2185,7 @@ mod tests {
             "message": {
                 "message_id": 9,
                 "chat": {"id": 100, "type": "private"},
-                "from": {"id": 42, "is_bot": false, "first_name": "Kyle"},
+                "from": {"id": 42, "is_bot": false, "first_name": "Alex"},
                 "date": 1_700_000_000,
                 "text": "pushed via webhook",
             }

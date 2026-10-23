@@ -315,3 +315,240 @@ for line in sys.stdin:
     }
     assert_eq!(harness.written_ids(), ["large"]);
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn agy_rpc_steers_mid_turn_via_language_server_and_cancels_natively() {
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        sync::{
+            Arc, Mutex,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+        time::Duration,
+    };
+
+    let dir = std::env::temp_dir();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let running = Arc::new(AtomicBool::new(true));
+    let steered: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let cancelled: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let running_srv = Arc::clone(&running);
+    let steered_srv = Arc::clone(&steered);
+    let cancelled_srv = Arc::clone(&cancelled);
+    thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut stream = stream;
+            let mut data = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                data.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&data[..pos]);
+                    let content_len = head
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if data.len() >= pos + 4 + content_len {
+                        break;
+                    }
+                }
+            }
+            let req = String::from_utf8_lossy(&data);
+            assert!(req.contains("x-codeium-csrf-token: test-csrf-123"));
+            let (head, body) = req.split_once("\r\n\r\n").unwrap_or(("", ""));
+            let first_line = head.lines().next().unwrap_or("");
+            let resp_body = if first_line.contains("GetAllCascadeTrajectories") {
+                let status = if running_srv.load(Ordering::SeqCst) {
+                    "CASCADE_RUN_STATUS_RUNNING"
+                } else {
+                    "CASCADE_RUN_STATUS_IDLE"
+                };
+                json!({
+                    "trajectorySummaries": {
+                        "sess-agy-1": { "status": status }
+                    }
+                })
+                .to_string()
+            } else if first_line.contains("GetCascadeTrajectoryGeneratorMetadata") {
+                json!({
+                    "generatorMetadata": [
+                        {
+                            "plannerConfig": {
+                                "planModel": 42,
+                                "modelName": "gemini-4-pro-high"
+                            }
+                        }
+                    ]
+                })
+                .to_string()
+            } else if first_line.contains("SendUserCascadeMessage") {
+                let val: serde_json::Value = serde_json::from_str(body).unwrap();
+                steered_srv.lock().unwrap().push(val);
+                "{}".to_string()
+            } else if first_line.contains("CancelCascadeInvocation") {
+                let val: serde_json::Value = serde_json::from_str(body).unwrap();
+                cancelled_srv.lock().unwrap().push(val);
+                "{}".to_string()
+            } else {
+                "{}".to_string()
+            };
+            let resp = format!(
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                resp_body.len(),
+                resp_body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let spec = StreamSpec::for_program("agy");
+    let mut harness = super::StreamHarness::launch_with_agy_rpc(
+        super::Launch {
+            spec: spec.clone(),
+            program: "/usr/bin/python3".into(),
+            args: vec![
+                "-u".into(),
+                "-c".into(),
+                r#"
+import json, sys, time
+print(json.dumps({"event":"init","session_id":"sess-agy-1"}), flush=True)
+line1 = sys.stdin.readline()
+time.sleep(0.15)
+print(json.dumps({"event":"step_update","step_update":{"conversation_id":"sess-agy-1","step_index":0,"state":"DONE","step_type":"user_input"}}), flush=True)
+line2 = sys.stdin.readline()
+print(json.dumps({"event":"result","session_id":"sess-agy-1","usage":{"input_tokens":5,"output_tokens":3}}), flush=True)
+line3 = sys.stdin.readline()
+"#
+                .into(),
+            ],
+            environment: vec![],
+            work_dir: Some(dir.clone()),
+            session_id: None,
+            mode: anyagents_harness::DeliveryMode::Steer,
+            steer: anyagents_harness::SteerSupport::Yes,
+        },
+        Some(super::AgyRpcConfig {
+            config_dir: dir,
+            csrf_token: "test-csrf-123".into(),
+            port_override: Some(port),
+        }),
+    )
+    .unwrap();
+
+    let mut m1 = large_message();
+    m1.id = "m1".into();
+    m1.text = "first".into();
+    let line1 = super::message_line(&spec, &m1);
+    assert!(matches!(
+        harness.deliver(&m1, &line1).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    ));
+
+    // Before `step_update` (`step_type: "user_input"`) arrives, m2 is deferred.
+    let mut m2 = m1.clone();
+    m2.id = "m2".into();
+    m2.text = "second-steered".into();
+    let line2 = super::message_line(&spec, &m2);
+    assert!(!harness.input_ready());
+    assert_eq!(
+        harness.deliver(&m2, &line2).unwrap(),
+        anyagents_harness::DeliverOutcome::Deferred
+    );
+
+    // Wait for `step_type: "user_input"` so `input_ready()` becomes true.
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !harness.input_ready() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(harness.input_ready());
+
+    // Now delivering m2 steers natively via SendUserCascadeMessage!
+    assert_eq!(
+        harness.deliver(&m2, &line2).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    {
+        let calls = steered.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["cascadeId"], "sess-agy-1");
+        assert_eq!(
+            calls[0]["deliveryStrategy"],
+            "MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION"
+        );
+        assert!(
+            calls[0]["items"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("anyagents-message:m2")
+        );
+    }
+
+    // When backend transitions to IDLE just before stdout `result`, m3 is deferred
+    // during the turn-close grace window.
+    running.store(false, Ordering::SeqCst);
+    let mut m3 = m1.clone();
+    m3.id = "m3".into();
+    m3.text = "third-after-turn".into();
+    let line3 = super::message_line(&spec, &m3);
+    assert_eq!(
+        harness.deliver(&m3, &line3).unwrap(),
+        anyagents_harness::DeliverOutcome::Deferred
+    );
+    assert!(!harness.input_ready());
+
+    // If the turn remains open in IDLE past the grace window (e.g. an active
+    // `schedule` background task keeps `pollResponse` alive without emitting
+    // `result`), `input_ready()` recovers and `deliver()` wakes the cascade via
+    // `SendUserCascadeMessage` with `plannerConfig`.
+    thread::sleep(Duration::from_millis(220));
+    assert!(harness.input_ready());
+    assert_eq!(
+        harness.deliver(&m3, &line3).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    {
+        let calls = steered.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls[1]["cascadeConfig"]["plannerConfig"]["modelName"],
+            "gemini-4-pro-high"
+        );
+    }
+
+    // Release python child to print `{"event":"result"}`.
+    super::write_stdin(&harness.stdin, &json!({"release": true})).unwrap();
+    assert!(harness.wait_finished("m1", Duration::from_secs(3)));
+    assert!(harness.wait_finished("m2", Duration::from_secs(3)));
+    assert!(harness.wait_finished("m3", Duration::from_secs(3)));
+    assert!(harness.input_ready());
+
+    // Native cancel calls CancelCascadeInvocation.
+    harness
+        .cancel(&super::cancel_line(&spec))
+        .expect("native cancel");
+    {
+        let calls = cancelled.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["cascadeId"], "sess-agy-1");
+    }
+}

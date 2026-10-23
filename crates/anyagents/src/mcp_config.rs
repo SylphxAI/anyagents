@@ -32,19 +32,91 @@ pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), 
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn write_codex(path: &Path, command: &Path, args: &[String]) -> Result<(), Error> {
+    write_codex_with_model(path, None, command, args)
+}
+
+pub fn write_codex_with_model(
+    path: &Path,
+    model: Option<&str>,
+    command: &Path,
+    args: &[String],
+) -> Result<(), Error> {
     let body = format!(
         "[mcp_servers.anyagents]\ncommand = \"{}\"\nargs = {}\n",
         toml_escape(&command.display().to_string()),
         toml_args(args),
     );
-    let existing = match std::fs::read_to_string(path) {
+    let mut existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(err) => return Err(err.into()),
     };
-    std::fs::write(path, upsert_table(&existing, &body))?;
+    if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        let normalized = raw_model
+            .strip_prefix("sylphx/")
+            .unwrap_or(raw_model)
+            .strip_prefix("openai/")
+            .unwrap_or(raw_model)
+            .split('#')
+            .next()
+            .unwrap_or(raw_model);
+        existing = upsert_top_key(
+            &existing,
+            "model",
+            &format!("\"{}\"", toml_escape(normalized)),
+        );
+    }
+    if !existing.contains("approval_policy") {
+        existing = upsert_top_key(&existing, "approval_policy", "\"never\"");
+    }
+    if !existing.contains("sandbox_mode") {
+        existing = upsert_top_key(&existing, "sandbox_mode", "\"danger-full-access\"");
+    }
+    let mut updated = upsert_table(&existing, &body);
+    if !updated.contains("[projects.\"/\"]") {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("\n[projects.\"/\"]\ntrust_level = \"trusted\"\n");
+    }
+    std::fs::write(path, updated)?;
     Ok(())
+}
+
+fn upsert_top_key(text: &str, key: &str, value_literal: &str) -> String {
+    let prefix = format!("{key} =");
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            if !in_section && !replaced {
+                lines.push(format!("{key} = {value_literal}"));
+                replaced = true;
+            }
+            in_section = true;
+        }
+        if !in_section && (trimmed.starts_with(&prefix) || trimmed.starts_with(&format!("{key}=")))
+        {
+            if !replaced {
+                lines.push(format!("{key} = {value_literal}"));
+                replaced = true;
+            }
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    if !replaced {
+        lines.insert(0, format!("{key} = {value_literal}"));
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn read_json(path: &Path) -> Result<serde_json::Value, Error> {

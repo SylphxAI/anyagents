@@ -9,54 +9,104 @@
 use std::path::Path;
 
 use anyagents_core::{
-    Address, CredentialStore, Error, FileCredentialStore, Incoming, NewChannel, Store,
+    Address, CredentialStore, Error, FileCredentialStore, Incoming, NewChannel, Quote, Store,
 };
 
 use crate::agent::{named, open};
-use crate::api::{InboxResponse, SendRequest, SendResponse};
+use crate::api::{
+    ConversationResponse, InboxResponse, SendArticle, SendChecklist, SendLocation, SendMedia,
+    SendPoll, SendRequest, SendResponse,
+};
 use crate::client;
 use crate::server;
 use crate::telegram;
 
-/// The operator's authority when it holds one, else none: only a deployment
-/// without the boundary answers an unauthenticated call.
-fn authority(data: &Path) -> client::Authority {
-    match crate::operator::operator_token(data) {
-        Some(_) => client::Authority::Operator,
-        None => client::Authority::None,
-    }
+pub struct SendOptions {
+    pub to: String,
+    pub text: String,
+    pub source_key: Option<String>,
+    pub source_time_ms: Option<i64>,
+    pub reply_to: Option<String>,
+    pub from: Option<String>,
+    pub quote: Option<String>,
+    pub media: Option<SendMedia>,
+    pub location: Option<SendLocation>,
+    pub poll: Option<SendPoll>,
+    pub checklist: Option<SendChecklist>,
+    pub article: Option<SendArticle>,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn send(
-    data: &Path,
-    to: &str,
-    text: String,
-    source_key: Option<String>,
-    source_time_ms: Option<i64>,
-    reply_to: Option<String>,
-    from: Option<String>,
-) -> Result<(), Error> {
+pub fn send_simple(data: &Path, to: &str, text: String) -> Result<(), Error> {
+    send_with_options(
+        data,
+        SendOptions {
+            to: to.to_string(),
+            text,
+            source_key: None,
+            source_time_ms: None,
+            reply_to: None,
+            from: None,
+            quote: None,
+            media: None,
+            location: None,
+            poll: None,
+            checklist: None,
+            article: None,
+        },
+    )
+}
+
+pub fn send_with_options(data: &Path, opts: SendOptions) -> Result<(), Error> {
+    let quote_obj = opts
+        .quote
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(|t| Quote {
+            text: t.to_string(),
+            ..Quote::default()
+        });
     if server::socket_path(data).exists() {
+        let auth = client::authority(data);
+        let sender = match (&opts.from, &auth) {
+            (Some(f), _) => Some(f.clone()),
+            (None, client::Authority::Operator) => Some("operator".to_string()),
+            (None, _) => None,
+        };
+        let recipients: Vec<String> = opts
+            .to
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
         let body = SendRequest {
-            sender: from.clone(),
-            // A reply names where it goes; the address is only what was typed.
-            to: if reply_to.is_some() {
+            sender,
+            to: if opts
+                .reply_to
+                .as_deref()
+                .is_some_and(|r| crate::reply::ref_message(r).is_some())
+                && (recipients.is_empty() || (recipients.len() == 1 && recipients[0] == "-"))
+            {
                 Vec::new()
             } else {
-                vec![to.to_string()]
+                recipients
             },
-            text: text.clone(),
-            reply_to: reply_to.clone(),
-            quote: None,
-            idempotency_key: source_key.clone(),
+            text: opts.text.clone(),
+            reply_to: opts.reply_to.clone(),
+            quote: quote_obj.clone(),
+            media: opts.media.clone(),
+            location: opts.location.clone(),
+            poll: opts.poll.clone(),
+            checklist: opts.checklist.clone(),
+            article: opts.article.clone(),
+            idempotency_key: opts.source_key.clone(),
         };
         let sent = client::call::<SendResponse>(
             data,
             "POST",
             "/v1/send",
             Some(serde_json::to_vec(&body).map_err(|err| Error::Message(err.to_string()))?),
-            &authority(data),
+            &auth,
         )
         .map_err(Error::Message)?;
         if let Some(sent) = sent {
@@ -70,7 +120,16 @@ pub fn send(
             return Ok(());
         }
     }
-    send_stored(data, to, text, source_key, source_time_ms, reply_to, from)
+    send_stored(
+        data,
+        &opts.to,
+        opts.text,
+        opts.source_key,
+        opts.source_time_ms,
+        opts.reply_to,
+        opts.from,
+        quote_obj,
+    )
 }
 
 /// The single-user path: the store itself, with the sender as named.
@@ -83,6 +142,7 @@ fn send_stored(
     source_time_ms: Option<i64>,
     reply_to: Option<String>,
     from: Option<String>,
+    quote: Option<Quote>,
 ) -> Result<(), Error> {
     let address = Address::parse(to)?;
     let name = match address {
@@ -97,7 +157,7 @@ fn send_stored(
                     source_time_ms,
                     source_key,
                     reply_to,
-                    quote: None,
+                    quote,
                     origin: None,
                     received_at_ms: None,
                 },
@@ -149,7 +209,7 @@ fn send_stored(
             source_time_ms,
             source_key,
             reply_to,
-            quote: None,
+            quote,
             origin: None,
             received_at_ms: None,
         },
@@ -197,26 +257,52 @@ fn parse_id(raw: &str, what: &'static str) -> Result<i64, Error> {
     raw.parse().map_err(|_| Error::Message(what.into()))
 }
 
-pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> {
-    if server::socket_path(data).exists() && crate::operator::operator_token(data).is_some() {
-        let who = named(data, agent)?.id;
-        let _ = &who;
-        let path = match since {
-            Some(since) => format!("/v1/agents/{who}/inbox?since={since}"),
-            None => format!("/v1/agents/{who}/inbox"),
+pub fn inbox(
+    data: &Path,
+    agent: Option<&str>,
+    since: Option<i64>,
+    limit: Option<usize>,
+) -> Result<(), Error> {
+    let target = match agent.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => a.to_string(),
+        None => client::agent_identity()
+            .map(|id| id.to_string())
+            .ok_or_else(|| Error::Message("inbox needs an agent name or id".into()))?,
+    };
+    if client::can_call_server(data) {
+        let who = named(data, &target)?.id;
+        let mut params = Vec::new();
+        if let Some(s) = since {
+            params.push(format!("since={s}"));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        let path = if params.is_empty() {
+            format!("/v1/agents/{who}/inbox")
+        } else {
+            format!("/v1/agents/{who}/inbox?{}", params.join("&"))
         };
-        let read = client::call::<InboxResponse>(data, "GET", &path, None, &authority(data))
-            .map_err(Error::Message)?;
+        let read =
+            client::call::<InboxResponse>(data, "GET", &path, None, &client::authority(data))
+                .map_err(Error::Message)?;
         if let Some(read) = read {
             print_messages(read);
             return Ok(());
         }
     }
     let store = open(data)?;
-    let agent = store.agent_by_name(agent)?;
+    let agent = store.agent_by_name(&target)?;
+    let mut rows = store.inbox(&agent.id, since)?;
+    if let Some(limit) = limit {
+        if since.is_none() && rows.len() > limit {
+            rows.drain(..rows.len() - limit);
+        } else if rows.len() > limit {
+            rows.truncate(limit);
+        }
+    }
     print_messages(InboxResponse {
-        messages: store
-            .inbox(&agent.id, since)?
+        messages: rows
             .into_iter()
             .map(|message| crate::api::MessageView {
                 id: message.id.to_string(),
@@ -231,6 +317,74 @@ pub fn inbox(data: &Path, agent: &str, since: Option<i64>) -> Result<(), Error> 
             })
             .collect(),
     });
+    Ok(())
+}
+
+pub fn conversation(
+    data: &Path,
+    agent: Option<&str>,
+    with: Option<&str>,
+    since_ms: Option<i64>,
+    limit: Option<usize>,
+) -> Result<(), Error> {
+    let target = match agent.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => a.to_string(),
+        None => client::agent_identity()
+            .map(|id| id.to_string())
+            .ok_or_else(|| Error::Message("conversation needs an agent name or id".into()))?,
+    };
+    if client::can_call_server(data) {
+        let mut params = Vec::new();
+        if let Some(w) = with.map(str::trim).filter(|s| !s.is_empty()) {
+            params.push(format!("with={w}"));
+        }
+        if let Some(s) = since_ms {
+            params.push(format!("since_ms={s}"));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        let path = if params.is_empty() {
+            format!("/v1/agents/{target}/conversation")
+        } else {
+            format!("/v1/agents/{target}/conversation?{}", params.join("&"))
+        };
+        let read = client::call::<ConversationResponse>(
+            data,
+            "GET",
+            &path,
+            None,
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?;
+        if let Some(read) = read {
+            for turn in read.turns {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}",
+                    turn.timestamp_ms,
+                    turn.direction,
+                    turn.id,
+                    turn.from,
+                    turn.to,
+                    turn.text.replace('\n', "\\n"),
+                );
+            }
+            return Ok(());
+        }
+    }
+    let store = open(data)?;
+    let found = store.agent_by_name(&target)?;
+    for turn in store.conversation(&found.id, with, since_ms, limit)? {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            turn.timestamp_ms,
+            turn.direction,
+            turn.id,
+            turn.from,
+            turn.to,
+            turn.text.replace('\n', "\\n"),
+        );
+    }
     Ok(())
 }
 

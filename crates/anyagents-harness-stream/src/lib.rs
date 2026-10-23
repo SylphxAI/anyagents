@@ -110,15 +110,33 @@ impl StreamSpec {
     }
 
     fn effect(&self, value: &Value) -> LineEffect {
-        let kind = value.get("type").and_then(Value::as_str);
-        let finishes = match self.protocol {
-            LineProtocol::Result | LineProtocol::ResultWithCost => kind == Some("result"),
-            LineProtocol::Done => kind == Some("done"),
-        };
+        let kind = value
+            .get("type")
+            .or_else(|| value.get("event"))
+            .and_then(Value::as_str);
+        let is_error = value
+            .pointer("/result/status")
+            .and_then(Value::as_str)
+            .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"));
+        let finishes = !is_error
+            && match self.protocol {
+                LineProtocol::Result | LineProtocol::ResultWithCost => kind == Some("result"),
+                LineProtocol::Done => {
+                    kind == Some("done")
+                        || kind == Some("session_settled")
+                        || (kind == Some("prompt_result")
+                            && value.get("sessionSettled").and_then(Value::as_bool) != Some(false))
+                }
+            };
         LineEffect {
             finishes_turn: finishes,
             session_id: value
                 .get("session_id")
+                .or_else(|| value.get("sessionId"))
+                .or_else(|| value.pointer("/data/sessionId"))
+                .or_else(|| value.get("conversation_id"))
+                .or_else(|| value.pointer("/result/conversation_id"))
+                .or_else(|| value.pointer("/step_update/conversation_id"))
                 .and_then(Value::as_str)
                 .map(str::to_string),
             usage: finishes.then(|| self.usage_of(value)),
@@ -130,12 +148,14 @@ impl StreamSpec {
     fn usage_of(&self, value: &Value) -> TurnUsage {
         let usage = value
             .get("usage")
-            .or_else(|| value.pointer("/result/usage"));
+            .or_else(|| value.pointer("/result/usage"))
+            .or_else(|| value.pointer("/message/usage"));
         TurnUsage {
-            input_tokens: number(usage, "input_tokens"),
-            output_tokens: number(usage, "output_tokens"),
-            cache_read_tokens: number(usage, "cache_read_tokens"),
-            cache_write_tokens: number(usage, "cache_write_tokens"),
+            input_tokens: number(usage, "input_tokens").max(number(usage, "input")),
+            output_tokens: number(usage, "output_tokens").max(number(usage, "output")),
+            cache_read_tokens: number(usage, "cache_read_tokens").max(number(usage, "cacheRead")),
+            cache_write_tokens: number(usage, "cache_write_tokens")
+                .max(number(usage, "cacheWrite")),
             reported_cost_micros: match self.protocol {
                 LineProtocol::ResultWithCost => value.get("cost_micros").and_then(Value::as_i64),
                 _ => None,
@@ -173,6 +193,14 @@ pub struct Launch {
     pub steer: SteerSupport,
 }
 
+/// Native `LanguageServerService` ConnectRPC configuration for Antigravity (`agy`).
+#[derive(Clone, Debug)]
+pub struct AgyRpcConfig {
+    pub config_dir: PathBuf,
+    pub csrf_token: String,
+    pub port_override: Option<u16>,
+}
+
 /// One vendor child.
 pub struct StreamHarness {
     spec: StreamSpec,
@@ -180,6 +208,7 @@ pub struct StreamHarness {
     args: Vec<String>,
     environment: Vec<(String, String)>,
     work_dir: Option<PathBuf>,
+    agy_rpc: Option<AgyRpcConfig>,
     mode: DeliveryMode,
     steer: SteerSupport,
     shared: Arc<Mutex<State>>,
@@ -207,6 +236,10 @@ struct State {
     epoch: u64,
     generation: u64,
     input_blocked: bool,
+    turn_user_inputs: usize,
+    idle_since: Option<Instant>,
+    planner_config: Option<Value>,
+    http_port: Option<u16>,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
@@ -227,12 +260,21 @@ impl StreamHarness {
     ///
     /// The spec's protocol runs on the reader thread for every JSON line.
     pub fn launch(launch: Launch) -> Result<Self, HarnessError> {
+        Self::launch_with_agy_rpc(launch, None)
+    }
+
+    /// Spawn the child with an optional Antigravity `LanguageServerService` RPC endpoint.
+    pub fn launch_with_agy_rpc(
+        launch: Launch,
+        agy_rpc: Option<AgyRpcConfig>,
+    ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             spec: launch.spec,
             program: launch.program,
             args: launch.args,
             environment: launch.environment,
             work_dir: launch.work_dir,
+            agy_rpc,
             mode: launch.mode,
             steer: launch.steer,
             shared: Arc::new(Mutex::new(State::new(launch.session_id.as_deref()))),
@@ -394,6 +436,28 @@ impl StreamHarness {
         if self.pending.is_some() {
             return Err(HarnessError::Failed("stdin delivery pending".into()));
         }
+        if let Some(ref rpc) = self.agy_rpc {
+            let (session_id, child_pid, cached_port) = {
+                let state = lock(&self.shared);
+                (
+                    state.session_id.clone(),
+                    state.child.as_ref().map(Child::id),
+                    state.http_port,
+                )
+            };
+            if let Some(session_id) = session_id
+                && let Some(port) = resolve_agy_http_port(rpc, cached_port, child_pid)
+            {
+                lock(&self.shared).http_port = Some(port);
+                agy_rpc_cancel(port, &rpc.csrf_token, &session_id).map_err(HarnessError::Failed)?;
+                let mut state = lock(&self.shared);
+                state.open.clear();
+                state.followups.clear();
+                state.turn_user_inputs = 0;
+                state.idle_since = None;
+                return Ok(());
+            }
+        }
         let result = write_stdin(&self.stdin, line);
         let mut state = lock(&self.shared);
         if let Err(err) = result {
@@ -406,6 +470,8 @@ impl StreamHarness {
         }
         state.open.clear();
         state.followups.clear();
+        state.turn_user_inputs = 0;
+        state.idle_since = None;
         Ok(())
     }
 
@@ -443,6 +509,7 @@ impl StreamHarness {
             .pending
             .is_none()
             .then(|| format!("{line}\n").into_bytes());
+        let mut agy_steer_ctx = None;
         {
             let mut state = lock(&self.shared);
             if !state.alive {
@@ -461,21 +528,147 @@ impl StreamHarness {
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
-                // Associate even an immediate result with its owner before the
-                // first byte is visible to the child. This is not acceptance.
-                if state.open.is_empty() {
-                    state.turns_started += 1;
-                    state.open.push(message.id.clone());
+                if !state.open.is_empty()
+                    && let Some(ref rpc) = self.agy_rpc
+                {
+                    if state
+                        .idle_since
+                        .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
+                        || state.turn_user_inputs == 0
+                        || state.session_id.is_none()
+                    {
+                        return Ok(DeliverOutcome::Deferred);
+                    }
+                    let session_id = state.session_id.clone().expect("checked above");
+                    let child_pid = state.child.as_ref().map(Child::id);
+                    let cached_port = state.http_port;
+                    let cached_planner = state.planner_config.clone();
+                    let generation = state.generation;
+                    agy_steer_ctx = Some((
+                        rpc.clone(),
+                        session_id,
+                        child_pid,
+                        cached_port,
+                        cached_planner,
+                        generation,
+                    ));
                 } else {
-                    state.followups.push(message.id.clone());
+                    // Associate even an immediate result with its owner before the
+                    // first byte is visible to the child. This is not acceptance.
+                    if state.open.is_empty() {
+                        state.turns_started += 1;
+                        state.open.push(message.id.clone());
+                        state.turn_user_inputs = 0;
+                        state.idle_since = None;
+                    } else if self.mode == DeliveryMode::Steer {
+                        if !state.open.contains(&message.id) {
+                            state.open.push(message.id.clone());
+                        }
+                    } else {
+                        state.followups.push(message.id.clone());
+                    }
+                    self.pending = Some(PendingWrite {
+                        id: message.id.clone(),
+                        bytes: bytes.expect("new write"),
+                        offset: 0,
+                        generation: state.generation,
+                    });
                 }
-                self.pending = Some(PendingWrite {
-                    id: message.id.clone(),
-                    bytes: bytes.expect("new write"),
-                    offset: 0,
-                    generation: state.generation,
-                });
             }
+        }
+        if let Some((rpc, session_id, child_pid, cached_port, mut planner_config, generation)) =
+            agy_steer_ctx
+        {
+            let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
+                let mut state = lock(&self.shared);
+                if state.generation == generation && !state.open.is_empty() {
+                    state.idle_since.get_or_insert_with(Instant::now);
+                }
+                return Ok(DeliverOutcome::Deferred);
+            };
+            {
+                let mut state = lock(&self.shared);
+                if state.generation != generation || !state.alive {
+                    return Err(HarnessError::Dead);
+                }
+                state.http_port = Some(port);
+            }
+            let running = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+                .map_err(HarnessError::Failed)?;
+            if running {
+                let mut state = lock(&self.shared);
+                if state.generation != generation || !state.alive {
+                    return Err(HarnessError::Dead);
+                }
+                state.idle_since = None;
+            } else {
+                let mut state = lock(&self.shared);
+                if state.generation != generation || !state.alive {
+                    return Err(HarnessError::Dead);
+                }
+                if state.open.is_empty() {
+                    state.idle_since = None;
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                let now = Instant::now();
+                let idle_since = *state.idle_since.get_or_insert(now);
+                if now.duration_since(idle_since) < AGY_TURN_CLOSE_GRACE {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                drop(state);
+                if planner_config.is_none() {
+                    planner_config =
+                        agy_rpc_fetch_planner_config(port, &rpc.csrf_token, &session_id)
+                            .map_err(HarnessError::Failed)?;
+                    let mut state = lock(&self.shared);
+                    if state.generation != generation || !state.alive {
+                        return Err(HarnessError::Dead);
+                    }
+                    if planner_config.is_some() {
+                        state.planner_config = planner_config.clone();
+                    }
+                }
+            }
+            let composed = compose_message(&message.id, &message.context, &message.text);
+            {
+                let mut state = lock(&self.shared);
+                if state.generation != generation || !state.alive {
+                    return Err(HarnessError::Dead);
+                }
+                if state.open.is_empty() {
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                if !state.open.contains(&message.id) {
+                    state.open.push(message.id.clone());
+                }
+            }
+            if let Err(err) = agy_rpc_send_steer(
+                port,
+                &rpc.csrf_token,
+                &session_id,
+                &composed,
+                planner_config.as_ref(),
+            ) {
+                let mut state = lock(&self.shared);
+                state.open.retain(|id| id != &message.id);
+                if err.contains("plan model not specified") {
+                    if !state.open.is_empty() {
+                        state.idle_since.get_or_insert_with(Instant::now);
+                    }
+                    return Ok(DeliverOutcome::Deferred);
+                }
+                return Err(HarnessError::Failed(err));
+            }
+            let mut state = lock(&self.shared);
+            if state.generation != generation || !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            state.idle_since = None;
+            state.seen.insert(message.id.clone());
+            state.written.push(message.id.clone());
+            return Ok(DeliverOutcome::Accepted {
+                turn_finished: state.finished.contains(&message.id),
+            });
         }
         // Never hold shared state across pipe I/O. On Linux stdin is
         // nonblocking: backpressure returns custody to the mailbox immediately.
@@ -509,7 +702,21 @@ impl StreamHarness {
     }
 
     pub fn input_ready(&self) -> bool {
-        !lock(&self.shared).input_blocked
+        let state = lock(&self.shared);
+        if state.input_blocked {
+            return false;
+        }
+        if self.agy_rpc.is_some()
+            && !state.open.is_empty()
+            && (state
+                .idle_since
+                .is_some_and(|t| t.elapsed() < AGY_TURN_CLOSE_GRACE)
+                || state.turn_user_inputs == 0
+                || state.session_id.is_none())
+        {
+            return false;
+        }
+        true
     }
 
     pub fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
@@ -586,6 +793,10 @@ impl StreamHarness {
             state.alive = true;
             state.open.clear();
             state.followups.clear();
+            state.turn_user_inputs = 0;
+            state.idle_since = None;
+            state.planner_config = None;
+            state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
             state.text = None;
             state.generation
         };
@@ -636,14 +847,15 @@ impl StreamHarness {
     fn stop_child(&mut self) {
         self.pending = None;
         *lock(&self.stdin) = None;
-        let mut child = {
+        let child = {
             let mut state = lock(&self.shared);
             state.alive = false;
             state.child.take()
         };
         self.wake.notify_all();
-        if let Some(child) = child.as_mut() {
-            anyagents_harness::kill_child(child, &self.environment);
+        if let Some(mut child) = child {
+            anyagents_harness::kill_child(&mut child, &self.environment);
+            let _ = child.wait();
         }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
@@ -652,12 +864,13 @@ impl StreamHarness {
         if let Some(handle) = self.readiness.take() {
             let _ = handle.join();
         }
-        if let Some(mut child) = child {
-            let _ = child.wait();
-        }
         let mut state = lock(&self.shared);
         state.open.clear();
         state.followups.clear();
+        state.turn_user_inputs = 0;
+        state.idle_since = None;
+        state.planner_config = None;
+        state.http_port = None;
         state.text = None;
         state.alive = false;
     }
@@ -703,6 +916,10 @@ impl State {
             written: Vec::new(),
             open: Vec::new(),
             followups: Vec::new(),
+            turn_user_inputs: 0,
+            idle_since: None,
+            planner_config: None,
+            http_port: None,
             finished: HashSet::new(),
             turns_started: 0,
             quota_reset_at_ms: None,
@@ -735,7 +952,15 @@ fn read_stdout(
             if state.generation != generation {
                 return;
             }
+            state.idle_since = None;
             note_markers(&mut state, &value);
+            if value
+                .pointer("/step_update/step_type")
+                .and_then(Value::as_str)
+                == Some("user_input")
+            {
+                state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+            }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
             }
@@ -753,7 +978,8 @@ fn read_stdout(
                 }
             }
             if effect.finishes_turn {
-                finish_open(&mut state, effect.usage.unwrap_or_default());
+                let usage = effect.usage.unwrap_or_default();
+                finish_open(&mut state, usage);
             }
             state.epoch = state.epoch.wrapping_add(1);
         }
@@ -765,6 +991,9 @@ fn read_stdout(
             return;
         }
         state.alive = false;
+        if let Some(child) = state.child.as_mut() {
+            let _ = child.try_wait();
+        }
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();
@@ -789,11 +1018,15 @@ fn id_for_quiet(state: &mut State, id: &str) {
     let text = state.text.clone();
     state.open.clear();
     state.followups.clear();
+    state.turn_user_inputs = 0;
+    state.idle_since = None;
     state.finished.insert(id.to_string());
     state.text = text;
 }
 
 fn finish_open(state: &mut State, usage: TurnUsage) {
+    state.turn_user_inputs = 0;
+    state.idle_since = None;
     if state.open.is_empty() {
         return;
     }
@@ -914,17 +1147,160 @@ fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Resu
     let Some(stdin) = guard.as_mut() else {
         return Err(std::io::Error::other("stdin closed"));
     };
-    // One small control line must be one pipe write: write_fmt can split a
-    // JSON value and leave a corrupt prefix behind on WouldBlock.
     let bytes = format!("{value}\n").into_bytes();
-    #[cfg(target_os = "linux")]
-    if bytes.len() > libc::PIPE_BUF {
-        return Err(std::io::Error::other(
-            "control line exceeds atomic pipe write",
-        ));
-    }
     stdin.write_all(&bytes)?;
     stdin.flush()
+}
+
+fn resolve_agy_http_port(
+    rpc: &AgyRpcConfig,
+    cached: Option<u16>,
+    child_pid: Option<u32>,
+) -> Option<u16> {
+    if let Some(port) = rpc.port_override.or(cached) {
+        return Some(port);
+    }
+    let log_path = rpc.config_dir.join(".gemini/antigravity-cli/cli.log");
+    let text = std::fs::read_to_string(&log_path).ok()?;
+    let pid_needle =
+        child_pid.map(|pid| format!("Starting language server process with pid {pid}"));
+    let mut pid_matched = pid_needle.is_none();
+    let mut found_port = None;
+    for line in text.lines() {
+        if let Some(ref needle) = pid_needle
+            && line.contains(needle)
+        {
+            pid_matched = true;
+            found_port = None;
+            continue;
+        }
+        if pid_matched
+            && let Some((_, after)) =
+                line.split_once("Language server listening on random port at ")
+            && let Some(port_str) = after.strip_suffix(" for HTTP")
+            && let Ok(port) = port_str.trim().parse::<u16>()
+        {
+            found_port = Some(port);
+        }
+    }
+    found_port
+}
+
+fn agy_rpc_post(
+    port: u16,
+    csrf_token: &str,
+    method: &str,
+    payload: &Value,
+) -> Result<Value, String> {
+    use std::io::Read as _;
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+
+    let body = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|err| format!("connect 127.0.0.1:{port}: {err}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut request = format!(
+        "POST /exa.language_server_pb.LanguageServerService/{method} HTTP/1.0\r\n\
+         Host: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\n\
+         x-codeium-csrf-token: {csrf_token}\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    stream
+        .write_all(&request)
+        .and_then(|_| stream.flush())
+        .map_err(|err| format!("write {method}: {err}"))?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .map_err(|err| format!("read {method}: {err}"))?;
+    let (head, resp_body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("malformed HTTP response from {method}"))?;
+    let status_line = head.lines().next().unwrap_or_default();
+    let status_code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+        .unwrap_or(0);
+    if !(200..300).contains(&status_code) {
+        return Err(format!("{method} HTTP {status_code}: {}", resp_body.trim()));
+    }
+    if resp_body.trim().is_empty() {
+        return Ok(json!({}));
+    }
+    serde_json::from_str::<Value>(resp_body.trim()).map_err(|err| format!("decode {method}: {err}"))
+}
+
+/// Grace window when an `agy` cascade transitions to `CASCADE_RUN_STATUS_IDLE`.
+/// Normal turns emit `{"event":"result"}` on stdout within ~100ms (`pollResponse`
+/// ticker). Cascades held open by an active background task (e.g. `schedule`
+/// timer via `isRootIdleWithTasks`) never emit `result` while idle and instead
+/// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
+const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
+
+fn agy_rpc_is_running(port: u16, csrf_token: &str, session_id: &str) -> Result<bool, String> {
+    let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
+    let status = resp
+        .get("trajectorySummaries")
+        .and_then(|m| m.get(session_id))
+        .and_then(|s| s.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Ok(status == "CASCADE_RUN_STATUS_RUNNING")
+}
+
+fn agy_rpc_fetch_planner_config(
+    port: u16,
+    csrf_token: &str,
+    session_id: &str,
+) -> Result<Option<Value>, String> {
+    let resp = agy_rpc_post(
+        port,
+        csrf_token,
+        "GetCascadeTrajectoryGeneratorMetadata",
+        &json!({ "cascadeId": session_id }),
+    )?;
+    Ok(resp
+        .get("generatorMetadata")
+        .and_then(Value::as_array)
+        .and_then(|items| items.last())
+        .and_then(|meta| meta.get("plannerConfig"))
+        .cloned())
+}
+
+fn agy_rpc_send_steer(
+    port: u16,
+    csrf_token: &str,
+    session_id: &str,
+    text: &str,
+    planner_config: Option<&Value>,
+) -> Result<(), String> {
+    let cascade_config = match planner_config {
+        Some(cfg) => json!({ "plannerConfig": cfg }),
+        None => json!({}),
+    };
+    let payload = json!({
+        "cascadeId": session_id,
+        "items": [{"text": text}],
+        "cascadeConfig": cascade_config,
+        "blocking": false,
+        "deliveryStrategy": "MESSAGE_DELIVERY_STRATEGY_NEXT_INVOCATION"
+    });
+    agy_rpc_post(port, csrf_token, "SendUserCascadeMessage", &payload).map(|_| ())
+}
+
+fn agy_rpc_cancel(port: u16, csrf_token: &str, session_id: &str) -> Result<(), String> {
+    let payload = json!({
+        "cascadeId": session_id
+    });
+    agy_rpc_post(port, csrf_token, "CancelCascadeInvocation", &payload).map(|_| ())
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -939,10 +1315,60 @@ fn number(value: Option<&Value>, key: &str) -> u64 {
 }
 
 fn quota_of(value: &Value) -> Option<i64> {
-    if value.get("type").and_then(Value::as_str) != Some("rate_limit") {
+    if value.get("type").and_then(Value::as_str) == Some("rate_limit") {
+        return value.get("resets_at_ms").and_then(Value::as_i64);
+    }
+    if let Some(err_text) = value
+        .pointer("/result/error")
+        .or_else(|| value.get("error"))
+        .and_then(Value::as_str)
+        && let Some(delay_ms) = parse_resets_in_ms(err_text)
+    {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        return Some(now_ms.saturating_add(delay_ms));
+    }
+    None
+}
+
+fn parse_resets_in_ms(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    let idx = lower.find("resets in ")?;
+    let after = &lower[idx + "resets in ".len()..];
+    let token = after
+        .split_whitespace()
+        .next()?
+        .trim_end_matches(|c: char| !c.is_ascii_alphanumeric());
+    if token.is_empty() {
         return None;
     }
-    value.get("resets_at_ms").and_then(Value::as_i64)
+    let mut total_ms: i64 = 0;
+    let mut num: i64 = 0;
+    let mut has_digits = false;
+    let mut matched_unit = false;
+    for ch in token.chars() {
+        if let Some(d) = ch.to_digit(10) {
+            num = num.saturating_mul(10).saturating_add(i64::from(d));
+            has_digits = true;
+        } else if has_digits {
+            let factor = match ch {
+                'd' => 86_400_000,
+                'h' => 3_600_000,
+                'm' => 60_000,
+                's' => 1_000,
+                _ => return None,
+            };
+            total_ms = total_ms.saturating_add(num.saturating_mul(factor));
+            num = 0;
+            has_digits = false;
+            matched_unit = true;
+        } else {
+            return None;
+        }
+    }
+    (matched_unit && !has_digits && total_ms > 0).then_some(total_ms)
 }
 
 /// The line that puts one message into the child.

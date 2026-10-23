@@ -42,12 +42,26 @@ struct AgentsResponse {
 
 #[derive(Deserialize)]
 struct AgentView {
+    id: String,
     name: String,
+    #[serde(default)]
+    parent: Option<String>,
     harness: String,
     state: String,
     process: String,
     delivery_mode: String,
     steer_support: String,
+}
+
+#[derive(Deserialize)]
+struct GroupsResponse {
+    groups: Vec<GroupView>,
+}
+
+#[derive(Deserialize)]
+struct GroupView {
+    name: String,
+    members: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -65,6 +79,16 @@ struct Delivery {
 #[derive(Deserialize)]
 struct InboxResponse {
     messages: Vec<MessageView>,
+}
+
+#[derive(Deserialize)]
+struct ConversationResponse {
+    turns: Vec<ConversationTurnView>,
+}
+
+#[derive(Deserialize)]
+struct ConversationTurnView {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -91,6 +115,7 @@ fn start_server(data: &std::path::Path) -> Serve {
         .arg("--data")
         .arg(data)
         .arg("serve")
+        .env("PATH", machine_path(data))
         .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
         .stdout(Stdio::null())
@@ -373,6 +398,130 @@ async fn mcp_tools_use_the_server_socket() {
     .await;
     assert!(error_text(&empty).contains("send needs an address"));
 
+    // Cross-agent conversation reading: alpha can read beta's conversation by name or ID, with optional limit.
+    let peer_conv: ConversationResponse = ok_json(
+        call(
+            &alpha,
+            "conversation",
+            serde_json::json!({"agent": "beta", "limit": 2}),
+        )
+        .await,
+    );
+    assert_eq!(peer_conv.turns.len(), 2);
+    assert_eq!(peer_conv.turns[1].text, "room line");
+
+    // Pure internal group creation & membership via `groups` MCP tool.
+    let joined_group: GroupsResponse = ok_json(
+        call(
+            &alpha,
+            "groups",
+            serde_json::json!({"action": "join", "group": "brain-trust"}),
+        )
+        .await,
+    );
+    assert_eq!(joined_group.groups[0].name, "brain-trust");
+    assert!(
+        joined_group.groups[0]
+            .members
+            .contains(&"alpha".to_string())
+    );
+    let _: GroupsResponse = ok_json(
+        call(
+            &beta,
+            "groups",
+            serde_json::json!({"action": "join", "group": "brain-trust"}),
+        )
+        .await,
+    );
+    let all_groups: GroupsResponse =
+        ok_json(call(&alpha, "groups", serde_json::json!({"action": "list"})).await);
+    assert!(
+        all_groups
+            .groups
+            .iter()
+            .any(|g| g.name == "brain-trust" && g.members.len() == 2)
+    );
+
+    // Sub-agent spawning (`spawn`), `parent`/`children`/`all` addressing, `archive`, and auto-wake on send.
+    let alpha_id = created_id(dir.path(), "alpha");
+    let spawned: AgentView = ok_json(
+        call(
+            &alpha,
+            "spawn",
+            serde_json::json!({
+                "name": "worker-1",
+                "prompt": "initial subagent task"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(spawned.name, "worker-1");
+    assert_eq!(spawned.parent.as_deref(), Some(alpha_id.as_str()));
+    assert_eq!(spawned.state, "running");
+
+    // Parent can read sub-agent's conversation by `agt_...` ID.
+    let worker_conv: ConversationResponse = ok_json(
+        call(
+            &alpha,
+            "conversation",
+            serde_json::json!({"agent": &spawned.id}),
+        )
+        .await,
+    );
+    assert_eq!(worker_conv.turns.len(), 1);
+    assert_eq!(worker_conv.turns[0].text, "initial subagent task");
+
+    // Parent can broadcast to `children`.
+    let to_children: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["children"], "text": "for my children"}),
+        )
+        .await,
+    );
+    assert_eq!(to_children.deliveries.len(), 1);
+    assert_eq!(to_children.deliveries[0].to, "agent:worker-1");
+
+    // Archive the sub-agent (`state = archived`), then send to its `agt_...` ID and verify it auto-wakes.
+    let archived: AgentView =
+        ok_json(call(&alpha, "archive", serde_json::json!({"agent": &spawned.id})).await);
+    assert_eq!(archived.state, "archived");
+
+    // While archived, `group:all` skips it.
+    let to_all: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["all"], "text": "broadcast to active"}),
+        )
+        .await,
+    );
+    let all_recipients: Vec<&str> = to_all.deliveries.iter().map(|d| d.to.as_str()).collect();
+    assert!(all_recipients.contains(&"agent:beta"), "{all_recipients:?}");
+    assert!(
+        !all_recipients.contains(&"agent:worker-1"),
+        "{all_recipients:?}"
+    );
+
+    // Sending directly to the archived sub-agent's `agt_...` ID wakes and resumes it automatically!
+    let resumed_send: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": [&spawned.id], "text": "wake up and continue"}),
+        )
+        .await,
+    );
+    assert_eq!(resumed_send.deliveries[0].to, "agent:worker-1");
+    let after_wake: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
+    let worker_row = after_wake
+        .agents
+        .iter()
+        .find(|a| a.id == spawned.id)
+        .expect("worker-1");
+    assert_eq!(worker_row.state, "running");
+
     alpha.cancel().await.unwrap();
     beta.cancel().await.unwrap();
     drop(server);
@@ -388,8 +537,9 @@ async fn mcp_tools_use_the_server_socket() {
         "{}",
         String::from_utf8_lossy(&inbox.stderr)
     );
-    // Two addressed lines and the room line, each readable from the CLI too.
+    // Two addressed lines, the room line, and the `all` broadcast line, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 3, "{listed}");
+    assert_eq!(listed.lines().count(), 4, "{listed}");
     assert!(listed.contains("room line"), "{listed}");
+    assert!(listed.contains("broadcast to active"), "{listed}");
 }

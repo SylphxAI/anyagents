@@ -64,10 +64,15 @@ fn start_server(data: &Path) -> Serve {
 /// The capability the server left in one agent's own config directory. Reading
 /// it here stands for the agent's own process reading its own file.
 fn capability(data: &Path, id: &str) -> String {
-    std::fs::read_to_string(data.join("agents").join(id).join("config").join("mcp-capability"))
-        .expect("the server minted a capability")
-        .trim()
-        .to_string()
+    std::fs::read_to_string(
+        data.join("agents")
+            .join(id)
+            .join("config")
+            .join("mcp-capability"),
+    )
+    .expect("the server minted a capability")
+    .trim()
+    .to_string()
 }
 
 fn create(data: &Path, name: &str) -> String {
@@ -109,10 +114,15 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &json!({"to": ["beta"], "text": "hello"}).to_string(),
         &alpha_auth,
     );
-    let sent: Value =
-        serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let sent: Value = serde_json::from_str(sent.split("\r\n\r\n").nth(1).unwrap()).unwrap();
     assert!(sent["deliveries"][0]["seq"].is_number(), "{sent}");
-    let beta_inbox = support::call_raw(&socket, "GET", &format!("/v1/agents/{beta}/inbox"), "", &beta_auth);
+    let beta_inbox = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{beta}/inbox"),
+        "",
+        &beta_auth,
+    );
     assert!(beta_inbox.contains("hello"), "{beta_inbox}");
     // The author recorded is the capability's agent, never the body.
     assert!(beta_inbox.contains("agent:alpha"), "{beta_inbox}");
@@ -126,26 +136,115 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &alpha_auth,
     );
     assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
-    // Another agent's inbox is refused.
-    let other = support::call_raw(&socket, "GET", &format!("/v1/agents/{alpha}/inbox"), "", &beta_auth);
-    assert!(other.starts_with("HTTP/1.1 403"), "{other}");
+    // An agent's inbox is strictly its own incoming queue; peers read each
+    // other's full two-way conversation via `/v1/agents/{name}/conversation`.
+    let other_inbox = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{alpha}/inbox"),
+        "",
+        &beta_auth,
+    );
+    assert!(other_inbox.starts_with("HTTP/1.1 403"), "{other_inbox}");
+    let other_conv = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{alpha}/conversation"),
+        "",
+        &beta_auth,
+    );
+    assert!(other_conv.starts_with("HTTP/1.1 200"), "{other_conv}");
+    assert!(other_conv.contains("hello"), "{other_conv}");
     // No capability at all is refused.
     let none = support::call_raw(&socket, "GET", "/v1/agents", "", "");
     assert!(none.starts_with("HTTP/1.1 401"), "{none}");
-    // An administrative route is refused to an agent.
-    let admin = support::call_raw(&socket, "POST", "/v1/agents", &json!({"name": "gamma"}).to_string(), &alpha_auth);
-    assert!(admin.starts_with("HTTP/1.1 403"), "{admin}");
-    let minted = support::call_raw(&socket, "POST", &format!("/v1/operator/agents/{beta}/capability"), "{}", &alpha_auth);
+    // An operator-only route is refused to an agent.
+    let op_inbox = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/operator/agents/{alpha}/inbox"),
+        "",
+        &beta_auth,
+    );
+    assert!(op_inbox.starts_with("HTTP/1.1 403"), "{op_inbox}");
+    let minted = support::call_raw(
+        &socket,
+        "POST",
+        &format!("/v1/operator/agents/{beta}/capability"),
+        "{}",
+        &alpha_auth,
+    );
     assert!(minted.starts_with("HTTP/1.1 403"), "{minted}");
 
     // Nothing from the refused calls reached a mailbox.
-    let after = support::call_raw(&socket, "GET", &format!("/v1/agents/{beta}/inbox"), "", &beta_auth);
+    let after = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{beta}/inbox"),
+        "",
+        &beta_auth,
+    );
     assert!(!after.contains("forged"), "{after}");
+
+    // An agent spawning a sub-agent via POST /v1/agents sets itself as parent.
+    let spawned = support::call_raw(
+        &socket,
+        "POST",
+        "/v1/agents",
+        &json!({"name": "gamma", "prompt": "subagent task"}).to_string(),
+        &alpha_auth,
+    );
+    assert!(spawned.starts_with("HTTP/1.1 201"), "{spawned}");
+    assert!(
+        spawned.contains(&format!("\"parent\":\"{alpha}\"")),
+        "{spawned}"
+    );
+    let gamma_conv = support::call_raw(
+        &socket,
+        "GET",
+        "/v1/agents/gamma/conversation",
+        "",
+        &alpha_auth,
+    );
+    assert!(gamma_conv.contains("subagent task"), "{gamma_conv}");
+
+    // Archiving gamma sets state = archived, and sending to gamma wakes it back to running.
+    let archived = support::call_raw(
+        &socket,
+        "POST",
+        "/v1/agents/gamma/archive",
+        "{}",
+        &alpha_auth,
+    );
+    assert!(archived.contains("\"state\":\"archived\""), "{archived}");
+    let woke_send = support::call_raw(
+        &socket,
+        "POST",
+        "/v1/send",
+        &json!({"to": ["gamma"], "text": "resume now"}).to_string(),
+        &alpha_auth,
+    );
+    assert!(woke_send.starts_with("HTTP/1.1 200"), "{woke_send}");
     let agents = support::call_raw(&socket, "GET", "/v1/agents", "", &support::header());
-    assert!(!agents.contains("gamma"), "{agents}");
+    let agents_json: Value =
+        serde_json::from_str(agents.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let gamma_row = agents_json["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "gamma")
+        .unwrap();
+    assert_eq!(gamma_row["state"], "running", "{gamma_row}");
+    assert_eq!(gamma_row["parent"], alpha, "{gamma_row}");
 
     // A replaced session stops working at once.
-    let re_minted = support::call_raw(&socket, "POST", "/v1/operator/agents/alpha/capability", "{}", &support::header());
+    let re_minted = support::call_raw(
+        &socket,
+        "POST",
+        "/v1/operator/agents/alpha/capability",
+        "{}",
+        &support::header(),
+    );
     assert!(re_minted.contains("minted"), "{re_minted}");
     let old = support::call_raw(&socket, "GET", "/v1/agents", "", &alpha_auth);
     assert!(old.starts_with("HTTP/1.1 401"), "{old}");
@@ -156,9 +255,9 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     drop(server);
 }
 
-/// Each agent's capability opens that agent's mailbox and no other.
+/// Each agent's capability can read its own and peer mailboxes, while operator routes stay restricted.
 #[test]
-fn each_agents_capability_opens_only_its_own_mailbox() {
+fn each_agents_capability_reads_own_and_peer_mailboxes() {
     let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
@@ -171,13 +270,40 @@ fn each_agents_capability_opens_only_its_own_mailbox() {
     let alpha_token = capability(&data, &alpha);
     let beta_token = capability(&data, &beta);
     assert_ne!(alpha_token, beta_token);
-    // The operator's own token creates and reads; an agent's reads only its own.
     let as_alpha = format!("x-anyagents-agent: {alpha_token}\r\n");
     let as_beta = format!("x-anyagents-agent: {beta_token}\r\n");
-    let own = support::call_raw(&socket, "GET", &format!("/v1/agents/{alpha}/inbox"), "", &as_alpha);
+    let own = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{alpha}/inbox"),
+        "",
+        &as_alpha,
+    );
     assert!(own.starts_with("HTTP/1.1 200"), "{own}");
-    let peer = support::call_raw(&socket, "GET", &format!("/v1/agents/{alpha}/inbox"), "", &as_beta);
-    assert!(peer.starts_with("HTTP/1.1 403"), "{peer}");
+    let peer_inbox = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{alpha}/inbox"),
+        "",
+        &as_beta,
+    );
+    assert!(peer_inbox.starts_with("HTTP/1.1 403"), "{peer_inbox}");
+    let peer_conv = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/agents/{alpha}/conversation"),
+        "",
+        &as_beta,
+    );
+    assert!(peer_conv.starts_with("HTTP/1.1 200"), "{peer_conv}");
+    let op_route = support::call_raw(
+        &socket,
+        "GET",
+        &format!("/v1/operator/agents/{alpha}/inbox"),
+        "",
+        &as_beta,
+    );
+    assert!(op_route.starts_with("HTTP/1.1 403"), "{op_route}");
     drop(first);
 }
 
@@ -211,18 +337,18 @@ fn the_capability_file_of_one_agent_never_opens_another() {
         assert!(mode == 0o600 || mode == 0o640, "{path:?} is {mode:o}");
     }
 
-    // The whoma answer is the capability's agent, and its inbox cannot be the
-    // peer's.
+    // The whoami answer is the capability's agent, and operator routes cannot be
+    // called by an agent capability.
     let alpha_auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &alpha));
     let who = support::call_raw(&socket, "GET", "/v1/whoami", "", &alpha_auth);
     assert!(who.contains(&alpha), "{who}");
     assert!(!who.contains(&beta), "{who}");
-    let peer = support::call_raw(
+    let op_only = support::call_raw(
         &socket,
         "GET",
-        &format!("/v1/agents/{beta}/inbox"),
+        &format!("/v1/operator/agents/{beta}/inbox"),
         "",
         &alpha_auth,
     );
-    assert!(peer.starts_with("HTTP/1.1 403"), "{peer}");
+    assert!(op_only.starts_with("HTTP/1.1 403"), "{op_only}");
 }

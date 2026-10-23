@@ -35,6 +35,9 @@ pub fn now_ms() -> i64 {
 const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sender, body, \
      reply_to, received_at_ms, delivered_at_ms, origin, context";
 
+const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
+     created_at_ms, launch_env, parent_id";
+
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
@@ -49,6 +52,8 @@ pub struct Agent {
     /// The gateway origin and this agent's own gateway token, set at create.
     /// Never a provider key.
     pub launch_env: Vec<(String, String)>,
+    /// The parent agent that spawned this agent, when it is a child/sub-agent.
+    pub parent_id: Option<AgentId>,
 }
 
 /// Fields for `agents.create`. The harness value is a catalog key.
@@ -59,6 +64,7 @@ pub struct NewAgent {
     pub model: Option<String>,
     pub workdir: Option<String>,
     pub instructions: Option<String>,
+    pub parent_id: Option<AgentId>,
 }
 
 impl NewAgent {
@@ -69,6 +75,7 @@ impl NewAgent {
             model: None,
             workdir: None,
             instructions: None,
+            parent_id: None,
         }
     }
 }
@@ -187,6 +194,20 @@ pub struct Message {
 pub enum ReceiveOutcome {
     New(Message),
     Duplicate(Message),
+}
+
+/// One turn in an agent's bidirectional conversation timeline (`in` or `out`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ConversationTurn {
+    pub id: String,
+    /// `"in"` when received by this agent; `"out"` when sent by this agent.
+    pub direction: String,
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    pub text: String,
+    pub timestamp_ms: i64,
 }
 
 /// Age of the oldest message the harness has not taken. `None` means the agent
@@ -548,6 +569,7 @@ impl Store {
             state: "created".into(),
             created_at_ms: now_ms(),
             launch_env: Vec::new(),
+            parent_id: new.parent_id,
         };
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -561,8 +583,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -571,6 +593,7 @@ impl Store {
                 agent.workdir,
                 agent.instructions,
                 agent.created_at_ms,
+                agent.parent_id.as_ref().map(|id| id.as_str()),
             ],
         )?;
         tx.execute(
@@ -586,12 +609,12 @@ impl Store {
     }
 
     pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
+        let lookup = name.strip_prefix("agent:").unwrap_or(name);
         let conn = self.conn();
         let found = conn
             .query_row(
-                "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
-                 FROM agents WHERE name = ?1",
-                [name],
+                &format!("SELECT {AGENT_COLS} FROM agents WHERE name = ?1 OR id = ?1"),
+                [lookup],
                 agent_from_row,
             )
             .optional()?;
@@ -600,11 +623,21 @@ impl Store {
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
         let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
-             FROM agents ORDER BY name",
-        )?;
+        let mut stmt = conn.prepare(&format!("SELECT {AGENT_COLS} FROM agents ORDER BY name"))?;
         let mut rows = stmt.query([])?;
+        let mut agents = Vec::new();
+        while let Some(row) = rows.next()? {
+            agents.push(agent_from_row(row)?);
+        }
+        Ok(agents)
+    }
+
+    pub fn children_of(&self, parent_id: &AgentId) -> Result<Vec<Agent>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {AGENT_COLS} FROM agents WHERE parent_id = ?1 ORDER BY created_at_ms, name"
+        ))?;
+        let mut rows = stmt.query([parent_id.as_str()])?;
         let mut agents = Vec::new();
         while let Some(row) = rows.next()? {
             agents.push(agent_from_row(row)?);
@@ -637,7 +670,12 @@ impl Store {
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
-            if author.as_deref() == Some(agent.name.as_str()) {
+            if agent.state == "archived" {
+                continue;
+            }
+            if author.as_deref() == Some(agent.name.as_str())
+                || author.as_deref() == Some(agent.id.as_str())
+            {
                 continue;
             }
             if let Some(members) = &members
@@ -685,6 +723,15 @@ impl Store {
             return Ok(Some(self.chat_members(chat_id)?));
         }
         let name = room.strip_prefix("group:").unwrap_or(room);
+        if name == "all" {
+            let names = self
+                .list_agents()?
+                .into_iter()
+                .filter(|agent| agent.state != "archived")
+                .map(|agent| agent.name)
+                .collect();
+            return Ok(Some(names));
+        }
         let members = self.group_members(name)?;
         Ok(Some(members))
     }
@@ -752,6 +799,26 @@ impl Store {
             members.push(row.get(0)?);
         }
         Ok(members)
+    }
+
+    /// Every named group and its current members, ordered by group name.
+    pub fn list_groups(&self) -> Result<Vec<(String, Vec<String>)>, Error> {
+        let names: Vec<String> = {
+            let conn = self.conn();
+            let mut stmt = conn.prepare("SELECT name FROM groups ORDER BY name")?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(row.get(0)?);
+            }
+            out
+        };
+        let mut groups = Vec::with_capacity(names.len());
+        for name in names {
+            let members = self.group_members(&name)?;
+            groups.push((name, members));
+        }
+        Ok(groups)
     }
 
     pub fn create_channel(&self, new: NewChannel) -> Result<Channel, Error> {
@@ -853,21 +920,6 @@ impl Store {
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
         let body = incoming.body();
-        // The trusted header is built from the record that arrives, before any
-        // field is moved into the row: the author, the channel, the chat and
-        // topic, and the reply a bare answer reaches.
-        let context = anyagents_harness::Context {
-            sender: incoming.sender.clone(),
-            channel: incoming
-                .sender
-                .as_deref()
-                .filter(|sender| sender.starts_with("telegram:"))
-                .map(|_| "telegram".to_string()),
-            chat_id: incoming.origin.and_then(|origin| origin.chat_id),
-            thread_id: incoming.origin.and_then(|origin| origin.thread_id),
-            message_id: incoming.origin.and_then(|origin| origin.message_id),
-            destination: incoming.reply_to.clone(),
-        };
         let source_key = incoming.source_key.filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let mut conn = self.conn();
@@ -878,6 +930,75 @@ impl Store {
         {
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
+        if let Some(origin) = incoming.origin
+            && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
+            && !incoming.text.starts_with("[Edited ")
+            && let Some(existing) = message_by_origin(
+                &tx,
+                agent_id,
+                chat_id,
+                message_id,
+                incoming.sender.as_deref(),
+                incoming.source_time_ms,
+                &body,
+                source_key.as_deref(),
+            )?
+        {
+            tx.commit()?;
+            return Ok(ReceiveOutcome::Duplicate(existing));
+        }
+        let event = if incoming.text.starts_with("[Pinned message #")
+            || incoming.text.starts_with("[pinned message")
+        {
+            Some("pinned".to_string())
+        } else if incoming.text.starts_with("[Edited message #") {
+            Some("edited".to_string())
+        } else {
+            None
+        };
+        let mentions = resolve_mentions(&tx, &incoming.text);
+        // The trusted header is built from the record that arrives, before any
+        // field is moved into the row: the author, the channel, the chat and
+        // topic, and the reply a bare answer reaches.
+        let context = anyagents_harness::Context {
+            sender: incoming.sender.clone(),
+            channel: incoming
+                .sender
+                .as_deref()
+                .filter(|sender| sender.starts_with("telegram:"))
+                .map(|_| "telegram".to_string())
+                .or_else(|| {
+                    incoming
+                        .origin
+                        .and_then(|o| o.chat_id)
+                        .map(|_| "telegram".to_string())
+                }),
+            chat_id: incoming.origin.and_then(|origin| origin.chat_id),
+            thread_id: incoming.origin.and_then(|origin| origin.thread_id),
+            message_id: incoming.origin.and_then(|origin| origin.message_id),
+            destination: incoming.reply_to.clone().or_else(|| {
+                source_key
+                    .as_deref()
+                    .and_then(|k| k.strip_prefix("room:"))
+                    .and_then(|rest| rest.split(':').next())
+                    .map(|room| {
+                        if room.starts_with("group:") || room.starts_with("telegram:") {
+                            room.to_string()
+                        } else {
+                            format!("group:{room}")
+                        }
+                    })
+                    .or_else(|| {
+                        incoming
+                            .sender
+                            .as_deref()
+                            .filter(|s| s.starts_with("agent:"))
+                            .map(str::to_string)
+                    })
+            }),
+            event,
+            mentions,
+        };
         let message = Message {
             id: MessageId::generate(),
             agent_id: agent_id.clone(),
@@ -913,8 +1034,17 @@ impl Store {
                 serde_json::to_string(&message.context).ok(),
             ],
         )?;
+        let woke_archived = tx.execute(
+            "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'archived'",
+            [agent_id.as_str()],
+        )? > 0;
         tx.commit()?;
         drop(conn);
+        if woke_archived {
+            self.notify(Wake::Agent {
+                agent_id: agent_id.clone(),
+            });
+        }
         self.notify(Wake::Mail {
             agent_id: agent_id.clone(),
         });
@@ -978,6 +1108,26 @@ impl Store {
         Ok(changed)
     }
 
+    /// Update an agent's lifecycle state (`running`, `archived`, `stopped`) and
+    /// notify the supervisor so it starts or stops the worker slot.
+    pub fn set_agent_state(&self, id: &AgentId, state: &str) -> Result<Agent, Error> {
+        let changed = {
+            let conn = self.conn();
+            let updated = conn.execute(
+                "UPDATE agents SET state = ?1 WHERE id = ?2",
+                params![state, id.as_str()],
+            )?;
+            if updated == 0 {
+                return Err(Error::AgentNotFound(id.to_string()));
+            }
+            agent_by_id(&conn, id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(changed)
+    }
+
     /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
         let conn = self.conn();
@@ -992,6 +1142,106 @@ impl Store {
             messages.push(message_from_row(&conn, row)?);
         }
         Ok(messages)
+    }
+
+    /// Record an outbound message sent by `agent_id` to `destination` (a user,
+    /// a channel chat/topic, a group, or another agent) so the agent's full
+    /// two-way conversation can be read by any peer agent.
+    pub fn record_outbound(
+        &self,
+        agent_id: &AgentId,
+        destination: &str,
+        reply_to: Option<&str>,
+        body: &str,
+    ) -> Result<String, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let id = format!("out_{}", MessageId::generate());
+        conn.execute(
+            "INSERT INTO outbound_messages (id, agent_id, destination, reply_to, body, sent_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, agent_id.as_str(), destination, reply_to, body, now_ms(),],
+        )?;
+        Ok(id)
+    }
+
+    /// Read the complete two-way (`in` + `out`) conversation of `agent_id` across
+    /// users, external channels, internal groups, and other agents, ordered
+    /// chronologically. Optional `with_peer` filters to a specific user/chat/group/agent.
+    pub fn conversation(
+        &self,
+        agent_id: &AgentId,
+        with_peer: Option<&str>,
+        since_ms: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ConversationTurn>, Error> {
+        let conn = self.conn();
+        let agent = agent_by_id(&conn, agent_id)?;
+        let self_addr = format!("agent:{}", agent.name);
+        let since = since_ms.unwrap_or(0);
+        let mut turns = Vec::new();
+
+        // 1. Inbound messages received by this agent.
+        let mut in_stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS}
+             FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2 ORDER BY received_at_ms, seq"
+        ))?;
+        let mut in_rows = in_stmt.query(params![agent_id.as_str(), since])?;
+        while let Some(row) = in_rows.next()? {
+            let msg = message_from_row(&conn, row)?;
+            let from = msg.sender.unwrap_or_else(|| "unknown".to_string());
+            let to = msg
+                .reply_to
+                .clone()
+                .filter(|r| r.starts_with("telegram:chat:") || r.starts_with("group:"))
+                .unwrap_or_else(|| self_addr.clone());
+            turns.push(ConversationTurn {
+                id: msg.id.to_string(),
+                direction: "in".to_string(),
+                from,
+                to,
+                reply_to: msg.reply_to,
+                text: msg.text,
+                timestamp_ms: msg.received_at_ms,
+            });
+        }
+
+        // 2. Outbound messages sent by this agent.
+        let mut out_stmt = conn.prepare(
+            "SELECT id, destination, reply_to, body, sent_at_ms
+             FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2 ORDER BY sent_at_ms, id",
+        )?;
+        let mut out_rows = out_stmt.query(params![agent_id.as_str(), since])?;
+        while let Some(row) = out_rows.next()? {
+            turns.push(ConversationTurn {
+                id: row.get(0)?,
+                direction: "out".to_string(),
+                from: self_addr.clone(),
+                to: row.get(1)?,
+                reply_to: row.get(2)?,
+                text: row.get(3)?,
+                timestamp_ms: row.get(4)?,
+            });
+        }
+
+        if let Some(peer) = with_peer.map(str::trim).filter(|s| !s.is_empty()) {
+            turns.retain(|turn| matches_conversation_peer(turn, peer));
+        }
+
+        turns.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+
+        if let Some(limit) = limit {
+            if since_ms.is_none() && turns.len() > limit {
+                turns.drain(..turns.len() - limit);
+            } else if turns.len() > limit {
+                turns.truncate(limit);
+            }
+        }
+        Ok(turns)
     }
 
     /// The next message the harness has not taken, or `None` when delivery has
@@ -1331,8 +1581,7 @@ fn channel_with(conn: &Connection, id: &ChannelId) -> Result<Channel, Error> {
 fn agent_by_id(conn: &Connection, id: &AgentId) -> Result<Agent, Error> {
     let found = conn
         .query_row(
-            "SELECT id, name, harness, model, workdir, instructions, state, created_at_ms, launch_env
-             FROM agents WHERE id = ?1",
+            &format!("SELECT {AGENT_COLS} FROM agents WHERE id = ?1"),
             [id.as_str()],
             agent_from_row,
         )
@@ -1470,6 +1719,13 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
     let id: String = row.get(0)?;
     let agent_id = AgentId::parse(&id)
         .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?;
+    let parent_id = match row.get::<_, Option<String>>(9)? {
+        Some(raw) if !raw.is_empty() => Some(
+            AgentId::parse(&raw)
+                .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?,
+        ),
+        _ => None,
+    };
     Ok(Agent {
         id: agent_id,
         name: row.get(1)?,
@@ -1483,6 +1739,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
             .get::<_, Option<String>>(8)?
             .map(|json| decode_env(&json))
             .unwrap_or_default(),
+        parent_id,
     })
 }
 
@@ -1584,6 +1841,216 @@ fn message_by_source(
         )
         .optional()?;
     found.transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn message_by_origin(
+    conn: &Connection,
+    agent_id: &AgentId,
+    chat_id: i64,
+    message_id: i64,
+    incoming_sender: Option<&str>,
+    incoming_source_time_ms: Option<i64>,
+    incoming_body: &str,
+    incoming_source_key: Option<&str>,
+) -> Result<Option<Message>, Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MESSAGE_COLS} FROM messages
+         WHERE agent_id = ?1 AND origin IS NOT NULL ORDER BY seq DESC LIMIT 64"
+    ))?;
+    let mut rows = stmt.query([agent_id.as_str()])?;
+    let in_user = telegram_sender_user_key(incoming_sender);
+    let in_is_relay =
+        incoming_source_key.is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
+    while let Some(row) = rows.next()? {
+        let mut msg = message_from_row(conn, row)?;
+        let Some(origin) = msg.origin else {
+            continue;
+        };
+        if origin.chat_id != Some(chat_id) {
+            continue;
+        }
+        if origin.message_id == Some(message_id) {
+            return Ok(Some(msg));
+        }
+        // Basic Telegram groups (`chat_type == "group"`, negative non-`-100...` IDs)
+        // assign each bot its own account-local `message_id` for the same human
+        // message. Match by `(chat_id, sender user, source_time_ms, body)` so cross-bot
+        // passive relay and direct webhook delivery coalesce into a single message.
+        let stored_is_relay = msg
+            .source_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
+        if (in_is_relay || stored_is_relay)
+            && msg.text == incoming_body
+            && in_user.is_some()
+            && in_user == telegram_sender_user_key(msg.sender.as_deref())
+            && match (msg.source_time_ms, incoming_source_time_ms) {
+                (Some(a), Some(b)) => (a - b).abs() <= 5_000,
+                _ => (now_ms() - msg.received_at_ms).abs() <= 15_000,
+            }
+        {
+            if !in_is_relay && stored_is_relay {
+                let mut updated_origin = origin;
+                updated_origin.message_id = Some(message_id);
+                let mut updated_context = msg.context.clone();
+                updated_context.message_id = Some(message_id);
+                let _ = conn.execute(
+                    "UPDATE messages SET origin = ?1, context = ?2 WHERE id = ?3",
+                    params![
+                        serde_json::to_string(&updated_origin).unwrap_or_default(),
+                        serde_json::to_string(&updated_context).ok(),
+                        msg.id.as_str(),
+                    ],
+                );
+                msg.origin = Some(updated_origin);
+                msg.context = updated_context;
+            }
+            return Ok(Some(msg));
+        }
+    }
+    Ok(None)
+}
+
+fn telegram_sender_user_key(sender: Option<&str>) -> Option<String> {
+    let s = sender?;
+    if let Some(rest) = s.strip_prefix("telegram:user:") {
+        let uid = rest.split(':').next()?;
+        return (!uid.is_empty()).then(|| format!("telegram:user:{uid}"));
+    }
+    if s.starts_with("agent:") {
+        return Some(s.to_string());
+    }
+    None
+}
+
+fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {
+    let bare = peer
+        .strip_prefix("agent:")
+        .or_else(|| peer.strip_prefix("group:"))
+        .or_else(|| peer.strip_prefix("telegram:chat:"))
+        .or_else(|| peer.strip_prefix("telegram:user:"))
+        .unwrap_or(peer);
+    let fields = [
+        Some(turn.from.as_str()),
+        Some(turn.to.as_str()),
+        turn.reply_to.as_deref(),
+    ];
+    fields.into_iter().flatten().any(|field| {
+        field == peer
+            || field == bare
+            || field.starts_with(&format!("{peer}:"))
+            || field.ends_with(&format!(":{bare}"))
+            || field.contains(&format!(":{bare}:"))
+    })
+}
+
+fn resolve_mentions(conn: &Connection, text: &str) -> Vec<String> {
+    if !text.contains('@') {
+        return Vec::new();
+    }
+    let handles = extract_at_handles(text);
+    if handles.is_empty() {
+        return Vec::new();
+    }
+    let mut bot_to_agent: Vec<(String, String)> = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT c.state, a.name
+         FROM channels c
+         JOIN channel_agents ca ON ca.channel_id = c.id
+         JOIN agents a ON a.id = ca.agent_id
+         WHERE c.kind = 'telegram'",
+    ) && let Ok(mut rows) = stmt.query([])
+    {
+        while let Ok(Some(row)) = rows.next() {
+            let Ok(state) = row.get::<_, String>(0) else {
+                continue;
+            };
+            let Ok(agent_name) = row.get::<_, String>(1) else {
+                continue;
+            };
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&state)
+                && let Some(bot) = val.get("bot").and_then(serde_json::Value::as_str)
+                && let Some((_, username)) = bot.split_once(':')
+                && !username.is_empty()
+            {
+                bot_to_agent.push((username.to_string(), agent_name));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    for handle in handles {
+        let agent_match: Option<String> = conn
+            .query_row(
+                "SELECT name FROM agents WHERE LOWER(name) = LOWER(?1)",
+                [&handle],
+                |row| row.get(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .or_else(|| {
+                bot_to_agent
+                    .iter()
+                    .find(|(bot_user, _)| bot_user.eq_ignore_ascii_case(&handle))
+                    .map(|(_, agent)| agent.clone())
+            });
+        let entry = match agent_match {
+            Some(agent) => format!("@{handle} (agent:{agent})"),
+            None => format!("@{handle}"),
+        };
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    out
+}
+
+fn extract_at_handles(text: &str) -> Vec<String> {
+    let mut handles = Vec::new();
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1 == '@' {
+            let valid_prefix = i == 0 || {
+                let prev = chars[i - 1].1;
+                !prev.is_ascii_alphanumeric() && prev != '_' && prev != '.'
+            };
+            if valid_prefix {
+                let mut j = i + 1;
+                while j < chars.len() {
+                    let c = chars[j].1;
+                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                        j += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let len = j - (i + 1);
+                let followed_by_domain = j + 1 < chars.len()
+                    && chars[j].1 == '.'
+                    && chars[j + 1].1.is_ascii_alphanumeric();
+                if (1..=64).contains(&len) && !followed_by_domain {
+                    let start_byte = chars[i + 1].0;
+                    let end_byte = if j < chars.len() {
+                        chars[j].0
+                    } else {
+                        text.len()
+                    };
+                    let handle = text[start_byte..end_byte]
+                        .trim_end_matches(['-', '_'])
+                        .to_string();
+                    if !handle.is_empty() && !handles.contains(&handle) {
+                        handles.push(handle);
+                    }
+                }
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    handles
 }
 
 fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
@@ -2204,5 +2671,94 @@ mod tests {
                 .iter()
                 .any(|message| message.text == "kept")
         );
+    }
+
+    #[test]
+    fn origin_dedup_mentions_pinned_and_auto_wake() {
+        let (_dir, store) = setup();
+        let alice = agent(&store, "alice");
+        let bob = agent(&store, "bob");
+        let ch = store
+            .create_channel(NewChannel {
+                kind: "telegram".into(),
+                identity: Some("999:bob_helper_bot".into()),
+                config: "{}".into(),
+                credential_ref: Some("secret-ref".into()),
+            })
+            .unwrap();
+        store.attach_channel(&ch.id, &bob.id).unwrap();
+        store
+            .set_channel_state(
+                &ch.id,
+                r#"{"bot":"999:bob_helper_bot","offset":null,"chats":[]}"#,
+            )
+            .unwrap();
+
+        // Archive alice, then send a message with @bob_helper_bot, @alice, and pinned event.
+        store.set_agent_state(&alice.id, "archived").unwrap();
+        assert_eq!(store.agent_by_name("alice").unwrap().state, "archived");
+
+        let origin = Origin {
+            chat_id: Some(-100123),
+            thread_id: Some(7),
+            message_id: Some(555),
+        };
+        let outcome = store
+            .receive(
+                &alice.id,
+                Incoming {
+                    text: "[pinned message] Hey @bob_helper_bot and @alice please check"
+                        .to_string(),
+                    sender: Some("telegram:user:42:555".to_string()),
+                    source_time_ms: None,
+                    source_key: Some("100:1".to_string()),
+                    reply_to: Some("telegram:chat:-100123:7".to_string()),
+                    quote: None,
+                    origin: Some(origin),
+                    received_at_ms: None,
+                },
+            )
+            .unwrap();
+        let ReceiveOutcome::New(msg) = outcome else {
+            panic!("expected New");
+        };
+        // Alice auto-woke to running!
+        assert_eq!(store.agent_by_name("alice").unwrap().state, "running");
+        // Context includes event: pinned and resolved mentions!
+        assert_eq!(msg.context.event.as_deref(), Some("pinned"));
+        assert!(
+            msg.context
+                .mentions
+                .contains(&"@bob_helper_bot (agent:bob)".to_string()),
+            "{:?}",
+            msg.context.mentions
+        );
+        assert!(
+            msg.context
+                .mentions
+                .contains(&"@alice (agent:alice)".to_string()),
+            "{:?}",
+            msg.context.mentions
+        );
+
+        // A second delivery of the same (chat_id, message_id) from a peer bot relay with a different source_key is deduplicated!
+        let dup = store
+            .receive(
+                &alice.id,
+                Incoming {
+                    text: "[pinned message] Hey @bob_helper_bot and @alice please check"
+                        .to_string(),
+                    sender: Some("telegram:user:42:555".to_string()),
+                    source_time_ms: None,
+                    source_key: Some("peer:100:1:alice".to_string()),
+                    reply_to: Some("telegram:chat:-100123:7".to_string()),
+                    quote: None,
+                    origin: Some(origin),
+                    received_at_ms: None,
+                },
+            )
+            .unwrap();
+        assert!(matches!(dup, ReceiveOutcome::Duplicate(_)));
+        assert_eq!(store.inbox(&alice.id, None).unwrap().len(), 1);
     }
 }

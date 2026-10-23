@@ -67,6 +67,9 @@ struct State {
     /// whatever service the machine happens to run.
     service: Option<String>,
     password: Option<String>,
+    last_usage_poll: Option<Instant>,
+    last_usage_written: usize,
+    cached_usage: TurnUsage,
 }
 
 impl OpenCodeHarness {
@@ -294,6 +297,28 @@ impl OpenCodeHarness {
             }
         }
         self.remember_session();
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
+            // OpenCode boots location services and MCP servers lazily on the first
+            // directory-scoped call (`GET /api/mcp` or `POST /api/session/<id>/prompt`).
+            // Poll `GET /api/mcp` briefly so the `anyagents` MCP server is connected
+            // before the very first turn builds its tool catalog.
+            for _ in 0..15 {
+                let Ok(mcp) = self.api("GET", "/api/mcp", None) else {
+                    break;
+                };
+                let Some(items) = mcp.get("data").and_then(Value::as_array) else {
+                    break;
+                };
+                if items.iter().any(|item| {
+                    item.get("name").and_then(Value::as_str) == Some("anyagents")
+                        && item.pointer("/status/status").and_then(Value::as_str)
+                            == Some("connected")
+                }) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
         Ok(())
     }
 
@@ -522,18 +547,35 @@ impl Harness for OpenCodeHarness {
     /// The session's own running totals, read from the session itself rather
     /// than from anything this adapter kept. The host records the difference.
     fn served_usage(&self) -> TurnUsage {
-        let Some(session) = self.lock().session.clone() else {
-            return TurnUsage::default();
+        let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
+        let (session, written_len) = {
+            let state = self.lock();
+            let Some(session) = state.session.clone() else {
+                return TurnUsage::default();
+            };
+            if !fake_mode {
+                if state.written.is_empty() {
+                    return state.cached_usage.clone();
+                }
+                if state.last_usage_written == state.written.len()
+                    && state
+                        .last_usage_poll
+                        .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+                {
+                    return state.cached_usage.clone();
+                }
+            }
+            (session, state.written.len())
         };
         let Ok(info) = self.api("GET", &format!("/api/session/{session}"), None) else {
-            return TurnUsage::default();
+            return self.lock().cached_usage.clone();
         };
         let Some(info) = info.get("data") else {
-            return TurnUsage::default();
+            return self.lock().cached_usage.clone();
         };
         let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
         let number = |key: &str| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
-        TurnUsage {
+        let usage = TurnUsage {
             input_tokens: number("input"),
             output_tokens: number("output"),
             cache_read_tokens: tokens
@@ -548,7 +590,12 @@ impl Harness for OpenCodeHarness {
                 .get("cost")
                 .and_then(Value::as_f64)
                 .map(|cost| (cost * 1_000_000.0) as i64),
-        }
+        };
+        let mut state = self.lock();
+        state.last_usage_poll = Some(Instant::now());
+        state.last_usage_written = written_len;
+        state.cached_usage = usage.clone();
+        usage
     }
 
     fn poll_steer(&mut self) -> Result<Option<SteerItem>, HarnessError> {

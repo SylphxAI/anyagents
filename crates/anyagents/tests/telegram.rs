@@ -228,7 +228,10 @@ impl Server {
             .env("ANYAGENTS_AGENTS", support::agents_line())
             // The server reads its operator's token from this file, the one
             // every call in the test presents.
-            .env("ANYAGENTS_OPERATOR_TOKEN_FILE", dir.join(support::TOKEN_FILE))
+            .env(
+                "ANYAGENTS_OPERATOR_TOKEN_FILE",
+                dir.join(support::TOKEN_FILE),
+            )
             .arg("--data")
             .arg(dir)
             .arg("serve")
@@ -261,7 +264,10 @@ impl Drop for Server {
 
 fn create(dir: &Path, name: &str) -> String {
     let created = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", dir.join(support::TOKEN_FILE))
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            dir.join(support::TOKEN_FILE),
+        )
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
@@ -292,7 +298,10 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
     let token_file = dir.join("bot-token");
     std::fs::write(&token_file, token).unwrap();
     let added = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", dir.join(support::TOKEN_FILE))
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            dir.join(support::TOKEN_FILE),
+        )
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
@@ -812,7 +821,7 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
-    // Kyle (42) quotes Sage's message (60) in group -1007, topic 3, at message
+    // Alex (42) quotes Sage's message (60) in group -1007, topic 3, at message
     // 61; the bot Ada received it.
     let quoting = json!({
         "update_id": 30,
@@ -821,7 +830,7 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
             "message_thread_id": 3,
             "is_topic_message": true,
             "chat": {"id": -1007, "type": "supergroup", "is_forum": true},
-            "from": {"id": 42, "is_bot": false, "first_name": "Kyle"},
+            "from": {"id": 42, "is_bot": false, "first_name": "Alex"},
             "reply_to_message": {
                 "message_id": 60,
                 "chat": {"id": -1007, "type": "supergroup"},
@@ -841,15 +850,17 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
     let socket = data.join("anyagents.sock");
 
     // The agent reads the line with its trusted context and its quote.
-    let agent_id = support::call(&socket, "GET", "/v1/agents", "")
-        .1["agents"][0]["id"]
+    let agent_id = support::call(&socket, "GET", "/v1/agents", "").1["agents"][0]["id"]
         .as_str()
         .expect("ada")
         .to_string();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let (_, read) = support::call(&socket, "GET", "/v1/operator/agents/ada/inbox", "");
-        let text = read["messages"][0]["text"].as_str().unwrap_or_default().to_string();
+        let text = read["messages"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         if text.contains("ship it") {
             break;
         }
@@ -858,7 +869,10 @@ fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
     }
     let (_, read) = support::call(&socket, "GET", "/v1/operator/agents/ada/inbox", "");
     let text = read["messages"][0]["text"].as_str().unwrap();
-    assert!(text.starts_with("ship it\n\n----- quoted message -----"), "{text}");
+    assert!(
+        text.starts_with("ship it\n\n----- quoted message -----"),
+        "{text}"
+    );
     assert!(text.contains("replied to Sage (@sage_bot):"), "{text}");
     assert!(text.contains("\"the schema is ready\""), "{text}");
     assert_eq!(read["messages"][0]["sender"], "telegram:user:42:61");
@@ -914,7 +928,10 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
         .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(&data))
         .env("ANYAGENTS_AGENTS", support::agents_line())
-        .env("ANYAGENTS_OPERATOR_TOKEN_FILE", data.join(support::TOKEN_FILE))
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            data.join(support::TOKEN_FILE),
+        )
         .arg("--data")
         .arg(&data)
         .arg("serve")
@@ -925,13 +942,16 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
     let server = Server { child };
     let addr_file = data.join("webhook.addr");
     wait_for(|| addr_file.exists(), "webhook listener did not bind");
-    let webhook_addr = std::fs::read_to_string(&addr_file).unwrap().trim().to_string();
+    let webhook_addr = std::fs::read_to_string(&addr_file)
+        .unwrap()
+        .trim()
+        .to_string();
 
     // Readiness check on the TCP webhook listener.
     let mut health_stream = TcpStream::connect(&webhook_addr).unwrap();
     write!(
         health_stream,
-        "GET /v1/webhooks/healthz HTTP/1.1\r\nHost: desk.kylet.se\r\nConnection: close\r\n\r\n"
+        "GET /v1/webhooks/healthz HTTP/1.1\r\nHost: webhooks.example.com\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
     let mut health_resp = String::new();
@@ -943,19 +963,24 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
     let mut forbidden_stream = TcpStream::connect(&webhook_addr).unwrap();
     write!(
         forbidden_stream,
-        "GET /v1/agents HTTP/1.1\r\nHost: desk.kylet.se\r\nConnection: close\r\n\r\n"
+        "GET /v1/agents HTTP/1.1\r\nHost: webhooks.example.com\r\nConnection: close\r\n\r\n"
     )
     .unwrap();
     let mut forbidden_resp = String::new();
-    forbidden_stream.read_to_string(&mut forbidden_resp).unwrap();
-    assert!(forbidden_resp.starts_with("HTTP/1.1 404"), "{forbidden_resp}");
+    forbidden_stream
+        .read_to_string(&mut forbidden_resp)
+        .unwrap();
+    assert!(
+        forbidden_resp.starts_with("HTTP/1.1 404"),
+        "{forbidden_resp}"
+    );
 
     // Wrong secret is rejected with 401.
     let payload = dm(99, 100, 77, "instant webhook message").to_string();
     let mut bad_stream = TcpStream::connect(&webhook_addr).unwrap();
     write!(
         bad_stream,
-        "POST /v1/webhooks/telegram/{channel_id} HTTP/1.1\r\nHost: desk.kylet.se\r\nX-Telegram-Bot-Api-Secret-Token: wrong\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        "POST /v1/webhooks/telegram/{channel_id} HTTP/1.1\r\nHost: webhooks.example.com\r\nX-Telegram-Bot-Api-Secret-Token: wrong\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     )
     .unwrap();
@@ -981,7 +1006,7 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
     let mut good_stream = TcpStream::connect(&webhook_addr).unwrap();
     write!(
         good_stream,
-        "POST /v1/webhooks/telegram/{channel_id} HTTP/1.1\r\nHost: desk.kylet.se\r\nX-Telegram-Bot-Api-Secret-Token: {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+        "POST /v1/webhooks/telegram/{channel_id} HTTP/1.1\r\nHost: webhooks.example.com\r\nX-Telegram-Bot-Api-Secret-Token: {secret}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
         payload.len()
     )
     .unwrap();

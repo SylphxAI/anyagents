@@ -39,6 +39,10 @@ pub(crate) fn authority(data: &Path) -> Authority {
     Authority::None
 }
 
+pub(crate) fn can_call_server(data: &Path) -> bool {
+    server::socket_path(data).exists() && !matches!(authority(data), Authority::None)
+}
+
 /// The agent whose config directory this process runs with, from the interface
 /// the deployment exports to an agent's harness. An id, never a name.
 pub(crate) fn agent_identity() -> Option<AgentId> {
@@ -46,9 +50,15 @@ pub(crate) fn agent_identity() -> Option<AgentId> {
     AgentId::parse(raw.trim()).ok()
 }
 
-fn capability(id: &AgentId) -> Option<String> {
-    let data = crate::data::data_dir()?;
-    let path = anyagents_core::agent_config_dir(&data, id).join(CAPABILITY_FILE);
+fn capability(data: &Path, id: &AgentId) -> Option<String> {
+    let dir = std::env::var_os("ANYAGENTS_AGENT_CONFIG")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            let root = crate::data::data_dir().unwrap_or_else(|| data.to_path_buf());
+            anyagents_core::agent_config_dir(&root, id)
+        });
+    let path = dir.join(CAPABILITY_FILE);
     let text = std::fs::read_to_string(path).ok()?;
     let token = text.trim().to_string();
     (!token.is_empty()).then_some(token)
@@ -64,7 +74,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
 ) -> Result<Option<T>, String> {
     let (agent_token, operator_token) = match authority {
         Authority::Operator => (None, crate::operator::operator_token(data)),
-        Authority::Agent(id) => (capability(id), None),
+        Authority::Agent(id) => (capability(data, id), None),
         Authority::None => (None, None),
     };
     // A boundary refuses a call that has no credential rather than answering
