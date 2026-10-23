@@ -375,20 +375,18 @@ impl CodexHarness {
 
     fn stop_child(&mut self) {
         *lock(&self.stdin) = None;
-        let mut child = {
+        let child = {
             let mut state = lock(&self.shared);
             state.alive = false;
             state.child.take()
         };
         self.wake.notify_all();
-        if let Some(child) = child.as_mut() {
-            anyagents_harness::kill_child(child, &self.environment);
+        if let Some(mut child) = child {
+            anyagents_harness::kill_child(&mut child, &self.environment);
+            let _ = child.wait();
         }
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
-        }
-        if let Some(mut child) = child {
-            let _ = child.wait();
         }
         let mut state = lock(&self.shared);
         state.open.clear();

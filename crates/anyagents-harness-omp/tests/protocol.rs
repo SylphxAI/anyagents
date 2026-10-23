@@ -4,7 +4,9 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyagents_harness::{Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport};
+use anyagents_harness::{
+    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport,
+};
 use anyagents_harness_omp::OmpHarness;
 use tempfile::TempDir;
 
@@ -16,9 +18,9 @@ fn msg(id: &str) -> OutboundMessage {
         sender: None,
         reply_to: None,
         source_time_ms: None,
-            context: Context::default(),
-        }
+        context: Context::default(),
     }
+}
 
 fn start(dir: &TempDir, mode: &str, session: Option<&str>) -> OmpHarness {
     let log = dir.path().join("log");

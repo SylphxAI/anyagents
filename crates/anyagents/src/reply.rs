@@ -319,10 +319,10 @@ mod tests {
 
     #[test]
     fn an_agent_message_is_answered_to_that_agent() {
-        let incoming = message(Some("agent:argon"), None);
+        let incoming = message(Some("agent:gamma"), None);
         assert_eq!(
             destination_of(&agent(), &incoming).unwrap().address(),
-            "agent:argon"
+            "agent:gamma"
         );
     }
 

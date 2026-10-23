@@ -1,6 +1,6 @@
 # AnyAgents architecture
 
-Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md).
+Status: design. Decisions behind it are in [adr/0001-server-first-one-binary.md](adr/0001-server-first-one-binary.md) and [adr/0002-runtime-drivers-and-capability-identity.md](adr/0002-runtime-drivers-and-capability-identity.md).
 
 ## The standard, and the shape
 
@@ -38,7 +38,7 @@ An agent is configured on three independent choices:
 
 | Axis | Values (first version) | Notes |
 | --- | --- | --- |
-| Harness | `claude-code`, `codex`, `opencode`, `agy`, `muse`, `gemini-cli`, `omp`, and more by adapter | Installed lazily when first chosen. |
+| Harness | `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, and more by adapter | Installed lazily when first chosen. |
 | Model | Claude, GPT, Gemini, DeepSeek, Grok, MiMo and any model a configured provider serves | Chosen separately from the harness. |
 | Auth | `subscription` or `api-key` | Decides which (harness, model) pairs are valid. |
 
@@ -118,7 +118,10 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
 | `claude-code` | `steer` | A `user` message on the stream-json child's stdin, at any point; the child echoes it, which is the acknowledgement. |
 | `muse` | `steer` | `turn/start` with `ifBusy: "steer"`. |
-| `agy` | `followup` | The CLI runs a turn per NDJSON input line. Pipe acceptance does not establish model consumption; native hook delivery is not wired (below). |
+| `omp` | `steer` | Stream-json child stdin with `steer` delivery into the active turn. |
+| `dsh` | `steer` | `POST /api/session/prompt` with `mode: "steer"` on the session controller HTTP gateway. |
+| `grok` | `steer` | ACP JSON-RPC 2.0 `session/prompt` over stdio with `follow_up_behavior = "steer"`. |
+| `agy` | `steer` | Stream-json child stdin plus native `LanguageServerService/SendUserCascadeMessage` Connect RPC steering into an open cascade turn. |
 | `followup` mode | `followup` | The contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per turn and answers with a `result`; a line written mid-turn waits for that turn to end. |
 
 No harness here uses `queue`: none of them is a one-shot run that must wait.
@@ -172,21 +175,21 @@ A channel adapter has an inbound side (a stream of events, each with its source 
 
 ## Identity: one authenticated connection per agent session
 
-A capability is 32 random bytes the server mints for one agent instance. The server keeps only its hash, beside the agent's immutable id and a generation: minting a new one revokes the last, so a replaced session stops working at once. The capability is written 0640 into the agent's own config directory (`agents/<id>/config/mcp-capability`), in that agent's own OS group, so its harness reads it and no other seat can. It is never an argument, a tool argument, an environment value or a log line.
+A capability is 32 random bytes the server mints for one agent instance. The server keeps only its hash, beside the agent's immutable id and a generation: minting a new one revokes the last, so a replaced session stops working at once. The capability is written `0600` into the agent's own config directory (`agents/<id>/config/mcp-capability`), or `0640` in that agent's own OS group when OS seats are configured, so its harness reads it and no other seat can. It is never an argument, a tool argument, an environment value or a log line.
 
 The server decides the principal before any route runs:
 
 - **An agent** is whatever agent the presented capability names, read from the store. A `sender`, an inbox path, a bot, a session id or an environment value never establishes identity. A body that names another sender is refused with no write.
 - **The operator** is the deployment's own authority, for its administrative calls only: creating agents, signing a harness in, minting a capability, reading any agent's inbox. It presents a token from a file the environment names, and the server keeps only a digest of it.
-- **A machine without an operator token** is the single-user route: it acts as the agent a call names, and says so once at start. It is not the identity boundary.
+- **A machine without an operator token** is the single-user route: it acts as the agent a call names, and says so once at start.
 
-## The OS boundary
+## Runtime boundaries: local, container, cluster and OS seat
 
-A server started with an operator token is the identity boundary, and it only serves that way when every harness it starts is inside the agent's own OS seat: a distinct managed uid per agent, placed by an installed launcher (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). The uid comes from the deployment's own start line, never from anything an agent writes.
+AnyAgents separates **session identity** (`mcp-capability`) from the **runtime execution environment** ([ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md)). AnyAgents never brokers external tool credentials (`kubectl`, `gh`, `ssh`, `1Password` or cloud IAM); external credentials and hardware belong to the runtime environment:
 
-`anyagents agent-run --config <dir> -- <command>` starts one agent command inside that seat, or refuses and prints the one admission it needs. Before a command starts, it asserts what the new process is: its effective uid is the configured one and not the server's, `NoNewPrivs` is 1, the server's database, secrets, socket and token and a peer's config are denied, and its own config is writable. A successful probe alone proves nothing.
-
-Every harness adapter, and every process an adapter starts, takes the seat from the launch environment the server set for that one agent.
+1. **Local host (`local`, default):** When no OS seats are configured, every harness process runs under the server user's own UID and keeps the user's real `HOME` directory. Host CLI tools, SSH keys, kubeconfigs and local hardware/GPUs work out of the box with zero configuration, while each agent's harness state (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `XDG_CONFIG_HOME` / `XDG_DATA_HOME` / `XDG_STATE_HOME`, `AGY_CONFIG_DIR`, `MUSE_CONFIG_HOME`, `PI_CODING_AGENT_DIR`) and `0600` `mcp-capability` are isolated under `<data>/agents/<id>/config`.
+2. **Container (`docker`) and cluster (`k8s`):** Each agent runs as the single user inside its own container or Pod, connects to the switchboard with its `mcp-capability`, and receives external credentials, volumes and GPU devices through standard Docker (`--env-file`, `-v`, `--gpus`) or Kubernetes (`Secret`, `ServiceAccount`, Workload Identity) primitives.
+3. **Multi-seat host (`seat`, opt-in):** When `ANYAGENTS_AGENTS`, `ANYAGENTS_AGENT_UID` or `ANYAGENTS_SOCKET_GID` is configured, every harness starts inside a distinct managed OS seat (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). `anyagents agent-run --config <dir> -- <command>` asserts the process's effective UID/GID, `NoNewPrivs = 1`, denial of the server's database/secrets/operator token and peers' config directories, and writability of its own config directory before executing the command.
 
 ## Replies and quotes
 

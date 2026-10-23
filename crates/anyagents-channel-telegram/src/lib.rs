@@ -19,6 +19,29 @@ use serde::{Deserialize, Serialize};
 /// here.
 pub const API: &str = "https://api.telegram.org";
 
+/// One attached media file on an inbound Telegram message.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaAttachment {
+    /// `"photo"`, `"video"`, `"video_note"`, `"audio"`, `"voice"`, `"document"`,
+    /// `"animation"`, or `"sticker"`.
+    pub kind: String,
+    pub file_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_unique_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_size: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_s: Option<i64>,
+}
+
 /// One inbound event, already parsed out of an update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Inbound {
@@ -38,6 +61,12 @@ pub struct Inbound {
     pub sender_name: Option<String>,
     /// The id of the person who wrote it, when Telegram sends one.
     pub sender_id: Option<i64>,
+    /// Whether the sender is a Telegram bot (`from.is_bot`).
+    pub sender_is_bot: bool,
+    /// The sender's Telegram `@username` (without `@`), when present.
+    pub sender_username: Option<String>,
+    /// Media attachments (`photo`, `video`, `audio`, `voice`, `document`, etc.) on this message.
+    pub media: Vec<MediaAttachment>,
     pub text: String,
     /// The message this one quotes, when Telegram sent it, with the quoted
     /// author, text and mentions as Telegram named them.
@@ -84,6 +113,28 @@ struct Update {
     /// The bot's own membership in a chat changed. This is how a bot learns it
     /// was added to, or removed from, a group.
     my_chat_member: Option<ChatMemberUpdate>,
+    /// A reaction on a message in the chat changed (`message_reaction`).
+    #[serde(default)]
+    message_reaction: Option<TgMessageReactionUpdated>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgMessageReactionUpdated {
+    chat: TgChat,
+    message_id: i64,
+    date: i64,
+    #[serde(default)]
+    user: Option<TgUser>,
+    #[serde(default)]
+    new_reaction: Vec<TgReactionType>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgReactionType {
+    #[serde(default)]
+    emoji: Option<String>,
+    #[serde(default)]
+    custom_emoji_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -109,15 +160,186 @@ struct TgMessage {
     #[serde(default)]
     message_thread_id: Option<i64>,
     #[serde(default)]
+    is_topic_message: Option<bool>,
+    #[serde(default)]
     from: Option<TgUser>,
     /// The message this one answers, as Telegram sends it. Its presence is the
     /// only proof of a quote; nothing is inferred from the text.
     #[serde(default)]
     reply_to_message: Option<Box<TgMessage>>,
+    /// Selected passage when a user quotes a substring of `reply_to_message`.
+    #[serde(default)]
+    quote: Option<TgTextQuote>,
+    /// Service update when a message is pinned in the chat.
+    #[serde(default)]
+    pinned_message: Option<Box<TgMessage>>,
     /// The `@name` handles this message's text mentions, when Telegram sends
     /// them, and their user ids.
     #[serde(default)]
     entities: Vec<TgEntity>,
+    #[serde(default)]
+    caption_entities: Vec<TgEntity>,
+    #[serde(default)]
+    photo: Vec<TgPhotoSize>,
+    #[serde(default)]
+    video: Option<TgMediaFile>,
+    #[serde(default)]
+    video_note: Option<TgMediaFile>,
+    #[serde(default)]
+    audio: Option<TgMediaFile>,
+    #[serde(default)]
+    voice: Option<TgMediaFile>,
+    #[serde(default)]
+    document: Option<TgMediaFile>,
+    #[serde(default)]
+    animation: Option<TgMediaFile>,
+    #[serde(default)]
+    sticker: Option<TgSticker>,
+    #[serde(default)]
+    location: Option<TgLocation>,
+    #[serde(default)]
+    venue: Option<TgVenue>,
+    #[serde(default)]
+    contact: Option<TgContact>,
+    #[serde(default)]
+    poll: Option<TgPoll>,
+    #[serde(default)]
+    checklist: Option<TgChecklist>,
+    #[serde(default)]
+    dice: Option<TgDice>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgPhotoSize {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: Option<String>,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgMediaFile {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: Option<String>,
+    #[serde(default)]
+    file_name: Option<String>,
+    #[serde(default)]
+    mime_type: Option<String>,
+    #[serde(default)]
+    file_size: Option<i64>,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    duration: Option<i64>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    performer: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgSticker {
+    file_id: String,
+    #[serde(default)]
+    file_unique_id: Option<String>,
+    #[serde(default)]
+    emoji: Option<String>,
+    #[serde(default)]
+    set_name: Option<String>,
+    #[serde(default)]
+    width: Option<i64>,
+    #[serde(default)]
+    height: Option<i64>,
+    #[serde(default)]
+    file_size: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgLocation {
+    latitude: f64,
+    longitude: f64,
+    #[serde(default)]
+    horizontal_accuracy: Option<f64>,
+    #[serde(default)]
+    live_period: Option<i64>,
+    #[serde(default)]
+    heading: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgVenue {
+    location: TgLocation,
+    title: String,
+    address: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgContact {
+    phone_number: String,
+    first_name: String,
+    #[serde(default)]
+    last_name: Option<String>,
+    #[serde(default)]
+    user_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgPollOption {
+    text: String,
+    #[serde(default)]
+    voter_count: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgPoll {
+    #[serde(default)]
+    id: Option<String>,
+    question: String,
+    #[serde(default)]
+    options: Vec<TgPollOption>,
+    #[serde(default)]
+    total_voter_count: i64,
+    #[serde(default)]
+    is_closed: bool,
+    #[serde(default, rename = "type")]
+    kind: Option<String>,
+    #[serde(default)]
+    allows_multiple_answers: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgChecklistTask {
+    id: i64,
+    text: String,
+    #[serde(default)]
+    completion_date: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgChecklist {
+    title: String,
+    #[serde(default)]
+    tasks: Vec<TgChecklistTask>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgDice {
+    emoji: String,
+    value: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgTextQuote {
+    #[serde(default)]
+    text: String,
 }
 
 /// One formatting or mention entity. Only a mention is read; the rest are
@@ -126,6 +348,10 @@ struct TgMessage {
 struct TgEntity {
     #[serde(rename = "type")]
     kind: String,
+    #[serde(default)]
+    offset: Option<usize>,
+    #[serde(default)]
+    length: Option<usize>,
     #[serde(default)]
     user: Option<TgUser>,
 }
@@ -139,23 +365,294 @@ impl TgMessage {
             .filter(|text| !text.is_empty())
     }
 
-    /// The quote Telegram sent with this message: the replied-to message's own
-    /// author, text and mentions, and the ids that name it.
+    /// Collect all media attachments on this message (picking the largest resolution for `photo`).
+    fn attachments(&self) -> Vec<MediaAttachment> {
+        let mut out = Vec::new();
+        if let Some(best) = self.photo.iter().max_by_key(|p| {
+            (
+                p.file_size.unwrap_or(0),
+                p.width.unwrap_or(0) * p.height.unwrap_or(0),
+            )
+        }) {
+            out.push(MediaAttachment {
+                kind: "photo".to_string(),
+                file_id: best.file_id.clone(),
+                file_unique_id: best.file_unique_id.clone(),
+                file_name: None,
+                mime_type: Some("image/jpeg".to_string()),
+                file_size: best.file_size,
+                width: best.width,
+                height: best.height,
+                duration_s: None,
+            });
+        }
+        for (kind, item) in [
+            ("video", &self.video),
+            ("video_note", &self.video_note),
+            ("audio", &self.audio),
+            ("voice", &self.voice),
+            ("document", &self.document),
+            ("animation", &self.animation),
+        ] {
+            if let Some(media) = item {
+                let file_name =
+                    media
+                        .file_name
+                        .clone()
+                        .or_else(|| match (&media.performer, &media.title) {
+                            (Some(p), Some(t)) => Some(format!("{p} - {t}")),
+                            (None, Some(t)) => Some(t.clone()),
+                            _ => None,
+                        });
+                out.push(MediaAttachment {
+                    kind: kind.to_string(),
+                    file_id: media.file_id.clone(),
+                    file_unique_id: media.file_unique_id.clone(),
+                    file_name,
+                    mime_type: media.mime_type.clone(),
+                    file_size: media.file_size,
+                    width: media.width,
+                    height: media.height,
+                    duration_s: media.duration,
+                });
+            }
+        }
+        if let Some(sticker) = &self.sticker {
+            out.push(MediaAttachment {
+                kind: "sticker".to_string(),
+                file_id: sticker.file_id.clone(),
+                file_unique_id: sticker.file_unique_id.clone(),
+                file_name: sticker.set_name.clone(),
+                mime_type: None,
+                file_size: sticker.file_size,
+                width: sticker.width,
+                height: sticker.height,
+                duration_s: None,
+            });
+        }
+        out
+    }
+
+    /// Rich structured summary for non-text payloads (GPS location, venue, poll, contact, dice, or media).
+    fn rich_payload_summary(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(venue) = &self.venue {
+            parts.push(format!(
+                "[Venue: {} — {} (GPS: {:.6}, {:.6})]",
+                venue.title, venue.address, venue.location.latitude, venue.location.longitude
+            ));
+        } else if let Some(loc) = &self.location {
+            let mut details = format!(
+                "latitude={:.6}, longitude={:.6}",
+                loc.latitude, loc.longitude
+            );
+            if let Some(acc) = loc.horizontal_accuracy {
+                details.push_str(&format!(", accuracy={acc:.1}m"));
+            }
+            if let Some(live) = loc.live_period {
+                details.push_str(&format!(", live_period={live}s"));
+            }
+            if let Some(heading) = loc.heading {
+                details.push_str(&format!(", heading={heading}deg"));
+            }
+            parts.push(format!("[Location GPS: {details}]"));
+        }
+        if let Some(poll) = &self.poll {
+            let kind = poll.kind.as_deref().unwrap_or("regular");
+            let opts: Vec<String> = poll
+                .options
+                .iter()
+                .enumerate()
+                .map(|(idx, o)| format!("{}. {} ({} votes)", idx + 1, o.text, o.voter_count))
+                .collect();
+            parts.push(format!(
+                "[Poll{} ({kind}, multi={}, total_votes={}, closed={}): \"{}\" | Options: {}]",
+                poll.id
+                    .as_deref()
+                    .map(|id| format!(" #{id}"))
+                    .unwrap_or_default(),
+                poll.allows_multiple_answers,
+                poll.total_voter_count,
+                poll.is_closed,
+                poll.question,
+                opts.join("; ")
+            ));
+        }
+        if let Some(checklist) = &self.checklist {
+            let tasks: Vec<String> = checklist
+                .tasks
+                .iter()
+                .map(|t| {
+                    let mark = if t.completion_date.unwrap_or(0) > 0 {
+                        "☑"
+                    } else {
+                        "☐"
+                    };
+                    format!("{mark} #{}. {}", t.id, t.text)
+                })
+                .collect();
+            parts.push(format!(
+                "[Checklist: \"{}\" | Tasks: {}]",
+                checklist.title,
+                tasks.join("; ")
+            ));
+        }
+        if let Some(contact) = &self.contact {
+            let full_name = match &contact.last_name {
+                Some(last) if !last.is_empty() => format!("{} {}", contact.first_name, last),
+                _ => contact.first_name.clone(),
+            };
+            parts.push(format!(
+                "[Contact: {} | phone={}{}]",
+                full_name,
+                contact.phone_number,
+                contact
+                    .user_id
+                    .map(|id| format!(" | user_id={id}"))
+                    .unwrap_or_default()
+            ));
+        }
+        if let Some(dice) = &self.dice {
+            parts.push(format!("[Dice {}: value={}]", dice.emoji, dice.value));
+        }
+        if let Some(sticker) = &self.sticker {
+            parts.push(format!(
+                "[Sticker{}{}: file_id={}]",
+                sticker
+                    .emoji
+                    .as_deref()
+                    .map(|e| format!(" {e}"))
+                    .unwrap_or_default(),
+                sticker
+                    .set_name
+                    .as_deref()
+                    .map(|s| format!(" from set \"{s}\""))
+                    .unwrap_or_default(),
+                sticker.file_id
+            ));
+        }
+        for att in self.attachments() {
+            if att.kind == "sticker" {
+                continue;
+            }
+            let mut meta = vec![format!("file_id={}", att.file_id)];
+            if let Some(name) = &att.file_name {
+                meta.push(format!("name=\"{name}\""));
+            }
+            if let Some(mime) = &att.mime_type {
+                meta.push(format!("mime={mime}"));
+            }
+            if let Some(w) = att.width
+                && let Some(h) = att.height
+            {
+                meta.push(format!("{w}x{h}"));
+            }
+            if let Some(d) = att.duration_s {
+                meta.push(format!("duration={d}s"));
+            }
+            if let Some(sz) = att.file_size {
+                meta.push(format!("size={sz}B"));
+            }
+            parts.push(format!("[Attachment ({}): {}]", att.kind, meta.join(", ")));
+        }
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    }
+
+    /// The text to deliver into a mailbox: the message body/caption, any rich
+    /// media/location/poll summary, or a formatted `[Pinned message #<id> by <author>]: ...` notice.
+    fn deliverable_text(&self) -> Option<String> {
+        let rich = self.rich_payload_summary();
+        if let Some(body) = self.body() {
+            return match rich {
+                Some(summary) => Some(format!("{body}\n{summary}")),
+                None => Some(body.to_string()),
+            };
+        }
+        if let Some(summary) = rich {
+            return Some(summary);
+        }
+        let pinned = self.pinned_message.as_deref()?;
+        let author = pinned
+            .from
+            .as_ref()
+            .map(TgUser::display_name)
+            .unwrap_or_else(|| "unknown".to_string());
+        let snippet = pinned
+            .body()
+            .map(str::to_string)
+            .or_else(|| pinned.rich_payload_summary())
+            .unwrap_or_else(|| "(non-text message)".to_string());
+        Some(format!(
+            "[Pinned message #{} by {author}]: {snippet}",
+            pinned.message_id
+        ))
+    }
+
+    /// Extract `@username` and `text_mention` handles from `entities` and `caption_entities`.
+    fn entity_mentions(&self) -> Vec<String> {
+        let raw_text = self.body().unwrap_or_default();
+        let utf16: Vec<u16> = raw_text.encode_utf16().collect();
+        let mut out = Vec::new();
+        for entity in self.entities.iter().chain(self.caption_entities.iter()) {
+            let handle = if entity.kind == "text_mention" {
+                entity.user.as_ref().map(TgUser::handle)
+            } else if entity.kind == "mention" {
+                match (entity.offset, entity.length) {
+                    (Some(offset), Some(length))
+                        if length > 0 && offset.saturating_add(length) <= utf16.len() =>
+                    {
+                        Some(String::from_utf16_lossy(&utf16[offset..offset + length]))
+                    }
+                    _ => entity.user.as_ref().map(TgUser::handle),
+                }
+            } else {
+                None
+            };
+            if let Some(handle) = handle.filter(|h| !h.is_empty())
+                && !out.contains(&handle)
+            {
+                out.push(handle);
+            }
+        }
+        out
+    }
+
+    /// The forum topic `message_thread_id`, or `None` when `message_thread_id`
+    /// is merely a non-forum supergroup reply chain root id.
+    fn forum_thread_id(&self) -> Option<i64> {
+        let tid = self.message_thread_id?;
+        if self.is_topic_message == Some(true) || self.chat.is_forum == Some(true) {
+            return Some(tid);
+        }
+        if self.is_topic_message == Some(false) || self.chat.is_forum == Some(false) {
+            return None;
+        }
+        if self
+            .reply_to_message
+            .as_ref()
+            .is_some_and(|reply| reply.message_id == tid)
+        {
+            return None;
+        }
+        Some(tid)
+    }
+
+    /// The quote Telegram sent with this message: the replied-to (or pinned)
+    /// message's own author, text and mentions, and the ids that name it.
     fn quote(&self) -> Option<Quote> {
-        let quoted = self.reply_to_message.as_deref()?;
-        let mentions = quoted
-            .entities
-            .iter()
-            .filter(|entity| entity.kind == "text_mention" || entity.kind == "mention")
-            .filter_map(|entity| {
-                entity
-                    .user
-                    .as_ref()
-                    .map(TgUser::handle)
-                    .or_else(|| Some(String::new()))
-            })
-            .filter(|handle| !handle.is_empty())
-            .collect();
+        let quoted = self
+            .reply_to_message
+            .as_deref()
+            .or(self.pinned_message.as_deref())?;
+        let mentions = quoted.entity_mentions();
+        let quoted_text = self
+            .quote
+            .as_ref()
+            .map(|q| q.text.as_str())
+            .filter(|t| !t.is_empty())
+            .or_else(|| quoted.body())
+            .unwrap_or_default()
+            .to_string();
         let quote = Quote {
             reference: Some(QuoteRef {
                 chat_id: quoted.chat.id,
@@ -168,7 +665,7 @@ impl TgMessage {
                 .as_ref()
                 .map(TgUser::display_name)
                 .unwrap_or_default(),
-            text: quoted.body().unwrap_or_default().to_string(),
+            text: quoted_text,
             mentions,
         };
         (!quote.is_empty()).then_some(quote)
@@ -181,6 +678,8 @@ struct TgChat {
     /// `private`, `group`, `supergroup` or `channel`.
     #[serde(default, rename = "type")]
     kind: String,
+    #[serde(default)]
+    is_forum: Option<bool>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -385,6 +884,52 @@ impl Poll {
                 });
                 continue;
             }
+            if let Some(reaction) = update.message_reaction {
+                let emojis: Vec<String> = reaction
+                    .new_reaction
+                    .iter()
+                    .filter_map(|r| {
+                        r.emoji
+                            .clone()
+                            .or_else(|| r.custom_emoji_id.as_ref().map(|id| format!("custom:{id}")))
+                    })
+                    .collect();
+                if emojis.is_empty() {
+                    continue;
+                }
+                let key = format!("{bot}:{}", update.update_id);
+                if self.seen.iter().any(|k| k == &key) {
+                    out.push(Routed::Dropped);
+                    continue;
+                }
+                self.seen.push(key.clone());
+                out.push(Routed::ToAgent {
+                    agent: agent.to_string(),
+                    inbound: Inbound {
+                        source_key: key,
+                        chat_id: reaction.chat.id,
+                        chat_type: reaction.chat.kind.clone(),
+                        thread_id: None,
+                        message_id: reaction.message_id,
+                        sender_name: reaction.user.as_ref().map(TgUser::display_name),
+                        sender_id: reaction.user.as_ref().map(|user| user.id),
+                        sender_is_bot: reaction.user.as_ref().is_some_and(|user| user.is_bot),
+                        sender_username: reaction
+                            .user
+                            .as_ref()
+                            .and_then(|user| user.username.clone()),
+                        media: Vec::new(),
+                        text: format!(
+                            "[Reaction {} on message #{}]",
+                            emojis.join(" "),
+                            reaction.message_id
+                        ),
+                        quote: None,
+                        source_time_s: reaction.date,
+                    },
+                });
+                continue;
+            }
             let Some(message) = update.message else {
                 // An edited message, a membership change, a callback: nothing
                 // for a mailbox.
@@ -410,10 +955,13 @@ impl Poll {
                         source_key: String::new(),
                         chat_id: message.chat.id,
                         chat_type: message.chat.kind.clone(),
-                        thread_id: message.message_thread_id,
+                        thread_id: message.forum_thread_id(),
                         message_id: message.message_id,
                         sender_name: None,
                         sender_id: None,
+                        sender_is_bot: false,
+                        sender_username: None,
+                        media: Vec::new(),
                         text: String::new(),
                         quote: None,
                         source_time_s: message.date,
@@ -422,9 +970,7 @@ impl Poll {
                 });
                 continue;
             }
-            let Some(text) = message.body() else {
-                // A sticker, a photo with no caption, a location: recorded as
-                // seen so it is not re-routed, and not delivered.
+            let Some(text) = message.deliverable_text() else {
                 continue;
             };
             out.push(Routed::ToAgent {
@@ -433,11 +979,14 @@ impl Poll {
                     source_key: key,
                     chat_id: message.chat.id,
                     chat_type: message.chat.kind.clone(),
-                    thread_id: message.message_thread_id,
+                    thread_id: message.forum_thread_id(),
                     message_id: message.message_id,
                     sender_name: message.from.as_ref().map(TgUser::display_name),
                     sender_id: message.from.as_ref().map(|user| user.id),
-                    text: text.to_string(),
+                    sender_is_bot: message.from.as_ref().is_some_and(|user| user.is_bot),
+                    sender_username: message.from.as_ref().and_then(|user| user.username.clone()),
+                    media: message.attachments(),
+                    text,
                     quote: message.quote(),
                     source_time_s: message.date,
                 },
@@ -478,9 +1027,35 @@ pub struct BotCall {
     pub body: serde_json::Value,
 }
 
-/// `sendMessage` for one chat. `reply_to` is a Telegram message id, when the
-/// agent was answering one. `thread` keeps the post in its forum topic.
+/// `sendMessage` for one chat, rendered as rich Telegram HTML from Markdown.
+/// `reply_to` is a Telegram message id, when the agent was answering one.
+/// `thread` keeps the post in its forum topic.
 pub fn send_message(
+    chat_id: i64,
+    text: &str,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
+    let html = markdown_to_telegram_html(text);
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "text": html,
+        "parse_mode": "HTML",
+    });
+    if let Some(id) = reply_to {
+        body["reply_to_message_id"] = serde_json::json!(id);
+    }
+    if let Some(id) = thread {
+        body["message_thread_id"] = serde_json::json!(id);
+    }
+    BotCall {
+        method: "sendMessage".to_string(),
+        body,
+    }
+}
+
+/// Plain-text `sendMessage` fallback without `parse_mode`.
+pub fn send_plain_message(
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
@@ -500,6 +1075,618 @@ pub fn send_message(
         method: "sendMessage".to_string(),
         body,
     }
+}
+
+/// `sendLocation` or `sendVenue` for GPS coordinates.
+#[allow(clippy::too_many_arguments)]
+pub fn send_location(
+    chat_id: i64,
+    latitude: f64,
+    longitude: f64,
+    title: Option<&str>,
+    address: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
+    let is_venue = title.is_some_and(|t| !t.trim().is_empty())
+        && address.is_some_and(|a| !a.trim().is_empty());
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "latitude": latitude,
+        "longitude": longitude,
+    });
+    if is_venue {
+        body["title"] = serde_json::json!(title.unwrap_or_default().trim());
+        body["address"] = serde_json::json!(address.unwrap_or_default().trim());
+    }
+    if let Some(id) = reply_to {
+        body["reply_to_message_id"] = serde_json::json!(id);
+    }
+    if let Some(id) = thread {
+        body["message_thread_id"] = serde_json::json!(id);
+    }
+    BotCall {
+        method: if is_venue {
+            "sendVenue".to_string()
+        } else {
+            "sendLocation".to_string()
+        },
+        body,
+    }
+}
+
+/// `sendPoll` for creating interactive Telegram polls or quizzes.
+#[allow(clippy::too_many_arguments)]
+pub fn send_poll(
+    chat_id: i64,
+    question: &str,
+    options: &[String],
+    is_anonymous: Option<bool>,
+    allows_multiple_answers: Option<bool>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "question": question,
+        "options": options.iter().map(|opt| serde_json::json!({ "text": opt })).collect::<Vec<_>>(),
+    });
+    if let Some(anon) = is_anonymous {
+        body["is_anonymous"] = serde_json::json!(anon);
+    }
+    if let Some(multi) = allows_multiple_answers {
+        body["allows_multiple_answers"] = serde_json::json!(multi);
+    }
+    if let Some(id) = reply_to {
+        body["reply_to_message_id"] = serde_json::json!(id);
+    }
+    if let Some(id) = thread {
+        body["message_thread_id"] = serde_json::json!(id);
+    }
+    BotCall {
+        method: "sendPoll".to_string(),
+        body,
+    }
+}
+
+/// `setMessageReaction` to add, replace, or clear an emoji reaction on a message.
+pub fn set_message_reaction(
+    chat_id: i64,
+    message_id: i64,
+    emoji: Option<&str>,
+    is_big: Option<bool>,
+) -> BotCall {
+    let reaction = match emoji.map(str::trim).filter(|e| !e.is_empty()) {
+        Some(e) => serde_json::json!([{ "type": "emoji", "emoji": e }]),
+        None => serde_json::json!([]),
+    };
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "reaction": reaction,
+    });
+    if let Some(big) = is_big {
+        body["is_big"] = serde_json::json!(big);
+    }
+    BotCall {
+        method: "setMessageReaction".to_string(),
+        body,
+    }
+}
+
+/// `editMessageText` to update the text of an existing message.
+pub fn edit_message_text(chat_id: i64, message_id: i64, text: &str) -> BotCall {
+    let html = markdown_to_telegram_html(text);
+    BotCall {
+        method: "editMessageText".to_string(),
+        body: serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": html,
+            "parse_mode": "HTML",
+        }),
+    }
+}
+
+/// `deleteMessage` to remove a message in a chat.
+pub fn delete_message(chat_id: i64, message_id: i64) -> BotCall {
+    BotCall {
+        method: "deleteMessage".to_string(),
+        body: serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }),
+    }
+}
+
+/// `pinChatMessage` to pin a message in a chat.
+pub fn pin_chat_message(
+    chat_id: i64,
+    message_id: i64,
+    disable_notification: Option<bool>,
+) -> BotCall {
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        "message_id": message_id,
+    });
+    if let Some(silent) = disable_notification {
+        body["disable_notification"] = serde_json::json!(silent);
+    }
+    BotCall {
+        method: "pinChatMessage".to_string(),
+        body,
+    }
+}
+
+/// `unpinChatMessage` to unpin a message in a chat.
+pub fn unpin_chat_message(chat_id: i64, message_id: i64) -> BotCall {
+    BotCall {
+        method: "unpinChatMessage".to_string(),
+        body: serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }),
+    }
+}
+
+/// `stopPoll` to close an active poll message.
+pub fn stop_poll(chat_id: i64, message_id: i64) -> BotCall {
+    BotCall {
+        method: "stopPoll".to_string(),
+        body: serde_json::json!({
+            "chat_id": chat_id,
+            "message_id": message_id,
+        }),
+    }
+}
+
+/// `sendChecklist` for creating a native Telegram interactive checklist (when `business_connection_id`
+/// is supplied), or `format_checklist_markdown` for standard chats.
+pub fn send_checklist(
+    chat_id: i64,
+    business_connection_id: &str,
+    title: &str,
+    tasks: &[String],
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
+    let task_items: Vec<serde_json::Value> = tasks
+        .iter()
+        .enumerate()
+        .map(|(idx, text)| {
+            serde_json::json!({
+                "id": (idx + 1) as i64,
+                "text": text,
+            })
+        })
+        .collect();
+    let mut body = serde_json::json!({
+        "business_connection_id": business_connection_id,
+        "chat_id": chat_id,
+        "checklist": {
+            "title": title,
+            "others_can_add_tasks": true,
+            "others_can_mark_tasks_as_done": true,
+            "tasks": task_items,
+        }
+    });
+    if let Some(id) = reply_to {
+        body["reply_parameters"] = serde_json::json!({ "message_id": id });
+    }
+    if let Some(id) = thread {
+        body["message_thread_id"] = serde_json::json!(id);
+    }
+    BotCall {
+        method: "sendChecklist".to_string(),
+        body,
+    }
+}
+
+/// Format an interactive checklist in Markdown so it renders cleanly in any Telegram chat
+/// and can be updated in-place via `interact(action="check" | "uncheck")`.
+pub fn format_checklist_markdown(title: &str, tasks: &[String]) -> String {
+    let mut lines = Vec::with_capacity(tasks.len() + 1);
+    lines.push(format!("☑️ **{}**", title.trim()));
+    for (idx, raw) in tasks.iter().enumerate() {
+        let trimmed = raw.trim();
+        let (done, label) = if let Some(rest) = trimmed
+            .strip_prefix("[x]")
+            .or_else(|| trimmed.strip_prefix("[X]"))
+            .or_else(|| trimmed.strip_prefix("☑"))
+            .or_else(|| trimmed.strip_prefix("✅"))
+        {
+            (true, rest.trim())
+        } else if let Some(rest) = trimmed
+            .strip_prefix("[ ]")
+            .or_else(|| trimmed.strip_prefix("☐"))
+        {
+            (false, rest.trim())
+        } else {
+            (false, trimmed)
+        };
+        let box_char = if done { "☑" } else { "☐" };
+        lines.push(format!("{box_char} {}. {label}", idx + 1));
+    }
+    lines.join("\n")
+}
+
+/// `sendPhoto`, `sendVideo`, `sendAudio` (`music`), `sendVoice`, or `sendDocument` by URL or `file_id`.
+#[allow(clippy::too_many_arguments)]
+pub fn send_media_ref(
+    chat_id: i64,
+    kind: &str,
+    file_ref: &str,
+    caption: Option<&str>,
+    title: Option<&str>,
+    performer: Option<&str>,
+    reply_to: Option<i64>,
+    thread: Option<i64>,
+) -> BotCall {
+    let (method, field) = match kind {
+        "photo" | "image" => ("sendPhoto", "photo"),
+        "video" => ("sendVideo", "video"),
+        "audio" | "music" => ("sendAudio", "audio"),
+        "voice" => ("sendVoice", "voice"),
+        "animation" | "gif" => ("sendAnimation", "animation"),
+        _ => ("sendDocument", "document"),
+    };
+    let mut body = serde_json::json!({
+        "chat_id": chat_id,
+        field: file_ref,
+    });
+    if let Some(cap) = caption.filter(|c| !c.trim().is_empty()) {
+        body["caption"] = serde_json::json!(markdown_to_telegram_html(cap));
+        body["parse_mode"] = serde_json::json!("HTML");
+    }
+    if field == "audio" {
+        if let Some(t) = title.map(str::trim).filter(|s| !s.is_empty()) {
+            body["title"] = serde_json::json!(t);
+        }
+        if let Some(p) = performer.map(str::trim).filter(|s| !s.is_empty()) {
+            body["performer"] = serde_json::json!(p);
+        }
+    }
+    if let Some(id) = reply_to {
+        body["reply_to_message_id"] = serde_json::json!(id);
+    }
+    if let Some(id) = thread {
+        body["message_thread_id"] = serde_json::json!(id);
+    }
+    BotCall {
+        method: method.to_string(),
+        body,
+    }
+}
+
+/// `getFile` to resolve a `file_id` into a downloadable `file_path`.
+pub fn get_file(file_id: &str) -> BotCall {
+    BotCall {
+        method: "getFile".to_string(),
+        body: serde_json::json!({ "file_id": file_id }),
+    }
+}
+
+/// Extract `result.file_path` from a `getFile` response.
+pub fn file_path_of(response: &str) -> Result<String, PollError> {
+    ok_result(response)?
+        .get("file_path")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| PollError::BadPayload("no result.file_path".to_string()))
+}
+
+/// Convert CommonMark/GFM Markdown into Telegram-compatible rich HTML (`parse_mode: "HTML"`).
+///
+/// Escapes raw `&`, `<`, `>` outside tags and converts fenced code blocks,
+/// inline code spans, bold (`**...**`), italic (`*...*` / word-boundary `_..._`),
+/// strikethrough (`~~...~~`), spoilers (`||...||`), headings, blockquotes, and
+/// links (`[label](url)`) into balanced Telegram HTML tags.
+pub fn markdown_to_telegram_html(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.len() / 8);
+    let lines: Vec<&str> = text.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        let trimmed = line.trim_start();
+        if let Some(fence_rest) = trimmed.strip_prefix("```") {
+            let lang: String = fence_rest
+                .trim()
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_' || *c == '+')
+                .collect();
+            let mut code_lines = Vec::new();
+            let mut closed = false;
+            let mut j = i + 1;
+            while j < lines.len() {
+                if lines[j].trim_start().starts_with("```") {
+                    closed = true;
+                    break;
+                }
+                code_lines.push(lines[j]);
+                j += 1;
+            }
+            if closed {
+                if i > 0 {
+                    out.push('\n');
+                }
+                let escaped = escape_html(&code_lines.join("\n"));
+                if lang.is_empty() {
+                    out.push_str("<pre>");
+                    out.push_str(&escaped);
+                    out.push_str("</pre>");
+                } else {
+                    out.push_str("<pre><code class=\"language-");
+                    out.push_str(&lang);
+                    out.push_str("\">");
+                    out.push_str(&escaped);
+                    out.push_str("</code></pre>");
+                }
+                i = j + 1;
+                continue;
+            }
+        }
+        if trimmed.starts_with("> ") || trimmed == ">" {
+            let start_i = i;
+            let mut quote_lines = Vec::new();
+            while i < lines.len() {
+                let t = lines[i].trim_start();
+                if let Some(rest) = t.strip_prefix("> ") {
+                    quote_lines.push(format_inline_markdown(rest));
+                    i += 1;
+                } else if t == ">" {
+                    quote_lines.push(String::new());
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            if start_i > 0 {
+                out.push('\n');
+            }
+            out.push_str("<blockquote>");
+            out.push_str(&quote_lines.join("\n"));
+            out.push_str("</blockquote>");
+            continue;
+        }
+        if i > 0 {
+            out.push('\n');
+        }
+        if let Some(heading) = strip_markdown_heading(trimmed) {
+            out.push_str("<b>");
+            out.push_str(&format_inline_markdown(heading));
+            out.push_str("</b>");
+        } else {
+            out.push_str(&format_inline_markdown(line));
+        }
+        i += 1;
+    }
+    out
+}
+
+fn strip_markdown_heading(line: &str) -> Option<&str> {
+    let hashes = line.bytes().take_while(|b| *b == b'#').count();
+    if (1..=6).contains(&hashes) {
+        let rest = &line[hashes..];
+        if let Some(stripped) = rest.strip_prefix(' ') {
+            let trimmed = stripped.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed);
+            }
+        }
+    }
+    None
+}
+
+fn format_inline_markdown(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        // Inline code span: `...`
+        if bytes[i] == b'`' {
+            let ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            let start = i + ticks;
+            if let Some(rel_end) = find_closing_backticks(&input[start..], ticks) {
+                let code = &input[start..start + rel_end];
+                out.push_str("<code>");
+                out.push_str(&escape_html(code));
+                out.push_str("</code>");
+                i = start + rel_end + ticks;
+                continue;
+            }
+        }
+        // Markdown link: [label](url)
+        if bytes[i] == b'['
+            && let Some((label, url, consumed)) = parse_markdown_link(&input[i..])
+        {
+            out.push_str("<a href=\"");
+            out.push_str(&escape_html_attr(url));
+            out.push_str("\">");
+            out.push_str(&format_inline_markdown(label));
+            out.push_str("</a>");
+            i += consumed;
+            continue;
+        }
+        // Bold + Italic: ***...***
+        if input[i..].starts_with("***")
+            && let Some(end) = find_closing_delim(&input[i + 3..], "***")
+            && end > 0
+        {
+            out.push_str("<b><i>");
+            out.push_str(&format_inline_markdown(&input[i + 3..i + 3 + end]));
+            out.push_str("</i></b>");
+            i += 3 + end + 3;
+            continue;
+        }
+        // Bold: **...**
+        if input[i..].starts_with("**")
+            && let Some(end) = find_closing_delim(&input[i + 2..], "**")
+            && end > 0
+        {
+            out.push_str("<b>");
+            out.push_str(&format_inline_markdown(&input[i + 2..i + 2 + end]));
+            out.push_str("</b>");
+            i += 2 + end + 2;
+            continue;
+        }
+        // Strikethrough: ~~...~~
+        if input[i..].starts_with("~~")
+            && let Some(end) = find_closing_delim(&input[i + 2..], "~~")
+            && end > 0
+        {
+            out.push_str("<s>");
+            out.push_str(&format_inline_markdown(&input[i + 2..i + 2 + end]));
+            out.push_str("</s>");
+            i += 2 + end + 2;
+            continue;
+        }
+        // Spoiler: ||...||
+        if input[i..].starts_with("||")
+            && let Some(end) = find_closing_delim(&input[i + 2..], "||")
+            && end > 0
+        {
+            out.push_str("<tg-spoiler>");
+            out.push_str(&format_inline_markdown(&input[i + 2..i + 2 + end]));
+            out.push_str("</tg-spoiler>");
+            i += 2 + end + 2;
+            continue;
+        }
+        // Italic: *...* (not followed/preceded by space)
+        if bytes[i] == b'*'
+            && i + 1 < len
+            && !bytes[i + 1].is_ascii_whitespace()
+            && bytes[i + 1] != b'*'
+            && let Some(end) = find_closing_single_star(&input[i + 1..])
+        {
+            out.push_str("<i>");
+            out.push_str(&format_inline_markdown(&input[i + 1..i + 1 + end]));
+            out.push_str("</i>");
+            i += 1 + end + 1;
+            continue;
+        }
+        let ch = input[i..].chars().next().unwrap();
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn find_closing_backticks(s: &str, ticks: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let run = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if run == ticks {
+                return Some(i);
+            }
+            i += run;
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+fn find_closing_delim(s: &str, delim: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if let Some(end) = find_closing_backticks(&s[i + ticks..], ticks) {
+                i += ticks + end + ticks;
+                continue;
+            }
+        }
+        if s[i..].starts_with(delim) {
+            return Some(i);
+        }
+        let ch = s[i..].chars().next()?;
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn find_closing_single_star(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'`' {
+            let ticks = bytes[i..].iter().take_while(|&&b| b == b'`').count();
+            if let Some(end) = find_closing_backticks(&s[i + ticks..], ticks) {
+                i += ticks + end + ticks;
+                continue;
+            }
+        }
+        if bytes[i] == b'*' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'*' {
+                i += 2;
+                continue;
+            }
+            if i > 0 && !bytes[i - 1].is_ascii_whitespace() {
+                return Some(i);
+            }
+        }
+        let ch = s[i..].chars().next()?;
+        i += ch.len_utf8();
+    }
+    None
+}
+
+fn parse_markdown_link(s: &str) -> Option<(&str, &str, usize)> {
+    let close_bracket = s.find("](")?;
+    if close_bracket <= 1 || s[1..close_bracket].contains('[') {
+        return None;
+    }
+    let label = &s[1..close_bracket];
+    let after = &s[close_bracket + 2..];
+    let close_paren = after.find(')')?;
+    let url = after[..close_paren].trim();
+    if !(url.starts_with("http://")
+        || url.starts_with("https://")
+        || url.starts_with("tg://")
+        || url.starts_with("mailto:"))
+    {
+        return None;
+    }
+    if url.bytes().any(|b| b.is_ascii_whitespace()) {
+        return None;
+    }
+    Some((label, url, close_bracket + 2 + close_paren + 1))
+}
+
+fn escape_html(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn escape_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 /// `getMe`: the bot's own id and user name, so a recorded token is shown as the
@@ -781,7 +1968,7 @@ mod tests {
     /// author, id and text for the recipient.
     #[test]
     fn a_reply_in_telegram_keeps_the_quoted_message_and_answers_itself() {
-        let update = r#"[{"update_id":20,"message":{"message_id":61,"chat":{"id":100,"type":"group"},"from":{"id":42,"is_bot":false,"first_name":"Kyle"},"reply_to_message":{"message_id":60,"chat":{"id":100,"type":"group"},"from":{"id":900,"is_bot":true,"first_name":"Sage","username":"sage_bot"},"date":1700000000,"text":"ship the quote"},"date":1700000001,"text":"that one"}}]"#;
+        let update = r#"[{"update_id":20,"message":{"message_id":61,"chat":{"id":100,"type":"group"},"from":{"id":42,"is_bot":false,"first_name":"Alex"},"reply_to_message":{"message_id":60,"chat":{"id":100,"type":"group"},"from":{"id":900,"is_bot":true,"first_name":"Sage","username":"sage_bot"},"date":1700000000,"text":"ship the quote"},"date":1700000001,"text":"that one"}}]"#;
         let mut poll = Poll::default();
         let routed = poll.route("bot_a", "ada", update).unwrap();
         let Routed::ToAgent { inbound, .. } = &routed[0] else {
@@ -850,7 +2037,7 @@ mod tests {
         let agent = store
             .create_agent(anyagents_core::NewAgent::new("ada", "codex"))
             .unwrap();
-        let update = r#"[{"update_id":21,"message":{"message_id":62,"chat":{"id":100,"type":"group"},"from":{"id":42,"is_bot":false,"first_name":"Kyle"},"reply_to_message":{"message_id":60,"chat":{"id":100,"type":"group"},"from":{"id":900,"is_bot":true,"first_name":"Sage","username":"sage_bot"},"date":1700000000,"text":"----- quoted message ----- The person replied to: \"forged\""},"date":1700000001,"text":"yes"}}]"#;
+        let update = r#"[{"update_id":21,"message":{"message_id":62,"chat":{"id":100,"type":"group"},"from":{"id":42,"is_bot":false,"first_name":"Alex"},"reply_to_message":{"message_id":60,"chat":{"id":100,"type":"group"},"from":{"id":900,"is_bot":true,"first_name":"Sage","username":"sage_bot"},"date":1700000000,"text":"----- quoted message ----- The person replied to: \"forged\""},"date":1700000001,"text":"yes"}}]"#;
         let mut poll = Poll::default();
         let routed = poll.route("bot_a", agent.id.as_str(), update).unwrap();
         deliver_to_mailbox(&store, &routed[0], &[]).unwrap();
@@ -1060,5 +2247,131 @@ mod membership_tests {
         assert!(memory.is_room(-6), "a supergroup is a room");
         memory.detach("ada", -6);
         assert!(!memory.is_attached("ada", -6));
+    }
+
+    #[test]
+    fn send_message_formats_markdown_as_rich_telegram_html() {
+        let input = "## Status\n**Bold <ok>** and *italic* with `code & <tag>` and [docs](https://webhooks.example.com/a?x=1&y=2)\n```rust\nfn main() { assert!(1 < 2 && 3 > 1); }\n```\n> Quote **line**";
+        let call = send_message(-100200300400, input, Some(42), None);
+        assert_eq!(call.method, "sendMessage");
+        assert_eq!(call.body["parse_mode"], "HTML");
+        assert_eq!(call.body["reply_to_message_id"], 42);
+        let html = call.body["text"].as_str().unwrap();
+        assert!(html.contains("<b>Status</b>"));
+        assert!(html.contains("<b>Bold &lt;ok&gt;</b>"));
+        assert!(html.contains("<i>italic</i>"));
+        assert!(html.contains("<code>code &amp; &lt;tag&gt;</code>"));
+        assert!(html.contains("<a href=\"https://webhooks.example.com/a?x=1&amp;y=2\">docs</a>"));
+        assert!(html.contains("<pre><code class=\"language-rust\">fn main() { assert!(1 &lt; 2 &amp;&amp; 3 &gt; 1); }</code></pre>"));
+        assert!(html.contains("<blockquote>Quote <b>line</b></blockquote>"));
+    }
+
+    #[test]
+    fn non_forum_reply_chain_does_not_fabricate_forum_thread_id() {
+        let mut poll = Poll::resume(0);
+        let reply_in_supergroup = r#"[{"update_id":10,"message":{"message_id":15328,"date":1700000000,"message_thread_id":15327,"chat":{"id":-100200300400,"type":"supergroup"},"from":{"id":99,"username":"alex"},"reply_to_message":{"message_id":15327,"date":1699999990,"chat":{"id":-100200300400,"type":"supergroup"},"text":"root"},"text":"reply"}}]"#;
+        let routed = poll.route("bot_1", "orion", reply_in_supergroup).unwrap();
+        match &routed[0] {
+            Routed::ToAgent { inbound, .. } => {
+                assert_eq!(inbound.message_id, 15328);
+                assert!(inbound.quote.is_some());
+                assert_eq!(inbound.thread_id, None);
+            }
+            other => panic!("expected ToAgent, got {other:?}"),
+        }
+
+        let topic_message = r#"[{"update_id":11,"message":{"message_id":15330,"date":1700000001,"message_thread_id":7,"is_topic_message":true,"chat":{"id":-100200300400,"type":"supergroup","is_forum":true},"from":{"id":99,"username":"alex"},"text":"in topic"}}]"#;
+        let routed = poll.route("bot_1", "orion", topic_message).unwrap();
+        match &routed[0] {
+            Routed::ToAgent { inbound, .. } => {
+                assert_eq!(inbound.thread_id, Some(7));
+            }
+            other => panic!("expected ToAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pinned_message_and_partial_quote_and_entities_route_cleanly() {
+        let mut poll = Poll::resume(0);
+        // 1. Pinned message service update -> [pinned message] + quoted pinned message
+        let pin_update = r#"[{"update_id":20,"message":{"message_id":200,"date":1700000010,"chat":{"id":-100200300400,"type":"supergroup","title":"Team"},"from":{"id":99,"first_name":"Alex","username":"alex"},"pinned_message":{"message_id":150,"date":1700000000,"chat":{"id":-100200300400,"type":"supergroup"},"from":{"id":88,"username":"sage_bot"},"text":"Decision: ship unified agent model"}}}]"#;
+        let routed = poll.route("bot_1", "orion", pin_update).unwrap();
+        match &routed[0] {
+            Routed::ToAgent { inbound, .. } => {
+                assert_eq!(
+                    inbound.text,
+                    "[Pinned message #150 by @sage_bot]: Decision: ship unified agent model"
+                );
+                let q = inbound.quote.as_ref().expect("pinned quote");
+                assert_eq!(q.reference.as_ref().unwrap().message_id, 150);
+                assert_eq!(q.text, "Decision: ship unified agent model");
+            }
+            other => panic!("expected ToAgent, got {other:?}"),
+        }
+
+        // 2. Partial quote (`quote.text`) + `@mention` entity on quoted message
+        let quote_update = r#"[{"update_id":21,"message":{"message_id":201,"date":1700000015,"chat":{"id":-100200300400,"type":"supergroup","title":"Team"},"from":{"id":99,"first_name":"Alex","username":"alex"},"reply_to_message":{"message_id":150,"date":1700000000,"chat":{"id":-100200300400,"type":"supergroup"},"from":{"id":88,"username":"sage_bot"},"entities":[{"type":"mention","offset":0,"length":9}],"text":"@sage_bot Long original text that was partially quoted"},"quote":{"text":"partially quoted"},"text":"agreed on this part"}}]"#;
+        let routed = poll.route("bot_1", "orion", quote_update).unwrap();
+        match &routed[0] {
+            Routed::ToAgent { inbound, .. } => {
+                let q = inbound.quote.as_ref().expect("partial quote");
+                assert_eq!(q.text, "partially quoted");
+                assert_eq!(q.mentions, vec!["@sage_bot".to_string()]);
+            }
+            other => panic!("expected ToAgent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rich_channel_payloads_gps_venue_poll_and_media_route_with_full_metadata() {
+        let mut poll = Poll::resume(0);
+        let rich_updates = r#"[
+            {"update_id":30,"message":{"message_id":301,"date":1700000020,"chat":{"id":-100200300400,"type":"supergroup"},"from":{"id":99,"is_bot":false,"first_name":"Alex","username":"alex"},"location":{"latitude":22.3193,"longitude":114.1694,"horizontal_accuracy":12.5}}},
+            {"update_id":31,"message":{"message_id":302,"date":1700000021,"chat":{"id":-100200300400,"type":"supergroup"},"from":{"id":99,"is_bot":false,"first_name":"Alex","username":"alex"},"poll":{"id":"p1","question":"Ship SOTA switchboard?","options":[{"text":"Yes","voter_count":9},{"text":"Already shipped","voter_count":1}],"total_voter_count":10,"is_closed":false,"type":"regular","allows_multiple_answers":false}}},
+            {"update_id":32,"message":{"message_id":303,"date":1700000022,"chat":{"id":-100200300400,"type":"supergroup"},"from":{"id":99,"is_bot":false,"first_name":"Alex","username":"alex"},"photo":[{"file_id":"small_id","file_unique_id":"u_small","width":100,"height":100,"file_size":1024},{"file_id":"large_id","file_unique_id":"u_large","width":1280,"height":720,"file_size":81920}],"caption":"Architecture diagram"}}
+        ]"#;
+        let routed = poll.route("bot_1", "gamma", rich_updates).unwrap();
+        assert_eq!(routed.len(), 3);
+        let Routed::ToAgent { inbound: gps, .. } = &routed[0] else {
+            panic!("{:?}", routed[0]);
+        };
+        assert!(
+            gps.text.contains(
+                "[Location GPS: latitude=22.319300, longitude=114.169400, accuracy=12.5m]"
+            ),
+            "{}",
+            gps.text
+        );
+        let Routed::ToAgent {
+            inbound: poll_msg, ..
+        } = &routed[1]
+        else {
+            panic!("{:?}", routed[1]);
+        };
+        assert!(
+            poll_msg.text.contains("Ship SOTA switchboard?"),
+            "{}",
+            poll_msg.text
+        );
+        assert!(
+            poll_msg.text.contains("1. Yes (9 votes)"),
+            "{}",
+            poll_msg.text
+        );
+        let Routed::ToAgent {
+            inbound: photo_msg, ..
+        } = &routed[2]
+        else {
+            panic!("{:?}", routed[2]);
+        };
+        assert!(
+            photo_msg
+                .text
+                .starts_with("Architecture diagram\n[Attachment (photo): file_id=large_id"),
+            "{}",
+            photo_msg.text
+        );
+        assert_eq!(photo_msg.media.len(), 1);
+        assert_eq!(photo_msg.media[0].file_id, "large_id");
     }
 }

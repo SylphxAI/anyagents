@@ -65,6 +65,7 @@ struct State {
 
 enum Answer {
     Waiting,
+    Async,
     Done(Value),
     Err(Value),
 }
@@ -181,6 +182,28 @@ impl RpcChild {
         self.await_answer(id, wait)
     }
 
+    /// Send one request without waiting for the answer. When the vendor replies
+    /// to that `id`, `on_line` receives a synthetic `"$rpc/response"` event.
+    pub fn send_request(&self, method: &str, params: Value) -> Result<i64, RpcFail> {
+        let id = {
+            let mut state = lock(&self.shared);
+            if !state.alive {
+                return Err(RpcFail::Dead);
+            }
+            state.next_id += 1;
+            let id = state.next_id;
+            state.pending.insert(id, Answer::Async);
+            id
+        };
+        let line = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        if write_stdin(&self.stdin, &line).is_err() {
+            lock(&self.shared).pending.remove(&id);
+            self.mark_dead();
+            return Err(RpcFail::Dead);
+        }
+        Ok(id)
+    }
+
     /// Send one notification and do not wait.
     pub fn notify(&self, method: &str, params: Value) -> Result<(), RpcFail> {
         let line = json!({"jsonrpc": "2.0", "method": method, "params": params});
@@ -221,7 +244,7 @@ impl RpcChild {
                     };
                     return Err(RpcFail::Failed(error));
                 }
-                Some(Answer::Waiting) => {}
+                Some(Answer::Waiting) | Some(Answer::Async) => {}
                 None => return Err(RpcFail::TimedOut),
             }
             if !state.alive {
@@ -413,15 +436,37 @@ fn read_stdout(
             }
             (None, Some(id)) => {
                 let Some(id) = id.as_i64() else { continue };
-                let mut state = lock(&shared);
-                if !matches!(state.pending.get(&id), Some(Answer::Waiting)) {
-                    continue;
-                }
-                if let Some(error) = value.get("error") {
-                    state.pending.insert(id, Answer::Err(error.clone()));
-                } else {
-                    let result = value.get("result").cloned().unwrap_or(Value::Null);
-                    state.pending.insert(id, Answer::Done(result));
+                let is_async = {
+                    let mut state = lock(&shared);
+                    match state.pending.get(&id) {
+                        Some(Answer::Waiting) => {
+                            if let Some(error) = value.get("error") {
+                                state.pending.insert(id, Answer::Err(error.clone()));
+                            } else {
+                                let result = value.get("result").cloned().unwrap_or(Value::Null);
+                                state.pending.insert(id, Answer::Done(result));
+                            }
+                            false
+                        }
+                        Some(Answer::Async) => {
+                            state.pending.remove(&id);
+                            true
+                        }
+                        _ => continue,
+                    }
+                };
+                if is_async {
+                    let effect = on_line(&json!({
+                        "method": "$rpc/response",
+                        "params": {
+                            "id": id,
+                            "result": value.get("result").cloned().unwrap_or(Value::Null),
+                            "error": value.get("error").cloned().unwrap_or(Value::Null),
+                        }
+                    }));
+                    if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+                        lock(&shared).quota_reset_at_ms = Some(reset_at_ms);
+                    }
                 }
             }
             (None, None) => continue,

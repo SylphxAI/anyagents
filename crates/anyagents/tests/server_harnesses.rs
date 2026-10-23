@@ -211,11 +211,11 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     support::operator_with_configured_seat(&data);
     // The agent that asks: the answers come back to it.
     create_asker(&data);
-    let (agy_file, muse_file) = (data.join("agent-argon"), data.join("agent-calliope"));
-    std::fs::write(&agy_file, "argon").unwrap();
-    std::fs::write(&muse_file, "calliope").unwrap();
-    let agy_id = create(&data, "argon", "agy", &agy_file);
-    let muse_id = create(&data, "calliope", "muse", &muse_file);
+    let (agy_file, muse_file) = (data.join("agent-gamma"), data.join("agent-delta"));
+    std::fs::write(&agy_file, "gamma").unwrap();
+    std::fs::write(&muse_file, "delta").unwrap();
+    let agy_id = create(&data, "gamma", "agy", &agy_file);
+    let muse_id = create(&data, "delta", "muse", &muse_file);
 
     // The Muse config carries the tool server, written by create before the
     // server was up. The Antigravity CLI keeps its own config.
@@ -234,8 +234,8 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     assert_eq!(muse_settings["mcpServers"]["anyagents"]["mode"], "required");
 
     let server = Server::start(&data, Path::new(env!("CARGO_BIN_EXE_anyagents")));
-    one_round(&data, "argon", "agy");
-    one_round(&data, "calliope", "muse");
+    one_round(&data, "gamma", "agy");
+    one_round(&data, "delta", "muse");
 
     // The catalog names both harnesses and their config variable.
     let listed = bin().args(["harnesses", "list"]).output().unwrap();

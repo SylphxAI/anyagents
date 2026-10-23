@@ -7,8 +7,8 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyagents_harness::{Context, 
-    DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
+use anyagents_harness::{
+    Context, DeliverOutcome, DeliveryMode, Harness, OutboundMessage, SteerSupport, TurnState,
 };
 use anyagents_harness_opencode::OpenCodeHarness;
 use tempfile::TempDir;
@@ -21,9 +21,9 @@ fn msg(id: &str) -> OutboundMessage {
         sender: Some("agent:owner".to_string()),
         reply_to: None,
         source_time_ms: None,
-            context: Context::default(),
-        }
+        context: Context::default(),
     }
+}
 
 /// A scripted `opencode` beside this test binary. The server crate ships the
 /// same program as `scripted_opencode`; this copy is built with the tests.

@@ -10,7 +10,9 @@ use std::path::{Path, PathBuf};
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, SteerSupport, TurnUsage,
 };
-use anyagents_harness_stream::{Launch, StreamHarness, StreamSpec, cancel_line, message_line};
+use anyagents_harness_stream::{
+    AgyRpcConfig, Launch, StreamHarness, StreamSpec, cancel_line, message_line,
+};
 
 /// One long-lived Antigravity child.
 pub struct AgyHarness {
@@ -40,7 +42,7 @@ impl AgyHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
-        let environment = environment
+        let environment: Vec<(String, String)> = environment
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
@@ -54,16 +56,54 @@ impl AgyHarness {
         } else {
             (DeliveryMode::Followup, SteerSupport::Unproven)
         };
-        let inner = StreamHarness::launch(Launch {
-            spec: spec.clone(),
-            program: program.into(),
-            args,
-            environment,
-            work_dir: work_dir.map(Path::to_path_buf),
-            session_id: session_id.map(str::to_string),
-            mode,
-            steer,
-        })?;
+        let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+            || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
+        let agy_rpc = if work_dir.is_some() && !fake_mode {
+            environment
+                .iter()
+                .find(|(k, _)| k == "ANYAGENTS_AGENT_CONFIG" || k == "AGY_CONFIG_DIR")
+                .map(|(_, v)| {
+                    let csrf_token = environment
+                        .iter()
+                        .find(|(k, _)| k == "ANYAGENTS_AGY_CSRF_TOKEN")
+                        .map(|(_, val)| val.clone())
+                        .unwrap_or_else(|| {
+                            let nanos = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_nanos())
+                                .unwrap_or(0);
+                            format!("agy-csrf-{}-{nanos}", std::process::id())
+                        });
+                    if !args.iter().any(|a| a == "--csrf_token") {
+                        args.push("--csrf_token".to_string());
+                        args.push(csrf_token.clone());
+                    }
+                    let port_override = environment
+                        .iter()
+                        .find(|(k, _)| k == "ANYAGENTS_AGY_HTTP_PORT")
+                        .and_then(|(_, val)| val.parse::<u16>().ok());
+                    AgyRpcConfig {
+                        config_dir: PathBuf::from(v),
+                        csrf_token,
+                        port_override,
+                    }
+                })
+        } else {
+            None
+        };
+        let inner = StreamHarness::launch_with_agy_rpc(
+            Launch {
+                spec: spec.clone(),
+                program: program.into(),
+                args,
+                environment,
+                work_dir: work_dir.map(Path::to_path_buf),
+                session_id: session_id.map(str::to_string),
+                mode,
+                steer,
+            },
+            agy_rpc,
+        )?;
         Ok(Self { inner, spec })
     }
 

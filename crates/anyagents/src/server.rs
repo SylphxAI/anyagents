@@ -25,8 +25,9 @@ use futures::StreamExt;
 use serde::Deserialize;
 
 use crate::api::{
-    AgentView, AgentsResponse, CreateAgentRequest, Delivery, InboxResponse, MessageView,
-    SendRequest, SendResponse,
+    AgentView, AgentsResponse, ConversationResponse, ConversationTurnView, CreateAgentRequest,
+    Delivery, GroupActionRequest, GroupView, GroupsResponse, InboxResponse, InteractRequest,
+    InteractResponse, MessageView, SendRequest, SendResponse,
 };
 use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
@@ -87,14 +88,38 @@ fn capability_key() -> Result<String, Error> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
+    std::fs::create_dir_all(data)?;
+    let lock_path = data.join("server.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(Error::Message(format!(
+                "anyagents serve already running on {}",
+                data.display()
+            )));
+        }
+    }
+    Ok(file)
+}
+
 async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
+    let _server_lock = acquire_server_lock(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
     let agents = store.list_agents()?;
     let mut mint_failures = Vec::new();
     for agent in &agents {
-        if let Err(err) = crate::operator::mint(&store, &agent.id) {
+        if let Err(err) = crate::operator::ensure(&store, &agent.id) {
             mint_failures.push(format!("{}: {err}", agent.name));
         }
     }
@@ -150,6 +175,9 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     prepare_socket(&path)?;
     let api_listener = tokio::net::UnixListener::bind(&path)?;
     set_socket_mode(&path)?;
+    if auth.is_confined() {
+        crate::sandbox::share_socket_with_seats(&path);
+    }
     let supervisor = Supervisor::<VendorHarness>::start(
         Arc::clone(&store),
         Arc::new(SystemClock::new()),
@@ -157,6 +185,9 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         vendor::child_env(),
     )
     .map_err(Error::Message)?;
+    if auth.is_confined() {
+        crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
+    }
     let state = AppState {
         send_namespace: capability_key()?[..16].to_string(),
         store: Arc::clone(&store),
@@ -190,7 +221,15 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
+        .route("/v1/agents/{name}/conversation", get(conversation_route))
+        .route("/v1/agents/{name}/archive", post(archive_agent_route))
+        .route("/v1/agents/{name}/wake", post(wake_agent_route))
+        .route(
+            "/v1/groups",
+            get(list_groups_route).post(group_action_route),
+        )
         .route("/v1/send", post(send))
+        .route("/v1/interact", post(interact_route))
         .route("/v1/harnesses/{id}/sign-in", post(sign_in_route))
         .route(
             "/v1/operator/agents/{name}/capability",
@@ -296,7 +335,7 @@ async fn mint_capability(
 }
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
-/// webhook listener (`https://desk.kylet.se/v1/webhooks/healthz`).
+/// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
 async fn webhook_healthz() -> Json<serde_json::Value> {
     Json(serde_json::json!({ "ok": true }))
 }
@@ -422,7 +461,7 @@ async fn operator_inbox(
         .store
         .agent_by_name(&name)
         .map_err(ApiError::from_store)?;
-    spawn_store(move || inbox_of(&state.store, &agent.id, query.since)).await
+    spawn_store(move || inbox_of(&state.store, &agent.id, query.since, query.limit)).await
 }
 
 /// Only the operator administers the deployment.
@@ -491,6 +530,12 @@ struct SignInLine {
     text: String,
 }
 
+#[derive(Deserialize, Default)]
+struct SignInQuery {
+    #[serde(default)]
+    profile: Option<String>,
+}
+
 /// `POST /v1/harnesses/{id}/sign-in`. The body stays open while the vendor
 /// command runs. Each link or code is one JSON line, and the last line is the
 /// outcome. The credential never appears here.
@@ -498,8 +543,16 @@ async fn sign_in_route(
     principal: Principal,
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
+    Query(query): Query<SignInQuery>,
 ) -> Result<Response, ApiError> {
     require_operator(&principal)?;
+    let profile = query
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("default")
+        .to_string();
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
     let runner = Arc::clone(&state.sign_in);
     let root = state.store.data_dir().to_path_buf();
@@ -511,7 +564,7 @@ async fn sign_in_route(
             &builtin_catalog(),
             &root,
             &id,
-            "default",
+            &profile,
             &mut *guard,
             &mut sink,
         );
@@ -661,6 +714,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name.clone(),
+        parent: agent.parent_id.as_ref().map(ToString::to_string),
         harness: agent.harness.clone(),
         model: agent.model.clone(),
         workdir: agent.workdir.clone(),
@@ -670,17 +724,23 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         steer_support: steer.to_string(),
         quota_reset_at_ms: quota,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
-        install: install_state(agent),
+        install: install_state(store, agent),
     })
 }
 
 /// `installed` once this harness is on the machine, `needed` when the reason it
 /// is not, `pending` when nothing has been recorded yet.
-fn install_state(agent: &Agent) -> String {
+fn install_state(store: &Store, agent: &Agent) -> String {
     match crate::install::recorded(&agent.harness) {
         Some(Ok(())) => "installed".to_string(),
         Some(Err(reason)) => reason,
-        None => "pending".to_string(),
+        None => {
+            if crate::install::program(store.data_dir(), &agent.harness).is_file() {
+                "installed".to_string()
+            } else {
+                "pending".to_string()
+            }
+        }
     }
 }
 
@@ -689,24 +749,234 @@ async fn create_agent_route(
     State(state): State<AppState>,
     Json(body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
-    require_operator(&principal)?;
+    let caller_agent = match &principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
+    };
     spawn_store(move || {
+        let parent_agent = match (&caller_agent, body.parent.as_deref()) {
+            (_, Some(parent_ref)) => Some(
+                state
+                    .store
+                    .agent_by_name(parent_ref)
+                    .map_err(ApiError::from_store)?,
+            ),
+            (Some((caller_id, _)), None) => {
+                Some(state.store.agent(caller_id).map_err(ApiError::from_store)?)
+            }
+            (None, None) => None,
+        };
+        let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
+        let harness = {
+            let trimmed = body.harness.trim();
+            if !trimmed.is_empty() {
+                trimmed.to_string()
+            } else if let Some(ref p) = parent_agent
+                && p.harness != "agy"
+            {
+                p.harness.clone()
+            } else {
+                "claude-code".to_string()
+            }
+        };
         let agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
-                harness: body.harness,
+                harness,
                 model: body.model,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
                 instructions: body.instructions,
+                parent_id,
             },
         )
         .map_err(ApiError::from_store)?;
-        operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
+        if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
+            .join("mcp-capability")
+            .is_file()
+        {
+            operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
+        }
+        if let Some(prompt) = body
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let sender = caller_agent
+                .as_ref()
+                .map(|(_, name)| format!("agent:{name}"))
+                .unwrap_or_else(|| "operator".to_string());
+            state
+                .store
+                .receive(
+                    &agent.id,
+                    Incoming {
+                        text: prompt.to_string(),
+                        sender: Some(sender),
+                        source_time_ms: None,
+                        source_key: None,
+                        reply_to: None,
+                        quote: None,
+                        origin: None,
+                        received_at_ms: None,
+                    },
+                )
+                .map_err(ApiError::from_store)?;
+            if let Some((ref caller_id, _)) = caller_agent {
+                let _ = state.store.record_outbound(
+                    caller_id,
+                    &format!("agent:{}", agent.name),
+                    None,
+                    prompt,
+                );
+            }
+        }
         let view = agent_view(&state.store, &state.health, &agent)?;
         Ok((StatusCode::CREATED, Json(view)))
+    })
+    .await
+}
+
+async fn archive_agent_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let agent = state
+            .store
+            .set_agent_state(&found.id, "archived")
+            .map_err(ApiError::from_store)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if state
+                .health
+                .get(&found.id)
+                .is_none_or(|live| !live.process_alive)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(Json(agent_view(&state.store, &state.health, &agent)?))
+    })
+    .await
+}
+
+async fn wake_agent_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let agent = state
+            .store
+            .set_agent_state(&found.id, "running")
+            .map_err(ApiError::from_store)?;
+        Ok(Json(agent_view(&state.store, &state.health, &agent)?))
+    })
+    .await
+}
+
+async fn list_groups_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<GroupsResponse>, ApiError> {
+    spawn_store(move || {
+        let rows = state.store.list_groups().map_err(ApiError::from_store)?;
+        let groups = rows
+            .into_iter()
+            .map(|(name, members)| GroupView { name, members })
+            .collect();
+        Ok(Json(GroupsResponse { groups }))
+    })
+    .await
+}
+
+async fn group_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<GroupActionRequest>,
+) -> Result<Json<GroupView>, ApiError> {
+    let default_agent = match &principal {
+        Principal::Agent { name, .. } => Some(name.clone()),
+        Principal::Operator => None,
+    };
+    spawn_store(move || {
+        let group = body
+            .group
+            .trim()
+            .strip_prefix("group:")
+            .unwrap_or(body.group.trim())
+            .to_string();
+        if group.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "group name is empty",
+            ));
+        }
+        let target_name = body
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or(default_agent);
+        match body.action.trim() {
+            "join" => {
+                let who = target_name.ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "join needs an agent name")
+                })?;
+                let agent = state
+                    .store
+                    .agent_by_name(&who)
+                    .map_err(ApiError::from_store)?;
+                state
+                    .store
+                    .join_group(&group, &agent.id)
+                    .map_err(ApiError::from_store)?;
+            }
+            "leave" => {
+                let who = target_name.ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "leave needs an agent name")
+                })?;
+                let agent = state
+                    .store
+                    .agent_by_name(&who)
+                    .map_err(ApiError::from_store)?;
+                state
+                    .store
+                    .leave_group(&group, &agent.id)
+                    .map_err(ApiError::from_store)?;
+            }
+            "members" => {}
+            other => {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown group action: {other}"),
+                ));
+            }
+        }
+        let members = state
+            .store
+            .room_members(&group)
+            .map_err(ApiError::from_store)?
+            .unwrap_or_default();
+        Ok(Json(GroupView {
+            name: group,
+            members,
+        }))
     })
     .await
 }
@@ -714,6 +984,14 @@ async fn create_agent_route(
 #[derive(Deserialize)]
 struct Since {
     since: Option<i64>,
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct ConversationQuery {
+    with: Option<String>,
+    since_ms: Option<i64>,
+    limit: Option<usize>,
 }
 
 async fn inbox(
@@ -722,8 +1000,9 @@ async fn inbox(
     AxumPath(name): AxumPath<String>,
     Query(query): Query<Since>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    // The name in the path is a check, never an identity: a call reads its own
-    // mailbox, and the operator reads any agent's by naming it explicitly.
+    // An agent's `inbox` is strictly its own incoming queue. To inspect another
+    // agent's full two-way communication (`in` + `out` with users, groups, and
+    // peers), agents use `/v1/agents/{name}/conversation`.
     let agent_id = match &principal {
         Principal::Operator => {
             state
@@ -732,20 +1011,59 @@ async fn inbox(
                 .map_err(ApiError::from_store)?
                 .id
         }
-        // A session reads the mailbox its capability names. The id in the path
-        // is a check that it named its own, so an inbox is never chosen by a
-        // string the model wrote.
-        Principal::Agent { agent_id, .. } => {
-            if name != agent_id.as_str() {
-                let forbidden = auth::AuthError::Forbidden(
-                    "a session reads its own inbox, not another agent's".to_string(),
-                );
-                return Err(ApiError::from_auth(&forbidden));
+        Principal::Agent {
+            agent_id,
+            name: own_name,
+        } => {
+            if name != agent_id.as_str() && name != own_name.as_str() {
+                return Err(ApiError::forbidden(
+                    "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
+                ));
             }
             agent_id.clone()
         }
     };
-    spawn_store(move || inbox_of(&state.store, &agent_id, query.since)).await
+    spawn_store(move || inbox_of(&state.store, &agent_id, query.since, query.limit)).await
+}
+
+async fn conversation_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Query(query): Query<ConversationQuery>,
+) -> Result<Json<ConversationResponse>, ApiError> {
+    spawn_store(move || {
+        let agent = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let turns = state
+            .store
+            .conversation(
+                &agent.id,
+                query.with.as_deref(),
+                query.since_ms,
+                query.limit,
+            )
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(|t| ConversationTurnView {
+                id: t.id,
+                direction: t.direction,
+                from: t.from,
+                to: t.to,
+                reply_to: t.reply_to,
+                text: t.text,
+                timestamp_ms: t.timestamp_ms,
+            })
+            .collect();
+        Ok(Json(ConversationResponse {
+            agent: agent.name,
+            agent_id: agent.id.to_string(),
+            turns,
+        }))
+    })
+    .await
 }
 
 /// One agent's messages past `since`, in sequence order.
@@ -753,10 +1071,17 @@ fn inbox_of(
     store: &Store,
     agent_id: &anyagents_core::AgentId,
     since: Option<i64>,
+    limit: Option<usize>,
 ) -> Result<Json<InboxResponse>, ApiError> {
-    let messages = store
-        .inbox(agent_id, since)
-        .map_err(ApiError::from_store)?
+    let mut rows = store.inbox(agent_id, since).map_err(ApiError::from_store)?;
+    if let Some(limit) = limit {
+        if since.is_none() && rows.len() > limit {
+            rows.drain(..rows.len() - limit);
+        } else if rows.len() > limit {
+            rows.truncate(limit);
+        }
+    }
+    let messages = rows
         .into_iter()
         .map(|message| MessageView {
             id: message.id.to_string(),
@@ -826,11 +1151,380 @@ async fn send(
     let principal_for_plan = principal.clone();
     let actor_for_plan = actor.clone();
     let body_for_plan = body.clone();
-    let plan =
-        spawn_store(move || plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan))
-            .await?;
+    let plan = spawn_store(move || {
+        plan_send(&store, &principal_for_plan, &actor_for_plan, &body_for_plan)
+    })
+    .await?;
     let store = Arc::clone(&state.store);
     spawn_store(move || send_sync(&store, &actor, body, plan, key)).await
+}
+
+async fn interact_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<InteractRequest>,
+) -> Result<Json<InteractResponse>, ApiError> {
+    let actor_name = match &principal {
+        Principal::Agent { name, .. } => name.clone(),
+        Principal::Operator => {
+            let sender = body.sender.as_deref().ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "an operator interact call needs an explicit sender",
+                )
+            })?;
+            sender
+                .trim()
+                .strip_prefix("agent:")
+                .unwrap_or(sender.trim())
+                .to_string()
+        }
+    };
+    let store = Arc::clone(&state.store);
+    spawn_store(move || interact_sync(&store, &principal, &actor_name, body)).await
+}
+
+fn interact_sync(
+    store: &Store,
+    principal: &Principal,
+    actor_name: &str,
+    body: InteractRequest,
+) -> Result<Json<InteractResponse>, ApiError> {
+    let action = body.action.trim().to_ascii_lowercase();
+    let raw_target = body.target.trim();
+    if raw_target.is_empty() {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "interact requires a non-empty target",
+        ));
+    }
+    let actor = Actor::Agent(actor_name.to_string());
+    // Resolve target into optional (chat_id, message_id, thread_id, stored_message).
+    let mut tg_coords: Option<(i64, i64, Option<i64>)> = None;
+    let mut stored_msg: Option<anyagents_core::Message> = None;
+    if let Some(msg_id_str) = raw_target
+        .strip_prefix("anyagents:reply:")
+        .or_else(|| raw_target.starts_with("msg_").then_some(raw_target))
+    {
+        if let Ok(Some(msg)) = own_message(store, principal, &actor, msg_id_str) {
+            if let Some(ref origin) = msg.origin
+                && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
+            {
+                tg_coords = Some((chat_id, message_id, origin.thread_id));
+            }
+            stored_msg = Some(msg);
+        } else if let Ok(agent_row) = store.agent_by_name(actor_name)
+            && let Ok(Some(msg)) = store.message(&agent_row.id, msg_id_str)
+        {
+            if let Some(ref origin) = msg.origin
+                && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
+            {
+                tg_coords = Some((chat_id, message_id, origin.thread_id));
+            }
+            stored_msg = Some(msg);
+        }
+    } else if let Some(rest) = raw_target
+        .strip_prefix("telegram:chat:")
+        .or_else(|| raw_target.strip_prefix("telegram:user:"))
+    {
+        let parts: Vec<&str> = rest.split(':').collect();
+        if parts.len() >= 2
+            && let (Ok(chat_id), Ok(message_id)) = (
+                parts[0].parse::<i64>(),
+                parts[parts.len() - 1].parse::<i64>(),
+            )
+        {
+            let thread_id = if parts.len() == 3 {
+                parts[1].parse::<i64>().ok()
+            } else {
+                None
+            };
+            tg_coords = Some((chat_id, message_id, thread_id));
+        }
+    }
+    let data_dir = store.data_dir();
+    match action.as_str() {
+        "react" => {
+            let emoji = body.emoji.as_deref().map(str::trim);
+            if let Some((chat_id, message_id, thread_id)) = tg_coords {
+                crate::telegram::react_message(
+                    store, data_dir, actor_name, chat_id, message_id, emoji, thread_id,
+                )
+                .map_err(ApiError::from_store)?;
+                Ok(Json(InteractResponse {
+                    ok: true,
+                    action,
+                    target: body.target,
+                    detail: Some(format!(
+                        "reacted {} on telegram:chat:{chat_id}:{message_id}",
+                        emoji.unwrap_or("(cleared)")
+                    )),
+                }))
+            } else if let Some(msg) = stored_msg {
+                let e = emoji.filter(|s| !s.is_empty()).unwrap_or("👍");
+                let summary = format!("[Reaction {e} on message {}]", msg.id);
+                if let Some(ref sender) = msg.sender
+                    && let Some(peer_name) = sender.strip_prefix("agent:")
+                    && let Ok(peer) = store.agent_by_name(peer_name)
+                {
+                    let mut incoming = Incoming::new(summary.clone());
+                    incoming.sender = Some(format!("agent:{actor_name}"));
+                    incoming.reply_to = msg.reply_to.clone();
+                    let _ = store.receive(&peer.id, incoming);
+                }
+                Ok(Json(InteractResponse {
+                    ok: true,
+                    action,
+                    target: body.target,
+                    detail: Some(summary),
+                }))
+            } else {
+                Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "react target must be anyagents:reply:msg_... or telegram:chat:<chat_id>:<message_id>",
+                ))
+            }
+        }
+        "vote" => {
+            if body.options.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "vote requires at least one option in `options`",
+                ));
+            }
+            let resolved_opts =
+                resolve_poll_options(stored_msg.as_ref().map(|m| m.text.as_str()), &body.options);
+            let comment = body
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let ballot = match comment {
+                Some(note) => format!("🗳️ **Poll Vote**: {} — {note}", resolved_opts.join(", ")),
+                None => format!("🗳️ **Poll Vote**: {}", resolved_opts.join(", ")),
+            };
+            if let Some((chat_id, message_id, thread_id)) = tg_coords {
+                let _ = crate::telegram::react_message(
+                    store,
+                    data_dir,
+                    actor_name,
+                    chat_id,
+                    message_id,
+                    Some("👍"),
+                    thread_id,
+                );
+                let posted_id = crate::telegram::post_text(
+                    store,
+                    data_dir,
+                    actor_name,
+                    chat_id,
+                    &ballot,
+                    Some(message_id),
+                    thread_id,
+                )
+                .map_err(ApiError::from_store)?;
+                Ok(Json(InteractResponse {
+                    ok: true,
+                    action,
+                    target: body.target,
+                    detail: Some(format!(
+                        "voted ({}) on telegram:chat:{chat_id}:{message_id} (receipt #{posted_id})",
+                        resolved_opts.join(", ")
+                    )),
+                }))
+            } else if let Some(msg) = stored_msg {
+                if let Some(ref sender) = msg.sender
+                    && let Some(peer_name) = sender.strip_prefix("agent:")
+                    && let Ok(peer) = store.agent_by_name(peer_name)
+                {
+                    let mut incoming = Incoming::new(ballot.clone());
+                    incoming.sender = Some(format!("agent:{actor_name}"));
+                    incoming.reply_to = msg.reply_to.clone();
+                    let _ = store.receive(&peer.id, incoming);
+                }
+                Ok(Json(InteractResponse {
+                    ok: true,
+                    action,
+                    target: body.target,
+                    detail: Some(ballot),
+                }))
+            } else {
+                Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "vote target must be anyagents:reply:msg_... or telegram:chat:<chat_id>:<message_id>",
+                ))
+            }
+        }
+        "check" | "uncheck" => {
+            if body.options.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "check/uncheck requires at least one task number or text in `options`",
+                ));
+            }
+            let mark_done = action == "check";
+            if let Some(ref msg) = stored_msg {
+                let updated = toggle_checklist_items(&msg.text, &body.options, mark_done);
+                if let Some((chat_id, message_id, thread_id)) = tg_coords {
+                    let _ = crate::telegram::edit_message(
+                        store, data_dir, actor_name, chat_id, message_id, &updated, thread_id,
+                    );
+                }
+                Ok(Json(InteractResponse {
+                    ok: true,
+                    action,
+                    target: body.target,
+                    detail: Some(updated),
+                }))
+            } else {
+                Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "check/uncheck target must resolve to a stored checklist message",
+                ))
+            }
+        }
+        "edit" => {
+            let new_text = body
+                .text
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "edit requires non-empty `text`")
+                })?;
+            let (chat_id, message_id, thread_id) = tg_coords.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "edit target must resolve to a Telegram message",
+                )
+            })?;
+            crate::telegram::edit_message(
+                store, data_dir, actor_name, chat_id, message_id, new_text, thread_id,
+            )
+            .map_err(ApiError::from_store)?;
+            Ok(Json(InteractResponse {
+                ok: true,
+                action,
+                target: body.target,
+                detail: Some(format!("edited telegram:chat:{chat_id}:{message_id}")),
+            }))
+        }
+        "delete" => {
+            let (chat_id, message_id, _) = tg_coords.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "delete target must resolve to a Telegram message",
+                )
+            })?;
+            crate::telegram::delete_chat_message(store, data_dir, actor_name, chat_id, message_id)
+                .map_err(ApiError::from_store)?;
+            Ok(Json(InteractResponse {
+                ok: true,
+                action,
+                target: body.target,
+                detail: Some(format!("deleted telegram:chat:{chat_id}:{message_id}")),
+            }))
+        }
+        "pin" | "unpin" => {
+            let (chat_id, message_id, _) = tg_coords.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "pin/unpin target must resolve to a Telegram message",
+                )
+            })?;
+            let pin = action == "pin";
+            crate::telegram::pin_message(store, data_dir, actor_name, chat_id, message_id, pin)
+                .map_err(ApiError::from_store)?;
+            Ok(Json(InteractResponse {
+                ok: true,
+                action,
+                target: body.target,
+                detail: Some(format!(
+                    "{} telegram:chat:{chat_id}:{message_id}",
+                    if pin { "pinned" } else { "unpinned" }
+                )),
+            }))
+        }
+        "stop_poll" | "close_poll" => {
+            let (chat_id, message_id, _) = tg_coords.ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "stop_poll target must resolve to a Telegram poll message",
+                )
+            })?;
+            crate::telegram::close_poll(store, data_dir, actor_name, chat_id, message_id)
+                .map_err(ApiError::from_store)?;
+            Ok(Json(InteractResponse {
+                ok: true,
+                action,
+                target: body.target,
+                detail: Some(format!("closed poll telegram:chat:{chat_id}:{message_id}")),
+            }))
+        }
+        other => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unsupported interact action `{other}`; expected react, vote, check, uncheck, edit, delete, pin, unpin, or stop_poll"
+            ),
+        )),
+    }
+}
+
+fn toggle_checklist_items(message_text: &str, selected: &[String], mark_done: bool) -> String {
+    let target_box = if mark_done { "☑" } else { "☐" };
+    message_text
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let rest = trimmed
+                .strip_prefix("☐ ")
+                .or_else(|| trimmed.strip_prefix("☑ "));
+            if let Some(after_box) = rest {
+                let idx_str = after_box.split('.').next().unwrap_or("").trim();
+                let matched = selected.iter().any(|sel| {
+                    let s = sel.trim();
+                    s == idx_str
+                        || after_box
+                            .to_ascii_lowercase()
+                            .contains(&s.to_ascii_lowercase())
+                });
+                if matched {
+                    return format!("{target_box} {after_box}");
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn resolve_poll_options(message_text: Option<&str>, chosen: &[String]) -> Vec<String> {
+    let mut parsed_options: Vec<String> = Vec::new();
+    if let Some(text) = message_text
+        && let Some(idx) = text.find("| Options: ")
+    {
+        let rest = &text[idx + "| Options: ".len()..];
+        let end = rest.rfind(']').unwrap_or(rest.len());
+        for item in rest[..end].split("; ") {
+            let cleaned = item.split(" (").next().unwrap_or(item).trim().to_string();
+            if !cleaned.is_empty() {
+                parsed_options.push(cleaned);
+            }
+        }
+    }
+    chosen
+        .iter()
+        .map(|sel| {
+            let trimmed = sel.trim();
+            if let Ok(num) = trimmed.parse::<usize>()
+                && num >= 1
+                && num <= parsed_options.len()
+            {
+                return parsed_options[num - 1].clone();
+            }
+            trimmed.to_string()
+        })
+        .collect()
 }
 
 /// One send, resolved to the destinations it will write, before any of them is
@@ -842,7 +1536,7 @@ fn plan_send(
     actor: &Actor,
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
-    let mut plan = SendPlan::parse(store, body)?;
+    let mut plan = SendPlan::parse(store, actor, body)?;
     let reply = crate::reply::resolve(
         principal,
         |id| own_message(store, principal, actor, id),
@@ -850,25 +1544,57 @@ fn plan_send(
     )
     .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
     if let Some(destination) = reply {
-        // A reply names where it goes, and the record decides that: the
-        // addresses are only checked against it when the caller wrote some.
-        // An agent message names the agent, and an address may say so as a
-        // bare name or as `agent:<name>`.
-        let wanted = destination.address();
-        let bare = wanted.strip_prefix("agent:").unwrap_or(&wanted).to_string();
-        let named: Vec<String> = plan.targets.iter().map(Target::address).collect();
-        if !plan.targets.is_empty()
-            && !named
-                .iter()
-                .any(|one| *one == wanted || one.strip_prefix("agent:") == Some(bare.as_str()))
-        {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "this reply names one place, and the addresses name another",
-            ));
+        if plan.targets.is_empty() {
+            plan.targets = vec![target_of(&destination)];
+            plan.reply = destination.reply().map(str::to_string);
+        } else {
+            // When `to` addresses are explicitly given alongside `reply_to`:
+            // - A Telegram target must name the same `chat` as a Telegram reply
+            //   destination (so a group reply never goes to a private Telegram
+            //   chat or another Telegram chat), and inherits the recorded topic
+            //   and message id for that chat when not specified on the target.
+            // - Internal `agent:<name>` and `group:<room>` targets in `to` are
+            //   honoured as written without wiping out `plan.targets`.
+            let mut matched_telegram = false;
+            for target in &mut plan.targets {
+                if let Target::Telegram {
+                    address,
+                    chat,
+                    thread,
+                    reply,
+                } = target
+                {
+                    match &destination {
+                        crate::reply::Destination::Telegram {
+                            chat: wanted_chat,
+                            thread: wanted_thread,
+                            reply: wanted_reply,
+                        } if chat == wanted_chat => {
+                            if thread.is_none() {
+                                *thread = wanted_thread.clone();
+                                *address = destination.address();
+                            }
+                            if reply.is_none() {
+                                *reply = wanted_reply.clone();
+                            }
+                            matched_telegram = true;
+                        }
+                        other => {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                format!(
+                                    "this reply names one place ({}), and the addresses name another ({address})",
+                                    other.address()
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            if matched_telegram {
+                plan.reply = destination.reply().map(str::to_string);
+            }
         }
-        plan.targets = vec![target_of(&destination)];
-        plan.reply = destination.reply().map(str::to_string);
     }
     Ok(plan)
 }
@@ -883,10 +1609,7 @@ fn own_message(
 ) -> Result<Option<anyagents_core::Message>, String> {
     let agent_id = match (principal, actor) {
         (Principal::Agent { agent_id, .. }, _) => agent_id.clone(),
-        (_, Actor::Agent(name)) => store
-            .agent_by_name(name)
-            .map_err(|err| err.to_string())?
-            .id,
+        (_, Actor::Agent(name)) => store.agent_by_name(name).map_err(|err| err.to_string())?.id,
         (Principal::Operator, Actor::Operator(_)) => return Ok(None),
     };
     store.message(&agent_id, id).map_err(|err| err.to_string())
@@ -928,19 +1651,8 @@ enum Target {
     },
 }
 
-impl Target {
-    /// The address this target is written as.
-    fn address(&self) -> String {
-        match self {
-            Self::Agent(name) => format!("agent:{name}"),
-            Self::Room(room) => format!("group:{room}"),
-            Self::Telegram { address, .. } => address.clone(),
-        }
-    }
-}
-
 impl SendPlan {
-    fn parse(store: &Store, body: &SendRequest) -> Result<Self, ApiError> {
+    fn parse(store: &Store, actor: &Actor, body: &SendRequest) -> Result<Self, ApiError> {
         if body.to.is_empty() && body.reply_to.is_none() {
             return Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -953,6 +1665,73 @@ impl SendPlan {
                 .map_err(Error::from)
                 .map_err(ApiError::from_store)?
             {
+                Address::Agent(name) if name == "all" => {
+                    targets.push(Target::Room("all".to_string()));
+                }
+                Address::Agent(name) if name == "parent" => {
+                    let Actor::Agent(sender_name) = actor else {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "only an agent has a parent",
+                        ));
+                    };
+                    let sender = store
+                        .agent_by_name(sender_name)
+                        .map_err(ApiError::from_store)?;
+                    let parent_id = sender.parent_id.ok_or_else(|| {
+                        ApiError::new(StatusCode::BAD_REQUEST, "this agent has no parent")
+                    })?;
+                    let parent = store
+                        .agent_by_name(parent_id.as_str())
+                        .map_err(ApiError::from_store)?;
+                    targets.push(Target::Agent(parent.name));
+                }
+                Address::Agent(name) if name == "children" => {
+                    let Actor::Agent(sender_name) = actor else {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "only an agent has children",
+                        ));
+                    };
+                    let sender = store
+                        .agent_by_name(sender_name)
+                        .map_err(ApiError::from_store)?;
+                    let children = store
+                        .children_of(&sender.id)
+                        .map_err(ApiError::from_store)?;
+                    if children.is_empty() {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "this agent has no active children",
+                        ));
+                    }
+                    for child in children {
+                        targets.push(Target::Agent(child.name));
+                    }
+                }
+                Address::Group(room) if room == "children" => {
+                    let Actor::Agent(sender_name) = actor else {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "only an agent has children",
+                        ));
+                    };
+                    let sender = store
+                        .agent_by_name(sender_name)
+                        .map_err(ApiError::from_store)?;
+                    let children = store
+                        .children_of(&sender.id)
+                        .map_err(ApiError::from_store)?;
+                    if children.is_empty() {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "this agent has no active children",
+                        ));
+                    }
+                    for child in children {
+                        targets.push(Target::Agent(child.name));
+                    }
+                }
                 Address::Agent(name) => targets.push(Target::Agent(name)),
                 Address::TelegramChat { chat, thread } => {
                     targets.push(Target::Telegram {
@@ -976,7 +1755,6 @@ impl SendPlan {
                 Address::Group(room) => targets.push(Target::Room(room)),
             }
         }
-        let _ = store;
         Ok(Self {
             targets,
             reply: None,
@@ -1046,7 +1824,9 @@ fn send_sync(
     // The request's `reply_to` is a reference, not a Telegram id; a Telegram
     // target carries the id the reference resolved to instead.
     let reply = plan.reply.clone();
+    let effective_text = format_internal_send_text(&body);
     let body = SendRequest {
+        text: effective_text,
         // A reply the caller resolved to a message id, or a reference the
         // server resolved to one, is what this post answers.
         reply_to: reply.clone().or_else(|| {
@@ -1056,14 +1836,37 @@ fn send_sync(
         ..body
     };
     check_targets(store, actor, &body, &plan)?;
+    let sender_agent_id = match actor {
+        Actor::Agent(name) => store.agent_by_name(name).ok().map(|a| a.id),
+        Actor::Operator(_) => None,
+    };
+    let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
-                deliveries.push(deliver_agent(store, &body, name, key.as_deref())?)
+                let d = deliver_agent(store, &body, name, key.as_deref())?;
+                if let Some(ref sid) = sender_agent_id
+                    && !d.duplicate
+                {
+                    let _ =
+                        store.record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body);
+                }
+                deliveries.push(d);
             }
             Target::Room(room) => {
                 let mut all = deliver_room(store, &body, room, key.as_deref())?;
+                if let Some(ref sid) = sender_agent_id
+                    && all.iter().any(|d| !d.duplicate)
+                {
+                    let dest = if room.starts_with("group:") || room.starts_with("telegram:") {
+                        room.clone()
+                    } else {
+                        format!("group:{room}")
+                    };
+                    let _ =
+                        store.record_outbound(sid, &dest, body.reply_to.as_deref(), &composed_body);
+                }
                 deliveries.append(&mut all);
             }
             Target::Telegram {
@@ -1071,15 +1874,22 @@ fn send_sync(
                 chat,
                 thread,
                 reply: address_reply,
-            } => deliveries.push(deliver_telegram(
-                store,
-                actor,
-                &body,
-                address,
-                chat,
-                thread.as_deref(),
-                address_reply.as_deref().or(reply.as_deref()),
-            )?),
+            } => {
+                let d = deliver_telegram(
+                    store,
+                    actor,
+                    &body,
+                    address,
+                    chat,
+                    thread.as_deref(),
+                    address_reply.as_deref().or(reply.as_deref()),
+                )?;
+                if let Some(ref sid) = sender_agent_id {
+                    let _ =
+                        store.record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body);
+                }
+                deliveries.push(d);
+            }
         }
     }
     let response = SendResponse { deliveries };
@@ -1135,6 +1945,9 @@ enum Actor {
 
 impl Actor {
     fn parse(raw: &str) -> Result<Self, ApiError> {
+        if raw.trim() == "operator" {
+            return Ok(Self::Operator("operator".to_string()));
+        }
         match anyagents_core::Address::parse(raw) {
             Ok(anyagents_core::Address::Agent(name)) => Ok(Self::Agent(name)),
             Ok(
@@ -1173,6 +1986,7 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .list_agents()
         .unwrap_or_default()
         .into_iter()
+        .filter(|agent| agent.state != "archived")
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
         .filter(|agent| {
             members
@@ -1319,6 +2133,62 @@ fn telegram_reply(body: &SendRequest, reply: Option<&str>) -> Result<Option<i64>
     }
 }
 
+fn format_internal_send_text(body: &SendRequest) -> String {
+    let mut parts = Vec::new();
+    if !body.text.trim().is_empty() {
+        parts.push(body.text.clone());
+    }
+    if let Some(ref media) = body.media {
+        parts.push(format!("[Attachment ({}): {}]", media.kind, media.source));
+    }
+    if let Some(ref loc) = body.location {
+        match (&loc.title, &loc.address) {
+            (Some(t), Some(a)) if !t.is_empty() && !a.is_empty() => {
+                parts.push(format!(
+                    "[Venue: {t} — {a} (GPS: {:.6}, {:.6})]",
+                    loc.latitude, loc.longitude
+                ));
+            }
+            _ => {
+                parts.push(format!(
+                    "[Location GPS: latitude={:.6}, longitude={:.6}]",
+                    loc.latitude, loc.longitude
+                ));
+            }
+        }
+    }
+    if let Some(ref poll) = body.poll {
+        parts.push(format!(
+            "[Poll: \"{}\" | Options: {}]",
+            poll.question,
+            poll.options.join(" / ")
+        ));
+    }
+    if let Some(ref cl) = body.checklist {
+        parts.push(anyagents_channel_telegram::format_checklist_markdown(
+            &cl.title, &cl.tasks,
+        ));
+    }
+    if let Some(ref art) = body.article {
+        match (&art.url, &art.content) {
+            (Some(u), _) if !u.trim().is_empty() => {
+                parts.push(format!("📰 [**{}**]({})", art.title, u.trim()));
+            }
+            (_, Some(c)) if !c.trim().is_empty() => {
+                parts.push(format!("📰 **{}**\n\n{}", art.title, c.trim()));
+            }
+            _ => {
+                parts.push(format!("📰 **{}**", art.title));
+            }
+        }
+    }
+    if parts.is_empty() {
+        body.text.clone()
+    } else {
+        parts.join("\n")
+    }
+}
+
 /// `id` is the Telegram message id. This delivery has no mailbox sequence.
 #[allow(clippy::too_many_arguments)]
 fn deliver_telegram(
@@ -1332,16 +2202,101 @@ fn deliver_telegram(
 ) -> Result<Delivery, ApiError> {
     let from = telegram_sender(actor)?;
     let (chat_id, thread_id, reply_to) = telegram_target(chat, thread, reply, body)?;
-    let message_id = crate::telegram::post_text(
-        store,
-        store.data_dir(),
-        from,
-        chat_id,
-        &body.text,
-        reply_to,
-        thread_id,
-    )
-    .map_err(ApiError::from_store)?;
+    let message_id = if let Some(ref media) = body.media {
+        let caption = body
+            .text
+            .strip_suffix(&format!(
+                "\n[Attachment ({}): {}]",
+                media.kind, media.source
+            ))
+            .or_else(|| {
+                body.text
+                    .strip_prefix(&format!("[Attachment ({}): {}]", media.kind, media.source))
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        crate::telegram::post_media(
+            store,
+            store.data_dir(),
+            from,
+            chat_id,
+            &media.kind,
+            &media.source,
+            caption,
+            media.title.as_deref(),
+            media.performer.as_deref(),
+            reply_to,
+            thread_id,
+        )
+        .map_err(ApiError::from_store)?
+    } else if let Some(ref loc) = body.location {
+        crate::telegram::post_location(
+            store,
+            store.data_dir(),
+            from,
+            chat_id,
+            loc.latitude,
+            loc.longitude,
+            loc.title.as_deref(),
+            loc.address.as_deref(),
+            reply_to,
+            thread_id,
+        )
+        .map_err(ApiError::from_store)?
+    } else if let Some(ref poll) = body.poll {
+        crate::telegram::post_poll(
+            store,
+            store.data_dir(),
+            from,
+            chat_id,
+            &poll.question,
+            &poll.options,
+            poll.is_anonymous,
+            poll.allows_multiple_answers,
+            reply_to,
+            thread_id,
+        )
+        .map_err(ApiError::from_store)?
+    } else if let Some(ref cl) = body.checklist {
+        crate::telegram::post_checklist(
+            store,
+            store.data_dir(),
+            from,
+            chat_id,
+            &cl.title,
+            &cl.tasks,
+            cl.business_connection_id.as_deref(),
+            reply_to,
+            thread_id,
+        )
+        .map_err(ApiError::from_store)?
+    } else if let Some(ref art) = body.article {
+        crate::telegram::post_article(
+            store,
+            store.data_dir(),
+            from,
+            chat_id,
+            &art.title,
+            art.content.as_deref(),
+            art.url.as_deref(),
+            art.author_name.as_deref(),
+            None,
+            reply_to,
+            thread_id,
+        )
+        .map_err(ApiError::from_store)?
+    } else {
+        crate::telegram::post_text(
+            store,
+            store.data_dir(),
+            from,
+            chat_id,
+            &body.text,
+            reply_to,
+            thread_id,
+        )
+        .map_err(ApiError::from_store)?
+    };
     // Remember the chat this agent answers in, so a post it makes there reaches
     // the other agents on that chat as a mailbox message.
     crate::telegram::record_chat(store, from, chat_id).map_err(ApiError::from_store)?;
@@ -1380,10 +2335,6 @@ impl ApiError {
 
     fn forbidden(message: impl Into<String>) -> Self {
         Self::new(StatusCode::FORBIDDEN, message)
-    }
-
-    fn from_auth(err: &auth::AuthError) -> Self {
-        Self::new(err.status(), err.message())
     }
 
     fn from_store(err: Error) -> Self {

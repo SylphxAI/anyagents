@@ -79,6 +79,7 @@ dependencies = [
  "anyagents-harness-claude",
  "anyagents-harness-codex",
  "anyagents-harness-muse",
+ "anyagents-harness-omp",
  "anyagents-harness-opencode",
  "anyagents-harness-stream",
  "anyagents-installer",
@@ -166,7 +167,6 @@ version = "0.1.0"
 dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
- "serde",
  "serde_json",
  "tempfile",
 ]

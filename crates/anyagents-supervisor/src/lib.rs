@@ -234,7 +234,9 @@ impl HealthBoard {
 /// have no wired, confirmed consumption acknowledgement.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
     match harness {
-        "codex" | "claude-code" | "opencode" | "muse" => (DeliveryMode::Steer, SteerSupport::Yes),
+        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok" => {
+            (DeliveryMode::Steer, SteerSupport::Yes)
+        }
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -448,6 +450,8 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
             Wake::Agent { agent_id } => {
                 if is_running(&inner.store, &agent_id) {
                     ensure(&inner, agent_id);
+                } else {
+                    stop_slot(&inner, &agent_id);
                 }
             }
         }
@@ -458,18 +462,78 @@ fn is_running(store: &Store, id: &AgentId) -> bool {
     store.agent(id).is_ok_and(|agent| agent.state == "running")
 }
 
-fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
-    let mut workers = lock(&inner.workers);
-    if let Some(slot) = workers.get_mut(&id) {
-        let finished = slot.done.load(Ordering::SeqCst);
-        let busy = slot.busy.load(Ordering::SeqCst);
-        if !finished || busy {
-            return;
+fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
+    let done = {
+        let mut workers = lock(&inner.workers);
+        if let Some(slot) = workers.get_mut(id) {
+            slot.stop.store(true, Ordering::SeqCst);
+            slot.woken.store(true, Ordering::SeqCst);
+            Some(Arc::clone(&slot.done))
+        } else {
+            None
         }
-        if let Some(thread) = slot.thread.take() {
+    };
+    inner.clock.poke();
+    if let Ok(agent) = inner.store.agent(id) {
+        let (mode, steer) = declared(&agent.harness);
+        inner.board.publish(
+            id,
+            LiveState {
+                process_alive: false,
+                delivery_mode: mode,
+                steer_support: steer,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+            },
+        );
+    }
+    if let Some(done) = done {
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        while !done.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        let finished_thread = {
+            let mut workers = lock(&inner.workers);
+            if let Some(slot) = workers.get_mut(id)
+                && slot.done.load(Ordering::SeqCst)
+            {
+                let thread = slot.thread.take();
+                workers.remove(id);
+                thread
+            } else {
+                None
+            }
+        };
+        if let Some(thread) = finished_thread {
             let _ = thread.join();
         }
-        workers.remove(&id);
+    }
+}
+
+fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
+    let stopping_thread = {
+        let mut workers = lock(&inner.workers);
+        if let Some(slot) = workers.get_mut(&id) {
+            let finished = slot.done.load(Ordering::SeqCst);
+            let stopping = slot.stop.load(Ordering::SeqCst);
+            let busy = slot.busy.load(Ordering::SeqCst);
+            if (!finished && !stopping) || busy {
+                return;
+            }
+            let thread = slot.thread.take();
+            workers.remove(&id);
+            thread
+        } else {
+            None
+        }
+    };
+    if let Some(thread) = stopping_thread {
+        let _ = thread.join();
+    }
+    let mut workers = lock(&inner.workers);
+    if workers.contains_key(&id) {
+        return;
     }
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicBool::new(false));
@@ -591,6 +655,8 @@ impl<H: Harness + 'static> Session<H> {
     fn run(&mut self) -> bool {
         loop {
             if self.stop.load(Ordering::SeqCst) {
+                self.delivery = None;
+                self.publish();
                 return false;
             }
             if self.delivery.is_none() {
@@ -603,6 +669,9 @@ impl<H: Harness + 'static> Session<H> {
                     Boot::Busy => return true,
                     Boot::Retry => {
                         if !self.wait_backoff() {
+                            self.delivery = None;
+                            self.restart_at = None;
+                            self.publish();
                             return false;
                         }
                     }
@@ -610,14 +679,17 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             self.publish();
+            if self.quota_waiting() {
+                continue;
+            }
             if !self.process_alive() {
                 if !self.wait_backoff() {
+                    self.delivery = None;
+                    self.restart_at = None;
+                    self.publish();
                     return false;
                 }
                 self.replace_process();
-                continue;
-            }
-            if self.quota_waiting() {
                 continue;
             }
             if self.deliver_once() {
@@ -662,7 +734,11 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn publish(&self) {
-        let state = match self.delivery.as_ref() {
+        let state = match self
+            .delivery
+            .as_ref()
+            .filter(|_| !self.stop.load(Ordering::SeqCst))
+        {
             Some(delivery) => {
                 let health = delivery.harness().health();
                 LiveState {
@@ -899,9 +975,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn agy_catalog_does_not_claim_unwired_native_steering() {
+    fn declared_catalog_matches_native_steer_adapters() {
+        for harness in [
+            "codex",
+            "claude-code",
+            "opencode",
+            "muse",
+            "agy",
+            "omp",
+            "dsh",
+            "grok",
+        ] {
+            assert_eq!(
+                super::declared(harness),
+                (super::DeliveryMode::Steer, super::SteerSupport::Yes),
+                "{harness}"
+            );
+        }
         assert_eq!(
-            super::declared("agy"),
+            super::declared("contract"),
             (super::DeliveryMode::Followup, super::SteerSupport::Unproven)
         );
     }

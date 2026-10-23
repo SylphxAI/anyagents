@@ -19,9 +19,9 @@ pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
 pub use store::{
-    Ack, Agent, AgentLock, BillingMode, Channel, Incoming, Lag, Message, NewAgent, NewChannel,
-    NewUsage, Origin, ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake, agent_config_dir,
-    agent_work_dir, now_ms, sum_usage, utc_day,
+    Ack, Agent, AgentLock, BillingMode, Channel, ConversationTurn, Incoming, Lag, Message,
+    NewAgent, NewChannel, NewUsage, Origin, ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake,
+    agent_config_dir, agent_work_dir, now_ms, sum_usage, utc_day,
 };
 
 /// The token a client presents as an agent, when it has one. A capability is

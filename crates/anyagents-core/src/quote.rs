@@ -31,7 +31,7 @@ pub struct Quote {
     /// The quoted author's id, when Telegram sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_id: Option<i64>,
-    /// The author, as Telegram names it: `Kyle`, `Sage` or `Sage (@sage_bot)`.
+    /// The author, as Telegram names it: `Alex`, `Sage` or `Sage (@sage_bot)`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub author: String,
     /// The quoted message's text, or its caption.
@@ -147,7 +147,7 @@ mod tests {
             }),
             sender_id: Some(42),
             author_is_bot: false,
-            author: "Kyle".into(),
+            author: "Alex".into(),
             text: "ship it".into(),
             mentions: Vec::new(),
         }
@@ -158,7 +158,7 @@ mod tests {
         let body = compose("yes", Some(&quote()));
         assert!(body.starts_with("yes\n\n"), "{body}");
         assert!(body.contains(QUOTE_FENCE), "{body}");
-        assert!(body.contains("The person replied to Kyle"), "{body}");
+        assert!(body.contains("The person replied to Alex"), "{body}");
         assert!(body.contains("\"ship it\""), "{body}");
         assert!(body.ends_with(QUOTE_END), "{body}");
     }

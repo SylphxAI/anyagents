@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub struct AgentView {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
@@ -28,7 +30,7 @@ fn default_harness() -> String {
 }
 
 /// Body of `POST /v1/agents`.
-#[derive(Clone, Debug, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
     pub name: String,
     #[serde(default = "default_harness")]
@@ -39,6 +41,29 @@ pub struct CreateAgentRequest {
     pub workdir: Option<String>,
     #[serde(default)]
     pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GroupView {
+    pub name: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GroupsResponse {
+    pub groups: Vec<GroupView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GroupActionRequest {
+    pub action: String,
+    pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -72,14 +97,120 @@ pub struct InboxResponse {
     pub messages: Vec<MessageView>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ConversationTurnView {
+    pub id: String,
+    /// `"in"` (received by the agent) or `"out"` (sent by the agent).
+    pub direction: String,
+    pub from: String,
+    pub to: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to: Option<String>,
+    pub text: String,
+    pub timestamp_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ConversationResponse {
+    pub agent: String,
+    pub agent_id: String,
+    pub turns: Vec<ConversationTurnView>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendMedia {
+    /// Media kind: `"photo"`, `"video"`, `"audio"`, `"music"`, `"voice"`, `"document"`, or `"animation"`.
+    pub kind: String,
+    /// Local file path, `https://` URL, or Telegram `file_id`.
+    pub source: String,
+    /// Optional track title (for `kind = "audio"` or `"music"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional artist/performer name (for `kind = "audio"` or `"music"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub performer: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendLocation {
+    pub latitude: f64,
+    pub longitude: f64,
+    /// Optional venue title (when both `title` and `address` are set, sends a rich venue card).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Optional venue street address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendPoll {
+    pub question: String,
+    pub options: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_anonymous: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allows_multiple_answers: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendChecklist {
+    /// Checklist title.
+    pub title: String,
+    /// Checklist items (`1..=30` task descriptions; prefix with `[x]` or `☑` for pre-checked items).
+    pub tasks: Vec<String>,
+    /// Optional Telegram Business Connection ID for native `sendChecklist`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_connection_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct SendArticle {
+    /// Article title.
+    pub title: String,
+    /// Markdown or plain-text body to publish as a Telegram Telegraph (`telegra.ph`) Instant View article.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Optional external article URL (when already hosted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    /// Optional author name shown on the Instant View header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub author_name: Option<String>,
+}
+
+pub fn deserialize_string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Ok(Vec::new()),
+        Some(OneOrMany::One(s)) => Ok(s
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(OneOrMany::Many(vec)) => Ok(vec),
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SendRequest {
     /// The principal this message is from. On the identity boundary the server
     /// already knows it from the capability, and this must agree or the call is
     /// refused; the operator names its own principal explicitly.
-    pub sender: Option<String>,
     #[serde(default)]
+    pub sender: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
     pub to: Vec<String>,
+    #[serde(default)]
     pub text: String,
     #[serde(default)]
     pub reply_to: Option<String>,
@@ -87,6 +218,21 @@ pub struct SendRequest {
     /// into the stored body; a harness cannot forge a quoted author.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<Quote>,
+    /// Optional media attachment (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media: Option<SendMedia>,
+    /// Optional GPS location or venue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<SendLocation>,
+    /// Optional interactive poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll: Option<SendPoll>,
+    /// Optional interactive checklist (`title`, `tasks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checklist: Option<SendChecklist>,
+    /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub article: Option<SendArticle>,
     /// Names one send, so a retry after a lost answer is the same delivery
     /// instead of a second one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,4 +250,36 @@ pub struct Delivery {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SendResponse {
     pub deliveries: Vec<Delivery>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct InteractRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    /// Channel action: `"react"` (set/clear emoji reaction), `"vote"` (cast a ballot on a poll),
+    /// `"check"` / `"uncheck"` (toggle checklist items by 1-based index in `options`),
+    /// `"edit"` (edit message text), `"delete"` (delete a message), `"pin"` (pin a message),
+    /// `"unpin"` (unpin a message), or `"stop_poll"` / `"close_poll"` (close a poll).
+    pub action: String,
+    /// Target message: `anyagents:reply:msg_...` from the message header, `msg_...`,
+    /// or `telegram:chat:<chat_id>:<message_id>`.
+    pub target: String,
+    /// Emoji reaction for `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, or `""` to clear).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    /// Selected poll option(s) for `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text).
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub options: Vec<String>,
+    /// New text for `action = "edit"`, or optional rationale/comment for `action = "vote"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct InteractResponse {
+    pub ok: bool,
+    pub action: String,
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }

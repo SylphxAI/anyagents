@@ -82,6 +82,51 @@ pub fn configured_seat() -> Option<(u32, u32, u32)> {
     ))
 }
 
+/// Whether the process is running inside a unit or integration test harness
+/// that must never read the host user's personal home directory or host seats.
+pub fn is_isolated_test_env() -> bool {
+    cfg!(test)
+        || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+        || std::env::var_os("ANYAGENTS_TESTS").is_some()
+        || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
+        || std::env::var_os("ANYAGENTS_HARNESS_BIN").is_some()
+}
+
+/// The server user's home directory on the host, resolved from
+/// `ANYAGENTS_HOST_HOME`, the OS user database (`getpwuid`), or `HOME`.
+/// Returns `None` in isolated test environments so tests never read the
+/// developer's personal home directory.
+pub fn host_home_dir() -> Option<PathBuf> {
+    if is_isolated_test_env() {
+        return None;
+    }
+    if let Some(explicit) = std::env::var_os("ANYAGENTS_HOST_HOME")
+        && !explicit.is_empty()
+    {
+        let path = PathBuf::from(explicit);
+        if path.is_dir() {
+            return Some(path);
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        let pwd = libc::getpwuid(libc::getuid());
+        if !pwd.is_null() && !(*pwd).pw_dir.is_null() {
+            let dir = std::ffi::CStr::from_ptr((*pwd).pw_dir).to_string_lossy();
+            if !dir.is_empty() {
+                let path = PathBuf::from(dir.into_owned());
+                if path.is_dir() {
+                    return Some(path);
+                }
+            }
+        }
+    }
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+}
+
 /// Whether a single-agent seat override (`ANYAGENTS_AGENT_UID` or
 /// `ANYAGENTS_AGENT_GID`) is configured. `ANYAGENTS_SOCKET_GID` may be set on
 /// its own alongside host `seat-<name>` accounts.
@@ -91,23 +136,34 @@ pub fn seat_named() -> bool {
         .any(|name| std::env::var_os(name).is_some())
 }
 
-/// Whether every harness process this server starts is in an OS seat: the
-/// launcher is installed, and there is a real seat for every agent here. A
-/// configured uid counts only for the single agent it names.
+/// Whether multi-UID OS seats are explicitly configured for this deployment.
+pub fn seats_configured() -> bool {
+    [
+        "ANYAGENTS_AGENTS",
+        "ANYAGENTS_AGENT_UID",
+        "ANYAGENTS_AGENT_GID",
+        "ANYAGENTS_SOCKET_GID",
+    ]
+    .iter()
+    .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+}
+
+/// Whether every harness process this server starts satisfies the deployment's
+/// launch boundary. When no OS seats are configured (`local`, `docker`, or `k8s`
+/// single-UID mode), capability authentication holds without requiring
+/// `anyagents-setpriv`. When OS seats are configured, the launcher must be
+/// installed and every pinned uid must be distinct from root and the server uid.
 pub fn launch_boundary(agents: &[String]) -> bool {
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
         // A test machine has no OS accounts of its own to place an agent in.
         return true;
     }
-    // The boundary is ready when the launcher is installed and every agent of
-    // this deployment has a seat. The seat is bound to one agent: its uid comes
-    // from the deployment's own start line, never from anything an agent
-    // writes, and never from the server's own.
+    if !seats_configured() {
+        return true;
+    }
     if !launcher().is_file() {
         return false;
     }
-    // An agent created after this server started has no line yet; it gets its
-    // seat when it is created, and its first turn waits for one.
     agents.iter().all(|agent| match pinned_uid(agent) {
         Some(uid) => uid != 0 && Some(uid) != Some(current_uid()),
         None => true,
@@ -166,7 +222,15 @@ fn lookup_group(name: &str) -> Option<u32> {
 /// several agents reads the host's own account for each, `seat-<agent name>`,
 /// and the `anyagents-sock` group every seat belongs to. A host account is
 /// this machine's admission; it is never invented from a name an agent wrote.
+#[allow(dead_code)]
 pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
+    seat_for_agent_with_hint(agent_name, None)
+}
+
+pub fn seat_for_agent_with_hint(
+    agent_name: &str,
+    parent_name: Option<&str>,
+) -> Option<(String, u32, u32, u32)> {
     let configured = configured_seat();
     let agents = std::env::var("ANYAGENTS_AGENTS").unwrap_or_default();
     let explicit = configured.is_some() && agents.trim() == agent_name;
@@ -175,11 +239,14 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     {
         return Some((agent_name.to_string(), uid, gid, sock_gid));
     }
-    if pinned_uid(agent_name).is_some()
-        && std::env::var_os("ANYAGENTS_TESTS").is_some()
-    {
+    if pinned_uid(agent_name).is_some() && std::env::var_os("ANYAGENTS_TESTS").is_some() {
         // A test machine is its own single seat.
-        return Some((agent_name.to_string(), current_uid(), current_uid(), current_uid()));
+        return Some((
+            agent_name.to_string(),
+            current_uid(),
+            current_uid(),
+            current_uid(),
+        ));
     }
     if let Some(uid) = pinned_uid(agent_name)
         && let Some(sock_gid) = sock_gid_for()
@@ -188,19 +255,27 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
         // the capability to the group that uid shares, and no other.
         return Some((seat_user(agent_name), uid, uid, sock_gid));
     }
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() || !seats_configured() {
         return None;
     }
     // The uid this deployment gives the agent, or the host's provisioned
     // `seat-<name>` account when `ANYAGENTS_AGENTS` is not explicitly set.
-    let user = seat_user(agent_name);
+    let mut user = seat_user(agent_name);
     let (uid, gid) = match pinned_uid(agent_name) {
         Some(uid) => (uid, lookup_user(&user).map(|(_, gid)| gid).unwrap_or(uid)),
         None => {
-            if cfg!(test) || std::env::var_os("ANYAGENTS_TESTS").is_some() {
+            if is_isolated_test_env() {
                 return None;
             }
-            lookup_user(&user)?
+            if let Some(found) = lookup_user(&user) {
+                found
+            } else if std::env::var_os("ANYAGENTS_AGENTS").is_none() {
+                let (fallback_user, found) = fallback_seat(agent_name, parent_name)?;
+                user = fallback_user;
+                found
+            } else {
+                return None;
+            }
         }
     };
     let sock_gid = sock_gid_for()?;
@@ -210,10 +285,98 @@ pub fn seat_for_agent(agent_name: &str) -> Option<(String, u32, u32, u32)> {
     Some((user, uid, gid, sock_gid))
 }
 
+fn fallback_seat(agent_name: &str, parent_name: Option<&str>) -> Option<(String, (u32, u32))> {
+    if let Some(parent) = parent_name {
+        let direct = seat_user(parent);
+        if let Some((uid, gid)) = lookup_user(&direct)
+            && server_has_gid(gid)
+        {
+            return Some((direct, (uid, gid)));
+        }
+        if let Some((prefix, _)) = parent.split_once('-') {
+            let candidate = seat_user(prefix);
+            if let Some((uid, gid)) = lookup_user(&candidate)
+                && server_has_gid(gid)
+            {
+                return Some((candidate, (uid, gid)));
+            }
+        }
+    }
+    if let Some((prefix, _)) = agent_name.split_once('-') {
+        let candidate = seat_user(prefix);
+        if let Some((uid, gid)) = lookup_user(&candidate)
+            && server_has_gid(gid)
+        {
+            return Some((candidate, (uid, gid)));
+        }
+    }
+    let seats = host_seat_users();
+    if seats.is_empty() {
+        return None;
+    }
+    let hash = agent_name.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(b as usize)
+    });
+    seats.get(hash % seats.len()).cloned()
+}
+
+fn host_seat_users() -> Vec<(String, (u32, u32))> {
+    let Ok(text) = std::fs::read_to_string("/etc/passwd") else {
+        return Vec::new();
+    };
+    let me = current_uid();
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.split(':');
+        let (Some(name), Some(_), Some(uid_s), Some(gid_s)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if !name.starts_with("seat-") {
+            continue;
+        }
+        if let (Ok(uid), Ok(gid)) = (uid_s.parse::<u32>(), gid_s.parse::<u32>())
+            && uid != 0
+            && uid != me
+            && server_has_gid(gid)
+        {
+            out.push((name.to_string(), (uid, gid)));
+        }
+    }
+    out
+}
+
+fn server_has_gid(target_gid: u32) -> bool {
+    if server_gid() == target_gid {
+        return true;
+    }
+    // SAFETY: getgroups(0, null) returns the supplementary group count.
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count <= 0 {
+        return false;
+    }
+    let mut gids = vec![0 as libc::gid_t; count as usize];
+    // SAFETY: `gids` has capacity `count`.
+    let read = unsafe { libc::getgroups(count, gids.as_mut_ptr()) };
+    if read <= 0 {
+        return false;
+    }
+    gids[..read as usize].contains(&target_gid)
+}
+
 /// The launch spec a harness adapter carries for this agent:
 /// `<launcher>\t<uid>\t<gid>\t<groups>`.
+#[allow(dead_code)]
 pub fn seat_launch_spec(agent_name: &str) -> Option<(String, String)> {
-    let (user, uid, gid, sock_gid) = seat_for_agent(agent_name)?;
+    seat_launch_spec_with_hint(agent_name, None)
+}
+
+pub fn seat_launch_spec_with_hint(
+    agent_name: &str,
+    parent_name: Option<&str>,
+) -> Option<(String, String)> {
+    let (user, uid, gid, sock_gid) = seat_for_agent_with_hint(agent_name, parent_name)?;
     if !launcher().is_file() {
         return None;
     }
@@ -269,6 +432,32 @@ pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
     }
 }
 
+/// Share a Unix socket (`anyagents.sock` or `wake.sock`) with the deployment's
+/// `anyagents-sock` group (`0660`) when running in a multi-seat boundary so
+/// `seat-<agent>` processes can connect `anyagents mcp` and send wake datagrams.
+pub fn share_socket_with_seats(path: &Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+    if cfg!(test)
+        || std::env::var_os("ANYAGENTS_TESTS").is_some()
+        || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+    {
+        return;
+    }
+    let Some(gid) = sock_gid_for() else {
+        return;
+    };
+    if gid == server_gid() {
+        return;
+    }
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+        return;
+    };
+    // SAFETY: `c_path` is NUL-terminated; `u32::MAX` keeps the owner.
+    if unsafe { libc::chown(c_path.as_ptr(), u32::MAX, gid) } == 0 {
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+    }
+}
+
 fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let me = current_uid();
@@ -292,7 +481,10 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
         if kind.is_symlink() {
             continue;
         }
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if kind.is_dir() {
             let _ = give_tree(&path, gid);
             continue;
@@ -435,7 +627,9 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
         .env("DATA", &boundary.data_dir)
         .env(
             "MINE",
-            config.map(|dir| dir.display().to_string()).unwrap_or_default(),
+            config
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default(),
         )
         .output()
         .map_err(|err| Error::Message(unadmitted(&boundary, &err.to_string())))?;

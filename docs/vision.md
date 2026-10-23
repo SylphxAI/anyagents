@@ -31,6 +31,7 @@ People and teams who already use one or more agent harnesses and want them runni
 - One Rust binary is the server, the CLI and the MCP server. The npm package is a launcher for that binary.
 - Local by default: the API listens on a Unix socket owned by the user. Network access is opt-in and needs a token.
 - Vendor sign-in credentials live in a config directory AnyAgents owns, written and read only by the vendor tool. AnyAgents never reads, sends or logs the token, and never routes a subscription through the gateway.
+- External tool credentials and hardware belong to the runtime environment (`local` host `$HOME`, Docker container volumes/env, or Kubernetes `Secret` / `ServiceAccount`), never to a credential broker inside AnyAgents ([ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md)).
 - Stability is the bar. Every delivery guarantee in [architecture.md](architecture.md#guarantees) is a tested invariant, not a convention.
 
 ## Not in the first version
@@ -39,8 +40,7 @@ People and teams who already use one or more agent harnesses and want them runni
 - Channels other than Telegram.
 - A TUI or GUI (the API is designed for them).
 - Several hosts sharing one server.
-- A sandbox beyond the agent's own OS seat (uid, no new privileges, its own config):
-  filesystem or network isolation beyond what that seat denies.
+- An internal credential broker or custom container runtime: container (`docker`) and cluster (`k8s`) sandboxes use standard OCI and Kubernetes primitives ([ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md)).
 
 ## Target metrics
 

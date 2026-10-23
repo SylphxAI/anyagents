@@ -51,6 +51,20 @@ impl Installer {
     }
 
     fn install(&self, harness: &str) -> Result<Install, String> {
+        let dirs = self.root.join("harnesses").join(harness);
+        if let Ok(versions) = std::fs::read_dir(&dirs) {
+            let mut installed: Vec<PathBuf> = versions
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|dir| dir.join(".installed").exists())
+                .collect();
+            installed.sort();
+            for dir in installed.into_iter().rev() {
+                if launcher(harness, &dir).is_file() {
+                    return Ok(Install { dir });
+                }
+            }
+        }
         let catalog = builtin_catalog();
         let mut runner = ProcessRunner;
         let version = match catalog_version(&catalog, harness, &mut runner) {
@@ -58,6 +72,7 @@ impl Installer {
             Err(InstallError::UnknownHarness(id)) => return Err(format!("unknown harness: {id}")),
             Err(err) => return Err(err.to_string()),
         };
+        ensure_vendored_binary(&self.root, harness);
         let dir = ensure_installed(&catalog, &self.root, harness, &version, &mut runner)
             .map_err(|err| err.to_string())?;
         // A copy of this version may already be in the private prefix from a
@@ -66,10 +81,104 @@ impl Installer {
     }
 }
 
+/// Ensures a vendored or script-installed harness binary (`omp`, `dsh`, `grok`)
+/// is present on the host when an agent first requests it in real mode.
+fn ensure_vendored_binary(root: &Path, harness: &str) {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+        return;
+    }
+    if std::env::var_os(format!(
+        "ANYAGENTS_{}_BIN",
+        harness.to_uppercase().replace('-', "_")
+    ))
+    .is_some()
+    {
+        return;
+    }
+    let name = match harness {
+        "claude-code" => "claude",
+        other => other,
+    };
+    if which(name).is_some() {
+        return;
+    }
+    let Some(home) = crate::sandbox::host_home_dir() else {
+        return;
+    };
+    let local_bin = home.join(".local/bin");
+    match harness {
+        "omp" => {
+            let _ = Command::new("bun")
+                .args(["install", "-g", "@oh-my-pi/pi-coding-agent"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let bun_omp = home.join(".bun/bin/omp");
+            if bun_omp.is_file() && local_bin.is_dir() {
+                let dst = local_bin.join("omp");
+                #[cfg(unix)]
+                if !dst.exists() {
+                    let _ = std::os::unix::fs::symlink(bun_omp, &dst);
+                }
+            }
+        }
+        "dsh" => {
+            if let Ok(entries) = std::fs::read_dir(home.join(".dsh")) {
+                let mut candidates: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path().join("node_modules/.bin/dsh"))
+                    .filter(|p| p.is_file())
+                    .collect();
+                candidates.sort();
+                if let Some(src) = candidates.pop() {
+                    let dst = if local_bin.is_dir() {
+                        local_bin.join("dsh")
+                    } else {
+                        root.join("harnesses/dsh/seat-bin/dsh")
+                    };
+                    if let Some(parent) = dst.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    #[cfg(unix)]
+                    if !dst.exists() {
+                        let _ = std::os::unix::fs::symlink(&src, &dst);
+                    }
+                }
+            }
+        }
+        "grok" => {
+            if let Ok(entries) = std::fs::read_dir(home.join(".local/share/grok/versions")) {
+                let mut candidates: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path().join("grok"))
+                    .filter(|p| p.is_file())
+                    .collect();
+                candidates.sort();
+                if let Some(src) = candidates.pop()
+                    && local_bin.is_dir()
+                {
+                    let dst = local_bin.join("grok");
+                    #[cfg(unix)]
+                    if !dst.exists() {
+                        let _ = std::os::unix::fs::symlink(&src, &dst);
+                    }
+                    return;
+                }
+            }
+            let _ = Command::new("sh")
+                .args(["-c", "curl -fsSL https://cli.grok.com/install.sh | bash"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        _ => {}
+    }
+}
+
 /// Whether any adapter can run this harness, and the reason when none can.
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
     match harness {
-        "claude-code" | "codex" | "opencode" | "agy" | "muse" => Ok(()),
+        "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok" => Ok(()),
         other => Err(anyagents_core::Error::Message(format!(
             "unknown harness: {other}"
         ))),
@@ -133,17 +242,108 @@ pub fn program(root: &Path, harness: &str) -> PathBuf {
         "muse" => "muse",
         other => other,
     };
-    which(name).unwrap_or_else(|| PathBuf::from(name))
+    match which(name) {
+        Some(found) => ensure_seat_accessible(root, harness, name, found),
+        None => PathBuf::from(name),
+    }
+}
+
+/// When OS seats are configured and a `PATH` binary resolves through a private
+/// (`0700`) directory (such as `~/.local/bin/codex -> ~/.codex/packages/...`),
+/// stage a world-executable copy under `<root>/harnesses/<harness>/seat-bin/`
+/// so confined seat users can execute it without relaxing `~/.codex`.
+#[cfg(unix)]
+fn ensure_seat_accessible(root: &Path, harness: &str, name: &str, candidate: PathBuf) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
+        return candidate;
+    }
+    let Ok(canonical) = std::fs::canonicalize(&candidate) else {
+        return candidate;
+    };
+    let blocked = canonical.ancestors().skip(1).any(|dir| {
+        std::fs::metadata(dir)
+            .map(|meta| (meta.permissions().mode() & 0o001) == 0)
+            .unwrap_or(false)
+    });
+    if !blocked {
+        return candidate;
+    }
+    let stage_dir = root.join("harnesses").join(harness).join("seat-bin");
+    if std::fs::create_dir_all(&stage_dir).is_err() {
+        return candidate;
+    }
+    let _ = std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o755));
+    if let Some(parent) = canonical.parent()
+        && let Ok(entries) = std::fs::read_dir(parent)
+    {
+        for entry in entries.flatten() {
+            let src = entry.path();
+            let Ok(src_meta) = std::fs::metadata(&src) else {
+                continue;
+            };
+            if !src_meta.is_file() {
+                continue;
+            }
+            let dst = stage_dir.join(entry.file_name());
+            let same_size = std::fs::metadata(&dst)
+                .map(|m| m.is_file() && m.len() == src_meta.len())
+                .unwrap_or(false);
+            if !same_size {
+                let tmp = stage_dir.join(format!(
+                    ".{}.{}.tmp",
+                    entry.file_name().to_string_lossy(),
+                    std::process::id()
+                ));
+                if std::fs::copy(&src, &tmp).is_ok() {
+                    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+                    let _ = std::fs::rename(&tmp, &dst);
+                }
+            }
+        }
+    }
+    let staged = stage_dir.join(name);
+    if staged.is_file() { staged } else { candidate }
+}
+
+#[cfg(not(unix))]
+fn ensure_seat_accessible(
+    _root: &Path,
+    _harness: &str,
+    _name: &str,
+    candidate: PathBuf,
+) -> PathBuf {
+    candidate
 }
 
 /// The launcher a package installed into `installed`, or the plain binary name.
 fn launcher(harness: &str, installed: &Path) -> PathBuf {
+    if harness == "codex" {
+        // Prefer the native static Rust binary shipped in `@openai/codex-linux-x64`
+        // over the `#!/usr/bin/env node` wrapper in `node_modules/.bin/codex`, so
+        // isolated agent seats with custom `HOME` do not depend on a per-seat Node
+        // wrapper installation.
+        let native = installed
+            .join("node_modules")
+            .join("@openai")
+            .join("codex-linux-x64")
+            .join("vendor")
+            .join("x86_64-unknown-linux-musl")
+            .join("bin")
+            .join("codex");
+        if native.is_file() {
+            return native;
+        }
+    }
     let names: &[&str] = match harness {
         "claude-code" => &["claude"],
         "codex" => &["codex"],
         // The OpenCode package ships its launcher under either name.
         "opencode" => &["opencode", "opencode-ai"],
         "agy" => &["agy"],
+        "omp" => &["omp"],
+        "dsh" => &["dsh"],
+        "grok" => &["grok"],
         other => &[other],
     };
     let bin = installed.join("node_modules").join(".bin");

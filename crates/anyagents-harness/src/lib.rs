@@ -40,7 +40,11 @@ pub fn ref_message(reference: &str) -> Option<&str> {
 /// the reference a bare answer names, where it goes, and what it quotes — then
 /// the body exactly as stored.
 pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
-    format!("{}{id}\n{}\n{body}", MESSAGE_MARKER_PREFIX, context.lines(id))
+    format!(
+        "{}{id}\n{}\n{body}",
+        MESSAGE_MARKER_PREFIX,
+        context.lines(id)
+    )
 }
 
 /// The trusted header of one message, as the server wrote it.
@@ -58,6 +62,12 @@ pub struct Context {
     pub message_id: Option<i64>,
     /// Where a bare answer goes, as the send tool takes it.
     pub destination: Option<String>,
+    /// Special channel event (`"pinned"`, `"edited"`, etc.), when this line is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
+    /// Handles or agents mentioned in this message (`@username`, `agent:<name>`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
 }
 
 impl Context {
@@ -80,6 +90,12 @@ impl Context {
         }
         if let Some(message) = self.message_id {
             out.push_str(&format!("message: {message}\n"));
+        }
+        if let Some(event) = &self.event {
+            out.push_str(&format!("event: {event}\n"));
+        }
+        if !self.mentions.is_empty() {
+            out.push_str(&format!("mentions: {}\n", self.mentions.join(", ")));
         }
         out.push_str(&format!("{REPLY_HINT_PREFIX}{}\n", reply_ref(id)));
         if let Some(destination) = &self.destination {
@@ -119,7 +135,14 @@ pub fn spawn_command(
             [launcher, uid, gid, groups] => {
                 let mut command = std::process::Command::new(launcher);
                 command.args([
-                    "--reuid", uid, "--regid", gid, "--groups", groups, "--no-new-privs", "--",
+                    "--reuid",
+                    uid,
+                    "--regid",
+                    gid,
+                    "--groups",
+                    groups,
+                    "--no-new-privs",
+                    "--",
                 ]);
                 command.arg(program);
                 command
@@ -451,8 +474,8 @@ impl SteerQueue {
                     sender: None,
                     reply_to: None,
                     source_time_ms: None,
-            context: Context::default(),
-        },
+                    context: Context::default(),
+                },
             })
             .collect();
         held.first().cloned()

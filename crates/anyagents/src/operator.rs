@@ -26,7 +26,14 @@ pub const CAPABILITY_FILE: &str = "mcp-capability";
 pub fn operator_token(data: &std::path::Path) -> Option<String> {
     let path = match std::env::var_os("ANYAGENTS_OPERATOR_TOKEN_FILE") {
         Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
-        _ => data.join(TOKEN_FILE),
+        _ => {
+            let direct = data.join(TOKEN_FILE);
+            if direct.is_file() {
+                direct
+            } else {
+                data.join("secrets").join(TOKEN_FILE)
+            }
+        }
     };
     let text = std::fs::read_to_string(path).ok()?;
     let token = text.trim();
@@ -39,6 +46,27 @@ pub const TOKEN_FILE: &str = "operator-token";
 /// The agent's config directory: `agents/<id>/config`.
 fn config_dir(data_dir: &Path, agent_id: &str) -> std::path::PathBuf {
     data_dir.join("agents").join(agent_id).join("config")
+}
+
+/// Ensure this agent has a valid capability file in its config directory that
+/// authenticates against `store` right now. If the existing file already
+/// authenticates as `agent_id`, keep it so running MCP tool processes do not
+/// lose their session across a server restart; otherwise mint a fresh one.
+pub fn ensure(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Error> {
+    let dir = config_dir(store.data_dir(), agent_id.as_str());
+    let path = dir.join(CAPABILITY_FILE);
+    if let Ok(raw) = std::fs::read_to_string(&path) {
+        let token = raw.trim();
+        if !token.is_empty()
+            && store
+                .authenticate_capability(token)
+                .is_ok_and(|id| &id == agent_id)
+        {
+            share_capability_if_needed(store, agent_id, &path)?;
+            return Ok(());
+        }
+    }
+    mint(store, agent_id)
 }
 
 /// Mint a capability for one agent and leave it where that agent's harness
@@ -62,20 +90,36 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
         file.write_all(b"\n")?;
     }
     std::fs::rename(&temp, &path)?;
+    share_capability_if_needed(store, agent_id, &path)?;
+    Ok(())
+}
+
+fn share_capability_if_needed(
+    store: &Store,
+    agent_id: &anyagents_core::AgentId,
+    path: &Path,
+) -> Result<(), Error> {
     // The capability belongs to this agent's own seat group, 0640, and is read
     // back: no other seat can read it. A seat group that is the server's own
     // group adds nothing, so that file stays 0600.
-    if let Ok(agent) = store.agent(agent_id)
-        && let Some((_, seat_uid, gid, _)) = crate::sandbox::seat_for_agent(&agent.name)
-        && seat_uid != crate::sandbox::server_uid()
-        && gid != crate::sandbox::server_gid()
-    {
-        crate::sandbox::share_capability_with_seat(&path, gid).map_err(|err| {
-            anyagents_core::Error::Message(format!(
-                "the capability for {} is not shared with its seat: {err}",
-                agent.name
-            ))
-        })?;
+    if let Ok(agent) = store.agent(agent_id) {
+        let parent_name = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .map(|p| p.name);
+        if let Some((_, seat_uid, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+            && seat_uid != crate::sandbox::server_uid()
+            && gid != crate::sandbox::server_gid()
+        {
+            crate::sandbox::share_capability_with_seat(path, gid).map_err(|err| {
+                anyagents_core::Error::Message(format!(
+                    "the capability for {} is not shared with its seat: {err}",
+                    agent.name
+                ))
+            })?;
+        }
     }
     Ok(())
 }

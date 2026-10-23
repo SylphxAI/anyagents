@@ -11,37 +11,76 @@
 //! and `usage.cache_write_tokens` are the token counts. A wait is `rate_limit`
 //! with `resets_at_ms` in epoch milliseconds.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyagents_harness::{
-    DeliverOutcome, Harness, HarnessError, HarnessHealth, OutboundMessage, TurnUsage,
+    DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
+    SteerSupport, TurnUsage, compose_message,
 };
-use anyagents_harness_stream::{StreamHarness, StreamSpec, cancel_line, message_line};
+use anyagents_harness_stream::{Launch, StreamHarness, StreamSpec, cancel_line, message_line};
 
-/// One long-lived OMP child. Its delivery mode is unverified.
+/// One long-lived OMP child.
 pub struct OmpHarness {
     inner: StreamHarness,
     spec: StreamSpec,
+    rpc_mode: bool,
 }
 
 impl OmpHarness {
     /// Start one child.
     ///
     /// `program` is the `omp` executable, or a test double. `session_id`, when
-    /// set, is passed as `--session`.
+    /// set, is passed as `--session` in test-double mode or `-r` in RPC mode.
     pub fn start(
         program: impl Into<PathBuf>,
         session_id: Option<&str>,
         environment: &[(&str, &str)],
     ) -> Result<Self, HarnessError> {
-        let environment = environment
+        let spec = StreamSpec::for_program("omp");
+        Self::start_with_spec(spec, program, session_id, environment, None)
+    }
+
+    /// Start one child with a custom `StreamSpec` and optional working directory.
+    pub fn start_with_spec(
+        spec: StreamSpec,
+        program: impl Into<PathBuf>,
+        session_id: Option<&str>,
+        environment: &[(&str, &str)],
+        work_dir: Option<&Path>,
+    ) -> Result<Self, HarnessError> {
+        let environment: Vec<(String, String)> = environment
             .iter()
             .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
             .collect();
-        let spec = StreamSpec::for_program("omp");
-        let inner = StreamHarness::open(spec.clone(), program, session_id, environment)?;
-        Ok(Self { inner, spec })
+        let mut args = spec.args.clone();
+        if let Some(id) = session_id {
+            args.push(spec.resume_flag.to_string());
+            args.push(id.to_string());
+        }
+        let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+            || environment.iter().any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
+        let rpc_mode = work_dir.is_some() && !fake_mode;
+        let (mode, steer) = if rpc_mode {
+            (DeliveryMode::Steer, SteerSupport::Yes)
+        } else {
+            (DeliveryMode::Followup, SteerSupport::Unproven)
+        };
+        let inner = StreamHarness::launch(Launch {
+            spec: spec.clone(),
+            program: program.into(),
+            args,
+            environment,
+            work_dir: work_dir.map(Path::to_path_buf),
+            session_id: session_id.map(str::to_string),
+            mode,
+            steer,
+        })?;
+        Ok(Self {
+            inner,
+            spec,
+            rpc_mode,
+        })
     }
 
     pub fn written_ids(&self) -> Vec<String> {
@@ -72,8 +111,19 @@ impl OmpHarness {
 
 impl Harness for OmpHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        self.inner
-            .deliver(message, &message_line(&self.spec, message))
+        if self.rpc_mode {
+            let text = compose_message(&message.id, &message.context, &message.text);
+            let line = serde_json::json!({
+                "id": message.id,
+                "type": "prompt",
+                "message": text,
+                "streamingBehavior": "steer",
+            });
+            self.inner.deliver(message, &line)
+        } else {
+            self.inner
+                .deliver(message, &message_line(&self.spec, message))
+        }
     }
 
     fn background(&mut self) -> Result<(), HarnessError> {
@@ -85,7 +135,11 @@ impl Harness for OmpHarness {
     }
 
     fn cancel(&mut self) -> Result<(), HarnessError> {
-        self.inner.cancel(&cancel_line(&self.spec))
+        if self.rpc_mode {
+            self.inner.cancel(&serde_json::json!({"type": "abort"}))
+        } else {
+            self.inner.cancel(&cancel_line(&self.spec))
+        }
     }
 
     fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
@@ -98,5 +152,13 @@ impl Harness for OmpHarness {
 
     fn health(&self) -> HarnessHealth {
         self.inner.health()
+    }
+
+    fn clear_quota(&mut self) {
+        self.inner.clear_quota()
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        self.inner.process_id()
     }
 }
