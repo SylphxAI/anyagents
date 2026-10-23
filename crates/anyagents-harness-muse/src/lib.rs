@@ -492,12 +492,19 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
                 state.quota_reset_at_ms = Some(reset_at_ms);
             }
         }
-        _ => {}
+        _ => {
+            if let Some(reset_at_ms) = quota_in_text(&params) {
+                state.quota_reset_at_ms = Some(reset_at_ms);
+            }
+        }
     }
     NotificationEffect::default()
 }
 
 fn finish_turn(state: &mut State, params: &Value) {
+    if let Some(reset_at_ms) = quota_of(params).or_else(|| quota_in_text(params)) {
+        state.quota_reset_at_ms = Some(reset_at_ms);
+    }
     let usage = params
         .get("usage")
         .map(usage_of)
@@ -564,7 +571,49 @@ fn quota_of(value: &Value) -> Option<i64> {
             return Some(epoch_ms(n));
         }
     }
-    None
+    quota_in_text(value)
+}
+
+fn quota_in_text(value: &Value) -> Option<i64> {
+    let raw = value.to_string();
+    let lower = raw.to_ascii_lowercase();
+    if !lower.contains("quota") && !lower.contains("rate_limit") && !lower.contains("429") {
+        return None;
+    }
+    let idx = lower.find("resets at ")?;
+    let after = &raw[idx + "resets at ".len()..];
+    let token = after.split_whitespace().next()?;
+    parse_iso_utc_ms(token)
+}
+
+fn parse_iso_utc_ms(s: &str) -> Option<i64> {
+    let s = s.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+    let s = s.strip_suffix('Z').or_else(|| s.strip_suffix('z'))?;
+    let (date, time) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let mut d = date.split('-');
+    let y: i64 = d.next()?.parse().ok()?;
+    let m: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let time_main = time.split('.').next()?;
+    let mut t = time_main.split(':');
+    let hh: i64 = t.next()?.parse().ok()?;
+    let mm: i64 = t.next()?.parse().ok()?;
+    let ss: i64 = t.next().unwrap_or("0").parse().ok()?;
+    if hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let y_adj = if m <= 2 { y - 1 } else { y };
+    let era = if y_adj >= 0 { y_adj } else { y_adj - 399 } / 400;
+    let yoe = y_adj - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let secs = days * 86_400 + hh * 3_600 + mm * 60 + ss;
+    Some(secs.saturating_mul(1_000))
 }
 
 /// A 429 answer, or one whose text names a quota, is a wait until the reset
@@ -644,4 +693,20 @@ fn command_id() -> String {
         &hex[16..20],
         &hex[20..32]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_iso_utc_reset_in_muse_rate_limit_error() {
+        let params = json!({
+            "status": "failed",
+            "error": {
+                "message": "API error 429 [request_id=5f55e49a-bec1-4c8f-9aee-f57fd86f5168]: Subscription quota exhausted. Your usage window resets at 2026-10-26T00:00:00Z. (rate_limit_error)"
+            }
+        });
+        assert_eq!(quota_of(&params), Some(1_792_972_800_000));
+    }
 }

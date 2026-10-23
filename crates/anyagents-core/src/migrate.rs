@@ -30,6 +30,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
 
 /// Apply pending migrations. Each migration commits on its own, in order.
 pub fn migrate(conn: &mut Connection) -> Result<(), Error> {
+    let latest = MIGRATIONS.last().map(|(version, _)| *version).unwrap_or(0);
+    if current_version(conn)? >= latest {
+        return Ok(());
+    }
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,

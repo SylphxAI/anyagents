@@ -97,7 +97,13 @@ pub fn write(
         }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(&path, bytes)?;
+    std::fs::write(&path, &bytes)?;
+    for sub in ["muse", ".config/muse"] {
+        let sub_dir = dir.join(sub);
+        if sub_dir.is_dir() {
+            let _ = std::fs::write(sub_dir.join("settings.json"), &bytes);
+        }
+    }
     Ok(())
 }
 

@@ -476,7 +476,13 @@ impl StreamHarness {
     }
 
     pub fn health(&self) -> HarnessHealth {
-        let state = lock(&self.shared);
+        let mut state = lock(&self.shared);
+        if !state.alive
+            && let Some(child) = state.child.as_mut()
+            && matches!(child.try_wait(), Ok(Some(_)))
+        {
+            state.child = None;
+        }
         HarnessHealth {
             process_alive: state.alive,
             turn_state: if state.open.is_empty() {
@@ -496,7 +502,14 @@ impl StreamHarness {
     }
 
     pub fn process_id(&self) -> Option<u32> {
-        lock(&self.shared).child.as_ref().map(Child::id)
+        let mut state = lock(&self.shared);
+        if !state.alive
+            && let Some(child) = state.child.as_mut()
+            && matches!(child.try_wait(), Ok(Some(_)))
+        {
+            state.child = None;
+        }
+        state.child.as_ref().map(Child::id)
     }
 
     /// Write one line into the child and record it as taken.
@@ -991,12 +1004,29 @@ fn read_stdout(
             return;
         }
         state.alive = false;
-        if let Some(child) = state.child.as_mut() {
-            let _ = child.try_wait();
+        if let Some(child) = state.child.as_mut()
+            && matches!(child.try_wait(), Ok(Some(_)))
+        {
+            state.child = None;
         }
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();
+    for _ in 0..10 {
+        {
+            let mut state = lock(&shared);
+            if state.generation != generation || state.child.is_none() {
+                break;
+            }
+            if let Some(child) = state.child.as_mut()
+                && matches!(child.try_wait(), Ok(Some(_)))
+            {
+                state.child = None;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// A harness that streams without a closing result line ends its turn here:

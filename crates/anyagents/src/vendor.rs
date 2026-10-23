@@ -329,6 +329,22 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &exe,
                     &mcp_args,
                 );
+            } else if request.agent.harness == "muse"
+                && let Ok(exe) = std::env::current_exe()
+            {
+                let mcp_args = vec![
+                    "--data".to_string(),
+                    request.data_dir.display().to_string(),
+                    "mcp".to_string(),
+                    "--config".to_string(),
+                    request.config_dir.display().to_string(),
+                ];
+                let _ = crate::muse_config::write(
+                    &request.config_dir,
+                    request.agent.model.as_deref(),
+                    &exe,
+                    &mcp_args,
+                );
             }
         }
         let cache_home = request.config_dir.join("cache-home");
