@@ -1027,27 +1027,12 @@ pub fn post_text(
             &FileCredentialStore::new(data_dir),
             &outbound.credential_ref,
         )?;
-        let response = match call_api(
+        let response = call_api(
             &token,
             &outbound.call,
             SHORT_TIMEOUT_S,
             Some(&outbound.channel_id),
-        ) {
-            Ok(resp) => resp,
-            Err(err)
-                if chunk_reply.is_some()
-                    && err.to_string().contains("\"class\":\"invalid_reply\"") =>
-            {
-                let retry = outbound_call(store, from, chat_id, chunk, None, thread)?;
-                call_api(
-                    &token,
-                    &retry.call,
-                    SHORT_TIMEOUT_S,
-                    Some(&outbound.channel_id),
-                )?
-            }
-            Err(err) => return Err(err),
-        };
+        )?;
         let message_id = sent_message_id(&response).map_err(|_| {
             api_error(
                 "sendMessage",
