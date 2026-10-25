@@ -40,7 +40,7 @@ pub fn write(
         root = serde_json::json!({});
     }
     if root.get("provider").is_none()
-        && let Some(donor) = donor_provider_block()
+        && let Some(donor) = donor_provider_block(dir)
     {
         root["provider"] = donor;
     }
@@ -102,13 +102,21 @@ pub fn write(
     Ok(())
 }
 
-fn donor_provider_block() -> Option<serde_json::Value> {
-    let candidates = [
-        "/home/kyle/.config/opencode/opencode.json",
-        "/scratch/coordinator/anyagents-data/opencode-provider.json",
-    ];
+fn donor_provider_block(dir: &Path) -> Option<serde_json::Value> {
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = dir.parent().and_then(Path::parent) {
+        candidates.push(data_dir.join("opencode-provider.json"));
+    }
+    if let Some(host_home) = crate::sandbox::host_home_dir() {
+        candidates.push(
+            host_home
+                .join(".config")
+                .join("opencode")
+                .join("opencode.json"),
+        );
+    }
     for path in candidates {
-        let Ok(bytes) = std::fs::read(path) else {
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {

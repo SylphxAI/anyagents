@@ -326,21 +326,19 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
                 let _ = std::os::unix::fs::symlink(&src, &dst);
             }
         }
-        for (rel, shared_candidates) in [
-            (".rustup", ["/home/kyle/.rustup", "/scratch/rustup-home"]),
-            (".cargo", ["/home/kyle/.cargo", "/scratch/cargo-registry"]),
+        for (rel, shared_fallback) in [
+            (".rustup", "/scratch/rustup-home"),
+            (".cargo", "/scratch/cargo-registry"),
         ] {
             let dst = target_config.join(rel);
             if !dst.exists() {
-                let found_shared = shared_candidates
-                    .iter()
-                    .map(Path::new)
-                    .find(|p| p.is_dir())
-                    .map(Path::to_path_buf)
-                    .or_else(|| {
-                        let h = host_home.join(rel);
-                        h.is_dir().then_some(h)
-                    });
+                let h = host_home.join(rel);
+                let found_shared = if h.is_dir() {
+                    Some(h)
+                } else {
+                    let fallback = Path::new(shared_fallback);
+                    fallback.is_dir().then(|| fallback.to_path_buf())
+                };
                 if let Some(src) = found_shared {
                     let _ = std::os::unix::fs::symlink(&src, &dst);
                 }

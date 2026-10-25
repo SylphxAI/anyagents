@@ -391,16 +391,27 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             cache_home.display().to_string(),
         ));
         env.push(("TMPDIR".to_string(), tmp_dir.display().to_string()));
-        if Path::new("/home/kyle/.rustup").is_dir() {
-            env.push(("RUSTUP_HOME".to_string(), "/home/kyle/.rustup".to_string()));
+        let host_home = crate::sandbox::host_home_dir();
+        if let Some(ref h) = host_home
+            && h.join(".rustup").is_dir()
+        {
+            env.push((
+                "RUSTUP_HOME".to_string(),
+                h.join(".rustup").display().to_string(),
+            ));
         } else if Path::new("/scratch/rustup-home").is_dir() {
             env.push((
                 "RUSTUP_HOME".to_string(),
                 "/scratch/rustup-home".to_string(),
             ));
         }
-        if Path::new("/home/kyle/.cargo").is_dir() {
-            env.push(("CARGO_HOME".to_string(), "/home/kyle/.cargo".to_string()));
+        if let Some(ref h) = host_home
+            && h.join(".cargo").is_dir()
+        {
+            env.push((
+                "CARGO_HOME".to_string(),
+                h.join(".cargo").display().to_string(),
+            ));
         } else if Path::new("/scratch/cargo-registry").is_dir() {
             env.push((
                 "CARGO_HOME".to_string(),
