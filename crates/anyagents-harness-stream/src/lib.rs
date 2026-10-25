@@ -614,7 +614,7 @@ impl StreamHarness {
             let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
                 let mut state = lock(&self.shared);
                 if state.generation == generation && !state.open.is_empty() {
-                    state.idle_since.get_or_insert_with(Instant::now);
+                    state.idle_since = Some(Instant::now());
                 }
                 return Ok(DeliverOutcome::Deferred);
             };
@@ -710,7 +710,7 @@ impl StreamHarness {
                 state.open.retain(|id| id != &message.id);
                 if err.contains("plan model not specified") {
                     if !state.open.is_empty() {
-                        state.idle_since.get_or_insert_with(Instant::now);
+                        state.idle_since = Some(Instant::now());
                     }
                     return Ok(DeliverOutcome::Deferred);
                 }

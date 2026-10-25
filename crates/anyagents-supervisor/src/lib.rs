@@ -911,7 +911,10 @@ impl<H: Harness + 'static> Session<H> {
                 if self.try_auto_archive_subagent() {
                     return false;
                 }
-                self.wake_unless_more();
+                self.inner.clock.wait(
+                    Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
+                    &self.woken,
+                );
                 false
             }
             Err(anyagents_agent::Error::HarnessDown) => {
@@ -1180,6 +1183,7 @@ fn remove_path_with_seat(target: &std::path::Path, seat_ids: Option<(u32, u32, u
                 "-rf",
             ])
             .arg(target)
+            .stderr(std::process::Stdio::null())
             .status();
         let _ = fs::remove_dir_all(target);
         let _ = fs::remove_file(target);

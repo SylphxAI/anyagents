@@ -369,6 +369,26 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &exe,
                     &mcp_args,
                 );
+            } else if request.agent.harness == "claude-code"
+                && let Ok(exe) = std::env::current_exe()
+            {
+                let mcp_args = vec![
+                    "--data".to_string(),
+                    request.data_dir.display().to_string(),
+                    "mcp".to_string(),
+                    "--config".to_string(),
+                    request.config_dir.display().to_string(),
+                ];
+                let _ = crate::mcp_config::write_claude(
+                    &request.config_dir.join("mcp.json"),
+                    &exe,
+                    &mcp_args,
+                );
+                let _ = crate::mcp_config::write_claude(
+                    &request.config_dir.join(".claude.json"),
+                    &exe,
+                    &mcp_args,
+                );
             }
         }
         let cache_home = request.config_dir.join("cache-home");
@@ -703,6 +723,9 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 args.push("--append-system-prompt-file".to_string());
                 args.push(sys_prompt.display().to_string());
             }
+            let lock_path = request.config_dir.join(".claude.json.lock");
+            let _ = std::fs::remove_dir_all(&lock_path);
+            let _ = std::fs::remove_file(&lock_path);
             let mcp_cfg = request.config_dir.join("mcp.json");
             let claude_cfg = request.config_dir.join(".claude.json");
             if mcp_cfg.is_file() {
@@ -779,21 +802,16 @@ pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
                 allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
                 changed = true;
             }
-            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
-                let deny = perms_obj
-                    .entry("deny".to_string())
-                    .or_insert_with(|| serde_json::json!([]));
-                if !deny.is_array() {
-                    *deny = serde_json::json!([]);
+            if let Some(deny_arr) = perms_obj.get_mut("deny").and_then(|v| v.as_array_mut()) {
+                let before = deny_arr.len();
+                deny_arr.retain(|v| {
+                    !matches!(
+                        v.as_str(),
+                        Some("invoke_subagent" | "define_subagent" | "manage_subagents")
+                    )
+                });
+                if deny_arr.len() != before {
                     changed = true;
-                }
-                if let Some(deny_arr) = deny.as_array_mut() {
-                    for tool_name in ["invoke_subagent", "define_subagent", "manage_subagents"] {
-                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool_name)) {
-                            deny_arr.push(serde_json::Value::String(tool_name.to_string()));
-                            changed = true;
-                        }
-                    }
                 }
             }
         }
