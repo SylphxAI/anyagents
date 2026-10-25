@@ -2567,4 +2567,17 @@ mod tests {
         assert_eq!(inbox[0].text, "pushed via webhook");
         assert_eq!(inbox[0].source_key.as_deref(), Some("bot:42"));
     }
+
+    #[test]
+    fn token_of_trims_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets = FileCredentialStore::new(dir.path());
+        secrets
+            .write("channels/xenon", b"8921438889:AAExampleTokenValue\n")
+            .unwrap();
+        assert_eq!(
+            token_of(&secrets, "channels/xenon").unwrap(),
+            "8921438889:AAExampleTokenValue"
+        );
+    }
 }

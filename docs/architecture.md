@@ -116,13 +116,26 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 | --- | --- | --- |
 | `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
-| `claude-code` | `steer` | A `user` message on the stream-json child's stdin, at any point; the child echoes it, which is the acknowledgement. |
+| `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
 | `muse` | `steer` | `turn/start` with `ifBusy: "steer"`. |
 | `omp` | `steer` | Stream-json child stdin with `steer` delivery into the active turn. |
 | `dsh` | `steer` | `POST /api/session/prompt` with `mode: "steer"` on the session controller HTTP gateway. |
 | `grok` | `steer` | ACP JSON-RPC 2.0 `session/prompt` over stdio with `follow_up_behavior = "steer"`. |
 | `agy` | `steer` | Stream-json child stdin plus native `LanguageServerService/SendUserCascadeMessage` Connect RPC steering into an open cascade turn. |
 | `followup` mode | `followup` | The contract double (`ANYAGENTS_HARNESS_BIN`) reads one line per turn and answers with a `result`; a line written mid-turn waits for that turn to end. |
+
+Claude Code initializes its SDK hook before accepting input and fails startup if
+initialization is rejected or times out. A busy delivery is deferred, leaving the
+mailbox cursor unchanged, until its hook response is written successfully.
+Repeated offers of the same mailbox id are coalesced; messages retain their
+sender, room context and reply reference. If the turn finishes without another
+tool call, the undelivered line starts the next idle turn instead. The hook write
+is a transport acceptance, not proof that the model acted on the message. Dedupe
+between acceptance and cursor commit is local to the retained harness instance;
+this does not add transactional exactly-once delivery across a vendor process
+crash. Hook protocol, cursor replay and tool ordering are covered by scripted
+fixtures, not a live authenticated Claude model test.
+
 
 No harness here uses `queue`: none of them is a one-shot run that must wait.
 

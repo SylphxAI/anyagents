@@ -335,9 +335,8 @@ fn finished_turns_sum_by_agent_and_day() {
     drop(supervisor);
 }
 
-/// Three lines arrive while the child holds its turn open. Every one is written
-/// into the running stream-json child at once, the child echoes each one once,
-/// and the one cursor ends on the last line.
+/// Three lines arrive while the child holds its turn open. Tool-boundary hook
+/// responses carry each line once, and the cursor ends on the last line.
 #[test]
 fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
     let dir = short_dir();

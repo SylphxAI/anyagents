@@ -204,21 +204,29 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     };
     assert_eq!(reply.sender.as_deref(), Some("agent:alpha"));
     assert!(reply.text.contains("pong from opencode"), "{}", reply.text);
+    // Exercise the shared-log case deterministically: the reply also becomes
+    // a prompt in the owner's session, but must not echo back to alpha.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while store.delivered_cursor(&owner.id).unwrap() < reply.seq {
+        assert!(Instant::now() < deadline, "owner reply not delivered");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     // The agent's own inbox holds the ask and no answer row.
     assert!(
         store
             .inbox(&agent.id, None)
             .unwrap()
             .iter()
-            .all(|message| message.reply_to.is_none())
+            .all(|message| message.reply_to.is_none() && message.text != "pong from opencode")
     );
     let log = std::fs::read_to_string(data.join("fake.log")).unwrap_or_default();
     // The line reached the service as a steer prompt on its real endpoint,
-    // carrying its mailbox id. The answer never went through the session: it is
-    // the agent's own `send`, so no prompt carries it.
+    // carrying its mailbox id. The answer is the agent's own `send`, not a
+    // scraped session response. The shared log can also contain the owner's
+    // prompt for that reply once its supervisor runs, so do not reject the
+    // reply text globally: only alpha's inbox must exclude it (checked above).
     assert!(log.contains("api:POST /api/session/"), "{log}");
     assert!(log.contains("\"delivery\":\"steer\""), "{log}");
     assert!(log.contains("anyagents-message:"), "{log}");
-    assert!(!log.contains("pong from opencode"), "{log}");
     drop(server);
 }
