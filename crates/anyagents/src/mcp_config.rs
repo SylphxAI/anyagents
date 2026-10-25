@@ -28,7 +28,86 @@ pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), 
         }),
     );
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(path, bytes)?;
+    atomic_write_shared(path, &bytes)?;
+    Ok(())
+}
+
+/// Write a clean, isolated `settings.json` for a `claude-code` agent in `config_dir`,
+/// stripping any host-leaked `apiKeyHelper`, `ANTHROPIC_BASE_URL`, legacy hooks,
+/// or `claudeMdExcludes` so the agent uses its bound `<provider>/<profile>` cleanly.
+pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
+    let is_anthropic_oauth = std::fs::read_to_string(config_dir.join(".anyagents-profile"))
+        .ok()
+        .map(|s| {
+            let t = s.trim();
+            t.is_empty() || t == "anthropic" || t.starts_with("anthropic/")
+        })
+        .unwrap_or(true);
+    let settings_path = config_dir.join("settings.json");
+    let mut root = read_json(&settings_path).unwrap_or_else(|_| serde_json::json!({}));
+    if !root.is_object() {
+        root = serde_json::json!({});
+    }
+    if let Some(obj) = root.as_object_mut() {
+        obj.remove("hooks");
+        obj.remove("claudeMdExcludes");
+        if is_anthropic_oauth {
+            obj.remove("apiKeyHelper");
+            if let Some(env_obj) = obj
+                .get_mut("env")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                env_obj.remove("ANTHROPIC_BASE_URL");
+                env_obj.remove("ANTHROPIC_API_KEY");
+            }
+        }
+        obj.insert("includeCoAuthoredBy".to_string(), serde_json::json!(false));
+        obj.insert(
+            "attribution".to_string(),
+            serde_json::json!({"commit": "", "pr": ""}),
+        );
+        obj.insert(
+            "skipDangerousModePermissionPrompt".to_string(),
+            serde_json::json!(true),
+        );
+        obj.entry("permissions".to_string()).or_insert_with(|| {
+            serde_json::json!({
+                "defaultMode": "bypassPermissions",
+                "deny": ["SendFeedback"]
+            })
+        });
+    }
+    let mut bytes =
+        serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
+    bytes.push(b'\n');
+    atomic_write_shared(&settings_path, &bytes)?;
+    let nested = config_dir.join(".claude").join("settings.json");
+    if nested.exists() {
+        let _ = std::fs::remove_file(&nested);
+    }
+    Ok(())
+}
+
+fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let tmp_path = path.with_file_name(format!(
+        ".{}.anyagents-new",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("config")
+    ));
+    std::fs::write(&tmp_path, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o664));
+    }
+    if std::fs::rename(&tmp_path, path).is_err() {
+        let _ = std::fs::remove_file(path);
+        std::fs::rename(&tmp_path, path)?;
+    }
     Ok(())
 }
 
@@ -185,7 +264,14 @@ fn read_json(path: &Path) -> Result<serde_json::Value, Error> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.is_empty() => Ok(serde_json::json!({})),
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|err| Error::Message(err.to_string())),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(serde_json::json!({})),
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            Ok(serde_json::json!({}))
+        }
         Err(err) => Err(err.into()),
     }
 }
@@ -247,10 +333,6 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
             key_candidates.push(prof_dir.join(".config/desk/sylphx-ai/key"));
         }
     }
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        key_candidates.push(home.join(".config/opencode/sylphx.key"));
-        key_candidates.push(home.join(".config/desk/sylphx-ai/key"));
-    }
     let api_key = key_candidates.into_iter().find_map(|p| {
         std::fs::read_to_string(p)
             .ok()
@@ -306,5 +388,36 @@ mod tests {
             text.contains("experimental_bearer_token = \"test-sylphx-key\""),
             "{text}"
         );
+    }
+
+    #[test]
+    fn sanitize_claude_settings_strips_host_gateway_and_hooks_for_oauth_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".anyagents-profile"), "anthropic/vulcan\n").unwrap();
+        std::fs::write(
+            dir.path().join("settings.json"),
+            r#"{
+  "apiKeyHelper": "/scratch/wt/owners-main/.claude/gateway-key",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://api.sylphx.com",
+    "OTHER": "1"
+  },
+  "hooks": {"SessionStart": []},
+  "claudeMdExcludes": ["/workspace-data/workspace/github.com/SylphxAI/owner/AGENTS.md"]
+}"#,
+        )
+        .unwrap();
+        sanitize_claude_settings(dir.path()).unwrap();
+        let cleaned: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(cleaned.get("apiKeyHelper").is_none());
+        assert!(cleaned.get("hooks").is_none());
+        assert!(cleaned.get("claudeMdExcludes").is_none());
+        assert!(cleaned["env"].get("ANTHROPIC_BASE_URL").is_none());
+        assert_eq!(cleaned["env"]["OTHER"], "1");
+        assert_eq!(cleaned["includeCoAuthoredBy"], false);
+        assert_eq!(cleaned["skipDangerousModePermissionPrompt"], true);
     }
 }

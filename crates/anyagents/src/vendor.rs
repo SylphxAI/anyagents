@@ -379,6 +379,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     "--config".to_string(),
                     request.config_dir.display().to_string(),
                 ];
+                let _ = crate::mcp_config::sanitize_claude_settings(&request.config_dir);
                 let _ = crate::mcp_config::write_claude(
                     &request.config_dir.join("mcp.json"),
                     &exe,

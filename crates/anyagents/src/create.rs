@@ -121,6 +121,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     } else if agent.harness == "grok" {
         crate::grok::write_grok_config(&config, agent.model.as_deref(), &command, &args)?;
     } else {
+        let _ = mcp_config::sanitize_claude_settings(&config);
         mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
         let _ = mcp_config::write_claude(&config.join("mcp.json"), &command, &args);
     }
@@ -482,16 +483,10 @@ pub(crate) fn seed_harness_credentials(
         }
     }
     let static_rel_paths: &[&str] = match agent.harness.as_str() {
-        "claude-code" => &[
-            ".credentials.json",
-            ".claude/.credentials.json",
-            "settings.json",
-            ".claude.json",
-        ],
+        "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
         "codex" => &[
             "auth.json",
             ".codex/auth.json",
-            "config.toml",
             "models_cache.json",
             "model-catalog-direct.json",
             ".config/desk/sylphx-ai/key",
@@ -513,11 +508,8 @@ pub(crate) fn seed_harness_credentials(
             ".gemini/config/.migrated",
         ],
         "muse" => &[
-            "settings.json",
-            "muse/settings.json",
             "muse/trust.json",
             "muse/auth.json",
-            ".config/muse/settings.json",
             ".config/muse/trust.json",
             ".config/muse/auth.json",
             ".local/share/muse/auth.json",
@@ -540,16 +532,14 @@ pub(crate) fn seed_harness_credentials(
         ],
         "grok" => &[
             ".grok/auth.json",
-            ".grok/config.toml",
             ".grok/models_cache.json",
             ".grok/settings_cache.json",
         ],
         _ => &[],
     };
-    let host_home = crate::sandbox::host_home_dir();
     let mut rel_paths: Vec<String> = static_rel_paths.iter().map(|s| (*s).to_string()).collect();
     // Discover any `{file:~/<rel>}` key paths referenced by opencode configs across
-    // donors or host home so custom provider key files are seeded without hardcoding.
+    // profiles or donors so custom provider key files are seeded without hardcoding.
     for other in &all_agents {
         let cfg = agent_config_dir(data, &other.id);
         for candidate in [
@@ -566,21 +556,27 @@ pub(crate) fn seed_harness_credentials(
             }
         }
     }
-    if let Some(ref home) = host_home
-        && let Ok(text) = std::fs::read_to_string(home.join(".config/opencode/opencode.json"))
-    {
-        for r in extract_file_tilde_refs(&text) {
-            if !rel_paths.contains(&r) {
-                rel_paths.push(r);
-            }
-        }
-    }
 
     let explicit_non_default_profile = bound_profile_name(target_config).is_some_and(|b| {
         let prof = b.split_once('/').map(|(_, p)| p).unwrap_or(b.as_str());
         !prof.is_empty() && prof != "default"
     });
     let profile_roots = select_or_bind_profile(data, &all_agents, agent, target_config);
+    for profile_root in &profile_roots {
+        for candidate in [
+            ".config/opencode/opencode.json",
+            "opencode/opencode.json",
+            "opencode.json",
+        ] {
+            if let Ok(text) = std::fs::read_to_string(profile_root.join(candidate)) {
+                for r in extract_file_tilde_refs(&text) {
+                    if !rel_paths.contains(&r) {
+                        rel_paths.push(r);
+                    }
+                }
+            }
+        }
+    }
     for rel in &rel_paths {
         let dst = target_config.join(rel);
         let is_auth_cred = matches!(
@@ -621,24 +617,7 @@ pub(crate) fn seed_harness_credentials(
                 }
             }
         }
-        if copied || dst.exists() {
-            continue;
-        }
-        if explicit_non_default_profile
-            && matches!(
-                rel.as_str(),
-                ".gemini/antigravity-cli/antigravity-oauth-token"
-                    | ".gemini/antigravity-cli/antigravity_state.pbtxt"
-                    | ".gemini/antigravity-cli/jetski_state.pbtxt"
-                    | ".credentials.json"
-                    | ".claude/.credentials.json"
-                    | "auth.json"
-                    | ".codex/auth.json"
-                    | "muse/auth.json"
-                    | ".config/muse/auth.json"
-                    | ".grok/auth.json"
-            )
-        {
+        if copied || dst.exists() || is_auth_cred {
             continue;
         }
         for donor in &donors {
@@ -659,49 +638,7 @@ pub(crate) fn seed_harness_credentials(
                 let _ = std::fs::create_dir_all(parent_dir);
             }
             if std::fs::copy(&src, &dst).is_ok() {
-                copied = true;
                 break;
-            }
-        }
-        if !copied && let Some(ref home) = host_home {
-            let host_src = home.join(rel);
-            if host_src.is_file() {
-                if let Some(parent_dir) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent_dir);
-                }
-                if std::fs::copy(&host_src, &dst).is_ok() {
-                    // Persist into the centralized AnyAgents upstream provider profile store as well.
-                    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-                    let default_profile = data.join("profiles").join(&provider).join("default");
-                    ensure_provider_profile_meta(&default_profile, &provider, None);
-                    let profile_dst = default_profile.join(rel);
-                    if !profile_dst.exists() {
-                        if let Some(p) = profile_dst.parent() {
-                            let _ = std::fs::create_dir_all(p);
-                        }
-                        let _ = std::fs::copy(&dst, &profile_dst);
-                    }
-                }
-            }
-        }
-    }
-    #[cfg(unix)]
-    if agent.harness == "dsh"
-        && let Some(ref home) = host_home
-    {
-        let host_dsh = home.join(".dsh");
-        let target_dsh = target_config.join(".dsh");
-        let _ = std::fs::create_dir_all(&target_dsh);
-        if let Ok(entries) = std::fs::read_dir(host_dsh) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with("runtime-") || name_str == "profiles" {
-                    let dst = target_dsh.join(&name);
-                    if !dst.exists() {
-                        let _ = std::os::unix::fs::symlink(entry.path(), &dst);
-                    }
-                }
             }
         }
     }
@@ -839,6 +776,8 @@ pub(crate) fn bind_profile(
             &command,
             &args,
         )?;
+    } else if agent.harness == "claude-code" {
+        let _ = crate::mcp_config::sanitize_claude_settings(&config);
     }
     Ok(())
 }
@@ -1049,11 +988,7 @@ pub(crate) fn sync_and_list_provider_profiles(
         let profile_dir = profiles_root.join(&provider).join(&prof_name);
         match provider.as_str() {
             "anthropic" => {
-                for rel in [
-                    ".credentials.json",
-                    ".claude/.credentials.json",
-                    "settings.json",
-                ] {
+                for rel in [".credentials.json", ".claude/.credentials.json"] {
                     let src = cfg.join(rel);
                     if src.is_file() {
                         ensure_provider_profile_meta(&profile_dir, "anthropic", None);
@@ -1068,12 +1003,15 @@ pub(crate) fn sync_and_list_provider_profiles(
                 }
             }
             "openai" => {
-                for rel in ["auth.json", "config.toml"] {
+                for rel in ["auth.json", ".codex/auth.json"] {
                     let src = cfg.join(rel);
                     if src.is_file() {
                         ensure_provider_profile_meta(&profile_dir, "openai", None);
                         let dst = profile_dir.join(rel);
                         if !dst.exists() {
+                            if let Some(p) = dst.parent() {
+                                let _ = std::fs::create_dir_all(p);
+                            }
                             let _ = std::fs::copy(&src, &dst);
                         }
                     }
@@ -1099,7 +1037,7 @@ pub(crate) fn sync_and_list_provider_profiles(
                 }
             }
             "muse" => {
-                for rel in ["settings.json", "muse/settings.json", "muse/auth.json"] {
+                for rel in ["muse/auth.json", ".config/muse/auth.json"] {
                     let src = cfg.join(rel);
                     if src.is_file() {
                         ensure_provider_profile_meta(&profile_dir, "muse", None);
@@ -1133,167 +1071,6 @@ pub(crate) fn sync_and_list_provider_profiles(
                 }
             }
             _ => {}
-        }
-    }
-
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        // 1. Anthropic subscription (`~/.claude`)
-        if home.join(".claude/.credentials.json").is_file() {
-            let dir = profiles_root.join("anthropic").join("default");
-            ensure_provider_profile_meta(&dir, "anthropic", Some("subscription"));
-            copy_host_file(
-                &home.join(".claude/.credentials.json"),
-                &dir.join(".claude/.credentials.json"),
-            );
-            copy_host_file(
-                &home.join(".claude/.credentials.json"),
-                &dir.join(".credentials.json"),
-            );
-            copy_host_file(
-                &home.join(".claude/settings.json"),
-                &dir.join("settings.json"),
-            );
-            copy_host_file(&home.join(".claude.json"), &dir.join(".claude.json"));
-        }
-
-        // 2. OpenAI / Codex subscription (`~/.codex`)
-        if home.join(".codex/auth.json").is_file() {
-            let dir = profiles_root.join("openai").join("default");
-            ensure_provider_profile_meta(&dir, "openai", Some("subscription"));
-            copy_host_file(&home.join(".codex/auth.json"), &dir.join("auth.json"));
-            copy_host_file(
-                &home.join(".codex/auth.json"),
-                &dir.join(".codex/auth.json"),
-            );
-            copy_host_file(&home.join(".codex/config.toml"), &dir.join("config.toml"));
-            copy_host_file(
-                &home.join(".codex/models_cache.json"),
-                &dir.join("models_cache.json"),
-            );
-        }
-
-        // 3. Google Antigravity subscription (`~/.gemini`)
-        if home
-            .join(".gemini/antigravity-cli/antigravity-oauth-token")
-            .is_file()
-        {
-            let dir = profiles_root.join("google-antigravity").join("default");
-            ensure_provider_profile_meta(&dir, "google-antigravity", Some("subscription"));
-            for rel in [
-                ".gemini/antigravity-cli/antigravity-oauth-token",
-                ".gemini/antigravity-cli/antigravity_state.pbtxt",
-                ".gemini/antigravity-cli/jetski_state.pbtxt",
-                ".gemini/config/config.json",
-                ".gemini/config/.migrated",
-            ] {
-                copy_host_file(&home.join(rel), &dir.join(rel));
-            }
-        }
-
-        // 4. Google Gemini API Key (`~/.codex/gemini-api-key`)
-        if home.join(".codex/gemini-api-key").is_file() {
-            let dir = profiles_root.join("google-gemini").join("api");
-            ensure_provider_profile_meta(&dir, "google-gemini", Some("api-key"));
-            copy_host_file(
-                &home.join(".codex/gemini-api-key"),
-                &dir.join("gemini-api-key"),
-            );
-        }
-
-        // 5. Meta Muse Code subscriptions (`~/.config/muse` + `.omp/agent/agent.db`)
-        if home.join(".config/muse/auth.json").is_file() {
-            let dir = profiles_root.join("muse").join("default");
-            ensure_provider_profile_meta(&dir, "muse", Some("subscription"));
-            for rel in ["auth.json", "settings.json", "trust.json"] {
-                copy_host_file(
-                    &home.join(".config/muse").join(rel),
-                    &dir.join(".config/muse").join(rel),
-                );
-                copy_host_file(
-                    &home.join(".config/muse").join(rel),
-                    &dir.join("muse").join(rel),
-                );
-            }
-            copy_host_file(
-                &home.join(".config/muse/settings.json"),
-                &dir.join("settings.json"),
-            );
-        }
-
-        // 6. DeepSeek Harness (`dsh` web session + API key in `~/.dsh`)
-        if home.join(".dsh/.credentials.yaml").is_file() {
-            let web_dir = profiles_root.join("deepseek").join("web");
-            ensure_provider_profile_meta(&web_dir, "deepseek", Some("subscription"));
-            for rel in [
-                ".dsh/.credentials.yaml",
-                ".dsh/settings.yaml",
-                ".dsh/.anonymous-user-id",
-                ".dsh/profiles/headless/cordis.yml",
-            ] {
-                copy_host_file(&home.join(rel), &web_dir.join(rel));
-            }
-            let api_dir = profiles_root.join("deepseek").join("api");
-            ensure_provider_profile_meta(&api_dir, "deepseek", Some("api-key"));
-            copy_host_file(
-                &home.join(".dsh/.credentials.yaml"),
-                &api_dir.join(".dsh/.credentials.yaml"),
-            );
-            copy_host_file(
-                &home.join(".omp/agent/agent.db"),
-                &api_dir.join(".omp/agent/agent.db"),
-            );
-        }
-
-        // 7. xAI Grok CLI (`~/.grok`)
-        if home.join(".grok/auth.json").is_file() {
-            let dir = profiles_root.join("xai").join("default");
-            ensure_provider_profile_meta(&dir, "xai", Some("subscription"));
-            for rel in [
-                ".grok/auth.json",
-                ".grok/config.toml",
-                ".grok/models_cache.json",
-                ".grok/settings_cache.json",
-            ] {
-                copy_host_file(&home.join(rel), &dir.join(rel));
-            }
-        }
-
-        // 8. OMP (`agent.db` + `models.yml` containing Cursor OAuth & OpenRouter API key)
-        if home.join(".omp/agent/agent.db").is_file() {
-            let cursor_dir = profiles_root.join("cursor").join("default");
-            ensure_provider_profile_meta(&cursor_dir, "cursor", Some("subscription"));
-            for rel in [
-                ".omp/agent/agent.db",
-                ".omp/agent/config.yml",
-                ".omp/agent/models.yml",
-                ".omp/agent/models.db",
-            ] {
-                copy_host_file(&home.join(rel), &cursor_dir.join(rel));
-                if let Some(fname) = Path::new(rel).file_name() {
-                    copy_host_file(&home.join(rel), &cursor_dir.join(fname));
-                }
-            }
-
-            let or_dir = profiles_root.join("openrouter").join("default");
-            ensure_provider_profile_meta(&or_dir, "openrouter", Some("api-key"));
-            copy_host_file(
-                &home.join(".omp/agent/agent.db"),
-                &or_dir.join(".omp/agent/agent.db"),
-            );
-            copy_host_file(
-                &home.join(".dsh/.credentials.yaml"),
-                &or_dir.join(".dsh/.credentials.yaml"),
-            );
-        }
-
-        // 9. Extra Qwen Cloud API key (`~/.codex/qwencloud-api-key`)
-        if home.join(".codex/qwencloud-api-key").is_file() {
-            let qc = profiles_root.join("qwen-token-plan").join("qwencloud");
-            ensure_provider_profile_meta(&qc, "qwen-token-plan", Some("coding-plan"));
-            copy_host_file(
-                &home.join(".codex/qwencloud-api-key"),
-                &qc.join("qwencloud-api-key"),
-            );
         }
     }
 
