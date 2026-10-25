@@ -222,7 +222,7 @@ pub(crate) fn write_agent_instructions(config: &Path, agent: &Agent, parent_name
            - The `anyagents` CLI binary is primarily for the human operator on the terminal.\n\
          - **Unified Cross-Harness Sub-Agents (`subagents` / `spawn` MCP Tools — Native Harness Sub-Agents Disabled by Default)**:\n\
            - Built-in harness sub-agent tools (`Task`/`Agent`/`task`/`invoke_subagent`) are **disabled by default** so sub-agents are never trapped inside a single vendor CLI.\n\
-           - Always spawn and manage sub-agents via **AnyAgents `subagents` / `spawn` MCP tools**. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`opencode` + `sylphx/openai/gpt-6.1-sol#medium` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
+           - Always spawn and manage sub-agents via **AnyAgents `subagents` / `spawn` MCP tools**. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`opencode` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
            - Full lifecycle actions on `subagents`:\n\
              - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"all\"`).\n\
              - **Inspect**: `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })`.\n\

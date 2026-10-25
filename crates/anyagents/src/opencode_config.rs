@@ -66,7 +66,7 @@ pub fn write(
         root["agent"] = serde_json::json!({
             "build": {
                 "model": "sylphx/openai/gpt-6.1-sol",
-                "variant": "medium",
+                "variant": "xhigh",
             }
         });
     }
