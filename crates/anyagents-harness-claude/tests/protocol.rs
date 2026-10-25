@@ -161,8 +161,9 @@ fn interrupt_clears_the_open_turn() {
     harness.deliver(&msg("m1")).unwrap();
     harness.cancel().unwrap();
     let log = log_path(&dir);
-    assert!(wait_log(&log, "control_request"));
-    assert!(read_log(&log).contains("interrupt"));
+    // Initialization also logs a control_request; wait for the specific
+    // asynchronous interrupt rather than mistaking initialization for it.
+    assert!(wait_log(&log, "interrupt"));
     assert!(!harness.is_finished("m1"));
     assert_eq!(harness.health().turn_state, TurnState::Idle);
 }
