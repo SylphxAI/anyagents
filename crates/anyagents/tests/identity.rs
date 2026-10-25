@@ -91,6 +91,125 @@ fn create(data: &Path, name: &str) -> String {
 }
 
 #[test]
+fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let server = start_server(&data);
+    let sage = create(&data, "sage");
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &sage));
+    let request = |method: &str, path: &str, body: Value| {
+        support::call_raw(&server.socket, method, path, &body.to_string(), &auth)
+    };
+    assert!(request("GET", "/v1/profiles", json!(null)).starts_with("HTTP/1.1 403"));
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/agents/sage/admin",
+        r#"{"admin":true}"#,
+    );
+    assert!(status.contains("200"), "{status}");
+    assert!(
+        request("POST", "/v1/agents/sage/admin", json!({"admin":true})).starts_with("HTTP/1.1 403")
+    );
+    let root = request(
+        "POST",
+        "/v1/agents",
+        json!({"name":"rhea", "harness":"claude-code", "parent":"root"}),
+    );
+    assert!(root.starts_with("HTTP/1.1 201"), "{root}");
+    let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
+    let rhea = store.agent_by_name("rhea").unwrap();
+    assert!(rhea.parent_id.is_none());
+    assert!(!rhea.is_admin);
+    let rhea_auth = format!(
+        "x-anyagents-agent: {}\r\n",
+        capability(&data, rhea.id.as_str())
+    );
+    for path in ["/v1/channels", "/v1/profiles"] {
+        assert!(
+            support::call_raw(&server.socket, "GET", path, "", &rhea_auth)
+                .starts_with("HTTP/1.1 403")
+        );
+    }
+    let child = request("POST", "/v1/agents", json!({"name":"child"}));
+    assert!(child.starts_with("HTTP/1.1 201"), "{child}");
+    assert!(!store.agent_by_name("child").unwrap().is_admin);
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/agents/child/admin",
+        r#"{"admin":true}"#,
+    );
+    assert!(status.contains("400"), "{status}");
+    let key = "test-provider-secret-never-return";
+    let token = "123:test-channel-secret-never-return";
+    let mut responses = Vec::new();
+    responses.push(request(
+        "POST",
+        "/v1/agents/rhea/model",
+        json!({"model":"test-model", "base_url":"https://api.example.test", "key":key}),
+    ));
+    responses.push(request(
+        "POST",
+        "/v1/channels",
+        json!({"kind":"telegram", "agent":"rhea", "token":token}),
+    ));
+    for response in &responses {
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+    responses.push(request("GET", "/v1/channels", json!(null)));
+    responses.push(request("GET", "/v1/profiles", json!(null)));
+    // Unknown path fields are rejected rather than read in the daemon's seat.
+    let rejected = request(
+        "POST",
+        "/v1/agents/rhea/model",
+        json!({"model":"test", "key_file":"/etc/passwd"}),
+    );
+    assert!(rejected.starts_with("HTTP/1.1 422"), "{rejected}");
+    responses.push(request(
+        "POST",
+        "/v1/channels",
+        json!({"kind":"invalid", "agent":"rhea", "token":token}),
+    ));
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/agents/sage/admin",
+        r#"{"admin":false}"#,
+    );
+    assert!(status.contains("200"));
+    for path in ["/v1/profiles", "/v1/channels"] {
+        assert!(request("GET", path, json!(null)).starts_with("HTTP/1.1 403"));
+    }
+    let conn = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT actor || ':' || action || ':' || target FROM admin_audit")
+        .unwrap();
+    let audit: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert!(
+        audit
+            .iter()
+            .any(|r| r == "agent:sage:agents.create_root:rhea")
+    );
+    assert!(
+        audit
+            .iter()
+            .any(|r| r == "operator:agents.revoke_admin:sage")
+    );
+    for text in responses.iter().chain(audit.iter()) {
+        assert!(!text.contains(key));
+        assert!(!text.contains(token));
+    }
+}
+
+#[test]
 fn a_session_acts_as_its_own_agent_and_nothing_else() {
     let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();

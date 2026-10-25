@@ -220,6 +220,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     }
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
+        .route("/v1/agents/{name}/admin", post(set_admin_route))
+        .route("/v1/agents/{name}/model", post(model_route))
+        .route("/v1/profiles", get(profiles_route))
+        .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
         .route("/v1/agents/{name}/archive", post(archive_agent_route))
@@ -473,6 +477,186 @@ fn require_operator(principal: &Principal) -> Result<(), ApiError> {
             "an agent session cannot administer the server",
         ))
     }
+}
+
+/// Authority is read from SQLite on every call, not from the capability.
+fn require_admin_or_operator(
+    store: &Store,
+    principal: &Principal,
+    action: &str,
+    target: &str,
+) -> Result<String, ApiError> {
+    let actor = match principal {
+        Principal::Operator => "operator".to_string(),
+        Principal::Agent { agent_id, name } => {
+            let agent = store.agent(agent_id).map_err(ApiError::from_store)?;
+            if agent.parent_id.is_some() || !agent.is_admin {
+                return Err(ApiError::forbidden("administrative authority required"));
+            }
+            format!("agent:{name}")
+        }
+    };
+    store
+        .record_admin_audit(&actor, action, target)
+        .map_err(ApiError::from_store)?;
+    Ok(actor)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminRequest {
+    admin: bool,
+}
+
+async fn set_admin_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<AdminRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_operator(&principal)?;
+    let agent = state
+        .store
+        .agent_by_name(&name)
+        .map_err(ApiError::from_store)?;
+    state
+        .store
+        .set_agent_admin(&agent.id, body.admin)
+        .map_err(ApiError::from_store)?;
+    state
+        .store
+        .record_admin_audit(
+            "operator",
+            if body.admin {
+                "agents.grant_admin"
+            } else {
+                "agents.revoke_admin"
+            },
+            &agent.name,
+        )
+        .map_err(ApiError::from_store)?;
+    Ok(Json(
+        serde_json::json!({"agent": agent.name, "admin": body.admin}),
+    ))
+}
+
+// Socket requests carry secret values, never host filesystem paths.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelRequest {
+    model: String,
+    base_url: Option<String>,
+    key: Option<String>,
+    profile: Option<String>,
+}
+
+async fn model_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<ModelRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+    let agent = state
+        .store
+        .agent_by_name(&name)
+        .map_err(ApiError::from_store)?;
+    if let Some(profile) = body.profile {
+        if body.key.is_some() || body.base_url.is_some() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "profile cannot be combined with a key or base URL",
+            ));
+        }
+        create::bind_profile(&state.store, &agent, &profile, &body.model)
+            .map_err(ApiError::from_store)?;
+    } else {
+        let key = body.key.as_deref().unwrap_or("").trim();
+        if key.is_empty() || key.contains(char::is_whitespace) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a nonempty single-line key is required",
+            ));
+        }
+        let base_url = body
+            .base_url
+            .as_deref()
+            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
+        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, &body.model, key)
+            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
+    }
+    Ok(Json(
+        serde_json::json!({"agent": agent.name, "model": body.model}),
+    ))
+}
+
+async fn profiles_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<create::ProviderProfileEntry>>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "profiles.list", "profiles")?;
+    Ok(Json(create::sync_and_list_provider_profiles(
+        &state.store,
+        state.store.data_dir(),
+    )))
+}
+
+async fn channels_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+    let channels: Vec<_> = state.store.list_channels().map_err(ApiError::from_store)?.into_iter().map(|c| serde_json::json!({"id": c.id.to_string(), "kind": c.kind, "agents": c.agents.iter().filter_map(|id| state.store.agent(id).ok().map(|a| a.name)).collect::<Vec<_>>()})).collect();
+    Ok(Json(serde_json::json!({"channels": channels})))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChannelRequest {
+    kind: String,
+    agent: String,
+    token: String,
+}
+
+async fn add_channel_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<ChannelRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
+    if body.kind != "telegram"
+        || body.token.trim().is_empty()
+        || body
+            .token
+            .trim()
+            .chars()
+            .any(|c| c.is_whitespace() || c == '/')
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "invalid channel kind or token",
+        ));
+    }
+    let agent = state
+        .store
+        .agent_by_name(&body.agent)
+        .map_err(ApiError::from_store)?;
+    crate::channel::record(
+        &state.store,
+        state.store.data_dir(),
+        &body.kind,
+        &agent.id,
+        body.token.trim().as_bytes(),
+    )
+    .map_err(|_| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not record channel",
+        )
+    })?;
+    Ok(Json(
+        serde_json::json!({"agent": agent.name, "kind": body.kind}),
+    ))
 }
 
 /// A loopback port the operating system picked, held open until the caller
@@ -755,6 +939,15 @@ async fn create_agent_route(
     };
     spawn_store(move || {
         let parent_agent = match (&caller_agent, body.parent.as_deref()) {
+            (_, Some("root" | "")) => {
+                require_admin_or_operator(
+                    &state.store,
+                    &principal,
+                    "agents.create_root",
+                    &body.name,
+                )?;
+                None
+            }
             (_, Some(parent_ref)) => Some(
                 state
                     .store

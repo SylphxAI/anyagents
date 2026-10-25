@@ -27,6 +27,8 @@ impl From<Error> for UsageError {
 
 pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
     match action {
+        AgentsCommand::GrantAdmin { agent } => set_admin(data, &agent, true)?,
+        AgentsCommand::RevokeAdmin { agent } => set_admin(data, &agent, false)?,
         AgentsCommand::Create {
             name,
             harness,
@@ -180,7 +182,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
 /// `agents create`. The server owns it when it is there, so one process makes
 /// the agent, mints its capability and starts it.
 fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
-    if client::can_call_server(data) {
+    if client::can_call_server(data) || client::agent_identity().is_some() {
         let answered = client::call::<AgentView>(
             data,
             "POST",
@@ -194,6 +196,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         serde_json::from_value(body).map_err(|err| err.to_string())?;
     let store = open_with_key(data).map_err(|err| err.to_string())?;
     let parent_id = match parsed.parent.as_deref() {
+        Some("root" | "") => None,
         Some(parent_ref) => Some(
             store
                 .agent_by_name(parent_ref)
@@ -251,6 +254,23 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
     })
+}
+
+fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
+    let body = serde_json::json!({"admin": admin});
+    let result = client::call::<serde_json::Value>(
+        data,
+        "POST",
+        &format!("/v1/agents/{agent}/admin"),
+        Some(body.to_string().into_bytes()),
+        &client::authority(data),
+    )
+    .map_err(Error::Message)?;
+    println!(
+        "{}",
+        result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+    );
+    Ok(())
 }
 
 /// `agents list` / `peers`: the server's view when it is there, else the stored rows.
@@ -423,6 +443,7 @@ pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
                 .find(|row| row.name == agent || row.id == agent)
         {
             return Ok(Agent {
+                is_admin: false,
                 id: AgentId::parse(&found.id)?,
                 name: found.name,
                 parent_id: found.parent.and_then(|p| AgentId::parse(&p).ok()),
