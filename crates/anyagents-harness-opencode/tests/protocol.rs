@@ -118,7 +118,7 @@ fn an_open_turn_never_blocks_the_next_line() {
     let mut harness = start(&dir, "hold");
     assert_eq!(harness.deliver(&msg("m1")).unwrap(), accepted());
     assert_eq!(harness.deliver(&msg("m2")).unwrap(), accepted());
-    assert_eq!(harness.health().turn_state, TurnState::Idle);
+    assert_eq!(harness.health().turn_state, TurnState::InTurn);
     assert_eq!(harness.health().delivery_mode, DeliveryMode::Steer);
     assert_eq!(harness.health().steer_support, SteerSupport::Yes);
     assert_eq!(
