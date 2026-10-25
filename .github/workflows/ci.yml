@@ -118,11 +118,11 @@ jobs:
         run: cargo test --workspace --locked
 
   # The required check name. Skipped lanes pass; a failed or cancelled lane
-  # fails. It reads results only, so it runs on the reserved gate pool.
+  # fails. It reads results only and runs no repository code.
   ci-ok:
-    if: always() && !cancelled()
+    if: always() && !cancelled() && github.event.repository.private == false
     needs: [changes, test, macos]
-    runs-on: sylphx-linux-control
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: SylphxAI/.github/.github/actions/needs-pass@b33f1acf5ac75cd568268d46ae00b0132e1ad67a # main
