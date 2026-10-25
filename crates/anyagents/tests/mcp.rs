@@ -330,14 +330,16 @@ async fn mcp_tools_use_the_server_socket() {
         vec![1, 2]
     );
 
-    let own: ConversationResponse = ok_json(call(&alpha, "conversation", serde_json::json!({})).await);
+    let own: ConversationResponse =
+        ok_json(call(&alpha, "conversation", serde_json::json!({})).await);
     assert!(
         own.turns.iter().all(|t| t.direction == "out"),
         "{:?}",
         own.turns
     );
 
-    let got: ConversationResponse = ok_json(call(&beta, "conversation", serde_json::json!({})).await);
+    let got: ConversationResponse =
+        ok_json(call(&beta, "conversation", serde_json::json!({})).await);
     assert_eq!(got.turns.len(), 2);
     assert_eq!(got.turns[0].text, "hello");
     assert_eq!(got.turns[0].from, "agent:alpha");

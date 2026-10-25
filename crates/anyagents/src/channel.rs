@@ -358,7 +358,9 @@ pub fn conversation(
             } else {
                 client::agent_identity()
                     .map(|id| id.to_string())
-                    .ok_or_else(|| Error::Message("conversation needs an agent name or id".into()))?
+                    .ok_or_else(|| {
+                        Error::Message("conversation needs an agent name or id".into())
+                    })?
             }
         }
     };

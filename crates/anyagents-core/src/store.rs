@@ -1621,7 +1621,11 @@ impl Store {
             .query_row(
                 "SELECT vector_i8 FROM rag_embeddings
                  WHERE content_hash = ?1 AND model = ?2 AND dimensions = ?3",
-                params![content_hash, locked_model, i64::try_from(locked_dim).unwrap_or(1024)],
+                params![
+                    content_hash,
+                    locked_model,
+                    i64::try_from(locked_dim).unwrap_or(1024)
+                ],
                 |r| r.get(0),
             )
             .optional()?;
@@ -1740,7 +1744,10 @@ impl Store {
                         direction: crow.get(1)?,
                         from: crow.get(2)?,
                         to: crow.get(3)?,
-                        reply_to: Some(format!("rag:cos={cos:.3}:agent={}", crow.get::<_, String>(6)?)),
+                        reply_to: Some(format!(
+                            "rag:cos={cos:.3}:agent={}",
+                            crow.get::<_, String>(6)?
+                        )),
                         text: crow.get(4)?,
                         timestamp_ms: crow.get(5)?,
                     };
@@ -1815,7 +1822,11 @@ impl Store {
                  WHERE m.received_at_ms > ?1 AND m.body LIKE ?2 ESCAPE '\\'
                  ORDER BY m.received_at_ms DESC LIMIT ?3",
             )?;
-            let mut lrows = lstmt.query(params![since, like_pat, i64::try_from(limit * 2).unwrap_or(40)])?;
+            let mut lrows = lstmt.query(params![
+                since,
+                like_pat,
+                i64::try_from(limit * 2).unwrap_or(40)
+            ])?;
             let mut rank = 0usize;
             while let Some(row) = lrows.next()? {
                 let cid: String = row.get(0)?;
@@ -1839,8 +1850,7 @@ impl Store {
                 {
                     continue;
                 }
-                *rrf_scores.entry(cid.clone()).or_insert(0.0) +=
-                    0.8 / (60.0 + (rank as f64) + 1.0);
+                *rrf_scores.entry(cid.clone()).or_insert(0.0) += 0.8 / (60.0 + (rank as f64) + 1.0);
                 chunk_meta.entry(cid).or_insert(turn);
                 rank += 1;
             }
@@ -1850,8 +1860,7 @@ impl Store {
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Deduplicate identical message text across multiple recipient agents in room broadcasts.
-        let mut seen_text_sig: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen_text_sig: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut out = Vec::new();
         for (cid, score) in ranked {
             if let Some(mut turn) = chunk_meta.remove(&cid) {
@@ -2559,10 +2568,7 @@ fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Messag
     message_from_row_with_cursor(row, delivered)
 }
 
-fn message_from_row_with_cursor(
-    row: &rusqlite::Row<'_>,
-    delivered: i64,
-) -> Result<Message, Error> {
+fn message_from_row_with_cursor(row: &rusqlite::Row<'_>, delivered: i64) -> Result<Message, Error> {
     let id: String = row.get(0)?;
     let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
     let seq: i64 = row.get(2)?;

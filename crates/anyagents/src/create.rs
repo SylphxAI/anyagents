@@ -327,14 +327,8 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
             }
         }
         for (rel, shared_candidates) in [
-            (
-                ".rustup",
-                ["/home/kyle/.rustup", "/scratch/rustup-home"],
-            ),
-            (
-                ".cargo",
-                ["/home/kyle/.cargo", "/scratch/cargo-registry"],
-            ),
+            (".rustup", ["/home/kyle/.rustup", "/scratch/rustup-home"]),
+            (".cargo", ["/home/kyle/.cargo", "/scratch/cargo-registry"]),
         ] {
             let dst = target_config.join(rel);
             if !dst.exists() {
@@ -833,9 +827,9 @@ pub(crate) fn set_provider_profile(
     provider_profile: &str,
     key: &str,
 ) -> Result<(String, String), Error> {
-    let (provider, profile) = provider_profile
-        .split_once('/')
-        .ok_or_else(|| Error::Message("expected <provider>/<profile> (e.g. kimi-code-plan/rhea)".into()))?;
+    let (provider, profile) = provider_profile.split_once('/').ok_or_else(|| {
+        Error::Message("expected <provider>/<profile> (e.g. kimi-code-plan/rhea)".into())
+    })?;
     let valid = |s: &str| {
         !s.is_empty()
             && s != "."
@@ -848,12 +842,17 @@ pub(crate) fn set_provider_profile(
     }
     let trimmed = key.trim();
     if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
-        return Err(Error::Message("a nonempty single-line key is required".into()));
+        return Err(Error::Message(
+            "a nonempty single-line key is required".into(),
+        ));
     }
     let dir = data.join("profiles").join(provider).join(profile);
     ensure_provider_profile_meta(&dir, provider, None);
     let default_dir = data.join("profiles").join(provider).join("default");
-    if default_dir != dir && default_dir.join("opencode.json").is_file() && !dir.join("opencode.json").exists() {
+    if default_dir != dir
+        && default_dir.join("opencode.json").is_file()
+        && !dir.join("opencode.json").exists()
+    {
         let _ = std::fs::copy(default_dir.join("opencode.json"), dir.join("opencode.json"));
     }
     let key_filename = match provider {
@@ -1021,10 +1020,7 @@ pub(crate) fn sync_and_list_provider_profiles(
         let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
         let prof_name = bound_profile_name(&cfg)
             .and_then(|b| {
-                let p = b
-                    .split_once('/')
-                    .map(|(_, p)| p.to_string())
-                    .unwrap_or(b);
+                let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
                 (!p.is_empty()).then_some(p)
             })
             .unwrap_or_else(|| "default".to_string());
@@ -1535,8 +1531,7 @@ pub(crate) fn save_subagent_defaults(
     cfg: &SubagentDefaultsConfig,
 ) -> Result<(), Error> {
     let path = data.join("subagent-defaults.json");
-    let text =
-        serde_json::to_string_pretty(cfg).map_err(|err| Error::Message(err.to_string()))?;
+    let text = serde_json::to_string_pretty(cfg).map_err(|err| Error::Message(err.to_string()))?;
     std::fs::write(path, format!("{text}\n"))?;
     Ok(())
 }
@@ -1637,7 +1632,10 @@ pub(crate) fn resolve_subagent_defaults(
     let target_provider = upstream_provider_of(&resolved_harness, resolved_model.as_deref());
     let inherit_profile_if_compatible = || {
         parent_bound_profile.as_ref().and_then(|prof| {
-            let prov = prof.split_once('/').map(|(p, _)| p).unwrap_or(prof.as_str());
+            let prov = prof
+                .split_once('/')
+                .map(|(p, _)| p)
+                .unwrap_or(prof.as_str());
             (prov == target_provider).then(|| prof.clone())
         })
     };
@@ -1659,7 +1657,10 @@ pub(crate) fn resolve_subagent_defaults(
                 if p.eq_ignore_ascii_case("inherit") {
                     inherit_profile_if_compatible()
                 } else {
-                    let prov = p.split_once('/').map(|(pr, _)| pr).unwrap_or(&target_provider);
+                    let prov = p
+                        .split_once('/')
+                        .map(|(pr, _)| pr)
+                        .unwrap_or(&target_provider);
                     (prov == target_provider).then(|| p.to_string())
                 }
             })

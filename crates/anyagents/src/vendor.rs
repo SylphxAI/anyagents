@@ -394,7 +394,10 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         if Path::new("/home/kyle/.rustup").is_dir() {
             env.push(("RUSTUP_HOME".to_string(), "/home/kyle/.rustup".to_string()));
         } else if Path::new("/scratch/rustup-home").is_dir() {
-            env.push(("RUSTUP_HOME".to_string(), "/scratch/rustup-home".to_string()));
+            env.push((
+                "RUSTUP_HOME".to_string(),
+                "/scratch/rustup-home".to_string(),
+            ));
         }
         if Path::new("/home/kyle/.cargo").is_dir() {
             env.push(("CARGO_HOME".to_string(), "/home/kyle/.cargo".to_string()));
@@ -671,9 +674,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     effort = v.to_string();
                 }
             }
-            if let Some((_, env_effort)) = env
-                .iter()
-                .find(|(k, _)| k == "CLAUDE_CODE_EFFORT_LEVEL")
+            if let Some((_, env_effort)) = env.iter().find(|(k, _)| k == "CLAUDE_CODE_EFFORT_LEVEL")
                 && !env_effort.trim().is_empty()
             {
                 effort = env_effort.trim().to_string();

@@ -716,7 +716,12 @@ struct TgChat {
 
 impl TgChat {
     fn display_title(&self) -> Option<String> {
-        if let Some(t) = self.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(t) = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             return Some(t.to_string());
         }
         let full = match (

@@ -199,8 +199,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-        && !crate::sandbox::is_isolated_test_env()
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         let reaper_root = data.to_path_buf();
         tokio::spawn(async move {
@@ -1337,7 +1336,12 @@ async fn archive_agent_route(
                     "a root agent cannot archive itself; pass a target agent name or id in `agent`",
                 ));
             }
-            require_admin_or_operator(&state.store, &principal, "agents.archive_root", &found.name)?;
+            require_admin_or_operator(
+                &state.store,
+                &principal,
+                "agents.archive_root",
+                &found.name,
+            )?;
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -1777,14 +1781,15 @@ async fn conversation_route(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
-        let clean_q = query.query.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let clean_q = query
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let is_all = name.eq_ignore_ascii_case("all") || name == "*";
         let (agent_name, agent_id_str, raw_turns) = if let Some(q) = clean_q {
-            let qvec = crate::channel::embed_query_for_store(
-                &state.store,
-                state.store.data_dir(),
-                q,
-            );
+            let qvec =
+                crate::channel::embed_query_for_store(&state.store, state.store.data_dir(), q);
             let turns = state
                 .store
                 .search_conversation(

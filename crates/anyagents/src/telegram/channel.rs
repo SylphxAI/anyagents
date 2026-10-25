@@ -373,9 +373,7 @@ fn ingest_updates(
                 .chats
                 .iter()
                 .any(|link| link.agent == agent_id.as_str() && link.chat_id == inbound.chat_id);
-            let old_title = memory
-                .title_of(inbound.chat_id)
-                .map(str::to_string);
+            let old_title = memory.title_of(inbound.chat_id).map(str::to_string);
             memory.attach_typed_titled(
                 agent_id.as_str(),
                 inbound.chat_id,

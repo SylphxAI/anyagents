@@ -266,11 +266,7 @@ impl Table {
             return;
         }
         let cols = self.headers.len();
-        let mut widths: Vec<usize> = self
-            .headers
-            .iter()
-            .map(|(h, _)| visible_width(h))
-            .collect();
+        let mut widths: Vec<usize> = self.headers.iter().map(|(h, _)| visible_width(h)).collect();
         for row in &self.rows {
             for (i, cell) in row.iter().enumerate().take(cols) {
                 let w = visible_width(cell);
@@ -366,9 +362,7 @@ pub fn print_agents_table(
                     .is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7)
         })
         .count();
-    let idle = running
-        .saturating_sub(working)
-        .saturating_sub(quota_count);
+    let idle = running.saturating_sub(working).saturating_sub(quota_count);
     let paused = agents.iter().filter(|a| a.state == "paused").count();
     let archived = agents.iter().filter(|a| a.state == "archived").count();
 
@@ -460,7 +454,11 @@ pub fn print_agents_table(
         if let Some(kids) = children_by_parent.get(root.id.as_str()) {
             let count = kids.len();
             for (idx, kid) in kids.iter().enumerate() {
-                let branch = if idx + 1 == count { "└─ " } else { "├─ " };
+                let branch = if idx + 1 == count {
+                    "└─ "
+                } else {
+                    "├─ "
+                };
                 let kid_name = if kid.state == "archived" {
                     dim(&kid.name)
                 } else {
@@ -471,9 +469,11 @@ pub fn print_agents_table(
         }
     }
 
-    let has_descriptions = ordered
-        .iter()
-        .any(|(_, a)| a.description.as_deref().is_some_and(|d| !d.trim().is_empty()));
+    let has_descriptions = ordered.iter().any(|(_, a)| {
+        a.description
+            .as_deref()
+            .is_some_and(|d| !d.trim().is_empty())
+    });
 
     let mut headers = vec![
         ("AGENT", false),
@@ -586,7 +586,11 @@ pub fn print_inbox_pretty(agent_name: &str, messages: &[MessageView]) {
 }
 
 /// Pretty-print two-way conversation turns (`conversation` and `search`).
-pub fn print_conversation_pretty(target: &str, query: Option<&str>, turns: &[ConversationTurnView]) {
+pub fn print_conversation_pretty(
+    target: &str,
+    query: Option<&str>,
+    turns: &[ConversationTurnView],
+) {
     if turns.is_empty() {
         println!("  {}", dim("No conversation turns matched."));
         return;

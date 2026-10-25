@@ -646,7 +646,8 @@ impl StreamHarness {
                 let first_idle = state.idle_since.is_none();
                 let idle_since = *state.idle_since.get_or_insert(now);
                 if now.duration_since(idle_since) < AGY_TURN_CLOSE_GRACE {
-                    let remain = AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
+                    let remain =
+                        AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
                     drop(state);
                     if first_idle {
                         let shared = Arc::clone(&self.shared);

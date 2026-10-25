@@ -160,7 +160,10 @@ impl Context {
             xml_attr_escape(self.sender.as_deref().unwrap_or("unknown"))
         );
         if let Some(sender_name) = &self.sender_name {
-            out.push_str(&format!(" sender_name=\"{}\"", xml_attr_escape(sender_name)));
+            out.push_str(&format!(
+                " sender_name=\"{}\"",
+                xml_attr_escape(sender_name)
+            ));
         }
         if let Some(recipient) = &self.recipient {
             out.push_str(&format!(" to=\"{}\"", xml_attr_escape(recipient)));
@@ -198,7 +201,10 @@ impl Context {
                 xml_attr_escape(&self.mentions.join(", "))
             ));
         }
-        out.push_str(&format!(" reply_to=\"{}\"", xml_attr_escape(&reply_ref(id))));
+        out.push_str(&format!(
+            " reply_to=\"{}\"",
+            xml_attr_escape(&reply_ref(id))
+        ));
         if let Some(destination) = &self.destination {
             out.push_str(&format!(" answer_to=\"{}\"", xml_attr_escape(destination)));
         }

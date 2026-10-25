@@ -592,12 +592,8 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 list_harnesses(&data);
                 Ok(())
             }
-            HarnessesCommand::Profiles { harness } => {
-                list_profiles_cmd(&data, harness.as_deref())
-            }
-            HarnessesCommand::Update { harness } => {
-                update_harnesses_cmd(&data, harness.as_deref())
-            }
+            HarnessesCommand::Profiles { harness } => list_profiles_cmd(&data, harness.as_deref()),
+            HarnessesCommand::Update { harness } => update_harnesses_cmd(&data, harness.as_deref()),
         },
         Command::Profiles {
             action,
@@ -647,8 +643,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                     clear,
                 )
             } else {
-                let cleaned_parent =
-                    parent.filter(|p| !p.trim().eq_ignore_ascii_case("list"));
+                let cleaned_parent = parent.filter(|p| !p.trim().eq_ignore_ascii_case("list"));
                 let parent_filter = cleaned_parent.or_else(|| {
                     if std::env::var("ANYAGENTS_AGENT_ID").is_ok()
                         || std::env::var("ANYAGENTS_AGENT_NAME").is_ok()
@@ -896,20 +891,8 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             wait_ms,
             headless,
         } => browser_cmd(
-            &data,
-            action,
-            target,
-            value,
-            profile,
-            url,
-            selector,
-            text,
-            script,
-            path,
-            submit,
-            full_page,
-            wait_ms,
-            headless,
+            &data, action, target, value, profile, url, selector, text, script, path, submit,
+            full_page, wait_ms, headless,
         ),
     }
 }
@@ -1075,10 +1058,7 @@ fn list_harnesses(data: &Path) {
     }
 }
 
-fn update_harnesses_cmd(
-    data: &Path,
-    target: Option<&str>,
-) -> Result<(), anyagents_core::Error> {
+fn update_harnesses_cmd(data: &Path, target: Option<&str>) -> Result<(), anyagents_core::Error> {
     let catalog = anyagents_installer::builtin_catalog();
     let targets: Vec<String> = match target.map(str::trim).filter(|s| !s.is_empty()) {
         Some(t) => {
@@ -1287,10 +1267,7 @@ fn profiles_cmd(
                 }
             }
             let (prov, prof) = create::set_provider_profile(data, profile, &key)?;
-            println!(
-                "{}",
-                serde_json::json!({"provider": prov, "profile": prof})
-            );
+            println!("{}", serde_json::json!({"provider": prov, "profile": prof}));
             Ok(())
         }
         Some("list") => list_profiles_cmd(data, target),
@@ -1338,14 +1315,8 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let prof_dir = data.join("profiles").join(prov).join(prof_name);
         let has_stored_creds = std::fs::read_dir(&prof_dir)
             .ok()
-            .is_some_and(|entries| {
-                entries
-                    .flatten()
-                    .any(|e| e.file_name() != "profile.json")
-            });
-        if has_stored_creds
-            && let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
-        {
+            .is_some_and(|entries| entries.flatten().any(|e| e.file_name() != "profile.json"));
+        if has_stored_creds && let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
             create::seed_harness_credentials(&store, data, &rec, &cfg);
             if let Some((_, _, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
                 crate::sandbox::share_config_with_seat(&cfg, gid);
@@ -1477,7 +1448,9 @@ fn subagents_default_cmd(
                 if is_inh {
                     ui::dim("inherit")
                 } else {
-                    s.profile.clone().unwrap_or_else(|| "auto / inherit".to_string())
+                    s.profile
+                        .clone()
+                        .unwrap_or_else(|| "auto / inherit".to_string())
                 },
             ]
         };
@@ -1520,9 +1493,18 @@ fn apply_local_subagent_default(
     }
     let spec = create::SubagentDefaultSpec {
         mode: mode.to_string(),
-        harness: harness.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
-        model: model.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
-        profile: profile.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        harness: harness
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        model: model
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        profile: profile
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     };
     if let Some(ag) = agent.map(str::trim).filter(|s| !s.is_empty()) {
         cfg.agents.insert(ag.to_string(), spec);
@@ -1569,8 +1551,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         for e in entries {
             if let Some(f) = filter {
                 let f_trimmed = f.trim();
-                if e.provider != f_trimmed
-                    && !e.compatible_harnesses.iter().any(|h| h == f_trimmed)
+                if e.provider != f_trimmed && !e.compatible_harnesses.iter().any(|h| h == f_trimmed)
                 {
                     continue;
                 }
@@ -1959,11 +1940,8 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
                     ui::bold_cyan("Groups"),
                     ui::bold(&list.len().to_string())
                 );
-                let mut table = ui::Table::new(&[
-                    ("GROUP", false),
-                    ("COUNT", true),
-                    ("MEMBERS", false),
-                ]);
+                let mut table =
+                    ui::Table::new(&[("GROUP", false), ("COUNT", true), ("MEMBERS", false)]);
                 for (group, members) in list {
                     table.add_row(vec![
                         ui::bold(&ui::cyan(&group)),

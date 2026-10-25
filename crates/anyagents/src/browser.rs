@@ -315,10 +315,11 @@ pub fn ensure_fingerprint(data: &Path, profile: &str) -> Result<BrowserFingerpri
 }
 
 fn stealth_init_script(fp: &BrowserFingerprint) -> String {
-    let vendor = serde_json::to_string(&fp.webgl_vendor).unwrap_or_else(|_| "\"Google Inc.\"".into());
-    let renderer =
-        serde_json::to_string(&fp.webgl_renderer).unwrap_or_else(|_| "\"ANGLE\"".into());
-    let langs = serde_json::to_string(&fp.languages).unwrap_or_else(|_| "[\"en-US\",\"en\"]".into());
+    let vendor =
+        serde_json::to_string(&fp.webgl_vendor).unwrap_or_else(|_| "\"Google Inc.\"".into());
+    let renderer = serde_json::to_string(&fp.webgl_renderer).unwrap_or_else(|_| "\"ANGLE\"".into());
+    let langs =
+        serde_json::to_string(&fp.languages).unwrap_or_else(|_| "[\"en-US\",\"en\"]".into());
     let noise_seed = (fp.seed % 9973) as u32 + 1;
     format!(
         r#"(() => {{
@@ -675,9 +676,7 @@ fn cdp_http_get(port: u16, path: &str) -> Result<Vec<u8>, Error> {
     )?;
     stream.set_read_timeout(Some(Duration::from_secs(5)))?;
     stream.set_write_timeout(Some(Duration::from_secs(5)))?;
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(req.as_bytes())?;
     let mut buf = Vec::with_capacity(4096);
     let mut temp = [0u8; 4096];
@@ -801,7 +800,9 @@ impl CdpSession {
         let header_end = loop {
             let n = stream.read(&mut temp)?;
             if n == 0 {
-                return Err(Error::Message("CDP WebSocket closed during handshake".into()));
+                return Err(Error::Message(
+                    "CDP WebSocket closed during handshake".into(),
+                ));
             }
             buf.extend_from_slice(&temp[..n]);
             if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -1149,10 +1150,7 @@ fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> (String, Op
             && let Some(found) = stored.elements.iter().find(|e| e.r#ref == trimmed)
         {
             return (
-                format!(
-                    "[data-anyagents-ref=\"{}\"], {}",
-                    trimmed, found.selector
-                ),
+                format!("[data-anyagents-ref=\"{}\"], {}", trimmed, found.selector),
                 Some((found.x, found.y)),
             );
         }
@@ -1217,11 +1215,7 @@ pub fn execute(
 ) -> Result<serde_json::Value, Error> {
     reap_idle_browsers(data);
     let action = if req.action.trim().is_empty() {
-        if req.url.is_some() {
-            "open"
-        } else {
-            "status"
-        }
+        if req.url.is_some() { "open" } else { "status" }
     } else {
         req.action.trim()
     }
@@ -1401,7 +1395,9 @@ pub fn execute(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
-                    Error::Message("browser click requires `selector` (e.g. `@e1` or CSS selector)".into())
+                    Error::Message(
+                        "browser click requires `selector` (e.g. `@e1` or CSS selector)".into(),
+                    )
                 })?;
             let (css_sel, fallback_xy) = resolve_selector(data, &profile, raw_sel);
             let sel_json = serde_json::to_string(&css_sel).unwrap_or_else(|_| "\"body\"".into());
@@ -1466,7 +1462,9 @@ pub fn execute(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| {
-                    Error::Message("browser fill requires `selector` (e.g. `@e1` or CSS selector)".into())
+                    Error::Message(
+                        "browser fill requires `selector` (e.g. `@e1` or CSS selector)".into(),
+                    )
                 })?;
             let text_val = req.text.as_deref().unwrap_or("");
             let (css_sel, _) = resolve_selector(data, &profile, raw_sel);
@@ -1535,7 +1533,11 @@ pub fn execute(
                 .or(req.text.as_deref())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| Error::Message("browser press requires `key` (e.g. `Enter`, `Tab`, `Escape`)".into()))?;
+                .ok_or_else(|| {
+                    Error::Message(
+                        "browser press requires `key` (e.g. `Enter`, `Tab`, `Escape`)".into(),
+                    )
+                })?;
             let vk = match key_name {
                 "Enter" => 13,
                 "Tab" => 9,
@@ -1629,7 +1631,10 @@ pub fn execute(
                 )?;
             }
             let all = cdp.call("Network.getAllCookies", serde_json::json!({}))?;
-            let list = all.get("cookies").cloned().unwrap_or_else(|| serde_json::json!([]));
+            let list = all
+                .get("cookies")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!([]));
             let count = list.as_array().map(|a| a.len()).unwrap_or(0);
             Ok(serde_json::json!({
                 "profile": profile,

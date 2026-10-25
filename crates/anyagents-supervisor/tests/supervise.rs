@@ -760,7 +760,10 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
     let due = 1_700_000_000_000;
     let mut stepped = 0;
     while other.agent(&sub.id).unwrap().state != "archived" {
-        assert!(stepped < 40, "sub-agent did not auto-archive after turn completion");
+        assert!(
+            stepped < 40,
+            "sub-agent did not auto-archive after turn completion"
+        );
         stepped += 1;
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));

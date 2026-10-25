@@ -711,7 +711,9 @@ impl AgentMcp {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`subagents inspect` requires `agent` (name or agt_... id)".to_string())?;
+                    .ok_or_else(|| {
+                        "`subagents inspect` requires `agent` (name or agt_... id)".to_string()
+                    })?;
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
                 let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
                 let view = resp
@@ -721,15 +723,15 @@ impl AgentMcp {
                     .ok_or_else(|| format!("sub-agent `{clean}` not found"))?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
-                let conv: ConversationResponse = self
-                    .client
-                    .get(&conv_path, None)
-                    .await
-                    .unwrap_or(ConversationResponse {
-                        agent_id: view.id.clone(),
-                        agent: view.name.clone(),
-                        turns: Vec::new(),
-                    });
+                let conv: ConversationResponse =
+                    self.client
+                        .get(&conv_path, None)
+                        .await
+                        .unwrap_or(ConversationResponse {
+                            agent_id: view.id.clone(),
+                            agent: view.name.clone(),
+                            turns: Vec::new(),
+                        });
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "subagent": view,
                     "recent_turns": conv.turns,

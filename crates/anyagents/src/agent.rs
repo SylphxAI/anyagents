@@ -140,7 +140,10 @@ pub fn describe_cmd(
             )
             .map_err(Error::Message)?;
             if let Some(val) = answered {
-                let n = val.get("name").and_then(|v| v.as_str()).unwrap_or(&target_name);
+                let n = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&target_name);
                 let d = val
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -158,7 +161,10 @@ pub fn describe_cmd(
             )
             .map_err(Error::Message)?;
             if let Some(val) = answered {
-                let n = val.get("name").and_then(|v| v.as_str()).unwrap_or(&target_name);
+                let n = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&target_name);
                 let d = val
                     .get("description")
                     .and_then(|v| v.as_str())
@@ -1000,9 +1006,7 @@ pub fn usage(data: &Path, agent: Option<&str>, by: Option<&str>) -> Result<(), U
                 .unwrap_or_else(|| total.agent_id.as_str());
             let day = total.day.as_deref().unwrap_or("all-time");
             let cost = match total.reported_cost_micros {
-                Some(micros) => {
-                    crate::ui::green(&format!("${:.4}", micros as f64 / 1_000_000.0))
-                }
+                Some(micros) => crate::ui::green(&format!("${:.4}", micros as f64 / 1_000_000.0)),
                 None => crate::ui::dim("-"),
             };
             table.add_row(vec![

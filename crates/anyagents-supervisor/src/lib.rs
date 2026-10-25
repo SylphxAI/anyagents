@@ -16,7 +16,9 @@ use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
 };
-use anyagents_harness::{DeliverOutcome, DeliveryMode, Harness, SteerSupport, TurnState, TurnUsage};
+use anyagents_harness::{
+    DeliverOutcome, DeliveryMode, Harness, SteerSupport, TurnState, TurnUsage,
+};
 
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
