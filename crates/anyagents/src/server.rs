@@ -2398,6 +2398,34 @@ pub(crate) mod tests {
         assert!(store.inbox(&alice.id, None).unwrap().is_empty());
         assert!(store.inbox(&outsider.id, None).unwrap().is_empty());
         assert_eq!(store.inbox(&bob.id, None).unwrap().len(), 4);
+        // Resolve membership at delivery time, not when the send is parsed.
+        let body: SendRequest = serde_json::from_value(serde_json::json!({
+            "sender": "agent:alice", "to": ["group:crew"], "text": "after membership change"
+        }))
+        .unwrap();
+        let plan = SendPlan::parse(&store, &Actor::Agent("alice".into()), &body)
+            .unwrap_or_else(|err| panic!("{}", err.message));
+        let Target::Room(room) = &plan.targets[0] else {
+            panic!("expected a named group")
+        };
+        store.leave_group("crew", &bob.id).unwrap();
+        store.join_group("crew", &outsider.id).unwrap();
+        assert_eq!(
+            room_recipients(&store, &body, room)
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["outsider"]
+        );
+        let delivered =
+            deliver_room(&store, &body, room, None).unwrap_or_else(|err| panic!("{}", err.message));
+        assert_eq!(
+            delivered.iter().map(|d| d.to.as_str()).collect::<Vec<_>>(),
+            vec!["agent:outsider"]
+        );
+        assert_eq!(store.inbox(&bob.id, None).unwrap().len(), 4);
+        assert_eq!(store.inbox(&outsider.id, None).unwrap().len(), 1);
+        assert!(store.inbox(&alice.id, None).unwrap().is_empty());
         assert_eq!(store.room_members("all").unwrap().unwrap().len(), 3);
         assert!(
             store
