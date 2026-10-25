@@ -285,7 +285,7 @@ struct SpawnArgs {
     /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
     #[serde(default)]
     harness: Option<String>,
-    /// Optional model override (e.g. `sylphx/openai/gpt-6.1-sol#medium`, `claude-opus-5-5#high`).
+    /// Optional model override (e.g. `sylphx/openai/gpt-6.1-sol#xhigh`, `claude-opus-5-5#high`).
     #[serde(default)]
     model: Option<String>,
     /// Optional upstream provider account profile (e.g. `acct-a`, `openai/default`, `sylphx/default`).

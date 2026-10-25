@@ -108,7 +108,7 @@ enum Command {
         /// Set sub-agent default harness (`subagents default --harness opencode`).
         #[arg(long)]
         harness: Option<String>,
-        /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#medium`).
+        /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#xhigh`).
         #[arg(long)]
         model: Option<String>,
         /// Set sub-agent default profile (`subagents default --profile sylphx/default`).
