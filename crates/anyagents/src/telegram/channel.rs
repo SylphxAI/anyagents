@@ -318,7 +318,6 @@ fn poll_channel(
         }
         if updated_titles {
             let _ = store.set_channel_state(&channel.id, &memory.to_state());
-            crate::create::sync_all_agent_instructions(store, store.data_dir());
         }
     }
     let poll = Poll::resume(memory.offset);

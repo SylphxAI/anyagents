@@ -374,10 +374,9 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
     if let Some(ref data_sk) = data_skills
         && !data_sk.exists()
         && skills_root != *data_sk
+        && std::os::unix::fs::symlink(&skills_root, data_sk).is_ok()
     {
-        if std::os::unix::fs::symlink(&skills_root, data_sk).is_ok() {
-            skills_root = data_sk.clone();
-        }
+        skills_root = data_sk.clone();
     }
     for rel in [
         "skills",

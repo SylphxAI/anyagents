@@ -39,10 +39,10 @@ pub fn write(
     if !root.is_object() {
         root = serde_json::json!({});
     }
-    if root.get("provider").is_none() {
-        if let Some(donor) = donor_provider_block() {
-            root["provider"] = donor;
-        }
+    if root.get("provider").is_none()
+        && let Some(donor) = donor_provider_block()
+    {
+        root["provider"] = donor;
     }
     let has_sylphx_provider = root.get("provider").and_then(|p| p.get("sylphx")).is_some();
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {

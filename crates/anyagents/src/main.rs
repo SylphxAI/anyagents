@@ -973,10 +973,10 @@ fn browser_cmd(
                 req.url = value;
             }
         }
-        "close" | "stop" | "status" | "info" | "fingerprint" => {
-            if req.profile.is_none() && target.is_some() {
-                req.profile = target;
-            }
+        "close" | "stop" | "status" | "info" | "fingerprint"
+            if req.profile.is_none() && target.is_some() =>
+        {
+            req.profile = target;
         }
         _ => {}
     }

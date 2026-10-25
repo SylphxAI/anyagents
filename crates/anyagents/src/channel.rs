@@ -721,7 +721,7 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
                 crate::ui::cyan(&channel.kind),
                 agents_cell,
                 crate::ui::dim(channel.credential_ref.as_deref().unwrap_or("-")),
-                crate::ui::dim(&channel.id.to_string()),
+                crate::ui::dim(channel.id.as_ref()),
             ]);
         }
         table.print();

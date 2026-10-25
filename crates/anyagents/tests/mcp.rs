@@ -77,11 +77,6 @@ struct Delivery {
 }
 
 #[derive(Deserialize)]
-struct InboxResponse {
-    messages: Vec<MessageView>,
-}
-
-#[derive(Deserialize)]
 struct ConversationResponse {
     turns: Vec<ConversationTurnView>,
 }
@@ -91,14 +86,6 @@ struct ConversationTurnView {
     direction: String,
     from: String,
     text: String,
-}
-
-#[derive(Deserialize)]
-struct MessageView {
-    seq: i64,
-    text: String,
-    sender: Option<String>,
-    ack: String,
 }
 
 struct Serve {

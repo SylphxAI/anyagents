@@ -520,9 +520,10 @@ fn ensure_browser_running(
         (c, "x11-display".to_string(), false)
     } else if !want_headless && has_xvfb {
         let mut c = Command::new("/usr/bin/xvfb-run");
+        let xvfb_server_args = "-screen 0 1920x1080x24 -ac +extension GLX +render -noreset";
         c.arg("-a")
             .arg("-s")
-            .arg("-screen 0 1920x1080x24 -ac +extension GLX +render -noreset")
+            .arg(xvfb_server_args)
             .arg(&bin)
             .args(&chrome_args);
         (c, "xvfb-headed".to_string(), false)
@@ -933,7 +934,7 @@ impl CdpSession {
                     continue;
                 }
                 0xA => continue,
-                0x1 | 0x2 | 0x0 => {
+                0x0..=0x2 => {
                     message.extend_from_slice(&payload);
                     if fin {
                         return Ok(String::from_utf8_lossy(&message).into_owned());

@@ -590,17 +590,16 @@ impl Harness for OpenCodeHarness {
             }
             (session, state.written.len())
         };
-        if !fake_mode {
-            if let Ok(active) = self.api("GET", "/api/session/active", None)
-                && active
-                    .pointer(&format!("/data/{session}/type"))
-                    .and_then(Value::as_str)
-                    == Some("running")
-            {
-                let mut state = self.lock();
-                state.last_usage_poll = Some(Instant::now());
-                return state.cached_usage.clone();
-            }
+        if !fake_mode
+            && let Ok(active) = self.api("GET", "/api/session/active", None)
+            && active
+                .pointer(&format!("/data/{session}/type"))
+                .and_then(Value::as_str)
+                == Some("running")
+        {
+            let mut state = self.lock();
+            state.last_usage_poll = Some(Instant::now());
+            return state.cached_usage.clone();
         }
         let Ok(info) = self.api("GET", &format!("/api/session/{session}"), None) else {
             return self.lock().cached_usage.clone();
