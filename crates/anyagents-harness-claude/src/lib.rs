@@ -4,12 +4,21 @@
 //! id is the first line of the user text (`anyagents-message:<id>`). An id already
 //! written, or echoed back on stdout, is not written again.
 //!
-//! Idle messages use stream-json stdin. During a turn stdin queues a followup;
-//! it does not prove that the active model saw the message. Instead, initialize
-//! registers a PreToolUse hook and pending mailbox lines enter the current
-//! transcript through its additionalContext response before the tool proceeds.
-//! Until that response is written the delivery cursor stays put. A result with
-//! no intervening tool leaves the line for the next idle delivery.
+//! Declared delivery mode is steer. A stream-json child reads a `user` message
+//! at any point, mid-turn included, so every mailbox line is written the moment
+//! it arrives and the running conversation takes it. `turn_finished` becomes
+//! true when a `result` event closes the open turn. Token counts and
+//! `total_cost_usd` from that event are kept on the finished ids.
+//!
+//! Mid-turn delivery: with `--replay-user-messages` the child echoes back every
+//! line written to its stdin as a `user` event, which is the harness's own
+//! acknowledgement that the line entered the running conversation. A line
+//! written during a turn reaches the agent before its next model step; the
+//! echo is what marks it taken, and an id already echoed is never written twice.
+//!
+//! A [`SteerQueue`] ([`ClaudeHarness::with_steer`]) holds lines a channel pushed
+//! between model steps even when the mailbox has not stored them yet; they are
+//! written by [`Harness::inject`] with the same acknowledgement.
 //!
 //! Resume starts the child again with `--resume` when the session id changed or the
 //! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
@@ -44,24 +53,23 @@ pub struct ClaudeHarness {
 #[derive(Default)]
 struct State {
     child: Option<Child>,
-    initialized: bool,
-    pending: Vec<OutboundMessage>,
     alive: bool,
     epoch: u64,
     seen: HashSet<String>,
     written: Vec<String>,
     open: Vec<String>,
+    followups: Vec<String>,
     finished: HashSet<String>,
     turns_started: usize,
     quota_reset_at_ms: Option<i64>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
-    turn_usages: Vec<TurnUsage>,
     failures: Vec<(String, String)>,
+    turns: std::collections::BTreeMap<String, u64>,
     request_seq: u64,
     /// Ids an echoed `user` event proved the child took.
     echoed: HashSet<String>,
-    /// Whether an id entered through idle stdin or a current-turn hook.
+    /// For each written id, whether no turn was open when it was written.
     phases: std::collections::HashMap<String, &'static str>,
 }
 
@@ -136,7 +144,8 @@ impl ClaudeHarness {
         })
     }
 
-    /// The stdin message used when the child is idle.
+    /// The `user` message a mailbox line becomes: one per line, whether the
+    /// child is idle or busy. A stream-json child reads it either way.
     pub fn create_input(message: &OutboundMessage) -> Value {
         Self::steer_input_line(message)
     }
@@ -162,7 +171,7 @@ impl ClaudeHarness {
         lock(&self.shared).written.clone()
     }
 
-    /// Turns opened through idle stdin so far.
+    /// Turns opened so far, including a followup promoted by a result.
     pub fn turns_started(&self) -> usize {
         lock(&self.shared).turns_started
     }
@@ -288,11 +297,10 @@ impl ClaudeHarness {
         };
         {
             let mut state = lock(&self.shared);
-            state.initialized = false;
-            state.pending.clear();
             state.child = Some(child);
             state.alive = true;
             state.open.clear();
+            state.followups.clear();
             if let Some(session_id) = session_id {
                 state.session_id = Some(session_id.to_string());
             }
@@ -300,40 +308,15 @@ impl ClaudeHarness {
         *lock(&self.stdin) = Some(child_stdin);
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
-        let stdin = Arc::clone(&self.stdin);
         match thread::Builder::new()
             .name("anyagents-claude".into())
-            .spawn(move || read_stdout(stdout, shared, wake, stdin))
+            .spawn(move || read_stdout(stdout, shared, wake))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
                 self.stop_child();
                 return Err(HarnessError::Failed(err.to_string()));
             }
-        }
-        write_stdin(
-            &self.stdin,
-            &json!({
-                "type": "control_request", "request_id": "initialize",
-                "request": {"subtype": "initialize", "hooks": {
-                    "PreToolUse": [{"hookCallbackIds": ["mailbox"], "matcher": ""}]
-                }}
-            }),
-        )
-        .map_err(|err| HarnessError::Failed(err.to_string()))?;
-        if !self.wait_pred(Duration::from_secs(10), |state| {
-            state.initialized || !state.alive
-        }) {
-            self.stop_child();
-            return Err(HarnessError::Failed(
-                "Claude hook initialization timed out".into(),
-            ));
-        }
-        if !lock(&self.shared).initialized {
-            self.stop_child();
-            return Err(HarnessError::Failed(
-                "Claude rejected hook initialization".into(),
-            ));
         }
         Ok(())
     }
@@ -357,6 +340,7 @@ impl ClaudeHarness {
         }
         let mut state = lock(&self.shared);
         state.open.clear();
+        state.followups.clear();
         state.alive = false;
     }
 }
@@ -369,37 +353,46 @@ impl Drop for ClaudeHarness {
 
 impl Harness for ClaudeHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        // Serialize state changes with stdout: a fast result must not race the
-        // bookkeeping for the write that opened its turn.
-        let mut state = lock(&self.shared);
-        if !state.alive {
-            return Err(HarnessError::Dead);
-        }
-        let failed = state.failures.iter().any(|(id, _)| id == &message.id);
-        if !failed && state.seen.contains(&message.id) {
-            return Ok(DeliverOutcome::Accepted {
-                turn_finished: state.finished.contains(&message.id),
-            });
-        }
-        if let Some(reset_at_ms) = state.quota_reset_at_ms {
-            return Ok(DeliverOutcome::Quota { reset_at_ms });
-        }
-        if !state.open.is_empty() {
-            if !state.pending.iter().any(|item| item.id == message.id) {
-                state.pending.push(message.clone());
+        let phase = {
+            let state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
             }
-            return Ok(DeliverOutcome::Deferred);
-        }
-        if write_stdin(&self.stdin, &Self::create_input(message)).is_err() {
+            // A message whose last turn failed is not a duplicate: the turn that
+            // succeeds has to carry it. The adapter remembers it failed, so the
+            // host handing it over again always means a new attempt.
+            let failed_before = state.failures.iter().any(|(item, _)| item == &message.id);
+            if !failed_before
+                && (state.seen.contains(&message.id)
+                    || state.open.contains(&message.id)
+                    || state.followups.contains(&message.id))
+            {
+                return Ok(DeliverOutcome::Accepted {
+                    turn_finished: state.finished.contains(&message.id),
+                });
+            }
+            if let Some(reset_at_ms) = state.quota_reset_at_ms {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
+            if state.open.is_empty() {
+                "idle"
+            } else {
+                "turn"
+            }
+        };
+        let line = Self::create_input(message);
+        let write_res = write_stdin(&self.stdin, &line);
+        let mut state = lock(&self.shared);
+        if write_res.is_err() {
             state.alive = false;
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
-        state.pending.retain(|item| item.id != message.id);
-        state.phases.insert(message.id.clone(), "idle");
+        state.phases.insert(message.id.clone(), phase);
         accept_message(&mut state, &message.id);
         Ok(DeliverOutcome::Accepted {
-            turn_finished: false,
+            turn_finished: state.finished.contains(&message.id)
+                && !state.failures.iter().any(|(item, _)| item == &message.id),
         })
     }
 
@@ -465,7 +458,7 @@ impl Harness for ClaudeHarness {
     }
 
     fn turns_served(&self) -> u32 {
-        lock(&self.shared).turn_usages.len() as u32
+        lock(&self.shared).usages.len() as u32
     }
 
     /// The total of every turn this process has finished. A total rather than
@@ -476,7 +469,7 @@ impl Harness for ClaudeHarness {
 
         let mut total = TurnUsage::default();
 
-        for usage in &state.turn_usages {
+        for (_, usage) in &state.usages {
             total.input_tokens += usage.input_tokens;
             total.output_tokens += usage.output_tokens;
             total.cache_read_tokens += usage.cache_read_tokens;
@@ -517,10 +510,37 @@ impl Harness for ClaudeHarness {
     }
 
     fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
-        Ok(matches!(
-            self.deliver(message)?,
-            DeliverOutcome::Accepted { .. }
-        ))
+        {
+            let state = lock(&self.shared);
+            if !state.alive {
+                return Err(HarnessError::Dead);
+            }
+            if state.echoed.contains(&message.id) || state.finished.contains(&message.id) {
+                return Ok(true);
+            }
+            // An id the mailbox already handed over is not written twice. The line
+            // stays held for the step where the host settles it.
+            if state.seen.contains(&message.id) {
+                return Ok(false);
+            }
+        }
+        let line = Self::steer_input_line(message);
+        let write_res = write_stdin(&self.stdin, &line);
+        let mut state = lock(&self.shared);
+        if write_res.is_err() {
+            state.alive = false;
+            self.wake.notify_all();
+            return Err(HarnessError::Dead);
+        }
+        state.seen.insert(message.id.clone());
+        state.written.push(message.id.clone());
+        if state.open.is_empty() {
+            state.turns_started += 1;
+            state.open.push(message.id.clone());
+        } else {
+            state.followups.push(message.id.clone());
+        }
+        Ok(true)
     }
 
     /// The ids the host settled are `keep`; every other held line goes back on
@@ -541,8 +561,13 @@ impl Harness for ClaudeHarness {
 }
 
 fn accept_message(state: &mut State, id: &str) {
-    state.turns_started += 1;
-    state.open.push(id.to_string());
+    *state.turns.entry(id.to_string()).or_insert(0) += 1;
+    if state.open.is_empty() {
+        state.turns_started += 1;
+        state.open.push(id.to_string());
+    } else {
+        state.followups.push(id.to_string());
+    }
     state.seen.insert(id.to_string());
     state.written.push(id.to_string());
 }
@@ -551,19 +576,22 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     if state.open.is_empty() {
         return;
     }
-    state.turn_usages.push(usage.clone());
     for id in state.open.drain(..) {
         state.finished.insert(id.clone());
         state.usages.push((id, usage.clone()));
     }
+    promote_followups(state);
 }
 
-fn read_stdout(
-    stdout: ChildStdout,
-    shared: Arc<Mutex<State>>,
-    wake: Arc<Condvar>,
-    stdin: Arc<Mutex<Option<ChildStdin>>>,
-) {
+/// Messages written while a turn was open start the next turn when it ends.
+fn promote_followups(state: &mut State) {
+    if !state.followups.is_empty() {
+        state.turns_started += 1;
+        state.open.append(&mut state.followups);
+    }
+}
+
+fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
     for line in BufReader::new(stdout).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -574,20 +602,6 @@ fn read_stdout(
         };
         {
             let mut state = lock(&shared);
-            if value
-                .pointer("/response/request_id")
-                .and_then(Value::as_str)
-                == Some("initialize")
-            {
-                state.initialized =
-                    value.pointer("/response/subtype").and_then(Value::as_str) == Some("success");
-                if !state.initialized {
-                    state.alive = false;
-                }
-            }
-            if value.get("type").and_then(Value::as_str) == Some("control_request") {
-                respond_to_hook(&mut state, &value, &stdin);
-            }
             // An id the vendor wrote or echoed starts no second turn. An id that
             // only appears inside an error or a system notice is not proof it
             // wrote the message: the turn that failed must be able to try again.
@@ -609,53 +623,6 @@ fn read_stdout(
         state.epoch = state.epoch.wrapping_add(1);
     }
     wake.notify_all();
-}
-
-/// Only our registered callback can consume pending lines. Failed writes leave
-/// them undelivered; repeated callbacks get an empty context, not duplicates.
-fn respond_to_hook(state: &mut State, value: &Value, stdin: &Mutex<Option<ChildStdin>>) {
-    let Some(request_id) = value.get("request_id").and_then(Value::as_str) else {
-        return;
-    };
-    let ours = value.pointer("/request/subtype").and_then(Value::as_str) == Some("hook_callback")
-        && value
-            .pointer("/request/callback_id")
-            .and_then(Value::as_str)
-            == Some("mailbox")
-        && value
-            .pointer("/request/input/hook_event_name")
-            .and_then(Value::as_str)
-            == Some("PreToolUse");
-    let response = if ours {
-        let context = state
-            .pending
-            .iter()
-            .map(|item| compose_message(&item.id, &item.context, &item.text))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        json!({"subtype": "success", "request_id": request_id, "response": {
-            "hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": context}
-        }})
-    } else {
-        json!({"subtype": "error", "request_id": request_id, "error": "Unsupported control request"})
-    };
-    if write_stdin(
-        stdin,
-        &json!({"type": "control_response", "response": response}),
-    )
-    .is_err()
-    {
-        state.alive = false;
-        return;
-    }
-    if ours {
-        for item in std::mem::take(&mut state.pending) {
-            state.seen.insert(item.id.clone());
-            state.phases.insert(item.id.clone(), "turn");
-            state.written.push(item.id.clone());
-            state.open.push(item.id);
-        }
-    }
 }
 
 fn watch_child(shared: Arc<Mutex<State>>, wake: Arc<Condvar>, notify: Arc<dyn Fn() + Send + Sync>) {
@@ -699,6 +666,7 @@ fn apply_result(state: &mut State, value: &Value) {
             state.finished.insert(id.clone());
             state.failures.push((id, reason.clone()));
         }
+        promote_followups(state);
         return;
     }
     finish_open(state, usage_from_claude(value));
@@ -922,35 +890,4 @@ fn write_stdin(slot: &Mutex<Option<ChildStdin>>, value: &Value) -> std::io::Resu
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|err| err.into_inner())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failed_hook_response_keeps_pending_message_unacknowledged() {
-        let mut state = State {
-            alive: true,
-            ..State::default()
-        };
-        state.pending.push(OutboundMessage {
-            id: "room-update".into(),
-            seq: 2,
-            text: "keep this".into(),
-            sender: None,
-            reply_to: None,
-            source_time_ms: None,
-            context: Default::default(),
-        });
-        let request = json!({"type":"control_request", "request_id":"hook-1", "request":{
-            "subtype":"hook_callback", "callback_id":"mailbox",
-            "input":{"hook_event_name":"PreToolUse"}
-        }});
-        respond_to_hook(&mut state, &request, &Mutex::new(None));
-        assert!(!state.alive);
-        assert_eq!(state.pending.len(), 1);
-        assert!(!state.seen.contains("room-update"));
-        assert!(state.written.is_empty());
-    }
 }
