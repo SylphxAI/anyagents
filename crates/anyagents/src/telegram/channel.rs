@@ -847,10 +847,10 @@ pub(crate) fn outbound_call(
     })
 }
 
-/// Maximum characters per Telegram `sendMessage` chunk before HTML expansion.
-const MAX_TELEGRAM_CHUNK_CHARS: usize = 3800;
+/// Maximum characters per Telegram `sendRichMessage` chunk (Bot API 10.1+ allows up to 32,768 UTF-8 chars).
+const MAX_TELEGRAM_CHUNK_CHARS: usize = 30000;
 
-/// Split a long message into chunks that stay within Telegram's 4096-character limit.
+/// Split a long message into chunks that stay within Telegram's 32,768-character limit.
 fn split_telegram_chunks(text: &str) -> Vec<&str> {
     if text.chars().count() <= MAX_TELEGRAM_CHUNK_CHARS {
         return vec![text];
@@ -1035,7 +1035,7 @@ pub fn post_text(
         )?;
         let message_id = sent_message_id(&response).map_err(|_| {
             api_error(
-                "sendMessage",
+                &outbound.call.method,
                 Some(&outbound.channel_id),
                 "invalid_response",
                 None,
@@ -2029,9 +2029,10 @@ fn api_error(
 ) -> anyagents_core::Error {
     // BotCall is internal today, but do not make that a redaction dependency.
     let method = match method {
-        "sendMessage" | "sendPhoto" | "sendVideo" | "sendAudio" | "sendVoice" | "sendDocument"
-        | "sendAnimation" | "sendLocation" | "sendVenue" | "sendPoll" | "getFile"
-        | "getUpdates" | "getMe" | "getChatMember" | "setWebhook" | "deleteWebhook" => method,
+        "sendMessage" | "sendRichMessage" | "editMessageText" | "sendPhoto" | "sendVideo"
+        | "sendAudio" | "sendVoice" | "sendDocument" | "sendAnimation" | "sendLocation"
+        | "sendVenue" | "sendPoll" | "getFile" | "getUpdates" | "getMe" | "getChatMember"
+        | "setWebhook" | "deleteWebhook" => method,
         _ => "unknown",
     };
     anyagents_core::Error::Message(format!(
@@ -2319,7 +2320,7 @@ fn call_api(
             retry_after,
         ));
     }
-    if call.method == "sendMessage"
+    if (call.method == "sendMessage" || call.method == "sendRichMessage")
         && value
             .pointer("/result/message_id")
             .and_then(serde_json::Value::as_i64)
@@ -2401,10 +2402,11 @@ mod tests {
 
         let sent = outbound_call(&store, "bea", 100, "hello", Some(5), Some(3)).unwrap();
         assert_eq!(sent.credential_ref, "channels/bea");
-        assert_eq!(sent.call.method, "sendMessage");
+        assert_eq!(sent.call.method, "sendRichMessage");
         assert_eq!(sent.call.body["chat_id"], 100);
-        assert_eq!(sent.call.body["text"], "hello");
+        assert_eq!(sent.call.body["rich_message"]["markdown"], "hello");
         assert_eq!(sent.call.body["reply_to_message_id"], 5);
+        assert_eq!(sent.call.body["reply_parameters"]["message_id"], 5);
         assert_eq!(sent.call.body["message_thread_id"], 3);
         assert!(!sent.call.body.to_string().contains("token"));
 
@@ -2430,7 +2432,7 @@ mod tests {
         store.attach_channel(&channel.id, &ada.id).unwrap();
         let sent = outbound_call(&store, "ada", 100, "hello", None, None).unwrap();
         assert_eq!(sent.credential_ref, "channels/ada");
-        assert_eq!(sent.call.method, "sendMessage");
+        assert_eq!(sent.call.method, "sendRichMessage");
         // There is no default bot: another agent does not post through it.
         let bea = store
             .create_agent(anyagents_core::NewAgent::new("bea", "codex"))
