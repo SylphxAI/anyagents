@@ -429,7 +429,7 @@ pub fn add_channel(
             "token is empty or contains whitespace or a slash".into(),
         ));
     }
-    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+    if client::can_call_server(data) || client::agent_identity().is_some() {
         let body = serde_json::json!({"kind": kind, "agent": agent_name, "token": token});
         let result = client::call::<serde_json::Value>(
             data,
@@ -478,7 +478,7 @@ pub(crate) fn record(
 }
 
 pub fn list_channels(data: &Path) -> Result<(), Error> {
-    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+    if client::can_call_server(data) || client::agent_identity().is_some() {
         let result = client::call::<serde_json::Value>(
             data,
             "GET",

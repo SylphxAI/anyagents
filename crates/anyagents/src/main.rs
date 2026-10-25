@@ -722,7 +722,7 @@ fn model_cmd(
             "profile cannot be combined with a key or base URL".into(),
         ));
     }
-    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+    if client::can_call_server(data) || client::agent_identity().is_some() {
         let key = key_file.map(std::fs::read_to_string).transpose()?;
         let body = serde_json::json!({"model": model, "base_url": base_url, "key": key, "profile": profile});
         let result = client::call::<serde_json::Value>(
@@ -812,7 +812,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
 }
 
 fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
-    let entries = if server::socket_path(data).exists() || client::agent_identity().is_some() {
+    let entries = if client::can_call_server(data) || client::agent_identity().is_some() {
         client::call::<Vec<create::ProviderProfileEntry>>(
             data,
             "GET",

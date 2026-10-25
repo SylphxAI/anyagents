@@ -182,7 +182,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
 /// `agents create`. The server owns it when it is there, so one process makes
 /// the agent, mints its capability and starts it.
 fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
-    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+    if client::can_call_server(data) || client::agent_identity().is_some() {
         let answered = client::call::<AgentView>(
             data,
             "POST",
