@@ -16,7 +16,9 @@ use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
 };
-use anyagents_harness::{DeliveryMode, Harness, SteerSupport, TurnUsage};
+use anyagents_harness::{
+    DeliverOutcome, DeliveryMode, Harness, SteerSupport, TurnState, TurnUsage,
+};
 
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
@@ -195,6 +197,7 @@ const IDLE_REVIEW_MS: i64 = 250;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveState {
     pub process_alive: bool,
+    pub turn_state: TurnState,
     pub delivery_mode: DeliveryMode,
     pub steer_support: SteerSupport,
     pub quota_reset_at_ms: Option<i64>,
@@ -480,6 +483,7 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
             id,
             LiveState {
                 process_alive: false,
+                turn_state: TurnState::Idle,
                 delivery_mode: mode,
                 steer_support: steer,
                 quota_reset_at_ms: None,
@@ -598,6 +602,9 @@ fn run_agent<H: Harness + 'static>(
         delivery: None,
         served: None,
         written: 0,
+        turns_recorded: 0,
+        pending_recovery: false,
+        completed_turn_in_session: false,
     };
     session.run()
 }
@@ -649,6 +656,15 @@ struct Session<H: Harness> {
     served: Option<TurnUsage>,
     /// Lines this loop wrote since the last usage row.
     written: u32,
+    /// Turns already recorded from the current harness process.
+    turns_recorded: u32,
+    /// Set when a fresh harness process starts (`boot` or `replace_process`)
+    /// so an open turn interrupted by the previous process's exit is resumed
+    /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
+    pending_recovery: bool,
+    /// Set once at least one turn has completed during this session, enabling
+    /// automatic scale-to-zero (`archived`) for sub-agents when idle.
+    completed_turn_in_session: bool,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -664,6 +680,12 @@ impl<H: Harness + 'static> Session<H> {
                     Boot::Ready(delivery) => {
                         delivery.harness().watch_activity(Arc::clone(&self.notify));
                         self.restart_at = None;
+                        self.pending_recovery = delivery
+                            .store()
+                            .open_turn(&self.id)
+                            .ok()
+                            .flatten()
+                            .is_some();
                         self.delivery = Some(*delivery);
                     }
                     Boot::Busy => {
@@ -751,6 +773,11 @@ impl<H: Harness + 'static> Session<H> {
                 let health = delivery.harness().health();
                 LiveState {
                     process_alive: health.process_alive,
+                    turn_state: if health.process_alive {
+                        health.turn_state
+                    } else {
+                        TurnState::Idle
+                    },
                     delivery_mode: health.delivery_mode,
                     steer_support: health.steer_support,
                     quota_reset_at_ms: health.quota_reset_at_ms,
@@ -770,6 +797,7 @@ impl<H: Harness + 'static> Session<H> {
                 let (mode, steer) = declared(&self.agent.harness);
                 LiveState {
                     process_alive: false,
+                    turn_state: TurnState::Idle,
                     delivery_mode: mode,
                     steer_support: steer,
                     quota_reset_at_ms: None,
@@ -806,14 +834,24 @@ impl<H: Harness + 'static> Session<H> {
             self.restart_at = None;
             return;
         }
+        // Flush any usage the exited process finished serving before swapping it.
+        self.record_usage();
         match self.launch_harness() {
             Ok(mut harness) => {
                 harness.watch_activity(Arc::clone(&self.notify));
                 // A quota wait belonged to the process that is gone.
                 harness.clear_quota();
                 if let Some(delivery) = self.delivery.as_mut() {
+                    self.pending_recovery = delivery
+                        .store()
+                        .open_turn(&self.id)
+                        .ok()
+                        .flatten()
+                        .is_some();
                     delivery.replace_harness(harness);
                 }
+                self.served = None;
+                self.turns_recorded = 0;
                 self.restart_at = None;
             }
             Err(_) => self.restart_at = None,
@@ -854,6 +892,9 @@ impl<H: Harness + 'static> Session<H> {
         match outcome {
             Ok(RunOutcome::Quota { .. }) => false,
             Ok(RunOutcome::Delivered { delivered }) => {
+                // New mailbox messages just woke the session directly; any open
+                // turn from before a process restart is now superseded by them.
+                self.pending_recovery = false;
                 self.written = self
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
@@ -864,6 +905,12 @@ impl<H: Harness + 'static> Session<H> {
                 // The mailbox has drained, so whatever the vendor reported for
                 // this burst is read once and recorded.
                 self.record_usage();
+                if self.pending_recovery && self.recover_once() {
+                    return false;
+                }
+                if self.try_auto_archive_subagent() {
+                    return false;
+                }
                 self.wake_unless_more();
                 false
             }
@@ -898,13 +945,23 @@ impl<H: Harness + 'static> Session<H> {
         };
         let served = delivery.harness().last_usage();
         let before = self.served.clone().unwrap_or_default();
+        let turns_served = delivery.harness().turns_served();
 
         if served == before {
+            if turns_served > self.turns_recorded
+                && delivery.harness().health().turn_state == TurnState::Idle
+            {
+                self.turns_recorded = turns_served;
+                let _ = delivery.store().note_turn_completed(&self.id);
+                self.completed_turn_in_session = true;
+            }
             return;
         }
         // One row for each unit the vendor charged: its turns, or as many as
         // the lines that were written here.
-        let turns = delivery.harness().turns_served().max(self.written.max(1));
+        let turns = turns_served
+            .saturating_sub(self.turns_recorded)
+            .max(self.written.max(1));
         let unit = owned_share(served.difference(before), turns);
         let mut recorded = true;
         for _ in 0..turns {
@@ -916,6 +973,82 @@ impl<H: Harness + 'static> Session<H> {
         if recorded {
             self.served = Some(served);
             self.written = 0;
+            self.turns_recorded = turns_served;
+            if delivery.harness().health().turn_state == TurnState::Idle {
+                let _ = delivery.store().note_turn_completed(&self.id);
+                self.completed_turn_in_session = true;
+            }
+        }
+    }
+
+    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "archived"`)
+    /// once it has finished its turn and its mailbox is drained. Sending any future
+    /// message to the sub-agent automatically wakes and resumes it.
+    fn try_auto_archive_subagent(&mut self) -> bool {
+        if self.agent.parent_id.is_none() || !self.completed_turn_in_session {
+            return false;
+        }
+        let archived = {
+            let Some(delivery) = self.delivery.as_ref() else {
+                return false;
+            };
+            if delivery.harness().health().turn_state != TurnState::Idle {
+                return false;
+            }
+            delivery
+                .store()
+                .complete_idle_subagent(&self.id)
+                .unwrap_or(false)
+        };
+        if !archived {
+            return false;
+        }
+        self.stop.store(true, Ordering::SeqCst);
+        self.delivery = None;
+        self.restart_at = None;
+        reap_ephemeral_dirs(&self.paths.config_dir, &self.paths.managed_work);
+        self.publish();
+        true
+    }
+
+    /// Deliver one synthetic `[Recovery]` wake when a newly started harness
+    /// process has an unfinished turn (`opened_seq > completed_seq`) and an
+    /// empty mailbox. Returns `true` when the caller should re-enter the main
+    /// loop immediately (e.g. after process replacement on failure).
+    fn recover_once(&mut self) -> bool {
+        let outcome = {
+            let Some(delivery) = self.delivery.as_mut() else {
+                self.pending_recovery = false;
+                return false;
+            };
+            let open = match delivery.store().open_turn(&self.id) {
+                Ok(Some(open)) => open,
+                Ok(None) | Err(_) => {
+                    self.pending_recovery = false;
+                    return false;
+                }
+            };
+            delivery.recover_open_turn(&open)
+        };
+        match outcome {
+            Ok(DeliverOutcome::Accepted { .. }) => {
+                self.pending_recovery = false;
+                self.written = self.written.saturating_add(1);
+                false
+            }
+            Ok(DeliverOutcome::Deferred) | Ok(DeliverOutcome::Quota { .. }) => false,
+            Err(anyagents_agent::Error::HarnessDown)
+            | Err(anyagents_agent::Error::HarnessFailed(_)) => {
+                if !self.wait_backoff() {
+                    return true;
+                }
+                self.replace_process();
+                true
+            }
+            Err(_) => {
+                self.pending_recovery = false;
+                false
+            }
         }
     }
 
@@ -923,10 +1056,12 @@ impl<H: Harness + 'static> Session<H> {
     /// then the next pass runs at once, so two lines in flight are both written.
     fn wake_unless_more(&mut self) {
         let more = self.delivery.as_ref().is_some_and(|delivery| {
-            match delivery.store().next_undelivered(&self.id) {
-                Ok(next) => next.is_some() && delivery.harness().input_ready(),
-                Err(_) => false,
-            }
+            let has_work = self.pending_recovery
+                || delivery
+                    .store()
+                    .next_undelivered(&self.id)
+                    .is_ok_and(|next| next.is_some());
+            has_work && delivery.harness().input_ready()
         });
         if more {
             return;
@@ -938,6 +1073,116 @@ impl<H: Harness + 'static> Session<H> {
             Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
             &self.woken,
         );
+    }
+}
+
+fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
+    let seat_ids = detect_seat_ids(config_dir);
+    for rel in [
+        "cache-home",
+        "state-home",
+        "tmp",
+        ".rustup",
+        ".cargo",
+        "data-home/opencode",
+        "opencode-session-id",
+        "claude-session-id",
+        ".claude/projects",
+        ".codex/sessions",
+    ] {
+        let target = config_dir.join(rel);
+        remove_path_with_seat(&target, seat_ids);
+    }
+    remove_path_with_seat(managed_work, seat_ids);
+}
+
+#[cfg(unix)]
+fn detect_seat_ids(config_dir: &std::path::Path) -> Option<(u32, u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (me, my_gid) = fs::metadata("/proc/self")
+        .map(|m| (m.uid(), m.gid()))
+        .unwrap_or((0, 0));
+    let cfg_meta = fs::metadata(config_dir).ok()?;
+    let gid = cfg_meta.gid();
+    let sock_gid = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| fs::metadata(p).ok())
+        .map(|m| m.gid())
+        .unwrap_or(gid);
+    if cfg_meta.uid() != me && cfg_meta.uid() != 0 {
+        return Some((cfg_meta.uid(), gid, sock_gid));
+    }
+    if let Ok(entries) = fs::read_dir(config_dir) {
+        for entry in entries.flatten() {
+            if let Ok(m) = entry.metadata() {
+                if m.uid() != me && m.uid() != 0 {
+                    return Some((m.uid(), gid, sock_gid));
+                }
+                if m.is_dir()
+                    && let Ok(sub) = fs::read_dir(entry.path())
+                {
+                    for child in sub.flatten() {
+                        if let Ok(cm) = child.metadata()
+                            && cm.uid() != me
+                            && cm.uid() != 0
+                        {
+                            return Some((cm.uid(), gid, sock_gid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if gid != my_gid && gid != 0 {
+        return Some((gid, gid, sock_gid));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn detect_seat_ids(_config_dir: &std::path::Path) -> Option<(u32, u32, u32)> {
+    None
+}
+
+fn remove_path_with_seat(target: &std::path::Path, seat_ids: Option<(u32, u32, u32)>) {
+    let Ok(meta) = fs::symlink_metadata(target) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || meta.is_file() {
+        if fs::remove_file(target).is_ok() {
+            return;
+        }
+    } else if meta.is_dir() && fs::remove_dir_all(target).is_ok() {
+        return;
+    }
+    if let Some((uid, gid, sock_gid)) = seat_ids
+        && std::path::Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+    {
+        let uid_s = uid.to_string();
+        let gid_s = gid.to_string();
+        let groups_s = if sock_gid != gid && sock_gid != 0 {
+            format!("{gid},{sock_gid}")
+        } else {
+            gid_s.clone()
+        };
+        let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+            .args([
+                "--reuid",
+                &uid_s,
+                "--regid",
+                &gid_s,
+                "--groups",
+                &groups_s,
+                "--no-new-privs",
+                "--",
+                "/bin/rm",
+                "-rf",
+            ])
+            .arg(target)
+            .status();
+        let _ = fs::remove_dir_all(target);
+        let _ = fs::remove_file(target);
     }
 }
 

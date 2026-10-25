@@ -58,7 +58,7 @@ impl Installer {
                 .map(|entry| entry.path())
                 .filter(|dir| dir.join(".installed").exists())
                 .collect();
-            installed.sort();
+            installed.sort_by_key(|p| version_sort_key(p));
             for dir in installed.into_iter().rev() {
                 if launcher(harness, &dir).is_file() {
                     return Ok(Install { dir });
@@ -79,6 +79,110 @@ impl Installer {
         // build without a launcher on `PATH`; either way this version is there.
         Ok(Install { dir })
     }
+}
+
+fn version_sort_key(path: &Path) -> (u64, u64, u64, String) {
+    let raw = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .trim_start_matches('v');
+    let core = raw.split('-').next().unwrap_or(raw);
+    let mut parts = core.split('.');
+    let major = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minor = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    let patch = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    (major, minor, patch, raw.to_string())
+}
+
+/// Detect the currently active version string of `harness`.
+pub fn detect_version(root: &Path, harness: &str) -> String {
+    let dirs = root.join("harnesses").join(harness);
+    if let Ok(versions) = std::fs::read_dir(&dirs) {
+        let mut installed: Vec<PathBuf> = versions
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|dir| dir.join(".installed").exists())
+            .collect();
+        installed.sort_by_key(|p| version_sort_key(p));
+        for dir in installed.into_iter().rev() {
+            if launcher(harness, &dir).is_file()
+                && let Some(ver) = dir.file_name().and_then(|s| s.to_str())
+                && ver != "unpinned"
+                && ver != "seat-bin"
+            {
+                return ver.to_string();
+            }
+        }
+    }
+    let bin = program(root, harness);
+    if let Ok(out) = Command::new(&bin)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+    {
+        let combined = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        for token in combined.split_whitespace() {
+            let cleaned = token
+                .trim_matches(|c: char| c == '(' || c == ')' || c == '[' || c == ']')
+                .trim_start_matches("omp/")
+                .trim_start_matches('v');
+            if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) && cleaned.contains('.') {
+                return cleaned.to_string();
+            }
+        }
+    }
+    "-".to_string()
+}
+
+/// Check upstream for the latest version of `harness`, install it into
+/// `<root>/harnesses/<harness>/<version>/` (or update its host/staged binary),
+/// and prune superseded version directories.
+pub fn update_harness(root: &Path, harness: &str) -> Result<(String, String, bool), String> {
+    let before = detect_version(root, harness);
+    let catalog = builtin_catalog();
+    let mut runner = ProcessRunner;
+    let version = match catalog_version(&catalog, harness, &mut runner) {
+        Ok(ver) => ver,
+        Err(InstallError::UnknownHarness(id)) => return Err(format!("unknown harness: {id}")),
+        Err(err) => return Err(err.to_string()),
+    };
+    if version != anyagents_installer::UNPINNED {
+        let dir = ensure_installed(&catalog, root, harness, &version, &mut runner)
+            .map_err(|err| err.to_string())?;
+        if let Some(inst) = INSTALLER.get() {
+            let mut done = inst.done.lock().unwrap_or_else(PoisonError::into_inner);
+            done.insert(harness.to_string(), Ok(Install { dir: dir.clone() }));
+        }
+        // Remove older version directories under `<root>/harnesses/<harness>/` so
+        // `program()` always resolves the latest version and disk stays clean.
+        let dirs = root.join("harnesses").join(harness);
+        if let Ok(entries) = std::fs::read_dir(&dirs) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p == dir || !p.is_dir() {
+                    continue;
+                }
+                let name = entry.file_name();
+                let name_s = name.to_string_lossy();
+                if name_s != "seat-bin" && name_s != "unpinned" {
+                    let _ = std::fs::remove_dir_all(&p);
+                }
+            }
+        }
+    } else {
+        ensure_vendored_binary(root, harness);
+        let _ = program(root, harness);
+    }
+    let after = detect_version(root, harness);
+    let changed = before != after;
+    Ok((before, after, changed))
 }
 
 /// Ensures a vendored or script-installed harness binary (`omp`, `dsh`, `grok`)
@@ -228,7 +332,7 @@ pub fn program(root: &Path, harness: &str) -> PathBuf {
             .map(|entry| entry.path())
             .filter(|dir| dir.join(".installed").exists())
             .collect();
-        installed.sort();
+        installed.sort_by_key(|p| version_sort_key(p));
         for dir in installed.into_iter().rev() {
             let launcher = launcher(harness, &dir);
             if launcher.is_file() {

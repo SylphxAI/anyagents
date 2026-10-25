@@ -140,6 +140,14 @@ impl anyagents_harness::Harness for ContractHarness {
         self.inner.process_id()
     }
 
+    fn turns_served(&self) -> u32 {
+        self.inner.turns_served()
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.inner.served_usage()
+    }
+
     fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
         self.inner.watch_activity(notify)
     }
@@ -383,6 +391,33 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             cache_home.display().to_string(),
         ));
         env.push(("TMPDIR".to_string(), tmp_dir.display().to_string()));
+        let host_home = crate::sandbox::host_home_dir();
+        if let Some(ref h) = host_home
+            && h.join(".rustup").is_dir()
+        {
+            env.push((
+                "RUSTUP_HOME".to_string(),
+                h.join(".rustup").display().to_string(),
+            ));
+        } else if Path::new("/scratch/rustup-home").is_dir() {
+            env.push((
+                "RUSTUP_HOME".to_string(),
+                "/scratch/rustup-home".to_string(),
+            ));
+        }
+        if let Some(ref h) = host_home
+            && h.join(".cargo").is_dir()
+        {
+            env.push((
+                "CARGO_HOME".to_string(),
+                h.join(".cargo").display().to_string(),
+            ));
+        } else if Path::new("/scratch/cargo-registry").is_dir() {
+            env.push((
+                "CARGO_HOME".to_string(),
+                "/scratch/cargo-registry".to_string(),
+            ));
+        }
     }
     if let Some((_, ref spec)) = seat_spec {
         env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec.clone()));
@@ -511,6 +546,11 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 spec.args.push("--model".to_string());
                 spec.args.push(model.to_string());
             }
+            let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
+            if sys_prompt.is_file() {
+                spec.args.push("--append-system-prompt".to_string());
+                spec.args.push(sys_prompt.display().to_string());
+            }
             OmpHarness::start_with_spec(
                 spec,
                 program.display().to_string(),
@@ -625,6 +665,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             Vec::new()
         } else {
             let mut args = vec!["--dangerously-skip-permissions".to_string()];
+            let mut effort = "medium".to_string();
             if let Some(model) = request
                 .agent
                 .model
@@ -632,13 +673,36 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 .map(str::trim)
                 .filter(|m| !m.is_empty())
             {
+                let (base_model, variant) = match model.split_once('#') {
+                    Some((b, v)) if !b.trim().is_empty() && !v.trim().is_empty() => {
+                        (b.trim(), Some(v.trim()))
+                    }
+                    _ => (model, None),
+                };
                 args.push("--model".to_string());
-                args.push(model.to_string());
+                args.push(base_model.to_string());
+                if let Some(v) = variant {
+                    effort = v.to_string();
+                }
+            }
+            if let Some((_, env_effort)) = env.iter().find(|(k, _)| k == "CLAUDE_CODE_EFFORT_LEVEL")
+                && !env_effort.trim().is_empty()
+            {
+                effort = env_effort.trim().to_string();
             }
             args.push("--effort".to_string());
-            args.push("medium".to_string());
+            args.push(effort);
             args.push("--name".to_string());
             args.push(request.agent.name.clone());
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                args.push("--disallowedTools".to_string());
+                args.push("Task,Agent".to_string());
+            }
+            let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
+            if sys_prompt.is_file() {
+                args.push("--append-system-prompt-file".to_string());
+                args.push(sys_prompt.display().to_string());
+            }
             let mcp_cfg = request.config_dir.join("mcp.json");
             let claude_cfg = request.config_dir.join(".claude.json");
             if mcp_cfg.is_file() {
@@ -714,6 +778,23 @@ pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
             {
                 allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
                 changed = true;
+            }
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                let deny = perms_obj
+                    .entry("deny".to_string())
+                    .or_insert_with(|| serde_json::json!([]));
+                if !deny.is_array() {
+                    *deny = serde_json::json!([]);
+                    changed = true;
+                }
+                if let Some(deny_arr) = deny.as_array_mut() {
+                    for tool_name in ["invoke_subagent", "define_subagent", "manage_subagents"] {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+                            deny_arr.push(serde_json::Value::String(tool_name.to_string()));
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
         let work_dir_str = work_dir.display().to_string();
@@ -886,6 +967,20 @@ impl Harness for VendorHarness {
             Self::Dsh(harness, _) => harness.last_usage(),
             Self::Grok(harness, _) => harness.last_usage(),
             Self::Contract(harness) => harness.last_usage(),
+        }
+    }
+
+    fn turns_served(&self) -> u32 {
+        match self {
+            Self::Claude(harness, _) => harness.turns_served(),
+            Self::Codex(harness, _) => harness.turns_served(),
+            Self::OpenCode(harness) => harness.turns_served(),
+            Self::Agy(harness, _) => harness.turns_served(),
+            Self::Muse(harness, _) => harness.turns_served(),
+            Self::Omp(harness, _) => harness.turns_served(),
+            Self::Dsh(harness, _) => harness.turns_served(),
+            Self::Grok(harness, _) => harness.turns_served(),
+            Self::Contract(harness) => harness.turns_served(),
         }
     }
 

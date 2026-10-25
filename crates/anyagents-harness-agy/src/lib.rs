@@ -170,6 +170,14 @@ impl Harness for AgyHarness {
         self.inner.process_id()
     }
 
+    fn turns_served(&self) -> u32 {
+        self.inner.turns_served()
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.inner.served_usage()
+    }
+
     fn watch_activity(&self, notify: std::sync::Arc<dyn Fn() + Send + Sync>) {
         self.inner.watch_activity(notify);
     }

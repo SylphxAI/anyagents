@@ -12,6 +12,7 @@ pub struct CreateRequest {
     pub name: String,
     pub harness: String,
     pub model: Option<String>,
+    pub profile: Option<String>,
     pub workdir: Option<PathBuf>,
     /// The working directory an owner agent gets when none is named.
     pub workdir_default: Option<PathBuf>,
@@ -49,6 +50,22 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     let config = agent_config_dir(&data, &agent.id);
     std::fs::create_dir_all(&config)?;
     let _ = std::fs::create_dir_all(config.join("tmp"));
+    if let Some(prof) = request
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let normalized = if prof.contains('/') {
+            prof.to_string()
+        } else {
+            format!(
+                "{}/{prof}",
+                upstream_provider_of(&agent.harness, agent.model.as_deref())
+            )
+        };
+        let _ = std::fs::write(config.join(".anyagents-profile"), format!("{normalized}\n"));
+    }
     seed_harness_credentials(store, &data, &agent, &config);
     ensure_seat_environment(&config);
     let workdir_created = request.workdir.as_ref().is_some_and(|p| !p.exists());
@@ -135,49 +152,112 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     Ok(running)
 }
 
+pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
+    let Ok(agents) = store.list_agents() else {
+        return;
+    };
+    let by_id: std::collections::HashMap<String, String> = agents
+        .iter()
+        .map(|a| (a.id.to_string(), a.name.clone()))
+        .collect();
+    for agent in &agents {
+        let cfg = agent_config_dir(data, &agent.id);
+        if !cfg.is_dir() {
+            continue;
+        }
+        let parent_name = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| by_id.get(pid.as_str()).cloned());
+        write_agent_instructions(&cfg, agent, parent_name.as_deref());
+        if let Some((_, _, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+        {
+            crate::sandbox::share_config_with_seat(&cfg, gid);
+        }
+    }
+}
+
 pub(crate) fn write_agent_instructions(config: &Path, agent: &Agent, parent_name: Option<&str>) {
     let mut doc = format!(
-        "# AnyAgents Identity & Communication Protocol\n\n\
-         - **Agent Name**: `{}` (`agent:{}`)\n\
-         - **Agent ID**: `{}`\n",
-        agent.name, agent.name, agent.id
+        "# AnyAgents Identity & Environment Awareness\n\n\
+         ## 1. Your Identity (Who You Are)\n\n\
+         - **Agent Name**: `{name}` (addressable as `agent:{name}`)\n\
+         - **Agent ID**: `{id}`\n",
+        name = agent.name,
+        id = agent.id,
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
-            "- **Parent Agent**: `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`)\n"
+            "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`)\n"
         ));
+    } else {
+        doc.push_str("- **Role**: Root Agent\n");
     }
-    doc.push_str(
-        "- **How to Reply / Send Messages**: Incoming messages arrive with a `----- message -----` \
-         header naming `from:`, `answer with reply_to:`, and `answer to:`. Plain text printed only \
-         to your local session/stdout is **never** delivered to other agents, your parent, groups, \
-         or channels. Whenever a message or task asks you to reply, answer, or report back, you \
-         **must** call the AnyAgents `send` MCP tool (`send`, or `await tools.anyagents.send({ ... })` \
-         inside `execute` in OpenCode Code Mode) with `to` (e.g. `[\"parent\"]` or the `answer to:` \
-         / `from:` address), `reply_to` (the `anyagents:reply:msg_...` token from the header), and `text`.\n\
-         - **Channel & Message Interactions (`interact`)**: Use the `interact` MCP tool with `target` \
-         set to the `anyagents:reply:msg_...` token from the message header (or `telegram:chat:<chat_id>:<message_id>`) \
-         and `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]` \
-         or option text, and optional `text` rationale), `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"`.\n",
-    );
+
     if let Some(custom) = agent
         .instructions
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        doc.push_str("\n## Agent Instructions\n\n");
+        doc.push_str("\n## 2. Role, Responsibilities & Standing Description\n\n");
         doc.push_str(custom);
         doc.push('\n');
     }
+
+    doc.push_str(
+        "\n## 3. Runtime Awareness, Role Description, Sub-Agents, Browser & Communication Protocol\n\n\
+         - **Cache-Stable Architecture (Static System Prompt + Tail Events & On-Demand Tools)**:\n\
+           - This System Prompt is **strictly static** so your LLM prompt prefix KV cache is never invalidated when groups, channels, peers, or sub-agents change.\n\
+           - Live routing context arrives **inline per message** at the tail of your context inside the `<message ...>` XML envelope (`id`, `from`, `sender_name`, `to`, `channel`, `chat`, `chat_title`, `chat_type`, `topic`, `event`, `in_reply_to`, `mentions`, `reply_to`, `answer_to`).\n\
+           - Live topology (your sub-agents, groups, peers, and role descriptions) is queried **on demand** via MCP tools:\n\
+             - **Role & Description (`describe`)**: `describe({ \"agent\": \"self\" })` (read your own role description), `describe({ \"agent\": \"self\", \"description\": \"...\" })` (update your own role/mission description whenever your focus changes; syncs your private system prompt and group roster), `describe({ \"agent\": \"all\" })` (read every peer's role & responsibilities).\n\
+             - **Sub-Agents (`subagents`)**: `subagents({ \"action\": \"list\" })` (list your sub-agents & live status), `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })` (live status + recent turns in one call).\n\
+             - **Groups (`groups`)**: `groups({ \"action\": \"list\" })` (returns `members` + full `roster` with each member's `description`), `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
+             - **Peers (`agents`)**: `agents({})` (all agents, harnesses, models, `description`, and live health).\n\
+         - **Unified Cross-Harness Sub-Agents (`subagents` / `spawn` MCP Tools — Native Harness Sub-Agents Disabled by Default)**:\n\
+           - Built-in harness sub-agent tools (`Task`/`Agent`/`task`/`invoke_subagent`) are **disabled by default** so sub-agents are never trapped inside a single vendor CLI.\n\
+           - Always spawn and manage sub-agents via **AnyAgents `subagents` / `spawn` MCP tools** (or `anyagents spawn` CLI). When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`opencode` + `sylphx/openai/gpt-6.1-sol#medium` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
+           - Full lifecycle actions on `subagents`:\n\
+             - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"all\"`).\n\
+             - **Inspect**: `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })`.\n\
+             - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"workdir\": \"/scratch/wt/...\", \"description\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`).\n\
+             - **Steer**: `subagents({ \"action\": \"steer\", \"agent\": \"<name-or-id>\", \"prompt\": \"...\" })`.\n\
+             - **Control (`wake`, `pause`, `archive`, `delete`)**: `subagents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"agent\": \"<name-or-id>\" })`.\n\
+         - **Native SOTA Anti-Detect Browser & Persistent Browser Profiles (`browser` MCP Tool & `anyagents browser` CLI)**:\n\
+           - Every harness has native browser automation via the `browser` MCP tool (`anyagents browser` CLI), running real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile anti-detect fingerprinting (WebGL vendor/renderer, Client Hints `Sec-CH-UA`, `navigator.webdriver = false`, WebRTC UDP leak protection, Canvas seed) and persistent `--user-data-dir` login profiles.\n\
+           - Actions: `browser({ \"action\": \"open\", \"url\": \"https://...\", \"profile\": \"<optional-profile>\" })` (launches on demand and returns visible text + `@e1`, `@e2` interactive element refs), `browser({ \"action\": \"snapshot\" })`, `browser({ \"action\": \"click\", \"selector\": \"@e1\" })`, `browser({ \"action\": \"fill\", \"selector\": \"@e2\", \"text\": \"...\", \"submit\": true })`, `browser({ \"action\": \"press\", \"key\": \"Enter\" })`, `browser({ \"action\": \"eval\", \"script\": \"...\" })`, `browser({ \"action\": \"screenshot\" })` (returns PNG path ready to inspect or send via `send` media), `browser({ \"action\": \"cookies\" })`, `browser({ \"action\": \"tabs\" })`, `browser({ \"action\": \"profiles\" })`, and `browser({ \"action\": \"close\" })` (scales the browser process to zero while keeping the profile logged in on disk).\n\
+         - **How to Reply / Send Messages**: Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call the AnyAgents `send` MCP tool (`send`, or `await tools.anyagents.send({ ... })` inside `execute` in OpenCode Code Mode) with `to` (e.g. `[\"parent\"]` or the `answer_to` / `from` address), `reply_to` (the `anyagents:reply:msg_...` token from the `<message>` tag), and `text`.\n\
+         - **Channel & Message Interactions (`interact`)**: Use the `interact` MCP tool with `target` set to the `anyagents:reply:msg_...` token from the message header (or `telegram:chat:<chat_id>:<message_id>`) and `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]` or option text, and optional `text` rationale), `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"`.\n\
+         - **Memory, History & Hybrid RAG Search (`conversation` / `search`)**: Incoming messages are pushed automatically to your session — never poll an inbox. Use `conversation({ \"query\": \"...\", \"agent\": \"all\", \"limit\": 20 })` or `search({ \"query\": \"...\" })` to run Hybrid RAG search (dense vector embedding `voyageai/voyage-4-large` + SQLite FTS5 BM25) across all agents' historical and live conversations since September without loading the full history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n",
+    );
+
     let paths = [
+        config.join("SYSTEM_PROMPT.md"),
         config.join("AGENTS.md"),
         config.join("opencode").join("AGENTS.md"),
         config.join(".config").join("opencode").join("AGENTS.md"),
         config.join("CLAUDE.md"),
         config.join(".claude").join("CLAUDE.md"),
+        config.join(".gemini").join("config").join("GEMINI.md"),
+        config.join(".gemini").join("config").join("AGENTS.md"),
+        config
+            .join(".gemini")
+            .join("config")
+            .join("rules")
+            .join("AGENTS.md"),
+        config.join("muse").join("AGENTS.md"),
+        config.join(".config").join("muse").join("AGENTS.md"),
+        config.join(".omp").join("agent").join("APPEND_SYSTEM.md"),
+        config.join(".omp").join("agent").join("AGENTS.md"),
+        config.join(".dsh").join("AGENTS.md"),
+        config.join(".grok").join("AGENTS.md"),
     ];
     for path in &paths {
+        if std::fs::read(path).ok().as_deref() == Some(doc.as_bytes()) {
+            continue;
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -246,6 +326,82 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
                 let _ = std::os::unix::fs::symlink(&src, &dst);
             }
         }
+        for (rel, shared_fallback) in [
+            (".rustup", "/scratch/rustup-home"),
+            (".cargo", "/scratch/cargo-registry"),
+        ] {
+            let dst = target_config.join(rel);
+            if !dst.exists() {
+                let h = host_home.join(rel);
+                let found_shared = if h.is_dir() {
+                    Some(h)
+                } else {
+                    let fallback = Path::new(shared_fallback);
+                    fallback.is_dir().then(|| fallback.to_path_buf())
+                };
+                if let Some(src) = found_shared {
+                    let _ = std::os::unix::fs::symlink(&src, &dst);
+                }
+            }
+        }
+        ensure_seat_skills(target_config, &host_home);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
+    let data_skills = target_config
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|data_dir| data_dir.join("skills"));
+    let canonical_skills = [
+        data_skills.as_deref(),
+        Some(Path::new("/scratch/wt/sylphx-skills/skills")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.is_dir())
+    .map(Path::to_path_buf)
+    .or_else(|| {
+        let candidate = host_home.join("workspace/github.com/SylphxAI/skills/skills");
+        candidate.is_dir().then_some(candidate)
+    });
+    let Some(mut skills_root) = canonical_skills else {
+        return;
+    };
+    if let Some(ref data_sk) = data_skills
+        && !data_sk.exists()
+        && skills_root != *data_sk
+        && std::os::unix::fs::symlink(&skills_root, data_sk).is_ok()
+    {
+        skills_root = data_sk.clone();
+    }
+    for rel in [
+        "skills",
+        ".agents/skills",
+        ".claude/skills",
+        ".codex/skills",
+        "opencode/skills",
+        ".config/opencode/skills",
+        ".gemini/config/skills",
+        "muse/skills",
+        ".config/muse/skills",
+        ".omp/agent/skills",
+        ".dsh/skills",
+        ".grok/skills",
+    ] {
+        let dst = target_config.join(rel);
+        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+            if meta.file_type().is_symlink() && !dst.exists() {
+                let _ = std::fs::remove_file(&dst);
+            } else {
+                continue;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::os::unix::fs::symlink(&skills_root, &dst);
     }
 }
 
@@ -410,16 +566,42 @@ pub(crate) fn seed_harness_credentials(
         }
     }
 
+    let explicit_non_default_profile = bound_profile_name(target_config).is_some_and(|b| {
+        let prof = b.split_once('/').map(|(_, p)| p).unwrap_or(b.as_str());
+        !prof.is_empty() && prof != "default"
+    });
     let profile_roots = select_or_bind_profile(data, &all_agents, agent, target_config);
     for rel in &rel_paths {
         let dst = target_config.join(rel);
-        if dst.exists() {
+        let is_auth_cred = matches!(
+            rel.as_str(),
+            ".gemini/antigravity-cli/antigravity-oauth-token"
+                | ".gemini/antigravity-cli/antigravity_state.pbtxt"
+                | ".gemini/antigravity-cli/jetski_state.pbtxt"
+                | ".credentials.json"
+                | ".claude/.credentials.json"
+                | "auth.json"
+                | ".codex/auth.json"
+                | "muse/auth.json"
+                | ".config/muse/auth.json"
+                | ".grok/auth.json"
+                | ".dsh/.credentials.yaml"
+        );
+        let dst_non_empty = dst.metadata().is_ok_and(|m| m.len() > 0);
+        if dst_non_empty && !(explicit_non_default_profile && is_auth_cred && !dst.is_file()) {
             continue;
         }
         let mut copied = false;
         for profile_root in &profile_roots {
             let src = profile_root.join(rel);
             if src.is_file() {
+                if dst.is_file()
+                    && let (Ok(a), Ok(b)) = (std::fs::read(&src), std::fs::read(&dst))
+                    && a == b
+                {
+                    copied = true;
+                    break;
+                }
                 if let Some(parent_dir) = dst.parent() {
                     let _ = std::fs::create_dir_all(parent_dir);
                 }
@@ -429,7 +611,24 @@ pub(crate) fn seed_harness_credentials(
                 }
             }
         }
-        if copied {
+        if copied || dst.exists() {
+            continue;
+        }
+        if explicit_non_default_profile
+            && matches!(
+                rel.as_str(),
+                ".gemini/antigravity-cli/antigravity-oauth-token"
+                    | ".gemini/antigravity-cli/antigravity_state.pbtxt"
+                    | ".gemini/antigravity-cli/jetski_state.pbtxt"
+                    | ".credentials.json"
+                    | ".claude/.credentials.json"
+                    | "auth.json"
+                    | ".codex/auth.json"
+                    | "muse/auth.json"
+                    | ".config/muse/auth.json"
+                    | ".grok/auth.json"
+            )
+        {
             continue;
         }
         for donor in &donors {
@@ -619,6 +818,70 @@ pub(crate) fn bind_profile(
     Ok(())
 }
 
+/// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.
+pub(crate) fn set_provider_profile(
+    data: &Path,
+    provider_profile: &str,
+    key: &str,
+) -> Result<(String, String), Error> {
+    let (provider, profile) = provider_profile.split_once('/').ok_or_else(|| {
+        Error::Message("expected <provider>/<profile> (e.g. kimi-code-plan/rhea)".into())
+    })?;
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if !valid(provider) || !valid(profile) {
+        return Err(Error::Message("invalid provider or profile name".into()));
+    }
+    let trimmed = key.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return Err(Error::Message(
+            "a nonempty single-line key is required".into(),
+        ));
+    }
+    let dir = data.join("profiles").join(provider).join(profile);
+    ensure_provider_profile_meta(&dir, provider, None);
+    let default_dir = data.join("profiles").join(provider).join("default");
+    if default_dir != dir
+        && default_dir.join("opencode.json").is_file()
+        && !dir.join("opencode.json").exists()
+    {
+        let _ = std::fs::copy(default_dir.join("opencode.json"), dir.join("opencode.json"));
+    }
+    let key_filename = match provider {
+        "kimi-code-plan" => "kimi.key",
+        "qwen-token-plan" => "qwen.key",
+        "glm-code-plan" => "glm.key",
+        "minimax-code-plan" => "minimax.key",
+        "sylphx" => "sylphx.key",
+        "openrouter" => "openrouter.key",
+        other => {
+            let prefix = other.split('-').next().unwrap_or(other);
+            return write_profile_key_file(&dir, &format!("{prefix}.key"), trimmed)
+                .map(|()| (provider.to_string(), profile.to_string()));
+        }
+    };
+    write_profile_key_file(&dir, key_filename, trimmed)?;
+    Ok((provider.to_string(), profile.to_string()))
+}
+
+fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), Error> {
+    let key_dir = dir.join(".config").join("opencode");
+    std::fs::create_dir_all(&key_dir)?;
+    let key_path = key_dir.join(filename);
+    std::fs::write(&key_path, format!("{key}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
 /// Resolves the upstream provider an agent draws its credential profile from.
 ///
 /// An agent's `model` prefix (`sylphx/...`, `openrouter/...`, `qwen-token-plan/...`,
@@ -752,7 +1015,13 @@ pub(crate) fn sync_and_list_provider_profiles(
     for agent in &agents {
         let cfg = agent_config_dir(data, &agent.id);
         let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-        let profile_dir = profiles_root.join(&provider).join("default");
+        let prof_name = bound_profile_name(&cfg)
+            .and_then(|b| {
+                let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+                (!p.is_empty()).then_some(p)
+            })
+            .unwrap_or_else(|| "default".to_string());
+        let profile_dir = profiles_root.join(&provider).join(&prof_name);
         match provider.as_str() {
             "anthropic" => {
                 for rel in [
@@ -1166,6 +1435,9 @@ fn select_or_bind_profile(
         } else {
             roots.push(data.join("profiles").join(&provider).join(prof_name));
         }
+        if prof_name != "default" {
+            return roots;
+        }
     } else if !available.is_empty() {
         let mut counts: std::collections::BTreeMap<String, usize> = available
             .iter()
@@ -1208,4 +1480,189 @@ fn select_or_bind_profile(
     roots.push(data.join("profiles").join(&agent.harness).join("default"));
     roots.push(data.join("config").join(&provider).join("default"));
     roots
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SubagentDefaultSpec {
+    /// `"inherit"` or `"preset"`.
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SubagentDefaultsConfig {
+    pub default: SubagentDefaultSpec,
+    #[serde(default)]
+    pub agents: std::collections::BTreeMap<String, SubagentDefaultSpec>,
+}
+
+impl Default for SubagentDefaultsConfig {
+    fn default() -> Self {
+        Self {
+            default: SubagentDefaultSpec {
+                mode: "inherit".to_string(),
+                harness: None,
+                model: None,
+                profile: None,
+            },
+            agents: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+pub(crate) fn load_subagent_defaults(data: &Path) -> SubagentDefaultsConfig {
+    let path = data.join("subagent-defaults.json");
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<SubagentDefaultsConfig>(&text).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn save_subagent_defaults(
+    data: &Path,
+    cfg: &SubagentDefaultsConfig,
+) -> Result<(), Error> {
+    let path = data.join("subagent-defaults.json");
+    let text = serde_json::to_string_pretty(cfg).map_err(|err| Error::Message(err.to_string()))?;
+    std::fs::write(path, format!("{text}\n"))?;
+    Ok(())
+}
+
+/// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.
+pub(crate) fn resolve_subagent_defaults(
+    data: &Path,
+    parent: Option<&Agent>,
+    raw_harness: &str,
+    raw_model: Option<String>,
+    raw_profile: Option<String>,
+) -> (String, Option<String>, Option<String>) {
+    let h_trim = raw_harness.trim();
+    let m_trim = raw_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let p_trim = raw_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let Some(parent_agent) = parent else {
+        let harness = if h_trim.is_empty() || h_trim.eq_ignore_ascii_case("inherit") {
+            "claude-code".to_string()
+        } else {
+            h_trim.to_string()
+        };
+        let model = m_trim
+            .filter(|m| !m.eq_ignore_ascii_case("inherit"))
+            .map(str::to_string);
+        let profile = p_trim
+            .filter(|p| !p.eq_ignore_ascii_case("inherit"))
+            .map(str::to_string);
+        return (harness, model, profile);
+    };
+
+    let cfg = load_subagent_defaults(data);
+    let spec = cfg.agents.get(&parent_agent.name).unwrap_or(&cfg.default);
+    let parent_cfg_dir = agent_config_dir(data, &parent_agent.id);
+    let parent_bound_profile = bound_profile_name(&parent_cfg_dir);
+
+    let inherit_harness = || {
+        if parent_agent.harness == "agy" {
+            "claude-code".to_string()
+        } else {
+            parent_agent.harness.clone()
+        }
+    };
+
+    let explicit_inherit = h_trim.eq_ignore_ascii_case("inherit")
+        || m_trim.is_some_and(|m| m.eq_ignore_ascii_case("inherit"))
+        || p_trim.is_some_and(|p| p.eq_ignore_ascii_case("inherit"));
+
+    let use_inherit = explicit_inherit || spec.mode.eq_ignore_ascii_case("inherit");
+
+    let resolved_harness = if !h_trim.is_empty() && !h_trim.eq_ignore_ascii_case("inherit") {
+        h_trim.to_string()
+    } else if h_trim.eq_ignore_ascii_case("inherit") || use_inherit {
+        inherit_harness()
+    } else {
+        spec.harness
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("inherit"))
+            .map(str::to_string)
+            .unwrap_or_else(inherit_harness)
+    };
+
+    let resolved_model = if let Some(m) = m_trim {
+        if m.eq_ignore_ascii_case("inherit") {
+            parent_agent.model.clone()
+        } else {
+            Some(m.to_string())
+        }
+    } else if use_inherit {
+        if resolved_harness == parent_agent.harness {
+            parent_agent.model.clone()
+        } else {
+            None
+        }
+    } else if h_trim.is_empty() || spec.harness.as_deref() == Some(resolved_harness.as_str()) {
+        spec.model
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|m| {
+                if m.eq_ignore_ascii_case("inherit") {
+                    parent_agent.model.clone()
+                } else {
+                    Some(m.to_string())
+                }
+            })
+    } else {
+        None
+    };
+
+    let target_provider = upstream_provider_of(&resolved_harness, resolved_model.as_deref());
+    let inherit_profile_if_compatible = || {
+        parent_bound_profile.as_ref().and_then(|prof| {
+            let prov = prof
+                .split_once('/')
+                .map(|(p, _)| p)
+                .unwrap_or(prof.as_str());
+            (prov == target_provider).then(|| prof.clone())
+        })
+    };
+
+    let resolved_profile = if let Some(p) = p_trim {
+        if p.eq_ignore_ascii_case("inherit") {
+            inherit_profile_if_compatible()
+        } else {
+            Some(p.to_string())
+        }
+    } else if use_inherit {
+        inherit_profile_if_compatible()
+    } else {
+        spec.profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|p| {
+                if p.eq_ignore_ascii_case("inherit") {
+                    inherit_profile_if_compatible()
+                } else {
+                    let prov = p
+                        .split_once('/')
+                        .map(|(pr, _)| pr)
+                        .unwrap_or(&target_provider);
+                    (prov == target_provider).then(|| p.to_string())
+                }
+            })
+            .or_else(inherit_profile_if_compatible)
+    };
+
+    (resolved_harness, resolved_model, resolved_profile)
 }

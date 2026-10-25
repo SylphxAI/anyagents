@@ -294,6 +294,10 @@ impl Harness for GrokHarness {
         self.rpc.process_id()
     }
 
+    fn turns_served(&self) -> u32 {
+        lock(&self.shared).finished.len() as u32
+    }
+
     fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         self.rpc.watch_activity(notify)
     }

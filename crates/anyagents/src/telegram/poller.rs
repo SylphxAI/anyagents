@@ -167,11 +167,27 @@ fn configured_webhook_base() -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
+static WEBHOOK_READY_CACHE: Mutex<Option<(String, Instant, bool)>> = Mutex::new(None);
+
 fn webhook_origin_ready(base: &str) -> bool {
     if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some() {
         return true;
     }
-    let url = format!("{}/v1/webhooks/healthz", base.trim_end_matches('/'));
+    let normalized = base.trim_end_matches('/').to_string();
+    {
+        let cached = lock(&WEBHOOK_READY_CACHE);
+        if let Some((ref cached_base, checked_at, ok)) = *cached {
+            let ttl = if ok {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(5)
+            };
+            if cached_base == &normalized && checked_at.elapsed() < ttl {
+                return ok;
+            }
+        }
+    }
+    let url = format!("{normalized}/v1/webhooks/healthz");
     let agent = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(3)))
         .http_status_as_error(false)
@@ -179,11 +195,13 @@ fn webhook_origin_ready(base: &str) -> bool {
         .max_redirects_will_error(false)
         .build()
         .new_agent();
-    agent
+    let ok = agent
         .get(&url)
         .call()
         .map(|resp| resp.status().as_u16() == 200)
-        .unwrap_or(false)
+        .unwrap_or(false);
+    *lock(&WEBHOOK_READY_CACHE) = Some((normalized, Instant::now(), ok));
+    ok
 }
 
 /// One channel's own loop: register its webhook when a live webhook origin is
@@ -218,12 +236,19 @@ fn run_channel(
                 }));
                 if matches!(outcome, Ok(Ok(()))) {
                     webhook_registered_for = Some(base);
+                } else {
+                    sleep_a_moment(&stop, &global_stop);
+                    continue;
                 }
             }
-            sleep_a_moment(&stop, &global_stop);
+            sleep_for(&stop, &global_stop, Duration::from_secs(30));
             continue;
         }
         webhook_registered_for = None;
+        if !channel_has_running_agent(&store, &channel) {
+            sleep_for(&stop, &global_stop, Duration::from_secs(5));
+            continue;
+        }
         // The timeout is capped so a shutdown never waits out a full long poll:
         // Telegram answers at once when the timeout is short.
         let timeout = if stop.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
@@ -267,6 +292,9 @@ pub fn release_every_bot(
     let (done_tx, done_rx) = mpsc::channel();
     let mut waiting = 0;
     for channel in channels {
+        if !channel_has_running_agent(store, &channel) {
+            continue;
+        }
         let secrets = FileCredentialStore::new(data_dir);
         let done = done_tx.clone();
         let id = channel.id.to_string();
@@ -306,14 +334,42 @@ pub fn release_every_bot(
     Ok(())
 }
 
-/// The channels this server should be polling: a Telegram channel with a
-/// credential, which a bot cannot be polled without.
+fn channel_has_running_agent(store: &Store, channel: &Channel) -> bool {
+    channel.agents.is_empty()
+        || channel.agents.iter().any(|agent_id| {
+            store
+                .agent(agent_id)
+                .map(|agent| agent.state != "paused" && agent.state != "archived")
+                .unwrap_or(false)
+        })
+}
+
+/// The channels this server should manage: every non-archived Telegram channel
+/// with a credential when a webhook origin is configured, or only channels with
+/// a running agent when long-polling.
 fn channels_to_poll(store: &Store) -> Vec<Channel> {
+    let webhook_configured = configured_webhook_base().is_some();
     store
         .list_channels()
         .unwrap_or_default()
         .into_iter()
-        .filter(|channel| channel.kind == "telegram" && channel.credential_ref.is_some())
+        .filter(|channel| {
+            channel.kind == "telegram"
+                && channel.credential_ref.is_some()
+                && (channel.agents.is_empty()
+                    || channel.agents.iter().any(|agent_id| {
+                        store
+                            .agent(agent_id)
+                            .map(|agent| {
+                                if webhook_configured {
+                                    agent.state != "archived"
+                                } else {
+                                    agent.state != "paused" && agent.state != "archived"
+                                }
+                            })
+                            .unwrap_or(false)
+                    }))
+        })
         .collect()
 }
 
@@ -322,7 +378,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn sleep_a_moment(flag: &AtomicBool, global_stop: &AtomicBool) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    sleep_for(flag, global_stop, Duration::from_secs(2));
+}
+
+fn sleep_for(flag: &AtomicBool, global_stop: &AtomicBool, duration: Duration) {
+    let deadline = Instant::now() + duration;
     while Instant::now() < deadline {
         if flag.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
             return;

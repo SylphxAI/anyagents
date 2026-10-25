@@ -199,6 +199,43 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let listener = api_listener;
     let poller = crate::telegram::Poller::start(Arc::clone(&store), data.to_path_buf())
         .map_err(Error::Message)?;
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    {
+        let reaper_root = data.to_path_buf();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let root = reaper_root.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::browser::reap_idle_browsers(&root);
+                })
+                .await;
+            }
+        });
+        let updater_root = data.to_path_buf();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
+            loop {
+                interval.tick().await;
+                let root = updater_root.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    for entry in anyagents_installer::builtin_catalog() {
+                        if let Ok((before, after, true)) =
+                            crate::install::update_harness(&root, &entry.id)
+                        {
+                            eprintln!(
+                                "anyagents-updater: upgraded harness `{}` {} -> {}",
+                                entry.id, before, after
+                            );
+                        }
+                    }
+                })
+                .await;
+            }
+        });
+    }
     if let Some(addr) = webhook_listen_addr() {
         match tokio::net::TcpListener::bind(&addr).await {
             Ok(tcp_listener) => {
@@ -206,6 +243,8 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                     let _ = std::fs::write(data.join("webhook.addr"), format!("{local}\n"));
                 }
                 let webhook_app = Router::new()
+                    .route("/", get(webhook_healthz))
+                    .route("/healthz", get(webhook_healthz))
                     .route("/v1/webhooks/healthz", get(webhook_healthz))
                     .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
                     .with_state(state.clone());
@@ -222,12 +261,30 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/model", post(model_route))
-        .route("/v1/profiles", get(profiles_route))
+        .route(
+            "/v1/agents/{name}/description",
+            get(get_description_route).post(set_description_route),
+        )
+        .route(
+            "/v1/agents/{name}/instructions",
+            get(get_description_route).post(set_description_route),
+        )
+        .route("/v1/browser", post(browser_route))
+        .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+        .route(
+            "/v1/subagent-defaults",
+            get(get_subagent_defaults_route).post(set_subagent_defaults_route),
+        )
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
         .route("/v1/agents/{name}/archive", post(archive_agent_route))
+        .route("/v1/agents/{name}/pause", post(pause_agent_route))
         .route("/v1/agents/{name}/wake", post(wake_agent_route))
+        .route(
+            "/v1/agents/{name}",
+            axum::routing::delete(delete_agent_route),
+        )
         .route(
             "/v1/groups",
             get(list_groups_route).post(group_action_route),
@@ -601,6 +658,230 @@ async fn profiles_route(
     )))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetProfileRequest {
+    profile: String,
+    key: String,
+}
+
+async fn set_profile_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<SetProfileRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "profiles.set", &body.profile)?;
+    let (provider, profile) =
+        create::set_provider_profile(state.store.data_dir(), &body.profile, &body.key)
+            .map_err(ApiError::from_store)?;
+    Ok(Json(serde_json::json!({
+        "provider": provider,
+        "profile": profile,
+    })))
+}
+
+async fn get_subagent_defaults_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
+    Ok(Json(create::load_subagent_defaults(state.store.data_dir())))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSubagentDefaultsRequest {
+    agent: Option<String>,
+    clear: Option<bool>,
+    mode: String,
+    harness: Option<String>,
+    model: Option<String>,
+    profile: Option<String>,
+}
+
+async fn set_subagent_defaults_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<SetSubagentDefaultsRequest>,
+) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
+    let target_label = body.agent.as_deref().unwrap_or("global");
+    require_admin_or_operator(
+        &state.store,
+        &principal,
+        "subagents.set_default",
+        target_label,
+    )?;
+    let mut cfg = create::load_subagent_defaults(state.store.data_dir());
+    if body.clear.unwrap_or(false) {
+        if let Some(ref ag) = body.agent {
+            cfg.agents.remove(ag.trim());
+        } else {
+            cfg.default = create::SubagentDefaultSpec {
+                mode: "inherit".to_string(),
+                harness: None,
+                model: None,
+                profile: None,
+            };
+        }
+    } else {
+        let spec = create::SubagentDefaultSpec {
+            mode: body.mode,
+            harness: body.harness.filter(|s| !s.trim().is_empty()),
+            model: body.model.filter(|s| !s.trim().is_empty()),
+            profile: body.profile.filter(|s| !s.trim().is_empty()),
+        };
+        if let Some(ag) = body
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.agents.insert(ag.to_string(), spec);
+        } else {
+            cfg.default = spec;
+        }
+    }
+    create::save_subagent_defaults(state.store.data_dir(), &cfg).map_err(ApiError::from_store)?;
+    Ok(Json(cfg))
+}
+
+#[derive(Deserialize, Default)]
+struct DescriptionRequest {
+    #[serde(default, alias = "instructions", alias = "role")]
+    description: Option<String>,
+    #[serde(default)]
+    clear: Option<bool>,
+}
+
+async fn get_description_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let rec = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
+        let system_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok();
+        Ok(Json(serde_json::json!({
+            "id": rec.id.as_str(),
+            "name": rec.name,
+            "description": rec.instructions,
+            "system_prompt": system_prompt,
+        })))
+    })
+    .await
+}
+
+async fn set_description_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<DescriptionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        if name.eq_ignore_ascii_case("all")
+            && body.description.is_none()
+            && !body.clear.unwrap_or(false)
+        {
+            require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
+            create::sync_all_agent_instructions(&state.store, state.store.data_dir());
+            return Ok(Json(serde_json::json!({
+                "synced": "all",
+            })));
+        }
+        let target = if name.eq_ignore_ascii_case("self") {
+            match &principal {
+                Principal::Agent { agent_id, .. } => {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                }
+                Principal::Operator => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "`self` requires an agent caller",
+                    ));
+                }
+            }
+        } else {
+            state
+                .store
+                .agent_by_name(&name)
+                .map_err(ApiError::from_store)?
+        };
+        let is_self_or_parent = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                *agent_id == target.id || target.parent_id.as_ref() == Some(agent_id)
+            }
+            Principal::Operator => false,
+        };
+        if !is_self_or_parent {
+            require_admin_or_operator(
+                &state.store,
+                &principal,
+                "agents.set_description",
+                &target.name,
+            )?;
+        }
+        let mut rec = target;
+        if body.clear.unwrap_or(false) {
+            rec = state
+                .store
+                .set_agent_instructions(&rec.id, None)
+                .map_err(ApiError::from_store)?;
+        } else if let Some(ref desc) = body.description {
+            let trimmed = desc.trim();
+            rec = state
+                .store
+                .set_agent_instructions(
+                    &rec.id,
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    },
+                )
+                .map_err(ApiError::from_store)?;
+        }
+        let parent_name = rec
+            .parent_id
+            .as_ref()
+            .and_then(|pid| state.store.agent(pid).ok())
+            .map(|p| p.name);
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
+        create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
+        if let Some((_, _, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
+        {
+            crate::sandbox::share_config_with_seat(&cfg, gid);
+        }
+        Ok(Json(serde_json::json!({
+            "id": rec.id.as_str(),
+            "name": rec.name,
+            "description": rec.instructions,
+            "system_prompt_synced": true,
+        })))
+    })
+    .await
+}
+
+async fn browser_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<crate::browser::BrowserRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let default_profile = match &principal {
+        Principal::Agent { name, .. } => name.clone(),
+        Principal::Operator => "default".to_string(),
+    };
+    spawn_store(move || {
+        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(out))
+    })
+    .await
+}
+
 async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -883,16 +1164,23 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     let lag = store
         .lag(&agent.id, now_ms())
         .map_err(ApiError::from_store)?;
-    let (process, mode, steer, quota) = match health.get(&agent.id) {
-        Some(live) => (
-            if live.process_alive { "alive" } else { "down" },
-            mode_name(live.delivery_mode),
-            steer_name(live.steer_support),
-            live.quota_reset_at_ms,
-        ),
+    let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
+    let (process, turn_state, mode, steer, quota) = match health.get(&agent.id) {
+        Some(live) => {
+            let working = live.process_alive
+                && live.quota_reset_at_ms.is_none()
+                && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn);
+            (
+                if live.process_alive { "alive" } else { "down" },
+                if working { "working" } else { "idle" },
+                mode_name(live.delivery_mode),
+                steer_name(live.steer_support),
+                live.quota_reset_at_ms,
+            )
+        }
         None => {
             let (mode, steer) = declared(&agent.harness);
-            ("down", mode_name(mode), steer_name(steer), None)
+            ("down", "idle", mode_name(mode), steer_name(steer), None)
         }
     };
     Ok(AgentView {
@@ -904,11 +1192,13 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         workdir: agent.workdir.clone(),
         state: agent.state.clone(),
         process: process.to_string(),
+        turn_state: turn_state.to_string(),
         delivery_mode: mode.to_string(),
         steer_support: steer.to_string(),
         quota_reset_at_ms: quota,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: install_state(store, agent),
+        description: agent.instructions.clone(),
     })
 }
 
@@ -960,25 +1250,21 @@ async fn create_agent_route(
             (None, None) => None,
         };
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
-        let harness = {
-            let trimmed = body.harness.trim();
-            if !trimmed.is_empty() {
-                trimmed.to_string()
-            } else if let Some(ref p) = parent_agent
-                && p.harness != "agy"
-            {
-                p.harness.clone()
-            } else {
-                "claude-code".to_string()
-            }
-        };
+        let (harness, model, profile) = create::resolve_subagent_defaults(
+            state.store.data_dir(),
+            parent_agent.as_ref(),
+            &body.harness,
+            body.model,
+            body.profile,
+        );
         let agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
                 harness,
-                model: body.model,
+                model,
+                profile,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
                 instructions: body.instructions,
@@ -1043,11 +1329,25 @@ async fn archive_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        if matches!(principal, Principal::Agent { .. }) && found.parent_id.is_none() {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "only an operator can archive a root agent; pass a sub-agent name or id in `agent`",
-            ));
+        if found.parent_id.is_none() {
+            if matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "a root agent cannot archive itself; pass a target agent name or id in `agent`",
+                ));
+            }
+            require_admin_or_operator(
+                &state.store,
+                &principal,
+                "agents.archive_root",
+                &found.name,
+            )?;
+        } else if matches!(
+            &principal,
+            Principal::Agent { agent_id, .. }
+                if agent_id != &found.id && found.parent_id.as_ref() != Some(agent_id)
+        ) {
+            require_admin_or_operator(&state.store, &principal, "agents.archive", &found.name)?;
         }
         let agent = state
             .store
@@ -1064,7 +1364,228 @@ async fn archive_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        if found.parent_id.is_some() {
+            reap_subagent_ephemeral_dirs(state.store.data_dir(), &found.id);
+        }
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
+    })
+    .await
+}
+
+pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
+    let agent_root = data_dir.join("agents").join(agent_id.as_str());
+    let config_dir = agent_root.join("config");
+    let seat_ids = detect_seat_ids(&config_dir);
+    for rel in [
+        "cache-home",
+        "state-home",
+        "tmp",
+        ".rustup",
+        ".cargo",
+        "data-home/opencode",
+        "opencode-session-id",
+        "claude-session-id",
+        ".claude/projects",
+        ".codex/sessions",
+    ] {
+        let target = config_dir.join(rel);
+        remove_path_with_seat(&target, seat_ids);
+    }
+    let work_dir = agent_root.join("work");
+    remove_path_with_seat(&work_dir, seat_ids);
+}
+
+#[cfg(unix)]
+fn detect_seat_ids(config_dir: &Path) -> Option<(u32, u32, u32)> {
+    use std::os::unix::fs::MetadataExt as _;
+    let (me, my_gid) = std::fs::metadata("/proc/self")
+        .map(|m| (m.uid(), m.gid()))
+        .unwrap_or((0, 0));
+    let cfg_meta = std::fs::metadata(config_dir).ok()?;
+    let gid = cfg_meta.gid();
+    let sock_gid = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.gid())
+        .unwrap_or(gid);
+    if cfg_meta.uid() != me && cfg_meta.uid() != 0 {
+        return Some((cfg_meta.uid(), gid, sock_gid));
+    }
+    if let Ok(entries) = std::fs::read_dir(config_dir) {
+        for entry in entries.flatten() {
+            if let Ok(m) = entry.metadata() {
+                if m.uid() != me && m.uid() != 0 {
+                    return Some((m.uid(), gid, sock_gid));
+                }
+                if m.is_dir()
+                    && let Ok(sub) = std::fs::read_dir(entry.path())
+                {
+                    for child in sub.flatten() {
+                        if let Ok(cm) = child.metadata()
+                            && cm.uid() != me
+                            && cm.uid() != 0
+                        {
+                            return Some((cm.uid(), gid, sock_gid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if gid != my_gid && gid != 0 {
+        return Some((gid, gid, sock_gid));
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn detect_seat_ids(_config_dir: &Path) -> Option<(u32, u32, u32)> {
+    None
+}
+
+fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) {
+    let Ok(meta) = std::fs::symlink_metadata(target) else {
+        return;
+    };
+    if meta.file_type().is_symlink() || meta.is_file() {
+        if std::fs::remove_file(target).is_ok() {
+            return;
+        }
+    } else if meta.is_dir() && std::fs::remove_dir_all(target).is_ok() {
+        return;
+    }
+    if let Some((uid, gid, sock_gid)) = seat_ids
+        && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+    {
+        let uid_s = uid.to_string();
+        let gid_s = gid.to_string();
+        let groups_s = if sock_gid != gid && sock_gid != 0 {
+            format!("{gid},{sock_gid}")
+        } else {
+            gid_s.clone()
+        };
+        let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+            .args([
+                "--reuid",
+                &uid_s,
+                "--regid",
+                &gid_s,
+                "--groups",
+                &groups_s,
+                "--no-new-privs",
+                "--",
+                "/bin/rm",
+                "-rf",
+            ])
+            .arg(target)
+            .status();
+        let _ = std::fs::remove_dir_all(target);
+        let _ = std::fs::remove_file(target);
+    }
+}
+
+async fn pause_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        if found.parent_id.is_none() {
+            if matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "a root agent cannot pause itself; pass a target agent name or id in `agent`",
+                ));
+            }
+            require_admin_or_operator(&state.store, &principal, "agents.pause_root", &found.name)?;
+        } else if matches!(
+            &principal,
+            Principal::Agent { agent_id, .. }
+                if agent_id != &found.id && found.parent_id.as_ref() != Some(agent_id)
+        ) {
+            require_admin_or_operator(&state.store, &principal, "agents.pause", &found.name)?;
+        }
+        let agent = state
+            .store
+            .set_agent_state(&found.id, "paused")
+            .map_err(ApiError::from_store)?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if state
+                .health
+                .get(&found.id)
+                .is_none_or(|live| !live.process_alive)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        Ok(Json(agent_view(&state.store, &state.health, &agent)?))
+    })
+    .await
+}
+
+async fn delete_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        if found.parent_id.is_none() {
+            if matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "a root agent cannot delete itself",
+                ));
+            }
+            require_admin_or_operator(&state.store, &principal, "agents.delete_root", &found.name)?;
+        } else if matches!(
+            &principal,
+            Principal::Agent { agent_id, .. }
+                if agent_id != &found.id && found.parent_id.as_ref() != Some(agent_id)
+        ) {
+            require_admin_or_operator(&state.store, &principal, "agents.delete", &found.name)?;
+        }
+        let _ = state.store.set_agent_state(&found.id, "archived");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            if state
+                .health
+                .get(&found.id)
+                .is_none_or(|live| !live.process_alive)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let deleted = state
+            .store
+            .delete_agent(&found.id)
+            .map_err(ApiError::from_store)?;
+        let agent_dir = state
+            .store
+            .data_dir()
+            .join("agents")
+            .join(deleted.id.as_str());
+        let seat_ids = detect_seat_ids(&agent_dir.join("config"));
+        reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
+        remove_path_with_seat(&agent_dir.join("config"), seat_ids);
+        remove_path_with_seat(&agent_dir, seat_ids);
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        Ok(Json(serde_json::json!({
+            "id": deleted.id.as_str(),
+            "name": deleted.name,
+            "deleted": true,
+        })))
     })
     .await
 }
@@ -1088,6 +1609,23 @@ async fn wake_agent_route(
     .await
 }
 
+fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::GroupMemberView> {
+    let mut out = Vec::with_capacity(members.len());
+    for name in members {
+        if let Ok(agent) = store.agent_by_name(name) {
+            out.push(crate::api::GroupMemberView {
+                id: agent.id.to_string(),
+                name: agent.name,
+                harness: agent.harness,
+                model: agent.model,
+                state: agent.state,
+                description: agent.instructions,
+            });
+        }
+    }
+    out
+}
+
 async fn list_groups_route(
     _principal: Principal,
     State(state): State<AppState>,
@@ -1096,7 +1634,14 @@ async fn list_groups_route(
         let rows = state.store.list_groups().map_err(ApiError::from_store)?;
         let groups = rows
             .into_iter()
-            .map(|(name, members)| GroupView { name, members })
+            .map(|(name, members)| {
+                let roster = build_group_roster(&state.store, &members);
+                GroupView {
+                    name,
+                    members,
+                    roster,
+                }
+            })
             .collect();
         Ok(Json(GroupsResponse { groups }))
     })
@@ -1172,9 +1717,11 @@ async fn group_action_route(
             .room_members(&group)
             .map_err(ApiError::from_store)?
             .unwrap_or_default();
+        let roster = build_group_roster(&state.store, &members);
         Ok(Json(GroupView {
             name: group,
             members,
+            roster,
         }))
     })
     .await
@@ -1191,6 +1738,8 @@ struct ConversationQuery {
     with: Option<String>,
     since_ms: Option<i64>,
     limit: Option<usize>,
+    #[serde(default, alias = "q", alias = "search")]
+    query: Option<String>,
 }
 
 async fn inbox(
@@ -1232,19 +1781,57 @@ async fn conversation_route(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
-        let agent = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
-        let turns = state
-            .store
-            .conversation(
-                &agent.id,
-                query.with.as_deref(),
-                query.since_ms,
-                query.limit,
-            )
-            .map_err(ApiError::from_store)?
+        let clean_q = query
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let is_all = name.eq_ignore_ascii_case("all") || name == "*";
+        let (agent_name, agent_id_str, raw_turns) = if let Some(q) = clean_q {
+            let qvec =
+                crate::channel::embed_query_for_store(&state.store, state.store.data_dir(), q);
+            let turns = state
+                .store
+                .search_conversation(
+                    Some(&name),
+                    query.with.as_deref(),
+                    query.since_ms,
+                    query.limit,
+                    q,
+                    qvec.as_deref(),
+                )
+                .map_err(ApiError::from_store)?;
+            let (aname, aid) = if is_all {
+                ("all".to_string(), "all".to_string())
+            } else if let Ok(a) = state.store.agent_by_name(&name) {
+                (a.name, a.id.to_string())
+            } else {
+                (name.clone(), name.clone())
+            };
+            (aname, aid, turns)
+        } else if is_all {
+            let turns = state
+                .store
+                .conversation_all(query.with.as_deref(), query.since_ms, query.limit)
+                .map_err(ApiError::from_store)?;
+            ("all".to_string(), "all".to_string(), turns)
+        } else {
+            let agent = state
+                .store
+                .agent_by_name(&name)
+                .map_err(ApiError::from_store)?;
+            let turns = state
+                .store
+                .conversation(
+                    &agent.id,
+                    query.with.as_deref(),
+                    query.since_ms,
+                    query.limit,
+                )
+                .map_err(ApiError::from_store)?;
+            (agent.name, agent.id.to_string(), turns)
+        };
+        let turns = raw_turns
             .into_iter()
             .map(|t| ConversationTurnView {
                 id: t.id,
@@ -1257,8 +1844,8 @@ async fn conversation_route(
             })
             .collect();
         Ok(Json(ConversationResponse {
-            agent: agent.name,
-            agent_id: agent.id.to_string(),
+            agent: agent_name,
+            agent_id: agent_id_str,
             turns,
         }))
     })
@@ -2185,7 +2772,7 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter(|agent| agent.state != "archived")
+        .filter(|agent| agent.state != "archived" && agent.state != "paused")
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
         .filter(|agent| {
             members

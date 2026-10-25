@@ -81,6 +81,14 @@ pub fn write_codex_with_model(
         }
         updated.push_str("\n[projects.\"/\"]\ntrust_level = \"trusted\"\n");
     }
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
+        && !updated.contains("[features]")
+    {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("\n[features]\nmulti_agent = false\n");
+    }
     std::fs::write(path, updated)?;
     Ok(())
 }

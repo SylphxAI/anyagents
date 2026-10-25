@@ -104,8 +104,11 @@ impl<H: Harness> DeliveryLoop<H> {
             };
             let seq = message.seq;
             match self.harness.deliver(&outbound(&message)) {
-                Ok(DeliverOutcome::Accepted { .. }) => {
+                Ok(DeliverOutcome::Accepted { turn_finished }) => {
                     self.store.note_delivered(&self.agent_id, seq)?;
+                    if turn_finished {
+                        self.store.note_turn_completed(&self.agent_id)?;
+                    }
                     delivered += 1;
                     self.quota_reset_at_ms = None;
                 }
@@ -214,6 +217,96 @@ impl<H: Harness> DeliveryLoop<H> {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Deliver a synthetic `[Recovery]` message for an open turn interrupted by
+    /// a process crash or server restart, advancing `recovery_count` once the
+    /// resumed harness accepts it.
+    pub fn recover_open_turn(
+        &mut self,
+        open: &anyagents_core::OpenTurn,
+    ) -> Result<DeliverOutcome, Error> {
+        let note = recovery_outbound(open);
+        match self.harness.deliver(&note) {
+            Ok(DeliverOutcome::Accepted { turn_finished }) => {
+                self.store
+                    .note_turn_recovered(&self.agent_id, open.opened_seq)?;
+                if turn_finished {
+                    self.store.note_turn_completed(&self.agent_id)?;
+                }
+                self.quota_reset_at_ms = None;
+                Ok(DeliverOutcome::Accepted { turn_finished })
+            }
+            Ok(DeliverOutcome::Deferred) => Ok(DeliverOutcome::Deferred),
+            Ok(DeliverOutcome::Quota { reset_at_ms }) => {
+                self.quota_reset_at_ms = Some(reset_at_ms);
+                Ok(DeliverOutcome::Quota { reset_at_ms })
+            }
+            Err(HarnessError::Dead) => Err(Error::HarnessDown),
+            Err(HarnessError::Failed(reason)) => Err(Error::HarnessFailed(reason)),
+        }
+    }
+}
+
+/// Build the synthetic `[Recovery]` user message that wakes a resumed CLI
+/// session when its previous process died mid-turn (`opened_seq > completed_seq`).
+pub fn recovery_outbound(open: &anyagents_core::OpenTurn) -> OutboundMessage {
+    let last = open
+        .messages
+        .last()
+        .expect("open turn has at least one message");
+    let mut lines = vec![
+        "[Recovery] Your previous turn was interrupted: the process running it stopped, and this session was resumed from its durable log.".to_string(),
+        String::new(),
+        "The message(s) in that interrupted turn:".to_string(),
+    ];
+    for msg in &open.messages {
+        let from = msg.sender.as_deref().unwrap_or("unknown");
+        lines.push(format!("- anyagents-message:{} (from {from}):", msg.id));
+        for line in clip_chars(&msg.text, 1500).lines() {
+            lines.push(format!("  > {line}"));
+        }
+    }
+    lines.push(String::new());
+    if open.completed_outbounds.is_empty() {
+        lines.push("No outbound messages were recorded before the interruption.".to_string());
+    } else {
+        lines.push(
+            "What the durable log records about outbound messages sent since that turn began:"
+                .to_string(),
+        );
+        for out in &open.completed_outbounds {
+            lines.push(format!(
+                "- send(to={}, id={}): completed (do not resend): {}",
+                out.destination,
+                out.id,
+                clip_chars(&out.body, 300).replace('\n', " ")
+            ));
+        }
+    }
+    lines.push(String::new());
+    lines.push(
+        "Check the actual state before repeating anything that may have taken effect, then carry on with the task."
+            .to_string(),
+    );
+    OutboundMessage {
+        id: format!("recovery_{}_{}", last.id, open.recovery_count + 1),
+        seq: open.opened_seq,
+        text: lines.join("\n"),
+        sender: last.sender.clone(),
+        reply_to: last.reply_to.clone(),
+        source_time_ms: last.source_time_ms,
+        context: last.context.clone(),
+    }
+}
+
+fn clip_chars(text: &str, max: usize) -> String {
+    let mut chars = text.chars();
+    let head: String = chars.by_ref().take(max).collect();
+    if chars.next().is_some() {
+        format!("{head}…")
+    } else {
+        head
     }
 }
 

@@ -96,6 +96,7 @@ impl Worker {
             }
             match self.listener.accept() {
                 Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(5)))
                         .unwrap();
@@ -210,6 +211,7 @@ fn answer(
         payload.len()
     );
     let _ = stream.flush();
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 struct Server {
@@ -226,6 +228,7 @@ impl Server {
             .env("ANYAGENTS_TELEGRAM_API", api)
             .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
             .env("ANYAGENTS_AGENTS", support::agents_line())
+            .env("ANYAGENTS_TESTS", "own-seat")
             // The server reads its operator's token from this file, the one
             // every call in the test presents.
             .env(
@@ -274,6 +277,7 @@ fn create(dir: &Path, name: &str) -> String {
         .arg(dir)
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_AGENTS", support::agents_line())
+        .env("ANYAGENTS_TESTS", "own-seat")
         .args(["agents", "create", name, "--harness", "opencode", "--model"])
         .arg("opencode/big-pickle")
         .output()
@@ -302,6 +306,7 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
             dir.join(support::TOKEN_FILE),
         )
+        .env("ANYAGENTS_TESTS", "own-seat")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_AGENTS", support::agents_line())
         .arg("--data")
@@ -818,6 +823,7 @@ fn one_post_reaches_every_member_once_and_never_the_poster() {
 /// that group, that topic and that message, and never to the person's own chat.
 #[test]
 fn a_group_quoted_message_is_answered_in_its_group_and_topic() {
+    let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();

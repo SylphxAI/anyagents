@@ -216,6 +216,10 @@ impl Harness for FakeHarness {
             sign_in_fault: None,
         }
     }
+
+    fn turns_served(&self) -> u32 {
+        self.finished.len() as u32
+    }
 }
 
 #[cfg(test)]

@@ -289,8 +289,10 @@ fn mid_turn_messages_enter_hook_context_before_tool_without_duplicates() {
         .unwrap()
         .as_str()
         .unwrap();
-    assert!(context.contains("from: agent:teammate"));
-    assert!(context.contains("channel: room"));
+    assert!(
+        context.contains("from=\"agent:teammate\"") || context.contains("from: agent:teammate")
+    );
+    assert!(context.contains("channel=\"room\"") || context.contains("channel: room"));
     assert!(
         context.find("anyagents-message:m2").unwrap()
             < context.find("anyagents-message:m3").unwrap()

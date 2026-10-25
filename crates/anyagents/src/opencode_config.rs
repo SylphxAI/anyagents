@@ -39,12 +39,50 @@ pub fn write(
     if !root.is_object() {
         root = serde_json::json!({});
     }
+    if root.get("provider").is_none()
+        && let Some(donor) = donor_provider_block(dir)
+    {
+        root["provider"] = donor;
+    }
     let has_sylphx_provider = root.get("provider").and_then(|p| p.get("sylphx")).is_some();
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         let normalized = normalize_model(raw_model, has_sylphx_provider);
-        root["model"] = serde_json::Value::String(normalized);
+        let (base_model, variant) = match normalized.split_once('#') {
+            Some((b, v)) if !b.is_empty() && !v.is_empty() => (b.to_string(), Some(v.to_string())),
+            _ => (normalized, None),
+        };
+        root["model"] = serde_json::Value::String(base_model.clone());
+        let mut build_agent = serde_json::json!({
+            "model": base_model,
+        });
+        if let Some(v) = variant {
+            build_agent["variant"] = serde_json::Value::String(v);
+        }
+        root["agent"] = serde_json::json!({
+            "build": build_agent,
+        });
     } else if root.get("model").is_none() && has_sylphx_provider {
-        root["model"] = serde_json::Value::String("sylphx/openai/gpt-6.1-sol#medium".to_string());
+        root["model"] = serde_json::Value::String("sylphx/openai/gpt-6.1-sol".to_string());
+        root["agent"] = serde_json::json!({
+            "build": {
+                "model": "sylphx/openai/gpt-6.1-sol",
+                "variant": "medium",
+            }
+        });
+    }
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        if !root.get("tools").is_some_and(|v| v.is_object()) {
+            root["tools"] = serde_json::json!({});
+        }
+        root["tools"]["task"] = serde_json::Value::Bool(false);
+        if let Some(build) = root.get_mut("agent").and_then(|a| a.get_mut("build"))
+            && build.is_object()
+        {
+            if !build.get("tools").is_some_and(|v| v.is_object()) {
+                build["tools"] = serde_json::json!({});
+            }
+            build["tools"]["task"] = serde_json::Value::Bool(false);
+        }
     }
     root["mcp"] = serde_json::json!({
         "anyagents": {
@@ -62,6 +100,33 @@ pub fn write(
     std::fs::create_dir_all(&home_opencode_dir)?;
     std::fs::write(home_opencode_dir.join("opencode.json"), &bytes)?;
     Ok(())
+}
+
+fn donor_provider_block(dir: &Path) -> Option<serde_json::Value> {
+    let mut candidates = Vec::new();
+    if let Some(data_dir) = dir.parent().and_then(Path::parent) {
+        candidates.push(data_dir.join("opencode-provider.json"));
+    }
+    if let Some(host_home) = crate::sandbox::host_home_dir() {
+        candidates.push(
+            host_home
+                .join(".config")
+                .join("opencode")
+                .join("opencode.json"),
+        );
+    }
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+        if let Some(provider) = val.get("provider").cloned() {
+            return Some(provider);
+        }
+    }
+    None
 }
 
 fn normalize_model(raw: &str, has_sylphx_provider: bool) -> String {

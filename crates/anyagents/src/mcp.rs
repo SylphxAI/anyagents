@@ -22,8 +22,8 @@ use serde::de::DeserializeOwned;
 
 use crate::api::{
     AgentView, AgentsResponse, ConversationResponse, CreateAgentRequest, GroupActionRequest,
-    GroupView, GroupsResponse, InboxResponse, InteractRequest, InteractResponse, SendArticle,
-    SendChecklist, SendLocation, SendMedia, SendPoll, SendRequest, SendResponse,
+    GroupView, GroupsResponse, InteractRequest, InteractResponse, SendArticle, SendChecklist,
+    SendLocation, SendMedia, SendPoll, SendRequest, SendResponse,
 };
 use crate::operator::CAPABILITY_FILE;
 use crate::server;
@@ -161,6 +161,15 @@ impl Client {
         body: Option<Vec<u8>>,
     ) -> Result<T, String> {
         let method = if body.is_some() { "POST" } else { "GET" };
+        self.request_method(method, path, body).await
+    }
+
+    async fn request_method<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Vec<u8>>,
+    ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
         let (status, bytes) = request_naming(
@@ -229,32 +238,28 @@ struct SendArgs {
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
-struct InboxArgs {
-    /// Exclusive sequence cursor. Omit to read from the start (or the latest `limit` messages).
-    #[serde(default)]
-    since: Option<i64>,
-    /// Optional maximum number of messages to return (when `since` is omitted,
-    /// returns the most recent `limit` messages).
-    #[serde(default)]
-    limit: Option<usize>,
-}
-
-#[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ConversationArgs {
-    /// Agent name or `agt_...` ID whose complete two-way (`in` + `out`) conversation
-    /// to read. Defaults to this agent when omitted. Any agent can read any peer's
-    /// or sub-agent's conversation across users, channels, groups, and other agents.
+    /// Optional semantic + keyword search query (Hybrid RAG: dense vector embedding
+    /// `voyageai/voyage-4-large` + SQLite FTS5 trigram BM25 with Reciprocal Rank Fusion).
+    /// When set, searches across all historical and live turns without loading the
+    /// full history. Omit `query` to read recent chronological turns.
+    #[serde(default, alias = "q", alias = "search")]
+    query: Option<String>,
+    /// Agent name (`sage`, `argon`, `prism`, `"all"`) or `agt_...` ID whose complete
+    /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
+    /// `query` is provided (searching across all agents), or this agent when reading
+    /// recent chronological turns.
     #[serde(default)]
     agent: Option<String>,
     /// Optional peer filter (e.g. `alice`, `telegram:user:42`, `telegram:chat:-1001234567890`,
-    /// `group:crew`, or `agent:beta`).
+    /// `group:owners`, or `agent:beta`).
     #[serde(default)]
     with: Option<String>,
     /// Optional exclusive timestamp cursor in milliseconds (`timestamp_ms > since_ms`).
     #[serde(default)]
     since_ms: Option<i64>,
-    /// Optional maximum number of turns to return (when `since_ms` is omitted,
-    /// returns the most recent `limit` turns). Defaults to 50 when omitted.
+    /// Optional maximum number of turns to return (defaults to 20 when `query` is set,
+    /// or 50 for chronological history).
     #[serde(default)]
     limit: Option<usize>,
 }
@@ -276,22 +281,88 @@ struct SpawnArgs {
     /// `<caller>-sub-<id>` name is generated automatically.
     #[serde(default)]
     name: Option<String>,
-    /// Harness catalog ID (`claude-code`, `codex`, `opencode`, `muse`). Defaults to
-    /// the caller's own harness (or `claude-code` when the caller runs on `agy`).
+    /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+    /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
     #[serde(default)]
     harness: Option<String>,
-    /// Optional model override.
+    /// Optional model override (e.g. `sylphx/openai/gpt-6.1-sol#medium`, `claude-opus-5-5#high`).
     #[serde(default)]
     model: Option<String>,
+    /// Optional upstream provider account profile (e.g. `acct-a`, `openai/default`, `sylphx/default`).
+    #[serde(default)]
+    profile: Option<String>,
     /// Optional working directory path.
     #[serde(default)]
     workdir: Option<String>,
-    /// Optional system instructions for the spawned agent.
-    #[serde(default)]
+    /// Optional system/role description or standing instructions for the spawned agent.
+    #[serde(default, alias = "description", alias = "role")]
     instructions: Option<String>,
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
     prompt: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DescribeArgs {
+    /// Target agent name (`"self"`, `"xenon"`, `"sage"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    #[serde(default, alias = "name", alias = "target")]
+    agent: Option<String>,
+    /// New role/responsibility description to set (syncs into the agent's private system prompt and group roster).
+    /// Omit to read the current description.
+    #[serde(default, alias = "instructions", alias = "role", alias = "text")]
+    description: Option<String>,
+    /// Set `true` to clear the agent's custom description.
+    #[serde(default)]
+    clear: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct SubagentsArgs {
+    /// Action to perform: `"list"` (default: list sub-agents and their live status),
+    /// `"inspect"` / `"status"` (inspect a sub-agent's live status + recent conversation turns),
+    /// `"spawn"` (create and start a new cross-harness sub-agent),
+    /// `"steer"` / `"send"` (send/steer a follow-up prompt into a sub-agent, waking it if archived),
+    /// `"wake"` / `"resume"` (wake an archived or paused sub-agent, with optional `prompt`),
+    /// `"pause"` (pause a sub-agent), `"archive"` (archive a sub-agent to scale to zero),
+    /// or `"delete"` / `"kill"` (permanently delete a sub-agent).
+    #[serde(default)]
+    action: Option<String>,
+    /// Target sub-agent name or `agt_...` ID (for `inspect`, `steer`, `wake`, `pause`, `archive`, `delete`, or `name` for `spawn`).
+    #[serde(
+        default,
+        alias = "id",
+        alias = "name",
+        alias = "agent_id",
+        alias = "target"
+    )]
+    agent: Option<String>,
+    /// Optional state filter for `list`: `"running"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
+    #[serde(default)]
+    state: Option<String>,
+    /// Optional parent filter for `list`: `"self"` (default: this agent's sub-agents), `"all"` (all sub-agents across all parents), or a parent agent name/ID.
+    #[serde(default)]
+    parent: Option<String>,
+    /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+    #[serde(default)]
+    harness: Option<String>,
+    /// Optional model override when `action = "spawn"`.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional account profile when `action = "spawn"`.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Optional working directory when `action = "spawn"`.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Optional system/role instructions when `action = "spawn"`.
+    #[serde(default, alias = "description", alias = "role")]
+    instructions: Option<String>,
+    /// Task prompt or follow-up message when `action` is `"spawn"`, `"steer"`, `"send"`, `"wake"`, or `"resume"`.
+    #[serde(default, alias = "text", alias = "message")]
+    prompt: Option<String>,
+    /// Number of recent conversation turns to include when `action = "inspect"` (default 10).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -311,9 +382,12 @@ struct ArchiveArgs {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 struct WakeArgs {
-    /// Agent name or `agt_...` ID to wake and resume from `archived` state.
+    /// Agent name or `agt_...` ID to wake and resume from `archived` or `paused` state.
     #[serde(alias = "id", alias = "name", alias = "agent_id", alias = "target")]
     agent: String,
+    /// Optional follow-up prompt/message to deliver immediately after waking.
+    #[serde(default, alias = "text", alias = "message")]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -406,42 +480,24 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Read this agent's own incoming mailbox (`since`, `limit`). To inspect another agent's full two-way (`in` + `out`) conversation with users, channels, groups, or other agents, use `conversation`."
-    )]
-    async fn inbox(
-        &self,
-        Parameters(args): Parameters<InboxArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<InboxResponse>, String> {
-        let target = match crate::client::agent_identity() {
-            Some(id) => id.to_string(),
-            None => self.agent.id.to_string(),
-        };
-        let mut query = Vec::new();
-        if let Some(since) = args.since {
-            query.push(format!("since={since}"));
-        }
-        if let Some(limit) = args.limit {
-            query.push(format!("limit={limit}"));
-        }
-        let path = if query.is_empty() {
-            format!("/v1/agents/{target}/inbox")
-        } else {
-            format!("/v1/agents/{target}/inbox?{}", query.join("&"))
-        };
-        let response = self.client.get(&path, None).await?;
-        Ok(rmcp::handler::server::wrapper::Json(response))
-    }
-
-    #[tool(
-        description = "Read the complete two-way (`in` + `out`) conversation of any agent (`agent` by name or `agt_...` ID; defaults to this agent) with users, external channels, internal groups, and other agents. Supports optional `with` peer filter, `since_ms`, and `limit`."
+        description = "Unified two-way (`in` + `out`) conversation reader and Hybrid RAG semantic search (`query`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` to run Hybrid RAG search (dense vector embedding + BM25 keyword search) across all agents' historical memory (`agent` defaults to `\"all\"`), or omit `query` to read recent chronological two-way turns of yourself or any peer (`agent`, `with`, `since_ms`, `limit`)."
     )]
     async fn conversation(
         &self,
         Parameters(args): Parameters<ConversationArgs>,
     ) -> Result<rmcp::handler::server::wrapper::Json<ConversationResponse>, String> {
-        let default_agent = match crate::client::agent_identity() {
-            Some(id) => id.to_string(),
-            None => self.agent.id.to_string(),
+        let clean_q = args
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let default_agent = if clean_q.is_some() {
+            "all".to_string()
+        } else {
+            match crate::client::agent_identity() {
+                Some(id) => id.to_string(),
+                None => self.agent.id.to_string(),
+            }
         };
         let target = args
             .agent
@@ -451,6 +507,9 @@ impl AgentMcp {
             .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
             .unwrap_or(default_agent);
         let mut query = Vec::new();
+        if let Some(q) = clean_q {
+            query.push(format!("query={}", urlencoding_simple(q)));
+        }
         if let Some(with_peer) = args
             .with
             .as_deref()
@@ -462,11 +521,23 @@ impl AgentMcp {
         if let Some(since_ms) = args.since_ms {
             query.push(format!("since_ms={since_ms}"));
         }
-        let limit = args.limit.unwrap_or(50);
+        let limit = args
+            .limit
+            .unwrap_or(if clean_q.is_some() { 20 } else { 50 });
         query.push(format!("limit={limit}"));
         let path = format!("/v1/agents/{target}/conversation?{}", query.join("&"));
         let response = self.client.get(&path, None).await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Hybrid RAG semantic + keyword search across all agents' historical and live conversations (`query`, optional `agent`, `with`, `since_ms`, `limit`). Uses locked `voyageai/voyage-4-large` dense embeddings fused with SQLite FTS5 trigram BM25."
+    )]
+    async fn search(
+        &self,
+        Parameters(args): Parameters<ConversationArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<ConversationResponse>, String> {
+        self.conversation(Parameters(args)).await
     }
 
     #[tool(
@@ -523,7 +594,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. When finished, the sub-agent can be archived via `archive` and later resumed at any time by sending a message to its ID/name or calling `wake`."
+        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. The sub-agent automatically scales to zero (`state = archived`) once its turn finishes and its mailbox is drained, and automatically wakes/resumes whenever a new message is sent to its ID/name."
     )]
     async fn spawn(
         &self,
@@ -547,6 +618,7 @@ impl AgentMcp {
             name,
             harness,
             model: args.model,
+            profile: args.profile,
             workdir: args.workdir,
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
@@ -560,6 +632,218 @@ impl AgentMcp {
             )
             .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view a sub-agent's live status AND its recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workdir; use `steer` to send follow-up instructions; use `pause`, `archive`, `wake`, or `delete` to control its lifecycle."
+    )]
+    async fn subagents(
+        &self,
+        Parameters(args): Parameters<SubagentsArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let action = args
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("list")
+            .to_ascii_lowercase();
+        match action.as_str() {
+            "list" | "ls" => {
+                let parent_arg = args
+                    .parent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("self");
+                let mut resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                if parent_arg.eq_ignore_ascii_case("all") {
+                    resp.agents.retain(|a| a.parent.is_some());
+                } else {
+                    let cleaned = parent_arg.strip_prefix("agent:").unwrap_or(parent_arg);
+                    let wanted_id = if cleaned.eq_ignore_ascii_case("self")
+                        || cleaned.eq_ignore_ascii_case(&self.agent.name)
+                        || cleaned == self.agent.id.as_str()
+                    {
+                        self.agent.id.to_string()
+                    } else {
+                        resp.agents
+                            .iter()
+                            .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
+                            .map(|a| a.id.clone())
+                            .unwrap_or_else(|| cleaned.to_string())
+                    };
+                    resp.agents
+                        .retain(|a| a.parent.as_deref() == Some(wanted_id.as_str()));
+                }
+                if let Some(st) = args
+                    .state
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+                {
+                    resp.agents.retain(|a| a.state.eq_ignore_ascii_case(st));
+                }
+                let running = resp.agents.iter().filter(|a| a.state == "running").count();
+                let working = resp
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "working")
+                    .count();
+                let paused = resp.agents.iter().filter(|a| a.state == "paused").count();
+                let archived = resp.agents.iter().filter(|a| a.state == "archived").count();
+                Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                    "parent": self.agent.name,
+                    "summary": {
+                        "total": resp.agents.len(),
+                        "running": running,
+                        "working": working,
+                        "idle": running.saturating_sub(working),
+                        "paused": paused,
+                        "archived": archived,
+                    },
+                    "subagents": resp.agents,
+                })))
+            }
+            "inspect" | "status" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "`subagents inspect` requires `agent` (name or agt_... id)".to_string()
+                    })?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                let view = resp
+                    .agents
+                    .into_iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(clean) || a.id == clean)
+                    .ok_or_else(|| format!("sub-agent `{clean}` not found"))?;
+                let limit = args.limit.unwrap_or(10);
+                let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
+                let conv: ConversationResponse =
+                    self.client
+                        .get(&conv_path, None)
+                        .await
+                        .unwrap_or(ConversationResponse {
+                            agent_id: view.id.clone(),
+                            agent: view.name.clone(),
+                            turns: Vec::new(),
+                        });
+                Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                    "subagent": view,
+                    "recent_turns": conv.turns,
+                })))
+            }
+            "spawn" | "create" => {
+                let spawned = self
+                    .spawn(Parameters(SpawnArgs {
+                        name: args.agent,
+                        harness: args.harness,
+                        model: args.model,
+                        profile: args.profile,
+                        workdir: args.workdir,
+                        instructions: args.instructions,
+                        prompt: args.prompt,
+                    }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(spawned).map_err(|e| e.to_string())?,
+                ))
+            }
+            "steer" | "send" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents steer` requires `agent`".to_string())?;
+                let text = args
+                    .prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents steer` requires `prompt`".to_string())?;
+                let sent = self
+                    .send(Parameters(SendArgs {
+                        to: vec![target.to_string()],
+                        text: text.to_string(),
+                        ..SendArgs::default()
+                    }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(sent).map_err(|e| e.to_string())?,
+                ))
+            }
+            "wake" | "resume" => {
+                let target = args
+                    .agent
+                    .ok_or_else(|| "`subagents wake` requires `agent`".to_string())?;
+                let woke = self
+                    .wake(Parameters(WakeArgs {
+                        agent: target,
+                        prompt: args.prompt,
+                    }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(woke).map_err(|e| e.to_string())?,
+                ))
+            }
+            "pause" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents pause` requires `agent`".to_string())?
+                    .strip_prefix("agent:")
+                    .unwrap_or_default()
+                    .to_string();
+                let clean = if target.is_empty() {
+                    args.agent.unwrap()
+                } else {
+                    target
+                };
+                let view: AgentView = self
+                    .client
+                    .get(&format!("/v1/agents/{clean}/pause"), Some(b"{}".to_vec()))
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(view).map_err(|e| e.to_string())?,
+                ))
+            }
+            "archive" => {
+                let view = self
+                    .archive(Parameters(ArchiveArgs { agent: args.agent }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(view).map_err(|e| e.to_string())?,
+                ))
+            }
+            "delete" | "kill" | "remove" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents delete` requires `agent`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let deleted: serde_json::Value = self
+                    .client
+                    .request_method("DELETE", &format!("/v1/agents/{clean}"), None)
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(deleted))
+            }
+            other => Err(format!(
+                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, or `delete`"
+            )),
+        }
     }
 
     #[tool(
@@ -586,7 +870,9 @@ impl AgentMcp {
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
-    #[tool(description = "Wake and resume an archived agent by its `agt_...` ID or name.")]
+    #[tool(
+        description = "Wake and resume an archived or paused agent by its `agt_...` ID or name, optionally delivering a follow-up `prompt`."
+    )]
     async fn wake(
         &self,
         Parameters(args): Parameters<WakeArgs>,
@@ -595,11 +881,26 @@ impl AgentMcp {
             .agent
             .trim()
             .strip_prefix("agent:")
-            .unwrap_or(args.agent.trim());
-        let response = self
+            .unwrap_or(args.agent.trim())
+            .to_string();
+        let response: AgentView = self
             .client
             .get(&format!("/v1/agents/{target}/wake"), Some(b"{}".to_vec()))
             .await?;
+        if let Some(prompt) = args
+            .prompt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let _ = self
+                .send(Parameters(SendArgs {
+                    to: vec![target],
+                    text: prompt.to_string(),
+                    ..SendArgs::default()
+                }))
+                .await?;
+        }
         Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
@@ -664,6 +965,88 @@ impl AgentMcp {
             .get(
                 "/v1/interact",
                 Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Read or update an agent's role & responsibility description (`description` / `instructions`). Any agent can update its own description (`agent: \"self\"`, `description: \"...\"`) whenever its mission or focus evolves, and Owner Admins or Parent agents can update other agents' descriptions. Updating `description` automatically syncs the agent's private `SYSTEM_PROMPT.md` / `AGENTS.md` and makes the role visible to all peers in `agents` and `groups`."
+    )]
+    async fn describe(
+        &self,
+        Parameters(args): Parameters<DescribeArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let target = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .unwrap_or_else(|| self.agent.name.clone());
+        let resolved_target = if target.eq_ignore_ascii_case("self") {
+            self.agent.name.clone()
+        } else {
+            target
+        };
+        if resolved_target.eq_ignore_ascii_case("all")
+            && args.description.is_none()
+            && !args.clear.unwrap_or(false)
+        {
+            let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+            let roster: Vec<serde_json::Value> = resp
+                .agents
+                .into_iter()
+                .filter(|a| a.state != "archived" || a.parent.is_none())
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "name": a.name,
+                        "parent": a.parent,
+                        "harness": a.harness,
+                        "model": a.model,
+                        "state": a.state,
+                        "description": a.description,
+                    })
+                })
+                .collect();
+            return Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                "agents": roster,
+            })));
+        }
+        if args.description.is_some() || args.clear.unwrap_or(false) {
+            let body = serde_json::json!({
+                "description": args.description,
+                "clear": args.clear.unwrap_or(false),
+            });
+            let updated: serde_json::Value = self
+                .client
+                .get(
+                    &format!("/v1/agents/{resolved_target}/description"),
+                    Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                )
+                .await?;
+            return Ok(rmcp::handler::server::wrapper::Json(updated));
+        }
+        let current: serde_json::Value = self
+            .client
+            .get(&format!("/v1/agents/{resolved_target}/description"), None)
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(current))
+    }
+
+    #[tool(
+        description = "Native SOTA anti-detect browser with persistent login profiles and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `eval` | `screenshot` | `cookies` | `tabs` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
+    )]
+    async fn browser(
+        &self,
+        Parameters(args): Parameters<crate::browser::BrowserRequest>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let response: serde_json::Value = self
+            .client
+            .get(
+                "/v1/browser",
+                Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
             )
             .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))

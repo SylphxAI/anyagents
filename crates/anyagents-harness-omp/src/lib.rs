@@ -161,4 +161,12 @@ impl Harness for OmpHarness {
     fn process_id(&self) -> Option<u32> {
         self.inner.process_id()
     }
+
+    fn turns_served(&self) -> u32 {
+        self.inner.turns_served()
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.inner.served_usage()
+    }
 }

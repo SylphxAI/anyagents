@@ -33,6 +33,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             name,
             harness,
             model,
+            profile,
             workdir,
             instructions,
             parent,
@@ -42,6 +43,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 "name": name,
                 "harness": harness,
                 "model": model,
+                "profile": profile,
                 "workdir": workdir.map(|path| path.display().to_string()),
                 "instructions": instructions,
                 "parent": parent,
@@ -54,13 +56,160 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             let view = set_state(data, &name, "archived")?;
             println!("{}\t{}\t{}", view.id, view.name, view.state);
         }
+        AgentsCommand::Pause { name } => {
+            let view = set_state(data, &name, "paused")?;
+            println!("{}\t{}\t{}", view.id, view.name, view.state);
+        }
         AgentsCommand::Wake { name } => {
             let view = set_state(data, &name, "running")?;
             println!("{}\t{}\t{}", view.id, view.name, view.state);
         }
+        AgentsCommand::Delete { name } => {
+            delete_cmd(data, &name)?;
+        }
         AgentsCommand::List { state, parent } => {
             list_filtered(data, state.as_deref(), parent.as_deref(), false)?
         }
+        AgentsCommand::Instructions {
+            name,
+            instructions,
+            clear,
+        } => {
+            describe_cmd(data, Some(name), instructions, clear)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn describe_cmd(
+    data: &Path,
+    agent_or_text: Option<String>,
+    description: Option<String>,
+    clear: bool,
+) -> Result<(), Error> {
+    let caller_id = client::agent_identity().map(|id| id.to_string());
+    let (target_name, new_desc) = match (agent_or_text, description) {
+        (Some(a), Some(d)) => (a, Some(d)),
+        (Some(a), None) => {
+            if caller_id.is_some() && (a.contains(' ') || a.len() > 28) && !clear {
+                ("self".to_string(), Some(a))
+            } else {
+                (a, None)
+            }
+        }
+        (None, Some(d)) => (caller_id.unwrap_or_else(|| "self".to_string()), Some(d)),
+        (None, None) => (caller_id.unwrap_or_else(|| "all".to_string()), None),
+    };
+    if client::can_call_server(data) {
+        if target_name.eq_ignore_ascii_case("all") && new_desc.is_none() && !clear {
+            let listed = client::call::<AgentsResponse>(
+                data,
+                "GET",
+                "/v1/agents",
+                None,
+                &client::authority(data),
+            )
+            .map_err(Error::Message)?;
+            if let Some(listed) = listed {
+                for a in listed.agents {
+                    if a.state == "archived" && a.parent.is_some() {
+                        continue;
+                    }
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        a.name,
+                        a.harness,
+                        a.state,
+                        a.description.as_deref().unwrap_or("-")
+                    );
+                }
+                return Ok(());
+            }
+        }
+        if new_desc.is_some() || clear {
+            let body = serde_json::json!({
+                "description": new_desc,
+                "clear": clear,
+            });
+            let answered = client::call::<serde_json::Value>(
+                data,
+                "POST",
+                &format!("/v1/agents/{target_name}/description"),
+                Some(body.to_string().into_bytes()),
+                &client::authority(data),
+            )
+            .map_err(Error::Message)?;
+            if let Some(val) = answered {
+                let n = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&target_name);
+                let d = val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!("updated\t{n}\t{d}");
+                return Ok(());
+            }
+        } else {
+            let answered = client::call::<serde_json::Value>(
+                data,
+                "GET",
+                &format!("/v1/agents/{target_name}/description"),
+                None,
+                &client::authority(data),
+            )
+            .map_err(Error::Message)?;
+            if let Some(val) = answered {
+                let n = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&target_name);
+                let d = val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!("{n}\t{d}");
+                return Ok(());
+            }
+        }
+    }
+    let store = Store::open(data.join("state.db"))?;
+    if target_name == "all" {
+        crate::create::sync_all_agent_instructions(&store, data);
+        println!("synced\tall");
+        return Ok(());
+    }
+    let mut rec = store.agent_by_name(&target_name)?;
+    if clear {
+        rec = store.set_agent_instructions(&rec.id, None)?;
+    } else if let Some(ref text) = new_desc {
+        rec = store.set_agent_instructions(&rec.id, Some(text))?;
+    }
+    let parent_name = rec
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok())
+        .map(|p| p.name);
+    let cfg = anyagents_core::agent_config_dir(data, &rec.id);
+    crate::create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
+    if let Some((_, _, gid, _)) =
+        crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
+    {
+        crate::sandbox::share_config_with_seat(&cfg, gid);
+    }
+    if new_desc.is_some() || clear {
+        println!(
+            "updated\t{}\t{}",
+            rec.name,
+            rec.instructions.as_deref().unwrap_or("-")
+        );
+    } else {
+        println!(
+            "{}\t{}",
+            rec.name,
+            rec.instructions.as_deref().unwrap_or("-")
+        );
     }
     Ok(())
 }
@@ -71,6 +220,7 @@ pub fn spawn(
     name: Option<String>,
     harness: Option<String>,
     model: Option<String>,
+    profile: Option<String>,
     workdir: Option<std::path::PathBuf>,
     instructions: Option<String>,
     parent: Option<String>,
@@ -98,6 +248,7 @@ pub fn spawn(
         "name": resolved_name,
         "harness": harness.unwrap_or_default(),
         "model": model,
+        "profile": profile,
         "workdir": workdir.map(|path| path.display().to_string()),
         "instructions": instructions,
         "parent": parent,
@@ -127,6 +278,45 @@ pub fn archive_cmd(data: &Path, name: Option<String>) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn pause_cmd(data: &Path, name: Option<String>) -> Result<(), Error> {
+    let target = match name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(n) => n,
+        None => client::agent_identity()
+            .map(|id| id.to_string())
+            .ok_or_else(|| Error::Message("pause needs an agent name or id".into()))?,
+    };
+    let view = set_state(data, &target, "paused")?;
+    println!("{}\t{}\t{}", view.id, view.name, view.state);
+    Ok(())
+}
+
+pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
+    if client::can_call_server(data) {
+        let answered = client::call::<serde_json::Value>(
+            data,
+            "DELETE",
+            &format!("/v1/agents/{name}"),
+            None,
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?;
+        if let Some(val) = answered {
+            let id = val.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+            let deleted_name = val.get("name").and_then(|v| v.as_str()).unwrap_or(name);
+            println!("{id}\t{deleted_name}\tdeleted");
+            return Ok(());
+        }
+        return Err(Error::Message("the server answered nothing".to_string()));
+    }
+    let store = open(data)?;
+    let found = store.agent_by_name(name)?;
+    let deleted = store.delete_agent(&found.id)?;
+    let agent_dir = data.join("agents").join(deleted.id.as_str());
+    let _ = std::fs::remove_dir_all(&agent_dir);
+    println!("{}\t{}\tdeleted", deleted.id, deleted.name);
+    Ok(())
+}
+
 pub fn resume_cmd(data: &Path, name: &str, prompt: Option<String>) -> Result<(), Error> {
     let view = set_state(data, name, "running")?;
     if let Some(text) = prompt.filter(|s| !s.trim().is_empty()) {
@@ -141,10 +331,10 @@ pub fn peers(data: &Path, state: Option<&str>, parent: Option<&str>) -> Result<(
 }
 
 fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
-    let verb = if state == "archived" {
-        "archive"
-    } else {
-        "wake"
+    let verb = match state {
+        "archived" => "archive",
+        "paused" => "pause",
+        _ => "wake",
     };
     if client::can_call_server(data) {
         let answered = client::call::<AgentView>(
@@ -155,11 +345,22 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             &client::authority(data),
         )
         .map_err(Error::Message)?;
-        return answered.ok_or_else(|| Error::Message("the server answered nothing".to_string()));
+        let view =
+            answered.ok_or_else(|| Error::Message("the server answered nothing".to_string()))?;
+        if state == "archived"
+            && view.parent.is_some()
+            && let Ok(id) = AgentId::parse(&view.id)
+        {
+            server::reap_subagent_ephemeral_dirs(data, &id);
+        }
+        return Ok(view);
     }
     let store = open(data)?;
     let found = store.agent_by_name(name)?;
     let agent = store.set_agent_state(&found.id, state)?;
+    if state == "archived" && found.parent_id.is_some() {
+        server::reap_subagent_ephemeral_dirs(data, &found.id);
+    }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
     let (mode, steer) = declared(&agent.harness);
     Ok(AgentView {
@@ -171,52 +372,64 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         workdir: agent.workdir,
         state: agent.state,
         process: "-".to_string(),
+        turn_state: "idle".to_string(),
         delivery_mode: mode_name(mode).to_string(),
         steer_support: steer_name(steer).to_string(),
         quota_reset_at_ms: None,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
+        description: agent.instructions,
     })
 }
 
 /// `agents create`. The server owns it when it is there, so one process makes
 /// the agent, mints its capability and starts it.
 fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
-    if client::can_call_server(data) || client::agent_identity().is_some() {
-        let answered = client::call::<AgentView>(
+    if client::can_call_server(data) {
+        match client::call::<AgentView>(
             data,
             "POST",
             "/v1/agents",
             Some(body.to_string().into_bytes()),
             &client::authority(data),
-        )?;
-        return answered.ok_or_else(|| "the server answered nothing".to_string());
+        ) {
+            Ok(answered) => {
+                return answered.ok_or_else(|| "the server answered nothing".to_string());
+            }
+            Err(err)
+                if body.get("parent").and_then(|v| v.as_str()) == Some("root")
+                    && err.contains("404") => {}
+            Err(err) => return Err(err),
+        }
     }
     let parsed: crate::api::CreateAgentRequest =
         serde_json::from_value(body).map_err(|err| err.to_string())?;
     let store = open_with_key(data).map_err(|err| err.to_string())?;
-    let parent_id = match parsed.parent.as_deref() {
+    let parent_agent = match parsed.parent.as_deref() {
         Some("root" | "") => None,
         Some(parent_ref) => Some(
             store
                 .agent_by_name(parent_ref)
-                .map_err(|err| err.to_string())?
-                .id,
+                .map_err(|err| err.to_string())?,
         ),
         None => None,
     };
-    let harness = if parsed.harness.trim().is_empty() {
-        "claude-code".to_string()
-    } else {
-        parsed.harness
-    };
+    let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
+    let (harness, model, profile) = crate::create::resolve_subagent_defaults(
+        data,
+        parent_agent.as_ref(),
+        &parsed.harness,
+        parsed.model,
+        parsed.profile,
+    );
     let agent = crate::create::create(
         &store,
         data,
         crate::create::CreateRequest {
             name: parsed.name,
             harness,
-            model: parsed.model,
+            model,
+            profile,
             workdir: parsed.workdir.map(std::path::PathBuf::from),
             workdir_default: server::owner_workdir(),
             instructions: parsed.instructions,
@@ -248,29 +461,83 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         workdir: agent.workdir,
         state: agent.state,
         process: "-".to_string(),
+        turn_state: "idle".to_string(),
         delivery_mode: mode_name(mode).to_string(),
         steer_support: steer_name(steer).to_string(),
         quota_reset_at_ms: None,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
+        description: agent.instructions,
     })
 }
 
 fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
     let body = serde_json::json!({"admin": admin});
-    let result = client::call::<serde_json::Value>(
+    match client::call::<serde_json::Value>(
         data,
         "POST",
         &format!("/v1/agents/{agent}/admin"),
         Some(body.to_string().into_bytes()),
         &client::authority(data),
-    )
-    .map_err(Error::Message)?;
-    println!(
-        "{}",
-        result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+    ) {
+        Ok(result) => {
+            println!(
+                "{}",
+                result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+            );
+            return Ok(());
+        }
+        Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
+        Err(err) => return Err(Error::Message(err)),
+    }
+    let store = open(data)?;
+    let rec = store.agent_by_name(agent)?;
+    store.set_agent_admin(&rec.id, admin)?;
+    let _ = store.record_admin_audit(
+        "operator",
+        if admin {
+            "agents.grant_admin"
+        } else {
+            "agents.revoke_admin"
+        },
+        &rec.name,
     );
+    println!("{}", serde_json::json!({"agent": rec.name, "admin": admin}));
     Ok(())
+}
+
+/// Enrich `AgentView` rows from the authoritative SQLite `turn_recovery` table
+/// (`has_open_turn`), and auto-archive any `running` sub-agent whose turn has
+/// settled (`complete_idle_subagent`).
+pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
+    let Ok(store) = open(data) else {
+        return;
+    };
+    for view in views.iter_mut() {
+        let Ok(id) = AgentId::parse(&view.id) else {
+            continue;
+        };
+        if view.state == "running" && view.process == "alive" {
+            let open_turn = store.has_open_turn(&id).unwrap_or(false);
+            if open_turn && view.quota_reset_at_ms.is_none() {
+                view.turn_state = "working".to_string();
+            } else if view.turn_state.is_empty() {
+                view.turn_state = "idle".to_string();
+            }
+            if view.parent.is_some()
+                && view.turn_state == "idle"
+                && !open_turn
+                && view.oldest_undelivered_age_ms.is_none()
+                && store.complete_idle_subagent(&id).unwrap_or(false)
+            {
+                let _ = set_state(data, &view.name, "archived");
+                view.state = "archived".to_string();
+                view.process = "down".to_string();
+            }
+        } else if view.turn_state.is_empty() {
+            view.turn_state = "idle".to_string();
+        }
+    }
 }
 
 /// `agents list` / `peers`: the server's view when it is there, else the stored rows.
@@ -297,6 +564,7 @@ fn list_filtered(
             client::call::<AgentsResponse>(data, "GET", &path, None, &client::authority(data))
                 .map_err(Error::Message)?;
         if let Some(mut listed) = listed {
+            reconcile_and_enrich_views(data, &mut listed.agents);
             if let Some(sf) = state_filter
                 .map(str::trim)
                 .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
@@ -307,6 +575,10 @@ fn list_filtered(
                 let cleaned = pf.strip_prefix("agent:").unwrap_or(pf);
                 if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none") {
                     listed.agents.retain(|a| a.parent.is_none());
+                } else if cleaned.eq_ignore_ascii_case("subagents")
+                    || cleaned.eq_ignore_ascii_case("all")
+                {
+                    listed.agents.retain(|a| a.parent.is_some());
                 } else {
                     let wanted_id = if cleaned.eq_ignore_ascii_case("self") {
                         client::agent_identity().map(|id| id.to_string())
@@ -324,6 +596,14 @@ fn list_filtered(
                             .retain(|a| a.parent.as_deref() == Some(pid.as_str()));
                     }
                 }
+            }
+            let include_archived = state_filter.is_some_and(|sf| {
+                let sf = sf.trim();
+                sf.eq_ignore_ascii_case("all") || sf.eq_ignore_ascii_case("archived")
+            });
+            if crate::ui::is_pretty() {
+                crate::ui::print_agents_table(&listed.agents, None, include_archived);
+                return Ok(());
             }
             for agent in listed.agents {
                 if show_parent {
@@ -357,6 +637,7 @@ fn list_filtered(
     }
     let store = open(data)?;
     let now = anyagents_core::now_ms();
+    let mut fallback_views = Vec::new();
     for agent in store.list_agents()? {
         if let Some(sf) = state_filter
             && sf != "all"
@@ -366,6 +647,26 @@ fn list_filtered(
         }
         let lag = store.lag(&agent.id, now)?;
         let (mode, steer) = declared(&agent.harness);
+        if crate::ui::is_pretty() {
+            fallback_views.push(AgentView {
+                id: agent.id.to_string(),
+                name: agent.name,
+                parent: agent.parent_id.as_ref().map(ToString::to_string),
+                harness: agent.harness,
+                model: agent.model,
+                workdir: agent.workdir,
+                state: agent.state,
+                process: "down".to_string(),
+                turn_state: "idle".to_string(),
+                delivery_mode: mode_name(mode).to_string(),
+                steer_support: steer_name(steer).to_string(),
+                quota_reset_at_ms: None,
+                oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
+                install: "-".to_string(),
+                description: agent.instructions,
+            });
+            continue;
+        }
         if show_parent {
             println!(
                 "{}\t{}\t{}\t{}\t{}\t{}\tdown\t{}",
@@ -395,6 +696,13 @@ fn list_filtered(
                 quota: None,
             });
         }
+    }
+    if crate::ui::is_pretty() {
+        let include_archived = state_filter.is_some_and(|sf| {
+            let sf = sf.trim();
+            sf.eq_ignore_ascii_case("all") || sf.eq_ignore_ascii_case("archived")
+        });
+        crate::ui::print_agents_table(&fallback_views, None, include_archived);
     }
     Ok(())
 }
@@ -450,7 +758,7 @@ pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
                 harness: found.harness,
                 model: found.model,
                 workdir: found.workdir,
-                instructions: None,
+                instructions: found.description,
                 state: found.state,
                 created_at_ms: 0,
                 launch_env: Vec::new(),
@@ -675,7 +983,47 @@ pub fn usage(data: &Path, agent: Option<&str>, by: Option<&str>) -> Result<(), U
         .into_iter()
         .map(|agent| (agent.id.to_string(), agent.name))
         .collect();
-    for total in sum_usage(&records, by_day) {
+    let totals = sum_usage(&records, by_day);
+    if crate::ui::is_pretty() {
+        if totals.is_empty() {
+            println!("  {}", crate::ui::dim("No usage records found."));
+            return Ok(());
+        }
+        println!("\n  {}\n", crate::ui::bold_cyan("Token Usage"));
+        let mut table = crate::ui::Table::new(&[
+            ("AGENT", false),
+            ("DAY", false),
+            ("INPUT", true),
+            ("OUTPUT", true),
+            ("CACHE READ", true),
+            ("CACHE WRITE", true),
+            ("COST", true),
+        ]);
+        for total in totals {
+            let name = names
+                .get(total.agent_id.as_str())
+                .map(String::as_str)
+                .unwrap_or_else(|| total.agent_id.as_str());
+            let day = total.day.as_deref().unwrap_or("all-time");
+            let cost = match total.reported_cost_micros {
+                Some(micros) => crate::ui::green(&format!("${:.4}", micros as f64 / 1_000_000.0)),
+                None => crate::ui::dim("-"),
+            };
+            table.add_row(vec![
+                crate::ui::bold(name),
+                crate::ui::dim(day),
+                crate::ui::format_tokens(total.input_tokens),
+                crate::ui::format_tokens(total.output_tokens),
+                crate::ui::format_tokens(total.cache_read_tokens),
+                crate::ui::format_tokens(total.cache_write_tokens),
+                cost,
+            ]);
+        }
+        table.print();
+        println!();
+        return Ok(());
+    }
+    for total in totals {
         let name = names
             .get(total.agent_id.as_str())
             .map(String::as_str)

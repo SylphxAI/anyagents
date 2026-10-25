@@ -53,6 +53,8 @@ pub struct Inbound {
     /// The chat's kind: `private`, `group`, `supergroup` or `channel`. Only a
     /// group is a room.
     pub chat_type: String,
+    /// Human-readable title of the chat/group/user, when Telegram sent one.
+    pub chat_title: Option<String>,
     /// The `message_thread_id` of a forum topic. `None` outside a topic.
     pub thread_id: Option<i64>,
     /// The Telegram message id, which a reply names.
@@ -110,6 +112,8 @@ pub enum Routed {
 struct Update {
     update_id: i64,
     message: Option<TgMessage>,
+    #[serde(default)]
+    edited_message: Option<TgMessage>,
     /// The bot's own membership in a chat changed. This is how a bot learns it
     /// was added to, or removed from, a group.
     my_chat_member: Option<ChatMemberUpdate>,
@@ -173,6 +177,12 @@ struct TgMessage {
     /// Service update when a message is pinned in the chat.
     #[serde(default)]
     pinned_message: Option<Box<TgMessage>>,
+    /// Service update when members join or are added to the group.
+    #[serde(default)]
+    new_chat_members: Vec<TgUser>,
+    /// Service update when a member leaves or is removed from the group.
+    #[serde(default)]
+    left_chat_member: Option<TgUser>,
     /// The `@name` handles this message's text mentions, when Telegram sends
     /// them, and their user ids.
     #[serde(default)]
@@ -571,6 +581,20 @@ impl TgMessage {
         if let Some(summary) = rich {
             return Some(summary);
         }
+        if !self.new_chat_members.is_empty() {
+            let names: Vec<String> = self
+                .new_chat_members
+                .iter()
+                .map(TgUser::display_name)
+                .collect();
+            return Some(format!("[Member joined group: {}]", names.join(", ")));
+        }
+        if let Some(left) = &self.left_chat_member {
+            return Some(format!(
+                "[Member removed/left group: {}]",
+                left.display_name()
+            ));
+        }
         let pinned = self.pinned_message.as_deref()?;
         let author = pinned
             .from
@@ -679,7 +703,55 @@ struct TgChat {
     #[serde(default, rename = "type")]
     kind: String,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    first_name: Option<String>,
+    #[serde(default)]
+    last_name: Option<String>,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
     is_forum: Option<bool>,
+}
+
+impl TgChat {
+    fn display_title(&self) -> Option<String> {
+        if let Some(t) = self
+            .title
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(t.to_string());
+        }
+        let full = match (
+            self.first_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+            self.last_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) {
+            (Some(f), Some(l)) => Some(format!("{f} {l}")),
+            (Some(f), None) => Some(f.to_string()),
+            (None, Some(l)) => Some(l.to_string()),
+            (None, None) => None,
+        };
+        match (
+            full,
+            self.username
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty()),
+        ) {
+            (Some(name), Some(u)) => Some(format!("{name} (@{u})")),
+            (Some(name), None) => Some(name),
+            (None, Some(u)) => Some(format!("@{u}")),
+            (None, None) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -759,6 +831,18 @@ impl Memory {
     /// Attach an agent to a chat, keeping the chat's kind so a private chat is
     /// never treated as a room.
     pub fn attach_typed(&mut self, agent: &str, chat_id: i64, chat_type: Option<&str>) {
+        self.attach_typed_titled(agent, chat_id, chat_type, None)
+    }
+
+    /// Attach an agent to a chat with optional `chat_type` and `title`.
+    pub fn attach_typed_titled(
+        &mut self,
+        agent: &str,
+        chat_id: i64,
+        chat_type: Option<&str>,
+        title: Option<&str>,
+    ) {
+        let clean_title = title.map(str::trim).filter(|s| !s.is_empty());
         if let Some(link) = self
             .chats
             .iter_mut()
@@ -767,12 +851,15 @@ impl Memory {
             if link.chat_type.is_none() {
                 link.chat_type = chat_type.map(str::to_string);
             }
+            if let Some(t) = clean_title {
+                link.title = Some(t.to_string());
+            }
             return;
         }
         self.chats.push(ChatLink {
             agent: agent.to_string(),
             chat_id,
-            title: None,
+            title: clean_title.map(str::to_string),
             chat_type: chat_type.map(str::to_string),
         });
     }
@@ -894,21 +981,28 @@ impl Poll {
                             .or_else(|| r.custom_emoji_id.as_ref().map(|id| format!("custom:{id}")))
                     })
                     .collect();
-                if emojis.is_empty() {
-                    continue;
-                }
                 let key = format!("{bot}:{}", update.update_id);
                 if self.seen.iter().any(|k| k == &key) {
                     out.push(Routed::Dropped);
                     continue;
                 }
                 self.seen.push(key.clone());
+                let reaction_text = if emojis.is_empty() {
+                    format!("[Reaction removed on message #{}]", reaction.message_id)
+                } else {
+                    format!(
+                        "[Reaction {} on message #{}]",
+                        emojis.join(" "),
+                        reaction.message_id
+                    )
+                };
                 out.push(Routed::ToAgent {
                     agent: agent.to_string(),
                     inbound: Inbound {
                         source_key: key,
                         chat_id: reaction.chat.id,
                         chat_type: reaction.chat.kind.clone(),
+                        chat_title: reaction.chat.display_title(),
                         thread_id: None,
                         message_id: reaction.message_id,
                         sender_name: reaction.user.as_ref().map(TgUser::display_name),
@@ -919,21 +1013,17 @@ impl Poll {
                             .as_ref()
                             .and_then(|user| user.username.clone()),
                         media: Vec::new(),
-                        text: format!(
-                            "[Reaction {} on message #{}]",
-                            emojis.join(" "),
-                            reaction.message_id
-                        ),
+                        text: reaction_text,
                         quote: None,
                         source_time_s: reaction.date,
                     },
                 });
                 continue;
             }
-            let Some(message) = update.message else {
-                // An edited message, a membership change, a callback: nothing
-                // for a mailbox.
-                continue;
+            let (is_edited, message) = match (update.message, update.edited_message) {
+                (Some(m), _) => (false, m),
+                (None, Some(em)) => (true, em),
+                (None, None) => continue,
             };
             let key = format!("{bot}:{}", update.update_id);
             if self.seen.iter().any(|k| k == &key) {
@@ -941,10 +1031,11 @@ impl Poll {
                 continue;
             }
             self.seen.push(key.clone());
-            if let Some(record) = self
-                .outbound
-                .iter()
-                .find(|r| r.chat_id == message.chat.id && r.message_id == message.message_id)
+            if !is_edited
+                && let Some(record) = self
+                    .outbound
+                    .iter()
+                    .find(|r| r.chat_id == message.chat.id && r.message_id == message.message_id)
             {
                 out.push(Routed::EchoToPeers {
                     chat_id: record.chat_id,
@@ -955,6 +1046,7 @@ impl Poll {
                         source_key: String::new(),
                         chat_id: message.chat.id,
                         chat_type: message.chat.kind.clone(),
+                        chat_title: message.chat.display_title(),
                         thread_id: message.forum_thread_id(),
                         message_id: message.message_id,
                         sender_name: None,
@@ -970,8 +1062,13 @@ impl Poll {
                 });
                 continue;
             }
-            let Some(text) = message.deliverable_text() else {
+            let Some(raw_text) = message.deliverable_text() else {
                 continue;
+            };
+            let text = if is_edited {
+                format!("[Edited message #{}]: {raw_text}", message.message_id)
+            } else {
+                raw_text
             };
             out.push(Routed::ToAgent {
                 agent: agent.to_string(),
@@ -979,6 +1076,7 @@ impl Poll {
                     source_key: key,
                     chat_id: message.chat.id,
                     chat_type: message.chat.kind.clone(),
+                    chat_title: message.chat.display_title(),
                     thread_id: message.forum_thread_id(),
                     message_id: message.message_id,
                     sender_name: message.from.as_ref().map(TgUser::display_name),
@@ -2092,7 +2190,11 @@ mod tests {
         };
         assert_eq!(inbound.text, "look");
         assert!(poll.route("bot_a", "ada", sticker).unwrap().is_empty());
-        assert!(poll.route("bot_a", "ada", edited).unwrap().is_empty());
+        let routed_edit = poll.route("bot_a", "ada", edited).unwrap();
+        let Routed::ToAgent { inbound: ed_in, .. } = &routed_edit[0] else {
+            panic!("{routed_edit:?}");
+        };
+        assert_eq!(ed_in.text, "[Edited message #72]: x");
         assert_eq!(poll.offset, 33);
     }
 

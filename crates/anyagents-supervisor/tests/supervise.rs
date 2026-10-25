@@ -578,50 +578,225 @@ fn backpressure_parks_until_the_input_activity_notification() {
 }
 
 #[test]
-fn deferred_message_keeps_cursor_until_hook_and_replay_does_not_duplicate() {
+fn an_interrupted_turn_with_no_new_messages_receives_a_recovery_note_on_restart() {
     let dir = short_dir();
     let log = dir.path().join("vendor.log");
-    let trigger = dir.path().join("trigger");
-    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
     let agent = store
-        .create_agent(NewAgent::new("owner", "claude-code"))
+        .create_agent(NewAgent::new("alpha", "claude-code"))
         .unwrap();
-    let harness = ClaudeHarness::start(
-        env!("CARGO_BIN_EXE_scripted_claude"),
-        None,
-        &[
-            ("ANYAGENTS_FAKE_MODE", "steer"),
-            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
-            ("ANYAGENTS_FAKE_TRIGGER", trigger.to_str().unwrap()),
-        ],
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_699_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("steer", log.clone()),
+        Vec::new(),
     )
     .unwrap();
-    let mut delivery = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
-    delivery
-        .store()
-        .receive(&agent.id, Incoming::new("start working"))
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.pid.is_some() && live.process_alive)
+    }));
+    let other = Store::open(dir.path().join("state.db")).unwrap();
+    other
+        .receive(&agent.id, Incoming::new("deploy-spiron-task"))
         .unwrap();
-    delivery.run_once().unwrap();
-    assert_eq!(delivery.delivered_cursor().unwrap(), 1);
-    delivery
-        .store()
-        .receive(&agent.id, Incoming::new("room update"))
+    assert!(wait_until(
+        || other.delivered_cursor(&agent.id).unwrap() >= 1
+    ));
+    // Simulate a partial outbound reply sent before the process crashed mid-turn.
+    other
+        .record_outbound(
+            &agent.id,
+            "telegram:chat:-5460290765",
+            None,
+            "part 1 report already delivered",
+        )
         .unwrap();
-    delivery.run_once().unwrap();
-    delivery.run_once().unwrap();
-    assert_eq!(delivery.delivered_cursor().unwrap(), 1);
-    assert!(!log_contains(&log, "room update"));
-    std::fs::write(&trigger, "hook-1").unwrap();
-    assert!(wait_until(|| log_contains(&log, "tool:proceed")));
-    // Simulate the gap between hook acceptance and cursor commit by dropping
-    // only the delivery loop. Its restarted loop must recognize the same id.
-    let harness = delivery.into_harness();
-    let store = Store::open(dir.path().join("state.db")).unwrap();
-    let mut delivery = DeliveryLoop::start(store, agent.id, harness).unwrap();
-    delivery.run_once().unwrap();
-    delivery.run_once().unwrap();
-    assert_eq!(delivery.delivered_cursor().unwrap(), 2);
-    let text = std::fs::read_to_string(&log).unwrap();
-    assert_eq!(text.matches("room update").count(), 1);
-    assert!(text.find("room update").unwrap() < text.find("tool:proceed").unwrap());
+    assert!(other.open_turn(&agent.id).unwrap().is_some());
+
+    let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
+    }));
+    // Advance clock to trigger process replacement with NO new messages in the mailbox.
+    clock.set_ms(supervisor.live(&agent.id).unwrap().restart_at_ms.unwrap());
+    assert!(
+        wait_until(|| {
+            log_contains(
+                &log,
+                "[Recovery] Your previous turn was interrupted: the process running it stopped",
+            )
+        }),
+        "expected recovery note in vendor log:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    let text = std::fs::read_to_string(&log).unwrap_or_default();
+    assert!(text.contains("deploy-spiron-task"), "{text}");
+    assert!(
+        text.contains("completed (do not resend): part 1 report already delivered"),
+        "{text}"
+    );
+    drop(supervisor);
+}
+
+#[test]
+fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut alpha_new = NewAgent::new("alpha", "claude-code");
+    alpha_new.model = Some("sonnet".to_string());
+    let agent = store.create_agent(alpha_new).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_699_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("finish", log.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.pid.is_some() && live.process_alive)
+    }));
+    let other = Store::open(dir.path().join("state.db")).unwrap();
+    other
+        .receive(&agent.id, Incoming::new("complete-me"))
+        .unwrap();
+    let due = 1_700_000_000_000;
+    let mut stepped = 0;
+    while store.list_usage(None).unwrap().is_empty() {
+        assert!(stepped < 40);
+        stepped += 1;
+        clock.set_ms(due + i64::from(stepped) * 1_000);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        other.open_turn(&agent.id).unwrap().is_none(),
+        "completed turn must clear open_turn"
+    );
+    let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| !live.process_alive && live.restart_at_ms.is_some())
+    }));
+    let restart_at = supervisor.live(&agent.id).unwrap().restart_at_ms.unwrap();
+    clock.set_ms(restart_at);
+    assert!(wait_until(|| {
+        supervisor
+            .live(&agent.id)
+            .is_some_and(|live| live.process_alive && live.pid != Some(pid))
+    }));
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        !log_contains(&log, "[Recovery]"),
+        "finished turn must not receive recovery note:\n{}",
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+    drop(supervisor);
+}
+
+#[test]
+fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let root = store
+        .create_agent(NewAgent::new("alpha", "claude-code"))
+        .unwrap();
+    let mut sub_new = NewAgent::new("alpha-worker", "claude-code");
+    sub_new.model = Some("sonnet".to_string());
+    sub_new.parent_id = Some(root.id.clone());
+    let sub = store.create_agent(sub_new).unwrap();
+    let work = dir.path().join("work-sub");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&sub.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_699_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("finish", log.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor
+            .live(&sub.id)
+            .is_some_and(|live| live.pid.is_some() && live.process_alive)
+    }));
+
+    let other = Store::open(dir.path().join("state.db")).unwrap();
+    other
+        .receive(&sub.id, Incoming::new("subagent-task-1"))
+        .unwrap();
+    let due = 1_700_000_000_000;
+    let mut stepped = 0;
+    while other.agent(&sub.id).unwrap().state != "archived" {
+        assert!(
+            stepped < 40,
+            "sub-agent did not auto-archive after turn completion"
+        );
+        stepped += 1;
+        clock.set_ms(due + i64::from(stepped) * 1_000);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
+    assert!(wait_until(|| {
+        supervisor
+            .live(&sub.id)
+            .is_some_and(|live| !live.process_alive && live.pid.is_none())
+    }));
+
+    // Sending a follow-up message wakes the sub-agent back up automatically,
+    // runs the second turn, and scales it back to zero when done.
+    other
+        .receive(&sub.id, Incoming::new("subagent-task-2"))
+        .unwrap();
+    let mut stepped2 = 0;
+    while !log_contains(&log, "subagent-task-2")
+        || other.agent(&sub.id).unwrap().state != "archived"
+    {
+        assert!(
+            stepped2 < 40,
+            "sub-agent did not wake, process task 2, and re-archive"
+        );
+        stepped2 += 1;
+        clock.set_ms(due + 100_000 + i64::from(stepped2) * 1_000);
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
+    assert!(wait_until(|| {
+        supervisor
+            .live(&sub.id)
+            .is_some_and(|live| !live.process_alive && live.pid.is_none())
+    }));
+    drop(supervisor);
 }

@@ -287,7 +287,7 @@ pub fn inbox(
             client::call::<InboxResponse>(data, "GET", &path, None, &client::authority(data))
                 .map_err(Error::Message)?;
         if let Some(read) = read {
-            print_messages(read);
+            print_messages(&target, read);
             return Ok(());
         }
     }
@@ -301,23 +301,44 @@ pub fn inbox(
             rows.truncate(limit);
         }
     }
-    print_messages(InboxResponse {
-        messages: rows
-            .into_iter()
-            .map(|message| crate::api::MessageView {
-                id: message.id.to_string(),
-                seq: message.seq,
-                text: message.text,
-                sender: message.sender,
-                reply_to: message.reply_to,
-                source_time_ms: message.source_time_ms,
-                received_at_ms: message.received_at_ms,
-                ack: message.ack.to_string(),
-                delivered_at_ms: message.delivered_at_ms,
-            })
-            .collect(),
-    });
+    print_messages(
+        &target,
+        InboxResponse {
+            messages: rows
+                .into_iter()
+                .map(|message| crate::api::MessageView {
+                    id: message.id.to_string(),
+                    seq: message.seq,
+                    text: message.text,
+                    sender: message.sender,
+                    reply_to: message.reply_to,
+                    source_time_ms: message.source_time_ms,
+                    received_at_ms: message.received_at_ms,
+                    ack: message.ack.to_string(),
+                    delivered_at_ms: message.delivered_at_ms,
+                })
+                .collect(),
+        },
+    );
     Ok(())
+}
+
+fn emit_turns(target: &str, query: Option<&str>, turns: Vec<crate::api::ConversationTurnView>) {
+    if crate::ui::is_pretty() {
+        crate::ui::print_conversation_pretty(target, query, &turns);
+        return;
+    }
+    for turn in turns {
+        println!(
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            turn.timestamp_ms,
+            turn.direction,
+            turn.id,
+            turn.from,
+            turn.to,
+            turn.text.replace('\n', "\\n"),
+        );
+    }
 }
 
 pub fn conversation(
@@ -326,23 +347,64 @@ pub fn conversation(
     with: Option<&str>,
     since_ms: Option<i64>,
     limit: Option<usize>,
+    query: Option<&str>,
 ) -> Result<(), Error> {
+    let clean_query = query.map(str::trim).filter(|s| !s.is_empty());
     let target = match agent.map(str::trim).filter(|s| !s.is_empty()) {
         Some(a) => a.to_string(),
-        None => client::agent_identity()
-            .map(|id| id.to_string())
-            .ok_or_else(|| Error::Message("conversation needs an agent name or id".into()))?,
+        None => {
+            if clean_query.is_some() {
+                "all".to_string()
+            } else {
+                client::agent_identity()
+                    .map(|id| id.to_string())
+                    .ok_or_else(|| {
+                        Error::Message("conversation needs an agent name or id".into())
+                    })?
+            }
+        }
     };
+    if let Ok(store) = open(data) {
+        let turns_res = if let Some(q) = clean_query {
+            let qvec = embed_query_for_store(&store, data, q);
+            store.search_conversation(Some(&target), with, since_ms, limit, q, qvec.as_deref())
+        } else if target.eq_ignore_ascii_case("all") || target == "*" {
+            store.conversation_all(with, since_ms, limit)
+        } else {
+            store
+                .agent_by_name(&target)
+                .and_then(|found| store.conversation(&found.id, with, since_ms, limit))
+        };
+        if let Ok(turns) = turns_res {
+            let views = turns
+                .into_iter()
+                .map(|t| crate::api::ConversationTurnView {
+                    id: t.id,
+                    direction: t.direction,
+                    from: t.from,
+                    to: t.to,
+                    text: t.text,
+                    reply_to: t.reply_to,
+                    timestamp_ms: t.timestamp_ms,
+                })
+                .collect();
+            emit_turns(&target, clean_query, views);
+            return Ok(());
+        }
+    }
     if client::can_call_server(data) {
         let mut params = Vec::new();
         if let Some(w) = with.map(str::trim).filter(|s| !s.is_empty()) {
-            params.push(format!("with={w}"));
+            params.push(format!("with={}", urlencoding_simple(w)));
         }
         if let Some(s) = since_ms {
             params.push(format!("since_ms={s}"));
         }
         if let Some(l) = limit {
             params.push(format!("limit={l}"));
+        }
+        if let Some(q) = clean_query {
+            params.push(format!("query={}", urlencoding_simple(q)));
         }
         let path = if params.is_empty() {
             format!("/v1/agents/{target}/conversation")
@@ -358,37 +420,162 @@ pub fn conversation(
         )
         .map_err(Error::Message)?;
         if let Some(read) = read {
-            for turn in read.turns {
-                println!(
-                    "{}\t{}\t{}\t{}\t{}\t{}",
-                    turn.timestamp_ms,
-                    turn.direction,
-                    turn.id,
-                    turn.from,
-                    turn.to,
-                    turn.text.replace('\n', "\\n"),
-                );
-            }
+            emit_turns(&target, clean_query, read.turns);
             return Ok(());
         }
     }
     let store = open(data)?;
-    let found = store.agent_by_name(&target)?;
-    for turn in store.conversation(&found.id, with, since_ms, limit)? {
-        println!(
-            "{}\t{}\t{}\t{}\t{}\t{}",
-            turn.timestamp_ms,
-            turn.direction,
-            turn.id,
-            turn.from,
-            turn.to,
-            turn.text.replace('\n', "\\n"),
-        );
-    }
+    let turns = if let Some(q) = clean_query {
+        let qvec = embed_query_for_store(&store, data, q);
+        store.search_conversation(Some(&target), with, since_ms, limit, q, qvec.as_deref())?
+    } else if target.eq_ignore_ascii_case("all") || target == "*" {
+        store.conversation_all(with, since_ms, limit)?
+    } else {
+        let found = store.agent_by_name(&target)?;
+        store.conversation(&found.id, with, since_ms, limit)?
+    };
+    let views = turns
+        .into_iter()
+        .map(|t| crate::api::ConversationTurnView {
+            id: t.id,
+            direction: t.direction,
+            from: t.from,
+            to: t.to,
+            text: t.text,
+            reply_to: t.reply_to,
+            timestamp_ms: t.timestamp_ms,
+        })
+        .collect();
+    emit_turns(&target, clean_query, views);
     Ok(())
 }
 
-fn print_messages(read: InboxResponse) {
+fn urlencoding_simple(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'@') {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+pub(crate) fn resolve_embedding_endpoint_and_key(data: &Path) -> Option<(String, String)> {
+    if let (Ok(url), Ok(key)) = (
+        std::env::var("ANYAGENTS_EMBEDDING_URL"),
+        std::env::var("ANYAGENTS_EMBEDDING_KEY"),
+    ) {
+        let u = url.trim();
+        let k = key.trim();
+        if !u.is_empty() && !k.is_empty() {
+            return Some((u.to_string(), k.to_string()));
+        }
+    }
+    if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
+        let k = key.trim();
+        if !k.is_empty() {
+            return Some((
+                "https://openrouter.ai/api/v1/embeddings".to_string(),
+                k.to_string(),
+            ));
+        }
+    }
+    // Check `<data>/profiles/openrouter/default/` or host `.dsh/.credentials.yaml`
+    let mut candidates = vec![
+        data.join("profiles/openrouter/default/api-key"),
+        data.join("profiles/openrouter/default/.dsh/.credentials.yaml"),
+    ];
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        candidates.push(home.join(".dsh/.credentials.yaml"));
+    }
+    for path in candidates {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if path.file_name().is_some_and(|n| n == "api-key") {
+            let k = raw.trim();
+            if !k.is_empty() {
+                return Some((
+                    "https://openrouter.ai/api/v1/embeddings".to_string(),
+                    k.to_string(),
+                ));
+            }
+        }
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("OPENROUTER_API_KEY:") {
+                let k = rest.trim().trim_matches(['"', '\'']);
+                if !k.is_empty() {
+                    return Some((
+                        "https://openrouter.ai/api/v1/embeddings".to_string(),
+                        k.to_string(),
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn embed_query_for_store(
+    store: &anyagents_core::Store,
+    data: &Path,
+    query: &str,
+) -> Option<Vec<i8>> {
+    let cleaned = anyagents_core::clean_rag_text(query);
+    if cleaned.chars().count() < 2 {
+        return None;
+    }
+    let chash = anyagents_core::rag_content_hash(&cleaned);
+    if let Ok(Some(cached)) = store.get_embedding_i8(&chash) {
+        return Some(cached);
+    }
+    let (model, dim) = store.locked_embedding_spec().ok()?;
+    let (endpoint, api_key) = resolve_embedding_endpoint_and_key(data)?;
+    let payload = serde_json::json!({
+        "model": model,
+        "input": [cleaned],
+        "dimensions": dim,
+    });
+    let agent = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(6)))
+        .build()
+        .new_agent();
+    let resp = agent
+        .post(&endpoint)
+        .header("authorization", &format!("Bearer {api_key}"))
+        .header("content-type", "application/json")
+        .send(payload.to_string().as_bytes())
+        .ok()?;
+    let body = resp.into_body().read_to_string().ok()?;
+    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+    let arr = val.pointer("/data/0/embedding")?.as_array()?;
+    if arr.len() != dim {
+        return None;
+    }
+    let mut floats = Vec::with_capacity(dim);
+    let mut norm_sq = 0.0_f64;
+    for v in arr {
+        let f = v.as_f64().unwrap_or(0.0);
+        norm_sq += f * f;
+        floats.push(f);
+    }
+    let norm = norm_sq.sqrt().max(1e-12);
+    let vec_i8: Vec<i8> = floats
+        .into_iter()
+        .map(|f| ((f / norm) * 127.0).clamp(-127.0, 127.0).round() as i8)
+        .collect();
+    let _ = store.store_embedding_i8(&chash, &model, dim, &vec_i8);
+    Some(vec_i8)
+}
+
+fn print_messages(target: &str, read: InboxResponse) {
+    if crate::ui::is_pretty() {
+        crate::ui::print_inbox_pretty(target, &read.messages);
+        return;
+    }
     for message in read.messages {
         let ack = message.ack.clone();
         println!(
@@ -429,21 +616,25 @@ pub fn add_channel(
             "token is empty or contains whitespace or a slash".into(),
         ));
     }
-    if client::can_call_server(data) || client::agent_identity().is_some() {
+    if client::can_call_server(data) {
         let body = serde_json::json!({"kind": kind, "agent": agent_name, "token": token});
-        let result = client::call::<serde_json::Value>(
+        match client::call::<serde_json::Value>(
             data,
             "POST",
             "/v1/channels",
             Some(body.to_string().into_bytes()),
             &client::authority(data),
-        )
-        .map_err(Error::Message)?;
-        println!(
-            "{}",
-            result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-        );
-        return Ok(());
+        ) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+                );
+                return Ok(());
+            }
+            Err(err) if err.contains("404") => {}
+            Err(err) => return Err(Error::Message(err)),
+        }
     }
     let store = open(data)?;
     let agent = store.agent_by_name(agent_name)?;
@@ -478,23 +669,66 @@ pub(crate) fn record(
 }
 
 pub fn list_channels(data: &Path) -> Result<(), Error> {
-    if client::can_call_server(data) || client::agent_identity().is_some() {
-        let result = client::call::<serde_json::Value>(
+    if client::can_call_server(data) {
+        match client::call::<serde_json::Value>(
             data,
             "GET",
             "/v1/channels",
             None,
             &client::authority(data),
-        )
-        .map_err(Error::Message)?;
-        println!(
-            "{}",
-            result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
-        );
-        return Ok(());
+        ) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+                );
+                return Ok(());
+            }
+            Err(err) if err.contains("404") => {}
+            Err(err) => return Err(Error::Message(err)),
+        }
     }
     let store = open(data)?;
-    for channel in store.list_channels()? {
+    let channels = store.list_channels()?;
+    if crate::ui::is_pretty() {
+        if channels.is_empty() {
+            println!("  {}", crate::ui::dim("No channels recorded."));
+            return Ok(());
+        }
+        println!(
+            "\n  {}  {} total\n",
+            crate::ui::bold_cyan("Channels"),
+            crate::ui::bold(&channels.len().to_string())
+        );
+        let mut table = crate::ui::Table::new(&[
+            ("KIND", false),
+            ("AGENTS", false),
+            ("CREDENTIAL REF", false),
+            ("ID", false),
+        ]);
+        for channel in channels {
+            let names: Vec<String> = channel
+                .agents
+                .iter()
+                .filter_map(|id| store.agent(id).ok().map(|agent| agent.name))
+                .collect();
+            let agents_cell = if names.is_empty() {
+                crate::ui::dim("-")
+            } else {
+                crate::ui::bold(&names.join(", "))
+            };
+            table.add_row(vec![
+                crate::ui::cyan(&channel.kind),
+                agents_cell,
+                crate::ui::dim(channel.credential_ref.as_deref().unwrap_or("-")),
+                crate::ui::dim(channel.id.as_ref()),
+            ]);
+        }
+        table.print();
+        println!();
+        return Ok(());
+    }
+    for channel in channels {
         let names: Vec<String> = channel
             .agents
             .iter()

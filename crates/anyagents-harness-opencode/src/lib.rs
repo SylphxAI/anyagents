@@ -67,6 +67,9 @@ struct State {
     /// whatever service the machine happens to run.
     service: Option<String>,
     password: Option<String>,
+    turn_open: bool,
+    last_prompt_at: Option<Instant>,
+    turns_completed: u32,
     last_usage_poll: Option<Instant>,
     last_usage_written: usize,
     cached_usage: TurnUsage,
@@ -502,7 +505,12 @@ impl Harness for OpenCodeHarness {
                 "prompt was not taken: {answer}"
             )));
         }
-        self.lock().written.push(message.id.clone());
+        {
+            let mut state = self.lock();
+            state.written.push(message.id.clone());
+            state.turn_open = true;
+            state.last_prompt_at = Some(Instant::now());
+        }
         Ok(DeliverOutcome::Accepted {
             turn_finished: false,
         })
@@ -526,6 +534,7 @@ impl Harness for OpenCodeHarness {
             &format!("/api/session/{session}/interrupt"),
             Some(json!({})),
         );
+        self.lock().turn_open = false;
         Ok(())
     }
 
@@ -533,10 +542,11 @@ impl Harness for OpenCodeHarness {
         let state = self.lock();
         HarnessHealth {
             process_alive: state.alive,
-            // The adapter never holds a turn open: a line is written and
-            // forgotten, and the session runs it. What a line is doing lives in
-            // the session's own inbox, not here.
-            turn_state: TurnState::Idle,
+            turn_state: if state.turn_open {
+                TurnState::InTurn
+            } else {
+                TurnState::Idle
+            },
             delivery_mode: DeliveryMode::Steer,
             steer_support: SteerSupport::Yes,
             quota_reset_at_ms: None,
@@ -544,29 +554,53 @@ impl Harness for OpenCodeHarness {
         }
     }
 
+    fn turns_served(&self) -> u32 {
+        self.lock().turns_completed
+    }
+
     /// The session's own running totals, read from the session itself rather
     /// than from anything this adapter kept. The host records the difference.
     fn served_usage(&self) -> TurnUsage {
-        let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
+        let fake_mode = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+            || self
+                .environment
+                .iter()
+                .any(|(k, _)| k == "ANYAGENTS_FAKE_MODE");
         let (session, written_len) = {
             let state = self.lock();
             let Some(session) = state.session.clone() else {
                 return TurnUsage::default();
             };
             if !fake_mode {
-                if state.written.is_empty() {
+                if !state.turn_open || state.written.is_empty() {
                     return state.cached_usage.clone();
                 }
-                if state.last_usage_written == state.written.len()
-                    && state
-                        .last_usage_poll
-                        .is_some_and(|t| t.elapsed() < Duration::from_secs(15))
+                if state
+                    .last_prompt_at
+                    .is_some_and(|t| t.elapsed() < Duration::from_millis(500))
+                {
+                    return state.cached_usage.clone();
+                }
+                if state
+                    .last_usage_poll
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(1))
                 {
                     return state.cached_usage.clone();
                 }
             }
             (session, state.written.len())
         };
+        if !fake_mode
+            && let Ok(active) = self.api("GET", "/api/session/active", None)
+            && active
+                .pointer(&format!("/data/{session}/type"))
+                .and_then(Value::as_str)
+                == Some("running")
+        {
+            let mut state = self.lock();
+            state.last_usage_poll = Some(Instant::now());
+            return state.cached_usage.clone();
+        }
         let Ok(info) = self.api("GET", &format!("/api/session/{session}"), None) else {
             return self.lock().cached_usage.clone();
         };
@@ -593,6 +627,12 @@ impl Harness for OpenCodeHarness {
         };
         let mut state = self.lock();
         state.last_usage_poll = Some(Instant::now());
+        if written_len > state.last_usage_written {
+            state.turns_completed = state.turns_completed.saturating_add(1);
+        }
+        if state.written.len() == written_len {
+            state.turn_open = false;
+        }
         state.last_usage_written = written_len;
         state.cached_usage = usage.clone();
         usage
@@ -629,7 +669,10 @@ impl Harness for OpenCodeHarness {
         ) {
             Ok(answer) => {
                 if answer.get("data").is_some() {
-                    self.lock().written.push(message.id.clone());
+                    let mut state = self.lock();
+                    state.written.push(message.id.clone());
+                    state.turn_open = true;
+                    state.last_prompt_at = Some(Instant::now());
                     Ok(true)
                 } else {
                     Ok(false)
