@@ -129,13 +129,16 @@ enum Command {
         agent: String,
         /// The provider origin, for example https://api.deepseek.com.
         #[arg(long = "base-url")]
-        base_url: String,
+        base_url: Option<String>,
         /// The model id the provider serves, for example deepseek-chat.
         #[arg(long)]
         model: String,
         /// A file holding the key, on its own line. The key is never an argument.
         #[arg(long = "key-file")]
-        key_file: PathBuf,
+        key_file: Option<PathBuf>,
+        /// Existing provider/profile to bind instead of an API key.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
@@ -381,6 +384,10 @@ enum ChannelsCommand {
 
 #[derive(Subcommand)]
 enum AgentsCommand {
+    /// Grant administrative authority to a root agent (operator only).
+    GrantAdmin { agent: String },
+    /// Revoke administrative authority immediately (operator only).
+    RevokeAdmin { agent: String },
     /// Record an agent. The harness is a catalog key.
     Create {
         name: String,
@@ -444,15 +451,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                 list_harnesses();
                 Ok(())
             }
-            HarnessesCommand::Profiles { harness } => {
-                list_profiles_cmd(&data, harness.as_deref());
-                Ok(())
-            }
+            HarnessesCommand::Profiles { harness } => list_profiles_cmd(&data, harness.as_deref()),
         },
-        Command::Profiles { filter } => {
-            list_profiles_cmd(&data, filter.as_deref());
-            Ok(())
-        }
+        Command::Profiles { filter } => list_profiles_cmd(&data, filter.as_deref()),
         Command::Mcp { config } => mcp::run(&data, config.as_deref()),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
@@ -489,7 +490,15 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             base_url,
             model,
             key_file,
-        } => store_key(&data, &agent, &base_url, &model, &key_file),
+            profile,
+        } => model_cmd(
+            &data,
+            &agent,
+            base_url.as_deref(),
+            &model,
+            key_file.as_deref(),
+            profile.as_deref(),
+        ),
         Command::Send {
             to,
             text,
@@ -699,6 +708,50 @@ fn store_key(
     Ok(())
 }
 
+fn model_cmd(
+    data: &Path,
+    agent: &str,
+    base_url: Option<&str>,
+    model: &str,
+    key_file: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    use anyagents_core::Error;
+    if profile.is_some() && (key_file.is_some() || base_url.is_some()) {
+        return Err(Error::Message(
+            "profile cannot be combined with a key or base URL".into(),
+        ));
+    }
+    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+        let key = key_file.map(std::fs::read_to_string).transpose()?;
+        let body = serde_json::json!({"model": model, "base_url": base_url, "key": key, "profile": profile});
+        let result = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/agents/{agent}/model"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?;
+        println!(
+            "{}",
+            result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+        );
+        return Ok(());
+    }
+    if let Some(profile) = profile {
+        let store = agent::open(data)?;
+        return create::bind_profile(&store, &store.agent_by_name(agent)?, profile, model);
+    }
+    store_key(
+        data,
+        agent,
+        base_url.ok_or_else(|| Error::Message("base URL is required".into()))?,
+        model,
+        key_file.ok_or_else(|| Error::Message("key file is required".into()))?,
+    )
+}
+
 /// The installer's sign-in, run against either a server master profile
 /// (`<data>/profiles/<harness>/<profile>`) when `target` is a harness catalog
 /// ID or `profile` is specified, or against a recorded agent's own config directory.
@@ -758,12 +811,21 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
     Ok(())
 }
 
-fn list_profiles_cmd(data: &Path, filter: Option<&str>) {
-    let Ok(store) = anyagents_core::Store::open(data.join("state.db")) else {
-        eprintln!("no store at {}", data.display());
-        return;
+fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
+    let entries = if server::socket_path(data).exists() || client::agent_identity().is_some() {
+        client::call::<Vec<create::ProviderProfileEntry>>(
+            data,
+            "GET",
+            "/v1/profiles",
+            None,
+            &client::authority(data),
+        )
+        .map_err(anyagents_core::Error::Message)?
+        .ok_or_else(|| anyagents_core::Error::Message("the server answered nothing".into()))?
+    } else {
+        let store = anyagents_core::Store::open(data.join("state.db"))?;
+        create::sync_and_list_provider_profiles(&store, data)
     };
-    let entries = create::sync_and_list_provider_profiles(&store, data);
     println!(
         "{:<20}\t{:<10}\t{:<13}\t{:<44}\tAGENTS",
         "PROVIDER", "PROFILE", "KIND", "COMPATIBLE HARNESSES"
@@ -786,6 +848,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) {
             e.provider, e.profile, e.kind, harnesses, agents
         );
     }
+    Ok(())
 }
 
 fn interact_cmd(

@@ -36,11 +36,12 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
      reply_to, received_at_ms, delivered_at_ms, origin, context";
 
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id";
+     created_at_ms, launch_env, parent_id, is_admin";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
+    pub is_admin: bool,
     pub id: AgentId,
     pub name: String,
     pub harness: String,
@@ -560,6 +561,7 @@ impl Store {
             return Err(Error::Message("harness is empty".into()));
         }
         let agent = Agent {
+            is_admin: false,
             id: AgentId::generate(),
             name: new.name,
             harness: new.harness,
@@ -606,6 +608,41 @@ impl Store {
 
     pub fn agent(&self, id: &AgentId) -> Result<Agent, Error> {
         agent_by_id(&self.conn(), id)
+    }
+
+    pub fn set_agent_admin(&self, agent_id: &AgentId, is_admin: bool) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = agent_by_id(&tx, agent_id)?;
+        if is_admin && agent.parent_id.is_some() {
+            return Err(Error::Message(
+                "a subagent cannot hold administrative authority".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE agents SET is_admin = ?2 WHERE id = ?1",
+            params![agent_id.as_str(), is_admin],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_agent_model(&self, agent_id: &AgentId, model: &str) -> Result<(), Error> {
+        self.agent(agent_id)?;
+        self.conn().execute(
+            "UPDATE agents SET model = ?2 WHERE id = ?1",
+            params![agent_id.as_str(), model],
+        )?;
+        Ok(())
+    }
+
+    /// Administrative metadata only; callers must never pass credentials here.
+    pub fn record_admin_audit(&self, actor: &str, action: &str, target: &str) -> Result<(), Error> {
+        self.conn().execute(
+            "INSERT INTO admin_audit (created_at, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
+            params![now_ms(), actor, action, target],
+        )?;
+        Ok(())
     }
 
     pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
@@ -1727,6 +1764,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         _ => None,
     };
     Ok(Agent {
+        is_admin: row.get(10)?,
         id: agent_id,
         name: row.get(1)?,
         harness: row.get(2)?,

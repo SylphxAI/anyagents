@@ -429,6 +429,22 @@ pub fn add_channel(
             "token is empty or contains whitespace or a slash".into(),
         ));
     }
+    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+        let body = serde_json::json!({"kind": kind, "agent": agent_name, "token": token});
+        let result = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            "/v1/channels",
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?;
+        println!(
+            "{}",
+            result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+        );
+        return Ok(());
+    }
     let store = open(data)?;
     let agent = store.agent_by_name(agent_name)?;
     record(&store, data, kind, &agent.id, token.as_bytes())?;
@@ -441,7 +457,7 @@ pub fn add_channel(
     Ok(())
 }
 
-fn record(
+pub(crate) fn record(
     store: &Store,
     data: &Path,
     kind: &str,
@@ -462,6 +478,21 @@ fn record(
 }
 
 pub fn list_channels(data: &Path) -> Result<(), Error> {
+    if server::socket_path(data).exists() || client::agent_identity().is_some() {
+        let result = client::call::<serde_json::Value>(
+            data,
+            "GET",
+            "/v1/channels",
+            None,
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?;
+        println!(
+            "{}",
+            result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+        );
+        return Ok(());
+    }
     let store = open(data)?;
     for channel in store.list_channels()? {
         let names: Vec<String> = channel

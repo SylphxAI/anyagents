@@ -551,13 +551,72 @@ pub(crate) fn seed_harness_credentials(
 
 /// One Upstream Provider Profile in the server's centralized profile pool
 /// (`<data>/profiles/<provider>/<profile>`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProviderProfileEntry {
     pub provider: String,
     pub profile: String,
     pub kind: String,
     pub compatible_harnesses: Vec<String>,
     pub assigned_agents: Vec<String>,
+}
+
+/// Bind only an existing named provider profile, never a caller-supplied path.
+pub(crate) fn bind_profile(
+    store: &Store,
+    agent: &Agent,
+    profile: &str,
+    model: &str,
+) -> Result<(), Error> {
+    let provider = upstream_provider_of(&agent.harness, Some(model));
+    let (named_provider, name) = profile.split_once('/').unwrap_or((&provider, profile));
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if named_provider != provider || !valid(name) || !valid(named_provider) {
+        return Err(Error::Message("invalid provider profile".into()));
+    }
+    let source = store.data_dir().join("profiles").join(&provider).join(name);
+    if !source.is_dir() {
+        return Err(Error::Message("provider profile not found".into()));
+    }
+    let config = agent_config_dir(store.data_dir(), &agent.id);
+    fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
+        std::fs::create_dir_all(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let target = target.join(entry.file_name());
+            if kind.is_dir() {
+                copy_files(&entry.path(), &target)?;
+            } else if kind.is_file() && entry.file_name() != "profile.json" {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+    copy_files(&source, &config)
+        .map_err(|_| Error::Message("could not bind provider profile".into()))?;
+    std::fs::write(
+        config.join(".anyagents-profile"),
+        format!("{provider}/{name}\n"),
+    )?;
+    store.set_agent_model(&agent.id, model)?;
+    if agent.harness == "opencode" {
+        let command = std::env::current_exe()?;
+        let args = vec![
+            "--data".into(),
+            store.data_dir().display().to_string(),
+            "mcp".into(),
+            "--config".into(),
+            config.display().to_string(),
+        ];
+        opencode_config::write(&config, Some(model), &command, &args)?;
+    }
+    Ok(())
 }
 
 /// Resolves the upstream provider an agent draws its credential profile from.
