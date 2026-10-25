@@ -4,9 +4,11 @@
 //! `echo`, `failed_turn`, `steer` or `die`. `ANYAGENTS_FAKE_LOG` is a file that
 //! receives argv and stdin.
 //!
-//! The steer script echoes idle stdin messages. Tests explicitly trigger SDK
-//! PreToolUse callbacks through a file; a tool only proceeds once its control
-//! response arrives. An stdin echo alone is not evidence of mid-turn delivery.
+//! With `--replay-user-messages` the real child echoes every line it reads back
+//! as a `user` event. The `steer` script does the same: each written line is
+//! answered with its echo, the open turn completes only when the test writes
+//! `empty` on stdin, and the prompt's length is logged so a test can tell the
+//! two lines apart.
 
 use std::env;
 use std::fs::OpenOptions;
@@ -25,45 +27,8 @@ fn main() {
     let log_path = env::var_os("ANYAGENTS_FAKE_LOG").map(PathBuf::from);
     let argv = env::args().skip(1).collect::<Vec<_>>().join(" ");
     log(&log_path, &format!("argv:{argv}"));
-    if let Ok(path) = env::var("ANYAGENTS_FAKE_TRIGGER") {
-        std::thread::spawn(move || {
-            let mut previous = String::new();
-            loop {
-                let next = std::fs::read_to_string(&path).unwrap_or_default();
-                if !next.is_empty() && next != previous {
-                    previous = next.clone();
-                    let value = if next == "result" {
-                        serde_json::from_str::<Value>(RESULT).unwrap()
-                    } else {
-                        json!({"type":"control_request", "request_id":next,
-                            "request":{"subtype":"hook_callback", "callback_id":"mailbox",
-                            "input":{"hook_event_name":"PreToolUse"}}})
-                    };
-                    let mut out = io::stdout().lock();
-                    writeln!(out, "{value}").unwrap();
-                    out.flush().unwrap();
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        });
-    }
-
-    if mode == "steer" && env::var_os("ANYAGENTS_FAKE_TRIGGER").is_none() {
-        std::thread::spawn(|| {
-            for seq in 0u64.. {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                let request = json!({"type":"control_request", "request_id":format!("tool-{seq}"),
-                    "request":{"subtype":"hook_callback", "callback_id":"mailbox",
-                    "input":{"hook_event_name":"PreToolUse"}}});
-                let mut out = io::stdout().lock();
-                if writeln!(out, "{request}")
-                    .and_then(|_| out.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        });
+    if mode == "die" {
+        return;
     }
 
     let mut stdout = io::stdout();
@@ -80,25 +45,6 @@ fn main() {
     for line in io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         log(&log_path, &line);
-        let value: Value = serde_json::from_str(&line).unwrap();
-        if value.pointer("/request/subtype").and_then(Value::as_str) == Some("initialize") {
-            writeln!(
-                stdout,
-                "{}",
-                json!({"type":"control_response", "response":{
-                "subtype":if mode == "reject_init" { "error" } else { "success" }, "request_id":"initialize", "response":{}}})
-            )
-            .unwrap();
-            stdout.flush().unwrap();
-            if mode == "die" {
-                return;
-            }
-            continue;
-        }
-        if value.get("type").and_then(Value::as_str) == Some("control_response") {
-            log(&log_path, "tool:proceed");
-            continue;
-        }
         if mode == "steer" {
             if let Ok(value) = serde_json::from_str::<Value>(&line)
                 && value.get("type").and_then(Value::as_str) == Some("user")

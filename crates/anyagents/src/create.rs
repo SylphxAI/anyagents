@@ -122,6 +122,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         crate::grok::write_grok_config(&config, agent.model.as_deref(), &command, &args)?;
     } else {
         mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
+        let _ = mcp_config::write_claude(&config.join("mcp.json"), &command, &args);
     }
     write_agent_instructions(&config, &agent, parent_name.as_deref());
     if let Some((_, _, gid, _)) =
@@ -431,14 +432,16 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
                 gid,
                 "--groups",
                 groups,
+                "--no-new-privs",
                 "--",
                 "sh",
                 "-c",
-                "mkdir -p \"$1/.config/op\" && chmod 0700 \"$1/.config/op\" && ln -sfn \"$2\" \"$1/.config/op/service-account-token\"",
+                "cd \"$1\" && mkdir -p .config/op && chmod 0700 .config/op && ln -sfn \"$2\" .config/op/service-account-token",
                 "sh",
             ])
             .arg(target_config)
             .arg(&op_token_src)
+            .stderr(std::process::Stdio::null())
             .status();
     }
 }

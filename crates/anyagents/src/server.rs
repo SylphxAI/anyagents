@@ -1479,6 +1479,7 @@ fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) {
                 "-rf",
             ])
             .arg(target)
+            .stderr(std::process::Stdio::null())
             .status();
         let _ = std::fs::remove_dir_all(target);
         let _ = std::fs::remove_file(target);

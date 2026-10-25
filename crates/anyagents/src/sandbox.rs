@@ -32,10 +32,14 @@ const SETPRIV: &str = "/usr/local/bin/anyagents-setpriv";
 
 /// The launcher this deployment starts agents with.
 fn launcher() -> PathBuf {
-    match std::env::var_os("ANYAGENTS_LAUNCHER") {
-        Some(path) if !path.is_empty() => PathBuf::from(path),
-        _ => PathBuf::from(SETPRIV),
+    for name in ["ANYAGENTS_LAUNCHER", "ANYAGENTS_SETPRIV"] {
+        if let Some(path) = std::env::var_os(name)
+            && !path.is_empty()
+        {
+            return PathBuf::from(path);
+        }
     }
+    PathBuf::from(SETPRIV)
 }
 
 /// Read the boundary contract of `data`, or fail with what is missing.
@@ -136,9 +140,11 @@ pub fn seat_named() -> bool {
         .any(|name| std::env::var_os(name).is_some())
 }
 
-/// Whether multi-UID OS seats are explicitly configured for this deployment.
+/// Whether multi-UID OS seats are configured for this deployment (either via
+/// explicit `ANYAGENTS_*` environment variables or provisioned host `seat-*`
+/// accounts with `anyagents-sock` and `anyagents-setpriv` outside test harnesses).
 pub fn seats_configured() -> bool {
-    [
+    if [
         "ANYAGENTS_AGENTS",
         "ANYAGENTS_AGENT_UID",
         "ANYAGENTS_AGENT_GID",
@@ -146,6 +152,13 @@ pub fn seats_configured() -> bool {
     ]
     .iter()
     .any(|name| std::env::var_os(name).is_some_and(|v| !v.is_empty()))
+    {
+        return true;
+    }
+    !is_isolated_test_env()
+        && launcher().is_file()
+        && lookup_group("anyagents-sock").is_some()
+        && !host_seat_users().is_empty()
 }
 
 /// Whether every harness process this server starts satisfies the deployment's
