@@ -482,14 +482,13 @@ pub(crate) fn resolve_embedding_endpoint_and_key(data: &Path) -> Option<(String,
             ));
         }
     }
-    // Check `<data>/profiles/openrouter/default/` or host `.dsh/.credentials.yaml`
-    let mut candidates = vec![
+    // Check `<data>/profiles/openrouter/default/` or `<data>/profiles/deepseek/`
+    let candidates = [
         data.join("profiles/openrouter/default/api-key"),
         data.join("profiles/openrouter/default/.dsh/.credentials.yaml"),
+        data.join("profiles/deepseek/api/.dsh/.credentials.yaml"),
+        data.join("profiles/deepseek/web/.dsh/.credentials.yaml"),
     ];
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        candidates.push(home.join(".dsh/.credentials.yaml"));
-    }
     for path in candidates {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;

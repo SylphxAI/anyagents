@@ -314,14 +314,21 @@ pub fn write_grok_config(
     let path = grok_dir.join("config.toml");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     let mut lines: Vec<String> = Vec::new();
+    let mut in_mcp_anyagents = false;
     for line in existing.lines() {
         let t = line.trim();
-        if t.starts_with("follow_up_behavior") {
+        if t.starts_with('[') {
+            in_mcp_anyagents = t == "[mcp_servers.anyagents]";
+        }
+        if in_mcp_anyagents
+            || t.starts_with("follow_up_behavior")
+            || t.starts_with("default_model")
+        {
             continue;
         }
         lines.push(line.to_string());
     }
-    let mut out = lines.join("\n");
+    let mut out = lines.join("\n").trim().to_string();
     if !out.contains("[ui]") {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
@@ -330,30 +337,33 @@ pub fn write_grok_config(
     } else {
         out = out.replacen("[ui]", "[ui]\nfollow_up_behavior = \"steer\"", 1);
     }
-    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty())
-        && !out.contains("default_model")
-    {
+    if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
         out = format!("default_model = \"{}\"\n{out}", m.replace('"', "\\\""));
     }
-    if !out.contains("[mcp_servers.anyagents]") {
-        let escaped_args: Vec<String> = args
-            .iter()
-            .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
-            .collect();
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&format!(
-            "\n[mcp_servers.anyagents]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
-            command
-                .display()
-                .to_string()
-                .replace('\\', "\\\\")
-                .replace('"', "\\\""),
-            escaped_args.join(", ")
-        ));
+    let escaped_args: Vec<String> = args
+        .iter()
+        .map(|a| format!("\"{}\"", a.replace('\\', "\\\\").replace('"', "\\\"")))
+        .collect();
+    if !out.ends_with('\n') {
+        out.push('\n');
     }
-    std::fs::write(&path, out)?;
+    out.push_str(&format!(
+        "\n[mcp_servers.anyagents]\ncommand = \"{}\"\nargs = [{}]\nenabled = true\n",
+        command
+            .display()
+            .to_string()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""),
+        escaped_args.join(", ")
+    ));
+    let tmp = path.with_extension("toml.new");
+    std::fs::write(&tmp, out)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
+    }
+    std::fs::rename(&tmp, &path)?;
     Ok(())
 }
 

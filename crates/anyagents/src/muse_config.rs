@@ -97,13 +97,25 @@ pub fn write(
         }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(&path, &bytes)?;
+    write_atomic(&path, &bytes)?;
     for sub in ["muse", ".config/muse"] {
         let sub_dir = dir.join(sub);
         if sub_dir.is_dir() {
-            let _ = std::fs::write(sub_dir.join("settings.json"), &bytes);
+            let _ = write_atomic(&sub_dir.join("settings.json"), &bytes);
         }
     }
+    Ok(())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let tmp = path.with_extension("json.new");
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 

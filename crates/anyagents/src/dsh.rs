@@ -434,7 +434,14 @@ pub fn write_dsh_mcp_patch(
         "- insert:\n    - id: mcp-anyagents\n      name: '@deepseek-ai/dsh-mcp-client'\n      config:\n        serverName: anyagents\n        transport: stdio\n        command: '{}'\n        args:\n{args_yaml}",
         command.display().to_string().replace('\'', "''")
     ));
-    std::fs::write(&patch_path, yaml)?;
+    let tmp = patch_path.with_extension("yml.new");
+    std::fs::write(&tmp, yaml)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
+    }
+    std::fs::rename(&tmp, &patch_path)?;
     Ok(patch_path)
 }
 

@@ -396,8 +396,17 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         let _ = std::fs::create_dir_all(&cache_home);
         let tmp_dir = request.config_dir.join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);
-        let _ = std::fs::create_dir_all(request.config_dir.join("data-home"));
-        let _ = std::fs::create_dir_all(request.config_dir.join("state-home"));
+        let data_home = request.config_dir.join("data-home");
+        let _ = std::fs::create_dir_all(&data_home);
+        let state_home = request.config_dir.join("state-home");
+        let _ = std::fs::create_dir_all(&state_home);
+        let xdg_config_home = if matches!(request.agent.harness.as_str(), "opencode" | "muse") {
+            request.config_dir.clone()
+        } else {
+            let dot_config = request.config_dir.join(".config");
+            let _ = std::fs::create_dir_all(&dot_config);
+            dot_config
+        };
         if let Some((_, _, gid, _)) =
             crate::sandbox::seat_for_agent_with_hint(&request.agent.name, parent_name.as_deref())
         {
@@ -407,6 +416,15 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
+        env.push((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg_config_home.display().to_string(),
+        ));
+        env.push(("XDG_DATA_HOME".to_string(), data_home.display().to_string()));
+        env.push((
+            "XDG_STATE_HOME".to_string(),
+            state_home.display().to_string(),
+        ));
         env.push((
             "XDG_CACHE_HOME".to_string(),
             cache_home.display().to_string(),

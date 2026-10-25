@@ -456,32 +456,6 @@ pub(crate) fn seed_harness_credentials(
     let Ok(all_agents) = store.list_agents() else {
         return;
     };
-    let mut donors: Vec<Agent> = Vec::new();
-    if let Some(ref pid) = agent.parent_id
-        && let Ok(parent) = store.agent(pid)
-        && parent.harness == agent.harness
-    {
-        donors.push(parent);
-    }
-    // Prefer root owner seats (`parent_id.is_none()`) before ephemeral children
-    // so full provider/credential configurations are always found first.
-    for other in &all_agents {
-        if other.id != agent.id
-            && other.parent_id.is_none()
-            && other.harness == agent.harness
-            && !donors.iter().any(|d| d.id == other.id)
-        {
-            donors.push(other.clone());
-        }
-    }
-    for other in &all_agents {
-        if other.id != agent.id
-            && other.harness == agent.harness
-            && !donors.iter().any(|d| d.id == other.id)
-        {
-            donors.push(other.clone());
-        }
-    }
     let static_rel_paths: &[&str] = match agent.harness.as_str() {
         "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
         "codex" => &[
@@ -516,11 +490,9 @@ pub(crate) fn seed_harness_credentials(
         ],
         "omp" => &[
             ".omp/agent/agent.db",
-            ".omp/agent/config.yml",
             ".omp/agent/models.yml",
             ".omp/agent/models.db",
             "agent.db",
-            "config.yml",
             "models.yml",
             "models.db",
         ],
@@ -538,24 +510,6 @@ pub(crate) fn seed_harness_credentials(
         _ => &[],
     };
     let mut rel_paths: Vec<String> = static_rel_paths.iter().map(|s| (*s).to_string()).collect();
-    // Discover any `{file:~/<rel>}` key paths referenced by opencode configs across
-    // profiles or donors so custom provider key files are seeded without hardcoding.
-    for other in &all_agents {
-        let cfg = agent_config_dir(data, &other.id);
-        for candidate in [
-            ".config/opencode/opencode.json",
-            "opencode/opencode.json",
-            "opencode.json",
-        ] {
-            if let Ok(text) = std::fs::read_to_string(cfg.join(candidate)) {
-                for r in extract_file_tilde_refs(&text) {
-                    if !rel_paths.contains(&r) {
-                        rel_paths.push(r);
-                    }
-                }
-            }
-        }
-    }
 
     let explicit_non_default_profile = bound_profile_name(target_config).is_some_and(|b| {
         let prof = b.split_once('/').map(|(_, p)| p).unwrap_or(b.as_str());
@@ -597,7 +551,6 @@ pub(crate) fn seed_harness_credentials(
         if dst_non_empty && !(explicit_non_default_profile && is_auth_cred && !dst.is_file()) {
             continue;
         }
-        let mut copied = false;
         for profile_root in &profile_roots {
             let src = profile_root.join(rel);
             if src.is_file() {
@@ -605,85 +558,8 @@ pub(crate) fn seed_harness_credentials(
                     && let (Ok(a), Ok(b)) = (std::fs::read(&src), std::fs::read(&dst))
                     && a == b
                 {
-                    copied = true;
                     break;
                 }
-                if let Some(parent_dir) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent_dir);
-                }
-                if std::fs::copy(&src, &dst).is_ok() {
-                    copied = true;
-                    break;
-                }
-            }
-        }
-        if copied || dst.exists() || is_auth_cred {
-            continue;
-        }
-        for donor in &donors {
-            let donor_config = agent_config_dir(data, &donor.id);
-            let src = donor_config.join(rel);
-            if !src.is_file() {
-                continue;
-            }
-            if (rel == "opencode.json"
-                || rel == "opencode/opencode.json"
-                || rel == ".config/opencode/opencode.json")
-                && let Ok(text) = std::fs::read_to_string(&src)
-                && !text.contains("\"provider\"")
-            {
-                continue;
-            }
-            if let Some(parent_dir) = dst.parent() {
-                let _ = std::fs::create_dir_all(parent_dir);
-            }
-            if std::fs::copy(&src, &dst).is_ok() {
-                break;
-            }
-        }
-    }
-    if agent.harness == "opencode" {
-        for donor in &donors {
-            let donor_key_dir = agent_config_dir(data, &donor.id)
-                .join(".config")
-                .join("opencode");
-            if let Ok(entries) = std::fs::read_dir(&donor_key_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file()
-                        && let Some(name) = path.file_name()
-                    {
-                        let dst = target_config.join(".config").join("opencode").join(name);
-                        if !dst.exists() {
-                            if let Some(parent_dir) = dst.parent() {
-                                let _ = std::fs::create_dir_all(parent_dir);
-                            }
-                            let _ = std::fs::copy(&path, &dst);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Ensure shared config files (`.kube/config`, `.gitconfig`, plus any `{file:~/...}` keys)
-    // are also seeded from any existing seat if the same-harness donor did not have them.
-    let mut shared_rels: Vec<String> = vec![".kube/config".to_string(), ".gitconfig".to_string()];
-    for r in &rel_paths {
-        if r.starts_with(".config/") && !shared_rels.contains(r) {
-            shared_rels.push(r.clone());
-        }
-    }
-    for shared_rel in &shared_rels {
-        let dst = target_config.join(shared_rel);
-        if dst.exists() {
-            continue;
-        }
-        for other in &all_agents {
-            if other.id == agent.id {
-                continue;
-            }
-            let src = agent_config_dir(data, &other.id).join(shared_rel);
-            if src.is_file() {
                 if let Some(parent_dir) = dst.parent() {
                     let _ = std::fs::create_dir_all(parent_dir);
                 }
@@ -1062,7 +938,23 @@ pub(crate) fn sync_and_list_provider_profiles(
                 let src_json = cfg.join(opencode_rel);
                 if src_json.is_file() {
                     ensure_provider_profile_meta(&profile_dir, &provider, Some(kind));
-                    let _ = copy_host_file(&src_json, &profile_dir.join(opencode_rel));
+                    let dst_json = profile_dir.join(opencode_rel);
+                    if !dst_json.is_file()
+                        && let Ok(text) = std::fs::read_to_string(&src_json)
+                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                        && let Some(prov_block) = val.get("provider")
+                    {
+                        if let Some(p) = dst_json.parent() {
+                            let _ = std::fs::create_dir_all(p);
+                        }
+                        let clean = serde_json::json!({
+                            "$schema": "https://opencode.ai/config.json",
+                            "provider": prov_block,
+                        });
+                        if let Ok(clean_bytes) = serde_json::to_vec_pretty(&clean) {
+                            let _ = std::fs::write(&dst_json, clean_bytes);
+                        }
+                    }
                     if let Ok(text) = std::fs::read_to_string(&src_json) {
                         for rel in extract_file_tilde_refs(&text) {
                             let _ = copy_host_file(&cfg.join(&rel), &profile_dir.join(&rel));

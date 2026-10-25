@@ -13,6 +13,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod support;
+
 use anyagents_core::Store;
 use serde_json::{Value, json};
 
@@ -205,6 +207,13 @@ impl Server {
         let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
             .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
             .env("ANYAGENTS_TELEGRAM_API", api)
+            .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+            .env("ANYAGENTS_AGENTS", support::agents_line())
+            .env("ANYAGENTS_TESTS", "own-seat")
+            .env(
+                "ANYAGENTS_OPERATOR_TOKEN_FILE",
+                dir.join(support::TOKEN_FILE),
+            )
             .arg("--data")
             .arg(dir)
             .arg("serve")
@@ -244,7 +253,11 @@ fn machine_path(dir: &Path) -> std::ffi::OsString {
         .unwrap();
         std::fs::set_permissions(&npm, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    std::env::join_paths([bin]).unwrap()
+    let mut paths = vec![bin];
+    if let Some(sys) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&sys));
+    }
+    std::env::join_paths(paths).unwrap()
 }
 
 fn create(dir: &Path, name: &str) -> String {
@@ -254,6 +267,13 @@ fn create(dir: &Path, name: &str) -> String {
         .args(["agents", "create", name, "--harness", "claude-code"])
         .env("PATH", machine_path(dir))
         .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+        .env("ANYAGENTS_AGENTS", support::agents_line())
+        .env("ANYAGENTS_TESTS", "own-seat")
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            dir.join(support::TOKEN_FILE),
+        )
         .output()
         .unwrap();
     assert!(
@@ -282,6 +302,13 @@ fn add_channel(dir: &Path, agent: &str, bot: i64) {
         .args(["channels", "add", "telegram", "--agent", agent])
         .arg("--token-file")
         .arg(&token)
+        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
+        .env("ANYAGENTS_AGENTS", support::agents_line())
+        .env("ANYAGENTS_TESTS", "own-seat")
+        .env(
+            "ANYAGENTS_OPERATOR_TOKEN_FILE",
+            dir.join(support::TOKEN_FILE),
+        )
         .output()
         .unwrap();
     assert!(

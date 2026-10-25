@@ -92,28 +92,41 @@ pub fn write(
         }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(dir.join("opencode.json"), &bytes)?;
+    write_atomic(&dir.join("opencode.json"), &bytes)?;
     let xdg_opencode_dir = dir.join("opencode");
     std::fs::create_dir_all(&xdg_opencode_dir)?;
-    std::fs::write(xdg_opencode_dir.join("opencode.json"), &bytes)?;
+    write_atomic(&xdg_opencode_dir.join("opencode.json"), &bytes)?;
     let home_opencode_dir = dir.join(".config").join("opencode");
     std::fs::create_dir_all(&home_opencode_dir)?;
-    std::fs::write(home_opencode_dir.join("opencode.json"), &bytes)?;
+    write_atomic(&home_opencode_dir.join("opencode.json"), &bytes)?;
+    Ok(())
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let tmp = path.with_extension("json.new");
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 fn donor_provider_block(dir: &Path) -> Option<serde_json::Value> {
     let mut candidates = Vec::new();
     if let Some(data_dir) = dir.parent().and_then(Path::parent) {
-        candidates.push(data_dir.join("opencode-provider.json"));
-    }
-    if let Some(host_home) = crate::sandbox::host_home_dir() {
         candidates.push(
-            host_home
+            data_dir
+                .join("profiles")
+                .join("sylphx")
+                .join("default")
                 .join(".config")
                 .join("opencode")
                 .join("opencode.json"),
         );
+        candidates.push(data_dir.join("opencode-provider.json"));
     }
     for path in candidates {
         let Ok(bytes) = std::fs::read(&path) else {
