@@ -335,9 +335,8 @@ fn finished_turns_sum_by_agent_and_day() {
     drop(supervisor);
 }
 
-/// Three lines arrive while the child holds its turn open. Every one is written
-/// into the running stream-json child at once, the child echoes each one once,
-/// and the one cursor ends on the last line.
+/// Three lines arrive while the child holds its turn open. Tool-boundary hook
+/// responses carry each line once, and the cursor ends on the last line.
 #[test]
 fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
     let dir = short_dir();
@@ -576,4 +575,53 @@ fn backpressure_parks_until_the_input_activity_notification() {
         || store.delivered_cursor(&agent.id).unwrap() == 1
     ));
     drop(supervisor);
+}
+
+#[test]
+fn deferred_message_keeps_cursor_until_hook_and_replay_does_not_duplicate() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let trigger = dir.path().join("trigger");
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let agent = store
+        .create_agent(NewAgent::new("owner", "claude-code"))
+        .unwrap();
+    let harness = ClaudeHarness::start(
+        env!("CARGO_BIN_EXE_scripted_claude"),
+        None,
+        &[
+            ("ANYAGENTS_FAKE_MODE", "steer"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("ANYAGENTS_FAKE_TRIGGER", trigger.to_str().unwrap()),
+        ],
+    )
+    .unwrap();
+    let mut delivery = DeliveryLoop::start(store, agent.id.clone(), harness).unwrap();
+    delivery
+        .store()
+        .receive(&agent.id, Incoming::new("start working"))
+        .unwrap();
+    delivery.run_once().unwrap();
+    assert_eq!(delivery.delivered_cursor().unwrap(), 1);
+    delivery
+        .store()
+        .receive(&agent.id, Incoming::new("room update"))
+        .unwrap();
+    delivery.run_once().unwrap();
+    delivery.run_once().unwrap();
+    assert_eq!(delivery.delivered_cursor().unwrap(), 1);
+    assert!(!log_contains(&log, "room update"));
+    std::fs::write(&trigger, "hook-1").unwrap();
+    assert!(wait_until(|| log_contains(&log, "tool:proceed")));
+    // Simulate the gap between hook acceptance and cursor commit by dropping
+    // only the delivery loop. Its restarted loop must recognize the same id.
+    let harness = delivery.into_harness();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let mut delivery = DeliveryLoop::start(store, agent.id, harness).unwrap();
+    delivery.run_once().unwrap();
+    delivery.run_once().unwrap();
+    assert_eq!(delivery.delivered_cursor().unwrap(), 2);
+    let text = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(text.matches("room update").count(), 1);
+    assert!(text.find("room update").unwrap() < text.find("tool:proceed").unwrap());
 }
