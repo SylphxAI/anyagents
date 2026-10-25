@@ -1600,7 +1600,8 @@ fn is_markdown_table_separator(line: &str) -> bool {
             let s = c.trim();
             !s.is_empty()
                 && s.chars().any(|ch| ch == '-')
-                && s.chars().all(|ch| ch == '-' || ch == ':' || ch.is_ascii_whitespace())
+                && s.chars()
+                    .all(|ch| ch == '-' || ch == ':' || ch.is_ascii_whitespace())
         })
 }
 
@@ -1690,7 +1691,10 @@ fn match_html_br(s: &str) -> Option<usize> {
 
 fn format_markdown_table_html(headers: &[String], rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
-        let joined: Vec<String> = headers.iter().map(|h| format!("<b>{}</b>", format_table_cell_inline(h))).collect();
+        let joined: Vec<String> = headers
+            .iter()
+            .map(|h| format!("<b>{}</b>", format_table_cell_inline(h)))
+            .collect();
         return format!("<blockquote>{}</blockquote>", joined.join(" · "));
     }
     let first_hdr = headers.first().map(|s| s.trim()).unwrap_or("");
@@ -1701,8 +1705,14 @@ fn format_markdown_table_html(headers: &[String], rows: &[Vec<String>]) -> Strin
     if headers.len() <= 2 {
         let mut lines = Vec::with_capacity(rows.len());
         for row in rows {
-            let c0 = row.first().map(|s| format_table_cell_inline(s)).unwrap_or_default();
-            let c1 = row.get(1).map(|s| format_table_cell_inline(s)).unwrap_or_default();
+            let c0 = row
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            let c1 = row
+                .get(1)
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
             if c1.is_empty() {
                 lines.push(format!("• {c0}"));
             } else {
@@ -1715,13 +1725,25 @@ fn format_markdown_table_html(headers: &[String], rows: &[Vec<String>]) -> Strin
     for row in rows {
         let mut card_lines = Vec::new();
         let start_col = if first_is_index && headers.len() >= 2 {
-            let c0 = row.first().map(|s| format_table_cell_inline(s)).unwrap_or_default();
-            let c1 = row.get(1).map(|s| format_table_cell_inline(s)).unwrap_or_default();
+            let c0 = row
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            let c1 = row
+                .get(1)
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
             card_lines.push(format!("{c0} · {c1}"));
             2
         } else {
-            let c0 = row.first().map(|s| format_table_cell_inline(s)).unwrap_or_default();
-            let h0 = headers.first().map(|s| format_table_cell_inline(s)).unwrap_or_default();
+            let c0 = row
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            let h0 = headers
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
             if c0.starts_with("<b>") || h0.is_empty() {
                 card_lines.push(c0);
             } else {
@@ -1743,7 +1765,10 @@ fn format_markdown_table_html(headers: &[String], rows: &[Vec<String>]) -> Strin
                 card_lines.push(format!("• <b>{formatted_hdr}</b>: {formatted_val}"));
             }
         }
-        cards.push(format!("<blockquote>{}</blockquote>", card_lines.join("\n")));
+        cards.push(format!(
+            "<blockquote>{}</blockquote>",
+            card_lines.join("\n")
+        ));
     }
     cards.join("\n")
 }
@@ -2678,8 +2703,14 @@ mod membership_tests {
         let html = markdown_to_telegram_html(md);
         assert!(!html.contains("|---|"), "{html}");
         assert!(!html.contains("&lt;br&gt;"), "{html}");
-        assert!(html.contains("<blockquote><b>1</b> · <b>Cloud</b> (<code>Spiron</code>)"), "{html}");
+        assert!(
+            html.contains("<blockquote><b>1</b> · <b>Cloud</b> (<code>Spiron</code>)"),
+            "{html}"
+        );
         assert!(html.contains("• <b>Model</b>: <b><code>Claude Opus 5.5 (xhigh)</code></b> / <i>(alt: <code>GPT-6.1 Sol</code>)</i>"), "{html}");
-        assert!(html.contains("• <b>Reason</b>: Rank <b>#1</b></blockquote>"), "{html}");
+        assert!(
+            html.contains("• <b>Reason</b>: Rank <b>#1</b></blockquote>"),
+            "{html}"
+        );
     }
 }
