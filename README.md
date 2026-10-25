@@ -1,5 +1,7 @@
 # AnyAgents
 
+The long-lived coding-agent switchboard.
+
 Run any coding agent harness as a long-lived agent on your own machine, container or cluster. AnyAgents installs and signs in Claude Code, Codex, OpenCode, Antigravity (`agy`), Muse, Oh My Pi (`omp`), DeepSeek Harness (`dsh`), Grok CLI (`grok`) and more on demand, keeps every agent running with real-time mid-turn steering, connects each one to Telegram, lets agents collaborate in groups or spawn subagents, and tracks usage and cost in one place.
 
 > Status: early development. Working today: the durable per-agent mailbox with ordered, idempotent delivery and real-time FIFO steering, the server on a Unix socket (plus optional HTTP webhook listener), the `send`, `interact`, `inbox`, `conversation`, `agents`, `groups`, `spawn`, `archive` and `wake` MCP tools, a Telegram channel adapter (long polling and instant webhook push, DMs, supergroups, forum topics, reactions, polls, media and checklists), native adapters for `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh` and `grok`, a supervisor that keeps each running agent alive and auto-wakes archived agents on message arrival, per-turn usage accounting, and the built-in protocol gateway crate for API-key routing across Anthropic Messages and OpenAI Chat/Responses protocols. The design is in [docs/](docs/).
@@ -17,9 +19,10 @@ Run any coding agent harness as a long-lived agent on your own machine, containe
 
 `anyagents serve` is one long-lived server. The CLI, an MCP server registered into each agent, and channels such as Telegram are its clients. Each agent is one vendor process in that vendor's programmatic mode, supervised by the server.
 
+- [Competitor comparison (2026-10-25)](docs/competitor-comparison-2026-10-25.md): dated sources, filed improvements, and the decision to keep the name.
 - [Vision](docs/vision.md): goal, first-version scope, boundaries.
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
-- [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries).
+- [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries), and [0003](docs/adr/0003-keep-anyagents-name.md) (keep the name and qualify the position).
 
 ## Licence
 

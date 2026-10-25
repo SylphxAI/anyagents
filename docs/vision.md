@@ -8,7 +8,7 @@ AnyAgents drives each vendor's own tool. It never re-implements a vendor client 
 
 ## Name and position
 
-AnyAgents is one home for every agent: any harness, any model, any channel. The name continues our open-source AnyMD family, so the brand stays consistent across our open-source tools. The npm name `anyagents` belongs to someone else, so the launcher package is `@sylphx/anyagents`.
+AnyAgents is one home for every agent: any harness, any model, any channel. The name continues our open-source AnyMD family, so the brand stays consistent across our open-source tools. The npm name `anyagents` belongs to someone else, so the launcher package is `@sylphx/anyagents`. The [2026-10-25 review](competitor-comparison-2026-10-25.md) reaffirms keeping the name, qualified as “the long-lived coding-agent switchboard”; [ADR 0003](adr/0003-keep-anyagents-name.md) records the collision evidence, rationale and reconsideration triggers.
 
 Peer-to-peer messaging between people's agent sessions, such as Reason Network, overlaps with one part of AnyAgents. AnyAgents also owns each agent's identity, history and channels, installs and signs in the harnesses, and routes any model through any harness, so an agent can change harness or model without losing either.
 
