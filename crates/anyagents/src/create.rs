@@ -494,6 +494,9 @@ pub(crate) fn seed_harness_credentials(
             "config.toml",
             "models_cache.json",
             "model-catalog-direct.json",
+            ".config/desk/sylphx-ai/key",
+            ".config/opencode/sylphx.key",
+            ".config/opencode/opencode.json",
         ],
         "opencode" => &[
             "opencode/opencode.json",
@@ -821,6 +824,21 @@ pub(crate) fn bind_profile(
             config.display().to_string(),
         ];
         opencode_config::write(&config, Some(model), &command, &args)?;
+    } else if agent.harness == "codex" {
+        let command = std::env::current_exe()?;
+        let args = vec![
+            "--data".into(),
+            store.data_dir().display().to_string(),
+            "mcp".into(),
+            "--config".into(),
+            config.display().to_string(),
+        ];
+        crate::mcp_config::write_codex_with_model(
+            &config.join("config.toml"),
+            Some(model),
+            &command,
+            &args,
+        )?;
     }
     Ok(())
 }

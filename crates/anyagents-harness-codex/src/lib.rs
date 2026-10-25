@@ -262,31 +262,51 @@ impl CodexHarness {
         )?;
         self.notify("initialized", json!({}))?;
         let fake = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
-        let (method, params) = if let Some(session) = session {
-            if fake {
-                ("thread/resume", json!({"threadId": session}))
-            } else {
-                (
-                    "thread/resume",
-                    json!({
-                        "threadId": session,
-                        "approvalPolicy": "never",
-                        "sandbox": "danger-full-access"
-                    }),
-                )
-            }
-        } else if fake {
-            ("thread/start", json!({}))
+        let (cfg_provider, cfg_model) = if fake {
+            (None, None)
         } else {
-            (
-                "thread/start",
-                json!({
-                    "approvalPolicy": "never",
-                    "sandbox": "danger-full-access"
-                }),
-            )
+            self.codex_config_overrides()
         };
-        let result = self.rpc(method, params)?;
+        let build_start_params = || {
+            if fake {
+                json!({})
+            } else {
+                let mut obj = serde_json::Map::new();
+                obj.insert("approvalPolicy".into(), json!("never"));
+                obj.insert("sandbox".into(), json!("danger-full-access"));
+                if let Some(ref p) = cfg_provider {
+                    obj.insert("modelProvider".into(), json!(p));
+                }
+                if let Some(ref m) = cfg_model {
+                    obj.insert("model".into(), json!(m));
+                }
+                Value::Object(obj)
+            }
+        };
+        let result = if let Some(session) = session {
+            let params = if fake {
+                json!({"threadId": session})
+            } else {
+                let mut obj = serde_json::Map::new();
+                obj.insert("threadId".into(), json!(session));
+                obj.insert("approvalPolicy".into(), json!("never"));
+                obj.insert("sandbox".into(), json!("danger-full-access"));
+                if let Some(ref p) = cfg_provider {
+                    obj.insert("modelProvider".into(), json!(p));
+                }
+                if let Some(ref m) = cfg_model {
+                    obj.insert("model".into(), json!(m));
+                }
+                Value::Object(obj)
+            };
+            match self.rpc("thread/resume", params) {
+                Ok(val) => val,
+                Err(_) if !fake => self.rpc("thread/start", build_start_params())?,
+                Err(err) => return Err(err),
+            }
+        } else {
+            self.rpc("thread/start", build_start_params())?
+        };
         let thread_id = result
             .pointer("/thread/id")
             .and_then(Value::as_str)
@@ -297,6 +317,50 @@ impl CodexHarness {
         };
         lock(&self.shared).thread_id = Some(thread_id);
         Ok(())
+    }
+
+    fn codex_config_overrides(&self) -> (Option<String>, Option<String>) {
+        let home = self
+            .environment
+            .iter()
+            .find(|(k, _)| k == "CODEX_HOME")
+            .or_else(|| self.environment.iter().find(|(k, _)| k == "HOME"))
+            .map(|(_, v)| PathBuf::from(v));
+        let Some(dir) = home else {
+            return (None, None);
+        };
+        let Ok(text) = std::fs::read_to_string(dir.join("config.toml")) else {
+            return (None, None);
+        };
+        let mut provider = None;
+        let mut model = None;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with('[') {
+                break;
+            }
+            if let Some(rest) = trimmed.strip_prefix("model_provider") {
+                let rest = rest.trim_start();
+                if let Some(val) = rest.strip_prefix('=') {
+                    let v = val.trim().trim_matches('"').trim();
+                    if !v.is_empty() {
+                        provider = Some(v.to_string());
+                    }
+                }
+            } else if let Some(rest) = trimmed.strip_prefix("model") {
+                if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+                    continue;
+                }
+                let rest = rest.trim_start();
+                if let Some(val) = rest.strip_prefix('=') {
+                    let v = val.trim().trim_matches('"').trim();
+                    if !v.is_empty() {
+                        model = Some(v.to_string());
+                    }
+                }
+            }
+        }
+        (provider, model)
     }
 
     fn rpc(&self, method: &str, params: Value) -> Result<Value, HarnessError> {
@@ -492,11 +556,18 @@ impl Harness for CodexHarness {
         let params = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
             json!({"threadId": session})
         } else {
-            json!({
-                "threadId": session,
-                "approvalPolicy": "never",
-                "sandbox": "danger-full-access"
-            })
+            let (cfg_provider, cfg_model) = self.codex_config_overrides();
+            let mut obj = serde_json::Map::new();
+            obj.insert("threadId".into(), json!(session));
+            obj.insert("approvalPolicy".into(), json!("never"));
+            obj.insert("sandbox".into(), json!("danger-full-access"));
+            if let Some(p) = cfg_provider {
+                obj.insert("modelProvider".into(), json!(p));
+            }
+            if let Some(m) = cfg_model {
+                obj.insert("model".into(), json!(m));
+            }
+            Value::Object(obj)
         };
         let result = self.rpc("thread/resume", params)?;
         let thread_id = result
