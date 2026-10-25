@@ -143,9 +143,18 @@ pub struct BrowserRequest {
         skip_serializing_if = "Option::is_none"
     )]
     pub selector: Option<String>,
-    /// Text to enter for `"fill"` / `"type"`.
+    /// Text to enter for `"fill"` / `"type"`. Supports zero-knowledge secret references:
+    /// - `"op://<vault>/<item>/<field>"` (1Password secret reference, resolved in-memory by the daemon)
+    /// - `"op-otp://<vault>/<item>"` or `"op://<vault>/<item>/otp?attribute=otp"` (live 1Password 2FA TOTP code)
+    /// - `"secret://<ref>"` (AnyAgents local credential store secret)
+    ///
+    /// Plaintext resolved from a secret reference is typed directly via CDP and never returned in tool output or logs.
     #[serde(default, alias = "value", skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    /// Optional explicit secret reference (`"op://..."`, `"op-otp://..."`, or `"secret://..."`) for `"fill"` / `"type"`,
+    /// so credentials can be injected into password or 2FA inputs without ever passing plaintext through LLM context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
     /// Keyboard key name for `"press"` (e.g. `"Enter"`, `"Tab"`, `"Escape"`, `"PageDown"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
@@ -1160,6 +1169,140 @@ fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> (String, Op
     (trimmed.to_string(), None)
 }
 
+fn load_op_service_account_token() -> Option<String> {
+    if let Ok(tok) = std::env::var("OP_SERVICE_ACCOUNT_TOKEN")
+        && !tok.trim().is_empty()
+    {
+        return Some(tok.trim().to_string());
+    }
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        for rel in [
+            ".config/op-seat/service-account-token",
+            ".config/op/service-account-token",
+        ] {
+            if let Ok(raw) = std::fs::read_to_string(home.join(rel)) {
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve a secret reference (`op://...`, `op-otp://...`, `secret://...`) in memory
+/// without ever echoing the plaintext secret in errors, logs, or responses.
+fn resolve_fill_value(
+    data: &Path,
+    raw_text: Option<&str>,
+    secret_ref: Option<&str>,
+) -> Result<(String, Option<String>), Error> {
+    let candidate = secret_ref
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| raw_text.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("");
+
+    if candidate.starts_with("op://") {
+        let mut cmd = Command::new("op");
+        cmd.args(["read", "--no-newline", candidate]);
+        if let Some(token) = load_op_service_account_token() {
+            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
+        }
+        let out = cmd.output().map_err(|err| {
+            Error::Message(format!("failed to invoke `op` CLI for secret ref: {err}"))
+        })?;
+        if !out.status.success() {
+            return Err(Error::Message(format!(
+                "1Password `op read` failed for reference `{candidate}` (exit status {})",
+                out.status
+            )));
+        }
+        let secret = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Ok((secret, Some(candidate.to_string())));
+    }
+
+    if let Some(rest) = candidate.strip_prefix("op-otp://") {
+        let mut cmd = Command::new("op");
+        let trimmed = rest.trim_matches('/');
+        if let Some((vault, item)) = trimmed.split_once('/') {
+            cmd.args(["item", "get", item, "--vault", vault, "--otp"]);
+        } else {
+            cmd.args(["item", "get", trimmed, "--otp"]);
+        }
+        if let Some(token) = load_op_service_account_token() {
+            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
+        }
+        let out = cmd.output().map_err(|err| {
+            Error::Message(format!("failed to invoke `op` CLI for OTP ref: {err}"))
+        })?;
+        if !out.status.success() {
+            return Err(Error::Message(format!(
+                "1Password `op item get --otp` failed for `{candidate}` (exit status {})",
+                out.status
+            )));
+        }
+        let otp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        return Ok((otp, Some(candidate.to_string())));
+    }
+
+    if let Some(secret_key) = candidate.strip_prefix("secret://") {
+        use anyagents_core::{CredentialStore, FileCredentialStore};
+        let store = FileCredentialStore::new(data);
+        let secret = store.read(secret_key.trim())?;
+        let val = secret
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .map_err(|_| Error::Message("stored secret is not valid UTF-8 text".into()))?;
+        return Ok((val, Some(candidate.to_string())));
+    }
+
+    if secret_ref.is_some() {
+        return Err(Error::Message(
+            "secret_ref must start with `op://`, `op-otp://`, or `secret://`".into(),
+        ));
+    }
+
+    Ok((raw_text.unwrap_or("").to_string(), None))
+}
+
+fn dispatch_trusted_click(cdp: &mut CdpSession, x: f64, y: f64) -> Result<(), Error> {
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        serde_json::json!({
+            "type": "mouseMoved",
+            "x": x,
+            "y": y,
+            "button": "none",
+            "buttons": 0,
+        }),
+    )?;
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        serde_json::json!({
+            "type": "mousePressed",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "buttons": 1,
+            "clickCount": 1,
+        }),
+    )?;
+    cdp.call(
+        "Input.dispatchMouseEvent",
+        serde_json::json!({
+            "type": "mouseReleased",
+            "x": x,
+            "y": y,
+            "button": "left",
+            "buttons": 0,
+            "clickCount": 1,
+        }),
+    )?;
+    Ok(())
+}
+
 pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
     let root = profiles_root(data);
     let mut names = std::collections::BTreeSet::new();
@@ -1402,14 +1545,14 @@ pub fn execute(
                 })?;
             let (css_sel, fallback_xy) = resolve_selector(data, &profile, raw_sel);
             let sel_json = serde_json::to_string(&css_sel).unwrap_or_else(|_| "\"body\"".into());
-            let js = format!(
+            let prep_js = format!(
                 r#"(() => {{
                   const el = document.querySelector({sel_json});
                   if (!el) return {{ found: false }};
                   el.scrollIntoView({{ block: 'center', inline: 'center' }});
                   const r = el.getBoundingClientRect();
-                  el.focus && el.focus();
-                  el.click && el.click();
+                  window.__anyagents_click_hit = false;
+                  el.addEventListener('click', () => {{ window.__anyagents_click_hit = true; }}, {{ once: true, capture: true }});
                   return {{
                     found: true,
                     tag: el.tagName.toLowerCase(),
@@ -1419,26 +1562,26 @@ pub fn execute(
                   }};
                 }})()"#
             );
-            let clicked = eval_js(&mut cdp, &js)?;
-            if clicked.get("found").and_then(|v| v.as_bool()) != Some(true) {
-                if let Some((x, y)) = fallback_xy {
-                    for ev_type in ["mouseMoved", "mousePressed", "mouseReleased"] {
-                        let _ = cdp.call(
-                            "Input.dispatchMouseEvent",
-                            serde_json::json!({
-                                "type": ev_type,
-                                "x": x,
-                                "y": y,
-                                "button": "left",
-                                "clickCount": 1,
-                            }),
-                        );
-                    }
-                } else {
-                    return Err(Error::Message(format!(
-                        "element `{raw_sel}` not found on page; run `snapshot` first to refresh @e refs"
-                    )));
-                }
+            let target_info = eval_js(&mut cdp, &prep_js)?;
+            if target_info.get("found").and_then(|v| v.as_bool()) == Some(true) {
+                let x = target_info.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let y = target_info.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let _ = dispatch_trusted_click(&mut cdp, x, y);
+                let check_js = format!(
+                    r#"(() => {{
+                      if (window.__anyagents_click_hit) return true;
+                      const el = document.querySelector({sel_json});
+                      if (el && el.click) {{ el.focus && el.focus(); el.click(); return true; }}
+                      return false;
+                    }})()"#
+                );
+                let _ = eval_js(&mut cdp, &check_js);
+            } else if let Some((x, y)) = fallback_xy {
+                let _ = dispatch_trusted_click(&mut cdp, x, y);
+            } else {
+                return Err(Error::Message(format!(
+                    "element `{raw_sel}` not found on page; run `snapshot` first to refresh @e refs"
+                )));
             }
             if let Some(wait_ms) = req.wait_ms
                 && wait_ms > 0
@@ -1451,7 +1594,7 @@ pub fn execute(
             Ok(serde_json::json!({
                 "profile": profile,
                 "clicked": raw_sel,
-                "detail": clicked,
+                "detail": target_info,
                 "url": snap.get("url").cloned().unwrap_or_default(),
                 "title": snap.get("title").cloned().unwrap_or_default(),
             }))
@@ -1467,38 +1610,151 @@ pub fn execute(
                         "browser fill requires `selector` (e.g. `@e1` or CSS selector)".into(),
                     )
                 })?;
-            let text_val = req.text.as_deref().unwrap_or("");
+            let (text_val, secret_source) =
+                resolve_fill_value(data, req.text.as_deref(), req.secret_ref.as_deref())?;
             let (css_sel, _) = resolve_selector(data, &profile, raw_sel);
             let sel_json = serde_json::to_string(&css_sel).unwrap_or_else(|_| "\"input\"".into());
-            let val_json = serde_json::to_string(text_val).unwrap_or_else(|_| "\"\"".into());
+            let val_json = serde_json::to_string(&text_val).unwrap_or_else(|_| "\"\"".into());
             let submit = req.submit.unwrap_or(false);
-            let js = format!(
+
+            // Step 1: Scroll into view, focus, handle <select> directly, or prepare <input>/<textarea>/[contenteditable]
+            // for hardware-trusted CDP keystroke injection (`event.isTrusted === true`).
+            let prep_js = format!(
                 r#"(() => {{
                   const el = document.querySelector({sel_json});
                   if (!el) return {{ found: false }};
                   el.scrollIntoView({{ block: 'center', inline: 'center' }});
+                  const r = el.getBoundingClientRect();
+                  const tag = el.tagName.toLowerCase();
+                  if (tag === 'select') {{
+                    const targetVal = {val_json};
+                    let matched = false;
+                    for (const opt of Array.from(el.options || [])) {{
+                      if (opt.value === targetVal || (opt.text && opt.text.trim() === targetVal)) {{
+                        el.value = opt.value;
+                        matched = true;
+                        break;
+                      }}
+                    }}
+                    if (!matched) el.value = targetVal;
+                    el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    return {{ found: true, kind: 'select', tag }};
+                  }}
                   el.focus();
-                  const proto = Object.getPrototypeOf(el);
-                  const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
-                  if (desc && desc.set) {{
-                    desc.set.call(el, {val_json});
-                  }} else {{
-                    el.value = {val_json};
+                  let hadContent = false;
+                  if (typeof el.value === 'string') {{
+                    hadContent = el.value.length > 0;
+                    if (typeof el.select === 'function') {{
+                      try {{ el.select(); }} catch (_) {{}}
+                    }}
+                    if (typeof el.setSelectionRange === 'function') {{
+                      try {{ el.setSelectionRange(0, el.value.length); }} catch (_) {{}}
+                    }}
+                  }} else if (el.isContentEditable) {{
+                    hadContent = (el.innerText || '').length > 0;
+                    try {{
+                      const range = document.createRange();
+                      range.selectNodeContents(el);
+                      const sel = window.getSelection();
+                      sel.removeAllRanges();
+                      sel.addRange(range);
+                    }} catch (_) {{}}
                   }}
-                  el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                  el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                  if ({submit} && el.form) {{
-                    el.form.requestSubmit ? el.form.requestSubmit() : el.form.submit();
-                  }}
-                  return {{ found: true, tag: el.tagName.toLowerCase() }};
+                  return {{
+                    found: true,
+                    kind: el.isContentEditable ? 'contenteditable' : 'input',
+                    tag,
+                    had_content: hadContent,
+                    x: Math.round(r.left + r.width / 2),
+                    y: Math.round(r.top + r.height / 2)
+                  }};
                 }})()"#
             );
-            let filled = eval_js(&mut cdp, &js)?;
-            if filled.get("found").and_then(|v| v.as_bool()) != Some(true) {
+            let prep = eval_js(&mut cdp, &prep_js)?;
+            if prep.get("found").and_then(|v| v.as_bool()) != Some(true) {
                 return Err(Error::Message(format!(
                     "input element `{raw_sel}` not found on page; run `snapshot` first"
                 )));
             }
+
+            if prep.get("kind").and_then(|v| v.as_str()) != Some("select") {
+                if prep.get("had_content").and_then(|v| v.as_bool()) == Some(true) {
+                    let _ = cdp.call(
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({
+                            "type": "keyDown",
+                            "key": "Backspace",
+                            "code": "Backspace",
+                            "windowsVirtualKeyCode": 8,
+                            "nativeVirtualKeyCode": 8,
+                        }),
+                    );
+                    let _ = cdp.call(
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({
+                            "type": "keyUp",
+                            "key": "Backspace",
+                            "code": "Backspace",
+                            "windowsVirtualKeyCode": 8,
+                            "nativeVirtualKeyCode": 8,
+                        }),
+                    );
+                }
+
+                // Use per-character hardware `Input.dispatchKeyEvent` for short single-line values
+                // (passwords, usernames, 6-digit OTP boxes) so `keydown`, `beforeinput`, `input`, and `keyup`
+                // all fire with `event.isTrusted === true` and split OTP boxes auto-advance cleanly.
+                if text_val.chars().count() <= 128 && !text_val.contains('\n') {
+                    for ch in text_val.chars() {
+                        let s = ch.to_string();
+                        let _ = cdp.call(
+                            "Input.dispatchKeyEvent",
+                            serde_json::json!({
+                                "type": "keyDown",
+                                "key": s,
+                                "text": s,
+                                "unmodifiedText": s,
+                            }),
+                        );
+                        let _ = cdp.call(
+                            "Input.dispatchKeyEvent",
+                            serde_json::json!({
+                                "type": "keyUp",
+                                "key": s,
+                            }),
+                        );
+                    }
+                } else if !text_val.is_empty() {
+                    let _ = cdp.call(
+                        "Input.insertText",
+                        serde_json::json!({
+                            "text": text_val,
+                        }),
+                    );
+                }
+
+                // Verify and fire `change` event (or apply native setter fallback if a custom control ignored key events).
+                let finalize_js = format!(
+                    r#"(() => {{
+                      const el = document.querySelector({sel_json});
+                      if (!el) return;
+                      if (typeof el.value === 'string' && el.value !== {val_json} && (!el.maxLength || el.maxLength < 0 || {val_json}.length <= el.maxLength)) {{
+                        const proto = Object.getPrototypeOf(el);
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                        if (desc && desc.set) {{
+                          desc.set.call(el, {val_json});
+                        }} else {{
+                          el.value = {val_json};
+                        }}
+                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                      }}
+                      el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    }})()"#
+                );
+                let _ = eval_js(&mut cdp, &finalize_js);
+            }
+
             if submit {
                 let _ = cdp.call(
                     "Input.dispatchKeyEvent",
@@ -1521,11 +1777,17 @@ pub fn execute(
                     }),
                 );
             }
-            Ok(serde_json::json!({
+            let mut resp = serde_json::json!({
                 "profile": profile,
                 "filled": raw_sel,
                 "submitted": submit,
-            }))
+                "trusted_input": true,
+            });
+            if let Some(src) = secret_source {
+                resp["secret_injected"] = serde_json::Value::Bool(true);
+                resp["secret_source"] = serde_json::Value::String(src);
+            }
+            Ok(resp)
         }
         "press" | "key" => {
             let key_name = req

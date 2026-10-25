@@ -921,6 +921,7 @@ fn browser_cmd(
         url,
         selector,
         text,
+        secret_ref: None,
         key: None,
         script,
         path,
