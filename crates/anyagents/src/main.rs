@@ -35,7 +35,7 @@ mod vendor;
 #[derive(Parser)]
 #[command(
     name = "anyagents",
-    version,
+    version = env!("ANYAGENTS_VERSION"),
     about = "Mailbox and delivery for long-lived coding agents",
     arg_required_else_help = true
 )]

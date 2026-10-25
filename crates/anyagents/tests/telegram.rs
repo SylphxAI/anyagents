@@ -964,6 +964,16 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
     health_stream.read_to_string(&mut health_resp).unwrap();
     assert!(health_resp.starts_with("HTTP/1.1 200"), "{health_resp}");
     assert!(health_resp.contains("\"ok\":true"), "{health_resp}");
+    let health: Value =
+        serde_json::from_str(health_resp.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(health["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(health["commit"], env!("ANYAGENTS_COMMIT"));
+    let version = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert!(String::from_utf8_lossy(&version.stdout).contains(env!("ANYAGENTS_COMMIT")));
 
     // Control-plane routes are NOT exposed on the TCP webhook listener.
     let mut forbidden_stream = TcpStream::connect(&webhook_addr).unwrap();

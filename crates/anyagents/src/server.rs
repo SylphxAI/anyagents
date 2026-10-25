@@ -398,7 +398,11 @@ async fn mint_capability(
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
 /// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
 async fn webhook_healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+    Json(serde_json::json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "commit": env!("ANYAGENTS_COMMIT"),
+    }))
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
