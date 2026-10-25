@@ -72,8 +72,8 @@ fn finish_records_usage_and_dedupes() {
     assert_eq!(usage.reported_cost_micros, Some(500_000));
     assert_eq!(harness.session_id().as_deref(), Some("sess-from-vendor"));
     let health = harness.health();
-    // Claude Code reads a stream-json `user` line mid-turn, so the catalog
-    // steers rather than following up.
+    // Claude Code injects pending context through its tool hook mid-turn, so
+    // the catalog steers rather than following up.
     assert_eq!(health.delivery_mode, DeliveryMode::Steer);
     assert_eq!(health.steer_support, SteerSupport::Yes);
     let again = harness.deliver(&msg("m1")).unwrap();
