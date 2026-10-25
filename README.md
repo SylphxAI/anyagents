@@ -19,6 +19,7 @@ Run any coding agent harness as a long-lived agent on your own machine, containe
 
 - [Vision](docs/vision.md): goal, first-version scope, boundaries.
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
+- [Verification](docs/verification.md): reproducible scripted harness checks, coverage and live-acceptance boundaries.
 - [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries).
 
 ## Licence

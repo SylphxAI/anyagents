@@ -1,13 +1,13 @@
-//! The server on an Antigravity agent and on a Muse agent: create, one send,
-//! one turn, and the reply the agent made through the AnyAgents tool server.
+//! The server on every catalog harness: create, repeated sends and turns,
+//! and replies correlated through the AnyAgents tool server.
 //!
 //! The vendors' models cannot run here, so each agent's config names the
 //! AnyAgents harness double (`anyagents harness <config>`), which obeys the
-//! adapter contract: it takes each user line, calls `send` through the same
+//! double contract: it takes each user line, calls `send` through the same
 //! `anyagents mcp --agent <name>` the vendor is given, and ends the turn with a
 //! `result`. That exercises the real path — create, supervisor, delivery loop,
-//! the adapter's create line, the mailbox cursor and the tool server — for both
-//! harnesses. The vendor protocols themselves are covered by each adapter's
+//! harness launch, the mailbox cursor and the tool server — for every catalog
+//! harness. The vendor protocols themselves are covered by each adapter's
 //! protocol tests.
 
 mod support;
@@ -109,7 +109,6 @@ fn create(dir: &Path, name: &str, harness: &str, agent_file: &Path) -> String {
         "harness": harness,
         "reply_with": format!("{} --data {} mcp", env!("CARGO_BIN_EXE_anyagents"), dir.display()),
         "agent_file": agent_file.display().to_string(),
-        "context_reply_to": true,
         // The double answers as `kind`, the agent that asks below.
         "sender": "agent:kind",
         // The model answers the message it was handed, by the mailbox reference in
@@ -163,7 +162,7 @@ fn call(socket: &Path, request: &str) -> Value {
 }
 
 /// The answer comes back to the agent that asked, through its `send` call.
-fn ask(dir: &Path, name: &str, harness: &str, _sent_id: &str) {
+fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
     let store = Store::open(dir.join("state.db")).unwrap();
     let agent = store.agent_by_name("kind").unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -172,14 +171,22 @@ fn ask(dir: &Path, name: &str, harness: &str, _sent_id: &str) {
         // The answer names the message it answers by the reference the server
         // put in its trusted context, and the server resolved that reference
         // back to the asker: this mailbox holds it, from that agent.
-        let answered = inbox.iter().any(|message| {
-            message.text == "pong"
-                && message
-                    .sender
-                    .as_deref()
-                    .is_some_and(|sender| sender == format!("agent:{name}"))
-        });
-        if answered {
+        let answers: Vec<_> = inbox
+            .iter()
+            .filter(|message| {
+                message.text == "pong"
+                    && message.reply_to.as_deref() == Some(sent_id)
+                    && message
+                        .sender
+                        .as_deref()
+                        .is_some_and(|sender| sender == format!("agent:{name}"))
+            })
+            .collect();
+        assert!(
+            answers.len() <= 1,
+            "duplicate replies to {sent_id}: {answers:?}"
+        );
+        if !answers.is_empty() {
             break;
         }
         assert!(
@@ -200,6 +207,43 @@ fn one_round(data: &Path, name: &str, harness: &str) {
     let text = sent.to_string();
     let sent_id = sent["deliveries"][0]["id"].as_str().expect(&text);
     ask(data, name, harness, sent_id);
+}
+
+/// Each case has its own server and store so a reply from another harness or
+/// an earlier turn cannot satisfy it. These exercise the common contract-double
+/// launch route, not the native vendor wire protocols or live authentication.
+fn repeated_replies(harness: &str) {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    create_asker(&data);
+    let name = "responder";
+    let agent_file = data.join("responder-name");
+    std::fs::write(&agent_file, name).unwrap();
+    create(&data, name, harness, &agent_file);
+    let _server = Server::start(&data, Path::new(env!("CARGO_BIN_EXE_anyagents")));
+    one_round(&data, name, harness);
+    one_round(&data, name, harness);
+}
+
+macro_rules! reply_cases {
+    ($($test:ident => $harness:literal),+ $(,)?) => {
+        $(#[test]
+        fn $test() {
+            repeated_replies($harness);
+        })+
+    };
+}
+
+reply_cases! {
+    claude_code_replies_to_each_turn => "claude-code",
+    codex_replies_to_each_turn => "codex",
+    opencode_replies_to_each_turn => "opencode",
+    omp_replies_to_each_turn => "omp",
+    dsh_replies_to_each_turn => "dsh",
+    grok_replies_to_each_turn => "grok",
 }
 
 #[test]
@@ -234,6 +278,10 @@ fn an_agy_agent_and_a_muse_agent_each_answer_a_mailbox_message() {
     assert_eq!(muse_settings["mcpServers"]["anyagents"]["mode"], "required");
 
     let server = Server::start(&data, Path::new(env!("CARGO_BIN_EXE_anyagents")));
+    one_round(&data, "gamma", "agy");
+    one_round(&data, "delta", "muse");
+    // A second turn must produce a new reply, not pass by finding the first
+    // turn's pong in the asker's persistent mailbox.
     one_round(&data, "gamma", "agy");
     one_round(&data, "delta", "muse");
 
