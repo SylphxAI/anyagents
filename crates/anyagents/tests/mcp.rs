@@ -86,8 +86,10 @@ struct ConversationResponse {
     turns: Vec<ConversationTurnView>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct ConversationTurnView {
+    direction: String,
+    from: String,
     text: String,
 }
 
@@ -275,7 +277,9 @@ async fn mcp_tools_use_the_server_socket() {
     let tools = alpha.list_all_tools().await.unwrap();
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
     assert!(names.contains(&"send".to_string()), "{names:?}");
-    assert!(names.contains(&"inbox".to_string()), "{names:?}");
+    assert!(names.contains(&"conversation".to_string()), "{names:?}");
+    assert!(names.contains(&"search".to_string()), "{names:?}");
+    assert!(!names.contains(&"inbox".to_string()), "{names:?}");
     assert!(names.contains(&"agents".to_string()), "{names:?}");
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
@@ -326,20 +330,17 @@ async fn mcp_tools_use_the_server_socket() {
         vec![1, 2]
     );
 
-    let own: InboxResponse = ok_json(call(&alpha, "inbox", serde_json::json!({})).await);
-    assert!(own.messages.is_empty(), "{:?}", own.messages.len());
-
-    let got: InboxResponse = ok_json(call(&beta, "inbox", serde_json::json!({})).await);
-    assert_eq!(got.messages.len(), 2);
-    assert_eq!(got.messages[0].text, "hello");
-    assert_eq!(got.messages[0].sender.as_deref(), Some("agent:alpha"));
-    // The mailbox holds it as soon as it is received. Whether the harness has
-    // taken it depends on the vendor process, which this test does not run.
+    let own: ConversationResponse = ok_json(call(&alpha, "conversation", serde_json::json!({})).await);
     assert!(
-        matches!(got.messages[0].ack.as_str(), "received" | "delivered"),
-        "{}",
-        got.messages[0].ack
+        own.turns.iter().all(|t| t.direction == "out"),
+        "{:?}",
+        own.turns
     );
+
+    let got: ConversationResponse = ok_json(call(&beta, "conversation", serde_json::json!({})).await);
+    assert_eq!(got.turns.len(), 2);
+    assert_eq!(got.turns[0].text, "hello");
+    assert_eq!(got.turns[0].from, "agent:alpha");
 
     // A room reaches every other agent, and not the sender.
     // A named group reaches its own members.
@@ -367,15 +368,26 @@ async fn mcp_tools_use_the_server_socket() {
     let to: Vec<&str> = room.deliveries.iter().map(|one| one.to.as_str()).collect();
     assert!(to.contains(&"agent:beta"), "{to:?}");
     assert!(!to.contains(&"agent:alpha"), "{to:?}");
-    let in_room: InboxResponse =
-        ok_json(call(&beta, "inbox", serde_json::json!({"since": 0})).await);
+    let in_room: ConversationResponse =
+        ok_json(call(&beta, "conversation", serde_json::json!({})).await);
     assert!(
-        in_room.messages.iter().any(|line| line.text == "room line"),
+        in_room.turns.iter().any(|line| line.text == "room line"),
         "{:?}",
-        in_room.messages.len()
+        in_room.turns.len()
     );
-    let own: InboxResponse = ok_json(call(&alpha, "inbox", serde_json::json!({"since": 0})).await);
-    assert!(!own.messages.iter().any(|line| line.text == "room line"));
+    let searched: ConversationResponse = ok_json(
+        call(
+            &alpha,
+            "search",
+            serde_json::json!({"query": "room line", "limit": 5}),
+        )
+        .await,
+    );
+    assert!(
+        searched.turns.iter().any(|line| line.text == "room line"),
+        "{:?}",
+        searched.turns
+    );
 
     let missing = call(
         &alpha,
@@ -384,11 +396,11 @@ async fn mcp_tools_use_the_server_socket() {
     )
     .await;
     assert!(error_text(&missing).contains("agent not found"));
-    // beta holds the two addressed lines and the room line; `since` 1 leaves the
-    // later two. A failed send to a missing agent wrote nothing.
-    let since: InboxResponse = ok_json(call(&beta, "inbox", serde_json::json!({"since": 1})).await);
-    assert_eq!(since.messages.len(), 2);
-    assert_eq!(since.messages[1].seq, 3);
+    // beta holds the two addressed lines and the room line. A failed send to a
+    // missing agent wrote nothing.
+    let since: ConversationResponse =
+        ok_json(call(&beta, "conversation", serde_json::json!({})).await);
+    assert_eq!(since.turns.len(), 3);
 
     let empty = call(
         &alpha,

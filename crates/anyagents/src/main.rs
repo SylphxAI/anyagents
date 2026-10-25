@@ -28,6 +28,7 @@ mod sandbox;
 mod server;
 mod signin;
 mod telegram;
+mod ui;
 mod vendor;
 
 #[derive(Parser)]
@@ -71,8 +72,13 @@ enum Command {
     },
     /// Upstream provider profile pool (Subscriptions, Coding Plans, and API Keys) shared across harnesses.
     Profiles {
-        /// Optional provider or harness filter (e.g. `sylphx`, `anthropic`, `openai`, `google-antigravity`, `qwen-token-plan`).
-        filter: Option<String>,
+        /// Optional action (`list`, `set`) or provider/harness filter.
+        action: Option<String>,
+        /// Target `<provider>/<profile>` when `action` is `set` (or filter when `action` is `list`).
+        target: Option<String>,
+        /// File holding the API / Coding Plan key when `action` is `set`.
+        #[arg(long = "key-file")]
+        key_file: Option<PathBuf>,
     },
     /// Create and list agents.
     Agents {
@@ -88,6 +94,14 @@ enum Command {
         #[arg(long)]
         parent: Option<String>,
     },
+    /// List sub-agents for a parent agent (defaults to `self` inside an agent, or all sub-agents from host CLI).
+    Subagents {
+        /// Optional parent agent name, `agt_...` id, `self`, or `all`.
+        parent: Option<String>,
+        /// Optional state filter: `running`, `paused`, `archived`, or `all`.
+        #[arg(long)]
+        state: Option<String>,
+    },
     /// Spawn a new agent or sub-agent and optionally deliver an initial task prompt.
     Spawn {
         /// Optional agent name (`[a-z0-9][a-z0-9_-]*`). Auto-generated when omitted.
@@ -96,6 +110,9 @@ enum Command {
         harness: Option<String>,
         #[arg(long)]
         model: Option<String>,
+        /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
@@ -110,12 +127,20 @@ enum Command {
         /// Agent name or `agt_...` id (defaults to this agent when run inside an agent).
         name: Option<String>,
     },
-    /// Wake an archived agent (`state = running`) and resume its session.
+    /// Pause an agent (`state = paused`), stopping its process, channel polling, and group wakes until resumed.
+    Pause {
+        /// Agent name or `agt_...` id (defaults to this agent when run inside an agent).
+        name: Option<String>,
+    },
+    /// Wake an archived or paused agent (`state = running`) and resume its session.
     Wake {
         /// Agent name or `agt_...` id.
         name: String,
+        /// Optional task/message to deliver immediately after waking.
+        #[arg(long)]
+        prompt: Option<String>,
     },
-    /// Resume an archived agent (`state = running`) and optionally send a task prompt.
+    /// Resume an archived or paused agent (`state = running`) and optionally send a task prompt.
     Resume {
         /// Agent name or `agt_...` id.
         name: String,
@@ -123,19 +148,27 @@ enum Command {
         #[arg(long)]
         prompt: Option<String>,
     },
-    /// Store the provider key an agent's model runs on (API key mode).
+    /// Permanently delete an agent and its on-disk directory.
+    Delete {
+        /// Agent name or `agt_...` id.
+        name: String,
+    },
+    /// Store the provider key an agent's model runs on (API key mode), or bind a named provider profile.
     Model {
         /// The agent name.
         agent: String,
         /// The provider origin, for example https://api.deepseek.com.
         #[arg(long = "base-url")]
-        base_url: String,
+        base_url: Option<String>,
         /// The model id the provider serves, for example deepseek-chat.
         #[arg(long)]
         model: String,
         /// A file holding the key, on its own line. The key is never an argument.
         #[arg(long = "key-file")]
-        key_file: PathBuf,
+        key_file: Option<PathBuf>,
+        /// Existing provider/profile to bind instead of an API key.
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Send a message, media file, GPS location/venue, or poll to one or more agents, groups, or channels.
     Send {
@@ -259,17 +292,37 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Read any agent's full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
+    /// Read or search (`--query`) any agent's full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
     Conversation {
-        /// Agent name or `agt_...` id (defaults to this agent when run inside an agent).
+        /// Agent name (`sage`, `argon`, `prism`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
         agent: Option<String>,
+        /// Optional Hybrid RAG semantic + BM25 search query.
+        #[arg(short = 'q', long)]
+        query: Option<String>,
         /// Optional peer filter (e.g. `alice`, `agent:beta`, `group:crew`, `telegram:chat:-1001234567890`).
         #[arg(long)]
         with: Option<String>,
         /// Exclusive timestamp cursor in milliseconds.
         #[arg(long = "since-ms")]
         since_ms: Option<i64>,
-        /// Maximum number of turns to return (default 50).
+        /// Maximum number of turns to return (default 50, or 20 with `--query`).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Hybrid RAG semantic + BM25 search across historical and live conversations.
+    Search {
+        /// Search query (matched via locked `voyageai/voyage-4-large` vector embedding + FTS5 trigram BM25).
+        query: String,
+        /// Optional agent filter (`sage`, `argon`, `prism`, or `all`; defaults to `all`).
+        #[arg(long)]
+        agent: Option<String>,
+        /// Optional peer filter.
+        #[arg(long)]
+        with: Option<String>,
+        /// Exclusive timestamp cursor in milliseconds.
+        #[arg(long = "since-ms")]
+        since_ms: Option<i64>,
+        /// Maximum number of turns to return (default 20).
         #[arg(long)]
         limit: Option<usize>,
     },
@@ -361,6 +414,11 @@ enum HarnessesCommand {
         /// Optional harness ID filter.
         harness: Option<String>,
     },
+    /// Check and update installed harnesses to the latest upstream version.
+    Update {
+        /// Optional harness ID filter (updates all when omitted).
+        harness: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -381,6 +439,10 @@ enum ChannelsCommand {
 
 #[derive(Subcommand)]
 enum AgentsCommand {
+    /// Grant administrative authority to a root agent (operator only).
+    GrantAdmin { agent: String },
+    /// Revoke administrative authority immediately (operator only).
+    RevokeAdmin { agent: String },
     /// Record an agent. The harness is a catalog key.
     Create {
         name: String,
@@ -388,6 +450,9 @@ enum AgentsCommand {
         harness: String,
         #[arg(long)]
         model: Option<String>,
+        /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
+        #[arg(long)]
+        profile: Option<String>,
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
@@ -399,16 +464,30 @@ enum AgentsCommand {
     },
     /// Archive an agent (`state = archived`), scaling its process to zero while keeping its session.
     Archive { name: String },
-    /// Wake and resume an archived agent (`state = running`).
+    /// Pause an agent (`state = paused`), stopping its process, channel polling, and group wakes until resumed.
+    Pause { name: String },
+    /// Wake and resume an archived or paused agent (`state = running`).
     Wake { name: String },
+    /// Permanently delete an agent and its on-disk directory.
+    Delete { name: String },
     /// List agents.
     List {
-        /// Optional state filter: `running`, `archived`, or `all`.
+        /// Optional state filter: `running`, `paused`, `archived`, or `all`.
         #[arg(long)]
         state: Option<String>,
         /// Optional parent filter: agent name, `agt_...` id, `self`, or `root`.
         #[arg(long)]
         parent: Option<String>,
+    },
+    /// View or update an agent's standing role instructions and refresh its injected system prompt.
+    Instructions {
+        /// Agent name or `agt_...` id (or `all` to refresh every agent's system prompt).
+        name: String,
+        /// New standing role instructions for this agent (omit to view current).
+        instructions: Option<String>,
+        /// Clear custom standing instructions.
+        #[arg(long)]
+        clear: bool,
     },
 }
 
@@ -441,18 +520,26 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
         Command::Harnesses { action } => match action {
             HarnessesCommand::List => {
-                list_harnesses();
+                list_harnesses(&data);
                 Ok(())
             }
             HarnessesCommand::Profiles { harness } => {
-                list_profiles_cmd(&data, harness.as_deref());
-                Ok(())
+                list_profiles_cmd(&data, harness.as_deref())
+            }
+            HarnessesCommand::Update { harness } => {
+                update_harnesses_cmd(&data, harness.as_deref())
             }
         },
-        Command::Profiles { filter } => {
-            list_profiles_cmd(&data, filter.as_deref());
-            Ok(())
-        }
+        Command::Profiles {
+            action,
+            target,
+            key_file,
+        } => profiles_cmd(
+            &data,
+            action.as_deref(),
+            target.as_deref(),
+            key_file.as_deref(),
+        ),
         Command::Mcp { config } => mcp::run(&data, config.as_deref()),
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
@@ -462,10 +549,23 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Peers { state, parent } => {
             agent::peers(&data, state.as_deref(), parent.as_deref())
         }
+        Command::Subagents { parent, state } => {
+            let parent_filter = parent.or_else(|| {
+                if std::env::var("ANYAGENTS_AGENT_ID").is_ok()
+                    || std::env::var("ANYAGENTS_AGENT_NAME").is_ok()
+                {
+                    Some("self".to_owned())
+                } else {
+                    Some("subagents".to_owned())
+                }
+            });
+            agent::peers(&data, state.as_deref(), parent_filter.as_deref())
+        }
         Command::Spawn {
             name,
             harness,
             model,
+            profile,
             workdir,
             instructions,
             parent,
@@ -475,21 +575,32 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             name,
             harness,
             model,
+            profile,
             workdir,
             instructions,
             parent,
             prompt,
         ),
         Command::Archive { name } => agent::archive_cmd(&data, name),
-        Command::Wake { name } => agent::resume_cmd(&data, &name, None),
+        Command::Pause { name } => agent::pause_cmd(&data, name),
+        Command::Wake { name, prompt } => agent::resume_cmd(&data, &name, prompt),
         Command::Resume { name, prompt } => agent::resume_cmd(&data, &name, prompt),
+        Command::Delete { name } => agent::delete_cmd(&data, &name),
         Command::Flush { agent } => agent::flush(&data, &agent),
         Command::Model {
             agent,
             base_url,
             model,
             key_file,
-        } => store_key(&data, &agent, &base_url, &model, &key_file),
+            profile,
+        } => model_cmd(
+            &data,
+            &agent,
+            base_url.as_deref(),
+            &model,
+            key_file.as_deref(),
+            profile.as_deref(),
+        ),
         Command::Send {
             to,
             text,
@@ -632,10 +743,32 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         } => channel::inbox(&data, agent.as_deref(), since, limit),
         Command::Conversation {
             agent,
+            query,
             with,
             since_ms,
             limit,
-        } => channel::conversation(&data, agent.as_deref(), with.as_deref(), since_ms, limit),
+        } => channel::conversation(
+            &data,
+            agent.as_deref(),
+            with.as_deref(),
+            since_ms,
+            limit,
+            query.as_deref(),
+        ),
+        Command::Search {
+            query,
+            agent,
+            with,
+            since_ms,
+            limit,
+        } => channel::conversation(
+            &data,
+            Some(agent.as_deref().unwrap_or("all")),
+            with.as_deref(),
+            since_ms,
+            Some(limit.unwrap_or(20)),
+            Some(&query),
+        ),
         Command::Usage { agent, by } => agent::usage(&data, agent.as_deref(), by.as_deref())
             .map_err(|err| match err {
                 agent::UsageError::Store(err) => err,
@@ -657,7 +790,33 @@ fn print_boundary(data: &Path) -> Result<(), anyagents_core::Error> {
 
 /// Print the catalog: id, the variable that points the vendor at its private
 /// config directory, and the command that installs it. Never a credential.
-fn list_harnesses() {
+fn list_harnesses(data: &Path) {
+    if ui::is_pretty() {
+        println!("\n  {}\n", ui::bold_cyan("Supported Harnesses"));
+        let mut table = ui::Table::new(&[
+            ("HARNESS", false),
+            ("VERSION", false),
+            ("CONFIG ENV", false),
+            ("INSTALL COMMAND", false),
+        ]);
+        for entry in anyagents_installer::builtin_catalog() {
+            let ver = install::detect_version(data, &entry.id);
+            let ver_cell = if ver == "-" {
+                ui::dim("-")
+            } else {
+                ui::green(&ver)
+            };
+            table.add_row(vec![
+                ui::bold(&ui::cyan(&entry.id)),
+                ver_cell,
+                ui::dim(signin::config_variable(&entry.id).unwrap_or("-")),
+                signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string()),
+            ]);
+        }
+        table.print();
+        println!();
+        return;
+    }
     for entry in anyagents_installer::builtin_catalog() {
         println!(
             "{}\t{}\t{}",
@@ -666,6 +825,83 @@ fn list_harnesses() {
             signin::install_hint(&entry.id).unwrap_or_else(|| "-".to_string())
         );
     }
+}
+
+fn update_harnesses_cmd(
+    data: &Path,
+    target: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    let catalog = anyagents_installer::builtin_catalog();
+    let targets: Vec<String> = match target.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(t) => {
+            if !catalog.iter().any(|c| c.id == t) {
+                return Err(anyagents_core::Error::Message(format!(
+                    "unknown harness `{t}`"
+                )));
+            }
+            vec![t.to_string()]
+        }
+        None => catalog.into_iter().map(|c| c.id).collect(),
+    };
+
+    let mut rows = Vec::new();
+    for id in targets {
+        match install::update_harness(data, &id) {
+            Ok((before, after, updated)) => {
+                rows.push((id, before, after, updated, None));
+            }
+            Err(err) => {
+                let cur = install::detect_version(data, &id);
+                rows.push((id, cur.clone(), cur, false, Some(err)));
+            }
+        }
+    }
+
+    if ui::is_pretty() {
+        println!("\n  {}\n", ui::bold_cyan("Harness Updates"));
+        let mut table = ui::Table::new(&[
+            ("HARNESS", false),
+            ("BEFORE", false),
+            ("CURRENT", false),
+            ("STATUS", false),
+        ]);
+        for (id, before, after, updated, err) in rows {
+            let status = if let Some(e) = err {
+                ui::yellow(&format!("! {e}"))
+            } else if updated {
+                ui::bold_green("↑ updated")
+            } else if after == "-" {
+                ui::dim("on-demand")
+            } else {
+                ui::green("✓ up-to-date")
+            };
+            table.add_row(vec![
+                ui::bold(&ui::cyan(&id)),
+                ui::dim(&before),
+                if updated {
+                    ui::bold_green(&after)
+                } else {
+                    after
+                },
+                status,
+            ]);
+        }
+        table.print();
+        println!();
+        return Ok(());
+    }
+
+    for (id, before, after, updated, err) in rows {
+        let state = if let Some(e) = err {
+            format!("error:{e}")
+        } else if updated {
+            "updated".to_string()
+        } else {
+            "up-to-date".to_string()
+        };
+        println!("{id}\t{before}\t{after}\t{state}");
+    }
+    Ok(())
 }
 
 /// Store an agent's provider key. The key is read from a file, kept 0600 under
@@ -697,6 +933,121 @@ fn store_key(
     gateway::store_key(&data, &recorded, base_url, model, key)?;
     println!("key stored\t{}\t{}", recorded.name, model);
     Ok(())
+}
+
+fn model_cmd(
+    data: &Path,
+    agent: &str,
+    base_url: Option<&str>,
+    model: &str,
+    key_file: Option<&Path>,
+    profile: Option<&str>,
+) -> Result<(), anyagents_core::Error> {
+    use anyagents_core::Error;
+    if profile.is_some() && (key_file.is_some() || base_url.is_some()) {
+        return Err(Error::Message(
+            "profile cannot be combined with a key or base URL".into(),
+        ));
+    }
+    if client::can_call_server(data) {
+        let key = key_file.map(std::fs::read_to_string).transpose()?;
+        let body = serde_json::json!({
+            "model": model,
+            "base_url": base_url,
+            "key": key,
+            "profile": profile,
+        });
+        match client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/agents/{agent}/model"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        ) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+                );
+                return Ok(());
+            }
+            Err(err) if err.contains("404") => {}
+            Err(err) => return Err(Error::Message(err)),
+        }
+    }
+    if let Some(profile) = profile {
+        let store = agent::open(data)?;
+        let rec = store.agent_by_name(agent)?;
+        create::bind_profile(&store, &rec, profile, model)?;
+        println!(
+            "{}",
+            serde_json::json!({"agent": rec.name, "model": model, "profile": profile})
+        );
+        return Ok(());
+    }
+    store_key(
+        data,
+        agent,
+        base_url.ok_or_else(|| Error::Message("base URL is required".into()))?,
+        model,
+        key_file.ok_or_else(|| Error::Message("key file is required".into()))?,
+    )
+}
+
+fn profiles_cmd(
+    data: &Path,
+    action: Option<&str>,
+    target: Option<&str>,
+    key_file: Option<&Path>,
+) -> Result<(), anyagents_core::Error> {
+    use anyagents_core::Error;
+    match action.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("set") => {
+            let profile = target
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    Error::Message(
+                        "usage: anyagents profiles set <provider>/<profile> --key-file <path>"
+                            .into(),
+                    )
+                })?;
+            let kf = key_file.ok_or_else(|| {
+                Error::Message("--key-file <path> is required for `profiles set`".into())
+            })?;
+            let key = std::fs::read_to_string(kf)?;
+            if client::can_call_server(data) {
+                let body = serde_json::json!({"profile": profile, "key": key});
+                match client::call::<serde_json::Value>(
+                    data,
+                    "POST",
+                    "/v1/profiles",
+                    Some(body.to_string().into_bytes()),
+                    &client::authority(data),
+                ) {
+                    Ok(result) => {
+                        println!(
+                            "{}",
+                            result.ok_or_else(|| {
+                                Error::Message("the server answered nothing".into())
+                            })?
+                        );
+                        return Ok(());
+                    }
+                    Err(err) if err.contains("404") => {}
+                    Err(err) => return Err(Error::Message(err)),
+                }
+            }
+            let (prov, prof) = create::set_provider_profile(data, profile, &key)?;
+            println!(
+                "{}",
+                serde_json::json!({"provider": prov, "profile": prof})
+            );
+            Ok(())
+        }
+        Some("list") => list_profiles_cmd(data, target),
+        other => list_profiles_cmd(data, other),
+    }
 }
 
 /// The installer's sign-in, run against either a server master profile
@@ -732,7 +1083,28 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         let rec = agent::named(data, target)?;
         let cfg = anyagents_core::agent_config_dir(data, &rec.id);
         std::fs::create_dir_all(&cfg)?;
-        let _ = std::fs::write(cfg.join(".anyagents-profile"), format!("{prof}\n"));
+        let expected_prov = create::upstream_provider_of(&rec.harness, rec.model.as_deref());
+        let (prov, prof_name) = prof.split_once('/').unwrap_or((&expected_prov, prof));
+        let normalized = format!("{prov}/{prof_name}");
+        let _ = std::fs::write(cfg.join(".anyagents-profile"), format!("{normalized}\n"));
+        let prof_dir = data.join("profiles").join(prov).join(prof_name);
+        let has_stored_creds = std::fs::read_dir(&prof_dir)
+            .ok()
+            .is_some_and(|entries| {
+                entries
+                    .flatten()
+                    .any(|e| e.file_name() != "profile.json")
+            });
+        if has_stored_creds
+            && let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
+        {
+            create::seed_harness_credentials(&store, data, &rec, &cfg);
+            if let Some((_, _, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
+                crate::sandbox::share_config_with_seat(&cfg, gid);
+            }
+            println!("signed in\t{target}\t{}\tprofile:{normalized}", rec.harness);
+            return Ok(());
+        }
     }
     let outcome = signin::sign_in_agent(data, target, &mut runner, &mut sink)?;
     let harness = agent::named(data, target)?.harness;
@@ -758,12 +1130,73 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
     Ok(())
 }
 
-fn list_profiles_cmd(data: &Path, filter: Option<&str>) {
-    let Ok(store) = anyagents_core::Store::open(data.join("state.db")) else {
-        eprintln!("no store at {}", data.display());
-        return;
+fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
+    let filter = filter.filter(|f| !f.trim().eq_ignore_ascii_case("list"));
+    let entries = if client::can_call_server(data) {
+        match client::call::<Vec<create::ProviderProfileEntry>>(
+            data,
+            "GET",
+            "/v1/profiles",
+            None,
+            &client::authority(data),
+        ) {
+            Ok(Some(list)) => list,
+            Ok(None) => {
+                return Err(anyagents_core::Error::Message(
+                    "the server answered nothing".into(),
+                ));
+            }
+            Err(err) if err.contains("404") => {
+                let store = anyagents_core::Store::open(data.join("state.db"))?;
+                create::sync_and_list_provider_profiles(&store, data)
+            }
+            Err(err) => return Err(anyagents_core::Error::Message(err)),
+        }
+    } else {
+        let store = anyagents_core::Store::open(data.join("state.db"))?;
+        create::sync_and_list_provider_profiles(&store, data)
     };
-    let entries = create::sync_and_list_provider_profiles(&store, data);
+    if ui::is_pretty() {
+        println!("\n  {}\n", ui::bold_cyan("Provider Profiles"));
+        let mut table = ui::Table::new(&[
+            ("PROVIDER", false),
+            ("PROFILE", false),
+            ("KIND", false),
+            ("COMPATIBLE HARNESSES", false),
+            ("AGENTS", false),
+        ]);
+        for e in entries {
+            if let Some(f) = filter {
+                let f_trimmed = f.trim();
+                if e.provider != f_trimmed
+                    && !e.compatible_harnesses.iter().any(|h| h == f_trimmed)
+                {
+                    continue;
+                }
+            }
+            let kind_badge = match e.kind.as_str() {
+                "oauth" | "subscription" => ui::green(&e.kind),
+                "coding-plan" => ui::cyan(&e.kind),
+                _ => ui::yellow(&e.kind),
+            };
+            let harnesses = ui::dim(&e.compatible_harnesses.join(", "));
+            let agents = if e.assigned_agents.is_empty() {
+                ui::dim("-")
+            } else {
+                ui::bold(&e.assigned_agents.join(", "))
+            };
+            table.add_row(vec![
+                ui::bold(&e.provider),
+                e.profile,
+                kind_badge,
+                harnesses,
+                agents,
+            ]);
+        }
+        table.print();
+        println!();
+        return Ok(());
+    }
     println!(
         "{:<20}\t{:<10}\t{:<13}\t{:<44}\tAGENTS",
         "PROVIDER", "PROFILE", "KIND", "COMPATIBLE HARNESSES"
@@ -786,6 +1219,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) {
             e.provider, e.profile, e.kind, harnesses, agents
         );
     }
+    Ok(())
 }
 
 fn interact_cmd(
@@ -853,6 +1287,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
     for entry in anyagents_installer::builtin_catalog() {
         let bin_path = install::program(data, &entry.id);
         let present = bin_path.is_file() || anyagents_installer::machine_has(&entry.id);
+        let version = install::detect_version(data, &entry.id);
         let (mode, steer) = anyagents_supervisor::declared(&entry.id);
         let profiles: Vec<String> = provider_profiles
             .iter()
@@ -862,6 +1297,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         harness_rows.push(serde_json::json!({
             "id": entry.id,
             "installed": present,
+            "version": version,
             "binary": bin_path.display().to_string(),
             "delivery_mode": anyagents_supervisor::mode_name(mode),
             "steer_support": anyagents_supervisor::steer_name(steer),
@@ -869,8 +1305,12 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         }));
     }
 
-    let agents_list = match live_agents {
-        Some(ref resp) => resp.agents.clone(),
+    let mut agents_list = match live_agents {
+        Some(ref resp) => {
+            let mut list = resp.agents.clone();
+            agent::reconcile_and_enrich_views(data, &mut list);
+            list
+        }
         None => {
             let mut fallback = Vec::new();
             if let Ok(store) = anyagents_core::Store::open(data.join("state.db"))
@@ -887,6 +1327,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         workdir: a.workdir,
                         state: a.state,
                         process: "offline".to_string(),
+                        turn_state: "idle".to_string(),
                         delivery_mode: anyagents_supervisor::mode_name(mode).to_string(),
                         steer_support: anyagents_supervisor::steer_name(steer).to_string(),
                         quota_reset_at_ms: None,
@@ -914,6 +1355,87 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             serde_json::to_string_pretty(&doc)
                 .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
         );
+        return Ok(());
+    }
+
+    if ui::is_pretty() {
+        let srv_badge = if server_up {
+            ui::bold_green("● running")
+        } else {
+            ui::red("○ stopped")
+        };
+        let tok_badge = if has_operator_token {
+            ui::green("✓ ready")
+        } else {
+            ui::yellow("⚠ missing")
+        };
+        println!(
+            "\n  {}  {} {} {} {} {} {} {}\n",
+            ui::bold_cyan("Server"),
+            srv_badge,
+            ui::dim("· socket"),
+            ui::dim(&sock.display().to_string()),
+            ui::dim("· webhook"),
+            webhook_addr.as_deref().unwrap_or("-"),
+            ui::dim("· token"),
+            tok_badge,
+        );
+
+        println!("  {}\n", ui::bold_cyan("Harnesses"));
+        let mut htable = ui::Table::new(&[
+            ("HARNESS", false),
+            ("STATUS", false),
+            ("VERSION", false),
+            ("DELIVERY", false),
+            ("STEER", false),
+            ("PROFILES", false),
+        ]);
+        for h in &harness_rows {
+            let id = h["id"].as_str().unwrap_or("-");
+            let inst = if h["installed"].as_bool() == Some(true) {
+                ui::green("✓ ready")
+            } else {
+                ui::dim("on-demand")
+            };
+            let ver = h["version"].as_str().unwrap_or("-");
+            let ver_cell = if ver == "-" {
+                ui::dim("-")
+            } else {
+                ver.to_string()
+            };
+            let mode = h["delivery_mode"].as_str().unwrap_or("-");
+            let steer = h["steer_support"].as_str().unwrap_or("-");
+            let profs = h["profiles"]
+                .as_array()
+                .map(|arr| {
+                    let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+                    if names.is_empty() {
+                        ui::dim("auto")
+                    } else {
+                        ui::dim(&names.join(", "))
+                    }
+                })
+                .unwrap_or_else(|| ui::dim("auto"));
+            htable.add_row(vec![
+                ui::bold(&ui::cyan(id)),
+                inst,
+                ver_cell,
+                mode.to_string(),
+                steer.to_string(),
+                profs,
+            ]);
+        }
+        htable.print();
+
+        let profile_lookup = |a: &api::AgentView| -> String {
+            anyagents_core::AgentId::parse(&a.id)
+                .ok()
+                .and_then(|id| {
+                    create::bound_profile_name(&anyagents_core::agent_config_dir(data, &id))
+                })
+                .unwrap_or_else(|| "default".to_string())
+        };
+        ui::print_agents_table(&agents_list, Some(&profile_lookup), false);
         return Ok(());
     }
 
@@ -1006,12 +1528,52 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
             println!("{group}\t{}", agent.name);
         }
         GroupsCommand::Members { group } => {
-            for name in agent::group_members(data, &group)? {
+            let members = agent::group_members(data, &group)?;
+            if ui::is_pretty() {
+                println!(
+                    "\n  {}  {} members\n",
+                    ui::bold_cyan(&format!("Group · {group}")),
+                    ui::bold(&members.len().to_string())
+                );
+                for name in members {
+                    println!("  • {}", ui::bold(&name));
+                }
+                println!();
+                return Ok(());
+            }
+            for name in members {
                 println!("{name}");
             }
         }
         GroupsCommand::List => {
-            for (group, members) in agent::list_groups(data)? {
+            let list = agent::list_groups(data)?;
+            if ui::is_pretty() {
+                if list.is_empty() {
+                    println!("  {}", ui::dim("No groups found."));
+                    return Ok(());
+                }
+                println!(
+                    "\n  {}  {} total\n",
+                    ui::bold_cyan("Groups"),
+                    ui::bold(&list.len().to_string())
+                );
+                let mut table = ui::Table::new(&[
+                    ("GROUP", false),
+                    ("COUNT", true),
+                    ("MEMBERS", false),
+                ]);
+                for (group, members) in list {
+                    table.add_row(vec![
+                        ui::bold(&ui::cyan(&group)),
+                        ui::dim(&members.len().to_string()),
+                        members.join(", "),
+                    ]);
+                }
+                table.print();
+                println!();
+                return Ok(());
+            }
+            for (group, members) in list {
                 println!("{group}\t{}", members.join(","));
             }
         }

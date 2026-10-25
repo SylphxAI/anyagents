@@ -523,7 +523,7 @@ line3 = sys.stdin.readline()
     assert_eq!(
         harness.deliver(&m3, &line3).unwrap(),
         anyagents_harness::DeliverOutcome::Accepted {
-            turn_finished: false
+            turn_finished: true
         }
     );
     {
@@ -533,6 +533,26 @@ line3 = sys.stdin.readline()
             calls[1]["cascadeConfig"]["plannerConfig"]["modelName"],
             "gemini-4-pro-high"
         );
+    }
+
+    // A subsequent message (m4) arriving after an RPC wake must remain
+    // immediately steerable (`input_ready() == true`), never deadlocking on
+    // `turn_user_inputs == 0` when `finish_open` closed the previous turn.
+    running.store(true, Ordering::SeqCst);
+    assert!(harness.input_ready());
+    let mut m4 = m1.clone();
+    m4.id = "m4".into();
+    m4.text = "fourth-after-rpc-wake".into();
+    let line4 = super::message_line(&spec, &m4);
+    assert_eq!(
+        harness.deliver(&m4, &line4).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: false
+        }
+    );
+    {
+        let calls = steered.lock().unwrap();
+        assert_eq!(calls.len(), 3);
     }
 
     // Release python child to print `{"event":"result"}`.

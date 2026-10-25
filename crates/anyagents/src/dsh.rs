@@ -302,6 +302,10 @@ impl Harness for DshHarness {
         lock(&self.shared).child.as_ref().map(Child::id)
     }
 
+    fn turns_served(&self) -> u32 {
+        lock(&self.shared).finished.len() as u32
+    }
+
     fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
@@ -415,7 +419,7 @@ pub fn write_dsh_mcp_patch(
         .iter()
         .map(|a| format!("      - '{}'\n", a.replace('\'', "''")))
         .collect::<String>();
-    let mut yaml = String::new();
+    let mut yaml = String::from("- id: agent-instructions\n  disabled: false\n");
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         let clean = raw_model
             .strip_prefix("deepseek/")

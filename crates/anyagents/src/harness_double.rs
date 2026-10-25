@@ -173,7 +173,14 @@ mod tool_server {
         // a real model does, else by the target its config names.
         let hinted = user
             .lines()
-            .find_map(|line| line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX))
+            .find_map(|line| {
+                line.strip_prefix(anyagents_harness::REPLY_HINT_PREFIX)
+                    .or_else(|| {
+                        let (_, rest) = line.split_once(" reply_to=\"")?;
+                        let (val, _) = rest.split_once('"')?;
+                        Some(val)
+                    })
+            })
             .map(str::to_string)
             .filter(|hint| !hint.is_empty());
         let configured = (!reply_to.is_empty()).then(|| reply_to.to_string());

@@ -15,6 +15,8 @@ pub struct AgentView {
     pub workdir: Option<String>,
     pub state: String,
     pub process: String,
+    #[serde(default)]
+    pub turn_state: String,
     pub delivery_mode: String,
     pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
@@ -37,6 +39,8 @@ pub struct CreateAgentRequest {
     pub harness: String,
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
     #[serde(default)]

@@ -89,8 +89,11 @@ pub fn mint(store: &Store, agent_id: &anyagents_core::AgentId) -> Result<(), Err
         file.write_all(token.as_bytes())?;
         file.write_all(b"\n")?;
     }
+    if let Err(err) = share_capability_if_needed(store, agent_id, &temp) {
+        let _ = std::fs::remove_file(&temp);
+        return Err(err);
+    }
     std::fs::rename(&temp, &path)?;
-    share_capability_if_needed(store, agent_id, &path)?;
     Ok(())
 }
 

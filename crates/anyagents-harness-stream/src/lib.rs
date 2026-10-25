@@ -336,6 +336,25 @@ impl StreamHarness {
             .map(|(_, usage)| usage.clone())
     }
 
+    pub fn turns_served(&self) -> u32 {
+        lock(&self.shared).finished.len() as u32
+    }
+
+    pub fn served_usage(&self) -> TurnUsage {
+        let state = lock(&self.shared);
+        let mut total = TurnUsage::default();
+        for (_, usage) in &state.usages {
+            total.input_tokens += usage.input_tokens;
+            total.output_tokens += usage.output_tokens;
+            total.cache_read_tokens += usage.cache_read_tokens;
+            total.cache_write_tokens += usage.cache_write_tokens;
+            if let Some(cost) = usage.reported_cost_micros {
+                *total.reported_cost_micros.get_or_insert(0) += cost;
+            }
+        }
+        total
+    }
+
     /// The last open turn for `id` ended on quiet, not on a result line.
     pub fn finished_quiet(&self, id: &str) -> bool {
         lock(&self.shared).finished_quiet.contains(id)
@@ -624,8 +643,24 @@ impl StreamHarness {
                     return Ok(DeliverOutcome::Deferred);
                 }
                 let now = Instant::now();
+                let first_idle = state.idle_since.is_none();
                 let idle_since = *state.idle_since.get_or_insert(now);
                 if now.duration_since(idle_since) < AGY_TURN_CLOSE_GRACE {
+                    let remain = AGY_TURN_CLOSE_GRACE.saturating_sub(now.duration_since(idle_since));
+                    drop(state);
+                    if first_idle {
+                        let shared = Arc::clone(&self.shared);
+                        let wake = Arc::clone(&self.wake);
+                        let _ = thread::spawn(move || {
+                            thread::sleep(remain);
+                            let mut st = lock(&shared);
+                            if st.generation == generation && st.alive {
+                                st.epoch = st.epoch.wrapping_add(1);
+                            }
+                            drop(st);
+                            wake.notify_all();
+                        });
+                    }
                     return Ok(DeliverOutcome::Deferred);
                 }
                 drop(state);
@@ -650,6 +685,14 @@ impl StreamHarness {
                 }
                 if state.open.is_empty() {
                     return Ok(DeliverOutcome::Deferred);
+                }
+                if !running {
+                    // The previous turn in `agy` already finished (`CASCADE_RUN_STATUS_IDLE`)
+                    // while held open by a background task. Close those open messages now
+                    // so `turn_recovery.completed_seq` advances and never replays stale
+                    // completed turns on restart.
+                    finish_open(&mut state, TurnUsage::default());
+                    state.turns_started += 1;
                 }
                 if !state.open.contains(&message.id) {
                     state.open.push(message.id.clone());
@@ -677,10 +720,11 @@ impl StreamHarness {
                 return Err(HarnessError::Dead);
             }
             state.idle_since = None;
+            state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
             state.seen.insert(message.id.clone());
             state.written.push(message.id.clone());
             return Ok(DeliverOutcome::Accepted {
-                turn_finished: state.finished.contains(&message.id),
+                turn_finished: !running || state.finished.contains(&message.id),
             });
         }
         // Never hold shared state across pipe I/O. On Linux stdin is

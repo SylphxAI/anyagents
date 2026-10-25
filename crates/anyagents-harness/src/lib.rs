@@ -35,16 +35,82 @@ pub fn ref_message(reference: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains(':')).then_some(id)
 }
 
-/// The text one stored message becomes for every harness: the ID line, then the
-/// server's trusted context — who wrote it, which channel, which chat and topic,
-/// the reference a bare answer names, where it goes, and what it quotes — then
-/// the body exactly as stored.
+/// The text one stored message becomes for every harness: the ID line, then a
+/// structured `<message>` XML envelope containing optional `<quoted_message>`
+/// context and the `<body>`.
 pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
-    format!(
-        "{}{id}\n{}\n{body}",
-        MESSAGE_MARKER_PREFIX,
-        context.lines(id)
-    )
+    let (main_body, quoted_xml) = extract_quoted_xml(body, context.reply_to_author.as_deref());
+    let open_tag = context.open_tag(id);
+    match quoted_xml {
+        Some(q) => format!(
+            "{MESSAGE_MARKER_PREFIX}{id}\n{open_tag}\n{q}\n<body>\n{main_body}\n</body>\n</message>"
+        ),
+        None => format!(
+            "{MESSAGE_MARKER_PREFIX}{id}\n{open_tag}\n<body>\n{main_body}\n</body>\n</message>"
+        ),
+    }
+}
+
+fn xml_attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn extract_quoted_xml<'a>(
+    body: &'a str,
+    reply_to_author: Option<&str>,
+) -> (&'a str, Option<String>) {
+    const FENCE_START: &str = "\n\n----- quoted message -----\n";
+    const FENCE_END: &str = "\n----- end of quoted message -----";
+    let Some((main_text, rest)) = body.split_once(FENCE_START) else {
+        return (body, None);
+    };
+    let Some(inner) = rest.strip_suffix(FENCE_END) else {
+        return (body, None);
+    };
+    let Some((first_line, mut q_rest)) = inner.split_once('\n') else {
+        return (body, None);
+    };
+    let (role, raw_author) = if let Some(a) = first_line
+        .strip_prefix("The agent replied to ")
+        .and_then(|s| s.strip_suffix(':'))
+    {
+        ("agent", a)
+    } else if let Some(a) = first_line
+        .strip_prefix("The person replied to ")
+        .and_then(|s| s.strip_suffix(':'))
+    {
+        ("user", a)
+    } else {
+        ("unknown", first_line.trim_end_matches(':'))
+    };
+    let mut q_mentions: Option<&str> = None;
+    if let Some((before_last, last_line)) = q_rest.rsplit_once('\n')
+        && let Some(m) = last_line
+            .strip_prefix("(mentions: ")
+            .and_then(|s| s.strip_suffix(')'))
+    {
+        q_mentions = Some(m);
+        q_rest = before_last;
+    }
+    let q_text = q_rest
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(q_rest);
+    let author_label = reply_to_author.unwrap_or(raw_author);
+    let mut tag = format!(
+        "<quoted_message author=\"{}\" author_role=\"{}\"",
+        xml_attr_escape(author_label),
+        role
+    );
+    if let Some(m) = q_mentions {
+        tag.push_str(&format!(" mentions=\"{}\"", xml_attr_escape(m)));
+    }
+    tag.push('>');
+    let xml = format!("{tag}\n{q_text}\n</quoted_message>");
+    (main_text, Some(xml))
 }
 
 /// The trusted header of one message, as the server wrote it.
@@ -52,10 +118,22 @@ pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
 pub struct Context {
     /// The authenticated author: `agent:<name>`, `telegram:user:<id>`, ...
     pub sender: Option<String>,
+    /// Human-readable display name of the sender (e.g. `Kyle (@shtse8)`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_name: Option<String>,
+    /// The recipient agent (`agent:<name>`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient: Option<String>,
     /// The channel it arrived through, when it came by one.
     pub channel: Option<String>,
     /// The provider chat, when the message is one.
     pub chat_id: Option<i64>,
+    /// Human-readable title of the chat/channel/group, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_title: Option<String>,
+    /// Kind of chat (`private`, `group`, `supergroup`, `channel`), when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chat_type: Option<String>,
     /// The forum topic inside that chat.
     pub thread_id: Option<i64>,
     /// The provider id of the incoming message a bare answer reaches.
@@ -65,12 +143,69 @@ pub struct Context {
     /// Special channel event (`"pinned"`, `"edited"`, etc.), when this line is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub event: Option<String>,
+    /// Who this message is directly replying to (quoted message author), when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reply_to_author: Option<String>,
     /// Handles or agents mentioned in this message (`@username`, `agent:<name>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
 }
 
 impl Context {
+    /// XML opening tag `<message ...>` with structured metadata attributes.
+    pub fn open_tag(&self, id: &str) -> String {
+        let mut out = format!(
+            "<message id=\"{}\" from=\"{}\"",
+            xml_attr_escape(id),
+            xml_attr_escape(self.sender.as_deref().unwrap_or("unknown"))
+        );
+        if let Some(sender_name) = &self.sender_name {
+            out.push_str(&format!(" sender_name=\"{}\"", xml_attr_escape(sender_name)));
+        }
+        if let Some(recipient) = &self.recipient {
+            out.push_str(&format!(" to=\"{}\"", xml_attr_escape(recipient)));
+        }
+        if let Some(channel) = &self.channel {
+            out.push_str(&format!(" channel=\"{}\"", xml_attr_escape(channel)));
+        }
+        if let Some(chat) = self.chat_id {
+            out.push_str(&format!(" chat=\"{chat}\""));
+        }
+        if let Some(chat_title) = &self.chat_title {
+            out.push_str(&format!(" chat_title=\"{}\"", xml_attr_escape(chat_title)));
+        }
+        if let Some(chat_type) = &self.chat_type {
+            out.push_str(&format!(" chat_type=\"{}\"", xml_attr_escape(chat_type)));
+        }
+        if let Some(thread) = self.thread_id {
+            out.push_str(&format!(" topic=\"{thread}\""));
+        }
+        if let Some(message) = self.message_id {
+            out.push_str(&format!(" message_id=\"{message}\""));
+        }
+        if let Some(event) = &self.event {
+            out.push_str(&format!(" event=\"{}\"", xml_attr_escape(event)));
+        }
+        if let Some(reply_to_author) = &self.reply_to_author {
+            out.push_str(&format!(
+                " in_reply_to=\"{}\"",
+                xml_attr_escape(reply_to_author)
+            ));
+        }
+        if !self.mentions.is_empty() {
+            out.push_str(&format!(
+                " mentions=\"{}\"",
+                xml_attr_escape(&self.mentions.join(", "))
+            ));
+        }
+        out.push_str(&format!(" reply_to=\"{}\"", xml_attr_escape(&reply_ref(id))));
+        if let Some(destination) = &self.destination {
+            out.push_str(&format!(" answer_to=\"{}\"", xml_attr_escape(destination)));
+        }
+        out.push('>');
+        out
+    }
+
     /// The lines a model reads, in a fixed order. The reply reference is this
     /// message's own id, so it is always there.
     pub fn lines(&self, id: &str) -> String {
@@ -93,6 +228,9 @@ impl Context {
         }
         if let Some(event) = &self.event {
             out.push_str(&format!("event: {event}\n"));
+        }
+        if let Some(reply_to_author) = &self.reply_to_author {
+            out.push_str(&format!("replying to: {reply_to_author}\n"));
         }
         if !self.mentions.is_empty() {
             out.push_str(&format!("mentions: {}\n", self.mentions.join(", ")));

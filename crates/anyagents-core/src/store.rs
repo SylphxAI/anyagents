@@ -36,11 +36,12 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
      reply_to, received_at_ms, delivered_at_ms, origin, context";
 
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id";
+     created_at_ms, launch_env, parent_id, is_admin";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
+    pub is_admin: bool,
     pub id: AgentId,
     pub name: String,
     pub harness: String,
@@ -282,6 +283,32 @@ pub struct NewUsage {
     pub billing_mode: BillingMode,
     pub quota_state: Option<String>,
     pub day: String,
+}
+
+/// Maximum number of automatic `[Recovery]` wake attempts for a single open turn.
+pub const MAX_RECOVERY_ATTEMPTS: i64 = 3;
+
+/// One outbound message already committed by the agent during an interrupted turn.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutboundEffect {
+    pub id: String,
+    pub destination: String,
+    pub reply_to: Option<String>,
+    pub body: String,
+    pub sent_at_ms: i64,
+}
+
+/// An open turn that a harness accepted (`opened_seq > completed_seq`) and had
+/// not yet completed when its process stopped.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenTurn {
+    pub agent_id: AgentId,
+    pub opened_seq: i64,
+    pub completed_seq: i64,
+    pub recovery_count: i64,
+    pub opened_at_ms: i64,
+    pub messages: Vec<Message>,
+    pub completed_outbounds: Vec<OutboundEffect>,
 }
 
 /// Held for the life of one agent loop. Drop releases the lock.
@@ -560,6 +587,7 @@ impl Store {
             return Err(Error::Message("harness is empty".into()));
         }
         let agent = Agent {
+            is_admin: false,
             id: AgentId::generate(),
             name: new.name,
             harness: new.harness,
@@ -606,6 +634,56 @@ impl Store {
 
     pub fn agent(&self, id: &AgentId) -> Result<Agent, Error> {
         agent_by_id(&self.conn(), id)
+    }
+
+    pub fn set_agent_admin(&self, agent_id: &AgentId, is_admin: bool) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let agent = agent_by_id(&tx, agent_id)?;
+        if is_admin && agent.parent_id.is_some() {
+            return Err(Error::Message(
+                "a subagent cannot hold administrative authority".into(),
+            ));
+        }
+        tx.execute(
+            "UPDATE agents SET is_admin = ?2 WHERE id = ?1",
+            params![agent_id.as_str(), is_admin],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_agent_model(&self, agent_id: &AgentId, model: &str) -> Result<(), Error> {
+        self.agent(agent_id)?;
+        self.conn().execute(
+            "UPDATE agents SET model = ?2 WHERE id = ?1",
+            params![agent_id.as_str(), model],
+        )?;
+        Ok(())
+    }
+
+    /// Administrative metadata only; callers must never pass credentials here.
+    pub fn record_admin_audit(&self, actor: &str, action: &str, target: &str) -> Result<(), Error> {
+        self.conn().execute(
+            "INSERT INTO admin_audit (created_at, actor, action, target) VALUES (?1, ?2, ?3, ?4)",
+            params![now_ms(), actor, action, target],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_agent_instructions(
+        &self,
+        id: &AgentId,
+        instructions: Option<&str>,
+    ) -> Result<Agent, Error> {
+        let clean = instructions.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn();
+        agent_by_id(&conn, id)?;
+        conn.execute(
+            "UPDATE agents SET instructions = ?1 WHERE id = ?2",
+            params![clean, id.as_str()],
+        )?;
+        agent_by_id(&conn, id)
     }
 
     pub fn agent_by_name(&self, name: &str) -> Result<Agent, Error> {
@@ -670,7 +748,7 @@ impl Store {
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
-            if agent.state == "archived" {
+            if agent.state == "archived" || agent.state == "paused" {
                 continue;
             }
             if author.as_deref() == Some(agent.name.as_str())
@@ -727,7 +805,7 @@ impl Store {
             let names = self
                 .list_agents()?
                 .into_iter()
-                .filter(|agent| agent.state != "archived")
+                .filter(|agent| agent.state != "archived" && agent.state != "paused")
                 .map(|agent| agent.name)
                 .collect();
             return Ok(Some(names));
@@ -930,6 +1008,10 @@ impl Store {
         {
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
+        let reply_to_author = incoming
+            .quote
+            .as_ref()
+            .and_then(|quote| resolve_quote_author(&tx, quote));
         if let Some(origin) = incoming.origin
             && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
             && !incoming.text.starts_with("[Edited ")
@@ -942,6 +1024,7 @@ impl Store {
                 incoming.source_time_ms,
                 &body,
                 source_key.as_deref(),
+                reply_to_author.as_deref(),
             )?
         {
             tx.commit()?;
@@ -953,27 +1036,49 @@ impl Store {
             Some("pinned".to_string())
         } else if incoming.text.starts_with("[Edited message #") {
             Some("edited".to_string())
+        } else if incoming.text.starts_with("[Deleted message #") {
+            Some("deleted".to_string())
+        } else if incoming.text.starts_with("[Reaction ") {
+            Some("reaction".to_string())
+        } else if incoming.text.starts_with("[Member joined group:")
+            || incoming.text.starts_with("[Added to group chat")
+        {
+            Some("member_joined".to_string())
+        } else if incoming.text.starts_with("[Member removed/left group:")
+            || incoming.text.starts_with("[Removed from group chat")
+        {
+            Some("member_left".to_string())
+        } else if incoming.text.starts_with("[Sub-Agent Completed]") {
+            Some("subagent_completed".to_string())
         } else {
             None
         };
         let mentions = resolve_mentions(&tx, &incoming.text);
+        let recipient_agent = agent_by_id(&tx, agent_id).ok();
+        let recipient = recipient_agent
+            .as_ref()
+            .map(|a| format!("agent:{}", a.name));
+        let chat_id_val = incoming.origin.and_then(|origin| origin.chat_id);
+        let (chat_title, chat_type) = match chat_id_val {
+            Some(cid) => resolve_chat_metadata(&tx, cid),
+            None => (None, None),
+        };
         // The trusted header is built from the record that arrives, before any
         // field is moved into the row: the author, the channel, the chat and
         // topic, and the reply a bare answer reaches.
         let context = anyagents_harness::Context {
             sender: incoming.sender.clone(),
+            sender_name: None,
+            recipient,
             channel: incoming
                 .sender
                 .as_deref()
                 .filter(|sender| sender.starts_with("telegram:"))
                 .map(|_| "telegram".to_string())
-                .or_else(|| {
-                    incoming
-                        .origin
-                        .and_then(|o| o.chat_id)
-                        .map(|_| "telegram".to_string())
-                }),
-            chat_id: incoming.origin.and_then(|origin| origin.chat_id),
+                .or_else(|| chat_id_val.map(|_| "telegram".to_string())),
+            chat_id: chat_id_val,
+            chat_title,
+            chat_type,
             thread_id: incoming.origin.and_then(|origin| origin.thread_id),
             message_id: incoming.origin.and_then(|origin| origin.message_id),
             destination: incoming.reply_to.clone().or_else(|| {
@@ -997,6 +1102,7 @@ impl Store {
                     })
             }),
             event,
+            reply_to_author,
             mentions,
         };
         let message = Message {
@@ -1038,6 +1144,22 @@ impl Store {
             "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'archived'",
             [agent_id.as_str()],
         )? > 0;
+        if let Ok(agent) = agent_by_id(&tx, agent_id) {
+            let _ = index_rag_chunk(
+                &tx,
+                message.id.as_str(),
+                message.agent_id.as_str(),
+                &agent.name,
+                "in",
+                message.sender.as_deref().unwrap_or("unknown"),
+                message
+                    .reply_to
+                    .as_deref()
+                    .unwrap_or(&format!("agent:{}", agent.name)),
+                message.received_at_ms,
+                &message.text,
+            );
+        }
         tx.commit()?;
         drop(conn);
         if woke_archived {
@@ -1108,7 +1230,7 @@ impl Store {
         Ok(changed)
     }
 
-    /// Update an agent's lifecycle state (`running`, `archived`, `stopped`) and
+    /// Update an agent's lifecycle state (`running`, `paused`, `archived`, `stopped`) and
     /// notify the supervisor so it starts or stops the worker slot.
     pub fn set_agent_state(&self, id: &AgentId, state: &str) -> Result<Agent, Error> {
         let changed = {
@@ -1128,18 +1250,137 @@ impl Store {
         Ok(changed)
     }
 
+    /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
+    /// `archived` when it has delivered every message in its mailbox and
+    /// completed its latest turn (`completed_seq >= opened_seq >= max_seq > 0`).
+    ///
+    /// Returns `Ok(true)` when the sub-agent transitioned to `archived` (and
+    /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
+    /// mail arrived or a turn is still open.
+    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+        let (transitioned, silent_completion) = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let silent_info: Option<(AgentId, String, i64)> = tx
+                .query_row(
+                    "SELECT a.parent_id, a.name, tr.completed_seq
+                     FROM agents a
+                     JOIN turn_recovery tr ON tr.agent_id = a.id
+                     WHERE a.id = ?1
+                       AND a.parent_id IS NOT NULL
+                       AND a.state = 'running'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM outbound_messages om
+                           WHERE om.agent_id = ?1
+                             AND om.sent_at_ms >= tr.opened_at_ms
+                       )",
+                    [id.as_str()],
+                    |r| {
+                        let pid: String = r.get(0)?;
+                        let parsed = AgentId::parse(&pid).map_err(|err| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                        })?;
+                        let name: String = r.get(1)?;
+                        let cseq: i64 = r.get(2)?;
+                        Ok((parsed, name, cseq))
+                    },
+                )
+                .optional()?;
+            let updated = tx.execute(
+                "UPDATE agents
+                 SET state = 'archived'
+                 WHERE id = ?1
+                   AND parent_id IS NOT NULL
+                   AND state = 'running'
+                   AND EXISTS (
+                       SELECT 1 FROM turn_recovery tr
+                       WHERE tr.agent_id = ?1
+                         AND tr.completed_seq >= tr.opened_seq
+                         AND tr.completed_seq > 0
+                         AND tr.completed_seq >= COALESCE((
+                             SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+                         ), 0)
+                   )
+                   AND COALESCE((
+                       SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
+                   ), 0) >= COALESCE((
+                       SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+                   ), 0)",
+                [id.as_str()],
+            )?;
+            tx.commit()?;
+            (updated > 0, if updated > 0 { silent_info } else { None })
+        };
+        if transitioned {
+            self.notify(Wake::Agent {
+                agent_id: id.clone(),
+            });
+            if let Some((parent_id, sub_name, completed_seq)) = silent_completion {
+                let notice = format!(
+                    "[Sub-Agent Completed] Sub-agent `agent:{sub_name}` (`{id}`) finished its turn and scaled to zero (`state = archived`) without sending a direct reply. Call `subagents({{ \"action\": \"inspect\", \"agent\": \"{sub_name}\" }})` to read its output or `subagents({{ \"action\": \"steer\", \"agent\": \"{sub_name}\", \"prompt\": \"...\" }})` to continue."
+                );
+                let _ = self.receive(
+                    &parent_id,
+                    Incoming {
+                        text: notice,
+                        sender: Some(format!("agent:{sub_name}")),
+                        source_time_ms: Some(now_ms()),
+                        source_key: Some(format!("subagent_completed:{id}:{completed_seq}")),
+                        reply_to: Some(format!("agent:{sub_name}")),
+                        quote: None,
+                        origin: None,
+                        received_at_ms: None,
+                    },
+                );
+            }
+        }
+        Ok(transitioned)
+    }
+
+    /// Permanently delete an agent and its associated records from the store.
+    pub fn delete_agent(&self, id: &AgentId) -> Result<Agent, Error> {
+        let deleted = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let agent = agent_by_id(&tx, id)?;
+            for table in [
+                "agent_capabilities",
+                "usage_records",
+                "mailbox_cursors",
+                "turn_recovery",
+                "messages",
+                "outbound_messages",
+                "group_agents",
+                "channel_agents",
+            ] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE agent_id = ?1"),
+                    [id.as_str()],
+                )?;
+            }
+            tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
+            tx.commit()?;
+            agent
+        };
+        self.notify(Wake::Agent {
+            agent_id: id.clone(),
+        });
+        Ok(deleted)
+    }
+
     /// Messages with `seq > since`, in sequence order. `None` starts at the beginning.
     pub fn inbox(&self, agent_id: &AgentId, since: Option<i64>) -> Result<Vec<Message>, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
+        let delivered = cursor(&conn, agent_id)?;
         let mut stmt = conn.prepare(&format!(
             "SELECT {MESSAGE_COLS}
              FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq"
         ))?;
-        let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(0)])?;
+        let mut rows = stmt.query(params![agent_id.as_str(), since.unwrap_or(i64::MIN)])?;
         let mut messages = Vec::new();
         while let Some(row) = rows.next()? {
-            messages.push(message_from_row(&conn, row)?);
+            messages.push(message_from_row_with_cursor(row, delivered)?);
         }
         Ok(messages)
     }
@@ -1155,13 +1396,25 @@ impl Store {
         body: &str,
     ) -> Result<String, Error> {
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        let agent = agent_by_id(&conn, agent_id)?;
         let id = format!("out_{}", MessageId::generate());
+        let ts_ms = now_ms();
         conn.execute(
             "INSERT INTO outbound_messages (id, agent_id, destination, reply_to, body, sent_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, agent_id.as_str(), destination, reply_to, body, now_ms(),],
+            params![id, agent_id.as_str(), destination, reply_to, body, ts_ms,],
         )?;
+        let _ = index_rag_chunk(
+            &conn,
+            &id,
+            agent_id.as_str(),
+            &agent.name,
+            "out",
+            &format!("agent:{}", agent.name),
+            destination,
+            ts_ms,
+            body,
+        );
         Ok(id)
     }
 
@@ -1177,18 +1430,45 @@ impl Store {
     ) -> Result<Vec<ConversationTurn>, Error> {
         let conn = self.conn();
         let agent = agent_by_id(&conn, agent_id)?;
+        let delivered = cursor(&conn, agent_id)?;
         let self_addr = format!("agent:{}", agent.name);
         let since = since_ms.unwrap_or(0);
+        let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
         let mut turns = Vec::new();
 
+        // Fast SQL-pushed LIMIT when no post-query peer filter is active.
+        let sql_limit = if peer_filter.is_none() {
+            limit.map(|l| i64::try_from(l.max(1)).unwrap_or(i64::MAX))
+        } else {
+            None
+        };
+
         // 1. Inbound messages received by this agent.
-        let mut in_stmt = conn.prepare(&format!(
-            "SELECT {MESSAGE_COLS}
-             FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2 ORDER BY received_at_ms, seq"
-        ))?;
-        let mut in_rows = in_stmt.query(params![agent_id.as_str(), since])?;
+        let in_sql = match (sql_limit, since_ms.is_none()) {
+            (Some(_), true) => format!(
+                "SELECT {MESSAGE_COLS}
+                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2
+                 ORDER BY received_at_ms DESC, seq DESC LIMIT ?3"
+            ),
+            (Some(_), false) => format!(
+                "SELECT {MESSAGE_COLS}
+                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2
+                 ORDER BY received_at_ms ASC, seq ASC LIMIT ?3"
+            ),
+            (None, _) => format!(
+                "SELECT {MESSAGE_COLS}
+                 FROM messages WHERE agent_id = ?1 AND received_at_ms > ?2
+                 ORDER BY received_at_ms, seq"
+            ),
+        };
+        let mut in_stmt = conn.prepare(&in_sql)?;
+        let mut in_rows = if let Some(lim) = sql_limit {
+            in_stmt.query(params![agent_id.as_str(), since, lim])?
+        } else {
+            in_stmt.query(params![agent_id.as_str(), since])?
+        };
         while let Some(row) = in_rows.next()? {
-            let msg = message_from_row(&conn, row)?;
+            let msg = message_from_row_with_cursor(row, delivered)?;
             let from = msg.sender.unwrap_or_else(|| "unknown".to_string());
             let to = msg
                 .reply_to
@@ -1207,11 +1487,29 @@ impl Store {
         }
 
         // 2. Outbound messages sent by this agent.
-        let mut out_stmt = conn.prepare(
-            "SELECT id, destination, reply_to, body, sent_at_ms
-             FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2 ORDER BY sent_at_ms, id",
-        )?;
-        let mut out_rows = out_stmt.query(params![agent_id.as_str(), since])?;
+        let out_sql = match (sql_limit, since_ms.is_none()) {
+            (Some(_), true) => {
+                "SELECT id, destination, reply_to, body, sent_at_ms
+                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
+                 ORDER BY sent_at_ms DESC, id DESC LIMIT ?3"
+            }
+            (Some(_), false) => {
+                "SELECT id, destination, reply_to, body, sent_at_ms
+                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
+                 ORDER BY sent_at_ms ASC, id ASC LIMIT ?3"
+            }
+            (None, _) => {
+                "SELECT id, destination, reply_to, body, sent_at_ms
+                 FROM outbound_messages WHERE agent_id = ?1 AND sent_at_ms > ?2
+                 ORDER BY sent_at_ms, id"
+            }
+        };
+        let mut out_stmt = conn.prepare(out_sql)?;
+        let mut out_rows = if let Some(lim) = sql_limit {
+            out_stmt.query(params![agent_id.as_str(), since, lim])?
+        } else {
+            out_stmt.query(params![agent_id.as_str(), since])?
+        };
         while let Some(row) = out_rows.next()? {
             turns.push(ConversationTurn {
                 id: row.get(0)?,
@@ -1224,7 +1522,7 @@ impl Store {
             });
         }
 
-        if let Some(peer) = with_peer.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(peer) = peer_filter {
             turns.retain(|turn| matches_conversation_peer(turn, peer));
         }
 
@@ -1242,6 +1540,336 @@ impl Store {
             }
         }
         Ok(turns)
+    }
+
+    /// Read the recent chronological conversation across all agents.
+    pub fn conversation_all(
+        &self,
+        with_peer: Option<&str>,
+        since_ms: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ConversationTurn>, Error> {
+        let conn = self.conn();
+        let since = since_ms.unwrap_or(0);
+        let lim = i64::try_from(limit.unwrap_or(50).max(1)).unwrap_or(50);
+        let mut turns = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+             FROM rag_chunks
+             WHERE timestamp_ms > ?1
+             ORDER BY timestamp_ms DESC
+             LIMIT ?2",
+        )?;
+        let mut rows = stmt.query(params![since, lim * 4])?;
+        while let Some(row) = rows.next()? {
+            turns.push(ConversationTurn {
+                id: row.get(0)?,
+                direction: row.get(1)?,
+                from: row.get(2)?,
+                to: row.get(3)?,
+                reply_to: None,
+                text: row.get(4)?,
+                timestamp_ms: row.get(5)?,
+            });
+        }
+        if let Some(peer) = with_peer.map(str::trim).filter(|s| !s.is_empty()) {
+            turns.retain(|turn| matches_conversation_peer(turn, peer));
+        }
+        turns.sort_by(|a, b| {
+            a.timestamp_ms
+                .cmp(&b.timestamp_ms)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        if let Some(limit) = limit
+            && turns.len() > limit
+        {
+            turns.drain(..turns.len() - limit);
+        }
+        Ok(turns)
+    }
+
+    /// Return the locked canonical embedding model and dimensionality for this store.
+    pub fn locked_embedding_spec(&self) -> Result<(String, usize), Error> {
+        let conn = self.conn();
+        Self::locked_embedding_spec_conn(&conn)
+    }
+
+    fn locked_embedding_spec_conn(conn: &Connection) -> Result<(String, usize), Error> {
+        let model: String = conn
+            .query_row(
+                "SELECT value FROM rag_meta WHERE key = 'embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "voyageai/voyage-4-large".to_string());
+        let dim_str: String = conn
+            .query_row(
+                "SELECT value FROM rag_meta WHERE key = 'embedding_dimensions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or_else(|_| "1024".to_string());
+        let dim = dim_str.parse::<usize>().unwrap_or(1024);
+        Ok((model, dim))
+    }
+
+    /// Look up a cached `i8` quantized embedding by `content_hash` for the currently locked model.
+    pub fn get_embedding_i8(&self, content_hash: &str) -> Result<Option<Vec<i8>>, Error> {
+        let conn = self.conn();
+        let (locked_model, locked_dim) = Self::locked_embedding_spec_conn(&conn)?;
+        let raw: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT vector_i8 FROM rag_embeddings
+                 WHERE content_hash = ?1 AND model = ?2 AND dimensions = ?3",
+                params![content_hash, locked_model, i64::try_from(locked_dim).unwrap_or(1024)],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(raw.map(|bytes| bytes.into_iter().map(|b| b as i8).collect()))
+    }
+
+    /// Store a quantized `i8` embedding for `content_hash`.
+    pub fn store_embedding_i8(
+        &self,
+        content_hash: &str,
+        model: &str,
+        dimensions: usize,
+        vec_i8: &[i8],
+    ) -> Result<(), Error> {
+        let conn = self.conn();
+        let bytes: Vec<u8> = vec_i8.iter().map(|&x| x as u8).collect();
+        conn.execute(
+            "INSERT OR REPLACE INTO rag_embeddings (content_hash, model, dimensions, vector_i8, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![content_hash, model, i64::try_from(dimensions).unwrap_or(1024), bytes, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Hybrid RAG Semantic + BM25 Keyword Search with Reciprocal Rank Fusion (RRF).
+    ///
+    /// Searches `rag_chunks` across `agent_filter` (`None` or `"all"` searches all agents)
+    /// combining Dense Vector Cosine Similarity (`rag_embeddings`) and SQLite FTS5 BM25
+    /// (`rag_chunks_fts`), plus live message fallback so unindexed turns are also matched.
+    pub fn search_conversation(
+        &self,
+        agent_filter: Option<&str>,
+        with_peer: Option<&str>,
+        since_ms: Option<i64>,
+        limit: Option<usize>,
+        query_text: &str,
+        query_vec_i8: Option<&[i8]>,
+    ) -> Result<Vec<ConversationTurn>, Error> {
+        let conn = self.conn();
+        let limit = limit.unwrap_or(20).clamp(1, 200);
+        let since = since_ms.unwrap_or(0);
+        let agent_name_filter = agent_filter
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all") && *s != "*")
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_lowercase());
+        let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
+
+        let mut rrf_scores: std::collections::HashMap<String, f64> =
+            std::collections::HashMap::new();
+        let mut chunk_meta: std::collections::HashMap<String, ConversationTurn> =
+            std::collections::HashMap::new();
+
+        // 1. Dense Vector Leg (Cosine Similarity over int8-quantized L2-normalized vectors, strictly scoped to locked_embedding_spec).
+        if let Some(qvec) = query_vec_i8
+            && !qvec.is_empty()
+        {
+            let (locked_model, locked_dim) = Self::locked_embedding_spec_conn(&conn)?;
+            let q_norm_sq: i32 = qvec.iter().map(|&x| (x as i32) * (x as i32)).sum();
+            let q_norm = (q_norm_sq as f64).sqrt().max(1.0);
+            let mut scored_hashes: Vec<(String, f64)> = Vec::new();
+            let mut emb_stmt = conn.prepare(
+                "SELECT content_hash, vector_i8 FROM rag_embeddings
+                 WHERE model = ?1 AND dimensions = ?2",
+            )?;
+            let mut emb_rows = emb_stmt.query(params![
+                locked_model,
+                i64::try_from(locked_dim).unwrap_or(1024)
+            ])?;
+            while let Some(row) = emb_rows.next()? {
+                let hash: String = row.get(0)?;
+                let blob: Vec<u8> = row.get(1)?;
+                if blob.len() != qvec.len() {
+                    continue;
+                }
+                let mut dot: i32 = 0;
+                let mut v_norm_sq: i32 = 0;
+                for (&qb, &vb_u8) in qvec.iter().zip(blob.iter()) {
+                    let q = qb as i32;
+                    let v = (vb_u8 as i8) as i32;
+                    dot += q * v;
+                    v_norm_sq += v * v;
+                }
+                let denom = q_norm * (v_norm_sq as f64).sqrt().max(1.0);
+                let cos = (dot as f64) / denom;
+                if cos > 0.15 {
+                    scored_hashes.push((hash, cos));
+                }
+            }
+            let candidate_pool = (limit * 8).max(120);
+            scored_hashes
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            scored_hashes.truncate(candidate_pool);
+
+            for (rank, (hash, cos)) in scored_hashes.into_iter().enumerate() {
+                let sql = if agent_name_filter.is_some() {
+                    "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, agent_name
+                     FROM rag_chunks
+                     WHERE content_hash = ?1 AND timestamp_ms > ?2 AND LOWER(agent_name) = ?3
+                     ORDER BY timestamp_ms DESC LIMIT 2"
+                } else {
+                    "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, agent_name
+                     FROM rag_chunks
+                     WHERE content_hash = ?1 AND timestamp_ms > ?2
+                     ORDER BY timestamp_ms DESC LIMIT 2"
+                };
+                let mut cstmt = conn.prepare(sql)?;
+                let mut crows = if let Some(ref aname) = agent_name_filter {
+                    cstmt.query(params![hash, since, aname])?
+                } else {
+                    cstmt.query(params![hash, since])?
+                };
+                while let Some(crow) = crows.next()? {
+                    let cid: String = crow.get(0)?;
+                    let turn = ConversationTurn {
+                        id: cid.clone(),
+                        direction: crow.get(1)?,
+                        from: crow.get(2)?,
+                        to: crow.get(3)?,
+                        reply_to: Some(format!("rag:cos={cos:.3}:agent={}", crow.get::<_, String>(6)?)),
+                        text: crow.get(4)?,
+                        timestamp_ms: crow.get(5)?,
+                    };
+                    if let Some(peer) = peer_filter
+                        && !matches_conversation_peer(&turn, peer)
+                    {
+                        continue;
+                    }
+                    *rrf_scores.entry(cid.clone()).or_insert(0.0) +=
+                        1.35 / (50.0 + (rank as f64) + 1.0) + (cos * 0.01);
+                    chunk_meta.entry(cid).or_insert(turn);
+                }
+            }
+        }
+
+        // 2. Lexical FTS5 BM25 Leg (`rag_chunks_fts`) — rank inside FTS5 first, then join top hits.
+        let fts_query = build_fts5_query(query_text);
+        if !fts_query.is_empty()
+            && let Ok(mut fstmt) = conn.prepare(
+                "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms, c.agent_name
+                 FROM (
+                     SELECT chunk_id, bm25(rag_chunks_fts) as score
+                     FROM rag_chunks_fts
+                     WHERE rag_chunks_fts MATCH ?1
+                     ORDER BY score ASC
+                     LIMIT ?3
+                 ) f
+                 JOIN rag_chunks c ON c.chunk_id = f.chunk_id
+                 WHERE c.timestamp_ms > ?2
+                 ORDER BY f.score ASC",
+            )
+            && let Ok(mut frows) = fstmt.query(params![fts_query, since, i64::try_from((limit * 8).max(120)).unwrap_or(120)])
+        {
+            let mut rank = 0usize;
+            while let Ok(Some(row)) = frows.next() {
+                let cid: String = row.get(0)?;
+                let aname: String = row.get(6)?;
+                if let Some(ref wanted) = agent_name_filter
+                    && !aname.eq_ignore_ascii_case(wanted)
+                {
+                    continue;
+                }
+                let turn = ConversationTurn {
+                    id: cid.clone(),
+                    direction: row.get(1)?,
+                    from: row.get(2)?,
+                    to: row.get(3)?,
+                    reply_to: Some(format!("rag:bm25_rank={}:agent={aname}", rank + 1)),
+                    text: row.get(4)?,
+                    timestamp_ms: row.get(5)?,
+                };
+                if let Some(peer) = peer_filter
+                    && !matches_conversation_peer(&turn, peer)
+                {
+                    continue;
+                }
+                *rrf_scores.entry(cid.clone()).or_insert(0.0) +=
+                    1.85 / (50.0 + (rank as f64) + 1.0);
+                chunk_meta.entry(cid).or_insert(turn);
+                rank += 1;
+            }
+        }
+
+        // 3. Direct substring fallback (covers CJK substrings or fresh turns in `messages` / `outbound_messages`).
+        let q_trim = query_text.trim();
+        if !q_trim.is_empty() && rrf_scores.len() < limit {
+            let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
+            let mut lstmt = conn.prepare(
+                "SELECT m.id, a.name, COALESCE(m.sender, 'unknown'), COALESCE(m.reply_to, 'agent:' || a.name), m.body, m.received_at_ms
+                 FROM messages m
+                 JOIN agents a ON a.id = m.agent_id
+                 WHERE m.received_at_ms > ?1 AND m.body LIKE ?2 ESCAPE '\\'
+                 ORDER BY m.received_at_ms DESC LIMIT ?3",
+            )?;
+            let mut lrows = lstmt.query(params![since, like_pat, i64::try_from(limit * 2).unwrap_or(40)])?;
+            let mut rank = 0usize;
+            while let Some(row) = lrows.next()? {
+                let cid: String = row.get(0)?;
+                let aname: String = row.get(1)?;
+                if let Some(ref wanted) = agent_name_filter
+                    && !aname.eq_ignore_ascii_case(wanted)
+                {
+                    continue;
+                }
+                let turn = ConversationTurn {
+                    id: cid.clone(),
+                    direction: "in".to_string(),
+                    from: row.get(2)?,
+                    to: row.get(3)?,
+                    reply_to: Some(format!("rag:substring:agent={aname}")),
+                    text: row.get(4)?,
+                    timestamp_ms: row.get(5)?,
+                };
+                if let Some(peer) = peer_filter
+                    && !matches_conversation_peer(&turn, peer)
+                {
+                    continue;
+                }
+                *rrf_scores.entry(cid.clone()).or_insert(0.0) +=
+                    0.8 / (60.0 + (rank as f64) + 1.0);
+                chunk_meta.entry(cid).or_insert(turn);
+                rank += 1;
+            }
+        }
+
+        let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Deduplicate identical message text across multiple recipient agents in room broadcasts.
+        let mut seen_text_sig: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for (cid, score) in ranked {
+            if let Some(mut turn) = chunk_meta.remove(&cid) {
+                let sig: String = turn.text.chars().take(180).collect();
+                if !seen_text_sig.insert(sig) {
+                    continue;
+                }
+                turn.reply_to = Some(format!(
+                    "score={score:.4} ({})",
+                    turn.reply_to.unwrap_or_default()
+                ));
+                out.push(turn);
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// The next message the harness has not taken, or `None` when delivery has
@@ -1265,7 +1893,7 @@ impl Store {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
         let seq: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
+            "SELECT MAX(0, COALESCE(MAX(seq), 0)) FROM messages WHERE agent_id = ?1",
             [agent_id.as_str()],
             |row| row.get(0),
         )?;
@@ -1308,12 +1936,142 @@ impl Store {
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         agent_by_id(&tx, agent_id)?;
         bump_delivered(&tx, agent_id, seq)?;
+        let now = now_ms();
+        let prev_seq = (seq - 1).max(0);
         tx.execute(
             "UPDATE messages SET delivered_at_ms = ?1 WHERE agent_id = ?2 AND seq = ?3",
-            params![now_ms(), agent_id.as_str(), seq],
+            params![now, agent_id.as_str(), seq],
+        )?;
+        tx.execute(
+            "INSERT INTO turn_recovery (agent_id, opened_seq, completed_seq, recovery_count, opened_at_ms)
+             VALUES (?1, ?2, ?3, 0, ?4)
+             ON CONFLICT(agent_id) DO UPDATE SET
+                 completed_seq = CASE
+                     WHEN turn_recovery.completed_seq >= turn_recovery.opened_seq THEN ?3
+                     WHEN EXISTS (
+                         SELECT 1 FROM outbound_messages
+                         WHERE outbound_messages.agent_id = ?1
+                           AND outbound_messages.sent_at_ms >= turn_recovery.opened_at_ms
+                     ) THEN ?3
+                     ELSE turn_recovery.completed_seq
+                 END,
+                 opened_at_ms = CASE
+                     WHEN turn_recovery.completed_seq >= turn_recovery.opened_seq THEN excluded.opened_at_ms
+                     WHEN EXISTS (
+                         SELECT 1 FROM outbound_messages
+                         WHERE outbound_messages.agent_id = ?1
+                           AND outbound_messages.sent_at_ms >= turn_recovery.opened_at_ms
+                     ) THEN excluded.opened_at_ms
+                     ELSE turn_recovery.opened_at_ms
+                 END,
+                 opened_seq = excluded.opened_seq,
+                 recovery_count = 0",
+            params![agent_id.as_str(), seq, prev_seq, now],
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
+    pub fn note_turn_completed(&self, agent_id: &AgentId) -> Result<(), Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "UPDATE turn_recovery
+             SET completed_seq = opened_seq,
+                 recovery_count = 0
+             WHERE agent_id = ?1 AND completed_seq < opened_seq",
+            [agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Record that one `[Recovery]` wake was delivered for `opened_seq`.
+    pub fn note_turn_recovered(&self, agent_id: &AgentId, opened_seq: i64) -> Result<(), Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "UPDATE turn_recovery
+             SET recovery_count = recovery_count + 1
+             WHERE agent_id = ?1 AND opened_seq = ?2",
+            params![agent_id.as_str(), opened_seq],
+        )?;
+        Ok(())
+    }
+
+    /// Return `true` when the agent currently has an open turn (`opened_seq > completed_seq`).
+    pub fn has_open_turn(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        let conn = self.conn();
+        let row: Option<(i64, i64)> = conn
+            .query_row(
+                "SELECT opened_seq, completed_seq FROM turn_recovery WHERE agent_id = ?1",
+                [agent_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.is_some_and(|(opened_seq, completed_seq)| opened_seq > completed_seq))
+    }
+
+    /// Return the agent's open turn (`opened_seq > completed_seq`) when it is
+    /// eligible for automatic mid-turn recovery (`recovery_count < MAX_RECOVERY_ATTEMPTS`).
+    pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let row: Option<(i64, i64, i64, i64)> = conn
+            .query_row(
+                "SELECT opened_seq, completed_seq, recovery_count, opened_at_ms
+                 FROM turn_recovery WHERE agent_id = ?1",
+                [agent_id.as_str()],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let Some((opened_seq, completed_seq, recovery_count, opened_at_ms)) = row else {
+            return Ok(None);
+        };
+        if opened_seq <= completed_seq || recovery_count >= MAX_RECOVERY_ATTEMPTS {
+            return Ok(None);
+        }
+        let delivered = cursor(&conn, agent_id)?;
+        let mut msg_stmt = conn.prepare(&format!(
+            "SELECT {MESSAGE_COLS}
+             FROM messages
+             WHERE agent_id = ?1 AND seq > ?2 AND seq <= ?3
+             ORDER BY seq ASC"
+        ))?;
+        let mut msg_rows = msg_stmt.query(params![agent_id.as_str(), completed_seq, opened_seq])?;
+        let mut messages = Vec::new();
+        while let Some(r) = msg_rows.next()? {
+            messages.push(message_from_row_with_cursor(r, delivered)?);
+        }
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        let mut out_stmt = conn.prepare(
+            "SELECT id, destination, reply_to, body, sent_at_ms
+             FROM outbound_messages
+             WHERE agent_id = ?1 AND sent_at_ms >= ?2
+             ORDER BY sent_at_ms ASC, id ASC",
+        )?;
+        let mut out_rows = out_stmt.query(params![agent_id.as_str(), opened_at_ms])?;
+        let mut completed_outbounds = Vec::new();
+        while let Some(r) = out_rows.next()? {
+            completed_outbounds.push(OutboundEffect {
+                id: r.get(0)?,
+                destination: r.get(1)?,
+                reply_to: r.get(2)?,
+                body: r.get(3)?,
+                sent_at_ms: r.get(4)?,
+            });
+        }
+        Ok(Some(OpenTurn {
+            agent_id: agent_id.clone(),
+            opened_seq,
+            completed_seq,
+            recovery_count,
+            opened_at_ms,
+            messages,
+            completed_outbounds,
+        }))
     }
 
     pub fn message(&self, agent_id: &AgentId, id: &str) -> Result<Option<Message>, Error> {
@@ -1727,6 +2485,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         _ => None,
     };
     Ok(Agent {
+        is_admin: row.get(10)?,
         id: agent_id,
         name: row.get(1)?,
         harness: row.get(2)?,
@@ -1795,10 +2554,18 @@ fn usage_from_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, Error> {
 }
 
 fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Message, Error> {
+    let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
+    let delivered = cursor(conn, &agent_id)?;
+    message_from_row_with_cursor(row, delivered)
+}
+
+fn message_from_row_with_cursor(
+    row: &rusqlite::Row<'_>,
+    delivered: i64,
+) -> Result<Message, Error> {
     let id: String = row.get(0)?;
     let agent_id = AgentId::parse(&row.get::<_, String>(1)?)?;
     let seq: i64 = row.get(2)?;
-    let delivered = cursor(conn, &agent_id)?;
     Ok(Message {
         id: MessageId::parse(&id)?,
         agent_id,
@@ -1823,6 +2590,97 @@ fn message_from_row(conn: &Connection, row: &rusqlite::Row<'_>) -> Result<Messag
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default(),
     })
+}
+
+/// Strip envelope headers so identical room messages share the same `content_hash`.
+pub fn clean_rag_text(text: &str) -> String {
+    let mut t = text.trim();
+    if let Some(after_hdr) = t.strip_prefix("----- message -----")
+        && let Some(idx) = after_hdr.find("-------------------")
+    {
+        t = after_hdr[idx + "-------------------".len()..].trim();
+    }
+    let out: String = t.chars().take(2400).collect();
+    out
+}
+
+/// Deterministic 128-bit FNV-1a content hash (`32` hex chars) shared by Rust and Python indexers.
+pub fn rag_content_hash(text: &str) -> String {
+    let cleaned = clean_rag_text(text);
+    let bytes = cleaned.as_bytes();
+    let mut h1: u64 = 0xcbf29ce484222325;
+    let mut h2: u64 = 0x84222325cbf29ce4;
+    for (i, &b) in bytes.iter().enumerate() {
+        h1 ^= u64::from(b);
+        h1 = h1.wrapping_mul(0x100000001b3);
+        h2 ^= u64::from(b) ^ ((i as u64) & 0xff);
+        h2 = h2.wrapping_mul(0x100000001b3);
+    }
+    format!("{h1:016x}{h2:016x}")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn index_rag_chunk(
+    conn: &Connection,
+    chunk_id: &str,
+    agent_id: &str,
+    agent_name: &str,
+    direction: &str,
+    sender: &str,
+    destination: &str,
+    timestamp_ms: i64,
+    text: &str,
+) -> Result<(), Error> {
+    let cleaned = clean_rag_text(text);
+    if cleaned.chars().count() < 4 {
+        return Ok(());
+    }
+    let chash = rag_content_hash(&cleaned);
+    conn.execute(
+        "INSERT OR REPLACE INTO rag_chunks (
+            chunk_id, agent_id, agent_name, direction, sender, destination, timestamp_ms, content_hash, text
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            chunk_id,
+            agent_id,
+            agent_name,
+            direction,
+            sender,
+            destination,
+            timestamp_ms,
+            chash,
+            cleaned
+        ],
+    )?;
+    conn.execute(
+        "INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, text)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![chunk_id, agent_name, sender, destination, cleaned],
+    )?;
+    Ok(())
+}
+
+fn build_fts5_query(raw: &str) -> String {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    for ch in raw.chars() {
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            current.push(ch);
+        } else if !current.is_empty() {
+            let trimmed = current.trim_matches(['-', '_']);
+            if !trimmed.is_empty() {
+                tokens.push(format!("\"{}\"", trimmed.replace('"', "")));
+            }
+            current.clear();
+        }
+    }
+    if !current.is_empty() {
+        let trimmed = current.trim_matches(['-', '_']);
+        if !trimmed.is_empty() {
+            tokens.push(format!("\"{}\"", trimmed.replace('"', "")));
+        }
+    }
+    tokens.join(" OR ")
 }
 
 fn message_by_source(
@@ -1853,6 +2711,7 @@ fn message_by_origin(
     incoming_source_time_ms: Option<i64>,
     incoming_body: &str,
     incoming_source_key: Option<&str>,
+    incoming_reply_to_author: Option<&str>,
 ) -> Result<Option<Message>, Error> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {MESSAGE_COLS} FROM messages
@@ -1862,6 +2721,7 @@ fn message_by_origin(
     let in_user = telegram_sender_user_key(incoming_sender);
     let in_is_relay =
         incoming_source_key.is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
+    let is_basic_group = chat_id < 0 && chat_id > -1_000_000_000_000;
     while let Some(row) = rows.next()? {
         let mut msg = message_from_row(conn, row)?;
         let Some(origin) = msg.origin else {
@@ -1870,19 +2730,21 @@ fn message_by_origin(
         if origin.chat_id != Some(chat_id) {
             continue;
         }
-        if origin.message_id == Some(message_id) {
+        let stored_is_relay = msg
+            .source_key
+            .as_deref()
+            .is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
+        if origin.message_id == Some(message_id)
+            && (!is_basic_group || (!in_is_relay && !stored_is_relay))
+        {
             return Ok(Some(msg));
         }
         // Basic Telegram groups (`chat_type == "group"`, negative non-`-100...` IDs)
         // assign each bot its own account-local `message_id` for the same human
         // message. Match by `(chat_id, sender user, source_time_ms, body)` so cross-bot
         // passive relay and direct webhook delivery coalesce into a single message.
-        let stored_is_relay = msg
-            .source_key
-            .as_deref()
-            .is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
         if (in_is_relay || stored_is_relay)
-            && msg.text == incoming_body
+            && strip_quoted_block(&msg.text) == strip_quoted_block(incoming_body)
             && in_user.is_some()
             && in_user == telegram_sender_user_key(msg.sender.as_deref())
             && match (msg.source_time_ms, incoming_source_time_ms) {
@@ -1890,26 +2752,104 @@ fn message_by_origin(
                 _ => (now_ms() - msg.received_at_ms).abs() <= 15_000,
             }
         {
+            let best_body = if incoming_body.len() > msg.text.len() {
+                Some(incoming_body.to_string())
+            } else {
+                None
+            };
             if !in_is_relay && stored_is_relay {
                 let mut updated_origin = origin;
                 updated_origin.message_id = Some(message_id);
                 let mut updated_context = msg.context.clone();
                 updated_context.message_id = Some(message_id);
+                if updated_context.reply_to_author.is_none()
+                    && let Some(rta) = incoming_reply_to_author
+                {
+                    updated_context.reply_to_author = Some(rta.to_string());
+                }
+                let new_body = best_body.as_deref().unwrap_or(&msg.text);
                 let _ = conn.execute(
-                    "UPDATE messages SET origin = ?1, context = ?2 WHERE id = ?3",
+                    "UPDATE messages SET origin = ?1, context = ?2, source_key = NULL, body = ?3 WHERE id = ?4",
                     params![
                         serde_json::to_string(&updated_origin).unwrap_or_default(),
                         serde_json::to_string(&updated_context).ok(),
+                        new_body,
                         msg.id.as_str(),
                     ],
                 );
                 msg.origin = Some(updated_origin);
                 msg.context = updated_context;
+                msg.source_key = None;
+                if let Some(b) = best_body {
+                    msg.text = b;
+                }
+            } else if best_body.is_some()
+                || (msg.context.reply_to_author.is_none() && incoming_reply_to_author.is_some())
+            {
+                let mut updated_context = msg.context.clone();
+                if updated_context.reply_to_author.is_none()
+                    && let Some(rta) = incoming_reply_to_author
+                {
+                    updated_context.reply_to_author = Some(rta.to_string());
+                }
+                let new_body = best_body.as_deref().unwrap_or(&msg.text);
+                let _ = conn.execute(
+                    "UPDATE messages SET body = ?1, context = ?2 WHERE id = ?3",
+                    params![
+                        new_body,
+                        serde_json::to_string(&updated_context).ok(),
+                        msg.id.as_str(),
+                    ],
+                );
+                msg.context = updated_context;
+                if let Some(b) = best_body {
+                    msg.text = b;
+                }
             }
             return Ok(Some(msg));
         }
     }
     Ok(None)
+}
+
+fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<String> {
+    let author = quote.author.trim();
+    if author.is_empty() {
+        return None;
+    }
+    let resolved = resolve_mentions(conn, author);
+    for entry in &resolved {
+        if let Some((_, rest)) = entry.split_once("(agent:")
+            && let Some(agent) = rest.strip_suffix(')')
+        {
+            return Some(format!("{author} [agent:{agent}]"));
+        }
+    }
+    if quote.author_is_bot {
+        let first_word = author
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-')
+            .next()
+            .unwrap_or("");
+        if !first_word.is_empty()
+            && let Ok(Some(agent)) = conn
+                .query_row(
+                    "SELECT name FROM agents WHERE LOWER(name) = LOWER(?1)",
+                    [first_word],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+        {
+            return Some(format!("{author} [agent:{agent}]"));
+        }
+    }
+    Some(author.to_string())
+}
+
+fn strip_quoted_block(text: &str) -> &str {
+    text.split("\n\n----- quoted message -----\n")
+        .next()
+        .unwrap_or(text)
+        .trim()
 }
 
 fn telegram_sender_user_key(sender: Option<&str>) -> Option<String> {
@@ -1943,6 +2883,52 @@ fn matches_conversation_peer(turn: &ConversationTurn, peer: &str) -> bool {
             || field.ends_with(&format!(":{bare}"))
             || field.contains(&format!(":{bare}:"))
     })
+}
+
+fn resolve_chat_metadata(conn: &Connection, chat_id: i64) -> (Option<String>, Option<String>) {
+    let mut found_title: Option<String> = None;
+    let mut found_type: Option<String> = None;
+    if let Ok(mut stmt) = conn.prepare("SELECT state FROM channels WHERE kind = 'telegram'")
+        && let Ok(mut rows) = stmt.query([])
+    {
+        while let Ok(Some(row)) = rows.next() {
+            let Ok(state) = row.get::<_, String>(0) else {
+                continue;
+            };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) else {
+                continue;
+            };
+            let Some(chats) = val.get("chats").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            for link in chats {
+                if link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(chat_id) {
+                    if found_title.is_none()
+                        && let Some(t) = link
+                            .get("title")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty() && *s != "-")
+                    {
+                        found_title = Some(t.to_string());
+                    }
+                    if found_type.is_none()
+                        && let Some(ct) = link
+                            .get("chat_type")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        found_type = Some(ct.to_string());
+                    }
+                }
+            }
+            if found_title.is_some() && found_type.is_some() {
+                break;
+            }
+        }
+    }
+    (found_title, found_type)
 }
 
 fn resolve_mentions(conn: &Connection, text: &str) -> Vec<String> {
@@ -2055,7 +3041,7 @@ fn extract_at_handles(text: &str) -> Vec<String> {
 
 fn next_seq(conn: &Connection, agent_id: &AgentId) -> Result<i64, Error> {
     let seq = conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE agent_id = ?1",
+        "SELECT MAX(0, COALESCE(MAX(seq), 0)) + 1 FROM messages WHERE agent_id = ?1",
         [agent_id.as_str()],
         |row| row.get(0),
     )?;
@@ -2760,5 +3746,93 @@ mod tests {
             .unwrap();
         assert!(matches!(dup, ReceiveOutcome::Duplicate(_)));
         assert_eq!(store.inbox(&alice.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_conversation_with_dense_query_vector_ranks_without_reentrant_lock() {
+        let (_dir, store) = setup();
+        let alice = agent(&store, "alice");
+        let outcome = store
+            .receive(
+                &alice.id,
+                Incoming {
+                    text: "durable turn recovery checkpoint design".to_string(),
+                    sender: Some("agent:bob".to_string()),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: Some(1_000),
+                },
+            )
+            .unwrap();
+        let ReceiveOutcome::New(msg) = outcome else {
+            panic!("expected New");
+        };
+        let hash = rag_content_hash(&msg.text);
+        let (model, dim) = store.locked_embedding_spec().unwrap();
+        let mut vec_i8 = vec![0i8; dim];
+        vec_i8[0] = 100;
+        store
+            .store_embedding_i8(&hash, &model, dim, &vec_i8)
+            .unwrap();
+
+        let hits = store
+            .search_conversation(
+                Some("alice"),
+                None,
+                None,
+                Some(10),
+                "durable recovery",
+                Some(&vec_i8),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].text.contains("durable turn recovery"));
+    }
+
+    #[test]
+    fn complete_idle_subagent_scales_finished_subagent_to_zero_and_wakes_on_new_mail() {
+        let (_dir, store) = setup();
+        let root = agent(&store, "root");
+        let mut child_new = NewAgent::new("root-worker", "opencode");
+        child_new.parent_id = Some(root.id.clone());
+        let child = store.create_agent(child_new).unwrap();
+        store.set_agent_running(&child.id, "/work").unwrap();
+
+        // Before any message/turn, does not auto-archive.
+        assert!(!store.complete_idle_subagent(&child.id).unwrap());
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+
+        // Send initial task message (seq = 1).
+        store.receive(&child.id, Incoming::new("task 1")).unwrap();
+        // While undelivered, does not auto-archive.
+        assert!(!store.complete_idle_subagent(&child.id).unwrap());
+
+        // Deliver seq = 1 (turn is open: opened_seq = 1, completed_seq = 0).
+        store.note_delivered(&child.id, 1).unwrap();
+        assert!(!store.complete_idle_subagent(&child.id).unwrap());
+
+        // Complete turn 1 (completed_seq = 1 == max_seq).
+        store.note_turn_completed(&child.id).unwrap();
+        // Root agent is never archived by complete_idle_subagent.
+        assert!(!store.complete_idle_subagent(&root.id).unwrap());
+        // Sub-agent automatically transitions to archived!
+        assert!(store.complete_idle_subagent(&child.id).unwrap());
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+
+        // Sending a follow-up message (seq = 2) wakes the sub-agent back to running,
+        // and it stays running until seq = 2 is delivered and its turn completes.
+        store.receive(&child.id, Incoming::new("task 2")).unwrap();
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+        assert!(!store.complete_idle_subagent(&child.id).unwrap());
+
+        store.note_delivered(&child.id, 2).unwrap();
+        assert!(!store.complete_idle_subagent(&child.id).unwrap());
+
+        store.note_turn_completed(&child.id).unwrap();
+        assert!(store.complete_idle_subagent(&child.id).unwrap());
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
     }
 }

@@ -84,6 +84,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         .enable_all()
         .build()
         .map_err(|err| err.to_string())?;
+    let body_clone = body.clone();
     let answer = runtime.block_on(async {
         tokio::time::timeout(
             TIMEOUT,
@@ -99,9 +100,35 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         .await
         .map_err(|_| "the server did not answer".to_string())?
     })?;
-    let (status, bytes) = answer;
+    let (mut status, mut bytes) = answer;
+    if status.as_u16() == 404 {
+        let admin_socket = data.join("admin.sock");
+        if admin_socket.exists()
+            && let Ok(Ok(fallback)) = runtime.block_on(async {
+                tokio::time::timeout(
+                    TIMEOUT,
+                    crate::mcp::request(
+                        &admin_socket,
+                        method,
+                        path,
+                        body_clone,
+                        agent_token.as_deref(),
+                        operator_token.as_deref(),
+                    ),
+                )
+                .await
+            })
+        {
+            (status, bytes) = fallback;
+        }
+    }
     if !status.is_success() {
-        return Err(error_message(&bytes));
+        let msg = error_message(&bytes);
+        return Err(if msg.is_empty() {
+            format!("http {}", status.as_u16())
+        } else {
+            msg
+        });
     }
     serde_json::from_slice(&bytes)
         .map(Some)

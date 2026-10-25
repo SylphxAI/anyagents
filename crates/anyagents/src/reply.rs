@@ -209,10 +209,26 @@ fn destination_through(
 ) -> Result<Destination, String> {
     let origin = origin(message);
     if let Some(chat) = origin.chat_id {
+        let chat_str = chat.to_string();
+        // In Telegram Basic Groups (negative chat_id not starting with `-100`),
+        // `message_id` is account-local per bot. Never pass another bot's
+        // `message_id` as `reply_to_message_id`.
+        let is_cross_bot_basic_group = chat < 0
+            && !chat_str.starts_with("-100")
+            && (message
+                .sender
+                .as_deref()
+                .is_some_and(|s| s.starts_with("agent:"))
+                || message
+                    .source_key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:")));
         return Ok(Destination::Telegram {
-            chat: chat.to_string(),
+            chat: chat_str,
             thread: origin.thread_id.map(|thread| thread.to_string()),
-            reply: origin.message_id.map(|id| id.to_string()),
+            reply: (!is_cross_bot_basic_group)
+                .then(|| origin.message_id.map(|id| id.to_string()))
+                .flatten(),
         });
     }
     // A recorded answer is answered to whoever asked it.

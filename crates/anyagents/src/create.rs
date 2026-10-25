@@ -12,6 +12,7 @@ pub struct CreateRequest {
     pub name: String,
     pub harness: String,
     pub model: Option<String>,
+    pub profile: Option<String>,
     pub workdir: Option<PathBuf>,
     /// The working directory an owner agent gets when none is named.
     pub workdir_default: Option<PathBuf>,
@@ -49,6 +50,22 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     let config = agent_config_dir(&data, &agent.id);
     std::fs::create_dir_all(&config)?;
     let _ = std::fs::create_dir_all(config.join("tmp"));
+    if let Some(prof) = request
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let normalized = if prof.contains('/') {
+            prof.to_string()
+        } else {
+            format!(
+                "{}/{prof}",
+                upstream_provider_of(&agent.harness, agent.model.as_deref())
+            )
+        };
+        let _ = std::fs::write(config.join(".anyagents-profile"), format!("{normalized}\n"));
+    }
     seed_harness_credentials(store, &data, &agent, &config);
     ensure_seat_environment(&config);
     let workdir_created = request.workdir.as_ref().is_some_and(|p| !p.exists());
@@ -93,6 +110,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             &command,
             &args,
         );
+        crate::vendor::ensure_agy_steering_settings(&config, &cwd);
     } else if agent.harness == "muse" {
         muse_config::write(&config, agent.model.as_deref(), &command, &args)?;
         muse_config::point_vendor_home(&config)?;
@@ -134,49 +152,108 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     Ok(running)
 }
 
+pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
+    let Ok(agents) = store.list_agents() else {
+        return;
+    };
+    let by_id: std::collections::HashMap<String, String> = agents
+        .iter()
+        .map(|a| (a.id.to_string(), a.name.clone()))
+        .collect();
+    for agent in &agents {
+        let cfg = agent_config_dir(data, &agent.id);
+        if !cfg.is_dir() {
+            continue;
+        }
+        let parent_name = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| by_id.get(pid.as_str()).cloned());
+        write_agent_instructions(&cfg, agent, parent_name.as_deref());
+        if let Some((_, _, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+        {
+            crate::sandbox::share_config_with_seat(&cfg, gid);
+        }
+    }
+}
+
 pub(crate) fn write_agent_instructions(config: &Path, agent: &Agent, parent_name: Option<&str>) {
     let mut doc = format!(
-        "# AnyAgents Identity & Communication Protocol\n\n\
-         - **Agent Name**: `{}` (`agent:{}`)\n\
-         - **Agent ID**: `{}`\n",
-        agent.name, agent.name, agent.id
+        "# AnyAgents Identity & Environment Awareness\n\n\
+         ## 1. Your Identity (Who You Are)\n\n\
+         - **Agent Name**: `{name}` (addressable as `agent:{name}`)\n\
+         - **Agent ID**: `{id}`\n",
+        name = agent.name,
+        id = agent.id,
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
-            "- **Parent Agent**: `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`)\n"
+            "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`)\n"
         ));
+    } else {
+        doc.push_str("- **Role**: Root Agent\n");
     }
-    doc.push_str(
-        "- **How to Reply / Send Messages**: Incoming messages arrive with a `----- message -----` \
-         header naming `from:`, `answer with reply_to:`, and `answer to:`. Plain text printed only \
-         to your local session/stdout is **never** delivered to other agents, your parent, groups, \
-         or channels. Whenever a message or task asks you to reply, answer, or report back, you \
-         **must** call the AnyAgents `send` MCP tool (`send`, or `await tools.anyagents.send({ ... })` \
-         inside `execute` in OpenCode Code Mode) with `to` (e.g. `[\"parent\"]` or the `answer to:` \
-         / `from:` address), `reply_to` (the `anyagents:reply:msg_...` token from the header), and `text`.\n\
-         - **Channel & Message Interactions (`interact`)**: Use the `interact` MCP tool with `target` \
-         set to the `anyagents:reply:msg_...` token from the message header (or `telegram:chat:<chat_id>:<message_id>`) \
-         and `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]` \
-         or option text, and optional `text` rationale), `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"`.\n",
-    );
+
     if let Some(custom) = agent
         .instructions
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        doc.push_str("\n## Agent Instructions\n\n");
+        doc.push_str("\n## 2. Role & Standing Instructions\n\n");
         doc.push_str(custom);
         doc.push('\n');
     }
+
+    doc.push_str(
+        "\n## 3. Runtime Awareness, Sub-Agents & Communication Protocol\n\n\
+         - **Cache-Stable Architecture (Static System Prompt + Tail Events & On-Demand Tools)**:\n\
+           - This System Prompt is **strictly static** so your LLM prompt prefix KV cache is never invalidated when groups, channels, peers, or sub-agents change.\n\
+           - Live routing context arrives **inline per message** at the tail of your context inside the `<message ...>` XML envelope (`id`, `from`, `sender_name`, `to`, `channel`, `chat`, `chat_title`, `chat_type`, `topic`, `event`, `in_reply_to`, `mentions`, `reply_to`, `answer_to`).\n\
+           - Live topology (your sub-agents, groups, and peers) is queried **on demand** via MCP tools:\n\
+             - **Sub-Agents (`subagents`)**: `subagents({ \"action\": \"list\" })` (list your sub-agents & live status), `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })` (live status + recent turns in one call).\n\
+             - **Groups (`groups`)**: `groups({ \"action\": \"list\" })`, `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
+             - **Peers (`agents`)**: `agents({})` (all agents, harnesses, models, and live health).\n\
+         - **Cross-Harness Sub-Agents (`subagents` / `spawn` MCP Tools vs. Harness Built-In Subagents)**:\n\
+           - Your local harness may expose its own built-in subagent tool (which only runs inside your same harness/account and is invisible to AnyAgents).\n\
+           - **AnyAgents Sub-Agents** (`subagents` and `spawn` MCP tools) are full cross-harness supervised workers: they can run **any** harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), any model (e.g. `sylphx/openai/gpt-6.1-sol#medium`), any `--profile` account, and any isolated `workdir`. They automatically scale to zero (`state = archived`) when their turn finishes, emit a `subagent_completed` event if they finish without calling `send`, and automatically wake/resume when you send them a new message.\n\
+           - Full lifecycle actions on `subagents`:\n\
+             - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"all\"`).\n\
+             - **Inspect**: `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })`.\n\
+             - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"harness\": \"opencode\", \"model\": \"sylphx/openai/gpt-6.1-sol#medium\", \"workdir\": \"/scratch/wt/...\", \"instructions\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`).\n\
+             - **Steer**: `subagents({ \"action\": \"steer\", \"agent\": \"<name-or-id>\", \"prompt\": \"...\" })`.\n\
+             - **Control (`wake`, `pause`, `archive`, `delete`)**: `subagents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"agent\": \"<name-or-id>\" })`.\n\
+         - **How to Reply / Send Messages**: Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call the AnyAgents `send` MCP tool (`send`, or `await tools.anyagents.send({ ... })` inside `execute` in OpenCode Code Mode) with `to` (e.g. `[\"parent\"]` or the `answer_to` / `from` address), `reply_to` (the `anyagents:reply:msg_...` token from the `<message>` tag), and `text`.\n\
+         - **Channel & Message Interactions (`interact`)**: Use the `interact` MCP tool with `target` set to the `anyagents:reply:msg_...` token from the message header (or `telegram:chat:<chat_id>:<message_id>`) and `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]` or option text, and optional `text` rationale), `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"`.\n\
+         - **Memory, History & Hybrid RAG Search (`conversation` / `search`)**: Incoming messages are pushed automatically to your session — never poll an inbox. Use `conversation({ \"query\": \"...\", \"agent\": \"all\", \"limit\": 20 })` or `search({ \"query\": \"...\" })` to run Hybrid RAG search (dense vector embedding `voyageai/voyage-4-large` + SQLite FTS5 BM25) across all agents' historical and live conversations since September without loading the full history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n",
+    );
+
     let paths = [
+        config.join("SYSTEM_PROMPT.md"),
         config.join("AGENTS.md"),
         config.join("opencode").join("AGENTS.md"),
         config.join(".config").join("opencode").join("AGENTS.md"),
         config.join("CLAUDE.md"),
         config.join(".claude").join("CLAUDE.md"),
+        config.join(".gemini").join("config").join("GEMINI.md"),
+        config.join(".gemini").join("config").join("AGENTS.md"),
+        config
+            .join(".gemini")
+            .join("config")
+            .join("rules")
+            .join("AGENTS.md"),
+        config.join("muse").join("AGENTS.md"),
+        config.join(".config").join("muse").join("AGENTS.md"),
+        config.join(".omp").join("agent").join("APPEND_SYSTEM.md"),
+        config.join(".omp").join("agent").join("AGENTS.md"),
+        config.join(".dsh").join("AGENTS.md"),
+        config.join(".grok").join("AGENTS.md"),
     ];
     for path in &paths {
+        if std::fs::read(path).ok().as_deref() == Some(doc.as_bytes()) {
+            continue;
+        }
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -245,6 +322,91 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
                 let _ = std::os::unix::fs::symlink(&src, &dst);
             }
         }
+        for (rel, shared_candidates) in [
+            (
+                ".rustup",
+                ["/home/kyle/.rustup", "/scratch/rustup-home"],
+            ),
+            (
+                ".cargo",
+                ["/home/kyle/.cargo", "/scratch/cargo-registry"],
+            ),
+        ] {
+            let dst = target_config.join(rel);
+            if !dst.exists() {
+                let found_shared = shared_candidates
+                    .iter()
+                    .map(Path::new)
+                    .find(|p| p.is_dir())
+                    .map(Path::to_path_buf)
+                    .or_else(|| {
+                        let h = host_home.join(rel);
+                        h.is_dir().then_some(h)
+                    });
+                if let Some(src) = found_shared {
+                    let _ = std::os::unix::fs::symlink(&src, &dst);
+                }
+            }
+        }
+        ensure_seat_skills(target_config, &host_home);
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
+    let data_skills = target_config
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|data_dir| data_dir.join("skills"));
+    let canonical_skills = [
+        data_skills.as_deref(),
+        Some(Path::new("/scratch/wt/sylphx-skills/skills")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|p| p.is_dir())
+    .map(Path::to_path_buf)
+    .or_else(|| {
+        let candidate = host_home.join("workspace/github.com/SylphxAI/skills/skills");
+        candidate.is_dir().then_some(candidate)
+    });
+    let Some(mut skills_root) = canonical_skills else {
+        return;
+    };
+    if let Some(ref data_sk) = data_skills
+        && !data_sk.exists()
+        && skills_root != *data_sk
+    {
+        if std::os::unix::fs::symlink(&skills_root, data_sk).is_ok() {
+            skills_root = data_sk.clone();
+        }
+    }
+    for rel in [
+        "skills",
+        ".agents/skills",
+        ".claude/skills",
+        ".codex/skills",
+        "opencode/skills",
+        ".config/opencode/skills",
+        ".gemini/config/skills",
+        "muse/skills",
+        ".config/muse/skills",
+        ".omp/agent/skills",
+        ".dsh/skills",
+        ".grok/skills",
+    ] {
+        let dst = target_config.join(rel);
+        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
+            if meta.file_type().is_symlink() && !dst.exists() {
+                let _ = std::fs::remove_file(&dst);
+            } else {
+                continue;
+            }
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::os::unix::fs::symlink(&skills_root, &dst);
     }
 }
 
@@ -409,16 +571,42 @@ pub(crate) fn seed_harness_credentials(
         }
     }
 
+    let explicit_non_default_profile = bound_profile_name(target_config).is_some_and(|b| {
+        let prof = b.split_once('/').map(|(_, p)| p).unwrap_or(b.as_str());
+        !prof.is_empty() && prof != "default"
+    });
     let profile_roots = select_or_bind_profile(data, &all_agents, agent, target_config);
     for rel in &rel_paths {
         let dst = target_config.join(rel);
-        if dst.exists() {
+        let is_auth_cred = matches!(
+            rel.as_str(),
+            ".gemini/antigravity-cli/antigravity-oauth-token"
+                | ".gemini/antigravity-cli/antigravity_state.pbtxt"
+                | ".gemini/antigravity-cli/jetski_state.pbtxt"
+                | ".credentials.json"
+                | ".claude/.credentials.json"
+                | "auth.json"
+                | ".codex/auth.json"
+                | "muse/auth.json"
+                | ".config/muse/auth.json"
+                | ".grok/auth.json"
+                | ".dsh/.credentials.yaml"
+        );
+        let dst_non_empty = dst.metadata().is_ok_and(|m| m.len() > 0);
+        if dst_non_empty && !(explicit_non_default_profile && is_auth_cred && !dst.is_file()) {
             continue;
         }
         let mut copied = false;
         for profile_root in &profile_roots {
             let src = profile_root.join(rel);
             if src.is_file() {
+                if dst.is_file()
+                    && let (Ok(a), Ok(b)) = (std::fs::read(&src), std::fs::read(&dst))
+                    && a == b
+                {
+                    copied = true;
+                    break;
+                }
                 if let Some(parent_dir) = dst.parent() {
                     let _ = std::fs::create_dir_all(parent_dir);
                 }
@@ -428,7 +616,24 @@ pub(crate) fn seed_harness_credentials(
                 }
             }
         }
-        if copied {
+        if copied || dst.exists() {
+            continue;
+        }
+        if explicit_non_default_profile
+            && matches!(
+                rel.as_str(),
+                ".gemini/antigravity-cli/antigravity-oauth-token"
+                    | ".gemini/antigravity-cli/antigravity_state.pbtxt"
+                    | ".gemini/antigravity-cli/jetski_state.pbtxt"
+                    | ".credentials.json"
+                    | ".claude/.credentials.json"
+                    | "auth.json"
+                    | ".codex/auth.json"
+                    | "muse/auth.json"
+                    | ".config/muse/auth.json"
+                    | ".grok/auth.json"
+            )
+        {
             continue;
         }
         for donor in &donors {
@@ -550,13 +755,131 @@ pub(crate) fn seed_harness_credentials(
 
 /// One Upstream Provider Profile in the server's centralized profile pool
 /// (`<data>/profiles/<provider>/<profile>`).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ProviderProfileEntry {
     pub provider: String,
     pub profile: String,
     pub kind: String,
     pub compatible_harnesses: Vec<String>,
     pub assigned_agents: Vec<String>,
+}
+
+/// Bind only an existing named provider profile, never a caller-supplied path.
+pub(crate) fn bind_profile(
+    store: &Store,
+    agent: &Agent,
+    profile: &str,
+    model: &str,
+) -> Result<(), Error> {
+    let provider = upstream_provider_of(&agent.harness, Some(model));
+    let (named_provider, name) = profile.split_once('/').unwrap_or((&provider, profile));
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if named_provider != provider || !valid(name) || !valid(named_provider) {
+        return Err(Error::Message("invalid provider profile".into()));
+    }
+    let source = store.data_dir().join("profiles").join(&provider).join(name);
+    if !source.is_dir() {
+        return Err(Error::Message("provider profile not found".into()));
+    }
+    let config = agent_config_dir(store.data_dir(), &agent.id);
+    fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
+        std::fs::create_dir_all(target)?;
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            let target = target.join(entry.file_name());
+            if kind.is_dir() {
+                copy_files(&entry.path(), &target)?;
+            } else if kind.is_file() && entry.file_name() != "profile.json" {
+                std::fs::copy(entry.path(), &target)?;
+            }
+        }
+        Ok(())
+    }
+    copy_files(&source, &config)
+        .map_err(|_| Error::Message("could not bind provider profile".into()))?;
+    std::fs::write(
+        config.join(".anyagents-profile"),
+        format!("{provider}/{name}\n"),
+    )?;
+    store.set_agent_model(&agent.id, model)?;
+    if agent.harness == "opencode" {
+        let command = std::env::current_exe()?;
+        let args = vec![
+            "--data".into(),
+            store.data_dir().display().to_string(),
+            "mcp".into(),
+            "--config".into(),
+            config.display().to_string(),
+        ];
+        opencode_config::write(&config, Some(model), &command, &args)?;
+    }
+    Ok(())
+}
+
+/// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.
+pub(crate) fn set_provider_profile(
+    data: &Path,
+    provider_profile: &str,
+    key: &str,
+) -> Result<(String, String), Error> {
+    let (provider, profile) = provider_profile
+        .split_once('/')
+        .ok_or_else(|| Error::Message("expected <provider>/<profile> (e.g. kimi-code-plan/rhea)".into()))?;
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if !valid(provider) || !valid(profile) {
+        return Err(Error::Message("invalid provider or profile name".into()));
+    }
+    let trimmed = key.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return Err(Error::Message("a nonempty single-line key is required".into()));
+    }
+    let dir = data.join("profiles").join(provider).join(profile);
+    ensure_provider_profile_meta(&dir, provider, None);
+    let default_dir = data.join("profiles").join(provider).join("default");
+    if default_dir != dir && default_dir.join("opencode.json").is_file() && !dir.join("opencode.json").exists() {
+        let _ = std::fs::copy(default_dir.join("opencode.json"), dir.join("opencode.json"));
+    }
+    let key_filename = match provider {
+        "kimi-code-plan" => "kimi.key",
+        "qwen-token-plan" => "qwen.key",
+        "glm-code-plan" => "glm.key",
+        "minimax-code-plan" => "minimax.key",
+        "sylphx" => "sylphx.key",
+        "openrouter" => "openrouter.key",
+        other => {
+            let prefix = other.split('-').next().unwrap_or(other);
+            return write_profile_key_file(&dir, &format!("{prefix}.key"), trimmed)
+                .map(|()| (provider.to_string(), profile.to_string()));
+        }
+    };
+    write_profile_key_file(&dir, key_filename, trimmed)?;
+    Ok((provider.to_string(), profile.to_string()))
+}
+
+fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), Error> {
+    let key_dir = dir.join(".config").join("opencode");
+    std::fs::create_dir_all(&key_dir)?;
+    let key_path = key_dir.join(filename);
+    std::fs::write(&key_path, format!("{key}\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
 }
 
 /// Resolves the upstream provider an agent draws its credential profile from.
@@ -692,7 +1015,16 @@ pub(crate) fn sync_and_list_provider_profiles(
     for agent in &agents {
         let cfg = agent_config_dir(data, &agent.id);
         let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-        let profile_dir = profiles_root.join(&provider).join("default");
+        let prof_name = bound_profile_name(&cfg)
+            .and_then(|b| {
+                let p = b
+                    .split_once('/')
+                    .map(|(_, p)| p.to_string())
+                    .unwrap_or(b);
+                (!p.is_empty()).then_some(p)
+            })
+            .unwrap_or_else(|| "default".to_string());
+        let profile_dir = profiles_root.join(&provider).join(&prof_name);
         match provider.as_str() {
             "anthropic" => {
                 for rel in [
@@ -1105,6 +1437,9 @@ fn select_or_bind_profile(
             roots.push(dir.clone());
         } else {
             roots.push(data.join("profiles").join(&provider).join(prof_name));
+        }
+        if prof_name != "default" {
+            return roots;
         }
     } else if !available.is_empty() {
         let mut counts: std::collections::BTreeMap<String, usize> = available
