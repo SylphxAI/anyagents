@@ -1546,6 +1546,30 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
             out.push_str("</blockquote>");
             continue;
         }
+        if i + 1 < lines.len()
+            && is_markdown_table_row(trimmed)
+            && is_markdown_table_separator(lines[i + 1].trim())
+        {
+            let start_i = i;
+            let headers = parse_markdown_table_cells(trimmed);
+            i += 2;
+            let mut rows = Vec::new();
+            while i < lines.len() {
+                let row_trimmed = lines[i].trim();
+                if !is_markdown_table_row(row_trimmed) {
+                    break;
+                }
+                if !is_markdown_table_separator(row_trimmed) {
+                    rows.push(parse_markdown_table_cells(row_trimmed));
+                }
+                i += 1;
+            }
+            if start_i > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format_markdown_table_html(&headers, &rows));
+            continue;
+        }
         if i > 0 {
             out.push('\n');
         }
@@ -1559,6 +1583,194 @@ pub fn markdown_to_telegram_html(text: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn is_markdown_table_row(line: &str) -> bool {
+    let t = line.trim();
+    t.starts_with('|') && t.ends_with('|') && t.len() >= 3
+}
+
+fn is_markdown_table_separator(line: &str) -> bool {
+    if !is_markdown_table_row(line) {
+        return false;
+    }
+    let cells = parse_markdown_table_cells(line);
+    !cells.is_empty()
+        && cells.iter().all(|c| {
+            let s = c.trim();
+            !s.is_empty()
+                && s.chars().any(|ch| ch == '-')
+                && s.chars()
+                    .all(|ch| ch == '-' || ch == ':' || ch.is_ascii_whitespace())
+        })
+}
+
+fn parse_markdown_table_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let inner = t
+        .strip_prefix('|')
+        .unwrap_or(t)
+        .strip_suffix('|')
+        .unwrap_or(t);
+    let mut cells = Vec::new();
+    let mut current = String::new();
+    let mut in_ticks = 0usize;
+    let chars: Vec<char> = inner.chars().collect();
+    let mut idx = 0;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch == '\\' && idx + 1 < chars.len() && chars[idx + 1] == '|' {
+            current.push('|');
+            idx += 2;
+            continue;
+        }
+        if ch == '`' {
+            let mut run = 1;
+            while idx + run < chars.len() && chars[idx + run] == '`' {
+                run += 1;
+            }
+            for _ in 0..run {
+                current.push('`');
+            }
+            if in_ticks == 0 {
+                in_ticks = run;
+            } else if in_ticks == run {
+                in_ticks = 0;
+            }
+            idx += run;
+            continue;
+        }
+        if ch == '|' && in_ticks == 0 {
+            cells.push(current.trim().to_string());
+            current.clear();
+            idx += 1;
+            continue;
+        }
+        current.push(ch);
+        idx += 1;
+    }
+    cells.push(current.trim().to_string());
+    cells
+}
+
+fn format_table_cell_inline(cell: &str) -> String {
+    let normalized = replace_html_br(cell, " / ");
+    format_inline_markdown(normalized.trim())
+}
+
+fn replace_html_br(s: &str, replacement: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some(consumed) = match_html_br(&s[i..]) {
+            out.push_str(replacement);
+            i += consumed;
+            continue;
+        }
+        let ch = s[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn match_html_br(s: &str) -> Option<usize> {
+    if !s.starts_with('<') {
+        return None;
+    }
+    let close = s.find('>')?;
+    let inside = s[1..close].trim();
+    let inside = inside.strip_suffix('/').unwrap_or(inside).trim();
+    if inside.eq_ignore_ascii_case("br") {
+        Some(close + 1)
+    } else {
+        None
+    }
+}
+
+fn format_markdown_table_html(headers: &[String], rows: &[Vec<String>]) -> String {
+    if rows.is_empty() {
+        let joined: Vec<String> = headers
+            .iter()
+            .map(|h| format!("<b>{}</b>", format_table_cell_inline(h)))
+            .collect();
+        return format!("<blockquote>{}</blockquote>", joined.join(" · "));
+    }
+    let first_hdr = headers.first().map(|s| s.trim()).unwrap_or("");
+    let first_is_index = matches!(
+        first_hdr.to_ascii_lowercase().as_str(),
+        "#" | "no" | "no." | "id" | "序號" | "編號"
+    );
+    if headers.len() <= 2 {
+        let mut lines = Vec::with_capacity(rows.len());
+        for row in rows {
+            let c0 = row
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            let c1 = row
+                .get(1)
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            if c1.is_empty() {
+                lines.push(format!("• {c0}"));
+            } else {
+                lines.push(format!("• {c0} — {c1}"));
+            }
+        }
+        return format!("<blockquote>{}</blockquote>", lines.join("\n"));
+    }
+    let mut cards = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut card_lines = Vec::new();
+        let start_col = if first_is_index && headers.len() >= 2 {
+            let c0 = row
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            let c1 = row
+                .get(1)
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            card_lines.push(format!("{c0} · {c1}"));
+            2
+        } else {
+            let c0 = row
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            let h0 = headers
+                .first()
+                .map(|s| format_table_cell_inline(s))
+                .unwrap_or_default();
+            if c0.starts_with("<b>") || h0.is_empty() {
+                card_lines.push(c0);
+            } else {
+                card_lines.push(format!("<b>{h0}</b>: {c0}"));
+            }
+            1
+        };
+        for col in start_col..headers.len().max(row.len()) {
+            let val = row.get(col).map(|s| s.trim()).unwrap_or("");
+            if val.is_empty() || val == "-" {
+                continue;
+            }
+            let formatted_val = format_table_cell_inline(val);
+            let hdr = headers.get(col).map(|s| s.trim()).unwrap_or("");
+            if hdr.is_empty() {
+                card_lines.push(format!("• {formatted_val}"));
+            } else {
+                let formatted_hdr = format_table_cell_inline(hdr);
+                card_lines.push(format!("• <b>{formatted_hdr}</b>: {formatted_val}"));
+            }
+        }
+        cards.push(format!(
+            "<blockquote>{}</blockquote>",
+            card_lines.join("\n")
+        ));
+    }
+    cards.join("\n")
 }
 
 fn strip_markdown_heading(line: &str) -> Option<&str> {
@@ -1661,6 +1873,14 @@ fn format_inline_markdown(input: &str) -> String {
             out.push_str(&format_inline_markdown(&input[i + 1..i + 1 + end]));
             out.push_str("</i>");
             i += 1 + end + 1;
+            continue;
+        }
+        // HTML <br> / <br/> / <br /> line break
+        if bytes[i] == b'<'
+            && let Some(consumed) = match_html_br(&input[i..])
+        {
+            out.push('\n');
+            i += consumed;
             continue;
         }
         let ch = input[i..].chars().next().unwrap();
@@ -2475,5 +2695,22 @@ mod membership_tests {
         );
         assert_eq!(photo_msg.media.len(), 1);
         assert_eq!(photo_msg.media[0].file_id, "large_id");
+    }
+
+    #[test]
+    fn gfm_markdown_table_and_html_br_render_as_rich_telegram_html_cards() {
+        let md = "Intro:\n\n| # | Owner | Model | Reason |\n|---|---|---|---|\n| **1** | **Cloud** (`Spiron`) | **`Claude Opus 5.5 (xhigh)`**<br>*(alt: `GPT-6.1 Sol`)* | Rank **#1** |\n";
+        let html = markdown_to_telegram_html(md);
+        assert!(!html.contains("|---|"), "{html}");
+        assert!(!html.contains("&lt;br&gt;"), "{html}");
+        assert!(
+            html.contains("<blockquote><b>1</b> · <b>Cloud</b> (<code>Spiron</code>)"),
+            "{html}"
+        );
+        assert!(html.contains("• <b>Model</b>: <b><code>Claude Opus 5.5 (xhigh)</code></b> / <i>(alt: <code>GPT-6.1 Sol</code>)</i>"), "{html}");
+        assert!(
+            html.contains("• <b>Reason</b>: Rank <b>#1</b></blockquote>"),
+            "{html}"
+        );
     }
 }
