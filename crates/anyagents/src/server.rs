@@ -976,9 +976,8 @@ async fn group_action_route(
         }
         let members = state
             .store
-            .room_members(&group)
-            .map_err(ApiError::from_store)?
-            .unwrap_or_default();
+            .group_members(&group)
+            .map_err(ApiError::from_store)?;
         Ok(Json(GroupView {
             name: group,
             members,
@@ -1634,7 +1633,7 @@ fn target_of(destination: &crate::reply::Destination) -> Target {
             reply: reply.clone(),
         },
         crate::reply::Destination::Agent(name) => Target::Agent(name.clone()),
-        crate::reply::Destination::Group(name) => Target::Room(name.clone()),
+        crate::reply::Destination::Group(name) => Target::Room(format!("group:{name}")),
     }
 }
 
@@ -1715,29 +1714,6 @@ impl SendPlan {
                         targets.push(Target::Agent(child.name));
                     }
                 }
-                Address::Group(room) if room == "children" => {
-                    let Actor::Agent(sender_name) = actor else {
-                        return Err(ApiError::new(
-                            StatusCode::BAD_REQUEST,
-                            "only an agent has children",
-                        ));
-                    };
-                    let sender = store
-                        .agent_by_name(sender_name)
-                        .map_err(ApiError::from_store)?;
-                    let children = store
-                        .children_of(&sender.id)
-                        .map_err(ApiError::from_store)?;
-                    if children.is_empty() {
-                        return Err(ApiError::new(
-                            StatusCode::BAD_REQUEST,
-                            "this agent has no active children",
-                        ));
-                    }
-                    for child in children {
-                        targets.push(Target::Agent(child.name));
-                    }
-                }
                 Address::Agent(name) => targets.push(Target::Agent(name)),
                 Address::TelegramChat { chat, thread } => {
                     targets.push(Target::Telegram {
@@ -1758,7 +1734,7 @@ impl SendPlan {
                         reply,
                     });
                 }
-                Address::Group(room) => targets.push(Target::Room(room)),
+                Address::Group(room) => targets.push(Target::Room(format!("group:{room}"))),
             }
         }
         Ok(Self {
@@ -2374,6 +2350,63 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    #[test]
+    fn explicit_groups_deliver_only_to_stored_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let alice = store
+            .create_agent(anyagents_core::NewAgent::new("alice", "claude-code"))
+            .unwrap();
+        let bob = store
+            .create_agent(anyagents_core::NewAgent::new("bob", "claude-code"))
+            .unwrap();
+        let outsider = store
+            .create_agent(anyagents_core::NewAgent::new("outsider", "claude-code"))
+            .unwrap();
+        for name in ["crew", "all", "children", "123"] {
+            store.join_group(name, &alice.id).unwrap();
+            store.join_group(name, &bob.id).unwrap();
+            let body: SendRequest = serde_json::from_value(serde_json::json!({
+                "sender": "agent:alice", "to": [format!("group:{name}")], "text": name
+            }))
+            .unwrap();
+            let plan = SendPlan::parse(&store, &Actor::Agent("alice".into()), &body)
+                .unwrap_or_else(|err| panic!("{}", err.message));
+            let Target::Room(room) = &plan.targets[0] else {
+                panic!("expected a named group")
+            };
+            assert_eq!(room, &format!("group:{name}"));
+            assert_eq!(
+                room_recipients(&store, &body, room)
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["bob"]
+            );
+            let delivered = deliver_room(&store, &body, room, None)
+                .unwrap_or_else(|err| panic!("{}", err.message));
+            assert_eq!(
+                delivered.iter().map(|d| d.to.as_str()).collect::<Vec<_>>(),
+                vec!["agent:bob"]
+            );
+            // A reply to the group retains the same namespace as a new send.
+            assert!(
+                matches!(target_of(&crate::reply::Destination::Group(name.into())), Target::Room(reply) if reply == *room)
+            );
+        }
+        assert!(store.inbox(&alice.id, None).unwrap().is_empty());
+        assert!(store.inbox(&outsider.id, None).unwrap().is_empty());
+        assert_eq!(store.inbox(&bob.id, None).unwrap().len(), 4);
+        assert_eq!(store.room_members("all").unwrap().unwrap().len(), 3);
+        assert!(
+            store
+                .room_members("group:unknown")
+                .unwrap()
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     /// Answers one sign-in with two lines and records where it ran.
     struct Scripted {

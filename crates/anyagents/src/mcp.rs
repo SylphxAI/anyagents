@@ -188,7 +188,7 @@ struct AgentMcp {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SendArgs {
     /// Destinations: agent names or IDs (`sage`, `agent:sage`, `agt_...`, `parent`,
-    /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
+    /// `children`), internal groups (`group:owners`, `group:<name>`; `all` broadcasts),
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
     /// `telegram:user:<user_id>[:<message_id>]`). Sending to an archived agent's
     /// name or `agt_...` ID automatically wakes and resumes its session. May be
@@ -366,7 +366,7 @@ fn generate_subagent_name(parent_name: &str) -> String {
 #[tool_router(server_handler)]
 impl AgentMcp {
     #[tool(
-        description = "Send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`)."
+        description = "Send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`; `all` broadcasts), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`)."
     )]
     async fn send(
         &self,

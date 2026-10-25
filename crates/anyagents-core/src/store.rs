@@ -705,15 +705,18 @@ impl Store {
         Ok(delivered)
     }
 
-    /// Who a room reaches, when the room names a chat. `None` is a room that is
-    /// not a chat: every agent, as a group by name always was.
     /// Who a room reaches.
     ///
     /// A chat (`<id>`, `chat:<id>`, `telegram:chat:<id>[:thread]`) reaches the
     /// agents whose own bot is attached to that chat. A named group reaches its
     /// own members, and nobody else. A room that is neither is empty rather
     /// than everyone: a name we do not know must never fan out to the world.
+    /// Explicit `group:` addresses always use stored membership, even for
+    /// numeric names or `all`. Only the bare `all` alias broadcasts.
     pub fn room_members(&self, room: &str) -> Result<Option<Vec<String>>, Error> {
+        if let Some(name) = room.strip_prefix("group:") {
+            return Ok(Some(self.group_members(name)?));
+        }
         let named = room
             .strip_prefix("telegram:chat:")
             .or_else(|| room.strip_prefix("chat:"))
@@ -2630,6 +2633,50 @@ mod tests {
             .receive_room("group:nobody", one("lost", "agent:alice"))
             .unwrap();
         assert!(delivered.is_empty(), "{delivered:?}");
+    }
+
+    #[test]
+    fn explicit_group_names_never_expand_to_broadcasts_or_chats() {
+        let (_dir, store) = setup();
+        let alice = agent(&store, "alice");
+        let bob = agent(&store, "bob");
+        let channel = store
+            .create_channel(NewChannel {
+                kind: "telegram".into(),
+                identity: None,
+                config: "{}".into(),
+                credential_ref: None,
+            })
+            .unwrap();
+        store.attach_channel(&channel.id, &bob.id).unwrap();
+        store
+            .set_channel_state(&channel.id, r#"{"chats":[{"agent":"bob","chat_id":123}]}"#)
+            .unwrap();
+        assert_eq!(
+            store.room_members("telegram:chat:123").unwrap(),
+            Some(vec!["bob".into()])
+        );
+        for name in ["all", "123"] {
+            // Even before the group exists it must not resolve to another room.
+            assert_eq!(
+                store.room_members(&format!("group:{name}")).unwrap(),
+                Some(vec![])
+            );
+            store.join_group(name, &alice.id).unwrap();
+            assert_eq!(
+                store.room_members(&format!("group:{name}")).unwrap(),
+                Some(vec!["alice".into()])
+            );
+            store.leave_group(name, &alice.id).unwrap();
+            assert_eq!(
+                store.room_members(&format!("group:{name}")).unwrap(),
+                Some(vec![])
+            );
+        }
+        assert_eq!(
+            store.room_members("all").unwrap(),
+            Some(vec![alice.name, bob.name])
+        );
     }
 
     /// A named group survives a restart: membership is stored, not held in

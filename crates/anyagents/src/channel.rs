@@ -150,7 +150,7 @@ fn send_stored(
         Address::Group(room) => {
             let store = open(data)?;
             let delivered = store.receive_room(
-                &room,
+                &format!("group:{room}"),
                 Incoming {
                     text,
                     sender: from,
