@@ -471,6 +471,10 @@ pub fn print_agents_table(
         }
     }
 
+    let has_descriptions = ordered
+        .iter()
+        .any(|(_, a)| a.description.as_deref().is_some_and(|d| !d.trim().is_empty()));
+
     let mut headers = vec![
         ("AGENT", false),
         ("STATUS", false),
@@ -481,6 +485,9 @@ pub fn print_agents_table(
         headers.push(("PROFILE", false));
     }
     headers.push(("MAILBOX", false));
+    if has_descriptions {
+        headers.push(("DESCRIPTION", false));
+    }
     headers.push(("ID", false));
 
     let mut table = Table::new(&headers);
@@ -519,6 +526,24 @@ pub fn print_agents_table(
             row.push(if is_dim { dim(&prof) } else { prof });
         }
         row.push(mailbox);
+        if has_descriptions {
+            let desc_raw = agent
+                .description
+                .as_deref()
+                .map(|s| s.lines().next().unwrap_or("").trim())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("-");
+            let truncated = if desc_raw.chars().count() > 54 {
+                format!("{}…", desc_raw.chars().take(53).collect::<String>())
+            } else {
+                desc_raw.to_string()
+            };
+            row.push(if is_dim || desc_raw == "-" {
+                dim(&truncated)
+            } else {
+                truncated
+            });
+        }
         row.push(id);
         table.add_row(row);
     }

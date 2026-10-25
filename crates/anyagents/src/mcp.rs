@@ -294,12 +294,26 @@ struct SpawnArgs {
     /// Optional working directory path.
     #[serde(default)]
     workdir: Option<String>,
-    /// Optional system instructions for the spawned agent.
-    #[serde(default)]
+    /// Optional system/role description or standing instructions for the spawned agent.
+    #[serde(default, alias = "description", alias = "role")]
     instructions: Option<String>,
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
     prompt: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct DescribeArgs {
+    /// Target agent name (`"self"`, `"xenon"`, `"sage"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
+    #[serde(default, alias = "name", alias = "target")]
+    agent: Option<String>,
+    /// New role/responsibility description to set (syncs into the agent's private system prompt and group roster).
+    /// Omit to read the current description.
+    #[serde(default, alias = "instructions", alias = "role", alias = "text")]
+    description: Option<String>,
+    /// Set `true` to clear the agent's custom description.
+    #[serde(default)]
+    clear: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -341,7 +355,7 @@ struct SubagentsArgs {
     #[serde(default)]
     workdir: Option<String>,
     /// Optional system/role instructions when `action = "spawn"`.
-    #[serde(default)]
+    #[serde(default, alias = "description", alias = "role")]
     instructions: Option<String>,
     /// Task prompt or follow-up message when `action` is `"spawn"`, `"steer"`, `"send"`, `"wake"`, or `"resume"`.
     #[serde(default, alias = "text", alias = "message")]
@@ -949,6 +963,88 @@ impl AgentMcp {
             .get(
                 "/v1/interact",
                 Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Read or update an agent's role & responsibility description (`description` / `instructions`). Any agent can update its own description (`agent: \"self\"`, `description: \"...\"`) whenever its mission or focus evolves, and Owner Admins or Parent agents can update other agents' descriptions. Updating `description` automatically syncs the agent's private `SYSTEM_PROMPT.md` / `AGENTS.md` and makes the role visible to all peers in `agents` and `groups`."
+    )]
+    async fn describe(
+        &self,
+        Parameters(args): Parameters<DescribeArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let target = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .unwrap_or_else(|| self.agent.name.clone());
+        let resolved_target = if target.eq_ignore_ascii_case("self") {
+            self.agent.name.clone()
+        } else {
+            target
+        };
+        if resolved_target.eq_ignore_ascii_case("all")
+            && args.description.is_none()
+            && !args.clear.unwrap_or(false)
+        {
+            let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+            let roster: Vec<serde_json::Value> = resp
+                .agents
+                .into_iter()
+                .filter(|a| a.state != "archived" || a.parent.is_none())
+                .map(|a| {
+                    serde_json::json!({
+                        "id": a.id,
+                        "name": a.name,
+                        "parent": a.parent,
+                        "harness": a.harness,
+                        "model": a.model,
+                        "state": a.state,
+                        "description": a.description,
+                    })
+                })
+                .collect();
+            return Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                "agents": roster,
+            })));
+        }
+        if args.description.is_some() || args.clear.unwrap_or(false) {
+            let body = serde_json::json!({
+                "description": args.description,
+                "clear": args.clear.unwrap_or(false),
+            });
+            let updated: serde_json::Value = self
+                .client
+                .get(
+                    &format!("/v1/agents/{resolved_target}/description"),
+                    Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                )
+                .await?;
+            return Ok(rmcp::handler::server::wrapper::Json(updated));
+        }
+        let current: serde_json::Value = self
+            .client
+            .get(&format!("/v1/agents/{resolved_target}/description"), None)
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(current))
+    }
+
+    #[tool(
+        description = "Native SOTA anti-detect browser with persistent login profiles and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `eval` | `screenshot` | `cookies` | `tabs` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
+    )]
+    async fn browser(
+        &self,
+        Parameters(args): Parameters<crate::browser::BrowserRequest>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let response: serde_json::Value = self
+            .client
+            .get(
+                "/v1/browser",
+                Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
             )
             .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))

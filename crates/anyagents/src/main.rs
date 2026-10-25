@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 mod agent;
 mod api;
 mod auth;
+mod browser;
 mod channel;
 mod client;
 mod create;
@@ -94,13 +95,31 @@ enum Command {
         #[arg(long)]
         parent: Option<String>,
     },
-    /// List sub-agents for a parent agent (defaults to `self` inside an agent, or all sub-agents from host CLI).
+    /// List sub-agents or configure default sub-agent harness/model/profile (`anyagents subagents default ...`).
     Subagents {
-        /// Optional parent agent name, `agt_...` id, `self`, or `all`.
+        /// Optional action (`default`, `list`) or parent agent name (`self`, `all`, `<agent>`).
         parent: Option<String>,
-        /// Optional state filter: `running`, `paused`, `archived`, or `all`.
+        /// Optional state filter (`running`, `paused`, `archived`, or `all`).
         #[arg(long)]
         state: Option<String>,
+        /// Set sub-agent default to inherit parent's harness, model, and profile (`subagents default --inherit`).
+        #[arg(long)]
+        inherit: bool,
+        /// Set sub-agent default harness (`subagents default --harness opencode`).
+        #[arg(long)]
+        harness: Option<String>,
+        /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#medium`).
+        #[arg(long)]
+        model: Option<String>,
+        /// Set sub-agent default profile (`subagents default --profile sylphx/default`).
+        #[arg(long)]
+        profile: Option<String>,
+        /// Optional parent agent name to scope `subagents default --agent <name>`.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Clear custom sub-agent default and revert to `inherit`.
+        #[arg(long)]
+        clear: bool,
     },
     /// Spawn a new agent or sub-agent and optionally deliver an initial task prompt.
     Spawn {
@@ -383,6 +402,56 @@ enum Command {
         #[command(subcommand)]
         action: GroupsCommand,
     },
+    /// View or update an agent's role & responsibility description (`anyagents describe [agent] [description]`).
+    Describe {
+        /// Target agent name (`self`, `all`, `xenon`, `sage`, ...) or description text when updating `self`.
+        agent: Option<String>,
+        /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
+        description: Option<String>,
+        /// Clear custom description.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Native SOTA anti-detect browser with persistent login profiles (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, `close`).
+    Browser {
+        /// Action: `open` / `goto`, `snapshot`, `click`, `fill` / `type`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, or `close` / `stop`.
+        #[arg(default_value = "status")]
+        action: String,
+        /// Primary argument: URL (for `open`), `@e1` / CSS selector (for `click` / `fill`), key name (for `press`), JS code (for `eval`), or output path (for `screenshot`).
+        target: Option<String>,
+        /// Secondary argument: text to enter when `action` is `fill` / `type`.
+        value: Option<String>,
+        /// Persistent browser profile name (e.g. `default`, `xenon`, `github`).
+        #[arg(short = 'p', long)]
+        profile: Option<String>,
+        /// Explicit URL override.
+        #[arg(long)]
+        url: Option<String>,
+        /// Explicit `@e1` or CSS selector override.
+        #[arg(long)]
+        selector: Option<String>,
+        /// Explicit text override for `fill` / `type`.
+        #[arg(long)]
+        text: Option<String>,
+        /// Explicit JS code override for `eval`.
+        #[arg(long)]
+        script: Option<String>,
+        /// Explicit output path for `screenshot`.
+        #[arg(long)]
+        path: Option<String>,
+        /// Press Enter / submit form after `fill` / `type`.
+        #[arg(long)]
+        submit: bool,
+        /// Capture full scrollable page on `screenshot`.
+        #[arg(long = "full-page")]
+        full_page: bool,
+        /// Wait duration in milliseconds after `open` or `click`.
+        #[arg(long = "wait-ms")]
+        wait_ms: Option<u64>,
+        /// Force headless mode (`false` by default: uses `xvfb-run` real headed GUI for anti-detect stealth).
+        #[arg(long)]
+        headless: Option<bool>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -446,7 +515,7 @@ enum AgentsCommand {
     /// Record an agent. The harness is a catalog key.
     Create {
         name: String,
-        #[arg(long, default_value = "claude-code")]
+        #[arg(long, default_value = "")]
         harness: String,
         #[arg(long)]
         model: Option<String>,
@@ -549,17 +618,48 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Peers { state, parent } => {
             agent::peers(&data, state.as_deref(), parent.as_deref())
         }
-        Command::Subagents { parent, state } => {
-            let parent_filter = parent.or_else(|| {
-                if std::env::var("ANYAGENTS_AGENT_ID").is_ok()
-                    || std::env::var("ANYAGENTS_AGENT_NAME").is_ok()
-                {
-                    Some("self".to_owned())
-                } else {
-                    Some("subagents".to_owned())
-                }
-            });
-            agent::peers(&data, state.as_deref(), parent_filter.as_deref())
+        Command::Subagents {
+            parent,
+            state,
+            inherit,
+            harness,
+            model,
+            profile,
+            agent,
+            clear,
+        } => {
+            if parent
+                .as_deref()
+                .is_some_and(|p| p.trim().eq_ignore_ascii_case("default"))
+                || inherit
+                || harness.is_some()
+                || model.is_some()
+                || profile.is_some()
+                || clear
+            {
+                subagents_default_cmd(
+                    &data,
+                    inherit,
+                    harness.as_deref(),
+                    model.as_deref(),
+                    profile.as_deref(),
+                    agent.as_deref(),
+                    clear,
+                )
+            } else {
+                let cleaned_parent =
+                    parent.filter(|p| !p.trim().eq_ignore_ascii_case("list"));
+                let parent_filter = cleaned_parent.or_else(|| {
+                    if std::env::var("ANYAGENTS_AGENT_ID").is_ok()
+                        || std::env::var("ANYAGENTS_AGENT_NAME").is_ok()
+                    {
+                        Some("self".to_owned())
+                    } else {
+                        Some("subagents".to_owned())
+                    }
+                });
+                agent::peers(&data, state.as_deref(), parent_filter.as_deref())
+            }
         }
         Command::Spawn {
             name,
@@ -776,7 +876,155 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             }),
         Command::Channels { action } => channel::channels(&data, action),
         Command::Groups { action } => groups(&data, action),
+        Command::Describe {
+            agent,
+            description,
+            clear,
+        } => agent::describe_cmd(&data, agent, description, clear),
+        Command::Browser {
+            action,
+            target,
+            value,
+            profile,
+            url,
+            selector,
+            text,
+            script,
+            path,
+            submit,
+            full_page,
+            wait_ms,
+            headless,
+        } => browser_cmd(
+            &data,
+            action,
+            target,
+            value,
+            profile,
+            url,
+            selector,
+            text,
+            script,
+            path,
+            submit,
+            full_page,
+            wait_ms,
+            headless,
+        ),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn browser_cmd(
+    data: &Path,
+    action: String,
+    target: Option<String>,
+    value: Option<String>,
+    profile: Option<String>,
+    url: Option<String>,
+    selector: Option<String>,
+    text: Option<String>,
+    script: Option<String>,
+    path: Option<String>,
+    submit: bool,
+    full_page: bool,
+    wait_ms: Option<u64>,
+    headless: Option<bool>,
+) -> Result<(), anyagents_core::Error> {
+    let act = action.trim().to_ascii_lowercase();
+    let mut req = browser::BrowserRequest {
+        action: act.clone(),
+        profile,
+        url,
+        selector,
+        text,
+        key: None,
+        script,
+        path,
+        submit: submit.then_some(true),
+        full_page: full_page.then_some(true),
+        wait_ms,
+        headless,
+        tab_action: None,
+        target_id: None,
+        cookies: None,
+    };
+    match act.as_str() {
+        "open" | "goto" | "navigate" => {
+            if req.url.is_none() {
+                req.url = target;
+            }
+        }
+        "click" => {
+            if req.selector.is_none() {
+                req.selector = target;
+            }
+        }
+        "fill" | "type" | "input" => {
+            if req.selector.is_none() {
+                req.selector = target;
+            }
+            if req.text.is_none() {
+                req.text = value;
+            }
+        }
+        "press" | "key" => {
+            if req.key.is_none() {
+                req.key = target;
+            }
+        }
+        "eval" | "evaluate" | "js" => {
+            if req.script.is_none() {
+                req.script = target;
+            }
+        }
+        "screenshot" | "shot" => {
+            if req.path.is_none() {
+                req.path = target;
+            }
+        }
+        "tabs" => {
+            req.tab_action = target;
+            req.target_id = value.clone();
+            if req.url.is_none() {
+                req.url = value;
+            }
+        }
+        "close" | "stop" | "status" | "info" | "fingerprint" => {
+            if req.profile.is_none() && target.is_some() {
+                req.profile = target;
+            }
+        }
+        _ => {}
+    }
+    let out = if client::can_call_server(data) {
+        let bytes = serde_json::to_vec(&req)
+            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+        match client::call::<serde_json::Value>(
+            data,
+            "POST",
+            "/v1/browser",
+            Some(bytes),
+            &client::authority(data),
+        ) {
+            Ok(Some(val)) => val,
+            Ok(None) => {
+                return Err(anyagents_core::Error::Message(
+                    "the server answered nothing".into(),
+                ));
+            }
+            Err(err) if err.contains("404") => browser::execute(data, "default", req)?,
+            Err(err) => return Err(anyagents_core::Error::Message(err)),
+        }
+    } else {
+        browser::execute(data, "default", req)?
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out)
+            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?
+    );
+    Ok(())
 }
 
 /// Print the boundary contract this deployment wrote, or say it has none.
@@ -1130,6 +1378,159 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
     Ok(())
 }
 
+fn subagents_default_cmd(
+    data: &Path,
+    inherit: bool,
+    harness: Option<&str>,
+    model: Option<&str>,
+    profile: Option<&str>,
+    agent: Option<&str>,
+    clear: bool,
+) -> Result<(), anyagents_core::Error> {
+    use anyagents_core::Error;
+    let is_write = inherit || harness.is_some() || model.is_some() || profile.is_some() || clear;
+    let cfg = if is_write {
+        let mode = if inherit || clear {
+            "inherit".to_string()
+        } else {
+            "preset".to_string()
+        };
+        if client::can_call_server(data) {
+            let body = serde_json::json!({
+                "agent": agent,
+                "clear": clear,
+                "mode": mode,
+                "harness": harness,
+                "model": model,
+                "profile": profile,
+            });
+            match client::call::<create::SubagentDefaultsConfig>(
+                data,
+                "POST",
+                "/v1/subagent-defaults",
+                Some(body.to_string().into_bytes()),
+                &client::authority(data),
+            ) {
+                Ok(Some(updated)) => updated,
+                Ok(None) => {
+                    return Err(Error::Message("the server answered nothing".into()));
+                }
+                Err(err) if err.contains("404") => {
+                    let mut c = create::load_subagent_defaults(data);
+                    apply_local_subagent_default(
+                        &mut c, clear, &mode, harness, model, profile, agent,
+                    );
+                    create::save_subagent_defaults(data, &c)?;
+                    c
+                }
+                Err(err) => return Err(Error::Message(err)),
+            }
+        } else {
+            let mut c = create::load_subagent_defaults(data);
+            apply_local_subagent_default(&mut c, clear, &mode, harness, model, profile, agent);
+            create::save_subagent_defaults(data, &c)?;
+            c
+        }
+    } else if client::can_call_server(data) {
+        match client::call::<create::SubagentDefaultsConfig>(
+            data,
+            "GET",
+            "/v1/subagent-defaults",
+            None,
+            &client::authority(data),
+        ) {
+            Ok(Some(c)) => c,
+            Ok(None) | Err(_) => create::load_subagent_defaults(data),
+        }
+    } else {
+        create::load_subagent_defaults(data)
+    };
+
+    if ui::is_pretty() {
+        println!("\n  {}\n", ui::bold_cyan("Sub-Agent Defaults"));
+        let mut table = ui::Table::new(&[
+            ("SCOPE", false),
+            ("MODE", false),
+            ("HARNESS", false),
+            ("MODEL", false),
+            ("PROFILE", false),
+        ]);
+        let fmt_row = |scope: &str, s: &create::SubagentDefaultSpec| -> Vec<String> {
+            let is_inh = s.mode.eq_ignore_ascii_case("inherit");
+            vec![
+                ui::bold(scope),
+                if is_inh {
+                    ui::green("inherit (parent)")
+                } else {
+                    ui::cyan("preset")
+                },
+                if is_inh {
+                    ui::dim("inherit")
+                } else {
+                    s.harness.clone().unwrap_or_else(|| "inherit".to_string())
+                },
+                if is_inh {
+                    ui::dim("inherit")
+                } else {
+                    s.model.clone().unwrap_or_else(|| "inherit".to_string())
+                },
+                if is_inh {
+                    ui::dim("inherit")
+                } else {
+                    s.profile.clone().unwrap_or_else(|| "auto / inherit".to_string())
+                },
+            ]
+        };
+        table.add_row(fmt_row("global (*)", &cfg.default));
+        for (ag, s) in &cfg.agents {
+            table.add_row(fmt_row(ag, s));
+        }
+        table.print();
+        println!();
+        return Ok(());
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&cfg).map_err(|e| Error::Message(e.to_string()))?
+    );
+    Ok(())
+}
+
+fn apply_local_subagent_default(
+    cfg: &mut create::SubagentDefaultsConfig,
+    clear: bool,
+    mode: &str,
+    harness: Option<&str>,
+    model: Option<&str>,
+    profile: Option<&str>,
+    agent: Option<&str>,
+) {
+    if clear {
+        if let Some(ag) = agent {
+            cfg.agents.remove(ag.trim());
+        } else {
+            cfg.default = create::SubagentDefaultSpec {
+                mode: "inherit".to_string(),
+                harness: None,
+                model: None,
+                profile: None,
+            };
+        }
+        return;
+    }
+    let spec = create::SubagentDefaultSpec {
+        mode: mode.to_string(),
+        harness: harness.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        model: model.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+        profile: profile.map(str::trim).filter(|s| !s.is_empty()).map(str::to_string),
+    };
+    if let Some(ag) = agent.map(str::trim).filter(|s| !s.is_empty()) {
+        cfg.agents.insert(ag.to_string(), spec);
+    } else {
+        cfg.default = spec;
+    }
+}
+
 fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
     let filter = filter.filter(|f| !f.trim().eq_ignore_ascii_case("list"));
     let entries = if client::can_call_server(data) {
@@ -1305,7 +1706,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
         }));
     }
 
-    let mut agents_list = match live_agents {
+    let agents_list = match live_agents {
         Some(ref resp) => {
             let mut list = resp.agents.clone();
             agent::reconcile_and_enrich_views(data, &mut list);
@@ -1333,6 +1734,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         quota_reset_at_ms: None,
                         oldest_undelivered_age_ms: None,
                         install: "recorded".to_string(),
+                        description: a.instructions,
                     });
                 }
             }

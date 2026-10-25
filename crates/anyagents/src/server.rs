@@ -202,6 +202,18 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && !crate::sandbox::is_isolated_test_env()
     {
+        let reaper_root = data.to_path_buf();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let root = reaper_root.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::browser::reap_idle_browsers(&root);
+                })
+                .await;
+            }
+        });
         let updater_root = data.to_path_buf();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
@@ -250,7 +262,20 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/model", post(model_route))
+        .route(
+            "/v1/agents/{name}/description",
+            get(get_description_route).post(set_description_route),
+        )
+        .route(
+            "/v1/agents/{name}/instructions",
+            get(get_description_route).post(set_description_route),
+        )
+        .route("/v1/browser", post(browser_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+        .route(
+            "/v1/subagent-defaults",
+            get(get_subagent_defaults_route).post(set_subagent_defaults_route),
+        )
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
@@ -656,6 +681,208 @@ async fn set_profile_route(
     })))
 }
 
+async fn get_subagent_defaults_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
+    Ok(Json(create::load_subagent_defaults(state.store.data_dir())))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetSubagentDefaultsRequest {
+    agent: Option<String>,
+    clear: Option<bool>,
+    mode: String,
+    harness: Option<String>,
+    model: Option<String>,
+    profile: Option<String>,
+}
+
+async fn set_subagent_defaults_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<SetSubagentDefaultsRequest>,
+) -> Result<Json<create::SubagentDefaultsConfig>, ApiError> {
+    let target_label = body.agent.as_deref().unwrap_or("global");
+    require_admin_or_operator(
+        &state.store,
+        &principal,
+        "subagents.set_default",
+        target_label,
+    )?;
+    let mut cfg = create::load_subagent_defaults(state.store.data_dir());
+    if body.clear.unwrap_or(false) {
+        if let Some(ref ag) = body.agent {
+            cfg.agents.remove(ag.trim());
+        } else {
+            cfg.default = create::SubagentDefaultSpec {
+                mode: "inherit".to_string(),
+                harness: None,
+                model: None,
+                profile: None,
+            };
+        }
+    } else {
+        let spec = create::SubagentDefaultSpec {
+            mode: body.mode,
+            harness: body.harness.filter(|s| !s.trim().is_empty()),
+            model: body.model.filter(|s| !s.trim().is_empty()),
+            profile: body.profile.filter(|s| !s.trim().is_empty()),
+        };
+        if let Some(ag) = body
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            cfg.agents.insert(ag.to_string(), spec);
+        } else {
+            cfg.default = spec;
+        }
+    }
+    create::save_subagent_defaults(state.store.data_dir(), &cfg).map_err(ApiError::from_store)?;
+    Ok(Json(cfg))
+}
+
+#[derive(Deserialize, Default)]
+struct DescriptionRequest {
+    #[serde(default, alias = "instructions", alias = "role")]
+    description: Option<String>,
+    #[serde(default)]
+    clear: Option<bool>,
+}
+
+async fn get_description_route(
+    _principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let rec = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
+        let system_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok();
+        Ok(Json(serde_json::json!({
+            "id": rec.id.as_str(),
+            "name": rec.name,
+            "description": rec.instructions,
+            "system_prompt": system_prompt,
+        })))
+    })
+    .await
+}
+
+async fn set_description_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<DescriptionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        if name.eq_ignore_ascii_case("all")
+            && body.description.is_none()
+            && !body.clear.unwrap_or(false)
+        {
+            require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
+            create::sync_all_agent_instructions(&state.store, state.store.data_dir());
+            return Ok(Json(serde_json::json!({
+                "synced": "all",
+            })));
+        }
+        let target = if name.eq_ignore_ascii_case("self") {
+            match &principal {
+                Principal::Agent { agent_id, .. } => {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                }
+                Principal::Operator => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "`self` requires an agent caller",
+                    ));
+                }
+            }
+        } else {
+            state
+                .store
+                .agent_by_name(&name)
+                .map_err(ApiError::from_store)?
+        };
+        let is_self_or_parent = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                *agent_id == target.id || target.parent_id.as_ref() == Some(agent_id)
+            }
+            Principal::Operator => false,
+        };
+        if !is_self_or_parent {
+            require_admin_or_operator(
+                &state.store,
+                &principal,
+                "agents.set_description",
+                &target.name,
+            )?;
+        }
+        let mut rec = target;
+        if body.clear.unwrap_or(false) {
+            rec = state
+                .store
+                .set_agent_instructions(&rec.id, None)
+                .map_err(ApiError::from_store)?;
+        } else if let Some(ref desc) = body.description {
+            let trimmed = desc.trim();
+            rec = state
+                .store
+                .set_agent_instructions(
+                    &rec.id,
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(trimmed)
+                    },
+                )
+                .map_err(ApiError::from_store)?;
+        }
+        let parent_name = rec
+            .parent_id
+            .as_ref()
+            .and_then(|pid| state.store.agent(pid).ok())
+            .map(|p| p.name);
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
+        create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
+        if let Some((_, _, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
+        {
+            crate::sandbox::share_config_with_seat(&cfg, gid);
+        }
+        Ok(Json(serde_json::json!({
+            "id": rec.id.as_str(),
+            "name": rec.name,
+            "description": rec.instructions,
+            "system_prompt_synced": true,
+        })))
+    })
+    .await
+}
+
+async fn browser_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<crate::browser::BrowserRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let default_profile = match &principal {
+        Principal::Agent { name, .. } => name.clone(),
+        Principal::Operator => "default".to_string(),
+    };
+    spawn_store(move || {
+        let out = crate::browser::execute(state.store.data_dir(), &default_profile, body)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(out))
+    })
+    .await
+}
+
 async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -972,6 +1199,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         quota_reset_at_ms: quota,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: install_state(store, agent),
+        description: agent.instructions.clone(),
     })
 }
 
@@ -1023,26 +1251,21 @@ async fn create_agent_route(
             (None, None) => None,
         };
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
-        let harness = {
-            let trimmed = body.harness.trim();
-            if !trimmed.is_empty() {
-                trimmed.to_string()
-            } else if let Some(ref p) = parent_agent
-                && p.harness != "agy"
-            {
-                p.harness.clone()
-            } else {
-                "claude-code".to_string()
-            }
-        };
+        let (harness, model, profile) = create::resolve_subagent_defaults(
+            state.store.data_dir(),
+            parent_agent.as_ref(),
+            &body.harness,
+            body.model,
+            body.profile,
+        );
         let agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
                 harness,
-                model: body.model,
-                profile: body.profile,
+                model,
+                profile,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
                 instructions: body.instructions,
@@ -1382,6 +1605,23 @@ async fn wake_agent_route(
     .await
 }
 
+fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::GroupMemberView> {
+    let mut out = Vec::with_capacity(members.len());
+    for name in members {
+        if let Ok(agent) = store.agent_by_name(name) {
+            out.push(crate::api::GroupMemberView {
+                id: agent.id.to_string(),
+                name: agent.name,
+                harness: agent.harness,
+                model: agent.model,
+                state: agent.state,
+                description: agent.instructions,
+            });
+        }
+    }
+    out
+}
+
 async fn list_groups_route(
     _principal: Principal,
     State(state): State<AppState>,
@@ -1390,7 +1630,14 @@ async fn list_groups_route(
         let rows = state.store.list_groups().map_err(ApiError::from_store)?;
         let groups = rows
             .into_iter()
-            .map(|(name, members)| GroupView { name, members })
+            .map(|(name, members)| {
+                let roster = build_group_roster(&state.store, &members);
+                GroupView {
+                    name,
+                    members,
+                    roster,
+                }
+            })
             .collect();
         Ok(Json(GroupsResponse { groups }))
     })
@@ -1466,9 +1713,11 @@ async fn group_action_route(
             .room_members(&group)
             .map_err(ApiError::from_store)?
             .unwrap_or_default();
+        let roster = build_group_roster(&state.store, &members);
         Ok(Json(GroupView {
             name: group,
             members,
+            roster,
         }))
     })
     .await

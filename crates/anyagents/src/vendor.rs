@@ -682,6 +682,10 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             args.push(effort);
             args.push("--name".to_string());
             args.push(request.agent.name.clone());
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                args.push("--disallowedTools".to_string());
+                args.push("Task,Agent".to_string());
+            }
             let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
             if sys_prompt.is_file() {
                 args.push("--append-system-prompt-file".to_string());
@@ -762,6 +766,23 @@ pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
             {
                 allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
                 changed = true;
+            }
+            if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                let deny = perms_obj
+                    .entry("deny".to_string())
+                    .or_insert_with(|| serde_json::json!([]));
+                if !deny.is_array() {
+                    *deny = serde_json::json!([]);
+                    changed = true;
+                }
+                if let Some(deny_arr) = deny.as_array_mut() {
+                    for tool_name in ["invoke_subagent", "define_subagent", "manage_subagents"] {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool_name)) {
+                            deny_arr.push(serde_json::Value::String(tool_name.to_string()));
+                            changed = true;
+                        }
+                    }
+                }
             }
         }
         let work_dir_str = work_dir.display().to_string();

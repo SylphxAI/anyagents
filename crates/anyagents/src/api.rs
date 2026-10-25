@@ -25,6 +25,9 @@ pub struct AgentView {
     /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
     /// has been installed yet, and what stopped it.
     pub install: String,
+    /// Standing role description / current responsibilities (`instructions` column in SQLite).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 fn default_harness() -> String {
@@ -43,7 +46,7 @@ pub struct CreateAgentRequest {
     pub profile: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "description")]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -52,9 +55,23 @@ pub struct CreateAgentRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct GroupMemberView {
+    pub id: String,
+    pub name: String,
+    pub harness: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GroupView {
     pub name: String,
     pub members: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roster: Vec<GroupMemberView>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

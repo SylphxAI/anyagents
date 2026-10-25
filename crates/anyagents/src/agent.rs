@@ -75,40 +75,135 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             instructions,
             clear,
         } => {
-            let store = Store::open(data.join("state.db"))?;
-            if name == "all" {
-                crate::create::sync_all_agent_instructions(&store, data);
-                println!("synced\tall");
-                return Ok(());
-            }
-            let mut rec = store.agent_by_name(&name)?;
-            if clear {
-                rec = store.set_agent_instructions(&rec.id, None)?;
-            } else if let Some(ref text) = instructions {
-                rec = store.set_agent_instructions(&rec.id, Some(text))?;
-            }
-            let parent_name = rec
-                .parent_id
-                .as_ref()
-                .and_then(|pid| store.agent(pid).ok())
-                .map(|p| p.name);
-            let cfg = anyagents_core::agent_config_dir(data, &rec.id);
-            crate::create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
-            if let Some((_, _, gid, _)) =
-                crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
-            {
-                crate::sandbox::share_config_with_seat(&cfg, gid);
-            }
-            if instructions.is_some() || clear {
-                println!(
-                    "updated\t{}\t{}",
-                    rec.name,
-                    rec.instructions.as_deref().unwrap_or("-")
-                );
-            } else if let Ok(prompt) = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")) {
-                print!("{prompt}");
+            describe_cmd(data, Some(name), instructions, clear)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn describe_cmd(
+    data: &Path,
+    agent_or_text: Option<String>,
+    description: Option<String>,
+    clear: bool,
+) -> Result<(), Error> {
+    let caller_id = client::agent_identity().map(|id| id.to_string());
+    let (target_name, new_desc) = match (agent_or_text, description) {
+        (Some(a), Some(d)) => (a, Some(d)),
+        (Some(a), None) => {
+            if caller_id.is_some() && (a.contains(' ') || a.len() > 28) && !clear {
+                ("self".to_string(), Some(a))
+            } else {
+                (a, None)
             }
         }
+        (None, Some(d)) => (caller_id.unwrap_or_else(|| "self".to_string()), Some(d)),
+        (None, None) => (caller_id.unwrap_or_else(|| "all".to_string()), None),
+    };
+    if client::can_call_server(data) {
+        if target_name.eq_ignore_ascii_case("all") && new_desc.is_none() && !clear {
+            let listed = client::call::<AgentsResponse>(
+                data,
+                "GET",
+                "/v1/agents",
+                None,
+                &client::authority(data),
+            )
+            .map_err(Error::Message)?;
+            if let Some(listed) = listed {
+                for a in listed.agents {
+                    if a.state == "archived" && a.parent.is_some() {
+                        continue;
+                    }
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        a.name,
+                        a.harness,
+                        a.state,
+                        a.description.as_deref().unwrap_or("-")
+                    );
+                }
+                return Ok(());
+            }
+        }
+        if new_desc.is_some() || clear {
+            let body = serde_json::json!({
+                "description": new_desc,
+                "clear": clear,
+            });
+            let answered = client::call::<serde_json::Value>(
+                data,
+                "POST",
+                &format!("/v1/agents/{target_name}/description"),
+                Some(body.to_string().into_bytes()),
+                &client::authority(data),
+            )
+            .map_err(Error::Message)?;
+            if let Some(val) = answered {
+                let n = val.get("name").and_then(|v| v.as_str()).unwrap_or(&target_name);
+                let d = val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!("updated\t{n}\t{d}");
+                return Ok(());
+            }
+        } else {
+            let answered = client::call::<serde_json::Value>(
+                data,
+                "GET",
+                &format!("/v1/agents/{target_name}/description"),
+                None,
+                &client::authority(data),
+            )
+            .map_err(Error::Message)?;
+            if let Some(val) = answered {
+                let n = val.get("name").and_then(|v| v.as_str()).unwrap_or(&target_name);
+                let d = val
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("-");
+                println!("{n}\t{d}");
+                return Ok(());
+            }
+        }
+    }
+    let store = Store::open(data.join("state.db"))?;
+    if target_name == "all" {
+        crate::create::sync_all_agent_instructions(&store, data);
+        println!("synced\tall");
+        return Ok(());
+    }
+    let mut rec = store.agent_by_name(&target_name)?;
+    if clear {
+        rec = store.set_agent_instructions(&rec.id, None)?;
+    } else if let Some(ref text) = new_desc {
+        rec = store.set_agent_instructions(&rec.id, Some(text))?;
+    }
+    let parent_name = rec
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok())
+        .map(|p| p.name);
+    let cfg = anyagents_core::agent_config_dir(data, &rec.id);
+    crate::create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
+    if let Some((_, _, gid, _)) =
+        crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
+    {
+        crate::sandbox::share_config_with_seat(&cfg, gid);
+    }
+    if new_desc.is_some() || clear {
+        println!(
+            "updated\t{}\t{}",
+            rec.name,
+            rec.instructions.as_deref().unwrap_or("-")
+        );
+    } else {
+        println!(
+            "{}\t{}",
+            rec.name,
+            rec.instructions.as_deref().unwrap_or("-")
+        );
     }
     Ok(())
 }
@@ -277,6 +372,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         quota_reset_at_ms: None,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
+        description: agent.instructions,
     })
 }
 
@@ -303,29 +399,31 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let parsed: crate::api::CreateAgentRequest =
         serde_json::from_value(body).map_err(|err| err.to_string())?;
     let store = open_with_key(data).map_err(|err| err.to_string())?;
-    let parent_id = match parsed.parent.as_deref() {
+    let parent_agent = match parsed.parent.as_deref() {
         Some("root" | "") => None,
         Some(parent_ref) => Some(
             store
                 .agent_by_name(parent_ref)
-                .map_err(|err| err.to_string())?
-                .id,
+                .map_err(|err| err.to_string())?,
         ),
         None => None,
     };
-    let harness = if parsed.harness.trim().is_empty() {
-        "claude-code".to_string()
-    } else {
-        parsed.harness
-    };
+    let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
+    let (harness, model, profile) = crate::create::resolve_subagent_defaults(
+        data,
+        parent_agent.as_ref(),
+        &parsed.harness,
+        parsed.model,
+        parsed.profile,
+    );
     let agent = crate::create::create(
         &store,
         data,
         crate::create::CreateRequest {
             name: parsed.name,
             harness,
-            model: parsed.model,
-            profile: parsed.profile,
+            model,
+            profile,
             workdir: parsed.workdir.map(std::path::PathBuf::from),
             workdir_default: server::owner_workdir(),
             instructions: parsed.instructions,
@@ -363,6 +461,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         quota_reset_at_ms: None,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
+        description: agent.instructions,
     })
 }
 
@@ -558,6 +657,7 @@ fn list_filtered(
                 quota_reset_at_ms: None,
                 oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
                 install: "-".to_string(),
+                description: agent.instructions,
             });
             continue;
         }
@@ -652,7 +752,7 @@ pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
                 harness: found.harness,
                 model: found.model,
                 workdir: found.workdir,
-                instructions: None,
+                instructions: found.description,
                 state: found.state,
                 created_at_ms: 0,
                 launch_env: Vec::new(),

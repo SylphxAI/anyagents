@@ -70,6 +70,20 @@ pub fn write(
             }
         });
     }
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        if !root.get("tools").is_some_and(|v| v.is_object()) {
+            root["tools"] = serde_json::json!({});
+        }
+        root["tools"]["task"] = serde_json::Value::Bool(false);
+        if let Some(build) = root.get_mut("agent").and_then(|a| a.get_mut("build"))
+            && build.is_object()
+        {
+            if !build.get("tools").is_some_and(|v| v.is_object()) {
+                build["tools"] = serde_json::json!({});
+            }
+            build["tools"]["task"] = serde_json::Value::Bool(false);
+        }
+    }
     root["mcp"] = serde_json::json!({
         "anyagents": {
             "type": "local",

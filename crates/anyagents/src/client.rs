@@ -30,6 +30,11 @@ pub(crate) enum Authority {
 pub(crate) fn authority(data: &Path) -> Authority {
     // Inside an agent its own capability is the only authority it has; a
     // command run by the operator presents the operator's token.
+    if std::env::var_os("ANYAGENTS_OPERATOR_TOKEN_FILE").is_none()
+        && let Some(id) = agent_identity()
+    {
+        return Authority::Agent(id);
+    }
     if crate::operator::operator_token(data).is_some() {
         return Authority::Operator;
     }
