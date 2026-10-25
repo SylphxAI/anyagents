@@ -54,19 +54,29 @@ pub fn write_codex_with_model(
         Err(err) => return Err(err.into()),
     };
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
-        let normalized = raw_model
+        let stripped = raw_model
             .strip_prefix("sylphx/")
             .unwrap_or(raw_model)
             .strip_prefix("openai/")
-            .unwrap_or(raw_model)
-            .split('#')
-            .next()
             .unwrap_or(raw_model);
+        let (normalized, effort) = match stripped.split_once('#') {
+            Some((b, e)) if !b.trim().is_empty() && !e.trim().is_empty() => {
+                (b.trim(), Some(e.trim()))
+            }
+            _ => (stripped.split('#').next().unwrap_or(raw_model), None),
+        };
         existing = upsert_top_key(
             &existing,
             "model",
             &format!("\"{}\"", toml_escape(normalized)),
         );
+        if let Some(eff) = effort {
+            existing = upsert_top_key(
+                &existing,
+                "model_reasoning_effort",
+                &format!("\"{}\"", toml_escape(eff)),
+            );
+        }
     }
     if !existing.contains("approval_policy") {
         existing = upsert_top_key(&existing, "approval_policy", "\"never\"");
