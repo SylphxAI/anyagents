@@ -183,6 +183,11 @@ impl Harness for GrokHarness {
             if !self.rpc.alive() {
                 return Err(HarnessError::Dead);
             }
+            if let Some(reset_at_ms) = st.quota_reset_at_ms
+                && !st.finished.contains(&message.id)
+            {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
             if st.seen.contains(&message.id) {
                 return Ok(DeliverOutcome::Accepted {
                     turn_finished: st.finished.contains(&message.id),
@@ -320,9 +325,7 @@ pub fn write_grok_config(
         if t.starts_with('[') {
             in_mcp_anyagents = t == "[mcp_servers.anyagents]";
         }
-        if in_mcp_anyagents
-            || t.starts_with("follow_up_behavior")
-            || t.starts_with("default_model")
+        if in_mcp_anyagents || t.starts_with("follow_up_behavior") || t.starts_with("default_model")
         {
             continue;
         }

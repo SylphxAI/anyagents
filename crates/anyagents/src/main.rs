@@ -1516,7 +1516,7 @@ fn apply_local_subagent_default(
 
 fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
     let filter = filter.filter(|f| !f.trim().eq_ignore_ascii_case("list"));
-    let entries = if client::can_call_server(data) {
+    let mut entries = if client::can_call_server(data) {
         match client::call::<Vec<create::ProviderProfileEntry>>(
             data,
             "GET",
@@ -1540,12 +1540,14 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         let store = anyagents_core::Store::open(data.join("state.db"))?;
         create::sync_and_list_provider_profiles(&store, data)
     };
+    create::enrich_profiles_usage(data, &mut entries);
     if ui::is_pretty() {
         println!("\n  {}\n", ui::bold_cyan("Provider Profiles"));
         let mut table = ui::Table::new(&[
             ("PROVIDER", false),
             ("PROFILE", false),
             ("KIND", false),
+            ("USAGE / BALANCE", false),
             ("COMPATIBLE HARNESSES", false),
             ("AGENTS", false),
         ]);
@@ -1562,6 +1564,11 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
                 "coding-plan" => ui::cyan(&e.kind),
                 _ => ui::yellow(&e.kind),
             };
+            let usage_cell = match e.usage.as_deref() {
+                Some(u) if u.contains(": 0% left") || u.starts_with("0% left") => ui::red(u),
+                Some(u) => ui::green(u),
+                None => ui::dim("-"),
+            };
             let harnesses = ui::dim(&e.compatible_harnesses.join(", "));
             let agents = if e.assigned_agents.is_empty() {
                 ui::dim("-")
@@ -1572,6 +1579,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
                 ui::bold(&e.provider),
                 e.profile,
                 kind_badge,
+                usage_cell,
                 harnesses,
                 agents,
             ]);
@@ -1581,8 +1589,8 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         return Ok(());
     }
     println!(
-        "{:<20}\t{:<10}\t{:<13}\t{:<44}\tAGENTS",
-        "PROVIDER", "PROFILE", "KIND", "COMPATIBLE HARNESSES"
+        "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\tAGENTS",
+        "PROVIDER", "PROFILE", "KIND", "USAGE / BALANCE", "COMPATIBLE HARNESSES"
     );
     for e in entries {
         if let Some(f) = filter {
@@ -1591,6 +1599,7 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
                 continue;
             }
         }
+        let usage = e.usage.as_deref().unwrap_or("-");
         let harnesses = e.compatible_harnesses.join(",");
         let agents = if e.assigned_agents.is_empty() {
             "-".to_string()
@@ -1598,8 +1607,8 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             e.assigned_agents.join(",")
         };
         println!(
-            "{:<20}\t{:<10}\t{:<13}\t{:<44}\t{}",
-            e.provider, e.profile, e.kind, harnesses, agents
+            "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\t{}",
+            e.provider, e.profile, e.kind, usage, harnesses, agents
         );
     }
     Ok(())

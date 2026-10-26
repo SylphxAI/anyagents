@@ -379,3 +379,65 @@ fn a_pushed_line_is_injected_once_and_settled_on_its_echo() {
     assert_eq!(again.message.id, "m7");
     let _ = item;
 }
+
+#[test]
+fn claude_code_2_1_assistant_rate_limit_event_and_session_jsonl_detection() {
+    use anyagents_harness_claude::{detect_session_quota_reset_ms, quota_from_claude};
+    use serde_json::json;
+
+    let rejected = json!({
+        "type": "assistant",
+        "message": {
+            "model": "<synthetic>",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "You've hit your session limit · resets 3:10am (UTC)"}]
+        },
+        "apiError": "usage_limit_reached",
+        "apiErrorParams": {
+            "rate_limit_info": {
+                "status": "rejected",
+                "resetsAt": 1792984200_i64,
+                "rateLimitType": "five_hour"
+            }
+        },
+        "quotaLimits": {
+            "status": "rejected",
+            "resetsAt": 1792984200_i64,
+            "rateLimitType": "five_hour"
+        },
+        "error": "rate_limit",
+        "isApiErrorMessage": true,
+        "apiErrorStatus": 429
+    });
+    assert_eq!(quota_from_claude(&rejected), Some(1_792_984_200_000));
+
+    // A normal rate_limit_event with status="allowed" must NOT be treated as a quota rejection.
+    let allowed = json!({
+        "type": "rate_limit_event",
+        "rate_limit_info": {
+            "status": "allowed",
+            "resetsAt": 1792984200_i64,
+            "rateLimitType": "five_hour"
+        }
+    });
+    assert_eq!(quota_from_claude(&allowed), None);
+
+    let dir = TempDir::new().unwrap();
+    let proj_dir = dir.path().join("projects").join("-scratch-wt-owners-main");
+    std::fs::create_dir_all(&proj_dir).unwrap();
+    let jsonl = proj_dir.join("b66c1988-a2af-4bd3-adc5-d4f31d3e175f.jsonl");
+    std::fs::write(
+        dir.path().join("claude-session-id"),
+        "b66c1988-a2af-4bd3-adc5-d4f31d3e175f\n",
+    )
+    .unwrap();
+    std::fs::write(&jsonl, format!("{rejected}\n")).unwrap();
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_970_000_000),
+        Some(1_792_984_200_000)
+    );
+    assert_eq!(
+        detect_session_quota_reset_ms(dir.path(), 1_792_990_000_000),
+        None
+    );
+}

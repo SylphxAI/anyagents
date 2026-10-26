@@ -296,11 +296,27 @@ impl ClaudeHarness {
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
         {
+            let initial_quota = self
+                .environment
+                .iter()
+                .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
+                .map(|(_, v)| Path::new(v))
+                .and_then(|cfg_dir| {
+                    let now_ms = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .ok()
+                        .and_then(|d| i64::try_from(d.as_millis()).ok())
+                        .unwrap_or(0);
+                    detect_session_quota_reset_ms(cfg_dir, now_ms)
+                });
             let mut state = lock(&self.shared);
             state.child = Some(child);
             state.alive = true;
             state.open.clear();
             state.followups.clear();
+            if initial_quota.is_some() {
+                state.quota_reset_at_ms = initial_quota;
+            }
             if let Some(session_id) = session_id {
                 state.session_id = Some(session_id.to_string());
             }
@@ -362,6 +378,11 @@ impl Harness for ClaudeHarness {
             // succeeds has to carry it. The adapter remembers it failed, so the
             // host handing it over again always means a new attempt.
             let failed_before = state.failures.iter().any(|(item, _)| item == &message.id);
+            if let Some(reset_at_ms) = state.quota_reset_at_ms
+                && !state.finished.contains(&message.id)
+            {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
             if !failed_before
                 && (state.seen.contains(&message.id)
                     || state.open.contains(&message.id)
@@ -609,6 +630,12 @@ fn read_stdout(stdout: ChildStdout, shared: Arc<Mutex<State>>, wake: Arc<Condvar
             note_echo(&mut state, &value);
             if let Some(reset_at_ms) = quota_from_claude(&value) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
+                let rejected_ids = std::mem::take(&mut state.open);
+                for id in rejected_ids {
+                    state.seen.remove(&id);
+                    state.echoed.remove(&id);
+                    state.failures.push((id, "rate_limit".to_string()));
+                }
             }
             if value.get("type").and_then(Value::as_str) == Some("result") {
                 apply_result(&mut state, &value);
@@ -812,11 +839,88 @@ fn collect_markers(state: &mut State, value: &Value) {
     }
 }
 
-fn quota_from_claude(value: &Value) -> Option<i64> {
+pub fn quota_from_claude(value: &Value) -> Option<i64> {
     if !mentions_rate_limit(value) {
         return None;
     }
     find_named_reset(value).or_else(|| find_delay(value))
+}
+
+/// Inspects the tail of the latest Claude Code session JSONL under
+/// `<config_dir>/projects/*/*.jsonl` and returns `Some(reset_at_ms)` if the
+/// latest assistant/result turn ended with a rate-limit rejection whose reset
+/// time is still in the future (`> now_ms`).
+pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let projects_dir = config_dir.join("projects");
+    let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
+        return None;
+    };
+    let preferred_session = std::fs::read_to_string(config_dir.join("claude-session-id"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let mut best_path: Option<(std::time::SystemTime, PathBuf)> = None;
+    let mut preferred_path: Option<PathBuf> = None;
+    for proj in project_entries.flatten() {
+        let proj_path = proj.path();
+        if !proj_path.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(&proj_path) else {
+            continue;
+        };
+        for file_entry in files.flatten() {
+            let p = file_entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            if let Some(ref sid) = preferred_session
+                && p.file_stem().and_then(|s| s.to_str()) == Some(sid.as_str())
+            {
+                preferred_path = Some(p.clone());
+            }
+            if let Ok(meta) = file_entry.metadata()
+                && let Ok(mtime) = meta.modified()
+                && best_path.as_ref().is_none_or(|(prev_t, _)| mtime > *prev_t)
+            {
+                best_path = Some((mtime, p));
+            }
+        }
+    }
+    let target_jsonl = match (preferred_path, best_path) {
+        (_, Some((_, newest))) => newest,
+        (Some(pref), None) => pref,
+        (None, None) => return None,
+    };
+    let mut file = std::fs::File::open(target_jsonl).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail_len = len.min(32_768);
+    if len > tail_len {
+        let _ = file.seek(SeekFrom::End(-(tail_len as i64)));
+    }
+    let mut buf = Vec::with_capacity(tail_len as usize);
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if let Some(reset_at_ms) = quota_from_claude(&val) {
+            return (reset_at_ms > now_ms).then_some(reset_at_ms);
+        }
+        if val.get("type").and_then(Value::as_str) == Some("assistant")
+            && val.get("error").is_none()
+            && val.get("apiError").is_none()
+        {
+            return None;
+        }
+    }
+    None
 }
 
 fn mentions_rate_limit(value: &Value) -> bool {
@@ -825,9 +929,26 @@ fn mentions_rate_limit(value: &Value) -> bool {
             let category = map.get("category").and_then(Value::as_str);
             let type_ = map.get("type").and_then(Value::as_str);
             let subtype = map.get("subtype").and_then(Value::as_str);
+            let error = map.get("error").and_then(Value::as_str);
+            let api_error = map.get("apiError").and_then(Value::as_str);
+            let api_status = map.get("apiErrorStatus").and_then(Value::as_u64);
+            let quota_rejected = map
+                .get("quotaLimits")
+                .and_then(|q| q.get("status"))
+                .and_then(Value::as_str)
+                == Some("rejected")
+                || map
+                    .get("rate_limit_info")
+                    .and_then(|q| q.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("rejected");
             if category == Some("rate_limit")
                 || type_ == Some("rate_limit")
                 || subtype.is_some_and(|text| text.contains("rate_limit"))
+                || error == Some("rate_limit")
+                || api_error == Some("usage_limit_reached")
+                || api_status == Some(429)
+                || quota_rejected
             {
                 return true;
             }

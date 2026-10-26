@@ -208,6 +208,11 @@ impl Harness for DshHarness {
             if !st.alive {
                 return Err(HarnessError::Dead);
             }
+            if let Some(reset_at_ms) = st.quota_reset_at_ms
+                && !st.finished.contains(&message.id)
+            {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
             if st.seen.contains(&message.id) {
                 return Ok(DeliverOutcome::Accepted {
                     turn_finished: st.finished.contains(&message.id),

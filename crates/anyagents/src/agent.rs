@@ -513,13 +513,21 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
     let Ok(store) = open(data) else {
         return;
     };
+    let now = anyagents_core::now_ms();
     for view in views.iter_mut() {
         let Ok(id) = AgentId::parse(&view.id) else {
             continue;
         };
+        if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
+            let cfg = anyagents_core::agent_config_dir(data, &id);
+            view.quota_reset_at_ms =
+                anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now);
+        }
         if view.state == "running" && view.process == "alive" {
             let open_turn = store.has_open_turn(&id).unwrap_or(false);
-            if open_turn && view.quota_reset_at_ms.is_none() {
+            if view.quota_reset_at_ms.is_some_and(|ms| ms > now) {
+                view.turn_state = "idle".to_string();
+            } else if open_turn && view.quota_reset_at_ms.is_none() {
                 view.turn_state = "working".to_string();
             } else if view.turn_state.is_empty() {
                 view.turn_state = "idle".to_string();

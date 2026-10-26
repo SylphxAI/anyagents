@@ -1161,26 +1161,38 @@ fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> 
 }
 
 fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
-    let lag = store
-        .lag(&agent.id, now_ms())
-        .map_err(ApiError::from_store)?;
+    let now = now_ms();
+    let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
     let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
+    let session_quota = if agent.harness == "claude-code" {
+        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+        anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now)
+    } else {
+        None
+    };
     let (process, turn_state, mode, steer, quota) = match health.get(&agent.id) {
         Some(live) => {
+            let effective_quota = live.quota_reset_at_ms.or(session_quota);
             let working = live.process_alive
-                && live.quota_reset_at_ms.is_none()
+                && effective_quota.is_none()
                 && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn);
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
                 mode_name(live.delivery_mode),
                 steer_name(live.steer_support),
-                live.quota_reset_at_ms,
+                effective_quota,
             )
         }
         None => {
             let (mode, steer) = declared(&agent.harness);
-            ("down", "idle", mode_name(mode), steer_name(steer), None)
+            (
+                "down",
+                "idle",
+                mode_name(mode),
+                steer_name(steer),
+                session_quota,
+            )
         }
     };
     Ok(AgentView {

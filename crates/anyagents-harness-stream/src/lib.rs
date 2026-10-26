@@ -552,6 +552,11 @@ impl StreamHarness {
                     return Ok(DeliverOutcome::Deferred);
                 }
             } else {
+                if let Some(reset_at_ms) = state.quota_reset_at_ms
+                    && !state.finished.contains(&message.id)
+                {
+                    return Ok(DeliverOutcome::Quota { reset_at_ms });
+                }
                 if state.seen.contains(&message.id) {
                     return Ok(DeliverOutcome::Accepted {
                         turn_finished: state.finished.contains(&message.id),
@@ -1021,6 +1026,10 @@ fn read_stdout(
             }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
+                let rejected_ids = std::mem::take(&mut state.open);
+                for id in rejected_ids {
+                    state.seen.remove(&id);
+                }
             }
             if let Some(session_id) = effect.session_id
                 && !session_id.is_empty()
