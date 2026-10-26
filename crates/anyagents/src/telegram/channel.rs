@@ -254,12 +254,7 @@ fn poll_channel(
             .collect();
         let mut pruned_any = false;
         for gid in group_ids {
-            let key = ( gid, format!("self:{}", channel.id) );
-            let should_check = probed_chat_bots()
-                .lock()
-                .ok()
-                .is_some_and(|mut g| g.insert(key));
-            if should_check && !bot_tag.is_empty() && !probe_members(&token, gid, &bot_tag) {
+            if !bot_tag.is_empty() && !cached_probe_members(&token, gid, &bot_tag) {
                 memory.chats.retain(|l| l.chat_id != gid);
                 pruned_any = true;
             }
@@ -378,6 +373,15 @@ fn ingest_updates(
     body: &str,
     method: &str,
 ) -> Result<(), anyagents_core::Error> {
+    if let Ok(channels) = store.list_channels()
+        && let Some(fresh) = channels.into_iter().find(|c| c.id == channel.id)
+    {
+        let fresh_mem = Memory::from_state(&fresh.state);
+        memory.chats = fresh_mem.chats;
+        if fresh_mem.bot.is_some() {
+            memory.bot = fresh_mem.bot;
+        }
+    }
     let mut poll = Poll::resume(memory.offset);
     let before = poll.offset;
     let routed = poll.route("bot", agent_id.as_str(), body).map_err(|_| {
@@ -398,6 +402,11 @@ fn ingest_updates(
         // This bot answers in the chat its update came from, so a post it makes
         // there reaches the other agents on that chat.
         if let Routed::ToAgent { inbound, .. } = &mut one {
+            if inbound.text.starts_with("[Member removed/left group:")
+                || inbound.text.starts_with("[Member joined group:")
+            {
+                invalidate_membership_cache(inbound.chat_id);
+            }
             if inbound.text.starts_with("[Member removed/left group:") {
                 let lower_text = inbound.text.to_ascii_lowercase();
                 let removed_own_bot = own_bots.iter().any(|(bot_id, bot_user)| {
@@ -433,7 +442,11 @@ fn ingest_updates(
                     Some(&inbound.chat_type),
                     inbound.chat_title.as_deref(),
                 );
-            } else if probe_members(token, inbound.chat_id, memory.bot.as_deref().unwrap_or("")) {
+            } else if cached_probe_members(
+                token,
+                inbound.chat_id,
+                memory.bot.as_deref().unwrap_or(""),
+            ) {
                 memory.attach_typed_titled(
                     agent_id.as_str(),
                     inbound.chat_id,
@@ -443,7 +456,7 @@ fn ingest_updates(
             } else {
                 continue;
             }
-            if !known && is_group {
+            if is_group {
                 discover_peer_bots_in_chat(
                     store,
                     token,
@@ -483,6 +496,7 @@ fn ingest_updates(
             ..
         } = &one
         {
+            invalidate_membership_cache(*chat_id);
             if *joined {
                 memory.attach_typed(agent_id.as_str(), *chat_id, chat_type.as_deref());
                 let _ = store.receive(
@@ -739,15 +753,48 @@ fn download_inbound_media(
     notes
 }
 
-fn probed_chat_bots() -> &'static std::sync::Mutex<std::collections::HashSet<(i64, String)>> {
-    static PROBED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(i64, String)>>> =
-        std::sync::OnceLock::new();
-    PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+const MEMBERSHIP_CACHE_TTL: Duration = Duration::from_secs(120);
+
+#[allow(clippy::type_complexity)]
+fn live_membership_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<(i64, String), (bool, std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(i64, String), (bool, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Passively check whether any other configured Telegram bot is also a member
-/// of `chat_id`, and attach it so internal group relay reaches all member bots
-/// even before they receive a direct mention.
+fn invalidate_membership_cache(chat_id: i64) {
+    if let Ok(mut guard) = live_membership_cache().lock() {
+        guard.retain(|(cid, _), _| *cid != chat_id);
+    }
+}
+
+fn cached_probe_members(token: &str, chat_id: i64, bot: &str) -> bool {
+    if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some() {
+        return probe_members(token, chat_id, bot);
+    }
+    let Some(bot_id) = bot.split(':').next().map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let key = (chat_id, bot_id.to_string());
+    if let Ok(guard) = live_membership_cache().lock()
+        && let Some((is_in, checked_at)) = guard.get(&key)
+        && checked_at.elapsed() < MEMBERSHIP_CACHE_TTL
+    {
+        return *is_in;
+    }
+    let is_in = probe_members(token, chat_id, bot);
+    if let Ok(mut guard) = live_membership_cache().lock() {
+        guard.insert(key, (is_in, std::time::Instant::now()));
+    }
+    is_in
+}
+
+/// Reconcile configured Telegram bots' membership in `chat_id` against
+/// Telegram's authoritative `getChatMember` (backed by the event-invalidated
+/// read-through TTL cache): attach bots that are present and prune bots that
+/// have been removed or left.
 fn discover_peer_bots_in_chat(
     store: &Store,
     token: &str,
@@ -755,6 +802,7 @@ fn discover_peer_bots_in_chat(
     chat_id: i64,
     chat_type: &str,
 ) {
+    let is_live = std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
     let Ok(channels) = store.list_channels() else {
         return;
     };
@@ -766,21 +814,20 @@ fn discover_peer_bots_in_chat(
             continue;
         };
         let mut other_mem = Memory::from_state(&other.state);
-        if other_mem.chats.iter().any(|l| l.chat_id == chat_id) {
+        let already_attached = other_mem.chats.iter().any(|l| l.chat_id == chat_id);
+        if !is_live && already_attached {
             continue;
         }
-        if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none() {
-            let key = (chat_id, other.id.to_string());
-            if let Ok(mut guard) = probed_chat_bots().lock()
-                && !guard.insert(key)
-            {
-                continue;
+        let Some(bot) = other_mem.bot.as_deref().map(str::to_string) else {
+            continue;
+        };
+        if cached_probe_members(token, chat_id, &bot) {
+            if !already_attached {
+                other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
+                let _ = store.set_channel_state(&other.id, &other_mem.to_state());
             }
-        }
-        if let Some(bot) = other_mem.bot.as_deref()
-            && probe_members(token, chat_id, bot)
-        {
-            other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
+        } else if is_live && already_attached {
+            other_mem.chats.retain(|l| l.chat_id != chat_id);
             let _ = store.set_channel_state(&other.id, &other_mem.to_state());
         }
     }
