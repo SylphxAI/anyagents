@@ -523,6 +523,12 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             view.quota_reset_at_ms =
                 anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now);
         }
+        if view.quota_reset_at_ms.is_some_and(|ms| ms > now)
+            && let Ok(agent_rec) = store.agent(&id)
+            && crate::create::try_rotate_exhausted_profile(&store, data, &agent_rec, true).is_some()
+        {
+            view.quota_reset_at_ms = None;
+        }
         if view.state == "running" && view.process == "alive" {
             let open_turn = store.has_open_turn(&id).unwrap_or(false);
             if view.quota_reset_at_ms.is_some_and(|ms| ms > now) {

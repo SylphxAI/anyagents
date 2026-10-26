@@ -852,6 +852,10 @@ pub fn quota_from_claude(value: &Value) -> Option<i64> {
 /// time is still in the future (`> now_ms`).
 pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i64> {
     use std::io::{Read, Seek, SeekFrom};
+    let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
     let projects_dir = config_dir.join("projects");
     let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
         return None;
@@ -894,7 +898,15 @@ pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i
         (None, None) => return None,
     };
     let mut file = std::fs::File::open(target_jsonl).ok()?;
-    let len = file.metadata().ok()?.len();
+    let meta = file.metadata().ok()?;
+    if rotated_ms > 0
+        && let Ok(mtime) = meta.modified()
+        && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
+        && (dur.as_millis() as i64) <= rotated_ms
+    {
+        return None;
+    }
+    let len = meta.len();
     let tail_len = len.min(32_768);
     if len > tail_len {
         let _ = file.seek(SeekFrom::End(-(tail_len as i64)));

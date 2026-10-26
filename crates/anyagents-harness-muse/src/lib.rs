@@ -259,6 +259,11 @@ impl Harness for MuseHarness {
             if !self.rpc.alive() {
                 return Err(HarnessError::Dead);
             }
+            if let Some(reset_at_ms) = state.quota_reset_at_ms
+                && !state.finished.contains(&message.id)
+            {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
             if state.seen.contains(&message.id) {
                 return Ok(DeliverOutcome::Accepted {
                     turn_finished: state.finished.contains(&message.id),
@@ -502,7 +507,8 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
 }
 
 fn finish_turn(state: &mut State, params: &Value) {
-    if let Some(reset_at_ms) = quota_of(params).or_else(|| quota_in_text(params)) {
+    let hit_quota = quota_of(params).or_else(|| quota_in_text(params));
+    if let Some(reset_at_ms) = hit_quota {
         state.quota_reset_at_ms = Some(reset_at_ms);
     }
     let usage = params
@@ -510,30 +516,19 @@ fn finish_turn(state: &mut State, params: &Value) {
         .map(usage_of)
         .or_else(|| state.last_usage.clone())
         .unwrap_or_default();
-    // The vendor's own error, kept so a reader of the session can see why the
-    // turn failed. Delivery does not depend on it.
-    let _failed = params
-        .get("error")
-        .filter(|error| !error.is_null())
-        .map(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("turn failed")
-                .to_string()
-        })
-        .or_else(|| {
-            params
-                .get("status")
-                .and_then(Value::as_str)
-                .filter(|status| *status == "failed" || *status == "error")
-                .map(|_| "turn failed".to_string())
-        });
     let carried: Vec<String> = if state.open.is_empty() {
         std::mem::take(&mut state.taken)
     } else {
         std::mem::take(&mut state.open)
     };
+    if hit_quota.is_some() {
+        for id in carried {
+            state.seen.remove(&id);
+            state.written.retain(|w| w != &id);
+        }
+        state.turn = None;
+        return;
+    }
     for id in carried {
         state.finished.insert(id.clone());
         state.usages.push((id, usage.clone()));

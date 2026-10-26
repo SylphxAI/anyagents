@@ -477,6 +477,11 @@ impl Harness for CodexHarness {
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
+            if let Some(reset_at_ms) = state.quota_reset_at_ms
+                && !state.finished.contains(&message.id)
+            {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
             if state.seen.contains(&message.id) {
                 return Ok(DeliverOutcome::Accepted {
                     turn_finished: state.finished.contains(&message.id),
@@ -815,6 +820,12 @@ fn on_notification(state: &mut State, method: &str, params: &Value) {
         "account/rateLimits/updated" => {
             if let Some(reset_at_ms) = quota_from_limits(params) {
                 state.quota_reset_at_ms = Some(reset_at_ms);
+                let rejected = std::mem::take(&mut state.open);
+                for id in rejected {
+                    state.seen.remove(&id);
+                    state.written.retain(|w| w != &id);
+                }
+                state.turn_id = None;
             }
         }
         _ => {}

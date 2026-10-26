@@ -859,6 +859,9 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn quota_waiting(&mut self) -> bool {
+        if !self.process_alive() {
+            return false;
+        }
         let reset_at = self
             .delivery
             .as_ref()

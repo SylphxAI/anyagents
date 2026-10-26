@@ -1516,7 +1516,9 @@ fn apply_local_subagent_default(
 
 fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
     let filter = filter.filter(|f| !f.trim().eq_ignore_ascii_case("list"));
-    let mut entries = if client::can_call_server(data) {
+    let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+        create::sync_and_list_provider_profiles(&store, data)
+    } else if client::can_call_server(data) {
         match client::call::<Vec<create::ProviderProfileEntry>>(
             data,
             "GET",
@@ -1529,10 +1531,6 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
                 return Err(anyagents_core::Error::Message(
                     "the server answered nothing".into(),
                 ));
-            }
-            Err(err) if err.contains("404") => {
-                let store = anyagents_core::Store::open(data.join("state.db"))?;
-                create::sync_and_list_provider_profiles(&store, data)
             }
             Err(err) => return Err(anyagents_core::Error::Message(err)),
         }

@@ -64,7 +64,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                 upstream_provider_of(&agent.harness, agent.model.as_deref())
             )
         };
-        let _ = std::fs::write(config.join(".anyagents-profile"), format!("{normalized}\n"));
+        write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"));
     }
     seed_harness_credentials(store, &data, &agent, &config);
     ensure_seat_environment(&config);
@@ -447,6 +447,73 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
     }
 }
 
+pub(crate) fn chmod_seat_file_readable(path: &Path) {
+    #[cfg(unix)]
+    if !crate::sandbox::is_isolated_test_env()
+        && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+        && let Ok(meta) = std::fs::metadata(path)
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let uid = meta.uid();
+        let gid = meta.gid();
+        if uid != 0
+            && let (Some(parent), Some(fname)) = (path.parent(), path.file_name())
+        {
+            let uid_s = uid.to_string();
+            let gid_s = gid.to_string();
+            let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+                .current_dir(parent)
+                .args([
+                    "--reuid",
+                    &uid_s,
+                    "--regid",
+                    &gid_s,
+                    "--groups",
+                    &gid_s,
+                    "--no-new-privs",
+                    "--",
+                    "/bin/chmod",
+                    "0664",
+                ])
+                .arg(fname)
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+pub(crate) fn write_seat_shared_file(dst: &Path, bytes: &[u8], mode: u32) -> bool {
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::write(dst, bytes).is_err() {
+        chmod_seat_file_readable(dst);
+        if std::fs::write(dst, bytes).is_err() {
+            let _ = std::fs::remove_file(dst);
+            if std::fs::write(dst, bytes).is_err() {
+                return false;
+            }
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(mode));
+    }
+    true
+}
+
+pub(crate) fn write_profile_marker(config_dir: &Path, marker_file: &str, content: &str) {
+    let _ = write_seat_shared_file(&config_dir.join(marker_file), content.as_bytes(), 0o664);
+}
+
+pub(crate) fn seeded_profile_name(config_dir: &Path) -> Option<String> {
+    std::fs::read_to_string(config_dir.join(".anyagents-seeded-profile"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 pub(crate) fn seed_harness_credentials(
     store: &Store,
     data: &Path,
@@ -511,11 +578,16 @@ pub(crate) fn seed_harness_credentials(
     };
     let mut rel_paths: Vec<String> = static_rel_paths.iter().map(|s| (*s).to_string()).collect();
 
-    let explicit_non_default_profile = bound_profile_name(target_config).is_some_and(|b| {
+    let profile_roots = select_or_bind_profile(data, &all_agents, agent, target_config);
+    let current_bound = bound_profile_name(target_config);
+    let last_seeded = seeded_profile_name(target_config);
+    let explicit_non_default_profile = current_bound.as_ref().is_some_and(|b| {
         let prof = b.split_once('/').map(|(_, p)| p).unwrap_or(b.as_str());
         !prof.is_empty() && prof != "default"
     });
-    let profile_roots = select_or_bind_profile(data, &all_agents, agent, target_config);
+    let profile_changed = current_bound.is_some()
+        && (current_bound != last_seeded || (last_seeded.is_none() && explicit_non_default_profile));
+
     for profile_root in &profile_roots {
         for candidate in [
             ".config/opencode/opencode.json",
@@ -533,41 +605,51 @@ pub(crate) fn seed_harness_credentials(
     }
     for rel in &rel_paths {
         let dst = target_config.join(rel);
-        let is_auth_cred = matches!(
-            rel.as_str(),
-            ".gemini/antigravity-cli/antigravity-oauth-token"
-                | ".gemini/antigravity-cli/antigravity_state.pbtxt"
-                | ".gemini/antigravity-cli/jetski_state.pbtxt"
-                | ".credentials.json"
-                | ".claude/.credentials.json"
-                | "auth.json"
-                | ".codex/auth.json"
-                | "muse/auth.json"
-                | ".config/muse/auth.json"
-                | ".grok/auth.json"
-                | ".dsh/.credentials.yaml"
-        );
+        let is_auth_cred = rel.ends_with(".key")
+            || matches!(
+                rel.as_str(),
+                ".gemini/antigravity-cli/antigravity-oauth-token"
+                    | ".gemini/antigravity-cli/antigravity_state.pbtxt"
+                    | ".gemini/antigravity-cli/jetski_state.pbtxt"
+                    | ".credentials.json"
+                    | ".claude/.credentials.json"
+                    | "auth.json"
+                    | ".codex/auth.json"
+                    | "muse/auth.json"
+                    | ".config/muse/auth.json"
+                    | ".grok/auth.json"
+                    | ".dsh/.credentials.yaml"
+                    | ".omp/agent/agent.db"
+                    | "agent.db"
+            );
         let dst_non_empty = dst.metadata().is_ok_and(|m| m.len() > 0);
-        if dst_non_empty && !(explicit_non_default_profile && is_auth_cred && !dst.is_file()) {
+        if dst_non_empty && !(profile_changed && is_auth_cred) {
             continue;
         }
         for profile_root in &profile_roots {
             let src = profile_root.join(rel);
             if src.is_file() {
-                if dst.is_file()
-                    && let (Ok(a), Ok(b)) = (std::fs::read(&src), std::fs::read(&dst))
-                    && a == b
-                {
-                    break;
+                let Ok(src_bytes) = std::fs::read(&src) else {
+                    continue;
+                };
+                if dst.is_file() {
+                    if std::fs::read(&dst).is_err() {
+                        chmod_seat_file_readable(&dst);
+                    }
+                    if let Ok(dst_bytes) = std::fs::read(&dst)
+                        && src_bytes == dst_bytes
+                    {
+                        break;
+                    }
                 }
-                if let Some(parent_dir) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent_dir);
-                }
-                if std::fs::copy(&src, &dst).is_ok() {
+                if write_seat_shared_file(&dst, &src_bytes, 0o660) {
                     break;
                 }
             }
         }
+    }
+    if let Some(ref bound) = current_bound {
+        write_profile_marker(target_config, ".anyagents-seeded-profile", &format!("{bound}\n"));
     }
 }
 
@@ -617,17 +699,23 @@ pub(crate) fn bind_profile(
             if kind.is_dir() {
                 copy_files(&entry.path(), &target)?;
             } else if kind.is_file() && entry.file_name() != "profile.json" {
-                std::fs::copy(entry.path(), &target)?;
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    let _ = write_seat_shared_file(&target, &bytes, 0o660);
+                }
             }
         }
         Ok(())
     }
     copy_files(&source, &config)
         .map_err(|_| Error::Message("could not bind provider profile".into()))?;
-    std::fs::write(
-        config.join(".anyagents-profile"),
-        format!("{provider}/{name}\n"),
-    )?;
+    let normalized = format!("{provider}/{name}\n");
+    write_profile_marker(&config, ".anyagents-profile", &normalized);
+    write_profile_marker(&config, ".anyagents-seeded-profile", &normalized);
+    write_profile_marker(
+        &config,
+        ".anyagents-profile-rotated-ms",
+        &format!("{}\n", anyagents_core::now_ms()),
+    );
     store.set_agent_model(&agent.id, model)?;
     if agent.harness == "opencode" {
         let command = std::env::current_exe()?;
@@ -688,26 +776,41 @@ pub(crate) fn set_provider_profile(
     let dir = data.join("profiles").join(provider).join(profile);
     ensure_provider_profile_meta(&dir, provider, None);
     let default_dir = data.join("profiles").join(provider).join("default");
-    if default_dir != dir
-        && default_dir.join("opencode.json").is_file()
-        && !dir.join("opencode.json").exists()
-    {
-        let _ = std::fs::copy(default_dir.join("opencode.json"), dir.join("opencode.json"));
+    if default_dir != dir {
+        for rel in [".config/opencode/opencode.json", "opencode.json"] {
+            if default_dir.join(rel).is_file() && !dir.join(rel).exists() {
+                if let Some(p) = dir.join(rel).parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let _ = std::fs::copy(default_dir.join(rel), dir.join(rel));
+            }
+        }
     }
-    let key_filename = match provider {
-        "kimi-code-plan" => "kimi.key",
-        "qwen-token-plan" => "qwen.key",
-        "glm-code-plan" => "glm.key",
-        "minimax-code-plan" => "minimax.key",
-        "sylphx" => "sylphx.key",
-        "openrouter" => "openrouter.key",
+    let key_filenames: &[&str] = match provider {
+        "kimi-code-plan" => &["kimi-code-plan.key", "kimi.key"],
+        "qwen-token-plan" => &["qwen-coding-plan.key", "qwen.key"],
+        "glm-code-plan" => &["glm-code-plan.key", "glm.key"],
+        "minimax-code-plan" => &["minimax-code-plan.key", "minimax.key"],
+        "sylphx" => &["sylphx.key"],
+        "openrouter" => &["openrouter.key"],
+        "deepseek" => &["deepseek.key"],
+        "google-gemini" => &["gemini.key"],
         other => {
             let prefix = other.split('-').next().unwrap_or(other);
-            return write_profile_key_file(&dir, &format!("{prefix}.key"), trimmed)
-                .map(|()| (provider.to_string(), profile.to_string()));
+            let fname = format!("{prefix}.key");
+            write_profile_key_file(&dir, &fname, trimmed)?;
+            let rel = format!(".config/opencode/{fname}");
+            propagate_profile_files_to_bound_agents(data, provider, profile, &[rel.as_str()]);
+            return Ok((provider.to_string(), profile.to_string()));
         }
     };
-    write_profile_key_file(&dir, key_filename, trimmed)?;
+    let mut rels = Vec::new();
+    for fname in key_filenames {
+        write_profile_key_file(&dir, fname, trimmed)?;
+        rels.push(format!(".config/opencode/{fname}"));
+    }
+    let rel_refs: Vec<&str> = rels.iter().map(String::as_str).collect();
+    propagate_profile_files_to_bound_agents(data, provider, profile, &rel_refs);
     Ok((provider.to_string(), profile.to_string()))
 }
 
@@ -722,6 +825,38 @@ fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), E
         let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
     }
     Ok(())
+}
+
+pub(crate) fn propagate_profile_files_to_bound_agents(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    rel_paths: &[&str],
+) {
+    let prof_dir = data.join("profiles").join(provider).join(profile);
+    let target_tag = format!("{provider}/{profile}");
+    let Ok(agents_dir) = std::fs::read_dir(data.join("agents")) else {
+        return;
+    };
+    for entry in agents_dir.flatten() {
+        let cfg = entry.path().join("config");
+        if !cfg.is_dir() {
+            continue;
+        }
+        let Some(bound) = bound_profile_name(&cfg) else {
+            continue;
+        };
+        if bound != target_tag {
+            continue;
+        }
+        for rel in rel_paths {
+            let src = prof_dir.join(rel);
+            if let Ok(bytes) = std::fs::read(&src) {
+                let _ = write_seat_shared_file(&cfg.join(rel), &bytes, 0o660);
+            }
+        }
+        write_profile_marker(&cfg, ".anyagents-seeded-profile", &format!("{target_tag}\n"));
+    }
 }
 
 /// Resolves the upstream provider an agent draws its credential profile from.
@@ -807,6 +942,12 @@ fn copy_host_file(src: &Path, dst: &Path) -> bool {
     std::fs::copy(src, dst).is_ok()
 }
 
+fn json_oauth_expires_at(bytes: &[u8]) -> Option<i64> {
+    let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    val.pointer("/claudeAiOauth/expiresAt")
+        .and_then(serde_json::Value::as_i64)
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     let Ok(src_meta) = std::fs::metadata(src) else {
         return false;
@@ -814,48 +955,42 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     if !src_meta.is_file() || src_meta.len() == 0 {
         return false;
     }
-    let should_copy = match std::fs::metadata(dst) {
-        Ok(dst_meta) => src_meta.modified().ok() > dst_meta.modified().ok(),
-        Err(_) => true,
+    if std::fs::read(src).is_err() {
+        chmod_seat_file_readable(src);
+    }
+    let Ok(src_bytes) = std::fs::read(src) else {
+        return false;
     };
-    if !should_copy {
-        return true;
+    if src_bytes.is_empty() {
+        return false;
+    }
+    if let Ok(dst_meta) = std::fs::metadata(dst)
+        && dst_meta.is_file()
+        && dst_meta.len() > 0
+    {
+        if let Ok(dst_bytes) = std::fs::read(dst) {
+            if src_bytes == dst_bytes {
+                return true;
+            }
+            if let (Some(src_exp), Some(dst_exp)) = (
+                json_oauth_expires_at(&src_bytes),
+                json_oauth_expires_at(&dst_bytes),
+            ) {
+                if src_exp <= dst_exp {
+                    return true;
+                }
+            } else if src_meta.modified().ok() <= dst_meta.modified().ok() {
+                return true;
+            }
+        } else if src_meta.modified().ok() <= dst_meta.modified().ok() {
+            return true;
+        }
     }
     if let Some(p) = dst.parent() {
         let _ = std::fs::create_dir_all(p);
     }
-    if std::fs::copy(src, dst).is_err() {
-        #[cfg(unix)]
-        if !crate::sandbox::is_isolated_test_env()
-            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let uid = src_meta.uid();
-            let gid = src_meta.gid();
-            if uid != 0 {
-                let uid_s = uid.to_string();
-                let gid_s = gid.to_string();
-                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
-                    .args([
-                        "--reuid",
-                        &uid_s,
-                        "--regid",
-                        &gid_s,
-                        "--groups",
-                        &gid_s,
-                        "--no-new-privs",
-                        "--",
-                        "/bin/chmod",
-                        "0664",
-                    ])
-                    .arg(src)
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        }
-        if std::fs::copy(src, dst).is_err() {
-            return false;
-        }
+    if std::fs::write(dst, &src_bytes).is_err() {
+        return false;
     }
     #[cfg(unix)]
     {
@@ -903,6 +1038,7 @@ pub(crate) fn sync_and_list_provider_profiles(
         "omp",
         "dsh",
         "grok",
+        "opengateway",
     ] {
         let legacy_dir = profiles_root.join(legacy_harness);
         if legacy_dir.is_dir() && !legacy_dir.join("default").join("profile.json").exists() {
@@ -915,7 +1051,12 @@ pub(crate) fn sync_and_list_provider_profiles(
     for agent in &agents {
         let cfg = agent_config_dir(data, &agent.id);
         let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-        let prof_name = bound_profile_name(&cfg)
+        let bound = bound_profile_name(&cfg);
+        let seeded = seeded_profile_name(&cfg);
+        if seeded.is_some() && bound.is_some() && seeded != bound {
+            continue;
+        }
+        let prof_name = bound
             .and_then(|b| {
                 let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
                 (!p.is_empty()).then_some(p)
@@ -1059,7 +1200,12 @@ pub(crate) fn sync_and_list_provider_profiles(
         }
     }
 
-    // Bind active agents to their resolved `<provider>/<profile>`.
+    entries.sort_by(|a, b| (&a.provider, &a.profile).cmp(&(&b.provider, &b.profile)));
+    enrich_profiles_usage(data, &mut entries);
+
+    // Bind active agents to their resolved `<provider>/<profile>`, and auto-failover
+    // any agent bound to an exhausted (`0% left`) profile when another profile under
+    // the same upstream provider has healthy quota (`>= 20% left`).
     for agent in &agents {
         if agent.state == "archived" {
             continue;
@@ -1067,7 +1213,7 @@ pub(crate) fn sync_and_list_provider_profiles(
         let cfg = agent_config_dir(data, &agent.id);
         let expected_provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
         let bound = bound_profile_name(&cfg);
-        let (bound_prov, bound_prof) = match bound.as_deref() {
+        let (bound_prov, mut bound_prof) = match bound.as_deref() {
             Some(s) if s.contains('/') => {
                 let (p, n) = s.split_once('/').unwrap_or((&expected_provider, "default"));
                 (p.to_string(), n.to_string())
@@ -1075,9 +1221,32 @@ pub(crate) fn sync_and_list_provider_profiles(
             Some(s) if !s.is_empty() => (expected_provider.clone(), s.to_string()),
             _ => (expected_provider.clone(), "default".to_string()),
         };
+        let cur_pct = entries
+            .iter()
+            .find(|e| e.provider == bound_prov && e.profile == bound_prof)
+            .and_then(|e| e.usage.as_deref())
+            .and_then(|u| parse_remaining_pct_from_usage(u, agent.model.as_deref()));
+        if cur_pct == Some(0) {
+            if let Some(best_alt) = entries
+                .iter()
+                .filter(|e| e.provider == bound_prov && e.profile != bound_prof)
+                .filter_map(|e| {
+                    let pct = parse_remaining_pct_from_usage(
+                        e.usage.as_deref()?,
+                        agent.model.as_deref(),
+                    )?;
+                    (pct >= 20).then_some((e.profile.clone(), e.assigned_agents.len(), pct))
+                })
+                .min_by_key(|(_, assigned, pct)| (*assigned, std::cmp::Reverse(*pct)))
+                .map(|(prof, _, _)| prof)
+            {
+                rotate_agent_to_profile(store, data, agent, &bound_prov, &best_alt);
+                bound_prof = best_alt;
+            }
+        }
         let normalized = format!("{bound_prov}/{bound_prof}");
         if bound.as_deref() != Some(normalized.as_str()) {
-            let _ = std::fs::write(cfg.join(".anyagents-profile"), format!("{normalized}\n"));
+            write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"));
         }
         if let Some(entry) = entries
             .iter_mut()
@@ -1092,8 +1261,6 @@ pub(crate) fn sync_and_list_provider_profiles(
     for entry in &mut entries {
         entry.assigned_agents.sort();
     }
-    entries.sort_by(|a, b| (&a.provider, &a.profile).cmp(&(&b.provider, &b.profile)));
-    enrich_profiles_usage(data, &mut entries);
     entries
 }
 
@@ -1110,8 +1277,13 @@ pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileE
     {
         for agent in &agents {
             let cfg = agent_config_dir(data, &agent.id);
+            let bound = bound_profile_name(&cfg);
+            let seeded = seeded_profile_name(&cfg);
+            if seeded.is_some() && bound.is_some() && seeded != bound {
+                continue;
+            }
             let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-            let prof_name = bound_profile_name(&cfg)
+            let prof_name = bound
                 .and_then(|b| {
                     let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
                     (!p.is_empty()).then_some(p)
@@ -1181,7 +1353,120 @@ fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
     None
 }
 
-fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option<String> {
+fn extract_agy_oauth_client() -> Option<(String, String)> {
+    let agy_bin = ["/home/kyle/.local/bin/agy", "/usr/local/bin/agy"]
+        .into_iter()
+        .map(Path::new)
+        .find(|p| p.is_file())?;
+    let bytes = std::fs::read(agy_bin).ok()?;
+    let cid_needle = b"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
+    if !bytes.windows(cid_needle.len()).any(|w| w == cid_needle) {
+        return None;
+    }
+    let sec_prefix = b"GOCSPX-";
+    for idx in 0..bytes.len().saturating_sub(35) {
+        if &bytes[idx..idx + 7] == sec_prefix {
+            let candidate = &bytes[idx..idx + 35];
+            if candidate[7..]
+                .iter()
+                .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+            {
+                let secret = String::from_utf8(candidate.to_vec()).ok()?;
+                return Some((
+                    String::from_utf8(cid_needle.to_vec()).ok()?,
+                    secret,
+                ));
+            }
+        }
+    }
+    None
+}
+
+fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
+    let db_path = ["agent.db", ".omp/agent/agent.db"]
+        .into_iter()
+        .map(|r| prof_dir.join(r))
+        .find(|p| p.is_file())?;
+    let bytes = std::fs::read(db_path).ok()?;
+    for needle in [
+        &b"{\"access\":\"eyJ"[..],
+        &b"{\"type\":\"oauth\",\"refresh\":\""[..],
+    ] {
+        for idx in (0..bytes.len().saturating_sub(needle.len())).rev() {
+            if &bytes[idx..idx + needle.len()] == needle {
+                let slice = &bytes[idx..bytes.len().min(idx + 2048)];
+                let Some(end) = slice.iter().position(|b| *b == b'}') else {
+                    continue;
+                };
+                let Ok(json_str) = std::str::from_utf8(&slice[..=end]) else {
+                    continue;
+                };
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) else {
+                    continue;
+                };
+                let Some(access) = val
+                    .get("access")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| s.trim().to_string())
+                else {
+                    continue;
+                };
+                let refresh = val
+                    .get("refresh")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+                if access.starts_with("eyJ") {
+                    return Some((access, refresh));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn decode_b64url(input: &str) -> Option<Vec<u8>> {
+    let val_of = |b: u8| -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    };
+    let clean: Vec<u8> = input
+        .bytes()
+        .filter(|b| *b != b'=' && !b.is_ascii_whitespace())
+        .collect();
+    let mut out = Vec::with_capacity(clean.len() * 3 / 4);
+    for chunk in clean.chunks(4) {
+        let b0 = val_of(*chunk.first()?)?;
+        let b1 = val_of(*chunk.get(1)?)?;
+        out.push((b0 << 2) | (b1 >> 4));
+        if let Some(&c2) = chunk.get(2) {
+            let b2 = val_of(c2)?;
+            out.push((b1 << 4) | (b2 >> 2));
+            if let Some(&c3) = chunk.get(3) {
+                let b3 = val_of(c3)?;
+                out.push((b2 << 6) | b3);
+            }
+        }
+    }
+    Some(out)
+}
+
+fn extract_jwt_sub_tail(jwt: &str) -> Option<String> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let decoded = decode_b64url(payload_b64)?;
+    let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    let sub = val.get("sub")?.as_str()?;
+    Some(sub.split('|').next_back().unwrap_or(sub).to_string())
+}
+
+pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option<String> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let http = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(4)))
@@ -1274,6 +1559,12 @@ fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option
                                 prof_dir.join(".claude/.credentials.json"),
                                 &updated,
                             );
+                            propagate_profile_files_to_bound_agents(
+                                data,
+                                provider,
+                                profile,
+                                &[".credentials.json", ".claude/.credentials.json"],
+                            );
                         }
                     }
                     token = new_acc;
@@ -1304,8 +1595,12 @@ fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option
             let auth_text = std::fs::read_to_string(prof_dir.join("auth.json"))
                 .or_else(|_| std::fs::read_to_string(prof_dir.join(".codex/auth.json")))
                 .ok()?;
-            let auth: serde_json::Value = serde_json::from_str(&auth_text).ok()?;
-            let token = auth.pointer("/tokens/access_token")?.as_str()?.trim();
+            let mut auth: serde_json::Value = serde_json::from_str(&auth_text).ok()?;
+            let token = auth
+                .pointer("/tokens/access_token")?
+                .as_str()?
+                .trim()
+                .to_string();
             if token.is_empty() {
                 return None;
             }
@@ -1313,17 +1608,76 @@ fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option
                 .pointer("/tokens/account_id")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("")
-                .trim();
-            let mut req = http
-                .get("https://chatgpt.com/backend-api/wham/usage")
-                .header("authorization", &format!("Bearer {token}"))
-                .header("user-agent", "codex-cli/0.164.0");
-            if !acc_id.is_empty() {
-                req = req.header("chatgpt-account-id", acc_id);
-            }
-            let resp = req.call().ok()?;
-            let body = resp.into_body().read_to_string().ok()?;
-            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+                .trim()
+                .to_string();
+            let fetch_wham = |tok: &str| -> Option<serde_json::Value> {
+                let mut req = http
+                    .get("https://chatgpt.com/backend-api/wham/usage")
+                    .header("authorization", &format!("Bearer {tok}"))
+                    .header("user-agent", "codex-cli/0.164.0");
+                if !acc_id.is_empty() {
+                    req = req.header("chatgpt-account-id", &acc_id);
+                }
+                let resp = req.call().ok()?;
+                let body = resp.into_body().read_to_string().ok()?;
+                serde_json::from_str(&body).ok()
+            };
+            let val = match fetch_wham(&token) {
+                Some(v) => v,
+                None => {
+                    let rtok = auth
+                        .pointer("/tokens/refresh_token")
+                        .and_then(serde_json::Value::as_str)?
+                        .trim()
+                        .to_string();
+                    if rtok.is_empty() {
+                        return None;
+                    }
+                    let req_body = serde_json::json!({
+                        "client_id": "app_EMoamEEZ73f0CkXaXp7hrann",
+                        "grant_type": "refresh_token",
+                        "refresh_token": rtok,
+                    })
+                    .to_string();
+                    let rresp = http
+                        .post("https://auth.openai.com/oauth/token")
+                        .header("content-type", "application/json")
+                        .send(req_body.as_bytes())
+                        .ok()?;
+                    let rbody = rresp.into_body().read_to_string().ok()?;
+                    let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
+                    let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
+                    if let Some(tokens_obj) = auth
+                        .get_mut("tokens")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        tokens_obj.insert(
+                            "access_token".to_string(),
+                            serde_json::Value::String(new_acc.clone()),
+                        );
+                        if let Some(new_ref) = rval
+                            .get("refresh_token")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            tokens_obj.insert(
+                                "refresh_token".to_string(),
+                                serde_json::Value::String(new_ref.to_string()),
+                            );
+                        }
+                        if let Ok(updated) = serde_json::to_string_pretty(&auth) {
+                            let _ = std::fs::write(prof_dir.join("auth.json"), &updated);
+                            let _ = std::fs::write(prof_dir.join(".codex/auth.json"), &updated);
+                            propagate_profile_files_to_bound_agents(
+                                data,
+                                provider,
+                                profile,
+                                &["auth.json", ".codex/auth.json"],
+                            );
+                        }
+                    }
+                    fetch_wham(&new_acc)?
+                }
+            };
             let used = val
                 .pointer("/rate_limit/primary_window/used_percent")
                 .and_then(serde_json::Value::as_f64)?;
@@ -1334,28 +1688,75 @@ fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option
             }
         }
         "google-antigravity" => {
-            let tok_text = std::fs::read_to_string(
-                prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            )
-            .ok()?;
-            let tok_val: serde_json::Value = serde_json::from_str(&tok_text).ok()?;
+            let tok_rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+            let tok_path = prof_dir.join(tok_rel);
+            let tok_text = std::fs::read_to_string(&tok_path).ok()?;
+            let mut tok_val: serde_json::Value = serde_json::from_str(&tok_text).ok()?;
             let token = tok_val
                 .pointer("/token/access_token")
                 .or_else(|| tok_val.get("access_token"))?
                 .as_str()?
-                .trim();
+                .trim()
+                .to_string();
             if token.is_empty() {
                 return None;
             }
-            let resp = http
-                .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels")
-                .header("authorization", &format!("Bearer {token}"))
-                .header("content-type", "application/json")
-                .header("user-agent", "antigravity")
-                .send(b"{}")
-                .ok()?;
-            let body = resp.into_body().read_to_string().ok()?;
-            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+            let fetch_models = |tok: &str| -> Option<serde_json::Value> {
+                let resp = http
+                    .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels")
+                    .header("authorization", &format!("Bearer {tok}"))
+                    .header("content-type", "application/json")
+                    .header("user-agent", "antigravity")
+                    .send(b"{}")
+                    .ok()?;
+                let body = resp.into_body().read_to_string().ok()?;
+                serde_json::from_str(&body).ok()
+            };
+            let val = match fetch_models(&token) {
+                Some(v) => v,
+                None => {
+                    let rtok = tok_val
+                        .pointer("/token/refresh_token")
+                        .or_else(|| tok_val.get("refresh_token"))
+                        .and_then(serde_json::Value::as_str)?
+                        .trim()
+                        .to_string();
+                    if rtok.is_empty() {
+                        return None;
+                    }
+                    let (cid, csec) = extract_agy_oauth_client()?;
+                    let form_body = format!(
+                        "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
+                    );
+                    let rresp = http
+                        .post("https://oauth2.googleapis.com/token")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .send(form_body.as_bytes())
+                        .ok()?;
+                    let rbody = rresp.into_body().read_to_string().ok()?;
+                    let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
+                    let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
+                    if let Some(tok_obj) = tok_val
+                        .get_mut("token")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        tok_obj.insert(
+                            "access_token".to_string(),
+                            serde_json::Value::String(new_acc.clone()),
+                        );
+                    } else if let Some(root_obj) = tok_val.as_object_mut() {
+                        root_obj.insert(
+                            "access_token".to_string(),
+                            serde_json::Value::String(new_acc.clone()),
+                        );
+                    }
+                    if let Ok(updated) = serde_json::to_string_pretty(&tok_val) {
+                        let _ = std::fs::write(&tok_path, &updated);
+                        propagate_profile_files_to_bound_agents(data, provider, profile, &[tok_rel]);
+                    }
+                    fetch_models(&new_acc)?
+                }
+            };
             let models = val.get("models")?.as_object()?;
             let frac_of = |names: &[&str]| -> Option<i64> {
                 for n in names {
@@ -1551,8 +1952,445 @@ fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option
             let rem = (total - used).max(0.0);
             Some(format!("${rem:.2} left (${used:.0} / ${total:.0})"))
         }
+        "cursor" => {
+            let (mut access, refresh) = extract_cursor_oauth_from_db(&prof_dir)?;
+            let fetch_summary = |tok: &str| -> Option<serde_json::Value> {
+                let uid = extract_jwt_sub_tail(tok)?;
+                let resp = http
+                    .get("https://cursor.com/api/usage-summary")
+                    .header("authorization", &format!("Bearer {tok}"))
+                    .header("cookie", &format!("WorkosCursorSessionToken={uid}%3A%3A{tok}"))
+                    .call()
+                    .ok()?;
+                let body = resp.into_body().read_to_string().ok()?;
+                serde_json::from_str(&body).ok()
+            };
+            let val = match fetch_summary(&access) {
+                Some(v) => v,
+                None if !refresh.is_empty() => {
+                    let cursor_cid = concat!("KbZUR41c", "Y7W6zRSd", "pSUJ7I7m", "LYBKOCmB");
+                    let req_body = serde_json::json!({
+                        "grant_type": "refresh_token",
+                        "client_id": cursor_cid,
+                        "refresh_token": refresh,
+                    })
+                    .to_string();
+                    let rresp = http
+                        .post("https://api2.cursor.sh/oauth/token")
+                        .header("content-type", "application/json")
+                        .send(req_body.as_bytes())
+                        .ok()?;
+                    let rbody = rresp.into_body().read_to_string().ok()?;
+                    let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
+                    access = rval.get("access_token")?.as_str()?.trim().to_string();
+                    fetch_summary(&access)?
+                }
+                None => return None,
+            };
+            let plan = val.pointer("/individualUsage/plan")?;
+            let limit_cents = plan
+                .get("limit")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let rem_cents = plan
+                .get("remaining")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let used_pct = plan
+                .get("totalPercentUsed")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let rem_pct = (100.0 - used_pct).clamp(0.0, 100.0).round() as i64;
+            let tier = val
+                .get("membershipType")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("pro");
+            if limit_cents > 0.0 {
+                let rem_usd = (rem_cents / 100.0).round() as i64;
+                let lim_usd = (limit_cents / 100.0).round() as i64;
+                Some(format!("mo: {rem_pct}% left (${rem_usd}/${lim_usd} {tier})"))
+            } else {
+                Some(format!("mo: {rem_pct}% left ({tier})"))
+            }
+        }
+        "muse" => {
+            let auth_text = std::fs::read_to_string(prof_dir.join("muse/auth.json"))
+                .or_else(|_| std::fs::read_to_string(prof_dir.join(".config/muse/auth.json")))
+                .ok()?;
+            let auth: serde_json::Value = serde_json::from_str(&auth_text).ok()?;
+            let token = auth
+                .pointer("/providers/meta/access_token")?
+                .as_str()?
+                .trim();
+            if token.is_empty() {
+                return None;
+            }
+            let resp = http
+                .post("https://api.meta.ai/muse-code/key")
+                .header("authorization", &format!("Bearer {token}"))
+                .header("x-api-version", "1.0.0")
+                .header("content-type", "application/json")
+                .send(b"{}")
+                .ok()?;
+            let body = resp.into_body().read_to_string().ok()?;
+            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+            if val.get("is_subs_active").and_then(serde_json::Value::as_bool) != Some(true) {
+                return None;
+            }
+            let tier = val
+                .get("subs_tier_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("active");
+            let short_tier = tier.strip_prefix("Muse Code ").unwrap_or(tier);
+            let used_pct = val
+                .pointer("/subs_usage/window/used_percent")
+                .or_else(|| val.pointer("/subs_usage/used_percent"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let rem_pct = (100.0 - used_pct).clamp(0.0, 100.0).round() as i64;
+            Some(format!("5h: {rem_pct}% left ({short_tier})"))
+        }
+        "xai" => {
+            let auth_rel = ".grok/auth.json";
+            let auth_path = prof_dir.join(auth_rel);
+            let auth_text = std::fs::read_to_string(&auth_path).ok()?;
+            let mut root_auth: serde_json::Value = serde_json::from_str(&auth_text).ok()?;
+            let entry_key = if root_auth.get("key").is_some() {
+                None
+            } else {
+                root_auth
+                    .as_object()?
+                    .iter()
+                    .find(|(_, v)| v.get("key").is_some())
+                    .map(|(k, _)| k.clone())
+            };
+            let auth_entry = match &entry_key {
+                Some(k) => root_auth.get(k)?,
+                None => &root_auth,
+            };
+            let key = auth_entry.get("key")?.as_str()?.trim().to_string();
+            if key.is_empty() {
+                return None;
+            }
+            let rtok = auth_entry
+                .get("refresh_token")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let issuer = auth_entry
+                .get("oidc_issuer")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("https://auth.x.ai")
+                .trim_end_matches('/')
+                .to_string();
+            let cid = auth_entry
+                .get("oidc_client_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let fetch_billing = |tok: &str| -> Option<serde_json::Value> {
+                let resp = http
+                    .get("https://cli-chat-proxy.grok.com/v1/billing?format=credits")
+                    .header("authorization", &format!("Bearer {tok}"))
+                    .header("x-xai-token-auth", "xai-grok-cli")
+                    .call()
+                    .ok()?;
+                let body = resp.into_body().read_to_string().ok()?;
+                serde_json::from_str(&body).ok()
+            };
+            let val = match fetch_billing(&key) {
+                Some(v) => v,
+                None => {
+                    if rtok.is_empty() || cid.is_empty() {
+                        return None;
+                    }
+                    let form_body = format!(
+                        "grant_type=refresh_token&refresh_token={rtok}&client_id={cid}"
+                    );
+                    let rresp = http
+                        .post(&format!("{issuer}/oauth2/token"))
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .send(form_body.as_bytes())
+                        .ok()?;
+                    let rbody = rresp.into_body().read_to_string().ok()?;
+                    let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
+                    let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
+                    let target_obj = match &entry_key {
+                        Some(k) => root_auth.get_mut(k).and_then(serde_json::Value::as_object_mut),
+                        None => root_auth.as_object_mut(),
+                    };
+                    if let Some(obj) = target_obj {
+                        obj.insert(
+                            "key".to_string(),
+                            serde_json::Value::String(new_acc.clone()),
+                        );
+                        if let Some(new_ref) = rval
+                            .get("refresh_token")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            obj.insert(
+                                "refresh_token".to_string(),
+                                serde_json::Value::String(new_ref.to_string()),
+                            );
+                        }
+                        if let Ok(updated) = serde_json::to_string_pretty(&root_auth) {
+                            let _ = std::fs::write(&auth_path, &updated);
+                            propagate_profile_files_to_bound_agents(
+                                data,
+                                provider,
+                                profile,
+                                &[auth_rel],
+                            );
+                        }
+                    }
+                    fetch_billing(&new_acc)?
+                }
+            };
+            let used = val
+                .pointer("/config/creditUsagePercent")
+                .or_else(|| val.get("creditUsagePercent"))
+                .and_then(serde_json::Value::as_f64)?;
+            let rem = (100.0 - used).clamp(0.0, 100.0).round() as i64;
+            if rem == 0
+                && let Some(end_str) = val
+                    .pointer("/config/currentPeriod/end")
+                    .or_else(|| val.pointer("/currentPeriod/end"))
+                    .and_then(serde_json::Value::as_str)
+                && let Some((date_part, time_part)) = end_str.split_once('T')
+                && let (Some(mmdd), Some(hhmm)) = (date_part.get(5..10), time_part.get(..5))
+            {
+                Some(format!("7d: 0% left (resets {mmdd} {hhmm}Z)"))
+            } else {
+                Some(format!("7d: {rem}% left"))
+            }
+        }
+        "qwen-token-plan" => {
+            let key = read_first_non_empty_file(
+                &prof_dir,
+                &[
+                    ".config/opencode/qwen-coding-plan.key",
+                    ".config/opencode/qwen.key",
+                ],
+            )?;
+            let resp = http
+                .get("https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/models")
+                .header("authorization", &format!("Bearer {key}"))
+                .call()
+                .ok()?;
+            let body = resp.into_body().read_to_string().ok()?;
+            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+            let count = val.get("data")?.as_array()?.len();
+            Some(format!("active ({count} models)"))
+        }
+        "sylphx" => {
+            let _key = read_first_non_empty_file(
+                &prof_dir,
+                &[
+                    ".config/opencode/sylphx.key",
+                    ".config/desk/sylphx-ai/key",
+                ],
+            )?;
+            let resp = http.get("https://api.models.sylphx.ai/health").call().ok()?;
+            let body = resp.into_body().read_to_string().ok()?;
+            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+            if val.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                Some("online (gateway-edge)".to_string())
+            } else {
+                None
+            }
+        }
+        "google-gemini" => {
+            let key = read_first_non_empty_file(
+                &prof_dir,
+                &["gemini-api-key", ".config/opencode/gemini.key"],
+            )
+            .or_else(|| read_dsh_yaml_ref(&prof_dir, "GEMINI_API_KEY"))?;
+            let resp = http
+                .get(&format!(
+                    "https://generativelanguage.googleapis.com/v1beta/models?pageSize=1&key={key}"
+                ))
+                .call()
+                .ok()?;
+            let body = resp.into_body().read_to_string().ok()?;
+            let val: serde_json::Value = serde_json::from_str(&body).ok()?;
+            if val.get("models").is_some() {
+                Some("active (api-key)".to_string())
+            } else {
+                None
+            }
+        }
         _ => None,
     }
+}
+
+pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -> Option<i64> {
+    let extract_after = |label: &str| -> Option<i64> {
+        let idx = usage.find(label)?;
+        let rest = &usage[idx + label.len()..];
+        let pct_idx = rest.find("% left")?;
+        rest[..pct_idx].trim().parse::<i64>().ok()
+    };
+    if usage.contains("gemini:") && usage.contains("opus:") {
+        let wants_opus = model
+            .map(|m| {
+                let lower = m.to_ascii_lowercase();
+                lower.contains("opus") || lower.contains("claude")
+            })
+            .unwrap_or(false);
+        if wants_opus {
+            return extract_after("opus:");
+        }
+        return extract_after("gemini:");
+    }
+    for prefix in ["5h:", "7d:", "mo:"] {
+        if let Some(p) = extract_after(prefix) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+pub(crate) fn probe_profile_remaining_pct(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    model: Option<&str>,
+) -> Option<i64> {
+    let usage = probe_one_profile_usage(data, provider, profile)?;
+    parse_remaining_pct_from_usage(&usage, model)
+}
+
+pub(crate) fn rotate_agent_to_profile(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    provider: &str,
+    new_profile: &str,
+) {
+    let cfg = agent_config_dir(data, &agent.id);
+    let normalized = format!("{provider}/{new_profile}\n");
+    write_profile_marker(&cfg, ".anyagents-profile", &normalized);
+    write_profile_marker(
+        &cfg,
+        ".anyagents-profile-rotated-ms",
+        &format!("{}\n", anyagents_core::now_ms()),
+    );
+    seed_harness_credentials(store, data, agent, &cfg);
+    let parent_name = agent
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok())
+        .map(|p| p.name);
+    if let Some((_, _, gid, _)) =
+        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+    {
+        crate::sandbox::share_config_with_seat(&cfg, gid);
+    }
+    #[cfg(unix)]
+    if agent.state == "running"
+        && !crate::sandbox::is_isolated_test_env()
+        && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+        && let Some((_, uid, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+    {
+        let uid_s = uid.to_string();
+        let gid_s = gid.to_string();
+        let proc_pat = match agent.harness.as_str() {
+            "claude-code" => "claude",
+            "agy" => "agy",
+            "codex" => "codex",
+            _ => "",
+        };
+        if !proc_pat.is_empty() {
+            let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+                .args([
+                    "--reuid",
+                    &uid_s,
+                    "--regid",
+                    &gid_s,
+                    "--groups",
+                    &gid_s,
+                    "--no-new-privs",
+                    "--",
+                    "/usr/bin/pkill",
+                    "-TERM",
+                    "-u",
+                    &uid_s,
+                    "-x",
+                    proc_pat,
+                ])
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+}
+
+/// Checks if `agent`'s currently bound profile is exhausted (`0% left`) and
+/// another profile under the same upstream provider has healthy quota (`>= 20%`).
+/// When found, rotates `agent` to the healthy profile and returns the new
+/// `<provider>/<profile>` name.
+pub(crate) fn try_rotate_exhausted_profile(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    has_active_quota_hold: bool,
+) -> Option<String> {
+    if crate::sandbox::is_isolated_test_env() {
+        return None;
+    }
+    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
+    let available = list_harness_profiles(data, &provider);
+    if available.len() <= 1 {
+        return None;
+    }
+    let cfg = agent_config_dir(data, &agent.id);
+    let current_prof = bound_profile_name(&cfg)
+        .and_then(|b| {
+            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+            (!p.is_empty()).then_some(p)
+        })
+        .unwrap_or_else(|| "default".to_string());
+    let cur_pct = probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
+    let is_exhausted = cur_pct == Some(0) || (has_active_quota_hold && cur_pct.is_none_or(|p| p <= 5));
+    if !is_exhausted {
+        return None;
+    }
+    let all_agents = store.list_agents().unwrap_or_default();
+    let mut counts: std::collections::BTreeMap<String, usize> = available
+        .iter()
+        .map(|(name, _)| (name.clone(), 0usize))
+        .collect();
+    for other in &all_agents {
+        if other.id != agent.id
+            && other.state != "archived"
+            && upstream_provider_of(&other.harness, other.model.as_deref()) == provider
+        {
+            let other_cfg = agent_config_dir(data, &other.id);
+            if let Some(p) = bound_profile_name(&other_cfg) {
+                let prof_name = p.split_once('/').map(|(_, n)| n).unwrap_or(p.as_str());
+                if let Some(c) = counts.get_mut(prof_name) {
+                    *c += 1;
+                }
+            }
+        }
+    }
+    let best_alt = available
+        .iter()
+        .filter(|(name, _)| name != &current_prof)
+        .filter_map(|(name, _)| {
+            let pct = probe_profile_remaining_pct(data, &provider, name, agent.model.as_deref())?;
+            (pct >= 20).then_some((
+                name.clone(),
+                counts.get(name).copied().unwrap_or(0),
+                pct,
+            ))
+        })
+        .min_by_key(|(_, assigned, pct)| (*assigned, std::cmp::Reverse(*pct)))
+        .map(|(name, _, _)| name)?;
+    rotate_agent_to_profile(store, data, agent, &provider, &best_alt);
+    Some(format!("{provider}/{best_alt}"))
 }
 
 /// Lists all available Master Profiles for `provider_or_harness` under `<data>/profiles/<provider>/<profile>`.
@@ -1603,8 +2441,8 @@ pub(crate) fn bound_profile_name(config_dir: &Path) -> Option<String> {
 }
 
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
-/// from `<data>/profiles/<provider>/<profile>` using least-loaded assignment
-/// across agents sharing that upstream provider, and persists
+/// from `<data>/profiles/<provider>/<profile>` using quota-aware least-loaded
+/// assignment across agents sharing that upstream provider, and persists
 /// `.anyagents-profile` (`<provider>/<profile>`) in `target_config`.
 fn select_or_bind_profile(
     data: &Path,
@@ -1635,6 +2473,7 @@ fn select_or_bind_profile(
             .collect();
         for other in all_agents {
             if other.id != agent.id
+                && other.state != "archived"
                 && upstream_provider_of(&other.harness, other.model.as_deref()) == provider
             {
                 let other_cfg = agent_config_dir(data, &other.id);
@@ -1646,24 +2485,47 @@ fn select_or_bind_profile(
                 }
             }
         }
-        let min_count = counts.values().copied().min().unwrap_or(0);
-        let candidates: Vec<&(String, PathBuf)> = available
+        let probe_enabled = !crate::sandbox::is_isolated_test_env() && available.len() > 1;
+        let scored: Vec<(&(String, PathBuf), bool, bool, usize, i64)> = available
             .iter()
-            .filter(|(name, _)| counts.get(name).copied().unwrap_or(0) == min_count)
+            .map(|item| {
+                let pct = if probe_enabled {
+                    probe_profile_remaining_pct(data, &provider, &item.0, agent.model.as_deref())
+                        .unwrap_or(100)
+                } else {
+                    100
+                };
+                let assigned = counts.get(&item.0).copied().unwrap_or(0);
+                (item, pct > 0, pct >= 20, assigned, pct)
+            })
+            .collect();
+        let best_tier = scored
+            .iter()
+            .map(|(_, has_quota, healthy, assigned, _)| (*has_quota, *healthy, std::cmp::Reverse(*assigned)))
+            .max()
+            .unwrap_or((true, true, std::cmp::Reverse(0)));
+        let candidates: Vec<&(String, PathBuf)> = scored
+            .iter()
+            .filter(|(_, has_quota, healthy, assigned, _)| {
+                (*has_quota, *healthy, std::cmp::Reverse(*assigned)) == best_tier
+            })
+            .map(|(item, _, _, _, _)| *item)
             .collect();
         let hash = agent.name.bytes().fold(0usize, |acc, b| {
             acc.wrapping_mul(31).wrapping_add(b as usize)
         });
         let chosen = candidates[hash % candidates.len()];
-        let _ = std::fs::write(
-            target_config.join(".anyagents-profile"),
-            format!("{provider}/{}\n", chosen.0),
+        write_profile_marker(
+            target_config,
+            ".anyagents-profile",
+            &format!("{provider}/{}\n", chosen.0),
         );
         roots.push(chosen.1.clone());
     } else {
-        let _ = std::fs::write(
-            target_config.join(".anyagents-profile"),
-            format!("{provider}/default\n"),
+        write_profile_marker(
+            target_config,
+            ".anyagents-profile",
+            &format!("{provider}/default\n"),
         );
     }
     roots.push(data.join("profiles").join(&provider).join("default"));

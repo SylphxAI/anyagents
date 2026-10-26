@@ -1170,7 +1170,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     } else {
         None
     };
-    let (process, turn_state, mode, steer, quota) = match health.get(&agent.id) {
+    let (process, turn_state, mode, steer, mut quota) = match health.get(&agent.id) {
         Some(live) => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
             let working = live.process_alive
@@ -1195,6 +1195,11 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
             )
         }
     };
+    if quota.is_some_and(|ms| ms > now)
+        && create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some()
+    {
+        quota = None;
+    }
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name.clone(),
