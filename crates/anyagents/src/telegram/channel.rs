@@ -244,6 +244,30 @@ fn poll_channel(
         memory.bot = Some(format!("{}:{}", identity.id, identity.username));
         store.set_channel_state(&channel.id, &memory.to_state())?;
     }
+    if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none() {
+        let bot_tag = memory.bot.clone().unwrap_or_default();
+        let group_ids: Vec<i64> = memory
+            .chats
+            .iter()
+            .filter(|c| c.chat_id < 0)
+            .map(|c| c.chat_id)
+            .collect();
+        let mut pruned_any = false;
+        for gid in group_ids {
+            let key = ( gid, format!("self:{}", channel.id) );
+            let should_check = probed_chat_bots()
+                .lock()
+                .ok()
+                .is_some_and(|mut g| g.insert(key));
+            if should_check && !bot_tag.is_empty() && !probe_members(&token, gid, &bot_tag) {
+                memory.chats.retain(|l| l.chat_id != gid);
+                pruned_any = true;
+            }
+        }
+        if pruned_any {
+            let _ = store.set_channel_state(&channel.id, &memory.to_state());
+        }
+    }
     if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none()
         && memory.chats.iter().any(|c| c.title.is_none())
     {
@@ -259,7 +283,7 @@ fn poll_channel(
                 method: "getChat".to_string(),
                 body: serde_json::json!({ "chat_id": cid }),
             };
-            let resolved = call_api(&token, &call, 5, Some(&channel.id))
+            let Some(resolved) = call_api(&token, &call, 5, Some(&channel.id))
                 .ok()
                 .and_then(|resp| serde_json::from_str::<serde_json::Value>(&resp).ok())
                 .and_then(|val| {
@@ -305,7 +329,13 @@ fn poll_channel(
                         });
                     Some((title.unwrap_or_else(|| "-".to_string()), ct))
                 })
-                .unwrap_or_else(|| ("-".to_string(), None));
+            else {
+                if cid < 0 {
+                    memory.chats.retain(|l| l.chat_id != cid);
+                    updated_titles = true;
+                }
+                continue;
+            };
             for link in memory.chats.iter_mut().filter(|l| l.chat_id == cid) {
                 link.title = Some(resolved.0.clone());
                 if link.chat_type.is_none()
@@ -368,28 +398,52 @@ fn ingest_updates(
         // This bot answers in the chat its update came from, so a post it makes
         // there reaches the other agents on that chat.
         if let Routed::ToAgent { inbound, .. } = &mut one {
+            if inbound.text.starts_with("[Member removed/left group:") {
+                let lower_text = inbound.text.to_ascii_lowercase();
+                let removed_own_bot = own_bots.iter().any(|(bot_id, bot_user)| {
+                    (!bot_user.is_empty() && lower_text.contains(&format!("@{bot_user}")))
+                        || bot_id.is_some_and(|id| lower_text.contains(&id.to_string()))
+                });
+                if removed_own_bot {
+                    let before_len = memory.chats.len();
+                    if let Some(my_bot) = memory.bot.as_deref()
+                        && let Some((_, my_user)) = my_bot.split_once(':')
+                        && lower_text.contains(&format!("@{}", my_user.to_ascii_lowercase()))
+                    {
+                        memory.chats.retain(|link| link.chat_id != inbound.chat_id);
+                        if memory.chats.len() != before_len {
+                            grew = true;
+                        }
+                    }
+                    detach_removed_own_bots_from_chat(store, inbound.chat_id, &lower_text);
+                    continue;
+                }
+            }
             let known = memory
                 .chats
                 .iter()
                 .any(|link| link.agent == agent_id.as_str() && link.chat_id == inbound.chat_id);
             let old_title = memory.title_of(inbound.chat_id).map(str::to_string);
-            memory.attach_typed_titled(
-                agent_id.as_str(),
-                inbound.chat_id,
-                Some(&inbound.chat_type),
-                inbound.chat_title.as_deref(),
-            );
-            if !known && probe_members(token, inbound.chat_id, memory.bot.as_deref().unwrap_or(""))
-            {
-                // Confirmed by Telegram rather than inferred from a message.
+            let is_group = inbound.chat_type == "group" || inbound.chat_type == "supergroup";
+            let is_live = std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
+            if known || !is_group || !is_live {
                 memory.attach_typed_titled(
                     agent_id.as_str(),
                     inbound.chat_id,
                     Some(&inbound.chat_type),
                     inbound.chat_title.as_deref(),
                 );
+            } else if probe_members(token, inbound.chat_id, memory.bot.as_deref().unwrap_or("")) {
+                memory.attach_typed_titled(
+                    agent_id.as_str(),
+                    inbound.chat_id,
+                    Some(&inbound.chat_type),
+                    inbound.chat_title.as_deref(),
+                );
+            } else {
+                continue;
             }
-            if !known && (inbound.chat_type == "group" || inbound.chat_type == "supergroup") {
+            if !known && is_group {
                 discover_peer_bots_in_chat(
                     store,
                     token,
@@ -552,6 +606,34 @@ fn is_own_bot(
                 && !bot_user.is_empty()
                 && uname.as_deref() == Some(bot_user.as_str()))
     })
+}
+
+fn detach_removed_own_bots_from_chat(store: &Store, chat_id: i64, lower_removal_text: &str) {
+    let Ok(channels) = store.list_channels() else {
+        return;
+    };
+    for ch in channels {
+        if ch.kind != "telegram" {
+            continue;
+        }
+        let mut mem = Memory::from_state(&ch.state);
+        let matched = mem
+            .bot
+            .as_deref()
+            .and_then(|b| b.split_once(':'))
+            .is_some_and(|(id_s, u)| {
+                let u_low = u.trim().trim_start_matches('@').to_ascii_lowercase();
+                (!u_low.is_empty() && lower_removal_text.contains(&format!("@{u_low}")))
+                    || (!id_s.trim().is_empty() && lower_removal_text.contains(id_s.trim()))
+            });
+        if matched {
+            let before = mem.chats.len();
+            mem.chats.retain(|l| l.chat_id != chat_id);
+            if mem.chats.len() != before {
+                let _ = store.set_channel_state(&ch.id, &mem.to_state());
+            }
+        }
+    }
 }
 
 fn download_inbound_media(
