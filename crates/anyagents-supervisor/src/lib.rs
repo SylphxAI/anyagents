@@ -605,6 +605,7 @@ fn run_agent<H: Harness + 'static>(
         turns_recorded: 0,
         pending_recovery: false,
         completed_turn_in_session: false,
+        quota_started_at: None,
     };
     session.run()
 }
@@ -665,6 +666,10 @@ struct Session<H: Harness> {
     /// Set once at least one turn has completed during this session, enabling
     /// automatic scale-to-zero (`archived`) for sub-agents when idle.
     completed_turn_in_session: bool,
+    /// Clock timestamp (`now_ms`) when the current quota wait began, so an
+    /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
+    /// can clear the quota hold before `reset_at`.
+    quota_started_at: Option<i64>,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -860,6 +865,7 @@ impl<H: Harness + 'static> Session<H> {
 
     fn quota_waiting(&mut self) -> bool {
         if !self.process_alive() {
+            self.quota_started_at = None;
             return false;
         }
         let reset_at = self
@@ -867,9 +873,19 @@ impl<H: Harness + 'static> Session<H> {
             .as_ref()
             .and_then(|delivery| delivery.harness().health().quota_reset_at_ms);
         let Some(reset_at) = reset_at else {
+            self.quota_started_at = None;
             return false;
         };
-        if self.inner.clock.now_ms() >= reset_at {
+        let now = self.inner.clock.now_ms();
+        let started_at = *self.quota_started_at.get_or_insert(now);
+        let rotated_after_start = fs::read_to_string(
+            self.paths.config_dir.join(".anyagents-profile-rotated-ms"),
+        )
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .is_some_and(|ms| ms >= started_at);
+        if rotated_after_start || now >= reset_at {
+            self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();
             }

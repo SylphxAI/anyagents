@@ -1271,6 +1271,10 @@ fn profiles_cmd(
             println!("{}", serde_json::json!({"provider": prov, "profile": prof}));
             Ok(())
         }
+        Some("refresh") | Some("reset") => {
+            create::force_refresh_provider_profiles(data, target);
+            list_profiles_cmd(data, target)
+        }
         Some("list") => list_profiles_cmd(data, target),
         other => list_profiles_cmd(data, other),
     }
@@ -1515,7 +1519,13 @@ fn apply_local_subagent_default(
 }
 
 fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
-    let filter = filter.filter(|f| !f.trim().eq_ignore_ascii_case("list"));
+    let filter = filter.filter(|f| {
+        let t = f.trim();
+        !t.is_empty()
+            && !t.eq_ignore_ascii_case("list")
+            && !t.eq_ignore_ascii_case("refresh")
+            && !t.eq_ignore_ascii_case("reset")
+    });
     let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
         create::sync_and_list_provider_profiles(&store, data)
     } else if client::can_call_server(data) {
@@ -1539,6 +1549,12 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         create::sync_and_list_provider_profiles(&store, data)
     };
     create::enrich_profiles_usage(data, &mut entries);
+    let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
+        e.provider == f_trimmed
+            || e.profile == f_trimmed
+            || format!("{}/{}", e.provider, e.profile) == f_trimmed
+            || e.compatible_harnesses.iter().any(|h| h == f_trimmed)
+    };
     if ui::is_pretty() {
         println!("\n  {}\n", ui::bold_cyan("Provider Profiles"));
         let mut table = ui::Table::new(&[
@@ -1550,12 +1566,10 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             ("AGENTS", false),
         ]);
         for e in entries {
-            if let Some(f) = filter {
-                let f_trimmed = f.trim();
-                if e.provider != f_trimmed && !e.compatible_harnesses.iter().any(|h| h == f_trimmed)
-                {
-                    continue;
-                }
+            if let Some(f) = filter
+                && !matches_filter(&e, f.trim())
+            {
+                continue;
             }
             let kind_badge = match e.kind.as_str() {
                 "oauth" | "subscription" => ui::green(&e.kind),
@@ -1591,11 +1605,10 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         "PROVIDER", "PROFILE", "KIND", "USAGE / BALANCE", "COMPATIBLE HARNESSES"
     );
     for e in entries {
-        if let Some(f) = filter {
-            let f_trimmed = f.trim();
-            if e.provider != f_trimmed && !e.compatible_harnesses.iter().any(|h| h == f_trimmed) {
-                continue;
-            }
+        if let Some(f) = filter
+            && !matches_filter(&e, f.trim())
+        {
+            continue;
         }
         let usage = e.usage.as_deref().unwrap_or("-");
         let harnesses = e.compatible_harnesses.join(",");
