@@ -474,6 +474,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         return Ok(VendorHarness::Contract(Box::new(harness)));
     }
     if request.agent.harness == "agy" {
+        crate::create::clear_stale_agy_quota_error_steps(&request.config_dir);
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         let session = session_from_file(&request.config_dir, "agy-session-id");
         let harness = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {

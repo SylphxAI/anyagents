@@ -1321,6 +1321,9 @@ pub(crate) fn sync_and_list_provider_profiles(
             }
         }
         if cur_pct.is_some_and(|p| p > 5) {
+            if agent.harness == "agy" {
+                clear_stale_agy_quota_error_steps(&cfg);
+            }
             write_profile_marker(
                 &cfg,
                 ".anyagents-profile-rotated-ms",
@@ -1891,6 +1894,17 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
             if token.is_empty() {
                 return None;
             }
+            let fetch_summary = |tok: &str| -> Option<serde_json::Value> {
+                let resp = http
+                    .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary")
+                    .header("authorization", &format!("Bearer {tok}"))
+                    .header("content-type", "application/json")
+                    .header("user-agent", "antigravity/3.0.0")
+                    .send(b"{}")
+                    .ok()?;
+                let body = resp.into_body().read_to_string().ok()?;
+                serde_json::from_str(&body).ok()
+            };
             let fetch_models = |tok: &str| -> Option<serde_json::Value> {
                 let resp = http
                     .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels")
@@ -1902,51 +1916,91 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                 let body = resp.into_body().read_to_string().ok()?;
                 serde_json::from_str(&body).ok()
             };
-            let val = match fetch_models(&token) {
-                Some(v) => v,
-                None => {
-                    let rtok = tok_val
-                        .pointer("/token/refresh_token")
-                        .or_else(|| tok_val.get("refresh_token"))
-                        .and_then(serde_json::Value::as_str)?
-                        .trim()
-                        .to_string();
-                    if rtok.is_empty() {
-                        return None;
-                    }
-                    let (cid, csec) = extract_agy_oauth_client()?;
-                    let form_body = format!(
-                        "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
-                    );
-                    let rresp = http
-                        .post("https://oauth2.googleapis.com/token")
-                        .header("content-type", "application/x-www-form-urlencoded")
-                        .send(form_body.as_bytes())
-                        .ok()?;
-                    let rbody = rresp.into_body().read_to_string().ok()?;
-                    let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
-                    let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
-                    if let Some(tok_obj) = tok_val
-                        .get_mut("token")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        tok_obj.insert(
-                            "access_token".to_string(),
-                            serde_json::Value::String(new_acc.clone()),
-                        );
-                    } else if let Some(root_obj) = tok_val.as_object_mut() {
-                        root_obj.insert(
-                            "access_token".to_string(),
-                            serde_json::Value::String(new_acc.clone()),
-                        );
-                    }
-                    if let Ok(updated) = serde_json::to_string_pretty(&tok_val) {
-                        let _ = std::fs::write(&tok_path, &updated);
-                        propagate_profile_files_to_bound_agents(data, provider, profile, &[tok_rel]);
-                    }
-                    fetch_models(&new_acc)?
+            let mut active_token = token;
+            let mut summary_val = fetch_summary(&active_token);
+            if summary_val.is_none() {
+                let rtok = tok_val
+                    .pointer("/token/refresh_token")
+                    .or_else(|| tok_val.get("refresh_token"))
+                    .and_then(serde_json::Value::as_str)?
+                    .trim()
+                    .to_string();
+                if rtok.is_empty() {
+                    return None;
                 }
-            };
+                let (cid, csec) = extract_agy_oauth_client()?;
+                let form_body = format!(
+                    "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
+                );
+                let rresp = http
+                    .post("https://oauth2.googleapis.com/token")
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .send(form_body.as_bytes())
+                    .ok()?;
+                let rbody = rresp.into_body().read_to_string().ok()?;
+                let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
+                let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
+                if let Some(tok_obj) = tok_val
+                    .get_mut("token")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    tok_obj.insert(
+                        "access_token".to_string(),
+                        serde_json::Value::String(new_acc.clone()),
+                    );
+                } else if let Some(root_obj) = tok_val.as_object_mut() {
+                    root_obj.insert(
+                        "access_token".to_string(),
+                        serde_json::Value::String(new_acc.clone()),
+                    );
+                }
+                if let Ok(updated) = serde_json::to_string_pretty(&tok_val) {
+                    let _ = std::fs::write(&tok_path, &updated);
+                    propagate_profile_files_to_bound_agents(data, provider, profile, &[tok_rel]);
+                }
+                active_token = new_acc;
+                summary_val = fetch_summary(&active_token);
+            }
+            if let Some(ref sv) = summary_val
+                && let Some(groups) = sv.get("groups").and_then(serde_json::Value::as_array)
+            {
+                let mut gem_5h = None;
+                let mut gem_7d = None;
+                let mut opus_5h = None;
+                let mut opus_7d = None;
+                for g in groups {
+                    let Some(buckets) = g.get("buckets").and_then(serde_json::Value::as_array) else {
+                        continue;
+                    };
+                    for b in buckets {
+                        let bid = b.get("bucketId").and_then(serde_json::Value::as_str).unwrap_or("");
+                        let disabled = b.get("disabled").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                        let frac = if disabled {
+                            0.0
+                        } else {
+                            b.get("remainingFraction")
+                                .and_then(serde_json::Value::as_f64)
+                                .unwrap_or(0.0)
+                        };
+                        let pct = (frac * 100.0).clamp(0.0, 100.0).round() as i64;
+                        match bid {
+                            "gemini-5h" => gem_5h = Some(pct),
+                            "gemini-weekly" => gem_7d = Some(pct),
+                            "3p-5h" => opus_5h = Some(pct),
+                            "3p-weekly" => opus_7d = Some(pct),
+                            _ => {}
+                        }
+                    }
+                }
+                if let (Some(g5), Some(g7), Some(o5), Some(o7)) = (gem_5h, gem_7d, opus_5h, opus_7d) {
+                    let gem = g5.min(g7);
+                    let opus = o5.min(o7);
+                    return Some(format!(
+                        "gemini: {gem}% left (5h: {g5}%, 7d: {g7}%) · opus: {opus}% left (5h: {o5}%, 7d: {o7}%)"
+                    ));
+                }
+            }
+            let val = fetch_models(&active_token)?;
             let models = val.get("models")?.as_object()?;
             let frac_of = |names: &[&str]| -> Option<i64> {
                 for n in names {
@@ -2675,6 +2729,126 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
     }
 }
 
+/// Clears historical `CORTEX_STEP_TYPE_ERROR_MESSAGE` (`step_type = 17`) rows
+/// in `<config_dir>/.gemini/antigravity-cli/conversations/*.db` so `agy` does not
+/// re-emit stale `"status":"ERROR","error":"...Resets in..."` result lines at the
+/// end of subsequent healthy turns via `StepIndicesByType(17)`.
+pub(crate) fn clear_stale_agy_quota_error_steps(config_dir: &Path) {
+    let conv_dir = config_dir
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations");
+    if !conv_dir.is_dir() {
+        return;
+    }
+    #[cfg(unix)]
+    if !crate::sandbox::is_isolated_test_env()
+        && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+        && let Ok(conv_meta) = std::fs::metadata(&conv_dir)
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let (my_uid, my_gid) = std::fs::metadata("/proc/self")
+            .map(|m| (m.uid(), m.gid()))
+            .unwrap_or((conv_meta.uid(), conv_meta.gid()));
+        if conv_meta.uid() != my_uid {
+            let sock_gid = config_dir
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| std::fs::metadata(p).ok())
+                .map(|m| m.gid())
+                .unwrap_or(my_gid);
+            let uid_s = conv_meta.uid().to_string();
+            let gid_s = conv_meta.gid().to_string();
+            let groups_s = format!("{},{},{}", conv_meta.gid(), sock_gid, my_gid);
+            let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+                .args([
+                    "--reuid",
+                    &uid_s,
+                    "--regid",
+                    &gid_s,
+                    "--groups",
+                    &groups_s,
+                    "--no-new-privs",
+                    "--",
+                    "python3",
+                    "-c",
+                    "import glob, os, sqlite3, sys\nfor p in glob.glob(os.path.join(sys.argv[1], '*.db')):\n    try:\n        c = sqlite3.connect(p, timeout=0.5)\n        if c.execute('SELECT 1 FROM steps WHERE step_type = 17 LIMIT 1').fetchone():\n            c.execute('UPDATE steps SET step_type = 0, status = 5, error_details = NULL, step_payload = ? WHERE step_type = 17', (b' \\x05*\\x03\\xd2\\x01\\x00',))\n            c.commit()\n        c.close()\n    except Exception:\n        pass\n",
+                ])
+                .arg(&conv_dir)
+                .stderr(std::process::Stdio::null())
+                .status();
+            return;
+        }
+    }
+    let Ok(entries) = std::fs::read_dir(&conv_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("db") {
+            continue;
+        }
+        if let Ok(conn) = rusqlite::Connection::open(&path) {
+            let _ = conn.busy_timeout(std::time::Duration::from_millis(500));
+            let _ = conn.execute(
+                "UPDATE steps SET step_type = 0, status = 5, error_details = NULL, step_payload = X'20052a03d20100' WHERE step_type = 17",
+                [],
+            );
+        }
+    }
+}
+
+fn restart_agent_harness_process(store: &Store, agent: &Agent) {
+    #[cfg(unix)]
+    {
+        let parent_name = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .map(|p| p.name);
+        if agent.state == "running"
+            && !crate::sandbox::is_isolated_test_env()
+            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+            && let Some((_, uid, gid, _)) =
+                crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+        {
+            let uid_s = uid.to_string();
+            let gid_s = gid.to_string();
+            let proc_pat = match agent.harness.as_str() {
+                "claude-code" => "claude",
+                "agy" => "agy",
+                "codex" => "codex",
+                _ => "",
+            };
+            if !proc_pat.is_empty() {
+                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+                    .args([
+                        "--reuid",
+                        &uid_s,
+                        "--regid",
+                        &gid_s,
+                        "--groups",
+                        &gid_s,
+                        "--no-new-privs",
+                        "--",
+                        "/usr/bin/pkill",
+                        "-TERM",
+                        "-u",
+                        &uid_s,
+                        "-x",
+                        proc_pat,
+                    ])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (store, agent);
+    }
+}
+
 pub(crate) fn rotate_agent_to_profile(
     store: &Store,
     data: &Path,
@@ -2701,44 +2875,11 @@ pub(crate) fn rotate_agent_to_profile(
     {
         crate::sandbox::share_config_with_seat(&cfg, gid);
     }
-    poke_agent_wake_socket(data, &agent.id);
-    #[cfg(unix)]
-    if agent.state == "running"
-        && !crate::sandbox::is_isolated_test_env()
-        && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-        && let Some((_, uid, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
-    {
-        let uid_s = uid.to_string();
-        let gid_s = gid.to_string();
-        let proc_pat = match agent.harness.as_str() {
-            "claude-code" => "claude",
-            "agy" => "agy",
-            "codex" => "codex",
-            _ => "",
-        };
-        if !proc_pat.is_empty() {
-            let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
-                .args([
-                    "--reuid",
-                    &uid_s,
-                    "--regid",
-                    &gid_s,
-                    "--groups",
-                    &gid_s,
-                    "--no-new-privs",
-                    "--",
-                    "/usr/bin/pkill",
-                    "-TERM",
-                    "-u",
-                    &uid_s,
-                    "-x",
-                    proc_pat,
-                ])
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+    restart_agent_harness_process(store, agent);
+    if agent.harness == "agy" {
+        clear_stale_agy_quota_error_steps(&cfg);
     }
+    poke_agent_wake_socket(data, &agent.id);
 }
 
 /// Checks if `agent`'s currently bound profile has recovered quota (`> 5% left`
@@ -2757,12 +2898,26 @@ pub(crate) fn try_rotate_exhausted_profile(
     }
     let cfg = agent_config_dir(data, &agent.id);
     let now_ms = anyagents_core::now_ms();
+    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
+    let current_prof = bound_profile_name(&cfg)
+        .and_then(|b| {
+            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+            (!p.is_empty()).then_some(p)
+        })
+        .unwrap_or_else(|| "default".to_string());
     if has_active_quota_hold {
         let last_check = std::fs::read_to_string(cfg.join(".anyagents-last-quota-check-ms"))
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
         if now_ms.saturating_sub(last_check) < 120_000 {
+            let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            if rotated_ms >= last_check && now_ms.saturating_sub(rotated_ms) < 120_000 {
+                return Some(format!("{provider}/{current_prof}"));
+            }
             return None;
         }
         write_profile_marker(
@@ -2771,13 +2926,6 @@ pub(crate) fn try_rotate_exhausted_profile(
             &format!("{now_ms}\n"),
         );
     }
-    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let current_prof = bound_profile_name(&cfg)
-        .and_then(|b| {
-            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-            (!p.is_empty()).then_some(p)
-        })
-        .unwrap_or_else(|| "default".to_string());
     let cur_pct = probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
     if has_active_quota_hold && cur_pct.is_some_and(|p| p > 5) {
         write_profile_marker(
@@ -2785,6 +2933,12 @@ pub(crate) fn try_rotate_exhausted_profile(
             ".anyagents-profile-rotated-ms",
             &format!("{now_ms}\n"),
         );
+        if !store.has_open_turn(&agent.id).unwrap_or(false) {
+            restart_agent_harness_process(store, agent);
+        }
+        if agent.harness == "agy" {
+            clear_stale_agy_quota_error_steps(&cfg);
+        }
         poke_agent_wake_socket(data, &agent.id);
         return Some(format!("{provider}/{current_prof}"));
     }
@@ -3156,4 +3310,66 @@ pub(crate) fn resolve_subagent_defaults(
     };
 
     (resolved_harness, resolved_model, resolved_profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_remaining_pct_from_usage_handles_agy_5h_and_7d_windows() {
+        let usage = "gemini: 84% left (5h: 100%, 7d: 84%) · opus: 0% left (5h: 0%, 7d: 0%)";
+        assert_eq!(
+            parse_remaining_pct_from_usage(usage, Some("gemini-4-argon-high")),
+            Some(84)
+        );
+        assert_eq!(
+            parse_remaining_pct_from_usage(usage, Some("claude-opus-5-5")),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn clear_stale_agy_quota_error_steps_resets_step_type_17_rows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conv_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("antigravity-cli")
+            .join("conversations");
+        std::fs::create_dir_all(&conv_dir).unwrap();
+        let db_path = conv_dir.join("test-conv.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute(
+            "CREATE TABLE steps (idx integer PRIMARY KEY, step_type integer NOT NULL DEFAULT 0, status integer NOT NULL DEFAULT 0, error_details blob, step_payload blob)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, status, error_details, step_payload) VALUES (10, 17, 5, X'0102', X'08112005')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, status, error_details, step_payload) VALUES (11, 15, 5, NULL, X'080f2005')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        clear_stale_agy_quota_error_steps(tmp.path());
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        let (st, status, ed, sp): (i64, i64, Option<Vec<u8>>, Vec<u8>) = conn
+            .query_row(
+                "SELECT step_type, status, error_details, step_payload FROM steps WHERE idx = 10",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(st, 0);
+        assert_eq!(status, 5);
+        assert!(ed.is_none());
+        assert_eq!(sp, b" \x05*\x03\xd2\x01\x00");
+    }
 }
