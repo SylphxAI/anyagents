@@ -118,14 +118,19 @@ impl StreamSpec {
             .pointer("/result/status")
             .and_then(Value::as_str)
             .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"));
-        let finishes = !is_error
+        let quota_reset_at_ms = quota_of(value);
+        let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
-                LineProtocol::Result | LineProtocol::ResultWithCost => kind == Some("result"),
+                LineProtocol::Result | LineProtocol::ResultWithCost => {
+                    kind == Some("result") && (!is_error || self.name == "anyagents-agy")
+                }
                 LineProtocol::Done => {
-                    kind == Some("done")
-                        || kind == Some("session_settled")
-                        || (kind == Some("prompt_result")
-                            && value.get("sessionSettled").and_then(Value::as_bool) != Some(false))
+                    !is_error
+                        && (kind == Some("done")
+                            || kind == Some("session_settled")
+                            || (kind == Some("prompt_result")
+                                && value.get("sessionSettled").and_then(Value::as_bool)
+                                    != Some(false)))
                 }
             };
         LineEffect {
@@ -140,7 +145,7 @@ impl StreamSpec {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             usage: finishes.then(|| self.usage_of(value)),
-            quota_reset_at_ms: quota_of(value),
+            quota_reset_at_ms,
             text: self.text_of(value, finishes),
         }
     }
@@ -237,6 +242,7 @@ struct State {
     generation: u64,
     input_blocked: bool,
     turn_user_inputs: usize,
+    last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
@@ -473,6 +479,7 @@ impl StreamHarness {
                 state.open.clear();
                 state.followups.clear();
                 state.turn_user_inputs = 0;
+                state.last_turn_step_type = None;
                 state.idle_since = None;
                 return Ok(());
             }
@@ -490,6 +497,7 @@ impl StreamHarness {
         state.open.clear();
         state.followups.clear();
         state.turn_user_inputs = 0;
+        state.last_turn_step_type = None;
         state.idle_since = None;
         Ok(())
     }
@@ -857,6 +865,7 @@ impl StreamHarness {
             state.open.clear();
             state.followups.clear();
             state.turn_user_inputs = 0;
+            state.last_turn_step_type = None;
             state.idle_since = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
@@ -894,9 +903,10 @@ impl StreamHarness {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
+        let agy_rpc = self.agy_rpc.clone();
         match thread::Builder::new()
             .name(spec.name.clone())
-            .spawn(move || read_stdout(stdout, shared, wake, spec, generation))
+            .spawn(move || read_stdout(stdout, shared, wake, spec, agy_rpc, generation))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
@@ -931,6 +941,7 @@ impl StreamHarness {
         state.open.clear();
         state.followups.clear();
         state.turn_user_inputs = 0;
+        state.last_turn_step_type = None;
         state.idle_since = None;
         state.planner_config = None;
         state.http_port = None;
@@ -980,6 +991,7 @@ impl State {
             open: Vec::new(),
             followups: Vec::new(),
             turn_user_inputs: 0,
+            last_turn_step_type: None,
             idle_since: None,
             planner_config: None,
             http_port: None,
@@ -999,6 +1011,7 @@ fn read_stdout(
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
     spec: StreamSpec,
+    agy_rpc: Option<AgyRpcConfig>,
     generation: u64,
 ) {
     for line in BufReader::new(stdout).lines() {
@@ -1009,7 +1022,47 @@ fn read_stdout(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let effect = spec.effect(&value);
+        let mut effect = spec.effect(&value);
+        let kind = value
+            .get("type")
+            .or_else(|| value.get("event"))
+            .and_then(Value::as_str);
+        if spec.name == "anyagents-agy" && effect.quota_reset_at_ms.is_some() {
+            let (last_step_type, session_id, child_pid, cached_port) = {
+                let state = lock(&shared);
+                (
+                    state.last_turn_step_type.clone(),
+                    effect
+                        .session_id
+                        .clone()
+                        .or_else(|| state.session_id.clone()),
+                    state.child.as_ref().map(Child::id),
+                    state.http_port,
+                )
+            };
+            let mut is_stale_quota = last_step_type
+                .as_deref()
+                .is_some_and(|st| st != "error_message" && st != "user_input");
+            if !is_stale_quota
+                && let (Some(rpc), Some(sid)) = (agy_rpc.as_ref(), session_id.as_deref())
+                && let Some(port) = resolve_agy_http_port(rpc, cached_port, child_pid)
+            {
+                lock(&shared).http_port = Some(port);
+                if matches!(
+                    agy_rpc_is_latest_step_quota_error(port, &rpc.csrf_token, sid),
+                    Ok(false)
+                ) {
+                    is_stale_quota = true;
+                }
+            }
+            if is_stale_quota {
+                effect.quota_reset_at_ms = None;
+                if kind == Some("result") {
+                    effect.finishes_turn = true;
+                    effect.usage = Some(spec.usage_of(&value));
+                }
+            }
+        }
         {
             let mut state = lock(&shared);
             if state.generation != generation {
@@ -1017,12 +1070,12 @@ fn read_stdout(
             }
             state.idle_since = None;
             note_markers(&mut state, &value);
-            if value
-                .pointer("/step_update/step_type")
-                .and_then(Value::as_str)
-                == Some("user_input")
+            if let Some(step_type) = value.pointer("/step_update/step_type").and_then(Value::as_str)
             {
-                state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+                state.last_turn_step_type = Some(step_type.to_string());
+                if step_type == "user_input" {
+                    state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+                }
             }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
@@ -1103,6 +1156,7 @@ fn id_for_quiet(state: &mut State, id: &str) {
     state.open.clear();
     state.followups.clear();
     state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
     state.idle_since = None;
     state.finished.insert(id.to_string());
     state.text = text;
@@ -1110,6 +1164,7 @@ fn id_for_quiet(state: &mut State, id: &str) {
 
 fn finish_open(state: &mut State, usage: TurnUsage) {
     state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
     state.idle_since = None;
     if state.open.is_empty() {
         return;
@@ -1338,6 +1393,46 @@ fn agy_rpc_is_running(port: u16, csrf_token: &str, session_id: &str) -> Result<b
         .and_then(Value::as_str)
         .unwrap_or_default();
     Ok(status == "CASCADE_RUN_STATUS_RUNNING")
+}
+
+fn agy_rpc_is_latest_step_quota_error(
+    port: u16,
+    csrf_token: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
+    let Some(step_count) = resp
+        .get("trajectorySummaries")
+        .and_then(|m| m.get(session_id))
+        .and_then(|s| s.get("stepCount"))
+        .and_then(Value::as_u64)
+    else {
+        return Ok(true);
+    };
+    if step_count == 0 {
+        return Ok(false);
+    }
+    let offset = step_count.saturating_sub(2);
+    let steps_resp = agy_rpc_post(
+        port,
+        csrf_token,
+        "GetCascadeTrajectorySteps",
+        &json!({ "cascadeId": session_id, "stepOffset": offset }),
+    )?;
+    let Some(last_step) = steps_resp
+        .get("steps")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.last())
+    else {
+        return Ok(true);
+    };
+    let step_type = last_step.get("type").and_then(Value::as_str).unwrap_or("");
+    let status = last_step.get("status").and_then(Value::as_str).unwrap_or("");
+    if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" || status == "CORTEX_STEP_STATUS_CLEARED" {
+        return Ok(false);
+    }
+    let raw = last_step.to_string().to_ascii_lowercase();
+    Ok(raw.contains("resets in ") || raw.contains("resource_exhausted"))
 }
 
 fn agy_rpc_fetch_planner_config(

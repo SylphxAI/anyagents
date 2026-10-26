@@ -1320,10 +1320,7 @@ pub(crate) fn sync_and_list_provider_profiles(
                 cur_pct = Some(alt_pct);
             }
         }
-        if cur_pct.is_some_and(|p| p > 0)
-            && agent.harness == "claude-code"
-            && anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms).is_some()
-        {
+        if cur_pct.is_some_and(|p| p > 5) {
             write_profile_marker(
                 &cfg,
                 ".anyagents-profile-rotated-ms",

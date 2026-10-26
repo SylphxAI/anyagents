@@ -572,3 +572,35 @@ line3 = sys.stdin.readline()
         assert_eq!(calls[0]["cascadeId"], "sess-agy-1");
     }
 }
+
+#[test]
+#[cfg(target_os = "linux")]
+fn agy_completed_turn_with_stale_historical_quota_or_tool_error_still_finishes() {
+    use std::time::Duration;
+    let spec = StreamSpec::for_program("agy");
+    let mut harness = pipe_harness(
+        r#"
+import json, sys
+line = sys.stdin.readline()
+print(json.dumps({"event":"step_update","step_update":{"conversation_id":"sess-agy-2","step_index":10,"state":"DONE","step_type":"user_input"}}), flush=True)
+print(json.dumps({"event":"step_update","step_update":{"conversation_id":"sess-agy-2","step_index":11,"state":"ERROR","step_type":"run_command"}}), flush=True)
+print(json.dumps({"event":"step_update","step_update":{"conversation_id":"sess-agy-2","step_index":12,"state":"DONE","step_type":"planner_response"}}), flush=True)
+print(json.dumps({"event":"result","result":{"conversation_id":"sess-agy-2","status":"ERROR","error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 5h12m40s.","usage":{"input_tokens":10,"output_tokens":5}}}), flush=True)
+sys.stdin.read()
+"#,
+    );
+    let mut m1 = large_message();
+    m1.id = "m-done".into();
+    m1.text = "hello".into();
+    let line1 = super::message_line(&spec, &m1);
+    assert!(matches!(
+        harness.deliver(&m1, &line1).unwrap(),
+        anyagents_harness::DeliverOutcome::Accepted { .. }
+    ));
+    assert!(harness.wait_finished("m-done", Duration::from_secs(3)));
+    assert_eq!(harness.health().quota_reset_at_ms, None);
+    assert_eq!(
+        harness.health().turn_state,
+        anyagents_harness::TurnState::Idle
+    );
+}
