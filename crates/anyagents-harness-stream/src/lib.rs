@@ -1070,7 +1070,9 @@ fn read_stdout(
             }
             state.idle_since = None;
             note_markers(&mut state, &value);
-            if let Some(step_type) = value.pointer("/step_update/step_type").and_then(Value::as_str)
+            if let Some(step_type) = value
+                .pointer("/step_update/step_type")
+                .and_then(Value::as_str)
             {
                 state.last_turn_step_type = Some(step_type.to_string());
                 if step_type == "user_input" {
@@ -1427,7 +1429,10 @@ fn agy_rpc_is_latest_step_quota_error(
         return Ok(true);
     };
     let step_type = last_step.get("type").and_then(Value::as_str).unwrap_or("");
-    let status = last_step.get("status").and_then(Value::as_str).unwrap_or("");
+    let status = last_step
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" || status == "CORTEX_STEP_STATUS_CLEARED" {
         return Ok(false);
     }

@@ -61,6 +61,7 @@ struct State {
     turns_started: usize,
     quota_reset_at_ms: Option<i64>,
     thread_id: Option<String>,
+    thread_invalidated: bool,
     turn_id: Option<String>,
     last_usage: Option<TurnUsage>,
     usages: Vec<(String, TurnUsage)>,
@@ -136,6 +137,12 @@ impl CodexHarness {
     /// Thread id from `thread/start` or `thread/resume`.
     pub fn session_id(&self) -> Option<String> {
         lock(&self.shared).thread_id.clone()
+    }
+
+    /// Whether the current thread became permanently unresumable (e.g. sealed
+    /// compacted residual or pre-sampling compact failure) and must be replaced.
+    pub fn thread_invalidated(&self) -> bool {
+        lock(&self.shared).thread_invalidated
     }
 
     /// Usage copied onto `id` when its turn completed.
@@ -802,9 +809,37 @@ fn apply_line(state: &mut State, value: &Value) {
     }
 }
 
+fn is_unrecoverable_thread_error(params: &Value) -> bool {
+    let raw = params.to_string().to_ascii_lowercase();
+    raw.contains("sealed to another residual")
+        || raw.contains("cannot be continued here")
+        || raw.contains("pre-sampling compact")
+        || raw.contains("context_length_exceeded")
+}
+
+fn invalidate_thread(state: &mut State) {
+    let rejected = std::mem::take(&mut state.open);
+    for id in rejected {
+        state.seen.remove(&id);
+        state.written.retain(|w| w != &id);
+    }
+    state.thread_id = None;
+    state.turn_id = None;
+    state.thread_invalidated = true;
+    state.alive = false;
+    if let Some(child) = state.child.as_mut() {
+        let _ = child.kill();
+    }
+}
+
 fn on_notification(state: &mut State, method: &str, params: &Value) {
     match method {
         "thread/tokenUsage/updated" => state.last_usage = Some(usage_from_codex(params)),
+        "error" => {
+            if is_unrecoverable_thread_error(params) {
+                invalidate_thread(state);
+            }
+        }
         "turn/completed" => {
             let status = params
                 .pointer("/turn/status")
@@ -812,6 +847,8 @@ fn on_notification(state: &mut State, method: &str, params: &Value) {
                 .unwrap_or("");
             if status == "completed" {
                 finish_open(state);
+            } else if is_unrecoverable_thread_error(params) {
+                invalidate_thread(state);
             } else {
                 state.open.clear();
                 state.turn_id = None;

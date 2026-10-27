@@ -35,6 +35,12 @@ pub enum VendorHarness {
 
 impl VendorHarness {
     fn sync_session(&self) {
+        if let Self::Codex(harness, path) = self
+            && harness.thread_invalidated()
+        {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
         let (session, path) = match self {
             Self::Claude(harness, path) => (harness.session_id(), Some(path)),
             Self::Codex(harness, path) => (harness.session_id(), Some(path)),
@@ -264,7 +270,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             );
             let _ = crate::operator::ensure(&store, &request.agent.id);
             if request.agent.harness == "opencode"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -280,7 +286,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &mcp_args,
                 );
             } else if request.agent.harness == "codex"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -296,7 +302,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &mcp_args,
                 );
             } else if request.agent.harness == "agy"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -311,7 +317,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &mcp_args,
                 );
             } else if request.agent.harness == "omp"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -322,7 +328,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 ];
                 let _ = crate::grok::write_omp_mcp_config(&request.config_dir, &exe, &mcp_args);
             } else if request.agent.harness == "dsh"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -338,7 +344,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &mcp_args,
                 );
             } else if request.agent.harness == "grok"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -354,7 +360,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &mcp_args,
                 );
             } else if request.agent.harness == "muse"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),
@@ -370,7 +376,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                     &mcp_args,
                 );
             } else if request.agent.harness == "claude-code"
-                && let Ok(exe) = std::env::current_exe()
+                && let Ok(exe) = crate::data::current_exe_clean()
             {
                 let mcp_args = vec![
                     "--data".to_string(),

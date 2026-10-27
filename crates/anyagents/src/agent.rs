@@ -506,6 +506,30 @@ fn set_admin(data: &Path, agent: &str, admin: bool) -> Result<(), Error> {
     Ok(())
 }
 
+fn is_agy_turn_settled_on_disk(config_dir: &Path, opened_at_ms: i64, now_ms: i64) -> bool {
+    if now_ms.saturating_sub(opened_at_ms) < 45_000 {
+        return false;
+    }
+    let conv_dir = config_dir
+        .join(".gemini")
+        .join("antigravity-cli")
+        .join("conversations");
+    let Ok(entries) = std::fs::read_dir(&conv_dir) else {
+        return false;
+    };
+    let mut latest_ms: Option<i64> = None;
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata()
+            && let Ok(modified) = meta.modified()
+            && let Ok(dur) = modified.duration_since(std::time::UNIX_EPOCH)
+        {
+            let ms = i64::try_from(dur.as_millis()).unwrap_or(0);
+            latest_ms = Some(latest_ms.map_or(ms, |prev| prev.max(ms)));
+        }
+    }
+    latest_ms.is_some_and(|ms| now_ms.saturating_sub(ms) > 45_000)
+}
+
 /// Enrich `AgentView` rows from the authoritative SQLite `turn_recovery` table
 /// (`has_open_turn`), and auto-archive any `running` sub-agent whose turn has
 /// settled (`complete_idle_subagent`).
@@ -518,8 +542,8 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         let Ok(id) = AgentId::parse(&view.id) else {
             continue;
         };
+        let cfg = anyagents_core::agent_config_dir(data, &id);
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
-            let cfg = anyagents_core::agent_config_dir(data, &id);
             view.quota_reset_at_ms =
                 anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now);
         }
@@ -530,7 +554,20 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             view.quota_reset_at_ms = None;
         }
         if view.state == "running" && view.process == "alive" {
-            let open_turn = store.has_open_turn(&id).unwrap_or(false);
+            let mut open_turn = store.has_open_turn(&id).unwrap_or(false);
+            if open_turn && view.harness == "agy" && view.oldest_undelivered_age_ms.is_none() {
+                let opened_at_ms = store
+                    .open_turn(&id)
+                    .ok()
+                    .flatten()
+                    .map(|o| o.opened_at_ms)
+                    .unwrap_or(0);
+                if is_agy_turn_settled_on_disk(&cfg, opened_at_ms, now) {
+                    let _ = store.note_turn_completed(&id);
+                    open_turn = false;
+                    view.turn_state = "idle".to_string();
+                }
+            }
             if view.quota_reset_at_ms.is_some_and(|ms| ms > now) {
                 view.turn_state = "idle".to_string();
             } else if open_turn && view.quota_reset_at_ms.is_none() {

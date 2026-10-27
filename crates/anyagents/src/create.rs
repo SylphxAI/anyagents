@@ -85,7 +85,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             None => std::path::absolute(&managed)?,
         },
     };
-    let command = std::env::current_exe()?;
+    let command = crate::data::current_exe_clean()?;
     // The tool server is pointed at the agent's own config directory, where its
     // capability is; a name on a command line is never an identity.
     let args = vec![
@@ -473,7 +473,7 @@ pub(crate) fn chmod_seat_file_readable(path: &Path) {
                     "--no-new-privs",
                     "--",
                     "/bin/chmod",
-                    "0664",
+                    "0666",
                 ])
                 .arg(fname)
                 .stderr(std::process::Stdio::null())
@@ -586,7 +586,34 @@ pub(crate) fn seed_harness_credentials(
         !prof.is_empty() && prof != "default"
     });
     let profile_changed = current_bound.is_some()
-        && (current_bound != last_seeded || (last_seeded.is_none() && explicit_non_default_profile));
+        && (current_bound != last_seeded
+            || (last_seeded.is_none() && explicit_non_default_profile));
+
+    if let (Some(bound), Some(primary_profile_root)) =
+        (current_bound.as_deref(), profile_roots.first())
+    {
+        for other in &all_agents {
+            if other.id == agent.id {
+                continue;
+            }
+            let other_cfg = agent_config_dir(data, &other.id);
+            if bound_profile_name(&other_cfg).as_deref() == Some(bound) {
+                for rel in [
+                    ".credentials.json",
+                    ".claude/.credentials.json",
+                    "auth.json",
+                    ".codex/auth.json",
+                    ".gemini/antigravity-cli/antigravity-oauth-token",
+                ] {
+                    let other_src = other_cfg.join(rel);
+                    if other_src.is_file() {
+                        let _ =
+                            copy_seat_file_if_newer(&other_src, &primary_profile_root.join(rel));
+                    }
+                }
+            }
+        }
+    }
 
     for profile_root in &profile_roots {
         for candidate in [
@@ -658,7 +685,8 @@ pub(crate) fn seed_harness_credentials(
                                     json_oauth_expires_at(&dst_bytes)
                                 ),
                                 (Some(s_exp), Some(d_exp)) if s_exp > d_exp
-                            );
+                            ) || (json_oauth_expires_at(&src_bytes).is_some()
+                                && json_oauth_expires_at(&dst_bytes).is_none());
                             if !newer_oauth {
                                 break;
                             }
@@ -674,7 +702,11 @@ pub(crate) fn seed_harness_credentials(
         }
     }
     if let Some(ref bound) = current_bound {
-        write_profile_marker(target_config, ".anyagents-seeded-profile", &format!("{bound}\n"));
+        write_profile_marker(
+            target_config,
+            ".anyagents-seeded-profile",
+            &format!("{bound}\n"),
+        );
     }
 }
 
@@ -743,7 +775,7 @@ pub(crate) fn bind_profile(
     );
     store.set_agent_model(&agent.id, model)?;
     if agent.harness == "opencode" {
-        let command = std::env::current_exe()?;
+        let command = crate::data::current_exe_clean()?;
         let args = vec![
             "--data".into(),
             store.data_dir().display().to_string(),
@@ -753,7 +785,7 @@ pub(crate) fn bind_profile(
         ];
         opencode_config::write(&config, Some(model), &command, &args)?;
     } else if agent.harness == "codex" {
-        let command = std::env::current_exe()?;
+        let command = crate::data::current_exe_clean()?;
         let args = vec![
             "--data".into(),
             store.data_dir().display().to_string(),
@@ -904,7 +936,11 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
                 let _ = write_seat_shared_file(&cfg.join(rel), &bytes, 0o660);
             }
         }
-        write_profile_marker(&cfg, ".anyagents-seeded-profile", &format!("{target_tag}\n"));
+        write_profile_marker(
+            &cfg,
+            ".anyagents-seeded-profile",
+            &format!("{target_tag}\n"),
+        );
         if let Some(a) = agent_rec {
             let parent_name = a
                 .parent_id
@@ -1005,6 +1041,14 @@ fn copy_host_file(src: &Path, dst: &Path) -> bool {
 
 fn json_oauth_expires_at(bytes: &[u8]) -> Option<i64> {
     let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let tok = val
+        .pointer("/claudeAiOauth/accessToken")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if tok.is_empty() {
+        return None;
+    }
     val.pointer("/claudeAiOauth/expiresAt")
         .and_then(serde_json::Value::as_i64)
 }
@@ -1025,26 +1069,31 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     if src_bytes.is_empty() {
         return false;
     }
+    if src.file_name().is_some_and(|n| n == ".credentials.json")
+        && json_oauth_expires_at(&src_bytes).is_none()
+    {
+        return false;
+    }
     if let Ok(dst_meta) = std::fs::metadata(dst)
         && dst_meta.is_file()
         && dst_meta.len() > 0
     {
         if let Ok(dst_bytes) = std::fs::read(dst) {
             if src_bytes == dst_bytes {
-                return true;
+                return false;
             }
             if let (Some(src_exp), Some(dst_exp)) = (
                 json_oauth_expires_at(&src_bytes),
                 json_oauth_expires_at(&dst_bytes),
             ) {
                 if src_exp <= dst_exp {
-                    return true;
+                    return false;
                 }
             } else if src_meta.modified().ok() <= dst_meta.modified().ok() {
-                return true;
+                return false;
             }
         } else if src_meta.modified().ok() <= dst_meta.modified().ok() {
-            return true;
+            return false;
         }
     }
     if let Some(p) = dst.parent() {
@@ -1383,11 +1432,15 @@ pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileE
                 "google-antigravity" => &[".gemini/antigravity-cli/antigravity-oauth-token"],
                 _ => &[],
             };
+            let mut updated_any = false;
             for rel in rels {
                 let src = cfg.join(rel);
-                if src.is_file() {
-                    let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
+                if src.is_file() && copy_seat_file_if_newer(&src, &profile_dir.join(rel)) {
+                    updated_any = true;
                 }
+            }
+            if updated_any {
+                propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels);
             }
         }
     }
@@ -1459,10 +1512,7 @@ fn extract_agy_oauth_client() -> Option<(String, String)> {
                 .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
             {
                 let secret = String::from_utf8(candidate.to_vec()).ok()?;
-                return Some((
-                    String::from_utf8(cid_needle.to_vec()).ok()?,
-                    secret,
-                ));
+                return Some((String::from_utf8(cid_needle.to_vec()).ok()?, secret));
             }
         }
     }
@@ -1605,7 +1655,10 @@ fn sync_anthropic_profile_metadata(
             .and_then(serde_json::Value::as_object_mut)
         {
             if let Some(ms) = mapped_sub
-                && oauth.get("subscriptionType").and_then(serde_json::Value::as_str) != Some(ms)
+                && oauth
+                    .get("subscriptionType")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(ms)
             {
                 oauth.insert(
                     "subscriptionType".to_string(),
@@ -1618,7 +1671,10 @@ fn sync_anthropic_profile_metadata(
                 changed = true;
             }
             if let Some(lt) = live_tier
-                && oauth.get("rateLimitTier").and_then(serde_json::Value::as_str) != Some(lt)
+                && oauth
+                    .get("rateLimitTier")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(lt)
             {
                 oauth.insert(
                     "rateLimitTier".to_string(),
@@ -1650,7 +1706,11 @@ fn sync_anthropic_profile_metadata(
     anthropic_tier_label(sub_type, rate_tier)
 }
 
-pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str) -> Option<String> {
+pub(crate) fn probe_one_profile_usage(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+) -> Option<String> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let http = ureq::Agent::config_builder()
         .timeout_global(Some(std::time::Duration::from_secs(4)))
@@ -1757,9 +1817,8 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                     fetch_usage(&token)?
                 }
             };
-            let tier_badge = sync_anthropic_profile_metadata(
-                &http, data, &prof_dir, profile, &token, &mut cred,
-            );
+            let tier_badge =
+                sync_anthropic_profile_metadata(&http, data, &prof_dir, profile, &token, &mut cred);
             let tier_suffix = tier_badge.map(|t| format!(" ({t})")).unwrap_or_default();
             let u5 = val
                 .pointer("/five_hour/utilization")
@@ -1780,7 +1839,9 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                     "5h: 0% left (resets {hhmm}Z) · 7d: {rem_7d}% left{tier_suffix}"
                 ))
             } else {
-                Some(format!("5h: {rem_5h}% left · 7d: {rem_7d}% left{tier_suffix}"))
+                Some(format!(
+                    "5h: {rem_5h}% left · 7d: {rem_7d}% left{tier_suffix}"
+                ))
             }
         }
         "openai" => {
@@ -1969,12 +2030,19 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                 let mut opus_5h = None;
                 let mut opus_7d = None;
                 for g in groups {
-                    let Some(buckets) = g.get("buckets").and_then(serde_json::Value::as_array) else {
+                    let Some(buckets) = g.get("buckets").and_then(serde_json::Value::as_array)
+                    else {
                         continue;
                     };
                     for b in buckets {
-                        let bid = b.get("bucketId").and_then(serde_json::Value::as_str).unwrap_or("");
-                        let disabled = b.get("disabled").and_then(serde_json::Value::as_bool).unwrap_or(false);
+                        let bid = b
+                            .get("bucketId")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("");
+                        let disabled = b
+                            .get("disabled")
+                            .and_then(serde_json::Value::as_bool)
+                            .unwrap_or(false);
                         let frac = if disabled {
                             0.0
                         } else {
@@ -1992,7 +2060,8 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                         }
                     }
                 }
-                if let (Some(g5), Some(g7), Some(o5), Some(o7)) = (gem_5h, gem_7d, opus_5h, opus_7d) {
+                if let (Some(g5), Some(g7), Some(o5), Some(o7)) = (gem_5h, gem_7d, opus_5h, opus_7d)
+                {
                     let gem = g5.min(g7);
                     let opus = o5.min(o7);
                     return Some(format!(
@@ -2203,7 +2272,10 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                 let resp = http
                     .get("https://cursor.com/api/usage-summary")
                     .header("authorization", &format!("Bearer {tok}"))
-                    .header("cookie", &format!("WorkosCursorSessionToken={uid}%3A%3A{tok}"))
+                    .header(
+                        "cookie",
+                        &format!("WorkosCursorSessionToken={uid}%3A%3A{tok}"),
+                    )
                     .call()
                     .ok()?;
                 let body = resp.into_body().read_to_string().ok()?;
@@ -2252,7 +2324,9 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
             if limit_cents > 0.0 {
                 let rem_usd = (rem_cents / 100.0).round() as i64;
                 let lim_usd = (limit_cents / 100.0).round() as i64;
-                Some(format!("mo: {rem_pct}% left (${rem_usd}/${lim_usd} {tier})"))
+                Some(format!(
+                    "mo: {rem_pct}% left (${rem_usd}/${lim_usd} {tier})"
+                ))
             } else {
                 Some(format!("mo: {rem_pct}% left ({tier})"))
             }
@@ -2278,7 +2352,11 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                 .ok()?;
             let body = resp.into_body().read_to_string().ok()?;
             let val: serde_json::Value = serde_json::from_str(&body).ok()?;
-            if val.get("is_subs_active").and_then(serde_json::Value::as_bool) != Some(true) {
+            if val
+                .get("is_subs_active")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
                 return None;
             }
             let tier = val
@@ -2350,9 +2428,8 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                     if rtok.is_empty() || cid.is_empty() {
                         return None;
                     }
-                    let form_body = format!(
-                        "grant_type=refresh_token&refresh_token={rtok}&client_id={cid}"
-                    );
+                    let form_body =
+                        format!("grant_type=refresh_token&refresh_token={rtok}&client_id={cid}");
                     let rresp = http
                         .post(&format!("{issuer}/oauth2/token"))
                         .header("content-type", "application/x-www-form-urlencoded")
@@ -2362,7 +2439,9 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
                     let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
                     let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
                     let target_obj = match &entry_key {
-                        Some(k) => root_auth.get_mut(k).and_then(serde_json::Value::as_object_mut),
+                        Some(k) => root_auth
+                            .get_mut(k)
+                            .and_then(serde_json::Value::as_object_mut),
                         None => root_auth.as_object_mut(),
                     };
                     if let Some(obj) = target_obj {
@@ -2431,12 +2510,12 @@ pub(crate) fn probe_one_profile_usage(data: &Path, provider: &str, profile: &str
         "sylphx" => {
             let _key = read_first_non_empty_file(
                 &prof_dir,
-                &[
-                    ".config/opencode/sylphx.key",
-                    ".config/desk/sylphx-ai/key",
-                ],
+                &[".config/opencode/sylphx.key", ".config/desk/sylphx-ai/key"],
             )?;
-            let resp = http.get("https://api.models.sylphx.ai/health").call().ok()?;
+            let resp = http
+                .get("https://api.models.sylphx.ai/health")
+                .call()
+                .ok()?;
             let body = resp.into_body().read_to_string().ok()?;
             let val: serde_json::Value = serde_json::from_str(&body).ok()?;
             if val.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
@@ -2521,9 +2600,9 @@ pub(crate) fn poke_agent_wake_socket(data: &Path, agent_id: &AgentId) {
 }
 
 pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>) {
-    let filter = target
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("refresh") && !s.eq_ignore_ascii_case("reset"));
+    let filter = target.map(str::trim).filter(|s| {
+        !s.is_empty() && !s.eq_ignore_ascii_case("refresh") && !s.eq_ignore_ascii_case("reset")
+    });
     if let Ok(agents_dir) = std::fs::read_dir(data.join("agents")) {
         for entry in agents_dir.flatten() {
             let _ = std::fs::remove_file(
@@ -2926,7 +3005,8 @@ pub(crate) fn try_rotate_exhausted_profile(
             &format!("{now_ms}\n"),
         );
     }
-    let cur_pct = probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
+    let cur_pct =
+        probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
     if has_active_quota_hold && cur_pct.is_some_and(|p| p > 5) {
         write_profile_marker(
             &cfg,
@@ -2946,7 +3026,8 @@ pub(crate) fn try_rotate_exhausted_profile(
     if available.len() <= 1 {
         return None;
     }
-    let is_exhausted = cur_pct == Some(0) || (has_active_quota_hold && cur_pct.is_none_or(|p| p <= 5));
+    let is_exhausted =
+        cur_pct == Some(0) || (has_active_quota_hold && cur_pct.is_none_or(|p| p <= 5));
     if !is_exhausted {
         return None;
     }
@@ -2974,11 +3055,7 @@ pub(crate) fn try_rotate_exhausted_profile(
         .filter(|(name, _)| name != &current_prof)
         .filter_map(|(name, _)| {
             let pct = probe_profile_remaining_pct(data, &provider, name, agent.model.as_deref())?;
-            (pct >= 20).then_some((
-                name.clone(),
-                counts.get(name).copied().unwrap_or(0),
-                pct,
-            ))
+            (pct >= 20).then_some((name.clone(), counts.get(name).copied().unwrap_or(0), pct))
         })
         .min_by_key(|(_, assigned, pct)| (*assigned, std::cmp::Reverse(*pct)))
         .map(|(name, _, _)| name)?;
@@ -3094,7 +3171,9 @@ fn select_or_bind_profile(
             .collect();
         let best_tier = scored
             .iter()
-            .map(|(_, has_quota, healthy, assigned, _)| (*has_quota, *healthy, std::cmp::Reverse(*assigned)))
+            .map(|(_, has_quota, healthy, assigned, _)| {
+                (*has_quota, *healthy, std::cmp::Reverse(*assigned))
+            })
             .max()
             .unwrap_or((true, true, std::cmp::Reverse(0)));
         let candidates: Vec<&(String, PathBuf)> = scored

@@ -878,12 +878,11 @@ impl<H: Harness + 'static> Session<H> {
         };
         let now = self.inner.clock.now_ms();
         let started_at = *self.quota_started_at.get_or_insert(now);
-        let rotated_after_start = fs::read_to_string(
-            self.paths.config_dir.join(".anyagents-profile-rotated-ms"),
-        )
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .is_some_and(|ms| ms >= started_at);
+        let rotated_after_start =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .is_some_and(|ms| ms >= started_at);
         if rotated_after_start || now >= reset_at {
             self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
@@ -995,8 +994,8 @@ impl<H: Harness + 'static> Session<H> {
         if recorded {
             self.served = Some(served);
             self.written = 0;
-            self.turns_recorded = turns_served;
             if delivery.harness().health().turn_state == TurnState::Idle {
+                self.turns_recorded = turns_served;
                 let _ = delivery.store().note_turn_completed(&self.id);
                 self.completed_turn_in_session = true;
             }

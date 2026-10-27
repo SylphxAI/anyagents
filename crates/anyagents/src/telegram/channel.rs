@@ -774,7 +774,12 @@ fn cached_probe_members(token: &str, chat_id: i64, bot: &str) -> bool {
     if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some() {
         return probe_members(token, chat_id, bot);
     }
-    let Some(bot_id) = bot.split(':').next().map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(bot_id) = bot
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return false;
     };
     let key = (chat_id, bot_id.to_string());

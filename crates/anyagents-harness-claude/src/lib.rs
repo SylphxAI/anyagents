@@ -479,7 +479,8 @@ impl Harness for ClaudeHarness {
     }
 
     fn turns_served(&self) -> u32 {
-        lock(&self.shared).usages.len() as u32
+        let state = lock(&self.shared);
+        (state.usages.len() + state.failures.len()) as u32
     }
 
     /// The total of every turn this process has finished. A total rather than
@@ -688,10 +689,25 @@ fn apply_result(state: &mut State, value: &Value) {
     // An errored result (a sign-in failure, a vendor error) is not a successful
     // turn: its ids finish, but with the vendor's own reason instead of usage.
     if let Some(reason) = result_error(value) {
+        let is_oauth_expired = reason.contains("OAuth session expired")
+            || reason.contains("Failed to authenticate: OAuth");
         let ids = std::mem::take(&mut state.open);
         for id in ids {
-            state.finished.insert(id.clone());
+            if is_oauth_expired {
+                state.seen.remove(&id);
+                state.echoed.remove(&id);
+                state.finished.remove(&id);
+            } else {
+                state.finished.insert(id.clone());
+            }
             state.failures.push((id, reason.clone()));
+        }
+        if is_oauth_expired {
+            if let Some(child) = state.child.as_mut() {
+                let _ = child.kill();
+            }
+            state.alive = false;
+            return;
         }
         promote_followups(state);
         return;
