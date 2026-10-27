@@ -523,6 +523,9 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
             let stopping = slot.stop.load(Ordering::SeqCst);
             let busy = slot.busy.load(Ordering::SeqCst);
             if (!finished && !stopping) || busy {
+                slot.woken.store(true, Ordering::SeqCst);
+                drop(workers);
+                inner.clock.poke();
                 return;
             }
             let thread = slot.thread.take();
@@ -815,10 +818,11 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn wait_backoff(&mut self) -> bool {
+        let started_at = self.inner.clock.now_ms();
         if self.restart_at.is_none() {
             self.attempt = self.attempt.saturating_add(1);
             let delay = restart_delay_ms(self.attempt, salt_for(&self.id, self.attempt));
-            self.restart_at = Some(self.inner.clock.now_ms().saturating_add(delay));
+            self.restart_at = Some(started_at.saturating_add(delay));
         }
         self.publish();
         let Some(deadline) = self.restart_at else {
@@ -827,6 +831,15 @@ impl<H: Harness + 'static> Session<H> {
         while self.inner.clock.now_ms() < deadline {
             if self.stop.load(Ordering::SeqCst) {
                 return false;
+            }
+            let rotated =
+                fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .is_some_and(|ms| ms >= started_at);
+            if rotated {
+                self.attempt = 0;
+                break;
             }
             self.inner.clock.wait(Some(deadline), &self.woken);
         }
