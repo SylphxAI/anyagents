@@ -158,6 +158,8 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
     let Ok(agents) = store.list_agents() else {
         return;
     };
+    #[cfg(unix)]
+    let host_home = crate::sandbox::host_home_dir();
     let by_id: std::collections::HashMap<String, String> = agents
         .iter()
         .map(|a| (a.id.to_string(), a.name.clone()))
@@ -172,6 +174,10 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
             .as_ref()
             .and_then(|pid| by_id.get(pid.as_str()).cloned());
         write_agent_instructions(&cfg, agent, parent_name.as_deref());
+        #[cfg(unix)]
+        if let Some(ref hh) = host_home {
+            ensure_seat_skills(&cfg, hh);
+        }
         if let Some((_, _, gid, _)) =
             crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
         {
@@ -355,6 +361,47 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
 }
 
 #[cfg(unix)]
+pub(crate) fn sync_canonical_skills(data_dir: &Path) {
+    let data_skills = data_dir.join("skills");
+    let resolved_skills = std::fs::canonicalize(&data_skills)
+        .ok()
+        .or_else(|| {
+            let wt = PathBuf::from("/scratch/wt/sylphx-skills/skills");
+            wt.is_dir().then_some(wt)
+        });
+    if let Some(skills_dir) = resolved_skills
+        && let Some(repo_root) = skills_dir.parent()
+        && repo_root.join(".git").exists()
+    {
+        let is_clean = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+        if is_clean {
+            let _ = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo_root)
+                .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    let owners_main = Path::new("/scratch/wt/owners-main");
+    if owners_main.is_dir() && data_skills.is_dir() {
+        let agents_dir = owners_main.join(".agents");
+        let _ = std::fs::create_dir_all(&agents_dir);
+        let dst = agents_dir.join("skills");
+        if !dst.exists() {
+            let _ = std::os::unix::fs::symlink(&data_skills, &dst);
+        }
+    }
+}
+
+#[cfg(unix)]
 pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
     let data_skills = target_config
         .parent()
@@ -398,16 +445,65 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
     ] {
         let dst = target_config.join(rel);
         if let Ok(meta) = std::fs::symlink_metadata(&dst) {
-            if meta.file_type().is_symlink() && !dst.exists() {
-                let _ = std::fs::remove_file(&dst);
-            } else {
+            if meta.file_type().is_symlink()
+                && dst.exists()
+                && std::fs::read_link(&dst).ok().as_deref() == Some(skills_root.as_path())
+            {
                 continue;
+            }
+            if meta.file_type().is_dir() {
+                let _ = std::fs::remove_dir_all(&dst);
+            } else {
+                let _ = std::fs::remove_file(&dst);
             }
         }
         if let Some(parent) = dst.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::os::unix::fs::symlink(&skills_root, &dst);
+        if std::os::unix::fs::symlink(&skills_root, &dst).is_err()
+            && !crate::sandbox::is_isolated_test_env()
+            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+            && let Some(anc_meta) = dst
+                .parent()
+                .and_then(|p| p.ancestors().find(|a| a.exists()))
+                .and_then(|a| std::fs::metadata(a).ok())
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            let uid = anc_meta.uid();
+            let gid = anc_meta.gid();
+            if uid != 0
+                && let Some(parent) = Path::new(rel).parent()
+            {
+                let rel_parent = if parent.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    parent
+                };
+                let uid_s = uid.to_string();
+                let gid_s = gid.to_string();
+                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
+                    .current_dir(target_config)
+                    .args([
+                        "--reuid",
+                        &uid_s,
+                        "--regid",
+                        &gid_s,
+                        "--groups",
+                        &gid_s,
+                        "--no-new-privs",
+                        "--",
+                        "sh",
+                        "-c",
+                        "mkdir -p \"$1\" && chmod a+rx \"$1\" && rm -rf \"$2\" && ln -sfn \"$3\" \"$2\"",
+                        "sh",
+                    ])
+                    .arg(rel_parent)
+                    .arg(rel)
+                    .arg(&skills_root)
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
     }
 }
 

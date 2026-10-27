@@ -209,6 +209,8 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                 let root = reaper_root.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     crate::browser::reap_idle_browsers(&root);
+                    #[cfg(unix)]
+                    crate::create::sync_canonical_skills(&root);
                 })
                 .await;
             }
