@@ -621,7 +621,7 @@ impl StreamHarness {
                 }
             }
         }
-        if let Some((rpc, session_id, child_pid, cached_port, mut planner_config, generation)) =
+        if let Some((rpc, mut session_id, child_pid, cached_port, mut planner_config, generation)) =
             agy_steer_ctx
         {
             let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
@@ -638,8 +638,15 @@ impl StreamHarness {
                 }
                 state.http_port = Some(port);
             }
-            let running = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+            let (resolved_sid, running) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
                 .map_err(HarnessError::Failed)?;
+            if resolved_sid != session_id {
+                session_id = resolved_sid;
+                let mut state = lock(&self.shared);
+                if state.generation == generation && state.alive {
+                    state.session_id = Some(session_id.clone());
+                }
+            }
             if running {
                 let mut state = lock(&self.shared);
                 if state.generation != generation || !state.alive {
@@ -1302,29 +1309,76 @@ fn resolve_agy_http_port(
         return Some(port);
     }
     let log_path = rpc.config_dir.join(".gemini/antigravity-cli/cli.log");
-    let text = std::fs::read_to_string(&log_path).ok()?;
-    let pid_needle =
-        child_pid.map(|pid| format!("Starting language server process with pid {pid}"));
-    let mut pid_matched = pid_needle.is_none();
-    let mut found_port = None;
-    for line in text.lines() {
-        if let Some(ref needle) = pid_needle
-            && line.contains(needle)
-        {
-            pid_matched = true;
-            found_port = None;
-            continue;
+    if let Ok(text) = std::fs::read_to_string(&log_path) {
+        let pid_needle =
+            child_pid.map(|pid| format!("Starting language server process with pid {pid}"));
+        let mut pid_matched = pid_needle.is_none();
+        let mut found_port = None;
+        for line in text.lines() {
+            if let Some(ref needle) = pid_needle
+                && line.contains(needle)
+            {
+                pid_matched = true;
+                found_port = None;
+                continue;
+            }
+            if pid_matched
+                && let Some((_, after)) =
+                    line.split_once("Language server listening on random port at ")
+                && let Some(port_str) = after.strip_suffix(" for HTTP")
+                && let Ok(port) = port_str.trim().parse::<u16>()
+            {
+                found_port = Some(port);
+            }
         }
-        if pid_matched
-            && let Some((_, after)) =
-                line.split_once("Language server listening on random port at ")
-            && let Some(port_str) = after.strip_suffix(" for HTTP")
-            && let Ok(port) = port_str.trim().parse::<u16>()
-        {
-            found_port = Some(port);
+        if found_port.is_some() {
+            return found_port;
         }
     }
-    found_port
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child_pid {
+        return resolve_agy_http_port_from_proc(pid, &rpc.csrf_token);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_agy_http_port_from_proc(pid: u32, csrf_token: &str) -> Option<u16> {
+    let fd_dir = format!("/proc/{pid}/fd");
+    let mut inodes = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(&fd_dir) {
+        for entry in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(entry.path())
+                && let Some(s) = target.to_str()
+                && let Some(rest) = s.strip_prefix("socket:[")
+                && let Some(inode) = rest.strip_suffix(']')
+            {
+                inodes.insert(inode.to_string());
+            }
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    let tcp_text = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).ok()?;
+    let mut candidate_ports = Vec::new();
+    for line in tcp_text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() > 9 && parts[3] == "0A" && inodes.contains(parts[9]) {
+            if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
+                && ip_hex == "0100007F"
+                && let Ok(port) = u16::from_str_radix(port_hex, 16)
+            {
+                candidate_ports.push(port);
+            }
+        }
+    }
+    for port in candidate_ports {
+        if agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({})).is_ok() {
+            return Some(port);
+        }
+    }
+    None
 }
 
 fn agy_rpc_post(
@@ -1386,15 +1440,37 @@ fn agy_rpc_post(
 /// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
 const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
-fn agy_rpc_is_running(port: u16, csrf_token: &str, session_id: &str) -> Result<bool, String> {
+fn agy_rpc_is_running(
+    port: u16,
+    csrf_token: &str,
+    session_id: &str,
+) -> Result<(String, bool), String> {
     let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
-    let status = resp
-        .get("trajectorySummaries")
-        .and_then(|m| m.get(session_id))
-        .and_then(|s| s.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    Ok(status == "CASCADE_RUN_STATUS_RUNNING")
+    let Some(summaries) = resp.get("trajectorySummaries").and_then(Value::as_object) else {
+        return Ok((session_id.to_string(), false));
+    };
+    if let Some(entry) = summaries.get(session_id) {
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok((
+            session_id.to_string(),
+            status == "CASCADE_RUN_STATUS_RUNNING",
+        ));
+    }
+    if let Some((cid, _)) = summaries.iter().find(|(_, v)| {
+        v.get("status").and_then(Value::as_str) == Some("CASCADE_RUN_STATUS_RUNNING")
+    }) {
+        return Ok((cid.clone(), true));
+    }
+    if summaries.len() == 1
+        && let Some((cid, v)) = summaries.iter().next()
+    {
+        let status = v.get("status").and_then(Value::as_str).unwrap_or_default();
+        return Ok((cid.clone(), status == "CASCADE_RUN_STATUS_RUNNING"));
+    }
+    Ok((session_id.to_string(), false))
 }
 
 fn agy_rpc_is_latest_step_quota_error(
