@@ -939,6 +939,25 @@ pub(crate) fn set_provider_profile(
             }
         }
     }
+    if provider == "google-antigravity" {
+        let tok_dir = dir.join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&tok_dir)?;
+        let tok_path = tok_dir.join("antigravity-oauth-token");
+        std::fs::write(&tok_path, format!("{trimmed}\n"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tok_path, std::fs::Permissions::from_mode(0o600));
+        }
+        let _ = std::fs::remove_file(dir.join(".config/opencode/google.key"));
+        propagate_profile_files_to_bound_agents(
+            data,
+            provider,
+            profile,
+            &[".gemini/antigravity-cli/antigravity-oauth-token"],
+        );
+        return Ok((provider.to_string(), profile.to_string()));
+    }
     let key_filenames: &[&str] = match provider {
         "kimi-code-plan" => &["kimi-code-plan.key", "kimi.key"],
         "qwen-token-plan" => &["qwen-coding-plan.key", "qwen.key"],
@@ -1149,6 +1168,26 @@ fn json_oauth_expires_at(bytes: &[u8]) -> Option<i64> {
         .and_then(serde_json::Value::as_i64)
 }
 
+fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
+    let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    for ptr in [
+        "/id_token_email",
+        "/tokens/account_id",
+        "/claudeAiOauth/refreshToken",
+        "/token/refresh_token",
+    ] {
+        if let Some(s) = val
+            .pointer(ptr)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+    }
+    None
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     let Ok(src_meta) = std::fs::metadata(src) else {
         return false;
@@ -1176,6 +1215,13 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     {
         if let Ok(dst_bytes) = std::fs::read(dst) {
             if src_bytes == dst_bytes {
+                return false;
+            }
+            if let (Some(src_id), Some(dst_id)) = (
+                json_oauth_identity(&src_bytes),
+                json_oauth_identity(&dst_bytes),
+            ) && src_id != dst_id
+            {
                 return false;
             }
             if let (Some(src_exp), Some(dst_exp)) = (
@@ -1414,7 +1460,11 @@ pub(crate) fn sync_and_list_provider_profiles(
     // auto-failover any agent bound to an exhausted (`0% left`) profile when another
     // profile under the same upstream provider has healthy quota (`>= 20% left`), and
     // auto-clear any stale session quota hold when the bound profile now has `> 0%` left.
-    let now_ms = anyagents_core::now_ms();
+    let active_names: std::collections::BTreeSet<String> = agents
+        .iter()
+        .filter(|a| a.state == "running")
+        .map(|a| a.name.clone())
+        .collect();
     for agent in &agents {
         if agent.state == "archived" {
             continue;
@@ -1430,51 +1480,50 @@ pub(crate) fn sync_and_list_provider_profiles(
             Some(s) if !s.is_empty() => (expected_provider.clone(), s.to_string()),
             _ => (expected_provider.clone(), "default".to_string()),
         };
-        if bound_prov == expected_provider && bound_prof != agent.name {
+        let has_dedicated = entries
+            .iter()
+            .any(|e| e.provider == expected_provider && e.profile == agent.name);
+        if bound_prov == expected_provider && bound_prof != agent.name && has_dedicated {
             let affinity_pct = entries
                 .iter()
                 .find(|e| e.provider == expected_provider && e.profile == agent.name)
                 .and_then(|e| e.usage.as_deref())
                 .and_then(|u| parse_remaining_pct_from_usage(u, agent.model.as_deref()));
-            if affinity_pct.is_some_and(|p| p >= 10) {
+            let current_occupied = entries
+                .iter()
+                .find(|e| e.provider == bound_prov && e.profile == bound_prof)
+                .is_some_and(|e| !e.assigned_agents.is_empty());
+            if affinity_pct.is_some_and(|p| p >= 10) || current_occupied {
                 rotate_agent_to_profile(store, data, agent, &expected_provider, &agent.name);
                 bound_prof = agent.name.clone();
             }
         }
-        let mut cur_pct = entries
+        let cur_pct = entries
             .iter()
             .find(|e| e.provider == bound_prov && e.profile == bound_prof)
             .and_then(|e| e.usage.as_deref())
             .and_then(|u| parse_remaining_pct_from_usage(u, agent.model.as_deref()));
-        if cur_pct == Some(0) {
-            if let Some((best_alt, alt_pct)) = entries
+        if agent.state == "running" && cur_pct == Some(0) {
+            if let Some((best_alt, _)) = entries
                 .iter()
-                .filter(|e| e.provider == bound_prov && e.profile != bound_prof)
+                .filter(|e| {
+                    e.provider == bound_prov
+                        && e.profile != bound_prof
+                        && e.assigned_agents.is_empty()
+                        && !active_names.contains(&e.profile)
+                })
                 .filter_map(|e| {
                     let pct = parse_remaining_pct_from_usage(
                         e.usage.as_deref()?,
                         agent.model.as_deref(),
                     )?;
-                    (pct >= 20).then_some((e.profile.clone(), e.assigned_agents.len(), pct))
+                    (pct >= 20).then_some((e.profile.clone(), pct))
                 })
-                .min_by_key(|(_, assigned, pct)| (*assigned, std::cmp::Reverse(*pct)))
-                .map(|(prof, _, pct)| (prof, pct))
+                .max_by_key(|(_, pct)| *pct)
             {
                 rotate_agent_to_profile(store, data, agent, &bound_prov, &best_alt);
                 bound_prof = best_alt;
-                cur_pct = Some(alt_pct);
             }
-        }
-        if cur_pct.is_some_and(|p| p > 5) {
-            if agent.harness == "agy" {
-                clear_stale_agy_quota_error_steps(&cfg);
-            }
-            write_profile_marker(
-                &cfg,
-                ".anyagents-profile-rotated-ms",
-                &format!("{now_ms}\n"),
-            );
-            poke_agent_wake_socket(data, &agent.id);
         }
         let normalized = format!("{bound_prov}/{bound_prof}");
         if bound.as_deref() != Some(normalized.as_str()) {
@@ -3134,9 +3183,12 @@ pub(crate) fn try_rotate_exhausted_profile(
         .collect();
     for other in &all_agents {
         if other.id != agent.id
-            && other.state != "archived"
+            && other.state == "running"
             && upstream_provider_of(&other.harness, other.model.as_deref()) == provider
         {
+            if let Some(c) = counts.get_mut(&other.name) {
+                *c += 1;
+            }
             let other_cfg = agent_config_dir(data, &other.id);
             if let Some(p) = bound_profile_name(&other_cfg) {
                 let prof_name = p.split_once('/').map(|(_, n)| n).unwrap_or(p.as_str());
@@ -3148,13 +3200,13 @@ pub(crate) fn try_rotate_exhausted_profile(
     }
     let best_alt = available
         .iter()
-        .filter(|(name, _)| name != &current_prof)
+        .filter(|(name, _)| name != &current_prof && counts.get(name).copied().unwrap_or(0) == 0)
         .filter_map(|(name, _)| {
             let pct = probe_profile_remaining_pct(data, &provider, name, agent.model.as_deref())?;
-            (pct >= 20).then_some((name.clone(), counts.get(name).copied().unwrap_or(0), pct))
+            (pct >= 20).then_some((name.clone(), pct))
         })
-        .min_by_key(|(_, assigned, pct)| (*assigned, std::cmp::Reverse(*pct)))
-        .map(|(name, _, _)| name)?;
+        .max_by_key(|(_, pct)| *pct)
+        .map(|(name, _)| name)?;
     rotate_agent_to_profile(store, data, agent, &provider, &best_alt);
     Some(format!("{provider}/{best_alt}"))
 }
