@@ -815,6 +815,9 @@ fn is_unrecoverable_thread_error(params: &Value) -> bool {
         || raw.contains("cannot be continued here")
         || raw.contains("pre-sampling compact")
         || raw.contains("context_length_exceeded")
+        || raw.contains("payload too large")
+        || raw.contains("exceeds the maximum accepted size")
+        || raw.contains("\"http_status_code\":413")
 }
 
 fn invalidate_thread(state: &mut State) {
