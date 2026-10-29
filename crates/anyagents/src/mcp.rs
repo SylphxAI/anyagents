@@ -180,6 +180,8 @@ impl Client {
                 || path.ends_with("/rename")
                 || path.ends_with("/role")
                 || path.starts_with("/v1/profiles")
+                || path.starts_with("/v1/schedules")
+                || path.contains("/schedules")
                 || path.contains("/conversation"));
         let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
             (Some(adm), true) => (adm.as_path(), Some(self.socket.as_path())),
@@ -269,6 +271,7 @@ impl Client {
                                 view.seat_uid = adm.seat_uid;
                                 view.seat_gid = adm.seat_gid;
                             }
+                            view.schedules = adm.schedules.clone();
                         }
                     }
                 }
@@ -557,6 +560,37 @@ struct InteractArgs {
     /// New message text when `action = "edit"`, or optional rationale/comment when `action = "vote"`.
     #[serde(default)]
     text: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ScheduleArgs {
+    /// Action: `"set"` (create a one-off `at`, recurring `every`, or event `watch` wake),
+    /// `"list"` (list active schedules), or `"cancel"` (cancel a schedule by `id` or `"all"`).
+    /// Inferred automatically when `at`, `every`, `watch`, or `id` is provided.
+    #[serde(default)]
+    action: Option<String>,
+    /// One-off wake time: relative duration (`"1m"`, `"30s"`, `"2h"`) or ISO-8601 / Unix timestamp (`"2026-10-29T16:30:00Z"`).
+    #[serde(default)]
+    at: Option<String>,
+    /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Fires only when idle and not quota-blocked; a missed wake never double-fires.
+    #[serde(default)]
+    every: Option<String>,
+    /// Event watch specification:
+    /// - `"github:pr:<owner>/<repo>#<num>"` (GitHub PR reaching a terminal state: merged/closed or checks terminal)
+    /// - `"github:check:<owner>/<repo>@<ref>"` (GitHub check runs reaching a terminal state)
+    /// - `"spiron:promise:<id>"` (Spiron promise state change pulled from the public API)
+    /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
+    #[serde(default)]
+    watch: Option<String>,
+    /// Prompt delivered to the agent when the schedule or event watch fires.
+    #[serde(default, alias = "text", alias = "message")]
+    prompt: Option<String>,
+    /// Schedule ID (`sch_...`) or `"all"` when `action = "cancel"`.
+    #[serde(default, alias = "schedule_id")]
+    id: Option<String>,
+    /// Optional target agent name or `agt_...` ID (defaults to this agent; owners/parents can also inspect or manage a peer/child's schedules).
+    #[serde(default, alias = "name", alias = "target")]
+    agent: Option<String>,
 }
 
 fn generate_subagent_name(parent_name: &str) -> String {
@@ -857,6 +891,30 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
+            "inspect" | "status" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("self");
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let resp: AgentsResponse = self.client.get_agents().await?;
+                let view = resp
+                    .agents
+                    .into_iter()
+                    .find(|a| {
+                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
+                            || a.name.eq_ignore_ascii_case(clean)
+                            || a.id == clean
+                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
+                    })
+                    .ok_or_else(|| format!("agent `{clean}` not found"))?;
+                Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                    "agent": view,
+                    "schedules": view.schedules,
+                })))
+            }
             "models" | "catalog" | "profiles" => {
                 let filter = args
                     .profile
@@ -873,7 +931,7 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(catalogs))
             }
             other => Err(format!(
-                "unknown agents action `{other}`; expected `list`, `create`, `rename`, `role`, `harness`, or `models`"
+                "unknown agents action `{other}`; expected `list`, `inspect`, `create`, `rename`, `role`, `harness`, or `models`"
             )),
         }
     }
@@ -1001,16 +1059,15 @@ impl AgentMcp {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        "`subagents inspect` requires `agent` (name or agt_... id)".to_string()
-                    })?;
+                    .unwrap_or("self");
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
                 let resp: AgentsResponse = self.client.get_agents().await?;
                 let view = resp
                     .agents
                     .into_iter()
                     .find(|a| {
-                        a.name.eq_ignore_ascii_case(clean)
+                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
+                            || a.name.eq_ignore_ascii_case(clean)
                             || a.id == clean
                             || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
                     })
@@ -1026,8 +1083,10 @@ impl AgentMcp {
                             agent: view.name.clone(),
                             turns: Vec::new(),
                         });
+                let schedules = view.schedules.clone();
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "subagent": view,
+                    "schedules": schedules,
                     "recent_turns": conv.turns,
                 })))
             }
@@ -1374,6 +1433,42 @@ impl AgentMcp {
             .get(
                 "/v1/browser",
                 Some(serde_json::to_vec(&args).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+    )]
+    async fn schedule(
+        &self,
+        Parameters(args): Parameters<ScheduleArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let target_opt = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string());
+        let path = match target_opt.as_deref() {
+            Some(target) => format!("/v1/agents/{target}/schedules"),
+            None => "/v1/schedules".to_string(),
+        };
+        let body = serde_json::json!({
+            "action": args.action,
+            "at": args.at,
+            "every": args.every,
+            "watch": args.watch,
+            "prompt": args.prompt,
+            "id": args.id,
+            "agent": target_opt,
+        });
+        let response: serde_json::Value = self
+            .client
+            .get(
+                &path,
+                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
             )
             .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))

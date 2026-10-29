@@ -33,6 +33,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         17,
         include_str!("../migrations/018_agent_aliases_and_role.sql"),
     ),
+    (
+        18,
+        include_str!("../migrations/019_agent_schedules.sql"),
+    ),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.

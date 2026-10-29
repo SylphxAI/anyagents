@@ -237,6 +237,20 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                 .await;
             }
         });
+        let sched_store = Arc::clone(&store);
+        let sched_health = state.health.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let st = Arc::clone(&sched_store);
+                let hb = sched_health.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::schedule::tick_schedules_once(&st, &hb, now_ms());
+                })
+                .await;
+            }
+        });
     }
     if let Some(addr) = webhook_listen_addr() {
         match tokio::net::TcpListener::bind(&addr).await {
@@ -266,6 +280,14 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents/{name}/role", post(role_agent_route))
         .route("/v1/agents/{name}/model", post(model_route))
         .route("/v1/agents/{name}/harness", post(harness_route))
+        .route(
+            "/v1/agents/{name}/schedules",
+            get(list_schedules_route).post(schedules_action_route),
+        )
+        .route(
+            "/v1/schedules",
+            get(list_self_schedules_route).post(self_schedules_action_route),
+        )
         .route(
             "/v1/agents/{name}/description",
             get(get_description_route).post(set_description_route),
@@ -355,10 +377,29 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         if auth.is_confined() {
             crate::sandbox::share_socket_with_seats(&path);
         }
+        let health = HealthBoard::default();
+        sync_health_from_primary_socket(data, &health);
+        let sched_store = Arc::clone(&store);
+        let sched_health = health.clone();
+        let sched_data = data.to_path_buf();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let st = Arc::clone(&sched_store);
+                let hb = sched_health.clone();
+                let dd = sched_data.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    sync_health_from_primary_socket(&dd, &hb);
+                    crate::schedule::tick_schedules_once(&st, &hb, now_ms());
+                })
+                .await;
+            }
+        });
         let state = AppState {
             send_namespace: capability_key()?[..16].to_string(),
             store: Arc::clone(&store),
-            health: HealthBoard::default(),
+            health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
             auth,
         };
@@ -369,6 +410,14 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             .route("/v1/agents/{name}/role", post(role_agent_route))
             .route("/v1/agents/{name}/model", post(model_route))
             .route("/v1/agents/{name}/harness", post(harness_route))
+            .route(
+                "/v1/agents/{name}/schedules",
+                get(list_schedules_route).post(schedules_action_route),
+            )
+            .route(
+                "/v1/schedules",
+                get(list_self_schedules_route).post(self_schedules_action_route),
+            )
             .route(
                 "/v1/agents/{name}/description",
                 get(get_description_route).post(set_description_route),
@@ -746,6 +795,351 @@ async fn harness_route(
         )
         .map_err(ApiError::from_store)?;
         Ok(Json(out))
+    })
+    .await
+}
+
+fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
+    #[cfg(unix)]
+    {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let sock = data.join("anyagents.sock");
+        if !sock.exists() {
+            return;
+        }
+        let Ok(mut stream) = UnixStream::connect(&sock) else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+        let auth_hdr = match crate::operator::operator_token(data) {
+            Some(tok) => format!("{}: {tok}\r\n", crate::operator::HEADER),
+            None => String::new(),
+        };
+        let req = format!(
+            "GET /v1/agents HTTP/1.1\r\nHost: localhost\r\n{auth_hdr}Connection: close\r\n\r\n"
+        );
+        if stream.write_all(req.as_bytes()).is_err() {
+            return;
+        }
+        let mut resp = String::new();
+        if stream.read_to_string(&mut resp).is_err() {
+            return;
+        }
+        let Some((head, body)) = resp.split_once("\r\n\r\n") else {
+            return;
+        };
+        if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+            return;
+        }
+        let Some(start) = body.find('{') else {
+            return;
+        };
+        let Some(end) = body.rfind('}') else {
+            return;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&body[start..=end]) else {
+            return;
+        };
+        let Some(arr) = val.get("agents").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for item in arr {
+            let Some(id_str) = item.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Ok(id) = anyagents_core::AgentId::parse(id_str) else {
+                continue;
+            };
+            let alive = item
+                .get("process")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|p| p == "alive");
+            let working = item
+                .get("turn_state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t == "working");
+            let harness_str = item
+                .get("harness")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("codex");
+            let (delivery_mode, steer_support) = declared(harness_str);
+            health.publish(
+                &id,
+                anyagents_supervisor::LiveState {
+                    process_alive: alive,
+                    turn_state: if working {
+                        anyagents_harness::TurnState::InTurn
+                    } else {
+                        anyagents_harness::TurnState::Idle
+                    },
+                    delivery_mode,
+                    steer_support,
+                    quota_reset_at_ms: item
+                        .get("quota_reset_at_ms")
+                        .and_then(serde_json::Value::as_i64),
+                    restart_at_ms: None,
+                    pid: None,
+                    live_harness: item
+                        .get("live_harness")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    live_model: item
+                        .get("live_model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    process_started_at_ms: item
+                        .get("process_started_at_ms")
+                        .and_then(serde_json::Value::as_i64),
+                    last_error: item
+                        .get("last_error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                },
+            );
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ScheduleRequest {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    at: Option<String>,
+    #[serde(default)]
+    every: Option<String>,
+    #[serde(default)]
+    watch: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default, alias = "schedule_id")]
+    id: Option<String>,
+    #[serde(default, alias = "name")]
+    agent: Option<String>,
+}
+
+fn authorize_schedule_target(
+    store: &Store,
+    principal: &Principal,
+    target_name: Option<&str>,
+) -> Result<Agent, ApiError> {
+    match (principal, target_name.map(str::trim).filter(|s| !s.is_empty())) {
+        (Principal::Agent { agent_id, .. }, None) => {
+            store.agent(agent_id).map_err(ApiError::from_store)
+        }
+        (Principal::Agent { agent_id, .. }, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            if clean.eq_ignore_ascii_case("self") {
+                return store.agent(agent_id).map_err(ApiError::from_store);
+            }
+            let found = store.agent_by_name(clean).map_err(ApiError::from_store)?;
+            if &found.id == agent_id || found.parent_id.as_ref() == Some(agent_id) {
+                return Ok(found);
+            }
+            require_admin_or_operator(store, principal, "agents.schedule", &found.name)?;
+            Ok(found)
+        }
+        (Principal::Operator, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            store.agent_by_name(clean).map_err(ApiError::from_store)
+        }
+        (Principal::Operator, None) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "operator schedule call requires an agent name",
+        )),
+    }
+}
+
+async fn list_schedules_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let target = authorize_schedule_target(&state.store, &principal, Some(&name))?;
+        let schedules: Vec<crate::api::ScheduleView> = state
+            .store
+            .list_schedules(Some(&target.id), true)
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(crate::api::ScheduleView::from)
+            .collect();
+        Ok(Json(serde_json::json!({
+            "agent": target.name,
+            "agent_id": target.id.as_str(),
+            "schedules": schedules,
+        })))
+    })
+    .await
+}
+
+async fn list_self_schedules_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        match &principal {
+            Principal::Agent { agent_id, name } => {
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(agent_id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": name,
+                    "agent_id": agent_id.as_str(),
+                    "schedules": schedules,
+                })))
+            }
+            Principal::Operator => {
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(None, true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "schedules": schedules,
+                })))
+            }
+        }
+    })
+    .await
+}
+
+async fn schedules_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(mut body): Json<ScheduleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    body.agent = Some(name);
+    handle_schedule_action(principal, state, body).await
+}
+
+async fn self_schedules_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<ScheduleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    handle_schedule_action(principal, state, body).await
+}
+
+async fn handle_schedule_action(
+    principal: Principal,
+    state: AppState,
+    body: ScheduleRequest,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let has_spec = body.at.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || body.every.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || body.watch.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let action = body
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if has_spec {
+                "create"
+            } else if body.id.is_some() {
+                "cancel"
+            } else {
+                "list"
+            })
+            .to_ascii_lowercase();
+
+        match action.as_str() {
+            "list" | "ls" => {
+                if matches!(principal, Principal::Operator) && body.agent.is_none() {
+                    let schedules: Vec<crate::api::ScheduleView> = state
+                        .store
+                        .list_schedules(None, true)
+                        .map_err(ApiError::from_store)?
+                        .into_iter()
+                        .map(crate::api::ScheduleView::from)
+                        .collect();
+                    return Ok(Json(serde_json::json!({ "schedules": schedules })));
+                }
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "schedules": schedules,
+                })))
+            }
+            "create" | "set" | "add" | "schedule" => {
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let prompt = body.prompt.as_deref().unwrap_or("");
+                let created = crate::schedule::create_agent_schedule(
+                    &state.store,
+                    &state.health,
+                    &target,
+                    body.at.as_deref(),
+                    body.every.as_deref(),
+                    body.watch.as_deref(),
+                    prompt,
+                )
+                .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "schedule": created,
+                    "schedules": schedules,
+                })))
+            }
+            "cancel" | "delete" | "remove" | "clear" | "off" => {
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let id_or_all = body
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("all");
+                let cancelled = state
+                    .store
+                    .cancel_schedule(Some(&target.id), id_or_all)
+                    .map_err(ApiError::from_store)?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "cancelled": cancelled,
+                    "schedules": schedules,
+                })))
+            }
+            other => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"),
+            )),
+        }
     })
     .await
 }
@@ -1610,6 +2004,12 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     };
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = create::resolved_agent_seat_info(store, agent);
+    let schedules = store
+        .list_schedules(Some(&agent.id), true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(crate::api::ScheduleView::from)
+        .collect();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name.clone(),
@@ -1637,6 +2037,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+        schedules,
     })
 }
 

@@ -26,6 +26,7 @@ mod opencode_config;
 mod operator;
 mod reply;
 mod sandbox;
+mod schedule;
 mod server;
 mod signin;
 mod telegram;
@@ -491,6 +492,40 @@ enum Command {
         /// Force headless mode (`false` by default: uses `xvfb-run` real headed GUI for anti-detect stealth).
         #[arg(long)]
         headless: Option<bool>,
+    },
+    /// Schedule one-off (`--at`), recurring (`--every`), or event-watch (`--watch`) wakes, or list/cancel (`--cancel`) schedules.
+    Schedule {
+        /// Optional target agent name or `agt_...` id (defaults to this agent when run inside an agent).
+        agent: Option<String>,
+        /// One-off wake time (`1m`, `30s`, `2026-10-29T16:30:00Z`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Recurring wake interval (`1m`, `5m`, `15m`, `1h`).
+        #[arg(long)]
+        every: Option<String>,
+        /// Event watch (`github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`).
+        #[arg(long)]
+        watch: Option<String>,
+        /// Prompt delivered when the schedule or event watch fires.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Cancel schedule by `sch_...` ID or `all`.
+        #[arg(long)]
+        cancel: Option<String>,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect an agent's live state, schedules, quota/block status, and recent conversation turns.
+    Inspect {
+        /// Agent name or `agt_...` ID (defaults to `self` inside an agent).
+        agent: Option<String>,
+        /// Number of recent turns to include (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1006,7 +1041,249 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             &data, action, target, value, profile, url, selector, text, secret_ref, script, path,
             submit, full_page, wait_ms, headless,
         ),
+        Command::Schedule {
+            agent,
+            at,
+            every,
+            watch,
+            prompt,
+            cancel,
+            json,
+        } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
+        Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_cmd(
+    data: &Path,
+    agent: Option<String>,
+    at: Option<String>,
+    every: Option<String>,
+    watch: Option<String>,
+    prompt: Option<String>,
+    cancel: Option<String>,
+    json: bool,
+) -> Result<(), anyagents_core::Error> {
+    let target = agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+        .or_else(|| client::agent_identity().map(|id| id.to_string()));
+    let action = if cancel.is_some() {
+        "cancel"
+    } else if at.is_some() || every.is_some() || watch.is_some() {
+        "set"
+    } else {
+        "list"
+    };
+    let body = serde_json::json!({
+        "action": action,
+        "at": at,
+        "every": every,
+        "watch": watch,
+        "prompt": prompt,
+        "id": cancel,
+        "agent": target,
+    });
+    if client::can_call_server(data) {
+        let path = match target.as_deref() {
+            Some(t) => format!("/v1/agents/{t}/schedules"),
+            None => "/v1/schedules".to_string(),
+        };
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+        if let Ok(Some(val)) = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &path,
+            Some(bytes),
+            &client::authority(data),
+        ) {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&val)
+                        .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            } else if let Some(s) = val.get("schedule") {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    s.get("id").and_then(|v| v.as_str()).unwrap_or("-"),
+                    s.get("kind").and_then(|v| v.as_str()).unwrap_or("-"),
+                    s.get("spec").and_then(|v| v.as_str()).unwrap_or("-"),
+                    s.get("prompt").and_then(|v| v.as_str()).unwrap_or("-")
+                );
+            } else if let Some(arr) = val.get("schedules").and_then(|v| v.as_array()) {
+                for s in arr {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        s.get("id").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("kind").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("spec").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("state").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("prompt").and_then(|v| v.as_str()).unwrap_or("-")
+                    );
+                }
+            } else {
+                println!("{val}");
+            }
+            return Ok(());
+        }
+    }
+    let store = anyagents_core::Store::open(data.join("state.db"))?;
+    let target_name = target.ok_or_else(|| {
+        anyagents_core::Error::Message("schedule requires an agent name or id".into())
+    })?;
+    let rec = store.agent_by_name(&target_name)?;
+    match action {
+        "cancel" => {
+            let cid = cancel.unwrap_or_default();
+            let count = schedule::cancel_agent_schedule(&store, &rec.id, &cid)
+                .map_err(anyagents_core::Error::Message)?;
+            let out = serde_json::json!({
+                "agent_id": rec.id.to_string(),
+                "agent": rec.name,
+                "cancelled": count,
+                "schedules": schedule::list_agent_schedules(&store, &rec.id, false),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out)
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+            );
+        }
+        "set" => {
+            let prompt_text = prompt.unwrap_or_default();
+            let health = anyagents_supervisor::HealthBoard::default();
+            let created = schedule::create_agent_schedule(
+                &store,
+                &health,
+                &rec,
+                at.as_deref(),
+                every.as_deref(),
+                watch.as_deref(),
+                &prompt_text,
+            )
+            .map_err(anyagents_core::Error::Message)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "agent_id": rec.id.to_string(),
+                        "agent": rec.name,
+                        "schedule": created,
+                    }))
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    created.id, created.kind, created.spec, created.prompt
+                );
+            }
+        }
+        _ => {
+            let list = schedule::list_agent_schedules(&store, &rec.id, false);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "agent_id": rec.id.to_string(),
+                        "agent": rec.name,
+                        "schedules": list,
+                    }))
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            } else {
+                for s in list {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        s.id, s.kind, s.spec, s.state, s.prompt
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_cmd(
+    data: &Path,
+    agent: Option<String>,
+    limit: usize,
+    _json: bool,
+) -> Result<(), anyagents_core::Error> {
+    let target = agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+        .or_else(|| client::agent_identity().map(|id| id.to_string()))
+        .ok_or_else(|| {
+            anyagents_core::Error::Message("inspect requires an agent name or id".into())
+        })?;
+    if client::can_call_server(data)
+        && let Ok(Some(mut listed)) = client::call::<api::AgentsResponse>(
+            data,
+            "GET",
+            "/v1/agents",
+            None,
+            &client::authority(data),
+        )
+    {
+        agent::reconcile_and_enrich_views(data, &mut listed.agents);
+        if let Some(view) = listed.agents.into_iter().find(|a| {
+            a.name.eq_ignore_ascii_case(&target)
+                || a.id == target
+                || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(&target))
+        }) {
+            let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
+            let conv = client::call::<api::ConversationResponse>(
+                data,
+                "GET",
+                &conv_path,
+                None,
+                &client::authority(data),
+            )
+            .ok()
+            .flatten();
+            let schedules = view.schedules.clone();
+            let out = serde_json::json!({
+                "agent": view,
+                "schedules": schedules,
+                "recent_turns": conv.map(|c| c.turns).unwrap_or_default(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out)
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+            );
+            return Ok(());
+        }
+    }
+    let store = anyagents_core::Store::open(data.join("state.db"))?;
+    let rec = store.agent_by_name(&target)?;
+    let schedules = schedule::list_agent_schedules(&store, &rec.id, false);
+    let out = serde_json::json!({
+        "agent": {
+            "id": rec.id.to_string(),
+            "name": rec.name,
+            "role": rec.role,
+            "harness": rec.harness,
+            "model": rec.model,
+            "state": rec.state,
+            "schedules": schedules,
+        },
+        "schedules": schedules,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1913,6 +2190,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
                         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+                        schedules: schedule::list_agent_schedules(&store, &a.id, false),
                     });
                 }
             }

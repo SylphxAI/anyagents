@@ -53,6 +53,49 @@ pub struct AgentView {
     /// Assigned OS seat numeric GID from the agent's `seat_launch` spec.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_gid: Option<u32>,
+    /// Active self-scheduled wakes (`at`, `every`) and event watches (`watch`) owned by this agent.
+    #[serde(default)]
+    pub schedules: Vec<ScheduleView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleView {
+    pub id: String,
+    pub agent_id: String,
+    pub kind: String,
+    pub spec: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_baseline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed: Option<String>,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+impl From<anyagents_core::AgentSchedule> for ScheduleView {
+    fn from(s: anyagents_core::AgentSchedule) -> Self {
+        Self {
+            id: s.id,
+            agent_id: s.agent_id.to_string(),
+            kind: s.kind,
+            spec: s.spec,
+            prompt: s.prompt,
+            interval_ms: s.interval_ms,
+            next_fire_at_ms: s.next_fire_at_ms,
+            last_fired_at_ms: s.last_fired_at_ms,
+            watch_baseline: s.watch_baseline,
+            last_observed: s.last_observed,
+            state: s.state,
+            created_at_ms: s.created_at_ms,
+        }
+    }
 }
 
 fn default_harness() -> String {

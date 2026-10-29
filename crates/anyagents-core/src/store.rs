@@ -84,6 +84,40 @@ impl NewAgent {
     }
 }
 
+/// One self-scheduled wake (`at`, `every`) or event watch (`watch`) owned by an agent.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentSchedule {
+    pub id: String,
+    pub agent_id: AgentId,
+    pub kind: String,
+    pub spec: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_baseline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed: Option<String>,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+/// Input for [`Store::create_schedule`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewSchedule {
+    pub agent_id: AgentId,
+    pub kind: String,
+    pub spec: String,
+    pub prompt: String,
+    pub interval_ms: Option<i64>,
+    pub next_fire_at_ms: Option<i64>,
+    pub watch_baseline: Option<String>,
+}
+
 /// A channel adapter and the bot or account it speaks as.
 ///
 /// `credential_ref` names a secret. The secret itself is never in this row.
@@ -2373,6 +2407,286 @@ impl Store {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
+        let now = now_ms();
+        let mut rand_bytes = [0u8; 8];
+        if let Ok(mut f) = File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut rand_bytes);
+        }
+        let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
+        let conn = self.conn();
+        agent_by_id(&conn, &input.agent_id)?;
+        // Deduplicate identical active recurring/watch schedules for the same agent.
+        if (input.kind == "every" || input.kind == "watch")
+            && let Some(existing_id) = conn
+                .query_row(
+                    "SELECT id FROM agent_schedules
+                     WHERE agent_id = ?1 AND kind = ?2 AND spec = ?3 AND prompt = ?4 AND state = 'active'
+                     LIMIT 1",
+                    params![input.agent_id.as_str(), input.kind, input.spec, input.prompt],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            conn.execute(
+                "UPDATE agent_schedules
+                 SET interval_ms = ?2, next_fire_at_ms = ?3, watch_baseline = COALESCE(?4, watch_baseline)
+                 WHERE id = ?1",
+                params![
+                    existing_id,
+                    input.interval_ms,
+                    input.next_fire_at_ms,
+                    input.watch_baseline
+                ],
+            )?;
+            return schedule_by_id(&conn, &existing_id);
+        }
+        conn.execute(
+            "INSERT INTO agent_schedules (
+                id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, 'active', ?9)",
+            params![
+                id,
+                input.agent_id.as_str(),
+                input.kind,
+                input.spec,
+                input.prompt,
+                input.interval_ms,
+                input.next_fire_at_ms,
+                input.watch_baseline,
+                now,
+            ],
+        )?;
+        schedule_by_id(&conn, &id)
+    }
+
+    pub fn list_schedules(
+        &self,
+        agent_id: Option<&AgentId>,
+        active_only: bool,
+    ) -> Result<Vec<AgentSchedule>, Error> {
+        let conn = self.conn();
+        let mut out = Vec::new();
+        match (agent_id, active_only) {
+            (Some(aid), true) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     WHERE agent_id = ?1 AND state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            (Some(aid), false) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     WHERE agent_id = ?1
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            (None, true) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     WHERE state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            (None, false) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                    last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+             FROM agent_schedules WHERE id = ?1",
+            [id.trim()],
+            schedule_from_row,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    pub fn cancel_schedule(
+        &self,
+        agent_id: Option<&AgentId>,
+        id_or_all: &str,
+    ) -> Result<usize, Error> {
+        let target = id_or_all.trim();
+        let conn = self.conn();
+        let count = if target.eq_ignore_ascii_case("all") || target == "*" {
+            match agent_id {
+                Some(aid) => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE agent_id = ?1 AND state = 'active'",
+                    [aid.as_str()],
+                )?,
+                None => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE state = 'active'",
+                    [],
+                )?,
+            }
+        } else {
+            match agent_id {
+                Some(aid) => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE id = ?1 AND agent_id = ?2 AND state = 'active'",
+                    params![target, aid.as_str()],
+                )?,
+                None => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE id = ?1 AND state = 'active'",
+                    [target],
+                )?,
+            }
+        };
+        Ok(count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_schedule_tick(
+        &self,
+        id: &str,
+        expected_next_fire_at_ms: Option<i64>,
+        new_state: &str,
+        new_next_fire_at_ms: Option<i64>,
+        fired_at_ms: Option<i64>,
+        watch_baseline: Option<&str>,
+        last_observed: Option<&str>,
+    ) -> Result<bool, Error> {
+        let conn = self.conn();
+        let updated = match expected_next_fire_at_ms {
+            Some(expected) => conn.execute(
+                "UPDATE agent_schedules
+                 SET state = ?3,
+                     next_fire_at_ms = ?4,
+                     last_fired_at_ms = COALESCE(?5, last_fired_at_ms),
+                     watch_baseline = COALESCE(?6, watch_baseline),
+                     last_observed = COALESCE(?7, last_observed)
+                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms = ?2",
+                params![
+                    id,
+                    expected,
+                    new_state,
+                    new_next_fire_at_ms,
+                    fired_at_ms,
+                    watch_baseline,
+                    last_observed
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE agent_schedules
+                 SET state = ?2,
+                     next_fire_at_ms = ?3,
+                     last_fired_at_ms = COALESCE(?4, last_fired_at_ms),
+                     watch_baseline = COALESCE(?5, watch_baseline),
+                     last_observed = COALESCE(?6, last_observed)
+                 WHERE id = ?1 AND state = 'active'",
+                params![
+                    id,
+                    new_state,
+                    new_next_fire_at_ms,
+                    fired_at_ms,
+                    watch_baseline,
+                    last_observed
+                ],
+            )?,
+        };
+        Ok(updated == 1)
+    }
+
+    pub fn update_schedule_watch_observation(
+        &self,
+        id: &str,
+        watch_baseline: Option<&str>,
+        last_observed: Option<&str>,
+    ) -> Result<(), Error> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE agent_schedules
+             SET watch_baseline = COALESCE(?2, watch_baseline),
+                 last_observed = COALESCE(?3, last_observed)
+             WHERE id = ?1 AND state = 'active'",
+            params![id, watch_baseline, last_observed],
+        )?;
+        Ok(())
+    }
+}
+
+fn schedule_by_id(conn: &Connection, id: &str) -> Result<AgentSchedule, Error> {
+    conn.query_row(
+        "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+         FROM agent_schedules WHERE id = ?1",
+        [id],
+        schedule_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
+}
+
+fn schedule_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSchedule, rusqlite::Error> {
+    let raw_aid: String = row.get(1)?;
+    let agent_id = AgentId::parse(&raw_aid).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )),
+        )
+    })?;
+    Ok(AgentSchedule {
+        id: row.get(0)?,
+        agent_id,
+        kind: row.get(2)?,
+        spec: row.get(3)?,
+        prompt: row.get(4)?,
+        interval_ms: row.get(5)?,
+        next_fire_at_ms: row.get(6)?,
+        last_fired_at_ms: row.get(7)?,
+        watch_baseline: row.get(8)?,
+        last_observed: row.get(9)?,
+        state: row.get(10)?,
+        created_at_ms: row.get(11)?,
+    })
 }
 
 /// `{data}/agents/{id}/work`.
