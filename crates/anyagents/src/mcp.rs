@@ -173,8 +173,21 @@ impl Client {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
         let body_clone = body.clone();
+        let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
+        let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
+            && (path.ends_with("/harness")
+                || path.ends_with("/model")
+                || path.ends_with("/rename")
+                || path.ends_with("/role")
+                || path.starts_with("/v1/profiles")
+                || path.contains("/conversation"));
+        let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
+            (Some(adm), true) => (adm.as_path(), Some(self.socket.as_path())),
+            (Some(adm), false) if adm.exists() => (self.socket.as_path(), Some(adm.as_path())),
+            _ => (self.socket.as_path(), None),
+        };
         let (mut status, mut bytes) = request_naming(
-            &self.socket,
+            primary_sock,
             method,
             path,
             body,
@@ -184,24 +197,20 @@ impl Client {
         )
         .await?;
         if !status.is_success()
-            && let Some(parent_dir) = self.socket.parent()
+            && let Some(sec_sock) = secondary_sock
+            && let Ok(fallback) = request_naming(
+                sec_sock,
+                method,
+                path,
+                body_clone,
+                Some(&cap),
+                None,
+                named.as_deref(),
+            )
+            .await
+            && fallback.0.is_success()
         {
-            let admin_socket = parent_dir.join("admin.sock");
-            if admin_socket.exists()
-                && let Ok(fallback) = request_naming(
-                    &admin_socket,
-                    method,
-                    path,
-                    body_clone,
-                    Some(&cap),
-                    None,
-                    named.as_deref(),
-                )
-                .await
-                && fallback.0.is_success()
-            {
-                (status, bytes) = fallback;
-            }
+            (status, bytes) = fallback;
         }
         if !status.is_success() {
             return Err(error_message(&bytes));

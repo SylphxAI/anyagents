@@ -85,6 +85,19 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     // A boundary refuses a call that has no credential rather than answering
     // with nothing, so a client notices instead of reading an empty deployment.
     let socket = server::socket_path(data);
+    let admin_socket = data.join("admin.sock");
+    let prefer_admin = admin_socket.exists()
+        && (path.ends_with("/harness")
+            || path.ends_with("/model")
+            || path.ends_with("/rename")
+            || path.ends_with("/role")
+            || path.starts_with("/v1/profiles")
+            || path.contains("/conversation"));
+    let (primary_sock, secondary_sock) = if prefer_admin {
+        (&admin_socket, Some(&socket))
+    } else {
+        (&socket, admin_socket.exists().then_some(&admin_socket))
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -94,7 +107,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         tokio::time::timeout(
             TIMEOUT,
             crate::mcp::request(
-                &socket,
+                primary_sock,
                 method,
                 path,
                 body,
@@ -106,27 +119,25 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         .map_err(|_| "the server did not answer".to_string())?
     })?;
     let (mut status, mut bytes) = answer;
-    if !status.is_success() {
-        let admin_socket = data.join("admin.sock");
-        if admin_socket.exists()
-            && let Ok(Ok(fallback)) = runtime.block_on(async {
-                tokio::time::timeout(
-                    TIMEOUT,
-                    crate::mcp::request(
-                        &admin_socket,
-                        method,
-                        path,
-                        body_clone,
-                        agent_token.as_deref(),
-                        operator_token.as_deref(),
-                    ),
-                )
-                .await
-            })
-            && (fallback.0.is_success() || status.as_u16() == 404)
-        {
-            (status, bytes) = fallback;
-        }
+    if !status.is_success()
+        && let Some(sec_sock) = secondary_sock
+        && let Ok(Ok(fallback)) = runtime.block_on(async {
+            tokio::time::timeout(
+                TIMEOUT,
+                crate::mcp::request(
+                    sec_sock,
+                    method,
+                    path,
+                    body_clone,
+                    agent_token.as_deref(),
+                    operator_token.as_deref(),
+                ),
+            )
+            .await
+        })
+        && (fallback.0.is_success() || status.as_u16() == 404)
+    {
+        (status, bytes) = fallback;
     }
     if !status.is_success() {
         let msg = error_message(&bytes);

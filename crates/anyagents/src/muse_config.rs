@@ -97,7 +97,12 @@ pub fn write(
         "schema_version": 1,
     });
     let mut all = Vec::with_capacity(args.len() + 1);
-    all.push(command.display().to_string());
+    let clean_cmd = command.display().to_string();
+    let clean_cmd = clean_cmd
+        .strip_suffix(" (deleted)")
+        .unwrap_or(clean_cmd.as_str())
+        .to_string();
+    all.push(clean_cmd);
     all.extend(args.iter().cloned());
     root["mcpServers"] = serde_json::json!({
         "anyagents": {

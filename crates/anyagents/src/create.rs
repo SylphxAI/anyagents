@@ -677,8 +677,11 @@ pub(crate) fn seed_harness_credentials(
             ".gemini/config/.migrated",
         ],
         "muse" => &[
+            "settings.json",
+            "muse/settings.json",
             "muse/trust.json",
             "muse/auth.json",
+            ".config/muse/settings.json",
             ".config/muse/trust.json",
             ".config/muse/auth.json",
             ".local/share/muse/auth.json",
