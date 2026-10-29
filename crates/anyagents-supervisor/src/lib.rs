@@ -736,7 +736,7 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    fn boot(&self) -> Boot<H> {
+    fn boot(&mut self) -> Boot<H> {
         let store = match Store::open(self.inner.store.data_dir().join("state.db")) {
             Ok(store) => store,
             Err(_) => return Boot::Retry,
@@ -752,7 +752,11 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    fn launch_harness(&self) -> Result<H, String> {
+    fn launch_harness(&mut self) -> Result<H, String> {
+        if let Ok(fresh) = self.inner.store.agent(&self.id) {
+            self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
+            self.agent = fresh;
+        }
         let _ = fs::create_dir_all(&self.paths.config_dir);
         let _ = fs::create_dir_all(&self.paths.managed_work);
         let _ = fs::create_dir_all(&self.paths.work_dir);

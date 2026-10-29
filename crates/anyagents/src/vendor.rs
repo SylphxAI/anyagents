@@ -243,19 +243,16 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         request.config_dir.display().to_string(),
     ));
     let store_opt = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
-    let parent_name = request
-        .agent
-        .parent_id
+    let seat_hint = store_opt
         .as_ref()
-        .and_then(|pid| store_opt.as_ref().and_then(|s| s.agent(pid).ok()))
-        .map(|p| p.name)
+        .and_then(|s| crate::create::resolve_root_seat_hint(s, &request.agent))
         .or_else(|| {
             env.iter()
                 .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
                 .map(|(_, v)| v.clone())
         });
     let seat_spec =
-        crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, parent_name.as_deref());
+        crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, seat_hint.as_deref());
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir);
     }
@@ -273,7 +270,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             crate::create::write_agent_instructions(
                 &request.config_dir,
                 &request.agent,
-                parent_name.as_deref(),
+                seat_hint.as_deref(),
             );
         }
     }
@@ -295,7 +292,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             dot_config
         };
         if let Some((_, _, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&request.agent.name, parent_name.as_deref())
+            crate::sandbox::seat_for_agent_with_hint(&request.agent.name, seat_hint.as_deref())
         {
             crate::sandbox::share_config_with_seat(&request.config_dir, gid);
         }

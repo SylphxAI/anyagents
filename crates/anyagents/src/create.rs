@@ -968,6 +968,33 @@ pub(crate) fn compute_live_session_continuity(
     None
 }
 
+/// Walks `parent_id` in `state.db` up to the root ancestor so multi-hop sub-agents
+/// (e.g. `prism -> prism-owner-provision -> owner-lootling`) inherit the root
+/// agent's OS seat (`seat-prism`).
+pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<String> {
+    let mut curr = agent.parent_id.clone();
+    let mut hops = 0usize;
+    let mut last_name = None;
+    while let Some(pid) = curr {
+        if hops >= 16 {
+            break;
+        }
+        hops += 1;
+        let Ok(parent) = store.agent(&pid) else {
+            break;
+        };
+        last_name = Some(parent.name);
+        curr = parent.parent_id;
+    }
+    last_name.or_else(|| {
+        agent
+            .launch_env
+            .iter()
+            .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+            .map(|(_, v)| v.clone())
+    })
+}
+
 /// Canonical, idempotent runtime reconciliation for an agent: resolves the
 /// authoritative parent from `state.db`, seeds credentials and model catalogs,
 /// ensures the mailbox capability, computes cross-harness continuity from
@@ -993,6 +1020,7 @@ pub(crate) fn reconcile_agent_runtime_config(
                 .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
                 .map(|(_, v)| v.clone())
         });
+    let seat_hint = resolve_root_seat_hint(store, agent);
     ensure_seat_environment(config);
     seed_harness_credentials(store, data, agent, config);
     if !config.join("mcp-capability").is_file()
@@ -1086,11 +1114,11 @@ pub(crate) fn reconcile_agent_runtime_config(
     }
 
     if let Some((_, _, gid, _)) =
-        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+        crate::sandbox::seat_for_agent_with_hint(&agent.name, seat_hint.as_deref())
     {
         crate::sandbox::share_config_with_seat(config, gid);
         if let Some((_, spec)) =
-            crate::sandbox::seat_launch_spec_with_hint(&agent.name, parent_name.as_deref())
+            crate::sandbox::seat_launch_spec_with_hint(&agent.name, seat_hint.as_deref())
         {
             ensure_seat_op_config(config, &spec);
         }
@@ -1253,6 +1281,11 @@ pub(crate) fn configure_agent_runtime(
             &format!("{}\n", anyagents_core::now_ms()),
         );
     }
+    write_profile_marker(
+        &config,
+        ".anyagents-profile-rotated-ms",
+        &format!("{}\n", anyagents_core::now_ms()),
+    );
     write_profile_marker(
         &config,
         ".anyagents-profile",
