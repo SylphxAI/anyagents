@@ -193,17 +193,20 @@ pub fn format_tokens(n: i64) -> String {
     }
 }
 
-/// Format an agent's combined `(state, process, turn_state, quota_reset_at_ms)` as a semantic status badge.
+/// Format an agent's combined `(state, process, turn_state, quota_reset_at_ms, block_reason)` as a semantic status badge.
 pub fn format_agent_status(
     state: &str,
     process: &str,
     turn_state: &str,
     quota_reset_at_ms: Option<i64>,
+    block_reason: Option<&str>,
 ) -> String {
     let now = anyagents_core::now_ms();
     let on_quota = quota_reset_at_ms.is_some_and(|ms| ms > now && ms - now < 86_400_000 * 7);
+    let is_blocked = block_reason.is_some_and(|r| !r.trim().is_empty()) && !on_quota;
     match (state, process, turn_state) {
         ("running", _, _) if on_quota => yellow("○ quota"),
+        ("running", _, _) if is_blocked => red("○ blocked"),
         ("running", "alive", "working") => bold_green("● working"),
         ("running", "alive", _) => green("○ idle"),
         ("running", "down", _) | ("running", "offline", _) | ("running", "-", _) => {
@@ -217,18 +220,36 @@ pub fn format_agent_status(
     }
 }
 
-/// Format an agent's mailbox lag (`oldest_undelivered_age_ms`) and quota reset.
+/// Format an agent's mailbox lag (`oldest_undelivered_age_ms`), quota reset, and block reason.
 pub fn format_mailbox_lag(
     state: &str,
     oldest_undelivered_age_ms: Option<i64>,
     quota_reset_at_ms: Option<i64>,
+    block_reason: Option<&str>,
 ) -> String {
     let now = anyagents_core::now_ms();
     if let Some(reset_ms) = quota_reset_at_ms
         && reset_ms > now
         && reset_ms - now < 86_400_000 * 7
     {
+        if let Some(age_ms) = oldest_undelivered_age_ms
+            && age_ms > 0
+        {
+            return red(&format!(
+                "! quota ({}) · wait {}",
+                format_duration_ms(reset_ms - now),
+                format_duration_ms(age_ms)
+            ));
+        }
         return red(&format!("! quota ({})", format_duration_ms(reset_ms - now)));
+    }
+    if let Some(reason) = block_reason.map(str::trim).filter(|s| !s.is_empty()) {
+        let short = if reason.chars().count() > 36 {
+            format!("{}…", reason.chars().take(35).collect::<String>())
+        } else {
+            reason.to_string()
+        };
+        return red(&format!("! {short}"));
     }
     match (state, oldest_undelivered_age_ms) {
         ("archived", _) => dim("-"),
@@ -451,10 +472,18 @@ pub fn print_agents_table(
 
     let mut ordered: Vec<(String, &AgentView)> = Vec::with_capacity(agents.len());
     for root in roots {
-        let root_label = match root.state.as_str() {
-            "running" => bold(&root.name),
-            "paused" => root.name.clone(),
-            _ => dim(&root.name),
+        let role_tag = root
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let root_label = match (root.state.as_str(), role_tag) {
+            ("running", Some(r)) => format!("{} {}", bold(&root.name), dim(&format!("· {r}"))),
+            ("running", None) => bold(&root.name),
+            ("paused", Some(r)) => format!("{} {}", root.name, dim(&format!("· {r}"))),
+            ("paused", None) => root.name.clone(),
+            (_, Some(r)) => dim(&format!("{} · {r}", root.name)),
+            (_, None) => dim(&root.name),
         };
         ordered.push((root_label, root));
         if let Some(kids) = children_by_parent.get(root.id.as_str()) {
@@ -504,6 +533,7 @@ pub fn print_agents_table(
             &agent.process,
             &agent.turn_state,
             agent.quota_reset_at_ms,
+            agent.block_reason.as_deref(),
         );
         let harness = if is_dim {
             dim(&agent.harness)
@@ -523,6 +553,7 @@ pub fn print_agents_table(
             &agent.state,
             agent.oldest_undelivered_age_ms,
             agent.quota_reset_at_ms,
+            agent.block_reason.as_deref(),
         );
         let id = dim(&agent.id);
 

@@ -262,6 +262,8 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
+        .route("/v1/agents/{name}/rename", post(rename_agent_route))
+        .route("/v1/agents/{name}/role", post(role_agent_route))
         .route("/v1/agents/{name}/model", post(model_route))
         .route("/v1/agents/{name}/harness", post(harness_route))
         .route(
@@ -274,6 +276,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         )
         .route("/v1/browser", post(browser_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+        .route("/v1/profiles/models", get(profile_models_route))
         .route(
             "/v1/subagent-defaults",
             get(get_subagent_defaults_route).post(set_subagent_defaults_route),
@@ -362,6 +365,8 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         let app = Router::new()
             .route("/v1/agents", get(list_agents).post(create_agent_route))
             .route("/v1/agents/{name}/admin", post(set_admin_route))
+            .route("/v1/agents/{name}/rename", post(rename_agent_route))
+            .route("/v1/agents/{name}/role", post(role_agent_route))
             .route("/v1/agents/{name}/model", post(model_route))
             .route("/v1/agents/{name}/harness", post(harness_route))
             .route(
@@ -374,6 +379,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             )
             .route("/v1/browser", post(browser_route))
             .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+            .route("/v1/profiles/models", get(profile_models_route))
             .route(
                 "/v1/subagent-defaults",
                 get(get_subagent_defaults_route).post(set_subagent_defaults_route),
@@ -819,6 +825,133 @@ async fn model_route(
     ))
 }
 
+#[derive(Deserialize)]
+struct RenameAgentRequest {
+    #[serde(alias = "new_name", alias = "to")]
+    name: String,
+}
+
+async fn rename_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RenameAgentRequest>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let old = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        require_admin_or_operator(&state.store, &principal, "agents.rename", &old.name)?;
+        let updated = state
+            .store
+            .rename_agent(&old.id, &body.name)
+            .map_err(ApiError::from_store)?;
+        let data_dir = state.store.data_dir();
+        if old.name != updated.name {
+            let browsers_dir = data_dir.join("browsers");
+            let old_browser = browsers_dir.join(&old.name);
+            let new_browser = browsers_dir.join(&updated.name);
+            if old_browser.is_dir() && !new_browser.exists() {
+                if std::fs::rename(&old_browser, &new_browser).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&updated.name, &old_browser);
+                    }
+                }
+            }
+        }
+        let cfg = anyagents_core::agent_config_dir(data_dir, &updated.id);
+        let work_dir = updated
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
+        let _ = create::reconcile_agent_runtime_config(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+        );
+        crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
+        Ok(Json(agent_view(&state.store, &state.health, &updated)?))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct RoleAgentRequest {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    clear: Option<bool>,
+}
+
+async fn role_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RoleAgentRequest>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        require_admin_or_operator(&state.store, &principal, "agents.role", &found.name)?;
+        let new_role = if body.clear.unwrap_or(false) {
+            None
+        } else {
+            body.role.as_deref()
+        };
+        let updated = state
+            .store
+            .set_agent_role(&found.id, new_role)
+            .map_err(ApiError::from_store)?;
+        let data_dir = state.store.data_dir();
+        let cfg = anyagents_core::agent_config_dir(data_dir, &updated.id);
+        let work_dir = updated
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
+        let _ = create::reconcile_agent_runtime_config(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+        );
+        crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
+        Ok(Json(agent_view(&state.store, &state.health, &updated)?))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct ProfileModelsQuery {
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+async fn profile_models_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<ProfileModelsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
+    let data = state.store.data_dir().to_path_buf();
+    let prof = query.profile;
+    spawn_store(move || {
+        Ok(Json(create::probe_profile_models_catalog(
+            &data,
+            prof.as_deref(),
+        )))
+    })
+    .await
+}
+
 async fn profiles_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -918,8 +1051,10 @@ async fn set_subagent_defaults_route(
 
 #[derive(Deserialize, Default)]
 struct DescriptionRequest {
-    #[serde(default, alias = "instructions", alias = "role")]
+    #[serde(default, alias = "instructions")]
     description: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     clear: Option<bool>,
 }
@@ -934,11 +1069,14 @@ async fn get_description_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         let system_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
+            "role": rec.role,
+            "aliases": aliases,
             "description": rec.instructions,
             "system_prompt": system_prompt,
         })))
@@ -955,6 +1093,7 @@ async fn set_description_route(
     spawn_store(move || {
         if name.eq_ignore_ascii_case("all")
             && body.description.is_none()
+            && body.role.is_none()
             && !body.clear.unwrap_or(false)
         {
             require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
@@ -996,6 +1135,18 @@ async fn set_description_route(
             )?;
         }
         let mut rec = target;
+        if let Some(ref role_str) = body.role {
+            require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+            rec = state
+                .store
+                .set_agent_role(&rec.id, Some(role_str.as_str()))
+                .map_err(ApiError::from_store)?;
+            crate::telegram::sync_agent_telegram_bot_name(
+                &state.store,
+                state.store.data_dir(),
+                &rec,
+            );
+        }
         if body.clear.unwrap_or(false) {
             rec = state
                 .store
@@ -1028,9 +1179,12 @@ async fn set_description_route(
             &cfg,
             &work_dir,
         );
+        let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
+            "role": rec.role,
+            "aliases": aliases,
             "description": rec.instructions,
             "system_prompt_synced": true,
         })))
@@ -1333,28 +1487,88 @@ fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> 
     }))
 }
 
+pub(crate) fn compute_block_reason(
+    quota_reset_at_ms: Option<i64>,
+    last_error: Option<&str>,
+    now_ms: i64,
+) -> Option<String> {
+    if quota_reset_at_ms.is_some_and(|ms| ms > now_ms) {
+        return Some("quota_exhausted".to_string());
+    }
+    if let Some(err) = last_error.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = err.to_ascii_lowercase();
+        if lower.contains("quota")
+            || lower.contains("resource_exhausted")
+            || lower.contains("rate_limit")
+        {
+            return Some("quota_exhausted".to_string());
+        }
+        if lower.contains("sign in")
+            || lower.contains("not logged in")
+            || lower.contains("unauthorized")
+        {
+            return Some("sign_in_required".to_string());
+        }
+        return Some("delivery_error".to_string());
+    }
+    None
+}
+
 fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
     let now = now_ms();
     let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
     let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
-    let session_quota = if agent.harness == "claude-code" {
-        let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-        anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now)
+    let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+    let (session_quota, session_error) = if agent.harness == "claude-code" {
+        (
+            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
+            None,
+        )
+    } else if agent.harness == "agy" {
+        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
     } else {
-        None
+        (None, None)
     };
-    let (process, turn_state, mode, steer, mut quota) = match health.get(&agent.id) {
+    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let (
+        process,
+        turn_state,
+        mode,
+        steer,
+        mut quota,
+        live_harness,
+        live_model,
+        process_started_at_ms,
+        pending_switch,
+        mut last_error,
+    ) = match health.get(&agent.id) {
         Some(live) => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
+            let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
                 && effective_quota.is_none()
                 && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn);
+            let switch_pending = live.process_alive
+                && (live
+                    .live_harness
+                    .as_deref()
+                    .is_some_and(|h| h != agent.harness)
+                    || live.live_model != agent.model
+                    || live.process_started_at_ms.is_some_and(|s| rotated_ms > s));
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
                 mode_name(live.delivery_mode),
                 steer_name(live.steer_support),
                 effective_quota,
+                live.live_harness.clone(),
+                live.live_model.clone(),
+                live.process_started_at_ms,
+                switch_pending,
+                effective_err,
             )
         }
         None => {
@@ -1365,6 +1579,11 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
                 mode_name(mode),
                 steer_name(steer),
                 session_quota,
+                None,
+                None,
+                None,
+                false,
+                session_error,
             )
         }
     };
@@ -1372,14 +1591,37 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         && create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some()
     {
         quota = None;
+        last_error = None;
     }
+    let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
+    let oldest_undelivered_age_ms = match lag.oldest_undelivered_age_ms {
+        Some(age) => Some(age),
+        None if has_open_turn
+            && (quota.is_some() || last_error.is_some() || turn_state != "working") =>
+        {
+            store.open_turn(&agent.id).ok().flatten().map(|open| {
+                open.messages
+                    .first()
+                    .map(|m| now.saturating_sub(m.received_at_ms))
+                    .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
+            })
+        }
+        None => None,
+    };
+    let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = create::resolved_agent_seat_info(store, agent);
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name.clone(),
+        role: agent.role.clone(),
+        aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
         harness: agent.harness.clone(),
         model: agent.model.clone(),
+        live_harness,
+        live_model,
+        process_started_at_ms,
+        pending_switch,
         workdir: agent.workdir.clone(),
         state: agent.state.clone(),
         process: process.to_string(),
@@ -1387,7 +1629,9 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         delivery_mode: mode.to_string(),
         steer_support: steer.to_string(),
         quota_reset_at_ms: quota,
-        oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
+        block_reason,
+        last_error,
+        oldest_undelivered_age_ms,
         install: install_state(store, agent),
         description: agent.instructions.clone(),
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
@@ -1456,6 +1700,7 @@ async fn create_agent_route(
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
+                role: body.role,
                 harness,
                 model,
                 profile,
@@ -1800,6 +2045,7 @@ fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::Grou
             out.push(crate::api::GroupMemberView {
                 id: agent.id.to_string(),
                 name: agent.name,
+                role: agent.role,
                 harness: agent.harness,
                 model: agent.model,
                 state: agent.state,
@@ -1947,7 +2193,13 @@ async fn inbox(
             agent_id,
             name: own_name,
         } => {
-            if name != agent_id.as_str() && name != own_name.as_str() {
+            let matches_self = name == agent_id.as_str()
+                || name == own_name.as_str()
+                || state
+                    .store
+                    .agent_by_name(&name)
+                    .is_ok_and(|a| a.id == *agent_id);
+            if !matches_self {
                 return Err(ApiError::forbidden(
                     "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
                 ));
@@ -2088,10 +2340,19 @@ async fn send(
     };
     let actor = match (&principal, route_named) {
         (_, Some(named)) => named,
-        (Principal::Agent { name, .. }, None) => {
+        (Principal::Agent { agent_id, name }, None) => {
             if let Some(named) = body.sender.as_deref() {
                 Actor::parse(named).and_then(|named| {
-                    if named.as_address() == Actor::Agent(name.clone()).as_address() {
+                    let matches_self = named.as_address()
+                        == Actor::Agent(name.clone()).as_address()
+                        || match &named {
+                            Actor::Agent(n) => state
+                                .store
+                                .agent_by_name(n)
+                                .is_ok_and(|a| a.id == *agent_id),
+                            _ => false,
+                        };
+                    if matches_self {
                         Ok(())
                     } else {
                         Err(ApiError::forbidden(

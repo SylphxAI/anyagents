@@ -203,6 +203,10 @@ pub struct LiveState {
     pub quota_reset_at_ms: Option<i64>,
     pub restart_at_ms: Option<i64>,
     pub pid: Option<u32>,
+    pub live_harness: Option<String>,
+    pub live_model: Option<String>,
+    pub process_started_at_ms: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 /// Latest [`LiveState`] for each agent the supervisor has touched.
@@ -489,6 +493,10 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
+                live_harness: None,
+                live_model: None,
+                process_started_at_ms: None,
+                last_error: None,
             },
         );
     }
@@ -609,6 +617,9 @@ fn run_agent<H: Harness + 'static>(
         pending_recovery: false,
         completed_turn_in_session: false,
         quota_started_at: None,
+        process_started_at: None,
+        process_profile_rotated_ms: 0,
+        last_error: None,
     };
     session.run()
 }
@@ -673,6 +684,9 @@ struct Session<H: Harness> {
     /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
     /// can clear the quota hold before `reset_at`.
     quota_started_at: Option<i64>,
+    process_started_at: Option<i64>,
+    process_profile_rotated_ms: i64,
+    last_error: Option<String>,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -760,13 +774,29 @@ impl<H: Harness + 'static> Session<H> {
         let _ = fs::create_dir_all(&self.paths.config_dir);
         let _ = fs::create_dir_all(&self.paths.managed_work);
         let _ = fs::create_dir_all(&self.paths.work_dir);
-        (self.inner.launch)(LaunchRequest {
+        let rotated_ms =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        let res = (self.inner.launch)(LaunchRequest {
             agent: self.agent.clone(),
             data_dir: self.inner.store.data_dir().to_path_buf(),
             config_dir: self.paths.config_dir.clone(),
             work_dir: self.paths.work_dir.clone(),
             extra_env: self.inner.extra_env.clone(),
-        })
+        });
+        match &res {
+            Ok(_) => {
+                self.process_started_at = Some(self.inner.clock.now_ms());
+                self.process_profile_rotated_ms = rotated_ms;
+                self.last_error = None;
+            }
+            Err(err) => {
+                self.last_error = Some(err.clone());
+            }
+        }
+        res
     }
 
     fn process_alive(&self) -> bool {
@@ -803,6 +833,18 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         None
                     },
+                    live_harness: health.process_alive.then(|| self.agent.harness.clone()),
+                    live_model: if health.process_alive {
+                        self.agent.model.clone()
+                    } else {
+                        None
+                    },
+                    process_started_at_ms: if health.process_alive {
+                        self.process_started_at
+                    } else {
+                        None
+                    },
+                    last_error: health.sign_in_fault.or_else(|| self.last_error.clone()),
                 }
             }
             None => {
@@ -815,6 +857,10 @@ impl<H: Harness + 'static> Session<H> {
                     quota_reset_at_ms: None,
                     restart_at_ms: self.restart_at,
                     pid: None,
+                    live_harness: None,
+                    live_model: None,
+                    process_started_at_ms: None,
+                    last_error: self.last_error.clone(),
                 }
             }
         };
@@ -881,10 +927,6 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn quota_waiting(&mut self) -> bool {
-        if !self.process_alive() {
-            self.quota_started_at = None;
-            return false;
-        }
         let reset_at = self
             .delivery
             .as_ref()
@@ -900,10 +942,16 @@ impl<H: Harness + 'static> Session<H> {
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .is_some_and(|ms| ms >= started_at);
-        if rotated_after_start || now >= reset_at {
+        let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
+            fresh.harness != self.agent.harness || fresh.model != self.agent.model
+        });
+        if rotated_after_start || config_switched || now >= reset_at {
             self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();
+            }
+            if rotated_after_start || config_switched {
+                self.replace_process();
             }
             return false;
         }
@@ -930,6 +978,7 @@ impl<H: Harness + 'static> Session<H> {
                 // New mailbox messages just woke the session directly; any open
                 // turn from before a process restart is now superseded by them.
                 self.pending_recovery = false;
+                self.last_error = None;
                 self.written = self
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
@@ -940,6 +989,9 @@ impl<H: Harness + 'static> Session<H> {
                 // The mailbox has drained, so whatever the vendor reported for
                 // this burst is read once and recorded.
                 self.record_usage();
+                if self.try_apply_pending_switch() {
+                    return false;
+                }
                 if self.pending_recovery && self.recover_once() {
                     return false;
                 }
@@ -959,7 +1011,8 @@ impl<H: Harness + 'static> Session<H> {
                 self.replace_process();
                 false
             }
-            Err(anyagents_agent::Error::HarnessFailed(_)) => {
+            Err(anyagents_agent::Error::HarnessFailed(err)) => {
+                self.last_error = Some(err);
                 if !self.wait_backoff() {
                     return false;
                 }
@@ -972,6 +1025,41 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
         }
+    }
+
+    /// When a running agent's configured harness, model, or profile changed
+    /// while it was working, replace the live process automatically as soon as
+    /// the current turn and any background commands finish.
+    fn try_apply_pending_switch(&mut self) -> bool {
+        let (is_idle, pid) = {
+            let Some(delivery) = self.delivery.as_ref() else {
+                return false;
+            };
+            let health = delivery.harness().health();
+            (
+                health.turn_state == TurnState::Idle,
+                delivery.harness().process_id(),
+            )
+        };
+        if !is_idle || harness_has_inflight_processes(pid) {
+            return false;
+        }
+        let Ok(fresh) = self.inner.store.agent(&self.id) else {
+            return false;
+        };
+        let current_rotated_ms =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        let config_changed = fresh.harness != self.agent.harness
+            || fresh.model != self.agent.model
+            || current_rotated_ms > self.process_profile_rotated_ms;
+        if !config_changed {
+            return false;
+        }
+        self.replace_process();
+        true
     }
 
     /// Record the usage the harness served since the last row. It is read when

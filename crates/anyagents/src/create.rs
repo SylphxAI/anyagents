@@ -10,6 +10,7 @@ use crate::{install, mcp_config, muse_config, opencode_config};
 
 pub struct CreateRequest {
     pub name: String,
+    pub role: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub profile: Option<String>,
@@ -20,10 +21,21 @@ pub struct CreateRequest {
     pub parent_id: Option<AgentId>,
 }
 
+pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
+    if name.starts_with("owner-") {
+        return name.to_string();
+    }
+    match role.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => format!("{name} · {r}"),
+        None => name.to_string(),
+    }
+}
+
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
     // A harness is installed only if an adapter can start it.
     install::adapter(&request.harness)?;
     let mut new = NewAgent::new(request.name, request.harness);
+    new.role = request.role;
     new.model = request.model;
     new.instructions = request.instructions;
     new.parent_id = request.parent_id;
@@ -160,6 +172,14 @@ pub(crate) fn write_agent_instructions_with_continuity(
         name = agent.name,
         id = agent.id,
     );
+    if let Some(role) = agent
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        doc.push_str(&format!("- **Role Label**: `{role}`\n"));
+    }
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
             "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `archive({{}})` to retire yourself.\n"
@@ -1354,6 +1374,10 @@ pub(crate) fn configure_agent_runtime(
         ".anyagents-profile",
         &format!("{normalized_profile}\n"),
     );
+    let _ = std::fs::remove_file(config.join(".anyagents-last-error.json"));
+    if updated.harness == "agy" {
+        clear_stale_agy_quota_error_steps(&config);
+    }
 
     let work_dir = updated
         .workdir
@@ -1361,6 +1385,7 @@ pub(crate) fn configure_agent_runtime(
         .map(PathBuf::from)
         .unwrap_or_else(|| agent_work_dir(data, &updated.id));
     reconcile_agent_runtime_config(store, data, &updated, &config, &work_dir)?;
+    poke_agent_wake_socket(data, &updated.id);
 
     let process = if lock_busy { "alive" } else { "down" };
     let turn_state = if in_progress_turn { "working" } else { "idle" };
@@ -3609,6 +3634,7 @@ pub(crate) fn rotate_agent_to_profile(
         ".anyagents-profile-rotated-ms",
         &format!("{}\n", anyagents_core::now_ms()),
     );
+    let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
     seed_harness_credentials(store, data, agent, &cfg);
     let parent_name = agent
         .parent_id
@@ -3620,11 +3646,145 @@ pub(crate) fn rotate_agent_to_profile(
     {
         crate::sandbox::share_config_with_seat(&cfg, gid);
     }
-    restart_agent_harness_process(store, agent);
+    if !store.has_open_turn(&agent.id).unwrap_or(false) {
+        restart_agent_harness_process(store, agent);
+    }
     if agent.harness == "agy" {
         clear_stale_agy_quota_error_steps(&cfg);
     }
     poke_agent_wake_socket(data, &agent.id);
+}
+
+/// Probes the exact model catalog and per-model quota availability for upstream
+/// provider profiles (especially `google-antigravity/<profile>`).
+pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) -> serde_json::Value {
+    let filter = target.map(str::trim).filter(|s| {
+        !s.is_empty() && !s.eq_ignore_ascii_case("models") && !s.eq_ignore_ascii_case("all")
+    });
+    let http = ureq::Agent::config_builder()
+        .timeout_global(Some(std::time::Duration::from_secs(6)))
+        .build()
+        .new_agent();
+
+    let mut agy_cli_models = Vec::new();
+    let agy_bin = if Path::new("/home/kyle/.local/bin/agy").is_file() {
+        "/home/kyle/.local/bin/agy"
+    } else {
+        "agy"
+    };
+    if let Ok(out) = std::process::Command::new(agy_bin).arg("models").output()
+        && out.status.success()
+    {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        for line in stdout.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("Available models:") {
+                continue;
+            }
+            let (left, right) = trimmed.split_once("  ").unwrap_or((trimmed, ""));
+            let id = left.trim();
+            if id.is_empty() {
+                continue;
+            }
+            let is_default = right.contains("(default)");
+            let label = right.replace("(default)", "").trim().to_string();
+            agy_cli_models.push(serde_json::json!({
+                "id": id,
+                "label": label,
+                "default": is_default,
+            }));
+        }
+    }
+
+    let mut profiles_out = Vec::new();
+    let profiles_root = data.join("profiles");
+    if let Ok(providers) = std::fs::read_dir(&profiles_root) {
+        let mut prov_list: Vec<_> = providers.flatten().collect();
+        prov_list.sort_by_key(|e| e.file_name());
+        for prov_entry in prov_list {
+            let prov_path = prov_entry.path();
+            if !prov_path.is_dir() {
+                continue;
+            }
+            let provider = prov_entry.file_name().to_string_lossy().into_owned();
+            if filter.is_none() && provider != "google-antigravity" {
+                continue;
+            }
+            let Ok(prof_dirs) = std::fs::read_dir(&prov_path) else {
+                continue;
+            };
+            let mut prof_list: Vec<_> = prof_dirs.flatten().collect();
+            prof_list.sort_by_key(|e| e.file_name());
+            for prof_entry in prof_list {
+                let prof_dir = prof_entry.path();
+                if !prof_dir.is_dir() {
+                    continue;
+                }
+                let profile = prof_entry.file_name().to_string_lossy().into_owned();
+                let full_name = format!("{provider}/{profile}");
+                if let Some(f) = filter
+                    && f != provider
+                    && f != profile
+                    && f != full_name
+                    && !(f == "agy" && provider == "google-antigravity")
+                {
+                    continue;
+                }
+                if provider == "google-antigravity" {
+                    let _ = probe_one_profile_usage(data, &provider, &profile);
+                    let tok_path = prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+                    let mut backend_models = Vec::new();
+                    if let Ok(tok_text) = std::fs::read_to_string(&tok_path)
+                        && let Ok(tok_val) = serde_json::from_str::<serde_json::Value>(&tok_text)
+                        && let Some(tok) = tok_val
+                            .pointer("/token/access_token")
+                            .or_else(|| tok_val.get("access_token"))
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                        && let Ok(resp) = http
+                            .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:fetchAvailableModels")
+                            .header("authorization", &format!("Bearer {tok}"))
+                            .header("content-type", "application/json")
+                            .header("user-agent", "antigravity")
+                            .send(b"{}")
+                        && let Ok(body) = resp.into_body().read_to_string()
+                        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
+                        && let Some(models_obj) = val.get("models").and_then(|m| m.as_object())
+                    {
+                        for (model_id, m) in models_obj {
+                            let qi = m.get("quotaInfo");
+                            let rem_pct = qi
+                                .and_then(|q| q.get("remainingFraction"))
+                                .and_then(|v| v.as_f64())
+                                .map(|f| (f * 100.0).clamp(0.0, 100.0).round() as i64)
+                                .unwrap_or(0);
+                            let reset_time = qi
+                                .and_then(|q| q.get("resetTime"))
+                                .and_then(|v| v.as_str());
+                            backend_models.push(serde_json::json!({
+                                "id": model_id,
+                                "display_name": m.get("displayName").and_then(|v| v.as_str()),
+                                "remaining_pct": rem_pct,
+                                "reset_time": reset_time,
+                            }));
+                        }
+                    }
+                    profiles_out.push(serde_json::json!({
+                        "profile": full_name,
+                        "provider": provider,
+                        "cli_models": agy_cli_models,
+                        "backend_models": backend_models,
+                    }));
+                }
+            }
+        }
+    }
+
+    serde_json::json!({
+        "agy_cli_models": agy_cli_models,
+        "profiles": profiles_out,
+    })
 }
 
 /// Checks if `agent`'s currently bound profile has recovered quota (`> 5% left`
@@ -4130,6 +4290,7 @@ mod tests {
         let parent = store
             .create_agent(anyagents_core::NewAgent {
                 name: "prism".to_string(),
+                role: None,
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
                 workdir: Some("/scratch/wt/owners-main".to_string()),
@@ -4140,6 +4301,7 @@ mod tests {
         let owner = store
             .create_agent(anyagents_core::NewAgent {
                 name: "owner-anymd".to_string(),
+                role: None,
                 harness: "opencode".to_string(),
                 model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
                 workdir: Some("/scratch/wt/owners-main".to_string()),

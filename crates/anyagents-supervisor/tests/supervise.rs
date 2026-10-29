@@ -789,3 +789,48 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
     }));
     drop(supervisor);
 }
+
+#[test]
+fn a_model_or_harness_change_automatically_switches_running_process_at_next_idle_point() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut new_agent = NewAgent::new("alpha", "claude-code");
+    new_agent.model = Some("sonnet".to_string());
+    let agent = store.create_agent(new_agent).unwrap();
+    let work = dir.path().join("work-switch");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_699_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock) as Arc<dyn Clock>,
+        scripted("idle", log),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor.live(&agent.id).is_some_and(|live| {
+            live.pid.is_some()
+                && live.process_alive
+                && live.live_harness.as_deref() == Some("claude-code")
+                && live.live_model.as_deref() == Some("sonnet")
+        })
+    }));
+    let first_pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+
+    // Update the agent's model in the store while it is idle: the supervisor
+    // automatically replaces the running process and records the new live model.
+    store.set_agent_model(&agent.id, "opus").unwrap();
+    assert!(wait_until(|| {
+        supervisor.live(&agent.id).is_some_and(|live| {
+            live.process_alive
+                && live.pid.is_some()
+                && live.pid != Some(first_pid)
+                && live.live_model.as_deref() == Some("opus")
+        })
+    }));
+    drop(supervisor);
+}

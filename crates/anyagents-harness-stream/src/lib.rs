@@ -1047,9 +1047,9 @@ fn read_stdout(
                     state.http_port,
                 )
             };
-            let mut is_stale_quota = last_step_type
-                .as_deref()
-                .is_some_and(|st| st != "error_message" && st != "user_input");
+            let mut is_stale_quota = last_step_type.as_deref().is_some_and(|st| {
+                st != "error_message" && st != "user_input" && st != "system_message"
+            });
             if !is_stale_quota
                 && let (Some(rpc), Some(sid)) = (agy_rpc.as_ref(), session_id.as_deref())
                 && let Some(port) = resolve_agy_http_port(rpc, cached_port, child_pid)
@@ -1068,6 +1068,30 @@ fn read_stdout(
                     effect.finishes_turn = true;
                     effect.usage = Some(spec.usage_of(&value));
                 }
+            }
+        }
+        if let Some(ref rpc) = agy_rpc {
+            if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+                let err_msg = value
+                    .pointer("/result/error")
+                    .or_else(|| value.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("RESOURCE_EXHAUSTED: quota reached");
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let _ = std::fs::write(
+                    rpc.config_dir.join(".anyagents-last-error.json"),
+                    serde_json::json!({
+                        "error": err_msg,
+                        "quota_reset_at_ms": reset_at_ms,
+                        "timestamp_ms": now_ms,
+                    })
+                    .to_string(),
+                );
+            } else if effect.finishes_turn {
+                let _ = std::fs::remove_file(rpc.config_dir.join(".anyagents-last-error.json"));
             }
         }
         {
@@ -1629,6 +1653,79 @@ fn parse_resets_in_ms(text: &str) -> Option<i64> {
         }
     }
     (matched_unit && !has_digits && total_ms > 0).then_some(total_ms)
+}
+
+/// Inspect `<config_dir>/.anyagents-last-error.json` and the latest Antigravity
+/// CLI log under `<config_dir>/.gemini/antigravity-cli/log/cli-*.log` to detect
+/// an active quota reset timestamp (`> now_ms`) and the latest sanitized harness
+/// delivery error after any profile/model rotation.
+pub fn detect_agy_session_quota_and_error(
+    config_dir: &Path,
+    now_ms: i64,
+) -> (Option<i64>, Option<String>) {
+    let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    if let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+    {
+        let ts = val.get("timestamp_ms").and_then(Value::as_i64).unwrap_or(0);
+        if ts > rotated_ms {
+            let err = val.get("error").and_then(Value::as_str).map(str::to_string);
+            let reset = val
+                .get("quota_reset_at_ms")
+                .and_then(Value::as_i64)
+                .filter(|&r| r > now_ms);
+            if reset.is_some() || err.is_some() {
+                return (reset, err);
+            }
+        }
+    }
+    let log_dir = config_dir.join(".gemini/antigravity-cli/log");
+    let Ok(entries) = std::fs::read_dir(&log_dir) else {
+        return (None, None);
+    };
+    let mut logs: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("cli-") || !name.ends_with(".log") {
+            continue;
+        }
+        if let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+            && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+        {
+            let mtime_ms = dur.as_millis() as i64;
+            if mtime_ms > rotated_ms {
+                logs.push((mtime_ms, p));
+            }
+        }
+    }
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (mtime_ms, path) in logs.into_iter().take(3) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines().rev() {
+            if let Some((_, after)) = line.split_once("run ended with error and no response: ") {
+                let err_str = after.trim().to_string();
+                let reset = parse_resets_in_ms(&err_str)
+                    .map(|d| mtime_ms.saturating_add(d))
+                    .filter(|&r| r > now_ms);
+                return (reset, Some(err_str));
+            }
+            if line.contains("Sending user message to conversation")
+                && !text.contains("run ended with error and no response:")
+            {
+                return (None, None);
+            }
+        }
+    }
+    (None, None)
 }
 
 /// The line that puts one message into the child.

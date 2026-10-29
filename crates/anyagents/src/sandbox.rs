@@ -199,8 +199,13 @@ pub fn pinned_uid(agent_name: &str) -> Option<u32> {
 }
 
 /// The seat user name a host provisions for one agent: `seat-<name>`.
+/// `plutus` was renamed in-place from `argon` and retains its provisioned
+/// `seat-argon` OS seat (`2101:2101`).
 fn seat_user(agent_name: &str) -> String {
-    format!("seat-{}", agent_name.to_ascii_lowercase())
+    match agent_name.to_ascii_lowercase().as_str() {
+        "plutus" => "seat-argon".to_string(),
+        lower => format!("seat-{lower}"),
+    }
 }
 
 fn lookup_user(name: &str) -> Option<(u32, u32)> {

@@ -36,7 +36,7 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
      reply_to, received_at_ms, delivered_at_ms, origin, context";
 
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id, is_admin";
+     created_at_ms, launch_env, parent_id, is_admin, role";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub struct Agent {
     pub is_admin: bool,
     pub id: AgentId,
     pub name: String,
+    pub role: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
@@ -61,6 +62,7 @@ pub struct Agent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewAgent {
     pub name: String,
+    pub role: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
@@ -72,6 +74,7 @@ impl NewAgent {
     pub fn new(name: impl Into<String>, harness: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            role: None,
             harness: harness.into(),
             model: None,
             workdir: None,
@@ -586,10 +589,17 @@ impl Store {
         if new.harness.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
+        let clean_role = new
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
+            role: clean_role,
             harness: new.harness,
             model: new.model,
             workdir: new.workdir,
@@ -611,8 +621,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -622,6 +632,7 @@ impl Store {
                 agent.instructions,
                 agent.created_at_ms,
                 agent.parent_id.as_ref().map(|id| id.as_str()),
+                agent.role,
             ],
         )?;
         tx.execute(
@@ -659,6 +670,9 @@ impl Store {
             "UPDATE agents SET model = ?2 WHERE id = ?1",
             params![agent_id.as_str(), model],
         )?;
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
         Ok(())
     }
 
@@ -667,13 +681,91 @@ impl Store {
         if clean.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
+        let updated = {
+            let conn = self.conn();
+            agent_by_id(&conn, agent_id)?;
+            conn.execute(
+                "UPDATE agents SET harness = ?2 WHERE id = ?1",
+                params![agent_id.as_str(), clean],
+            )?;
+            agent_by_id(&conn, agent_id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(updated)
+    }
+
+    /// Rename an agent in place while preserving its immutable `AgentId`,
+    /// mailbox, sessions, grants, and recording the old name in `agent_aliases`.
+    pub fn rename_agent(&self, agent_id: &AgentId, new_name: &str) -> Result<Agent, Error> {
+        let clean = new_name
+            .trim()
+            .strip_prefix("agent:")
+            .unwrap_or(new_name.trim());
+        validate_token(clean, "agent name")?;
+        let updated = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = agent_by_id(&tx, agent_id)?;
+            if current.name == clean {
+                return Ok(current);
+            }
+            let taken: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM agents WHERE name = ?1 AND id != ?2",
+                params![clean, agent_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if taken != 0 {
+                return Err(Error::AgentExists(clean.to_string()));
+            }
+            tx.execute(
+                "UPDATE agents SET name = ?2 WHERE id = ?1",
+                params![agent_id.as_str(), clean],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO agent_aliases (alias, agent_id, created_at_ms) VALUES (?1, ?2, ?3)",
+                params![current.name, agent_id.as_str(), now_ms()],
+            )?;
+            tx.execute("DELETE FROM agent_aliases WHERE alias = ?1", [clean])?;
+            let _ = tx.execute(
+                "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1",
+                params![agent_id.as_str(), clean],
+            );
+            let updated = agent_by_id(&tx, agent_id)?;
+            tx.commit()?;
+            updated
+        };
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(updated)
+    }
+
+    /// Set or clear an agent's short role label (e.g. `"Spiron"`, `"Design"`, `"Revenue"`).
+    pub fn set_agent_role(&self, id: &AgentId, role: Option<&str>) -> Result<Agent, Error> {
+        let clean = role.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
-        agent_by_id(&conn, agent_id)?;
+        agent_by_id(&conn, id)?;
         conn.execute(
-            "UPDATE agents SET harness = ?2 WHERE id = ?1",
-            params![agent_id.as_str(), clean],
+            "UPDATE agents SET role = ?1 WHERE id = ?2",
+            params![clean, id.as_str()],
         )?;
-        agent_by_id(&conn, agent_id)
+        agent_by_id(&conn, id)
+    }
+
+    /// Former names recorded for this agent via `rename_agent`.
+    pub fn agent_aliases(&self, id: &AgentId) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT alias FROM agent_aliases WHERE agent_id = ?1 ORDER BY created_at_ms DESC",
+        )?;
+        let mut rows = stmt.query([id.as_str()])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
     }
 
     /// Administrative metadata only; callers must never pass credentials here.
@@ -710,7 +802,21 @@ impl Store {
                 agent_from_row,
             )
             .optional()?;
-        found.ok_or_else(|| Error::AgentNotFound(name.to_string()))
+        if let Some(agent) = found {
+            return Ok(agent);
+        }
+        let aliased = conn
+            .query_row(
+                "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
+                        a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role \
+                 FROM agent_aliases al \
+                 JOIN agents a ON a.id = al.agent_id \
+                 WHERE al.alias = ?1",
+                [lookup],
+                agent_from_row,
+            )
+            .optional()?;
+        aliased.ok_or_else(|| Error::AgentNotFound(name.to_string()))
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
@@ -759,6 +865,9 @@ impl Store {
         let author = sender
             .as_deref()
             .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+        let author_id = author
+            .as_deref()
+            .and_then(|a| self.agent_by_name(a).ok().map(|ag| ag.id));
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
@@ -767,6 +876,7 @@ impl Store {
             }
             if author.as_deref() == Some(agent.name.as_str())
                 || author.as_deref() == Some(agent.id.as_str())
+                || author_id.as_ref() == Some(&agent.id)
             {
                 continue;
             }
@@ -1283,9 +1393,8 @@ impl Store {
                     [id.as_str()],
                     |r| {
                         let pid: String = r.get(0)?;
-                        AgentId::parse(&pid).map_err(|err| {
-                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                        })
+                        AgentId::parse(&pid)
+                            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
                     },
                 )
                 .optional()?;
@@ -1384,6 +1493,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let agent = agent_by_id(&tx, id)?;
             for table in [
+                "agent_aliases",
                 "agent_capabilities",
                 "usage_records",
                 "mailbox_cursors",
@@ -2537,6 +2647,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         is_admin: row.get(10)?,
         id: agent_id,
         name: row.get(1)?,
+        role: row.get(11)?,
         harness: row.get(2)?,
         model: row.get(3)?,
         workdir: row.get(4)?,
@@ -3865,5 +3976,43 @@ mod tests {
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
         store.receive(&child.id, Incoming::new("task 3")).unwrap();
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+    }
+
+    #[test]
+    fn rename_agent_preserves_id_grants_history_and_resolves_old_alias_and_role() {
+        let (_dir, store) = setup();
+        let argon = agent(&store, "argon");
+        store.set_agent_admin(&argon.id, true).unwrap();
+        store.join_group("owners", &argon.id).unwrap();
+        store
+            .receive(&argon.id, Incoming::new("revenue check"))
+            .unwrap();
+
+        let renamed = store.rename_agent(&argon.id, "plutus").unwrap();
+        assert_eq!(renamed.id, argon.id);
+        assert_eq!(renamed.name, "plutus");
+        assert!(renamed.is_admin);
+
+        let with_role = store.set_agent_role(&argon.id, Some("Revenue")).unwrap();
+        assert_eq!(with_role.role.as_deref(), Some("Revenue"));
+
+        // Old name resolves via alias table
+        let by_old = store.agent_by_name("argon").unwrap();
+        assert_eq!(by_old.id, argon.id);
+        assert_eq!(by_old.name, "plutus");
+        assert_eq!(by_old.role.as_deref(), Some("Revenue"));
+
+        let by_prefixed = store.agent_by_name("agent:argon").unwrap();
+        assert_eq!(by_prefixed.id, argon.id);
+
+        assert_eq!(
+            store.agent_aliases(&argon.id).unwrap(),
+            vec!["argon".to_string()]
+        );
+        assert_eq!(
+            store.group_members("owners").unwrap(),
+            vec!["plutus".to_string()]
+        );
+        assert_eq!(store.inbox(&argon.id, None).unwrap().len(), 1);
     }
 }

@@ -9,9 +9,21 @@ pub struct AgentView {
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     pub harness: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub pending_switch: bool,
     pub workdir: Option<String>,
     pub state: String,
     pub process: String,
@@ -20,6 +32,10 @@ pub struct AgentView {
     pub delivery_mode: String,
     pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     /// Age of the oldest message the harness has not taken yet.
     pub oldest_undelivered_age_ms: Option<i64>,
     /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
@@ -47,6 +63,8 @@ fn default_harness() -> String {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     #[serde(default = "default_harness")]
     pub harness: String,
     #[serde(default)]
@@ -67,6 +85,8 @@ pub struct CreateAgentRequest {
 pub struct GroupMemberView {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,

@@ -1258,9 +1258,9 @@ fn resolve_fill_value(
         let mut cmd = Command::new("op");
         cmd.args(["read", "--no-newline", candidate]);
         configure_op_command(&mut cmd);
-        let out = cmd.output().map_err(|_| {
-            Error::Message("failed to invoke `op` CLI for secret reference".into())
-        })?;
+        let out = cmd
+            .output()
+            .map_err(|_| Error::Message("failed to invoke `op` CLI for secret reference".into()))?;
         if !out.status.success() {
             return Err(Error::Message(format!(
                 "1Password secret resolution failed (exit code {})",
@@ -1290,9 +1290,9 @@ fn resolve_fill_value(
             cmd.args(["item", "get", trimmed, "--otp"]);
         }
         configure_op_command(&mut cmd);
-        let out = cmd.output().map_err(|_| {
-            Error::Message("failed to invoke `op` CLI for OTP reference".into())
-        })?;
+        let out = cmd
+            .output()
+            .map_err(|_| Error::Message("failed to invoke `op` CLI for OTP reference".into()))?;
         if !out.status.success() {
             return Err(Error::Message(format!(
                 "1Password OTP resolution failed (exit code {})",

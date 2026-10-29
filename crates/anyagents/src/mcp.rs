@@ -183,7 +183,7 @@ impl Client {
             named.as_deref(),
         )
         .await?;
-        if status.as_u16() == 404
+        if !status.is_success()
             && let Some(parent_dir) = self.socket.parent()
         {
             let admin_socket = parent_dir.join("admin.sock");
@@ -198,6 +198,7 @@ impl Client {
                     named.as_deref(),
                 )
                 .await
+                && fallback.0.is_success()
             {
                 (status, bytes) = fallback;
             }
@@ -206,6 +207,65 @@ impl Client {
             return Err(error_message(&bytes));
         }
         serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+    }
+
+    async fn get_agents(&self) -> Result<AgentsResponse, String> {
+        let mut resp: AgentsResponse = self.get("/v1/agents", None).await?;
+        if let Some(parent_dir) = self.socket.parent() {
+            let admin_socket = parent_dir.join("admin.sock");
+            if admin_socket.exists() {
+                let named = crate::client::agent_identity().map(|id| id.to_string());
+                let cap = self.current_capability();
+                if let Ok((st, bytes)) = request_naming(
+                    &admin_socket,
+                    "GET",
+                    "/v1/agents",
+                    None,
+                    Some(&cap),
+                    None,
+                    named.as_deref(),
+                )
+                .await
+                    && st.is_success()
+                    && let Ok(admin_resp) = serde_json::from_slice::<AgentsResponse>(&bytes)
+                {
+                    let by_id: std::collections::HashMap<String, AgentView> = admin_resp
+                        .agents
+                        .into_iter()
+                        .map(|a| (a.id.clone(), a))
+                        .collect();
+                    for view in &mut resp.agents {
+                        if let Some(adm) = by_id.get(&view.id) {
+                            view.name = adm.name.clone();
+                            if adm.role.is_some() {
+                                view.role = adm.role.clone();
+                            }
+                            if !adm.aliases.is_empty() {
+                                view.aliases = adm.aliases.clone();
+                            }
+                            if view.quota_reset_at_ms.is_none() {
+                                view.quota_reset_at_ms = adm.quota_reset_at_ms;
+                            }
+                            if view.block_reason.is_none() {
+                                view.block_reason = adm.block_reason.clone();
+                            }
+                            if view.last_error.is_none() {
+                                view.last_error = adm.last_error.clone();
+                            }
+                            if view.oldest_undelivered_age_ms.is_none() {
+                                view.oldest_undelivered_age_ms = adm.oldest_undelivered_age_ms;
+                            }
+                            if adm.seat_user.is_some() {
+                                view.seat_user = adm.seat_user.clone();
+                                view.seat_uid = adm.seat_uid;
+                                view.seat_gid = adm.seat_gid;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(resp)
     }
 }
 
@@ -287,8 +347,11 @@ struct ConversationArgs {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct AgentsArgs {
     /// Action to perform: `"list"` (default: list agents), `"create"` (admin-only: create a
-    /// standalone root agent with no parent), or `"harness"` (admin-only: declaratively update
-    /// an agent's harness/model/profile).
+    /// standalone root agent with no parent), `"rename"` (admin-only: rename an agent in place
+    /// while preserving its `agt_...` ID and keeping the old name as a live alias), `"role"`
+    /// (admin-only: set or clear an agent's short role label), `"harness"` (admin-only:
+    /// declaratively update an agent's harness/model/profile), or `"models"` (list upstream
+    /// provider profile model catalogs).
     #[serde(default)]
     action: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"archived"`, or `"all"` (default `"all"`).
@@ -298,9 +361,19 @@ struct AgentsArgs {
     /// or `"root"` (persistent root agents with no parent).
     #[serde(default)]
     parent: Option<String>,
-    /// Agent name when `action` is `"create"` or `"harness"`.
+    /// Agent name when `action` is `"create"`, `"rename"`, `"role"`, or `"harness"`.
     #[serde(default, alias = "agent", alias = "id", alias = "target")]
     name: Option<String>,
+    /// New agent name when `action = "rename"`.
+    #[serde(default, alias = "to")]
+    new_name: Option<String>,
+    /// Short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...)
+    /// when `action` is `"create"` or `"role"`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Set `true` to clear the role label when `action = "role"`.
+    #[serde(default)]
+    clear: Option<bool>,
     /// Harness catalog ID when `action` is `"create"` or `"harness"` (`codex`, `claude-code`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     #[serde(default)]
     harness: Option<String>,
@@ -314,7 +387,7 @@ struct AgentsArgs {
     #[serde(default)]
     workdir: Option<String>,
     /// Optional system/role description or standing instructions when `action = "create"`.
-    #[serde(default, alias = "description", alias = "role")]
+    #[serde(default, alias = "description")]
     instructions: Option<String>,
     /// Optional initial message to deliver when `action = "create"`.
     #[serde(default)]
@@ -327,6 +400,9 @@ struct SpawnArgs {
     /// `<caller>-sub-<id>` name is generated automatically.
     #[serde(default)]
     name: Option<String>,
+    /// Optional short role label for the spawned agent.
+    #[serde(default)]
+    role: Option<String>,
     /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
     #[serde(default)]
@@ -341,7 +417,7 @@ struct SpawnArgs {
     #[serde(default)]
     workdir: Option<String>,
     /// Optional system/role description or standing instructions for the spawned agent.
-    #[serde(default, alias = "description", alias = "role")]
+    #[serde(default, alias = "description")]
     instructions: Option<String>,
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
@@ -355,8 +431,11 @@ struct DescribeArgs {
     agent: Option<String>,
     /// New role/responsibility description to set (syncs into the agent's private system prompt and group roster).
     /// Omit to read the current description.
-    #[serde(default, alias = "instructions", alias = "role", alias = "text")]
+    #[serde(default, alias = "instructions", alias = "text")]
     description: Option<String>,
+    /// Optional short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...).
+    #[serde(default)]
+    role: Option<String>,
     /// Set `true` to clear the agent's custom description.
     #[serde(default)]
     clear: Option<bool>,
@@ -587,7 +666,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "List or provision agents (`action`: `list` | `create` | `harness`). Use `list` (default) to list agents with optional `state` (`running` | `archived` | `all`) and `parent` (`self` | `root` | `<name/id>`) filters. Admin agents can use `action = \"create\"` (`name`, `harness`, optional `model`, `profile`, `workdir`, `instructions`, `prompt`) to provision a standalone root agent (`parent = null`), or `action = \"harness\"` to declaratively switch an agent's harness/model/profile."
+        description = "List, provision, rename, or configure agents (`action`: `list` | `create` | `rename` | `role` | `harness` | `models`). Use `list` (default) to list agents with optional `state` (`running` | `archived` | `all`) and `parent` (`self` | `root` | `<name/id>`) filters. Admin agents can use `action = \"create\"` (`name`, `harness`, optional `role`, `model`, `profile`, `workdir`, `instructions`, `prompt`) to provision a standalone root agent (`parent = null`), `action = \"rename\"` (`name`, `new_name`) to rename an agent in place while keeping its `agt_...` ID and old name as an alias, `action = \"role\"` (`name`, `role`) to set its short role label, `action = \"harness\"` to declaratively switch an agent's harness/model/profile, or `action = \"models\"` to inspect upstream provider profile model catalogs."
     )]
     async fn agents(
         &self,
@@ -602,7 +681,7 @@ impl AgentMcp {
             .to_ascii_lowercase();
         match action.as_str() {
             "list" | "ls" => {
-                let mut response: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                let mut response: AgentsResponse = self.client.get_agents().await?;
                 if let Some(state_filter) = args
                     .state
                     .as_deref()
@@ -635,7 +714,13 @@ impl AgentMcp {
                             response
                                 .agents
                                 .iter()
-                                .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
+                                .find(|a| {
+                                    a.name.eq_ignore_ascii_case(cleaned)
+                                        || a.id == cleaned
+                                        || a.aliases
+                                            .iter()
+                                            .any(|al| al.eq_ignore_ascii_case(cleaned))
+                                })
                                 .map(|a| a.id.clone())
                                 .or_else(|| Some(cleaned.to_string()))
                         };
@@ -667,6 +752,7 @@ impl AgentMcp {
                     .to_string();
                 let body = CreateAgentRequest {
                     name,
+                    role: args.role,
                     harness,
                     model: args.model,
                     profile: args.profile,
@@ -685,6 +771,54 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(
                     serde_json::to_value(created).map_err(|e| e.to_string())?,
                 ))
+            }
+            "rename" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents rename` requires `name`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let new_name = args
+                    .new_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents rename` requires `new_name`".to_string())?;
+                let clean_new = new_name.strip_prefix("agent:").unwrap_or(new_name);
+                let body = serde_json::json!({
+                    "name": clean_new,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/rename"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
+            "role" | "set_role" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents role` requires `name`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let body = serde_json::json!({
+                    "role": args.role,
+                    "clear": args.clear.unwrap_or(false),
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/role"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
             }
             "harness" | "set_harness" => {
                 let target = args
@@ -714,8 +848,23 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
+            "models" | "catalog" | "profiles" => {
+                let filter = args
+                    .profile
+                    .as_deref()
+                    .or(args.harness.as_deref())
+                    .or(args.name.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let path = match filter {
+                    Some(f) => format!("/v1/profiles/models?filter={}", urlencoding_simple(f)),
+                    None => "/v1/profiles/models".to_string(),
+                };
+                let catalogs: serde_json::Value = self.client.get(&path, None).await?;
+                Ok(rmcp::handler::server::wrapper::Json(catalogs))
+            }
             other => Err(format!(
-                "unknown agents action `{other}`; expected `list`, `create`, or `harness`"
+                "unknown agents action `{other}`; expected `list`, `create`, `rename`, `role`, `harness`, or `models`"
             )),
         }
     }
@@ -743,6 +892,7 @@ impl AgentMcp {
             .to_string();
         let body = CreateAgentRequest {
             name,
+            role: args.role,
             harness,
             model: args.model,
             profile: args.profile,
@@ -783,7 +933,7 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
-                let mut resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                let mut resp: AgentsResponse = self.client.get_agents().await?;
                 if parent_arg.eq_ignore_ascii_case("all") {
                     resp.agents.retain(|a| a.parent.is_some());
                 } else {
@@ -796,7 +946,11 @@ impl AgentMcp {
                     } else {
                         resp.agents
                             .iter()
-                            .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
+                            .find(|a| {
+                                a.name.eq_ignore_ascii_case(cleaned)
+                                    || a.id == cleaned
+                                    || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(cleaned))
+                            })
                             .map(|a| a.id.clone())
                             .unwrap_or_else(|| cleaned.to_string())
                     };
@@ -842,11 +996,15 @@ impl AgentMcp {
                         "`subagents inspect` requires `agent` (name or agt_... id)".to_string()
                     })?;
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                let resp: AgentsResponse = self.client.get_agents().await?;
                 let view = resp
                     .agents
                     .into_iter()
-                    .find(|a| a.name.eq_ignore_ascii_case(clean) || a.id == clean)
+                    .find(|a| {
+                        a.name.eq_ignore_ascii_case(clean)
+                            || a.id == clean
+                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
+                    })
                     .ok_or_else(|| format!("sub-agent `{clean}` not found"))?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
@@ -868,6 +1026,7 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.agent,
+                        role: None,
                         harness: args.harness,
                         model: args.model,
                         profile: args.profile,
@@ -1146,9 +1305,10 @@ impl AgentMcp {
         };
         if resolved_target.eq_ignore_ascii_case("all")
             && args.description.is_none()
+            && args.role.is_none()
             && !args.clear.unwrap_or(false)
         {
-            let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+            let resp: AgentsResponse = self.client.get_agents().await?;
             let roster: Vec<serde_json::Value> = resp
                 .agents
                 .into_iter()
@@ -1157,6 +1317,8 @@ impl AgentMcp {
                     serde_json::json!({
                         "id": a.id,
                         "name": a.name,
+                        "role": a.role,
+                        "aliases": a.aliases,
                         "parent": a.parent,
                         "harness": a.harness,
                         "model": a.model,
@@ -1169,9 +1331,10 @@ impl AgentMcp {
                 "agents": roster,
             })));
         }
-        if args.description.is_some() || args.clear.unwrap_or(false) {
+        if args.description.is_some() || args.role.is_some() || args.clear.unwrap_or(false) {
             let body = serde_json::json!({
                 "description": args.description,
+                "role": args.role,
                 "clear": args.clear.unwrap_or(false),
             });
             let updated: serde_json::Value = self

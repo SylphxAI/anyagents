@@ -425,7 +425,27 @@ enum Command {
         agent: Option<String>,
         /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
         description: Option<String>,
+        /// Optional short role label (`Spiron`, `Design`, `Revenue`, `Growth`, `Lead`, `Standards`, ...).
+        #[arg(long)]
+        role: Option<String>,
         /// Clear custom description.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
+    Rename {
+        /// Current agent name or `agt_...` ID.
+        agent: String,
+        /// New agent name (`[a-z0-9][a-z0-9_-]*`).
+        new_name: String,
+    },
+    /// Set or clear an agent's short role label (`anyagents role <agent> <role>`).
+    Role {
+        /// Target agent name or `agt_...` ID.
+        agent: String,
+        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        role: Option<String>,
+        /// Clear the role label.
         #[arg(long)]
         clear: bool,
     },
@@ -532,9 +552,29 @@ enum AgentsCommand {
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
     RevokeAdmin { agent: String },
+    /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
+    Rename {
+        /// Current agent name or `agt_...` ID.
+        agent: String,
+        /// New agent name (`[a-z0-9][a-z0-9_-]*`).
+        new_name: String,
+    },
+    /// Set or clear an agent's short role label (`anyagents agents role <agent> <role>`).
+    Role {
+        /// Target agent name or `agt_...` ID.
+        agent: String,
+        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        role: Option<String>,
+        /// Clear the role label.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Record an agent. The harness is a catalog key.
     Create {
         name: String,
+        /// Optional short role label (`Spiron`, `Design`, `Revenue`, ...).
+        #[arg(long)]
+        role: Option<String>,
         #[arg(long, default_value = "")]
         harness: String,
         #[arg(long)]
@@ -940,8 +980,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Describe {
             agent,
             description,
+            role,
             clear,
-        } => agent::describe_cmd(&data, agent, description, clear),
+        } => agent::describe_cmd(&data, agent, description, role, clear),
+        Command::Rename { agent, new_name } => agent::rename_cmd(&data, &agent, &new_name),
+        Command::Role { agent, role, clear } => {
+            agent::role_cmd(&data, &agent, role.as_deref(), clear)
+        }
         Command::Browser {
             action,
             target,
@@ -1366,6 +1411,32 @@ fn profiles_cmd(
         Some("refresh") | Some("reset") => {
             create::force_refresh_provider_profiles(data, target);
             list_profiles_cmd(data, target)
+        }
+        Some("models") | Some("catalog") => {
+            let catalogs = if client::can_call_server(data) {
+                let path = match target.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(t) => format!("/v1/profiles/models?filter={t}"),
+                    None => "/v1/profiles/models".to_string(),
+                };
+                match client::call::<serde_json::Value>(
+                    data,
+                    "GET",
+                    &path,
+                    None,
+                    &client::authority(data),
+                ) {
+                    Ok(Some(val)) => val,
+                    Ok(None) | Err(_) => create::probe_profile_models_catalog(data, target),
+                }
+            } else {
+                create::probe_profile_models_catalog(data, target)
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&catalogs)
+                    .map_err(|e| Error::Message(e.to_string()))?
+            );
+            Ok(())
         }
         Some("list") => list_profiles_cmd(data, target),
         other => list_profiles_cmd(data, other),
@@ -1814,12 +1885,19 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                 for a in rows {
                     let (mode, steer) = anyagents_supervisor::declared(&a.harness);
                     let seat_info = create::resolved_agent_seat_info(&store, &a);
+                    let aliases = store.agent_aliases(&a.id).unwrap_or_default();
                     fallback.push(api::AgentView {
                         id: a.id.to_string(),
                         name: a.name,
+                        role: a.role,
+                        aliases,
                         parent: a.parent_id.map(|p| p.to_string()),
                         harness: a.harness,
                         model: a.model,
+                        live_harness: None,
+                        live_model: None,
+                        process_started_at_ms: None,
+                        pending_switch: false,
                         workdir: a.workdir,
                         state: a.state,
                         process: "offline".to_string(),
@@ -1827,6 +1905,8 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         delivery_mode: anyagents_supervisor::mode_name(mode).to_string(),
                         steer_support: anyagents_supervisor::steer_name(steer).to_string(),
                         quota_reset_at_ms: None,
+                        block_reason: None,
+                        last_error: None,
                         oldest_undelivered_age_ms: None,
                         install: "recorded".to_string(),
                         description: a.instructions,
@@ -2030,13 +2110,26 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
         GroupsCommand::Members { group } => {
             let members = agent::group_members(data, &group)?;
             if ui::is_pretty() {
+                let role_map: std::collections::HashMap<String, Option<String>> =
+                    anyagents_core::Store::open(data.join("state.db"))
+                        .ok()
+                        .and_then(|s| s.list_agents().ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.name, a.role))
+                        .collect();
                 println!(
                     "\n  {}  {} members\n",
                     ui::bold_cyan(&format!("Group · {group}")),
                     ui::bold(&members.len().to_string())
                 );
                 for name in members {
-                    println!("  • {}", ui::bold(&name));
+                    let role = role_map.get(&name).and_then(|r| r.as_deref());
+                    let display = match role.map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(r) => format!("{} {}", ui::bold(&name), ui::dim(&format!("· {r}"))),
+                        None => ui::bold(&name),
+                    };
+                    println!("  • {display}");
                 }
                 println!();
                 return Ok(());
@@ -2052,6 +2145,14 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
                     println!("  {}", ui::dim("No groups found."));
                     return Ok(());
                 }
+                let role_map: std::collections::HashMap<String, Option<String>> =
+                    anyagents_core::Store::open(data.join("state.db"))
+                        .ok()
+                        .and_then(|s| s.list_agents().ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.name, a.role))
+                        .collect();
                 println!(
                     "\n  {}  {} total\n",
                     ui::bold_cyan("Groups"),
@@ -2060,10 +2161,17 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
                 let mut table =
                     ui::Table::new(&[("GROUP", false), ("COUNT", true), ("MEMBERS", false)]);
                 for (group, members) in list {
+                    let formatted_members: Vec<String> = members
+                        .iter()
+                        .map(|m| {
+                            let r = role_map.get(m).and_then(|v| v.as_deref());
+                            create::format_agent_display(m, r)
+                        })
+                        .collect();
                     table.add_row(vec![
                         ui::bold(&ui::cyan(&group)),
                         ui::dim(&members.len().to_string()),
-                        members.join(", "),
+                        formatted_members.join(", "),
                     ]);
                 }
                 table.print();

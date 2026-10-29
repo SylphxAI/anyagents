@@ -1069,6 +1069,16 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
                 {
                     agent_to_bot.push((name_lower, bot_username.to_string()));
                 }
+                if let Ok(aliases) = store.agent_aliases(&agent.id) {
+                    for alias in aliases {
+                        let al = alias.to_ascii_lowercase();
+                        if !al.eq_ignore_ascii_case(bot_username)
+                            && !agent_to_bot.iter().any(|(n, _)| n == &al)
+                        {
+                            agent_to_bot.push((al, bot_username.to_string()));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1136,6 +1146,50 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
         i += 1;
     }
     out
+}
+
+fn format_telegram_bot_display_name(name: &str, role: Option<&str>) -> String {
+    let mut chars = name.chars();
+    let title = match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    };
+    match role.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => format!("{title} · {r}"),
+        None => title,
+    }
+}
+
+/// Synchronizes the attached Telegram bot's display name (`setMyName`) with
+/// `format_telegram_bot_display_name(&agent.name, agent.role.as_deref())` (e.g. `"Plutus · Revenue"`).
+pub fn sync_agent_telegram_bot_name(
+    store: &Store,
+    data_dir: &std::path::Path,
+    agent: &anyagents_core::Agent,
+) {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+    {
+        return;
+    }
+    let Ok(channel) = channel_for(store, &agent.name) else {
+        return;
+    };
+    let Some(credential_ref) = channel.credential_ref.as_deref() else {
+        return;
+    };
+    let Ok(token) = token_of(&FileCredentialStore::new(data_dir), credential_ref) else {
+        return;
+    };
+    let raw_name = format_telegram_bot_display_name(&agent.name, agent.role.as_deref());
+    let bot_name: String = raw_name.chars().take(64).collect();
+    let call = BotCall {
+        method: "setMyName".to_string(),
+        body: serde_json::json!({ "name": bot_name }),
+    };
+    let _ = call_api(&token, &call, 10, Some(&channel.id));
 }
 
 /// Post one text through the agent's bot. The token is read for this call only.
@@ -2166,7 +2220,7 @@ fn api_error(
         "sendMessage" | "sendRichMessage" | "editMessageText" | "sendPhoto" | "sendVideo"
         | "sendAudio" | "sendVoice" | "sendDocument" | "sendAnimation" | "sendLocation"
         | "sendVenue" | "sendPoll" | "getFile" | "getUpdates" | "getMe" | "getChatMember"
-        | "setWebhook" | "deleteWebhook" => method,
+        | "setWebhook" | "deleteWebhook" | "setMyName" => method,
         _ => "unknown",
     };
     anyagents_core::Error::Message(format!(
