@@ -542,11 +542,35 @@ pub fn share_socket_with_seats(path: &Path) {
 fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let me = current_uid();
-    if let Ok(meta) = std::fs::metadata(dir)
-        && meta.uid() == me
-    {
-        let _ = chown_to_seat_group(dir, gid);
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
+    if let Ok(meta) = std::fs::metadata(dir) {
+        if meta.uid() == me {
+            let _ = chown_to_seat_group(dir, gid);
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
+        } else if meta.gid() != gid
+            && !is_isolated_test_env()
+            && let Some(sock_gid) = sock_gid_for()
+            && launcher().is_file()
+        {
+            let f_uid = meta.uid().to_string();
+            let f_gid = meta.gid().to_string();
+            let groups = format!("{},{sock_gid}", meta.gid());
+            let _ = std::process::Command::new(launcher())
+                .args([
+                    "--reuid",
+                    &f_uid,
+                    "--regid",
+                    &f_gid,
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "chmod",
+                    "-R",
+                    "0777",
+                ])
+                .arg(dir)
+                .status();
+        }
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
@@ -571,6 +595,69 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             continue;
         };
         if meta.uid() != me {
+            if meta.gid() != gid
+                && !is_isolated_test_env()
+                && let Some(sock_gid) = sock_gid_for()
+                && launcher().is_file()
+            {
+                let target_uid = host_seat_users()
+                    .into_iter()
+                    .find_map(|(_, (u, g))| (g == gid).then_some(u))
+                    .unwrap_or(gid);
+                let t_uid = target_uid.to_string();
+                let t_gid = gid.to_string();
+                let groups = format!("{gid},{sock_gid}");
+                let tmp = path.with_extension("seat_mig_tmp");
+                let status = std::process::Command::new(launcher())
+                    .args([
+                        "--reuid",
+                        &t_uid,
+                        "--regid",
+                        &t_gid,
+                        "--groups",
+                        &groups,
+                        "--no-new-privs",
+                        "--",
+                        "cp",
+                        "-f",
+                    ])
+                    .arg(&path)
+                    .arg(&tmp)
+                    .status();
+                if status.is_ok_and(|s| s.success()) {
+                    let _ = std::process::Command::new(launcher())
+                        .args([
+                            "--reuid",
+                            &t_uid,
+                            "--regid",
+                            &t_gid,
+                            "--groups",
+                            &groups,
+                            "--no-new-privs",
+                            "--",
+                            "chmod",
+                            "0660",
+                        ])
+                        .arg(&tmp)
+                        .status();
+                    let _ = std::process::Command::new(launcher())
+                        .args([
+                            "--reuid",
+                            &t_uid,
+                            "--regid",
+                            &t_gid,
+                            "--groups",
+                            &groups,
+                            "--no-new-privs",
+                            "--",
+                            "mv",
+                            "-f",
+                        ])
+                        .arg(&tmp)
+                        .arg(&path)
+                        .status();
+                }
+            }
             continue;
         }
         let _ = chown_to_seat_group(&path, gid);
