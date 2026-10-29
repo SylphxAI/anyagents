@@ -565,6 +565,26 @@ async fn mcp_tools_use_the_server_socket() {
         .expect("worker-1");
     assert_eq!(worker_row.state, "running");
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let alpha_cfg = dir.path().join("agents").join(&alpha_id).join("config");
+        std::fs::set_permissions(&alpha_cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
+        let before_gid = std::fs::metadata(&alpha_cfg).unwrap().gid();
+        let desc_res: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "describe",
+                serde_json::json!({"agent": "self", "description": "Standing owner role description."}),
+            )
+            .await,
+        );
+        assert_eq!(desc_res["system_prompt_synced"], true);
+        let after_meta = std::fs::metadata(&alpha_cfg).unwrap();
+        assert_eq!(after_meta.permissions().mode() & 0o7777, 0o0700);
+        assert_eq!(after_meta.gid(), before_gid);
+    }
+
     alpha.cancel().await.unwrap();
     beta.cancel().await.unwrap();
     drop(server);

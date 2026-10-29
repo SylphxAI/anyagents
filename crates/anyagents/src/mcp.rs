@@ -179,6 +179,7 @@ impl Client {
                 || path.ends_with("/model")
                 || path.ends_with("/rename")
                 || path.ends_with("/role")
+                || path.ends_with("/description")
                 || path.starts_with("/v1/profiles")
                 || path.starts_with("/v1/schedules")
                 || path.starts_with("/v1/browser")

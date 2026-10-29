@@ -263,10 +263,74 @@ pub(crate) fn write_agent_instructions_with_continuity(
         if std::fs::read(path).ok().as_deref() == Some(doc.as_bytes()) {
             continue;
         }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
+    }
+}
+
+/// Fast, non-intrusive instruction sync used by `describe()`: updates the
+/// agent's system prompt files (`AGENTS.md`, `CLAUDE.md`, `SYSTEM_PROMPT.md`,
+/// `config.toml` developer instructions) without walking or re-chowning the
+/// `config/` or `work/` directory trees, and guarantees `config`'s existing
+/// group and execute bits remain intact.
+pub(crate) fn sync_agent_description_files(store: &Store, agent: &Agent, config: &Path) {
+    #[cfg(unix)]
+    let pre_existing_mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(config)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    };
+    let _ = std::fs::create_dir_all(config);
+    #[cfg(unix)]
+    if let Some(base_mode) = pre_existing_mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+        let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+        let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+        if safe_mode != base_mode {
+            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
         }
-        let _ = std::fs::write(path, doc.as_bytes());
+    }
+    let parent_name = agent
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok())
+        .map(|p| p.name)
+        .or_else(|| {
+            agent
+                .launch_env
+                .iter()
+                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+                .map(|(_, v)| v.clone())
+        });
+    let continuity = compute_live_session_continuity(store, agent, config);
+    write_agent_instructions_with_continuity(
+        config,
+        agent,
+        parent_name.as_deref(),
+        continuity.as_deref(),
+    );
+    if agent.harness == "codex" {
+        let codex_toml = config.join("config.toml");
+        if codex_toml.is_file() {
+            let _ = mcp_config::sync_codex_developer_instructions(
+                &codex_toml,
+                continuity.as_deref(),
+            );
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base_mode = pre_existing_mode.unwrap_or(0o0700);
+        let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+        let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+        let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+        if let Ok(after_meta) = std::fs::metadata(config)
+            && (after_meta.permissions().mode() & 0o7777) != safe_mode
+        {
+            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
+        }
     }
 }
 
@@ -1064,12 +1128,16 @@ pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<Str
 }
 
 /// Resolve an agent's authoritative `(seat_user, uid, gid, seat_launch_spec)`
-/// using the exact same root-parent hint and `seat_launch_spec_with_hint`
-/// lookup that `vendor_launch` and `ensure_seat_op_config` use.
+/// using the existing `seat-*` group on `<data>/agents/<id>/config` when present,
+/// and otherwise the root-parent hint and `seat_launch_spec_with_hint` lookup.
 pub(crate) fn resolved_agent_seat_info(
     store: &Store,
     agent: &Agent,
 ) -> Option<(String, u32, u32, Option<String>)> {
+    let cfg = agent_config_dir(store.data_dir(), &agent.id);
+    if let Some(existing) = crate::sandbox::existing_config_seat(&cfg) {
+        return Some(existing);
+    }
     let seat_hint = resolve_root_seat_hint(store, agent);
     if let Some((user, spec)) =
         crate::sandbox::seat_launch_spec_with_hint(&agent.name, seat_hint.as_deref())
@@ -1100,7 +1168,24 @@ pub(crate) fn reconcile_agent_runtime_config(
     config: &Path,
     work_dir: &Path,
 ) -> Result<Option<String>, Error> {
+    #[cfg(unix)]
+    let pre_existing_mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::metadata(config)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o7777)
+    };
     std::fs::create_dir_all(config)?;
+    #[cfg(unix)]
+    if let Some(base_mode) = pre_existing_mode {
+        use std::os::unix::fs::PermissionsExt as _;
+        let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+        let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+        let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+        if safe_mode != base_mode {
+            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
+        }
+    }
     let parent_name = agent
         .parent_id
         .as_ref()
@@ -1206,10 +1291,10 @@ pub(crate) fn reconcile_agent_runtime_config(
     }
 
     if let Some((_, uid, gid, spec_opt)) = resolved_agent_seat_info(store, agent) {
-        crate::sandbox::share_config_with_seat_uid(config, uid, gid);
         if let Some(ref spec) = spec_opt {
             ensure_seat_op_config(config, spec);
         }
+        crate::sandbox::share_config_with_seat_uid(config, uid, gid);
         if agent.harness == "muse"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
@@ -1222,6 +1307,16 @@ pub(crate) fn reconcile_agent_runtime_config(
                 agent.model.as_deref(),
                 spec_opt.as_deref(),
             );
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let base_mode = pre_existing_mode.unwrap_or(0o0700);
+            let group_exec = if (base_mode & 0o0060) != 0 { 0o0010 } else { 0 };
+            let other_exec = if (base_mode & 0o0006) != 0 { 0o0001 } else { 0 };
+            let safe_mode = (base_mode | 0o0700 | group_exec | other_exec) & 0o7777;
+            let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
         }
     }
     Ok(continuity)
@@ -4432,5 +4527,30 @@ mod tests {
         let toml_after = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
         assert!(toml_after.contains("model = \"gpt-5.4-mini\""));
         assert!(toml_after.contains("model_reasoning_effort = \"medium\""));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
+            let orig_gid = std::fs::metadata(&cfg).unwrap().gid();
+            let updated_desc = store
+                .set_agent_instructions(&owner.id, Some("Updated description via describe sync."))
+                .unwrap();
+            let work_dir = agent_work_dir(data, &owner.id);
+            sync_agent_description_files(&store, &updated_desc, &cfg);
+            let meta_after = std::fs::metadata(&cfg).unwrap();
+            assert_eq!(meta_after.permissions().mode() & 0o7777, 0o0700);
+            assert_eq!(meta_after.gid(), orig_gid);
+
+            // Even if config dir had its execute bit stripped (0600), prompt sync heals it back to 0700.
+            std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o0600)).unwrap();
+            sync_agent_description_files(&store, &updated_desc, &cfg);
+            let healed_mode = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(healed_mode & 0o0700, 0o0700);
+
+            reconcile_agent_runtime_config(&store, data, &updated_desc, &cfg, &work_dir).unwrap();
+            let healed_reconcile = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(healed_reconcile & 0o0700, 0o0700);
+        }
     }
 }

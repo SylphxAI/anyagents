@@ -441,12 +441,7 @@ pub fn describe_cmd(
         rec = store.set_agent_instructions(&rec.id, Some(text))?;
     }
     let cfg = anyagents_core::agent_config_dir(data, &rec.id);
-    let work_dir = rec
-        .workdir
-        .as_deref()
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &rec.id));
-    let _ = crate::create::reconcile_agent_runtime_config(&store, data, &rec, &cfg, &work_dir);
+    crate::create::sync_agent_description_files(&store, &rec, &cfg);
     if new_desc.is_some() || role.is_some() || clear {
         println!(
             "updated\t{}\t{}",

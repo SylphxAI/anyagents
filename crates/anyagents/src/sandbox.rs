@@ -199,13 +199,8 @@ pub fn pinned_uid(agent_name: &str) -> Option<u32> {
 }
 
 /// The seat user name a host provisions for one agent: `seat-<name>`.
-/// `plutus` was renamed in-place from `argon` and retains its provisioned
-/// `seat-argon` OS seat (`2101:2101`).
 fn seat_user(agent_name: &str) -> String {
-    match agent_name.to_ascii_lowercase().as_str() {
-        "plutus" => "seat-argon".to_string(),
-        lower => format!("seat-{lower}"),
-    }
+    format!("seat-{}", agent_name.to_ascii_lowercase())
 }
 
 fn lookup_user(name: &str) -> Option<(u32, u32)> {
@@ -481,6 +476,34 @@ pub fn seat_launch_spec_with_hint(
     ))
 }
 
+/// If `config_dir` already exists on disk and its group belongs to a provisioned
+/// host `seat-*` account, return that seat's `(user, uid, gid, seat_launch_spec)`
+/// so `describe()`, `rename`, and runtime reconciliation never flip a running
+/// agent's config directory to a different seat group.
+pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Option<String>)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if is_isolated_test_env() {
+            return None;
+        }
+        let meta = std::fs::metadata(config_dir).ok()?;
+        let dir_gid = meta.gid();
+        if dir_gid == 0 || dir_gid == server_gid() {
+            return None;
+        }
+        for (user, (uid, gid)) in host_seat_users() {
+            if gid == dir_gid {
+                let spec = sock_gid_for().filter(|_| launcher().is_file()).map(|sock_gid| {
+                    format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
+                });
+                return Some((user, uid, gid, spec));
+            }
+        }
+    }
+    None
+}
+
 /// Give a minted capability to its seat's group: 0640, owned by the server's
 /// user, readable by that one seat. The mode and group are read back; a file
 /// any other seat could read is a refusal.
@@ -522,9 +545,13 @@ pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
 }
 
 pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
+    let (eff_uid, eff_gid) = match existing_config_seat(config_dir) {
+        Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
+        None => (uid, gid),
+    };
     for dir in [config_dir.to_path_buf(), config_dir.with_file_name("work")] {
         if dir.is_dir()
-            && let Err(err) = give_tree(&dir, uid, gid)
+            && let Err(err) = give_tree(&dir, eff_uid, eff_gid)
         {
             eprintln!("seat: cannot share {}: {err}", dir.display());
         }

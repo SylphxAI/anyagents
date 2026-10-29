@@ -1564,18 +1564,7 @@ async fn set_description_route(
                 .map_err(ApiError::from_store)?;
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        let work_dir = rec
-            .workdir
-            .as_deref()
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &rec.id));
-        let _ = create::reconcile_agent_runtime_config(
-            &state.store,
-            state.store.data_dir(),
-            &rec,
-            &cfg,
-            &work_dir,
-        );
+        create::sync_agent_description_files(&state.store, &rec, &cfg);
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
