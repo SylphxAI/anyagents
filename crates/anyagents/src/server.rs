@@ -925,7 +925,10 @@ fn authorize_schedule_target(
     principal: &Principal,
     target_name: Option<&str>,
 ) -> Result<Agent, ApiError> {
-    match (principal, target_name.map(str::trim).filter(|s| !s.is_empty())) {
+    match (
+        principal,
+        target_name.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
         (Principal::Agent { agent_id, .. }, None) => {
             store.agent(agent_id).map_err(ApiError::from_store)
         }
@@ -979,34 +982,32 @@ async fn list_self_schedules_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    spawn_store(move || {
-        match &principal {
-            Principal::Agent { agent_id, name } => {
-                let schedules: Vec<crate::api::ScheduleView> = state
-                    .store
-                    .list_schedules(Some(agent_id), true)
-                    .map_err(ApiError::from_store)?
-                    .into_iter()
-                    .map(crate::api::ScheduleView::from)
-                    .collect();
-                Ok(Json(serde_json::json!({
-                    "agent": name,
-                    "agent_id": agent_id.as_str(),
-                    "schedules": schedules,
-                })))
-            }
-            Principal::Operator => {
-                let schedules: Vec<crate::api::ScheduleView> = state
-                    .store
-                    .list_schedules(None, true)
-                    .map_err(ApiError::from_store)?
-                    .into_iter()
-                    .map(crate::api::ScheduleView::from)
-                    .collect();
-                Ok(Json(serde_json::json!({
-                    "schedules": schedules,
-                })))
-            }
+    spawn_store(move || match &principal {
+        Principal::Agent { agent_id, name } => {
+            let schedules: Vec<crate::api::ScheduleView> = state
+                .store
+                .list_schedules(Some(agent_id), true)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(crate::api::ScheduleView::from)
+                .collect();
+            Ok(Json(serde_json::json!({
+                "agent": name,
+                "agent_id": agent_id.as_str(),
+                "schedules": schedules,
+            })))
+        }
+        Principal::Operator => {
+            let schedules: Vec<crate::api::ScheduleView> = state
+                .store
+                .list_schedules(None, true)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(crate::api::ScheduleView::from)
+                .collect();
+            Ok(Json(serde_json::json!({
+                "schedules": schedules,
+            })))
         }
     })
     .await
@@ -1137,7 +1138,9 @@ async fn handle_schedule_action(
             }
             other => Err(ApiError::new(
                 StatusCode::BAD_REQUEST,
-                format!("unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"),
+                format!(
+                    "unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"
+                ),
             )),
         }
     })
@@ -3474,6 +3477,7 @@ fn send_sync(
     };
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     let mut deliveries = Vec::with_capacity(plan.targets.len());
+    let mut skipped = Vec::new();
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
@@ -3488,6 +3492,7 @@ fn send_sync(
             }
             Target::Room(room) => {
                 let mut all = deliver_room(store, &body, room, key.as_deref())?;
+                let mut room_skip = room_skipped(store, &body, room);
                 if let Some(ref sid) = sender_agent_id
                     && all.iter().any(|d| !d.duplicate)
                 {
@@ -3500,6 +3505,14 @@ fn send_sync(
                         store.record_outbound(sid, &dest, body.reply_to.as_deref(), &composed_body);
                 }
                 deliveries.append(&mut all);
+                for s in room_skip.drain(..) {
+                    if !skipped
+                        .iter()
+                        .any(|existing: &crate::api::SkippedDelivery| existing.to == s.to)
+                    {
+                        skipped.push(s);
+                    }
+                }
             }
             Target::Telegram {
                 address,
@@ -3524,7 +3537,10 @@ fn send_sync(
             }
         }
     }
-    let response = SendResponse { deliveries };
+    let response = SendResponse {
+        deliveries,
+        skipped,
+    };
     if let Some(key) = key.as_deref() {
         let text = serde_json::to_string(&response)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -3618,12 +3634,50 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter(|agent| agent.state != "archived" && agent.state != "paused")
+        .filter(|agent| agent.state == "running")
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
         .filter(|agent| {
             members
                 .as_ref()
                 .is_none_or(|members| members.iter().any(|name| name == &agent.name))
+        })
+        .collect()
+}
+
+/// Non-running agents in a room that a broadcast or group send skipped, with their state reason.
+fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api::SkippedDelivery> {
+    let sender = body
+        .sender
+        .as_deref()
+        .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+    let name = room.strip_prefix("group:").unwrap_or(room);
+    if name == "all" {
+        return store
+            .list_agents()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+            .filter(|agent| agent.state != "running" && agent.state != "archived")
+            .map(|agent| crate::api::SkippedDelivery {
+                to: format!("agent:{}", agent.name),
+                reason: agent.state,
+            })
+            .collect();
+    }
+    let members = match store.room_members(room) {
+        Ok(Some(members)) => members,
+        _ => return Vec::new(),
+    };
+    store
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+        .filter(|agent| members.iter().any(|m| m == &agent.name))
+        .filter(|agent| agent.state != "running")
+        .map(|agent| crate::api::SkippedDelivery {
+            to: format!("agent:{}", agent.name),
+            reason: agent.state,
         })
         .collect()
 }
@@ -3674,6 +3728,9 @@ fn deliver_agent(
     key: Option<&str>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
+    if agent.state == "archived" {
+        let _ = store.set_agent_state(&agent.id, "running");
+    }
     let outcome = store
         .receive(
             &agent.id,

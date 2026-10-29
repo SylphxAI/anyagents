@@ -340,9 +340,17 @@ pub struct Delivery {
     pub duplicate: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedDelivery {
+    pub to: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SendResponse {
     pub deliveries: Vec<Delivery>,
+    #[serde(default)]
+    pub skipped: Vec<SkippedDelivery>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]

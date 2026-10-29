@@ -489,6 +489,15 @@ enum Command {
         /// Wait duration in milliseconds after `open` or `click`.
         #[arg(long = "wait-ms")]
         wait_ms: Option<u64>,
+        /// Hold duration in milliseconds for `press` / `hold` (`keydown` held across rendered frames, then `keyup`).
+        #[arg(long = "hold-ms", alias = "duration-ms")]
+        hold_ms: Option<u64>,
+        /// Key name override for `press` / `hold` / `key_down` / `key_up`.
+        #[arg(long)]
+        key: Option<String>,
+        /// Emit repeated `keydown` events (`autoRepeat: true`) while holding a key.
+        #[arg(long)]
+        repeat: bool,
         /// Force headless mode (`false` by default: uses `xvfb-run` real headed GUI for anti-detect stealth).
         #[arg(long)]
         headless: Option<bool>,
@@ -1036,10 +1045,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             submit,
             full_page,
             wait_ms,
+            hold_ms,
+            key,
+            repeat,
             headless,
         } => browser_cmd(
             &data, action, target, value, profile, url, selector, text, secret_ref, script, path,
-            submit, full_page, wait_ms, headless,
+            submit, full_page, wait_ms, hold_ms, key, repeat, headless,
         ),
         Command::Schedule {
             agent,
@@ -1302,6 +1314,9 @@ fn browser_cmd(
     submit: bool,
     full_page: bool,
     wait_ms: Option<u64>,
+    hold_ms: Option<u64>,
+    key: Option<String>,
+    repeat: bool,
     headless: Option<bool>,
 ) -> Result<(), anyagents_core::Error> {
     let act = action.trim().to_ascii_lowercase();
@@ -1312,7 +1327,10 @@ fn browser_cmd(
         selector,
         text,
         secret_ref,
-        key: None,
+        key,
+        keys: None,
+        hold_ms,
+        repeat: repeat.then_some(true),
         script,
         path,
         submit: submit.then_some(true),
@@ -1342,9 +1360,16 @@ fn browser_cmd(
                 req.text = value;
             }
         }
-        "press" | "key" => {
+        "press" | "key" | "hold" | "key_down" | "keydown" | "key_up" | "keyup" | "release"
+        | "release_keys" => {
             if req.key.is_none() {
                 req.key = target;
+            }
+            if req.hold_ms.is_none()
+                && let Some(ms_str) = value.as_deref()
+                && let Ok(parsed) = ms_str.trim().parse::<u64>()
+            {
+                req.hold_ms = Some(parsed);
             }
         }
         "eval" | "evaluate" | "js" => {

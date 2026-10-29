@@ -397,6 +397,10 @@ impl Store {
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
+        let _ = conn.execute(
+            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('running', 'paused', 'archived')",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
             data_dir: data_dir_for(path),
@@ -905,7 +909,7 @@ impl Store {
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
-            if agent.state == "archived" || agent.state == "paused" {
+            if agent.state != "running" {
                 continue;
             }
             if author.as_deref() == Some(agent.name.as_str())
@@ -963,7 +967,7 @@ impl Store {
             let names = self
                 .list_agents()?
                 .into_iter()
-                .filter(|agent| agent.state != "archived" && agent.state != "paused")
+                .filter(|agent| agent.state == "running")
                 .map(|agent| agent.name)
                 .collect();
             return Ok(Some(names));

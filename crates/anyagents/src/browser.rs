@@ -122,7 +122,8 @@ pub struct BrowserRequest {
     /// `"snapshot"` (extract visible text + `@e1`, `@e2` interactive element refs),
     /// `"click"` (click `@e1` ref or CSS `selector`),
     /// `"fill"` / `"type"` (type `text` into `@e1` ref or CSS `selector`, optional `submit`),
-    /// `"press"` (press keyboard `key` such as `"Enter"`, `"Tab"`, `"Escape"`),
+    /// `"press"` / `"hold"` (press or hold keyboard `key` / `keys` such as `"Enter"`, `"Escape"`, `"a"`, `"w"`, `"ArrowUp"`, with optional `hold_ms` to hold across rendered frames),
+    /// `"key_down"` / `"key_up"` / `"release_keys"` (explicitly hold down or release `key` / `keys` on this profile),
     /// `"eval"` (evaluate JavaScript `script` / `expression` in the page),
     /// `"screenshot"` (save PNG screenshot to `path` or profile screenshots dir),
     /// `"cookies"` (list cookies, or set cookies when `cookies` JSON array is provided),
@@ -159,9 +160,23 @@ pub struct BrowserRequest {
     /// so credentials can be injected into password or 2FA inputs without ever passing plaintext through LLM context.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_ref: Option<String>,
-    /// Keyboard key name for `"press"` (e.g. `"Enter"`, `"Tab"`, `"Escape"`, `"PageDown"`).
+    /// Keyboard key name for `"press"`, `"hold"`, `"key_down"`, or `"key_up"` (e.g. `"Enter"`, `"Tab"`, `"Escape"`, `"a"`, `"w"`, `"d"`, `"ArrowUp"`, `"Space"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+    /// Optional list of keys to press, hold, or release simultaneously (e.g. `["w", "d"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keys: Option<Vec<String>>,
+    /// Duration in milliseconds to hold `key` / `keys` down across rendered frames before releasing (`keyUp`), e.g. `hold_ms: 500` for continuous game movement.
+    #[serde(
+        default,
+        alias = "duration_ms",
+        alias = "hold",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub hold_ms: Option<u64>,
+    /// Whether to emit auto-repeat `keyDown` events (`autoRepeat: true`) while holding a key for `hold_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repeat: Option<bool>,
     /// JavaScript code to evaluate when `action = "eval"`.
     #[serde(
         default,
@@ -628,18 +643,28 @@ pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Err
     let dir = profile_dir(data, profile);
     let rt_path = dir.join("runtime.json");
     let mut stopped_pid = None;
+    let mut released_keys = Vec::new();
     if let Ok(bytes) = std::fs::read(&rt_path)
-        && let Ok(rt) = serde_json::from_slice::<BrowserRuntimeState>(&bytes)
+        && let Ok(mut rt) = serde_json::from_slice::<BrowserRuntimeState>(&bytes)
     {
+        if cdp_port_alive(rt.cdp_port)
+            && let Ok(page) = select_page_target(data, &mut rt, None)
+            && let Some(ws_url) = page.ws_url
+            && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
+        {
+            released_keys = release_recorded_held_keys(data, profile, &mut cdp);
+        }
         stopped_pid = Some(rt.pid);
         stop_process_group(rt.pid);
     }
+    clear_held_keys(data, profile);
     let _ = std::fs::remove_file(&rt_path);
     cleanup_singleton_locks(&dir.join("user-data"));
     Ok(serde_json::json!({
         "profile": profile,
         "status": "stopped",
         "stopped_pid": stopped_pid,
+        "released_keys": released_keys,
         "user_data_preserved": true,
     }))
 }
@@ -1615,6 +1640,338 @@ fn dispatch_trusted_click(cdp: &mut CdpSession, x: f64, y: f64) -> Result<(), Er
     Ok(())
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct KeySpec {
+    pub key: String,
+    pub code: String,
+    pub vk: u32,
+}
+
+fn resolve_key_spec(raw: &str) -> KeySpec {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || raw == " " {
+        return KeySpec {
+            key: " ".to_string(),
+            code: "Space".to_string(),
+            vk: 32,
+        };
+    }
+    if trimmed.len() == 1 {
+        let ch = trimmed.chars().next().unwrap();
+        if ch.is_ascii_alphabetic() {
+            let upper = ch.to_ascii_uppercase();
+            return KeySpec {
+                key: ch.to_string(),
+                code: format!("Key{upper}"),
+                vk: upper as u32,
+            };
+        }
+        if ch.is_ascii_digit() {
+            return KeySpec {
+                key: ch.to_string(),
+                code: format!("Digit{ch}"),
+                vk: ch as u32,
+            };
+        }
+    }
+    if trimmed.len() == 4
+        && trimmed.starts_with("Key")
+        && trimmed.as_bytes()[3].is_ascii_alphabetic()
+    {
+        let upper = (trimmed.as_bytes()[3] as char).to_ascii_uppercase();
+        let lower = upper.to_ascii_lowercase();
+        return KeySpec {
+            key: lower.to_string(),
+            code: format!("Key{upper}"),
+            vk: upper as u32,
+        };
+    }
+    if trimmed.len() == 6 && trimmed.starts_with("Digit") && trimmed.as_bytes()[5].is_ascii_digit()
+    {
+        let digit = trimmed.as_bytes()[5] as char;
+        return KeySpec {
+            key: digit.to_string(),
+            code: format!("Digit{digit}"),
+            vk: digit as u32,
+        };
+    }
+    match trimmed {
+        "Enter" => KeySpec {
+            key: "Enter".to_string(),
+            code: "Enter".to_string(),
+            vk: 13,
+        },
+        "NumpadEnter" => KeySpec {
+            key: "Enter".to_string(),
+            code: "NumpadEnter".to_string(),
+            vk: 13,
+        },
+        "Tab" => KeySpec {
+            key: "Tab".to_string(),
+            code: "Tab".to_string(),
+            vk: 9,
+        },
+        "Escape" | "Esc" => KeySpec {
+            key: "Escape".to_string(),
+            code: "Escape".to_string(),
+            vk: 27,
+        },
+        "Backspace" => KeySpec {
+            key: "Backspace".to_string(),
+            code: "Backspace".to_string(),
+            vk: 8,
+        },
+        "Delete" => KeySpec {
+            key: "Delete".to_string(),
+            code: "Delete".to_string(),
+            vk: 46,
+        },
+        "Space" => KeySpec {
+            key: " ".to_string(),
+            code: "Space".to_string(),
+            vk: 32,
+        },
+        "ArrowDown" => KeySpec {
+            key: "ArrowDown".to_string(),
+            code: "ArrowDown".to_string(),
+            vk: 40,
+        },
+        "ArrowUp" => KeySpec {
+            key: "ArrowUp".to_string(),
+            code: "ArrowUp".to_string(),
+            vk: 38,
+        },
+        "ArrowLeft" => KeySpec {
+            key: "ArrowLeft".to_string(),
+            code: "ArrowLeft".to_string(),
+            vk: 37,
+        },
+        "ArrowRight" => KeySpec {
+            key: "ArrowRight".to_string(),
+            code: "ArrowRight".to_string(),
+            vk: 39,
+        },
+        "PageDown" => KeySpec {
+            key: "PageDown".to_string(),
+            code: "PageDown".to_string(),
+            vk: 34,
+        },
+        "PageUp" => KeySpec {
+            key: "PageUp".to_string(),
+            code: "PageUp".to_string(),
+            vk: 33,
+        },
+        "Home" => KeySpec {
+            key: "Home".to_string(),
+            code: "Home".to_string(),
+            vk: 36,
+        },
+        "End" => KeySpec {
+            key: "End".to_string(),
+            code: "End".to_string(),
+            vk: 35,
+        },
+        "[" | "BracketLeft" => KeySpec {
+            key: "[".to_string(),
+            code: "BracketLeft".to_string(),
+            vk: 219,
+        },
+        "]" | "BracketRight" => KeySpec {
+            key: "]".to_string(),
+            code: "BracketRight".to_string(),
+            vk: 221,
+        },
+        "/" | "?" | "Slash" => KeySpec {
+            key: if trimmed == "?" { "?" } else { "/" }.to_string(),
+            code: "Slash".to_string(),
+            vk: 191,
+        },
+        other => KeySpec {
+            key: other.to_string(),
+            code: other.to_string(),
+            vk: 0,
+        },
+    }
+}
+
+fn held_keys_path(data: &Path, profile: &str) -> PathBuf {
+    profile_dir(data, profile).join("held_keys.json")
+}
+
+fn load_held_keys(data: &Path, profile: &str) -> Vec<KeySpec> {
+    let path = held_keys_path(data, profile);
+    std::fs::read(&path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Vec<KeySpec>>(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_held_keys(data: &Path, profile: &str, keys: &[KeySpec]) {
+    let path = held_keys_path(data, profile);
+    if keys.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(keys) {
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+fn clear_held_keys(data: &Path, profile: &str) {
+    let _ = std::fs::remove_file(held_keys_path(data, profile));
+}
+
+fn dispatch_cdp_key_down(
+    cdp: &mut CdpSession,
+    spec: &KeySpec,
+    auto_repeat: bool,
+    target_frame_id: Option<&str>,
+) -> Result<(), Error> {
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+            "type": "keyDown",
+            "key": spec.key,
+            "code": spec.code,
+            "windowsVirtualKeyCode": spec.vk,
+            "nativeVirtualKeyCode": spec.vk,
+            "autoRepeat": auto_repeat,
+        }),
+    )?;
+    if let Some(fid) = target_frame_id {
+        let key_json = serde_json::to_string(&spec.key).unwrap_or_else(|_| "\"Enter\"".into());
+        let code_json = serde_json::to_string(&spec.code).unwrap_or_else(|_| "\"Enter\"".into());
+        let vk = spec.vk;
+        let js = format!(
+            r#"(() => {{
+              const el = document.activeElement || document.body;
+              if (!el) return;
+              el.dispatchEvent(new KeyboardEvent('keydown', {{ key: {key_json}, code: {code_json}, keyCode: {vk}, which: {vk}, repeat: {auto_repeat}, bubbles: true }}));
+            }})()"#
+        );
+        let _ = eval_js_in_frame(cdp, Some(fid), &js);
+    }
+    Ok(())
+}
+
+fn dispatch_cdp_key_up(
+    cdp: &mut CdpSession,
+    spec: &KeySpec,
+    target_frame_id: Option<&str>,
+) -> Result<(), Error> {
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+            "type": "keyUp",
+            "key": spec.key,
+            "code": spec.code,
+            "windowsVirtualKeyCode": spec.vk,
+            "nativeVirtualKeyCode": spec.vk,
+        }),
+    )?;
+    if let Some(fid) = target_frame_id {
+        let key_json = serde_json::to_string(&spec.key).unwrap_or_else(|_| "\"Enter\"".into());
+        let code_json = serde_json::to_string(&spec.code).unwrap_or_else(|_| "\"Enter\"".into());
+        let vk = spec.vk;
+        let js = format!(
+            r#"(() => {{
+              const el = document.activeElement || document.body;
+              if (!el) return;
+              el.dispatchEvent(new KeyboardEvent('keyup', {{ key: {key_json}, code: {code_json}, keyCode: {vk}, which: {vk}, bubbles: true }}));
+            }})()"#
+        );
+        let _ = eval_js_in_frame(cdp, Some(fid), &js);
+    }
+    Ok(())
+}
+
+fn release_recorded_held_keys(data: &Path, profile: &str, cdp: &mut CdpSession) -> Vec<String> {
+    let held = load_held_keys(data, profile);
+    if held.is_empty() {
+        return Vec::new();
+    }
+    let mut released = Vec::with_capacity(held.len());
+    for spec in held.iter().rev() {
+        let _ = dispatch_cdp_key_up(cdp, spec, None);
+        released.push(spec.key.clone());
+    }
+    clear_held_keys(data, profile);
+    released
+}
+
+struct HeldKeyGuard<'a> {
+    data: &'a Path,
+    profile: &'a str,
+    cdp: &'a mut CdpSession,
+    target_frame_id: Option<String>,
+    specs: Vec<KeySpec>,
+    released: bool,
+}
+
+impl<'a> HeldKeyGuard<'a> {
+    fn release(&mut self) -> Result<(), Error> {
+        if self.released {
+            return Ok(());
+        }
+        self.released = true;
+        let mut first_err = None;
+        for spec in self.specs.iter().rev() {
+            if let Err(err) = dispatch_cdp_key_up(self.cdp, spec, self.target_frame_id.as_deref())
+                && first_err.is_none()
+            {
+                first_err = Some(err);
+            }
+        }
+        clear_held_keys(self.data, self.profile);
+        if let Some(err) = first_err {
+            Err(err)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl Drop for HeldKeyGuard<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            self.released = true;
+            for spec in self.specs.iter().rev() {
+                let _ = dispatch_cdp_key_up(self.cdp, spec, self.target_frame_id.as_deref());
+            }
+            clear_held_keys(self.data, self.profile);
+        }
+    }
+}
+
+fn resolve_request_key_specs(req: &BrowserRequest) -> Result<Vec<KeySpec>, Error> {
+    let mut out = Vec::new();
+    if let Some(ref list) = req.keys {
+        for item in list {
+            if !item.is_empty() {
+                out.push(resolve_key_spec(item));
+            }
+        }
+    }
+    if out.is_empty()
+        && let Some(raw) = req
+            .key
+            .as_deref()
+            .or(req.text.as_deref())
+            .filter(|s| !s.is_empty())
+    {
+        out.push(resolve_key_spec(raw));
+    }
+    if out.is_empty() {
+        return Err(Error::Message(
+            "browser press/hold requires `key` or `keys` (e.g. `Enter`, `Escape`, `a`, `w`, `ArrowUp`)".into(),
+        ));
+    }
+    Ok(out)
+}
+
 pub fn list_profiles(data: &Path) -> Result<Vec<BrowserProfileSummary>, Error> {
     let root = profiles_root(data);
     let mut names = std::collections::BTreeSet::new();
@@ -1691,6 +2048,10 @@ pub fn execute(
         }
         "status" | "info" | "fingerprint" => {
             let fp = ensure_fingerprint(data, &profile)?;
+            let held: Vec<String> = load_held_keys(data, &profile)
+                .into_iter()
+                .map(|k| k.key)
+                .collect();
             if let Some(rt) = load_runtime(data, &profile) {
                 let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
                 return Ok(serde_json::json!({
@@ -1699,12 +2060,14 @@ pub fn execute(
                     "runtime": rt,
                     "fingerprint": fp,
                     "tabs": pages,
+                    "held_keys": held,
                 }));
             }
             return Ok(serde_json::json!({
                 "profile": profile,
                 "status": "stopped",
                 "fingerprint": fp,
+                "held_keys": held,
             }));
         }
         _ => {}
@@ -1808,6 +2171,7 @@ pub fn execute(
             } else {
                 format!("https://{raw_url}")
             };
+            clear_held_keys(data, &profile);
             cdp.call("Page.navigate", serde_json::json!({ "url": url }))?;
             let wait_ms = req.wait_ms.unwrap_or(1000);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -2167,32 +2531,8 @@ pub fn execute(
             }
             Ok(resp)
         }
-        "press" | "key" => {
-            let key_name = req
-                .key
-                .as_deref()
-                .or(req.text.as_deref())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    Error::Message(
-                        "browser press requires `key` (e.g. `Enter`, `Tab`, `Escape`)".into(),
-                    )
-                })?;
-            let vk = match key_name {
-                "Enter" => 13,
-                "Tab" => 9,
-                "Escape" => 27,
-                "Backspace" => 8,
-                "ArrowDown" => 40,
-                "ArrowUp" => 38,
-                "ArrowLeft" => 37,
-                "ArrowRight" => 39,
-                "PageDown" => 34,
-                "PageUp" => 33,
-                "Space" | " " => 32,
-                _ => 0,
-            };
+        "press" | "key" | "hold" | "key_down" | "keydown" | "key_up" | "keyup" | "release"
+        | "release_keys" => {
             let mut target_frame_id = None;
             if let Some(raw_sel) = req
                 .selector
@@ -2214,44 +2554,189 @@ pub fn execute(
                     }})()"#
                 );
                 let _ = eval_js_in_frame(&mut cdp, target_frame_id.as_deref(), &focus_js);
-            }
-            cdp.call(
-                "Input.dispatchKeyEvent",
-                serde_json::json!({
-                    "type": "keyDown",
-                    "key": key_name,
-                    "code": key_name,
-                    "windowsVirtualKeyCode": vk,
-                    "nativeVirtualKeyCode": vk,
-                }),
-            )?;
-            cdp.call(
-                "Input.dispatchKeyEvent",
-                serde_json::json!({
-                    "type": "keyUp",
-                    "key": key_name,
-                    "code": key_name,
-                    "windowsVirtualKeyCode": vk,
-                    "nativeVirtualKeyCode": vk,
-                }),
-            )?;
-            if let Some(fid) = target_frame_id.as_deref() {
-                let key_json =
-                    serde_json::to_string(key_name).unwrap_or_else(|_| "\"Enter\"".into());
-                let press_js = format!(
-                    r#"(() => {{
-                      const el = document.activeElement || document.body;
-                      if (!el) return;
-                      el.dispatchEvent(new KeyboardEvent('keydown', {{ key: {key_json}, code: {key_json}, keyCode: {vk}, which: {vk}, bubbles: true }}));
-                      el.dispatchEvent(new KeyboardEvent('keyup', {{ key: {key_json}, code: {key_json}, keyCode: {vk}, which: {vk}, bubbles: true }}));
-                    }})()"#
+            } else {
+                let _ = eval_js(
+                    &mut cdp,
+                    "try { window.focus && window.focus(); } catch (_) {}",
                 );
-                let _ = eval_js_in_frame(&mut cdp, Some(fid), &press_js);
             }
-            Ok(serde_json::json!({
-                "profile": profile,
-                "pressed": key_name,
-            }))
+
+            if matches!(
+                action.as_str(),
+                "key_up" | "keyup" | "release" | "release_keys"
+            ) {
+                let has_explicit_key = req
+                    .keys
+                    .as_ref()
+                    .is_some_and(|v| v.iter().any(|s| !s.trim().is_empty()))
+                    || req
+                        .key
+                        .as_deref()
+                        .or(req.text.as_deref())
+                        .is_some_and(|s| !s.trim().is_empty());
+                if has_explicit_key {
+                    let specs = resolve_request_key_specs(&req)?;
+                    for spec in specs.iter().rev() {
+                        dispatch_cdp_key_up(&mut cdp, spec, target_frame_id.as_deref())?;
+                    }
+                    let mut remaining = load_held_keys(data, &profile);
+                    remaining.retain(|held| {
+                        !specs
+                            .iter()
+                            .any(|s| s.code == held.code || s.key == held.key)
+                    });
+                    save_held_keys(data, &profile, &remaining);
+                    let released_names: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
+                    return Ok(serde_json::json!({
+                        "profile": profile,
+                        "released": if released_names.len() == 1 {
+                            serde_json::json!(released_names[0])
+                        } else {
+                            serde_json::json!(released_names)
+                        },
+                        "released_keys": released_names,
+                        "held_keys": remaining.iter().map(|s| s.key.clone()).collect::<Vec<_>>(),
+                    }));
+                } else {
+                    let released = release_recorded_held_keys(data, &profile, &mut cdp);
+                    return Ok(serde_json::json!({
+                        "profile": profile,
+                        "released": released,
+                        "released_keys": released,
+                        "held_keys": Vec::<String>::new(),
+                    }));
+                }
+            }
+
+            let specs = resolve_request_key_specs(&req)?;
+            let key_names: Vec<String> = specs.iter().map(|s| s.key.clone()).collect();
+            let code_names: Vec<String> = specs.iter().map(|s| s.code.clone()).collect();
+
+            if matches!(action.as_str(), "key_down" | "keydown") {
+                let mut current_held = load_held_keys(data, &profile);
+                for spec in &specs {
+                    dispatch_cdp_key_down(&mut cdp, spec, false, target_frame_id.as_deref())?;
+                    if !current_held
+                        .iter()
+                        .any(|h| h.code == spec.code && h.key == spec.key)
+                    {
+                        current_held.push(spec.clone());
+                    }
+                }
+                save_held_keys(data, &profile, &current_held);
+                return Ok(serde_json::json!({
+                    "profile": profile,
+                    "key_down": if key_names.len() == 1 {
+                        serde_json::json!(key_names[0])
+                    } else {
+                        serde_json::json!(key_names)
+                    },
+                    "keys": key_names,
+                    "codes": code_names,
+                    "held_keys": current_held.iter().map(|s| s.key.clone()).collect::<Vec<_>>(),
+                }));
+            }
+
+            // Release any prior unclosed held keys on this profile before starting a new press/hold.
+            let _ = release_recorded_held_keys(data, &profile, &mut cdp);
+
+            let hold_ms = if action == "hold" {
+                req.hold_ms.or(req.wait_ms).unwrap_or(500)
+            } else {
+                req.hold_ms.unwrap_or(0)
+            }
+            .min(30_000);
+            let repeat = req.repeat.unwrap_or(false);
+
+            if hold_ms > 0 {
+                save_held_keys(data, &profile, &specs);
+                let mut guard = HeldKeyGuard {
+                    data,
+                    profile: &profile,
+                    cdp: &mut cdp,
+                    specs: specs.clone(),
+                    target_frame_id: target_frame_id.clone(),
+                    released: false,
+                };
+                for spec in &guard.specs {
+                    dispatch_cdp_key_down(
+                        guard.cdp,
+                        spec,
+                        false,
+                        guard.target_frame_id.as_deref(),
+                    )?;
+                }
+                let start = std::time::Instant::now();
+                let total = Duration::from_millis(hold_ms);
+                let mut next_repeat = Duration::from_millis(50);
+                while start.elapsed() < total {
+                    let rem = total.saturating_sub(start.elapsed());
+                    let step = rem.min(Duration::from_millis(25));
+                    if !step.is_zero() {
+                        std::thread::sleep(step);
+                    }
+                    if repeat && start.elapsed() >= next_repeat && start.elapsed() < total {
+                        for spec in &guard.specs {
+                            dispatch_cdp_key_down(
+                                guard.cdp,
+                                spec,
+                                true,
+                                guard.target_frame_id.as_deref(),
+                            )?;
+                        }
+                        next_repeat += Duration::from_millis(50);
+                    }
+                }
+                let elapsed_ms = start.elapsed().as_millis() as u64;
+                guard.release()?;
+
+                if let Some(wait_ms) = req.wait_ms
+                    && action != "hold"
+                    && wait_ms > 0
+                {
+                    std::thread::sleep(Duration::from_millis(wait_ms.min(10_000)));
+                }
+
+                Ok(serde_json::json!({
+                    "profile": profile,
+                    "pressed": if key_names.len() == 1 {
+                        serde_json::json!(key_names[0])
+                    } else {
+                        serde_json::json!(key_names)
+                    },
+                    "keys": key_names,
+                    "codes": code_names,
+                    "hold_ms": hold_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "released": true,
+                    "trusted_input": true,
+                }))
+            } else {
+                for spec in &specs {
+                    dispatch_cdp_key_down(&mut cdp, spec, false, target_frame_id.as_deref())?;
+                }
+                for spec in specs.iter().rev() {
+                    dispatch_cdp_key_up(&mut cdp, spec, target_frame_id.as_deref())?;
+                }
+                if let Some(wait_ms) = req.wait_ms
+                    && wait_ms > 0
+                {
+                    std::thread::sleep(Duration::from_millis(wait_ms.min(10_000)));
+                }
+                Ok(serde_json::json!({
+                    "profile": profile,
+                    "pressed": if key_names.len() == 1 {
+                        serde_json::json!(key_names[0])
+                    } else {
+                        serde_json::json!(key_names)
+                    },
+                    "keys": key_names,
+                    "codes": code_names,
+                    "hold_ms": 0,
+                    "released": true,
+                    "trusted_input": true,
+                }))
+            }
         }
         "eval" | "evaluate" | "js" => {
             let script = req
@@ -2319,7 +2804,7 @@ pub fn execute(
             }))
         }
         other => Err(Error::Message(format!(
-            "unknown browser action `{other}`; expected `open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, or `close`"
+            "unknown browser action `{other}`; expected `open`, `snapshot`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, or `close`"
         ))),
     }
 }
@@ -2530,6 +3015,222 @@ mod tests {
             BrowserRequest {
                 action: "close".into(),
                 profile: Some("test-iframe".into()),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[test]
+    fn held_key_moves_raf_fixture_stops_on_release_and_isolates_profiles() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let fixture_html = r#"<!doctype html>
+<html>
+<head><title>Held Key Fixture</title></head>
+<body>
+  <div id="status">ready</div>
+  <script>
+    window.__state = {
+      x: 0,
+      y: 0,
+      frames: 0,
+      heldFrames: 0,
+      downCount: 0,
+      upCount: 0,
+      trustedDown: false,
+      trustedUp: false,
+      lastKey: "",
+      lastCode: "",
+      pressed: {}
+    };
+    window.addEventListener("keydown", (e) => {
+      window.__state.downCount += 1;
+      window.__state.trustedDown = e.isTrusted === true;
+      window.__state.lastKey = e.key;
+      window.__state.lastCode = e.code;
+      window.__state.pressed[e.key.toLowerCase()] = true;
+      window.__state.pressed[e.code] = true;
+    });
+    window.addEventListener("keyup", (e) => {
+      window.__state.upCount += 1;
+      window.__state.trustedUp = e.isTrusted === true;
+      delete window.__state.pressed[e.key.toLowerCase()];
+      delete window.__state.pressed[e.code];
+    });
+    function step() {
+      window.__state.frames += 1;
+      let moving = false;
+      if (window.__state.pressed["d"] || window.__state.pressed["KeyD"] || window.__state.pressed["ArrowRight"]) {
+        window.__state.x += 4;
+        moving = true;
+      }
+      if (window.__state.pressed["w"] || window.__state.pressed["KeyW"] || window.__state.pressed["ArrowUp"]) {
+        window.__state.y -= 4;
+        moving = true;
+      }
+      if (moving) {
+        window.__state.heldFrames += 1;
+      }
+      document.getElementById("status").innerText =
+        `x=${window.__state.x} y=${window.__state.y} heldFrames=${window.__state.heldFrames} pressed=${Object.keys(window.__state.pressed).join(",")}`;
+      requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
+  </script>
+</body>
+</html>"#
+            .to_string();
+        let port = spawn_html_server("127.0.0.1", fixture_html);
+        let dir = tempfile::tempdir().unwrap();
+
+        execute(
+            dir.path(),
+            "profile-a",
+            BrowserRequest {
+                action: "open".into(),
+                profile: Some("profile-a".into()),
+                url: Some(format!("http://127.0.0.1:{port}/")),
+                headless: Some(true),
+                wait_ms: Some(300),
+                ..Default::default()
+            },
+        )
+        .expect("open profile-a");
+
+        execute(
+            dir.path(),
+            "profile-b",
+            BrowserRequest {
+                action: "open".into(),
+                profile: Some("profile-b".into()),
+                url: Some(format!("http://127.0.0.1:{port}/")),
+                headless: Some(true),
+                wait_ms: Some(300),
+                ..Default::default()
+            },
+        )
+        .expect("open profile-b");
+
+        // Hold `d` for 350ms on profile-a.
+        let hold_res = execute(
+            dir.path(),
+            "profile-a",
+            BrowserRequest {
+                action: "press".into(),
+                profile: Some("profile-a".into()),
+                key: Some("d".into()),
+                hold_ms: Some(350),
+                ..Default::default()
+            },
+        )
+        .expect("hold d on profile-a");
+        assert_eq!(hold_res["pressed"], "d");
+        assert_eq!(hold_res["codes"][0], "KeyD");
+        assert_eq!(hold_res["released"], true);
+        assert_eq!(hold_res["trusted_input"], true);
+
+        let after_hold = execute(
+            dir.path(),
+            "profile-a",
+            BrowserRequest {
+                action: "eval".into(),
+                profile: Some("profile-a".into()),
+                script: Some("window.__state".into()),
+                ..Default::default()
+            },
+        )
+        .expect("eval state after hold")["result"]
+            .clone();
+
+        let x_after = after_hold["x"].as_i64().unwrap_or(0);
+        let held_frames = after_hold["heldFrames"].as_i64().unwrap_or(0);
+        assert!(
+            x_after > 0 && held_frames >= 2,
+            "expected multi-frame movement while held, got: {after_hold}"
+        );
+        assert_eq!(after_hold["trustedDown"], true);
+        assert_eq!(after_hold["trustedUp"], true);
+        assert_eq!(after_hold["lastKey"], "d");
+        assert_eq!(after_hold["lastCode"], "KeyD");
+        assert_eq!(
+            after_hold["pressed"]
+                .as_object()
+                .map(|m| m.len())
+                .unwrap_or(99),
+            0,
+            "expected no stuck keys after hold completes, got: {after_hold}"
+        );
+
+        // Wait 200ms after release and verify movement stopped completely.
+        std::thread::sleep(Duration::from_millis(200));
+        let after_stop = execute(
+            dir.path(),
+            "profile-a",
+            BrowserRequest {
+                action: "eval".into(),
+                profile: Some("profile-a".into()),
+                script: Some("window.__state".into()),
+                ..Default::default()
+            },
+        )
+        .expect("eval state after stop")["result"]
+            .clone();
+        assert_eq!(
+            after_stop["x"].as_i64().unwrap_or(-1),
+            x_after,
+            "expected x to remain stationary after keyUp, got {after_stop} vs {x_after}"
+        );
+
+        // Verify profile-b was completely isolated and never moved.
+        let state_b = execute(
+            dir.path(),
+            "profile-b",
+            BrowserRequest {
+                action: "eval".into(),
+                profile: Some("profile-b".into()),
+                script: Some("window.__state".into()),
+                ..Default::default()
+            },
+        )
+        .expect("eval profile-b")["result"]
+            .clone();
+        assert_eq!(state_b["x"].as_i64().unwrap_or(-1), 0);
+        assert_eq!(state_b["downCount"].as_i64().unwrap_or(-1), 0);
+
+        // Verify explicit key_down + close releases held keys and clears held_keys.json.
+        execute(
+            dir.path(),
+            "profile-a",
+            BrowserRequest {
+                action: "key_down".into(),
+                profile: Some("profile-a".into()),
+                key: Some("w".into()),
+                ..Default::default()
+            },
+        )
+        .expect("key_down w");
+        assert_eq!(load_held_keys(dir.path(), "profile-a").len(), 1);
+
+        let _ = execute(
+            dir.path(),
+            "profile-a",
+            BrowserRequest {
+                action: "close".into(),
+                profile: Some("profile-a".into()),
+                ..Default::default()
+            },
+        );
+        assert!(
+            load_held_keys(dir.path(), "profile-a").is_empty(),
+            "closing profile must clear held_keys state"
+        );
+        let _ = execute(
+            dir.path(),
+            "profile-b",
+            BrowserRequest {
+                action: "close".into(),
+                profile: Some("profile-b".into()),
                 ..Default::default()
             },
         );

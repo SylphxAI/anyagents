@@ -228,7 +228,10 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
         .strip_prefix("agent:idle:")
         .or_else(|| s.strip_prefix("idle:"))
     {
-        let clean = target.trim().strip_prefix("agent:").unwrap_or(target.trim());
+        let clean = target
+            .trim()
+            .strip_prefix("agent:")
+            .unwrap_or(target.trim());
         if clean.is_empty() {
             return Err("`agent:idle:<name>` requires a target agent name or id".to_string());
         }
@@ -390,8 +393,9 @@ pub fn create_agent_schedule(
     let at_opt = at.map(str::trim).filter(|s| !s.is_empty());
     let every_opt = every.map(str::trim).filter(|s| !s.is_empty());
     let watch_opt = watch.map(str::trim).filter(|s| !s.is_empty());
-    let mode_count =
-        usize::from(at_opt.is_some()) + usize::from(every_opt.is_some()) + usize::from(watch_opt.is_some());
+    let mode_count = usize::from(at_opt.is_some())
+        + usize::from(every_opt.is_some())
+        + usize::from(watch_opt.is_some());
     if mode_count == 0 {
         return Err("`schedule` requires one of `at`, `every`, or `watch`".to_string());
     }
@@ -517,8 +521,14 @@ pub fn agent_wake_block_reason(
         anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
     };
     let live = health.get(&agent.id);
-    let effective_quota = live.as_ref().and_then(|l| l.quota_reset_at_ms).or(session_quota);
-    let effective_err = live.as_ref().and_then(|l| l.last_error.clone()).or(session_error);
+    let effective_quota = live
+        .as_ref()
+        .and_then(|l| l.quota_reset_at_ms)
+        .or(session_quota);
+    let effective_err = live
+        .as_ref()
+        .and_then(|l| l.last_error.clone())
+        .or(session_error);
     if effective_quota.is_some_and(|ms| ms > now) {
         return Some("quota_blocked");
     }
@@ -539,12 +549,7 @@ pub fn agent_wake_block_reason(
     None
 }
 
-pub fn is_agent_busy(
-    store: &Store,
-    health: &HealthBoard,
-    agent: &Agent,
-    now: i64,
-) -> bool {
+pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
     if store.has_open_turn(&agent.id).unwrap_or(false) {
         return true;
     }
@@ -608,7 +613,13 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                     )
                     .unwrap_or(false)
                 {
-                    deliver_scheduled_wake(store, &agent, &sched, &format!("schedule:{}:{}", sched.id, due), now);
+                    deliver_scheduled_wake(
+                        store,
+                        &agent,
+                        &sched,
+                        &format!("schedule:{}:{}", sched.id, due),
+                        now,
+                    );
                     fired_count += 1;
                 }
             }
@@ -649,7 +660,13 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                     )
                     .unwrap_or(false)
                 {
-                    deliver_scheduled_wake(store, &agent, &sched, &format!("schedule:{}:{}", sched.id, due), now);
+                    deliver_scheduled_wake(
+                        store,
+                        &agent,
+                        &sched,
+                        &format!("schedule:{}:{}", sched.id, due),
+                        now,
+                    );
                     fired_count += 1;
                 }
             }
@@ -891,8 +908,8 @@ fn spiron_api_key() -> Option<String> {
 
 /// Pull a Spiron promise or task state from the Spiron public API (`GET /v1/promises/{id}` or `/v1/tasks/{id}`).
 pub fn probe_spiron_state(id: &str, kind: &str) -> Option<String> {
-    let base = std::env::var("SPIRON_API_BASE")
-        .unwrap_or_else(|_| "https://api.spiron.ai".to_string());
+    let base =
+        std::env::var("SPIRON_API_BASE").unwrap_or_else(|_| "https://api.spiron.ai".to_string());
     let base = base.trim_end_matches('/');
     let key = spiron_api_key();
     let agent = ureq::Agent::config_builder()
@@ -902,9 +919,15 @@ pub fn probe_spiron_state(id: &str, kind: &str) -> Option<String> {
         .new_agent();
 
     let paths = if kind == "task" {
-        [format!("{base}/v1/tasks/{id}"), format!("{base}/v1/promises/{id}")]
+        [
+            format!("{base}/v1/tasks/{id}"),
+            format!("{base}/v1/promises/{id}"),
+        ]
     } else {
-        [format!("{base}/v1/promises/{id}"), format!("{base}/v1/tasks/{id}")]
+        [
+            format!("{base}/v1/promises/{id}"),
+            format!("{base}/v1/tasks/{id}"),
+        ]
     };
 
     for url in paths {
@@ -1014,11 +1037,7 @@ fn check_item_is_terminal(item: &serde_json::Value) -> bool {
     false
 }
 
-fn probe_github_check_terminal(
-    owner: &str,
-    repo: &str,
-    reference: &str,
-) -> Option<(bool, String)> {
+fn probe_github_check_terminal(owner: &str, repo: &str, reference: &str) -> Option<(bool, String)> {
     let clean_ref = reference.strip_prefix('#').unwrap_or(reference);
     if clean_ref.chars().all(|c| c.is_ascii_digit())
         && let Ok(pr_num) = clean_ref.parse::<u64>()
@@ -1239,7 +1258,10 @@ mod tests {
         let fourth_due = store.list_schedules(Some(&owner.id), true).unwrap()[0]
             .next_fire_at_ms
             .unwrap();
-        assert_eq!(store.cancel_schedule(Some(&owner.id), &sched.id).unwrap(), 1);
+        assert_eq!(
+            store.cancel_schedule(Some(&owner.id), &sched.id).unwrap(),
+            1
+        );
         assert_eq!(tick_schedules_once(&store, &health, fourth_due + 1_000), 0);
         assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
     }

@@ -69,6 +69,14 @@ struct GroupView {
 #[derive(Deserialize)]
 struct SendResponse {
     deliveries: Vec<Delivery>,
+    #[serde(default)]
+    skipped: Vec<SkippedDelivery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkippedDelivery {
+    to: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -492,6 +500,38 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(archived.state, "archived");
 
     // While archived, `group:all` skips it.
+    // Also pause `worker-1` after joining `crew` to verify `skipped` reports paused agents with reason.
+    let paused_worker: AgentView = ok_json(
+        call(
+            &alpha,
+            "subagents",
+            serde_json::json!({"action": "pause", "agent": &spawned.id}),
+        )
+        .await,
+    );
+    assert_eq!(paused_worker.state, "paused");
+
+    let to_all_with_paused: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["all"], "text": "broadcast while worker paused"}),
+        )
+        .await,
+    );
+    assert!(
+        to_all_with_paused
+            .skipped
+            .iter()
+            .any(|s| s.to == "agent:worker-1" && s.reason == "paused"),
+        "expected paused worker in skipped receipt: {:?}",
+        to_all_with_paused.skipped
+    );
+
+    let archived: AgentView =
+        ok_json(call(&alpha, "archive", serde_json::json!({"agent": &spawned.id})).await);
+    assert_eq!(archived.state, "archived");
+
     let to_all: SendResponse = ok_json(
         call(
             &alpha,
@@ -540,9 +580,9 @@ async fn mcp_tools_use_the_server_socket() {
         "{}",
         String::from_utf8_lossy(&inbox.stderr)
     );
-    // Two addressed lines, the room line, and the `all` broadcast line, each readable from the CLI too.
+    // Two addressed lines, the room line, and the two `all` broadcast lines, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 4, "{listed}");
+    assert_eq!(listed.lines().count(), 5, "{listed}");
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
 }

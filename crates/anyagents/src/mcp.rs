@@ -181,6 +181,8 @@ impl Client {
                 || path.ends_with("/role")
                 || path.starts_with("/v1/profiles")
                 || path.starts_with("/v1/schedules")
+                || path.starts_with("/v1/browser")
+                || path.starts_with("/v1/send")
                 || path.contains("/schedules")
                 || path.contains("/conversation"));
         let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
@@ -1422,7 +1424,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Native SOTA anti-detect browser with persistent login profiles and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `eval` | `screenshot` | `cookies` | `tabs` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
+        description = "Native SOTA anti-detect browser with persistent login profiles and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `eval` | `screenshot` | `cookies` | `tabs` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"press\"` or `\"hold\"` with `key` (or `keys`: `[\"w\", \"d\"]`) and optional `hold_ms` (e.g. `500`) to hold trusted keyboard input (`isTrusted: true`, W3C `KeyboardEvent.code`) across rendered animation frames and release cleanly on completion; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
     )]
     async fn browser(
         &self,
