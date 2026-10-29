@@ -158,3 +158,45 @@ fn launch_resumes_when_a_session_is_known() {
     assert!(!log.contains("\"method\":\"thread/start\""));
     drop(harness);
 }
+
+#[test]
+fn harness_returning_401_surfaces_errored_within_three_turns() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "401", None);
+    let _ = harness.deliver(&msg("m1"));
+    let err = harness
+        .wait_error(Duration::from_secs(5))
+        .expect("401 turn error surfaced");
+    assert!(err.contains("401"), "unexpected error: {err}");
+    let health = harness.health();
+    assert_eq!(health.turn_state, TurnState::Idle);
+    assert!(
+        health
+            .sign_in_fault
+            .as_deref()
+            .is_some_and(|s| s.contains("401")),
+        "expected sign_in_fault with 401, got {:?}",
+        health.sign_in_fault
+    );
+    assert!(
+        harness.turns_started() <= 3,
+        "expected errored within 3 turns, started {}",
+        harness.turns_started()
+    );
+}
+
+#[test]
+fn consecutive_turn_failures_surface_errored_within_three_turns() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "turn-error", None);
+    let _ = harness.deliver(&msg("m1"));
+    let err = harness
+        .wait_error(Duration::from_secs(5))
+        .expect("repeated turn error surfaced within 3 turns");
+    assert!(
+        err.contains("upstream model stream closed unexpectedly"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(harness.turns_started(), 3);
+    assert_eq!(harness.health().turn_state, TurnState::Idle);
+}

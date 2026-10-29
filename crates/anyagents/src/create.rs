@@ -97,8 +97,14 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     };
     let _ = crate::operator::mint(store, &agent.id);
     store.set_agent_launch_env(&agent.id, &pairs)?;
+    let mut pre_running = agent.clone();
+    pre_running.workdir = Some(cwd.display().to_string());
+    if let Err(err) = reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd) {
+        let _ = store.delete_agent(&agent.id);
+        let _ = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()));
+        return Err(err);
+    }
     let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
-    reconcile_agent_runtime_config(store, &data, &running, &config, &cwd)?;
     if workdir_created
         && let Some((_, _, gid, _)) =
             crate::sandbox::seat_for_agent_with_hint(&running.name, parent_name.as_deref())
@@ -1230,7 +1236,9 @@ pub(crate) fn reconcile_agent_runtime_config(
         continuity.as_deref(),
     );
 
-    if let Ok(command) = crate::data::current_exe_clean() {
+    if std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_none()
+        && let Ok(command) = crate::data::current_exe_clean()
+    {
         let args = vec![
             "--data".to_string(),
             data.display().to_string(),
@@ -1256,11 +1264,11 @@ pub(crate) fn reconcile_agent_runtime_config(
                 opencode_config::write(config, agent.model.as_deref(), &command, &args)?;
             }
             "agy" => {
-                let _ = mcp_config::write_claude(
+                mcp_config::write_claude(
                     &config.join(".gemini/config/mcp_config.json"),
                     &command,
                     &args,
-                );
+                )?;
                 crate::vendor::ensure_agy_steering_settings(config, work_dir);
             }
             "muse" => {
@@ -1268,24 +1276,18 @@ pub(crate) fn reconcile_agent_runtime_config(
                 let _ = muse_config::point_vendor_home(config);
             }
             "omp" => {
-                let _ = crate::grok::write_omp_mcp_config(config, &command, &args);
+                crate::grok::write_omp_mcp_config(config, &command, &args)?;
             }
             "dsh" => {
-                let _ = crate::dsh::write_dsh_mcp_patch(
-                    config,
-                    agent.model.as_deref(),
-                    &command,
-                    &args,
-                );
+                crate::dsh::write_dsh_mcp_patch(config, agent.model.as_deref(), &command, &args)?;
             }
             "grok" => {
-                let _ =
-                    crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args);
+                crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
             _ => {
                 let _ = mcp_config::sanitize_claude_settings(config);
-                let _ = mcp_config::write_claude(&config.join(".claude.json"), &command, &args);
-                let _ = mcp_config::write_claude(&config.join("mcp.json"), &command, &args);
+                mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
+                mcp_config::write_claude(&config.join("mcp.json"), &command, &args)?;
             }
         }
     }
@@ -1319,7 +1321,254 @@ pub(crate) fn reconcile_agent_runtime_config(
             let _ = std::fs::set_permissions(config, std::fs::Permissions::from_mode(safe_mode));
         }
     }
+    verify_harness_runtime_config(config, &agent.harness, agent.model.as_deref())?;
     Ok(continuity)
+}
+
+/// Verifies that the active harness's runtime configuration file exists on disk
+/// and contains the required AnyAgents MCP server, model, and provider bindings
+/// before any harness process is allowed to start.
+pub(crate) fn verify_harness_runtime_config(
+    config: &Path,
+    harness: &str,
+    model: Option<&str>,
+) -> Result<(), Error> {
+    if std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some() {
+        return Err(Error::Message(format!(
+            "harness runtime config verification failed for `{harness}`: config write suppressed"
+        )));
+    }
+    let has_model = model.map(str::trim).is_some_and(|m| !m.is_empty());
+    match harness {
+        "codex" => {
+            let path = config.join("config.toml");
+            let text = std::fs::read_to_string(&path).map_err(|_| {
+                Error::Message(format!(
+                    "codex runtime config missing: {}",
+                    path.display()
+                ))
+            })?;
+            if !text.contains("[mcp_servers.anyagents]") || !text.contains("command =") {
+                return Err(Error::Message(
+                    "codex config.toml missing [mcp_servers.anyagents]".into(),
+                ));
+            }
+            if has_model
+                && !text.lines().any(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("model =") || t.starts_with("model=")
+                })
+            {
+                return Err(Error::Message("codex config.toml missing model".into()));
+            }
+            let profile_is_sylphx = std::fs::read_to_string(config.join(".anyagents-profile"))
+                .ok()
+                .is_some_and(|s| {
+                    let t = s.trim();
+                    t == "sylphx" || t.starts_with("sylphx/")
+                });
+            let model_is_sylphx = model
+                .map(str::trim)
+                .is_some_and(|m| m.starts_with("sylphx/"));
+            if (profile_is_sylphx || model_is_sylphx)
+                && (!text.contains("model_provider = \"sylphx\"")
+                    || !text.contains("[model_providers.sylphx]"))
+            {
+                return Err(Error::Message(
+                    "codex config.toml missing sylphx model_provider".into(),
+                ));
+            }
+        }
+        "opencode" => {
+            for rel in ["opencode/opencode.json", ".config/opencode/opencode.json"] {
+                let path = config.join(rel);
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    Error::Message(format!("opencode runtime config missing: {}", path.display()))
+                })?;
+                let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    Error::Message(format!("opencode runtime config invalid JSON: {}", path.display()))
+                })?;
+                if val.pointer("/mcp/anyagents/command").is_none() {
+                    return Err(Error::Message(format!(
+                        "opencode config missing mcp.anyagents: {}",
+                        path.display()
+                    )));
+                }
+                if has_model
+                    && val
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|s| s.trim().is_empty())
+                {
+                    return Err(Error::Message(format!(
+                        "opencode config missing model: {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        "muse" => {
+            for rel in ["settings.json", "muse/settings.json", ".config/muse/settings.json"] {
+                let path = config.join(rel);
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    Error::Message(format!("muse runtime config missing: {}", path.display()))
+                })?;
+                let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    Error::Message(format!("muse runtime config invalid JSON: {}", path.display()))
+                })?;
+                if val.get("schema_version").is_none()
+                    || val.pointer("/mcpServers/anyagents/command").is_none()
+                {
+                    return Err(Error::Message(format!(
+                        "muse settings.json missing schema_version or mcpServers.anyagents: {}",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        "agy" => {
+            let path = config.join(".gemini/config/mcp_config.json");
+            let bytes = std::fs::read(&path).map_err(|_| {
+                Error::Message(format!("agy runtime config missing: {}", path.display()))
+            })?;
+            let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                Error::Message(format!("agy runtime config invalid JSON: {}", path.display()))
+            })?;
+            if val.pointer("/mcpServers/anyagents/command").is_none() {
+                return Err(Error::Message(
+                    "agy mcp_config.json missing mcpServers.anyagents".into(),
+                ));
+            }
+        }
+        "omp" => {
+            let path = config.join(".omp/agent/mcp.json");
+            let text = std::fs::read_to_string(&path).map_err(|_| {
+                Error::Message(format!("omp runtime config missing: {}", path.display()))
+            })?;
+            if !text.contains("\"anyagents\"") {
+                return Err(Error::Message("omp mcp.json missing anyagents".into()));
+            }
+        }
+        "dsh" => {
+            let path = config.join("dsh-mcp-patch.yml");
+            let text = std::fs::read_to_string(&path).map_err(|_| {
+                Error::Message(format!("dsh runtime config missing: {}", path.display()))
+            })?;
+            if !text.contains("anyagents") {
+                return Err(Error::Message(
+                    "dsh-mcp-patch.yml missing anyagents".into(),
+                ));
+            }
+        }
+        "grok" => {
+            let path = config.join(".grok/config.toml");
+            let text = std::fs::read_to_string(&path).map_err(|_| {
+                Error::Message(format!("grok runtime config missing: {}", path.display()))
+            })?;
+            if !text.contains("[mcp_servers.anyagents]") {
+                return Err(Error::Message(
+                    "grok config.toml missing [mcp_servers.anyagents]".into(),
+                ));
+            }
+        }
+        _ => {
+            for rel in ["mcp.json", ".claude.json"] {
+                let path = config.join(rel);
+                let bytes = std::fs::read(&path).map_err(|_| {
+                    Error::Message(format!(
+                        "claude-code runtime config missing: {}",
+                        path.display()
+                    ))
+                })?;
+                let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
+                    Error::Message(format!(
+                        "claude-code runtime config invalid JSON: {}",
+                        path.display()
+                    ))
+                })?;
+                if val.pointer("/mcpServers/anyagents/command").is_none() {
+                    return Err(Error::Message(format!(
+                        "claude-code {} missing mcpServers.anyagents",
+                        path.display()
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Notifies a sub-agent's parent once when the sub-agent enters `turn_state == "errored"`.
+/// Uses both a marker file in `config` (`.anyagents-notified-parent-error.json`) and
+/// `Store::receive`'s ACID `source_key` deduplication so the parent never receives
+/// duplicate alerts for the same error episode.
+pub(crate) fn maybe_notify_parent_on_error(
+    store: &Store,
+    agent: &Agent,
+    config: &Path,
+    err_msg: &str,
+) {
+    let Some(ref parent_id) = agent.parent_id else {
+        return;
+    };
+    let trimmed = err_msg.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let rotated_ms = std::fs::read_to_string(config.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let marker_path = config.join(".anyagents-notified-parent-error.json");
+    let source_key = format!("subagent-error:{}:{rotated_ms}:{trimmed}", agent.id.as_str());
+    if let Ok(existing) = std::fs::read_to_string(&marker_path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&existing)
+        && val.get("source_key").and_then(|v| v.as_str()) == Some(source_key.as_str())
+    {
+        return;
+    }
+    let marker = serde_json::json!({
+        "source_key": source_key,
+        "error": trimmed,
+        "timestamp_ms": anyagents_core::now_ms(),
+    });
+    let _ = std::fs::write(&marker_path, marker.to_string());
+    let text = format!(
+        "[Sub-Agent Error] Sub-agent `{}` (`{}`) entered `turn_state: \"errored\"` on harness `{}`: {}",
+        agent.name,
+        agent.id.as_str(),
+        agent.harness,
+        trimmed
+    );
+    if let Ok(anyagents_core::ReceiveOutcome::New(_)) = store.receive(
+        parent_id,
+        anyagents_core::Incoming {
+            text,
+            sender: Some(format!("agent:{}", agent.name)),
+            source_time_ms: None,
+            source_key: Some(source_key),
+            reply_to: None,
+            quote: None,
+            origin: None,
+            received_at_ms: None,
+        },
+    ) {
+        poke_agent_wake_socket_mail(store.data_dir(), parent_id);
+    }
+}
+
+pub(crate) fn poke_agent_wake_socket_mail(data: &Path, agent_id: &AgentId) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::net::UnixDatagram;
+        let sock_path = data.join("wake.sock");
+        if sock_path.exists()
+            && let Ok(sock) = UnixDatagram::unbound()
+        {
+            let msg = format!("m{}", agent_id.as_str());
+            let _ = sock.send_to(msg.as_bytes(), &sock_path);
+        }
+    }
 }
 
 /// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
@@ -4552,5 +4801,181 @@ mod tests {
             let healed_reconcile = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777;
             assert_eq!(healed_reconcile & 0o0700, 0o0700);
         }
+    }
+
+    #[test]
+    fn spawn_refuses_when_config_write_is_suppressed_or_invalid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+
+        let empty_cfg = data.join("empty-codex-cfg");
+        std::fs::create_dir_all(&empty_cfg).unwrap();
+        let err = verify_harness_runtime_config(
+            &empty_cfg,
+            "codex",
+            Some("sylphx/openai/gpt-5.4#xhigh"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("codex runtime config missing") && err.contains("config.toml"),
+            "unexpected err: {err}"
+        );
+
+        // Write a partial config missing [mcp_servers.anyagents]
+        std::fs::write(empty_cfg.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
+        let err2 = verify_harness_runtime_config(
+            &empty_cfg,
+            "codex",
+            Some("sylphx/openai/gpt-5.4#xhigh"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err2.contains("[mcp_servers.anyagents]"),
+            "unexpected err: {err2}"
+        );
+
+        unsafe {
+            std::env::set_var("ANYAGENTS_SUPPRESS_CONFIG_WRITE", "1");
+        }
+        let res = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "broken-spawn-child".to_string(),
+                role: Some("Worker".to_string()),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
+                profile: None,
+                workdir: None,
+                workdir_default: Some(data.to_path_buf()),
+                instructions: Some("Should never start".to_string()),
+                parent_id: None,
+            },
+        );
+        unsafe {
+            std::env::remove_var("ANYAGENTS_SUPPRESS_CONFIG_WRITE");
+        }
+        assert!(res.is_err(), "expected spawn to fail when config write suppressed");
+        assert!(
+            store.agent_by_name("broken-spawn-child").is_err(),
+            "refused spawn must not leave a running agent row behind"
+        );
+    }
+
+    #[test]
+    fn failing_turn_shows_errored_and_notifies_parent_once() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+
+        let parent = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "parent-helios".to_string(),
+                role: Some("Owner".to_string()),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
+                profile: None,
+                workdir: None,
+                workdir_default: Some(data.to_path_buf()),
+                instructions: Some("Parent".to_string()),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+
+        let child = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "helios-goal-settlement".to_string(),
+                role: Some("Worker".to_string()),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
+                profile: None,
+                workdir: None,
+                workdir_default: Some(data.to_path_buf()),
+                instructions: Some("Child".to_string()),
+                parent_id: Some(parent.id.clone()),
+            },
+        )
+        .unwrap();
+
+        let child_cfg = anyagents_core::agent_config_dir(data, &child.id);
+        let sess_dir = child_cfg.join("sessions/2026/10/29");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+        let rollout_path = sess_dir.join("rollout-2026-10-29T18-51-32-test.jsonl");
+        let rollout_line = serde_json::json!({
+            "timestamp": "2026-10-29T18:51:40.000Z",
+            "ordinal": 4,
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "root_turn_id": "t1",
+                "turn_id": "t1",
+                "last_agent_message": null,
+                "error": {
+                    "message": "workspace routing discovery unauthorized (401)"
+                }
+            }
+        });
+        std::fs::write(&rollout_path, format!("{rollout_line}\n")).unwrap();
+
+        let mut views = vec![crate::api::AgentView {
+            id: child.id.to_string(),
+            name: child.name.clone(),
+            role: child.role.clone(),
+            aliases: Vec::new(),
+            parent: Some(parent.id.to_string()),
+            harness: child.harness.clone(),
+            model: child.model.clone(),
+            live_harness: Some(child.harness.clone()),
+            live_model: child.model.clone(),
+            process_started_at_ms: Some(anyagents_core::now_ms()),
+            pending_switch: false,
+            workdir: child.workdir.clone(),
+            state: "running".to_string(),
+            process: "alive".to_string(),
+            turn_state: "working".to_string(),
+            delivery_mode: "steer".to_string(),
+            steer_support: "yes".to_string(),
+            quota_reset_at_ms: None,
+            block_reason: None,
+            last_error: None,
+            oldest_undelivered_age_ms: None,
+            install: "installed".to_string(),
+            description: child.instructions.clone(),
+            seat_user: None,
+            seat_uid: None,
+            seat_gid: None,
+            schedules: Vec::new(),
+        }];
+
+        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        assert_eq!(views[0].turn_state, "errored");
+        assert_eq!(
+            views[0].last_error.as_deref(),
+            Some("workspace routing discovery unauthorized (401)")
+        );
+        assert_eq!(views[0].block_reason.as_deref(), Some("sign_in_required"));
+
+        let first_msg = store
+            .next_undelivered(&parent.id)
+            .unwrap()
+            .expect("parent notified once");
+        assert!(first_msg.text.contains("[Sub-Agent Error]"));
+        assert!(first_msg.text.contains("workspace routing discovery unauthorized (401)"));
+        store.note_delivered(&parent.id, first_msg.seq).unwrap();
+
+        // Second check must not re-notify parent for the same error.
+        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        assert!(
+            store.next_undelivered(&parent.id).unwrap().is_none(),
+            "parent should only be notified once per error"
+        );
     }
 }

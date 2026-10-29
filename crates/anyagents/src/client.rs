@@ -87,11 +87,16 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     let socket = server::socket_path(data);
     let admin_socket = data.join("admin.sock");
     let prefer_admin = admin_socket.exists()
-        && (path.ends_with("/harness")
+        && ((method == "POST" && path == "/v1/agents")
+            || path.ends_with("/harness")
             || path.ends_with("/model")
             || path.ends_with("/rename")
             || path.ends_with("/role")
             || path.ends_with("/description")
+            || path.ends_with("/wake")
+            || path.ends_with("/pause")
+            || path.ends_with("/archive")
+            || path.starts_with("/v1/subagent-defaults")
             || path.starts_with("/v1/profiles")
             || path.starts_with("/v1/schedules")
             || path.starts_with("/v1/browser")

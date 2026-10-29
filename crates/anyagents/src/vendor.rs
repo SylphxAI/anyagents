@@ -191,6 +191,153 @@ pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, O
     Some((err, reset))
 }
 
+fn has_persisted_turn_error(config_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    val.get("consecutive_turn_errors")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        > 0
+}
+
+pub fn detect_codex_session_turn_error(config_dir: &Path, min_ts_ms: i64) -> Option<String> {
+    if let Some((Some(err), None)) = read_persisted_last_error(config_dir)
+        && !err.trim().is_empty()
+    {
+        return Some(err);
+    }
+    let sessions_dir = config_dir.join("sessions");
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+    let mut latest_file: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(years) = std::fs::read_dir(&sessions_dir) {
+        for y in years.flatten() {
+            let Ok(months) = std::fs::read_dir(y.path()) else {
+                continue;
+            };
+            for m in months.flatten() {
+                let Ok(days) = std::fs::read_dir(m.path()) else {
+                    continue;
+                };
+                for d in days.flatten() {
+                    let Ok(files) = std::fs::read_dir(d.path()) else {
+                        continue;
+                    };
+                    for f in files.flatten() {
+                        let path = f.path();
+                        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                            continue;
+                        }
+                        let Ok(meta) = f.metadata() else {
+                            continue;
+                        };
+                        let Ok(mtime) = meta.modified() else {
+                            continue;
+                        };
+                        if latest_file
+                            .as_ref()
+                            .is_none_or(|(prev_m, _)| mtime > *prev_m)
+                        {
+                            latest_file = Some((mtime, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (mtime, path) = latest_file?;
+    let mtime_ms = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if mtime_ms <= min_ts_ms {
+        return None;
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail_offset = len.saturating_sub(65_536);
+    if tail_offset > 0 {
+        let _ = file.seek(SeekFrom::Start(tail_offset));
+    }
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    let lines_iter: Box<dyn Iterator<Item = &str>> = if tail_offset > 0 {
+        Box::new(buf.lines().skip(1))
+    } else {
+        Box::new(buf.lines())
+    };
+    let mut consec_err = 0u32;
+    let mut last_err: Option<String> = None;
+    for line in lines_iter {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let t = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let payload = val.get("payload");
+        let pt = payload
+            .and_then(|p| p.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let role = payload
+            .and_then(|p| p.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if t == "token_usage_record"
+            || (t == "response_item"
+                && (role == "assistant"
+                    || matches!(pt, "function_call" | "custom_tool_call" | "reasoning")))
+        {
+            consec_err = 0;
+            last_err = None;
+        } else if t == "event_msg" && pt == "task_complete" {
+            let err_opt = payload
+                .and_then(|p| p.get("error"))
+                .and_then(|e| {
+                    e.get("message")
+                        .and_then(|m| m.as_str())
+                        .or_else(|| e.as_str())
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(msg) = err_opt {
+                consec_err = consec_err.saturating_add(1);
+                last_err = Some(msg.to_string());
+            } else {
+                consec_err = 0;
+                last_err = None;
+            }
+        }
+    }
+    let err = last_err?;
+    let lower = err.to_ascii_lowercase();
+    let is_auth_401 = lower.contains("(401)")
+        || lower.contains(" 401 ")
+        || lower.contains("status 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("authentication failed");
+    if is_auth_401 || consec_err >= 3 {
+        Some(err)
+    } else {
+        None
+    }
+}
+
 pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at_ms: Option<i64>) {
     let path = config_dir.join(".anyagents-last-error.json");
     match error.map(str::trim).filter(|s| !s.is_empty()) {
@@ -221,6 +368,8 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                         && reset_ms > anyagents_core::now_ms()
                     {
                         // Keep active quota reset window intact.
+                    } else if has_persisted_turn_error(&config_dir) {
+                        // Keep active turn-level error intact until a turn succeeds or wake clears it.
                     } else {
                         persist_last_error(&config_dir, None, None);
                     }
@@ -354,22 +503,35 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir);
     }
+    if std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some() {
+        return Err(format!(
+            "harness config verification failed for {} ({}): config write suppressed",
+            request.agent.name, request.agent.harness
+        ));
+    }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         let _ = crate::install::record(&root, &request.agent.harness);
         if let Some(ref store) = store_opt {
-            let _ = crate::create::reconcile_agent_runtime_config(
+            crate::create::reconcile_agent_runtime_config(
                 store,
                 &request.data_dir,
                 &request.agent,
                 &request.config_dir,
                 &request.work_dir,
-            );
+            )
+            .map_err(|e| e.to_string())?;
         } else {
             crate::create::write_agent_instructions(
                 &request.config_dir,
                 &request.agent,
                 seat_hint.as_deref(),
             );
+            crate::create::verify_harness_runtime_config(
+                &request.config_dir,
+                &request.agent.harness,
+                request.agent.model.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
         }
     }
     if let Some((ref seat_user, ref seat_launch)) = seat_spec {

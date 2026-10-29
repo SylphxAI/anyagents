@@ -67,6 +67,12 @@ struct State {
     usages: Vec<(String, TurnUsage)>,
     next_rpc: i64,
     pending: std::collections::HashMap<i64, Pending>,
+    config_dir: Option<PathBuf>,
+    consecutive_turn_errors: u32,
+    pending_turn_error: Option<String>,
+    fault_error: Option<String>,
+    last_turn_input: Option<(String, Value, String)>,
+    retry_turn_start: bool,
 }
 
 enum Pending {
@@ -176,6 +182,16 @@ impl CodexHarness {
         found
     }
 
+    /// Wait until a turn fault (`401` or 3 consecutive turn errors) has been recorded.
+    pub fn wait_error(&self, timeout: Duration) -> Option<String> {
+        let mut found = None;
+        self.wait_pred(timeout, |state| {
+            found = state.fault_error.clone();
+            found.is_some()
+        });
+        found
+    }
+
     /// Wait until the child has exited or its stdout has closed.
     pub fn wait_dead(&self, timeout: Duration) -> bool {
         self.wait_pred(timeout, |state| !state.alive)
@@ -247,6 +263,11 @@ impl CodexHarness {
             let mut state = lock(&harness.shared);
             state.child = Some(child);
             state.alive = true;
+            state.config_dir = env_pairs
+                .iter()
+                .find(|(k, _)| k == "CODEX_HOME")
+                .or_else(|| env_pairs.iter().find(|(k, _)| k == "HOME"))
+                .map(|(_, v)| PathBuf::from(v));
         }
         *lock(&harness.stdin) = Some(child_stdin);
         let shared = Arc::clone(&harness.shared);
@@ -501,6 +522,8 @@ impl Harness for CodexHarness {
                 return Err(HarnessError::Failed("no thread".into()));
             };
             let steering = state.turn_id.clone();
+            state.fault_error = None;
+            state.consecutive_turn_errors = 0;
             state.open.push(message.id.clone());
             (thread_id, steering)
         };
@@ -523,7 +546,7 @@ impl Harness for CodexHarness {
                 "turn/start",
                 json!({
                     "threadId": thread_id,
-                    "input": input,
+                    "input": input.clone(),
                     "clientUserMessageId": message.id,
                 }),
             )
@@ -532,6 +555,10 @@ impl Harness for CodexHarness {
         let mut state = lock(&self.shared);
         match rpc {
             Ok(result) => {
+                if steering.is_none() {
+                    state.last_turn_input =
+                        Some((thread_id, input, message.id.clone()));
+                }
                 commit_delivery(&mut state, &message.id, steering.is_none(), method, &result);
                 Ok(DeliverOutcome::Accepted {
                     turn_finished: state.finished.contains(&message.id),
@@ -548,6 +575,11 @@ impl Harness for CodexHarness {
             }
             Err(CallFail::Failed(reason)) => {
                 unstage(&mut state, &message.id);
+                state.consecutive_turn_errors = state.consecutive_turn_errors.saturating_add(1);
+                if is_auth_or_provider_401(&reason) || state.consecutive_turn_errors >= 3 {
+                    state.fault_error = Some(reason.clone());
+                    persist_codex_fault_error(state.config_dir.as_deref(), Some(&reason));
+                }
                 Err(HarnessError::Failed(reason))
             }
         }
@@ -618,7 +650,7 @@ impl Harness for CodexHarness {
         let state = lock(&self.shared);
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() {
+            turn_state: if state.open.is_empty() || state.fault_error.is_some() {
                 TurnState::Idle
             } else {
                 TurnState::InTurn
@@ -626,7 +658,7 @@ impl Harness for CodexHarness {
             delivery_mode: DeliveryMode::Steer,
             steer_support: SteerSupport::Yes,
             quota_reset_at_ms: state.quota_reset_at_ms,
-            sign_in_fault: None,
+            sign_in_fault: state.fault_error.clone(),
         }
     }
 
@@ -741,10 +773,34 @@ fn read_stdout(
             });
             let _ = write_stdin(&stdin, &reply);
         }
-        {
+        let retry_payload = {
             let mut state = lock(&shared);
             apply_line(&mut state, &value);
+            let retry = if state.retry_turn_start {
+                state.retry_turn_start = false;
+                state.last_turn_input.clone().map(|(tid, inp, mid)| {
+                    state.next_rpc += 1;
+                    let rpc_id = state.next_rpc;
+                    state.turns_started += 1;
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": rpc_id,
+                        "method": "turn/start",
+                        "params": {
+                            "threadId": tid,
+                            "input": inp,
+                            "clientUserMessageId": mid,
+                        }
+                    })
+                })
+            } else {
+                None
+            };
             state.epoch = state.epoch.wrapping_add(1);
+            retry
+        };
+        if let Some(req) = retry_payload {
+            let _ = write_stdin(&stdin, &req);
         }
         wake.notify_all();
     }
@@ -835,12 +891,85 @@ fn invalidate_thread(state: &mut State) {
     }
 }
 
+fn is_auth_or_provider_401(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("authentication failed")
+        || lower.contains("not logged in")
+        || lower.contains("sign in required")
+}
+
+fn extract_turn_error(params: &Value) -> Option<String> {
+    for ptr in [
+        "/turn/error/message",
+        "/error/message",
+        "/msg/error/message",
+        "/turn/lastError/message",
+        "/turn/error",
+        "/error",
+        "/msg/error",
+        "/message",
+    ] {
+        if let Some(s) = params
+            .pointer(ptr)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(s.to_string());
+        }
+    }
+    for ptr in ["/turn/error", "/error", "/msg/error"] {
+        if let Some(obj) = params.pointer(ptr).filter(|v| v.is_object()) {
+            let raw = obj.to_string();
+            if raw != "{}" {
+                return Some(raw);
+            }
+        }
+    }
+    None
+}
+
+fn persist_codex_fault_error(config_dir: Option<&Path>, err: Option<&str>) {
+    let Some(dir) = config_dir else {
+        return;
+    };
+    let path = dir.join(".anyagents-last-error.json");
+    match err.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(msg) => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
+                .unwrap_or(0);
+            let payload = json!({
+                "error": msg,
+                "quota_reset_at_ms": null,
+                "timestamp_ms": ts,
+            });
+            let _ = std::fs::write(&path, payload.to_string());
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 fn on_notification(state: &mut State, method: &str, params: &Value) {
     match method {
         "thread/tokenUsage/updated" => state.last_usage = Some(usage_from_codex(params)),
-        "error" => {
+        "error" | "codex/event/error" | "codex/event/stream_error" => {
+            if let Some(msg) = extract_turn_error(params) {
+                state.pending_turn_error = Some(msg);
+            }
             if is_unrecoverable_thread_error(params) {
                 invalidate_thread(state);
+            }
+        }
+        "codex/event/task_complete" => {
+            if let Some(msg) = extract_turn_error(params) {
+                state.pending_turn_error = Some(msg);
             }
         }
         "turn/completed" => {
@@ -848,13 +977,44 @@ fn on_notification(state: &mut State, method: &str, params: &Value) {
                 .pointer("/turn/status")
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            if status == "completed" {
+            let turn_err = extract_turn_error(params).or_else(|| state.pending_turn_error.take());
+            if status == "completed" && turn_err.is_none() {
+                state.consecutive_turn_errors = 0;
+                state.fault_error = None;
+                state.last_turn_input = None;
+                state.retry_turn_start = false;
+                persist_codex_fault_error(state.config_dir.as_deref(), None);
                 finish_open(state);
-            } else if is_unrecoverable_thread_error(params) {
-                invalidate_thread(state);
-            } else {
+            } else if status == "interrupted" && turn_err.is_none() {
                 state.open.clear();
                 state.turn_id = None;
+                state.retry_turn_start = false;
+            } else if is_unrecoverable_thread_error(params) {
+                if let Some(msg) = turn_err {
+                    state.fault_error = Some(msg.clone());
+                    persist_codex_fault_error(state.config_dir.as_deref(), Some(&msg));
+                }
+                invalidate_thread(state);
+            } else {
+                state.consecutive_turn_errors = state.consecutive_turn_errors.saturating_add(1);
+                let msg = turn_err.unwrap_or_else(|| {
+                    format!(
+                        "turn {}",
+                        if status.is_empty() { "failed" } else { status }
+                    )
+                });
+                if is_auth_or_provider_401(&msg) || state.consecutive_turn_errors >= 3 {
+                    state.fault_error = Some(msg.clone());
+                    persist_codex_fault_error(state.config_dir.as_deref(), Some(&msg));
+                }
+                if state.consecutive_turn_errors < 3 && state.last_turn_input.is_some() {
+                    state.turn_id = None;
+                    state.retry_turn_start = true;
+                } else {
+                    state.open.clear();
+                    state.turn_id = None;
+                    state.retry_turn_start = false;
+                }
             }
         }
         "account/rateLimits/updated" => {
@@ -866,6 +1026,7 @@ fn on_notification(state: &mut State, method: &str, params: &Value) {
                     state.written.retain(|w| w != &id);
                 }
                 state.turn_id = None;
+                state.retry_turn_start = false;
             }
         }
         _ => {}

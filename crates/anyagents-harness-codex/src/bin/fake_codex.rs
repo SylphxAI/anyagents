@@ -91,6 +91,10 @@ fn main() {
                 turn_id = Some(tid.clone());
                 if mode == "finish" {
                     emit_usage_and_complete(&mut stdout, &tid);
+                } else if mode == "401" {
+                    emit_turn_error(&mut stdout, &tid, "workspace routing discovery unauthorized (401)");
+                } else if mode == "turn-error" {
+                    emit_turn_error(&mut stdout, &tid, "upstream model stream closed unexpectedly");
                 }
             }
             "turn/steer" => {
@@ -104,6 +108,10 @@ fn main() {
                 }
                 if mode == "steer" || mode == "finish" {
                     emit_usage_and_complete(&mut stdout, &tid);
+                } else if mode == "401" {
+                    emit_turn_error(&mut stdout, &tid, "workspace routing discovery unauthorized (401)");
+                } else if mode == "turn-error" {
+                    emit_turn_error(&mut stdout, &tid, "upstream model stream closed unexpectedly");
                 }
             }
             "turn/interrupt" => {
@@ -157,6 +165,30 @@ fn emit_usage_and_complete(stdout: &mut impl Write, turn_id: &str) {
         json!({
             "threadId": "thread-1",
             "turn": {"id": turn_id, "items": [], "status": "completed"}
+        }),
+    );
+}
+
+fn emit_turn_error(stdout: &mut impl Write, turn_id: &str, message: &str) {
+    note(
+        stdout,
+        "error",
+        json!({
+            "error": {"message": message},
+            "willRetry": false
+        }),
+    );
+    note(
+        stdout,
+        "turn/completed",
+        json!({
+            "threadId": "thread-1",
+            "turn": {
+                "id": turn_id,
+                "items": [],
+                "status": "failed",
+                "error": {"message": message}
+            }
         }),
     );
 }

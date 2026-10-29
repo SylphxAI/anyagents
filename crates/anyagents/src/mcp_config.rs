@@ -88,12 +88,16 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
     let tmp_path = path.with_file_name(format!(
-        ".{}.anyagents-new",
+        ".{}.{pid}.{seq}.anyagents-new",
         path.file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("config")
@@ -104,10 +108,7 @@ fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o664));
     }
-    if std::fs::rename(&tmp_path, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp_path, path)?;
-    }
+    std::fs::rename(&tmp_path, path)?;
     Ok(())
 }
 
@@ -226,18 +227,7 @@ pub fn write_codex_with_model(
             "\n[features]\napps = false\ncode_mode = false\ncode_mode_only = false\nmulti_agent = false\n",
         );
     }
-    let tmp_path = path.with_extension("toml.new");
-    std::fs::write(&tmp_path, &updated)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o664));
-    }
-    if std::fs::rename(&tmp_path, path).is_err() {
-        let _ = std::fs::remove_file(path);
-        std::fs::rename(&tmp_path, path)?;
-    }
-    Ok(())
+    atomic_write_shared(path, updated.as_bytes())
 }
 
 pub fn sync_codex_developer_instructions(

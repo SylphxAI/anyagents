@@ -620,6 +620,7 @@ fn run_agent<H: Harness + 'static>(
         process_started_at: None,
         process_profile_rotated_ms: 0,
         last_error: None,
+        consecutive_turn_errors: 0,
     };
     session.run()
 }
@@ -687,6 +688,7 @@ struct Session<H: Harness> {
     process_started_at: Option<i64>,
     process_profile_rotated_ms: i64,
     last_error: Option<String>,
+    consecutive_turn_errors: u32,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -788,9 +790,15 @@ impl<H: Harness + 'static> Session<H> {
         });
         match &res {
             Ok(_) => {
+                let rotated_advanced = rotated_ms > self.process_profile_rotated_ms;
                 self.process_started_at = Some(self.inner.clock.now_ms());
                 self.process_profile_rotated_ms = rotated_ms;
-                self.last_error = None;
+                if rotated_advanced || self.consecutive_turn_errors == 0 {
+                    self.last_error = None;
+                    if rotated_advanced {
+                        self.consecutive_turn_errors = 0;
+                    }
+                }
             }
             Err(err) => {
                 self.last_error = Some(err.clone());
@@ -1012,7 +1020,19 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Err(anyagents_agent::Error::HarnessFailed(err)) => {
+                self.consecutive_turn_errors = self.consecutive_turn_errors.saturating_add(1);
+                let lower = err.to_ascii_lowercase();
+                let is_auth_401 = lower.contains("(401)")
+                    || lower.contains(" 401 ")
+                    || lower.contains("status 401")
+                    || lower.contains("http 401")
+                    || lower.contains("unauthorized")
+                    || lower.contains("invalid_api_key");
                 self.last_error = Some(err);
+                if is_auth_401 || self.consecutive_turn_errors >= 3 {
+                    self.pending_recovery = false;
+                }
+                self.publish();
                 if !self.wait_backoff() {
                     return false;
                 }
@@ -1074,12 +1094,15 @@ impl<H: Harness + 'static> Session<H> {
         let turns_served = delivery.harness().turns_served();
 
         if served == before {
-            if turns_served > self.turns_recorded
-                && delivery.harness().health().turn_state == TurnState::Idle
-            {
+            let health = delivery.harness().health();
+            if turns_served > self.turns_recorded && health.turn_state == TurnState::Idle {
                 self.turns_recorded = turns_served;
-                let _ = delivery.store().note_turn_completed(&self.id);
-                self.completed_turn_in_session = true;
+                if health.sign_in_fault.is_none() {
+                    let _ = delivery.store().note_turn_completed(&self.id);
+                    self.completed_turn_in_session = true;
+                    self.consecutive_turn_errors = 0;
+                    self.last_error = None;
+                }
             }
             return;
         }
@@ -1099,10 +1122,15 @@ impl<H: Harness + 'static> Session<H> {
         if recorded {
             self.served = Some(served);
             self.written = 0;
-            if delivery.harness().health().turn_state == TurnState::Idle {
+            let health = delivery.harness().health();
+            if health.turn_state == TurnState::Idle {
                 self.turns_recorded = turns_served;
-                let _ = delivery.store().note_turn_completed(&self.id);
-                self.completed_turn_in_session = true;
+                if health.sign_in_fault.is_none() {
+                    let _ = delivery.store().note_turn_completed(&self.id);
+                    self.completed_turn_in_session = true;
+                    self.consecutive_turn_errors = 0;
+                    self.last_error = None;
+                }
             }
         }
     }
@@ -1113,7 +1141,10 @@ impl<H: Harness + 'static> Session<H> {
     /// Its config directory and session are preserved so sending any future message
     /// to the sub-agent automatically wakes and resumes it.
     fn try_auto_archive_subagent(&mut self) -> bool {
-        if self.agent.parent_id.is_none() || !self.completed_turn_in_session {
+        if self.agent.parent_id.is_none()
+            || !self.completed_turn_in_session
+            || self.last_error.is_some()
+        {
             return false;
         }
         let scaled = {
@@ -1121,7 +1152,7 @@ impl<H: Harness + 'static> Session<H> {
                 return false;
             };
             let health = delivery.harness().health();
-            if health.turn_state != TurnState::Idle {
+            if health.turn_state != TurnState::Idle || health.sign_in_fault.is_some() {
                 return false;
             }
             if harness_has_inflight_processes(delivery.harness().process_id()) {
@@ -1169,8 +1200,28 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Ok(DeliverOutcome::Deferred) | Ok(DeliverOutcome::Quota { .. }) => false,
-            Err(anyagents_agent::Error::HarnessDown)
-            | Err(anyagents_agent::Error::HarnessFailed(_)) => {
+            Err(anyagents_agent::Error::HarnessDown) => {
+                if !self.wait_backoff() {
+                    return true;
+                }
+                self.replace_process();
+                true
+            }
+            Err(anyagents_agent::Error::HarnessFailed(err)) => {
+                self.consecutive_turn_errors = self.consecutive_turn_errors.saturating_add(1);
+                let lower = err.to_ascii_lowercase();
+                let is_auth_401 = lower.contains("(401)")
+                    || lower.contains(" 401 ")
+                    || lower.contains("status 401")
+                    || lower.contains("http 401")
+                    || lower.contains("unauthorized")
+                    || lower.contains("invalid_api_key");
+                self.last_error = Some(err);
+                if is_auth_401 || self.consecutive_turn_errors >= 3 {
+                    self.pending_recovery = false;
+                    self.publish();
+                    return false;
+                }
                 if !self.wait_backoff() {
                     return true;
                 }

@@ -1905,7 +1905,11 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
     let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
-    let (session_quota, session_error) = if agent.harness == "claude-code" {
+    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let (session_quota, mut session_error) = if agent.harness == "claude-code" {
         let (_, persisted_err) =
             anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
         (
@@ -1915,13 +1919,12 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     } else {
         anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
     };
-    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(0);
+    if session_error.is_none() && agent.harness == "codex" {
+        session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
+    }
     let (
         process,
-        turn_state,
+        mut turn_state,
         mode,
         steer,
         mut quota,
@@ -1936,6 +1939,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
             let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
                 && effective_quota.is_none()
+                && effective_err.is_none()
                 && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn);
             let switch_pending = live.process_alive
                 && (live
@@ -1978,6 +1982,14 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     {
         quota = None;
         last_error = None;
+    }
+    if agent.state == "running" && quota.is_none_or(|ms| ms <= now) {
+        if let Some(ref err_msg) = last_error {
+            turn_state = "errored";
+            create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
+        } else {
+            let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+        }
     }
     let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
     let oldest_undelivered_age_ms = match lag.oldest_undelivered_age_ms {
@@ -2110,12 +2122,14 @@ async fn create_agent_route(
         {
             operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
         }
+        let mut has_prompt = false;
         if let Some(prompt) = body
             .prompt
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            has_prompt = true;
             let sender = caller_agent
                 .as_ref()
                 .map(|(_, name)| format!("agent:{name}"))
@@ -2144,6 +2158,11 @@ async fn create_agent_route(
                     prompt,
                 );
             }
+        }
+        if has_prompt {
+            create::poke_agent_wake_socket_mail(state.store.data_dir(), &agent.id);
+        } else {
+            create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
         }
         let view = agent_view(&state.store, &state.health, &agent)?;
         Ok((StatusCode::CREATED, Json(view)))
@@ -2422,10 +2441,35 @@ async fn wake_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
+        let work_dir = found
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &found.id));
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        {
+            create::reconcile_agent_runtime_config(
+                &state.store,
+                state.store.data_dir(),
+                &found,
+                &cfg,
+                &work_dir,
+            )
+            .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()))?;
+        }
+        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
+        let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+        let _ = std::fs::write(
+            cfg.join(".anyagents-profile-rotated-ms"),
+            format!("{}\n", now_ms()),
+        );
         let agent = state
             .store
             .set_agent_state(&found.id, "running")
             .map_err(ApiError::from_store)?;
+        create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await

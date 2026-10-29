@@ -601,8 +601,29 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     }
     let store = open(data)?;
     let found = store.agent_by_name(name)?;
+    if state == "running" {
+        let cfg = anyagents_core::agent_config_dir(data, &found.id);
+        let work_dir = found
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &found.id));
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        {
+            crate::create::reconcile_agent_runtime_config(&store, data, &found, &cfg, &work_dir)?;
+        }
+        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
+        let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+        let _ = std::fs::write(
+            cfg.join(".anyagents-profile-rotated-ms"),
+            format!("{}\n", anyagents_core::now_ms()),
+        );
+    }
     let agent = store.set_agent_state(&found.id, state)?;
-    if state == "archived" && found.parent_id.is_some() {
+    if state == "running" {
+        crate::create::poke_agent_wake_socket(data, &agent.id);
+    } else if state == "archived" && found.parent_id.is_some() {
         server::reap_subagent_ephemeral_dirs(data, &found.id);
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
@@ -833,6 +854,10 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             }
         }
         let cfg = anyagents_core::agent_config_dir(data, &id);
+        let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
         let (persisted_q, persisted_err) =
             anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
@@ -843,6 +868,9 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         }
         if view.last_error.is_none() {
             view.last_error = persisted_err;
+        }
+        if view.last_error.is_none() && view.harness == "codex" {
+            view.last_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
         }
         if view.quota_reset_at_ms.is_some_and(|ms| ms > now)
             && let Ok(agent_rec) = store.agent(&id)
@@ -875,11 +903,21 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 view.turn_state = "idle".to_string();
             } else if open_turn && view.quota_reset_at_ms.is_none() && view.last_error.is_none() {
                 view.turn_state = "working".to_string();
-            } else if view.turn_state.is_empty() || view.last_error.is_some() {
+            } else if view.turn_state.is_empty() {
                 view.turn_state = "idle".to_string();
             }
         } else if view.turn_state.is_empty() {
             view.turn_state = "idle".to_string();
+        }
+        if view.state == "running" && view.quota_reset_at_ms.is_none_or(|ms| ms <= now) {
+            if let Some(ref err_msg) = view.last_error {
+                view.turn_state = "errored".to_string();
+                if let Ok(agent_rec) = store.agent(&id) {
+                    crate::create::maybe_notify_parent_on_error(&store, &agent_rec, &cfg, err_msg);
+                }
+            } else {
+                let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+            }
         }
         view.block_reason =
             server::compute_block_reason(view.quota_reset_at_ms, view.last_error.as_deref(), now);

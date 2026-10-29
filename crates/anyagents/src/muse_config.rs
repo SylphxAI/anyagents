@@ -303,8 +303,17 @@ pub fn ensure_workspace_session(
     }
 }
 
+static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let tmp = path.with_extension("json.new");
+    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp = path.with_file_name(format!(
+        ".{}.{pid}.{seq}.anyagents-new",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("settings.json")
+    ));
     std::fs::write(&tmp, bytes)?;
     #[cfg(unix)]
     {

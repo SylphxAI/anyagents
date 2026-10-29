@@ -175,11 +175,16 @@ impl Client {
         let body_clone = body.clone();
         let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
         let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
-            && (path.ends_with("/harness")
+            && ((method == "POST" && path == "/v1/agents")
+                || path.ends_with("/harness")
                 || path.ends_with("/model")
                 || path.ends_with("/rename")
                 || path.ends_with("/role")
                 || path.ends_with("/description")
+                || path.ends_with("/wake")
+                || path.ends_with("/pause")
+                || path.ends_with("/archive")
+                || path.starts_with("/v1/subagent-defaults")
                 || path.starts_with("/v1/profiles")
                 || path.starts_with("/v1/schedules")
                 || path.starts_with("/v1/browser")
@@ -265,6 +270,13 @@ impl Client {
                             }
                             if view.last_error.is_none() {
                                 view.last_error = adm.last_error.clone();
+                            }
+                            if adm.turn_state == "errored"
+                                || (view.state == "running"
+                                    && view.last_error.is_some()
+                                    && view.quota_reset_at_ms.is_none())
+                            {
+                                view.turn_state = "errored".to_string();
                             }
                             if view.oldest_undelivered_age_ms.is_none() {
                                 view.oldest_undelivered_age_ms = adm.oldest_undelivered_age_ms;
@@ -1033,13 +1045,20 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
                 {
-                    resp.agents.retain(|a| a.state.eq_ignore_ascii_case(st));
+                    resp.agents.retain(|a| {
+                        a.state.eq_ignore_ascii_case(st) || a.turn_state.eq_ignore_ascii_case(st)
+                    });
                 }
                 let running = resp.agents.iter().filter(|a| a.state == "running").count();
                 let working = resp
                     .agents
                     .iter()
                     .filter(|a| a.state == "running" && a.turn_state == "working")
+                    .count();
+                let errored = resp
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "errored")
                     .count();
                 let paused = resp.agents.iter().filter(|a| a.state == "paused").count();
                 let archived = resp.agents.iter().filter(|a| a.state == "archived").count();
@@ -1049,7 +1068,8 @@ impl AgentMcp {
                         "total": resp.agents.len(),
                         "running": running,
                         "working": working,
-                        "idle": running.saturating_sub(working),
+                        "errored": errored,
+                        "idle": running.saturating_sub(working).saturating_sub(errored),
                         "paused": paused,
                         "archived": archived,
                     },
