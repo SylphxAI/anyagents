@@ -249,6 +249,16 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                     .route("/healthz", get(webhook_healthz))
                     .route("/v1/webhooks/healthz", get(webhook_healthz))
                     .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+                    .route("/webhooks/results", post(result_webhook_route))
+                    .route(
+                        "/webhooks/results/{subscription_id}",
+                        post(result_webhook_by_id_route),
+                    )
+                    .route("/v1/webhooks/results", post(result_webhook_route))
+                    .route(
+                        "/v1/webhooks/results/{subscription_id}",
+                        post(result_webhook_by_id_route),
+                    )
                     .with_state(state.clone());
                 tokio::spawn(async move {
                     let _ = axum::serve(tcp_listener, webhook_app).await;
@@ -264,6 +274,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/model", post(model_route))
         .route("/v1/agents/{name}/harness", post(harness_route))
+        .route("/v1/agents/{name}/parent", post(parent_route))
         .route(
             "/v1/agents/{name}/description",
             get(get_description_route).post(set_description_route),
@@ -294,6 +305,15 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         )
         .route("/v1/send", post(send))
         .route("/v1/interact", post(interact_route))
+        .route(
+            "/v1/result-subscriptions",
+            get(list_result_subscriptions_route).post(register_result_subscription_route),
+        )
+        .route(
+            "/v1/result-subscriptions/{id}",
+            axum::routing::delete(delete_result_subscription_route),
+        )
+        .route("/v1/result-deliveries", get(list_result_deliveries_route))
         .route("/v1/harnesses/{id}/sign-in", post(sign_in_route))
         .route(
             "/v1/operator/agents/{name}/capability",
@@ -303,6 +323,16 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/whoami", get(whoami))
         .route("/v1/webhooks/healthz", get(webhook_healthz))
         .route("/v1/webhooks/telegram/{channel_id}", post(telegram_webhook))
+        .route("/webhooks/results", post(result_webhook_route))
+        .route(
+            "/webhooks/results/{subscription_id}",
+            post(result_webhook_by_id_route),
+        )
+        .route("/v1/webhooks/results", post(result_webhook_route))
+        .route(
+            "/v1/webhooks/results/{subscription_id}",
+            post(result_webhook_by_id_route),
+        )
         .with_state(state);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let result = axum::serve(listener, app)
@@ -359,11 +389,40 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
             auth,
         };
+        let admin_webhook_addr = std::env::var("ANYAGENTS_ADMIN_WEBHOOK_LISTEN")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "0" && !s.eq_ignore_ascii_case("off"))
+            .unwrap_or_else(|| "0.0.0.0:8789".to_string());
+        if let Ok(tcp_listener) = tokio::net::TcpListener::bind(&admin_webhook_addr).await {
+            if let Ok(local) = tcp_listener.local_addr() {
+                let _ = std::fs::write(data.join("result-webhook.addr"), format!("{local}\n"));
+            }
+            let webhook_app = Router::new()
+                .route("/", get(webhook_healthz))
+                .route("/healthz", get(webhook_healthz))
+                .route("/v1/webhooks/healthz", get(webhook_healthz))
+                .route("/webhooks/results", post(result_webhook_route))
+                .route(
+                    "/webhooks/results/{subscription_id}",
+                    post(result_webhook_by_id_route),
+                )
+                .route("/v1/webhooks/results", post(result_webhook_route))
+                .route(
+                    "/v1/webhooks/results/{subscription_id}",
+                    post(result_webhook_by_id_route),
+                )
+                .with_state(state.clone());
+            tokio::spawn(async move {
+                let _ = axum::serve(tcp_listener, webhook_app).await;
+            });
+        }
         let app = Router::new()
             .route("/v1/agents", get(list_agents).post(create_agent_route))
             .route("/v1/agents/{name}/admin", post(set_admin_route))
             .route("/v1/agents/{name}/model", post(model_route))
             .route("/v1/agents/{name}/harness", post(harness_route))
+            .route("/v1/agents/{name}/parent", post(parent_route))
             .route(
                 "/v1/agents/{name}/description",
                 get(get_description_route).post(set_description_route),
@@ -395,11 +454,31 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             .route("/v1/send", post(send))
             .route("/v1/interact", post(interact_route))
             .route(
+                "/v1/result-subscriptions",
+                get(list_result_subscriptions_route).post(register_result_subscription_route),
+            )
+            .route(
+                "/v1/result-subscriptions/{id}",
+                axum::routing::delete(delete_result_subscription_route),
+            )
+            .route("/v1/result-deliveries", get(list_result_deliveries_route))
+            .route(
                 "/v1/operator/agents/{name}/capability",
                 post(mint_capability),
             )
             .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
             .route("/v1/whoami", get(whoami))
+            .route("/v1/webhooks/healthz", get(webhook_healthz))
+            .route("/webhooks/results", post(result_webhook_route))
+            .route(
+                "/webhooks/results/{subscription_id}",
+                post(result_webhook_by_id_route),
+            )
+            .route("/v1/webhooks/results", post(result_webhook_route))
+            .route(
+                "/v1/webhooks/results/{subscription_id}",
+                post(result_webhook_by_id_route),
+            )
             .with_state(state);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -740,6 +819,372 @@ async fn harness_route(
         )
         .map_err(ApiError::from_store)?;
         Ok(Json(out))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct ParentRequest {
+    #[serde(default)]
+    parent: Option<String>,
+}
+
+async fn parent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    body: Option<Json<ParentRequest>>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let actor = require_admin_or_operator(&state.store, &principal, "agents.parent", &name)?;
+        let parent_target = body.as_ref().and_then(|b| b.parent.as_deref());
+        let out = create::set_agent_parent(
+            &state.store,
+            state.store.data_dir(),
+            &actor,
+            &name,
+            parent_target,
+        )
+        .map_err(ApiError::from_store)?;
+        Ok(Json(out))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegisterResultSubscriptionRequest {
+    #[serde(default)]
+    recipient: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default, alias = "promise_id", alias = "resource_id")]
+    subject: Option<String>,
+    #[serde(default)]
+    org_id: Option<String>,
+    #[serde(default)]
+    event_types: Vec<String>,
+    #[serde(default)]
+    secret: Option<String>,
+    #[serde(default)]
+    previous_secret: Option<String>,
+    #[serde(default)]
+    after_seq: Option<i64>,
+}
+
+fn authorize_subscription_recipient(
+    store: &Store,
+    principal: &Principal,
+    action: &str,
+    recipient_opt: Option<&str>,
+) -> Result<(Agent, String), ApiError> {
+    match principal {
+        Principal::Operator => {
+            let r_name = recipient_opt
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "recipient is required when called by the operator",
+                    )
+                })?;
+            let target = store.agent_by_name(r_name).map_err(ApiError::from_store)?;
+            store
+                .record_admin_audit("operator", action, &target.name)
+                .map_err(ApiError::from_store)?;
+            Ok((target, "operator".to_string()))
+        }
+        Principal::Agent { agent_id, name } => {
+            let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
+            let target = match recipient_opt.map(str::trim).filter(|s| !s.is_empty()) {
+                None => caller.clone(),
+                Some(r) if r.eq_ignore_ascii_case("self") || r == name => caller.clone(),
+                Some(r) => store.agent_by_name(r).map_err(ApiError::from_store)?,
+            };
+            let is_self_or_child =
+                target.id == caller.id || target.parent_id.as_ref() == Some(&caller.id);
+            let is_root_admin = caller.parent_id.is_none() && caller.is_admin;
+            if !is_self_or_child && !is_root_admin {
+                return Err(ApiError::forbidden(
+                    "administrative authority required to manage result subscriptions for another agent",
+                ));
+            }
+            let actor = format!("agent:{name}");
+            store
+                .record_admin_audit(&actor, action, &target.name)
+                .map_err(ApiError::from_store)?;
+            Ok((target, actor))
+        }
+    }
+}
+
+async fn register_result_subscription_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<RegisterResultSubscriptionRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let (target, actor) = authorize_subscription_recipient(
+            &state.store,
+            &principal,
+            "result_subscriptions.register",
+            body.recipient.as_deref(),
+        )?;
+        let source = body
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/spiron/promise-ledger")
+            .to_string();
+        let (sub, secret, changed) = state
+            .store
+            .register_result_subscription(anyagents_core::NewResultSubscription {
+                recipient_id: target.id,
+                source,
+                subject: body.subject,
+                org_id: body.org_id,
+                event_types: body.event_types,
+                secret: body.secret,
+                previous_secret: body.previous_secret,
+                created_by: actor,
+                after_seq: body.after_seq.unwrap_or(0),
+            })
+            .map_err(ApiError::from_store)?;
+        let base = std::env::var("ANYAGENTS_WEBHOOK_URL")
+            .ok()
+            .map(|s| s.trim().trim_end_matches('/').to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "http://127.0.0.1:8788".to_string());
+        Ok(Json(serde_json::json!({
+            "subscription": sub,
+            "secret": secret,
+            "changed": changed,
+            "webhook_url": format!("{base}/v1/webhooks/results/{}", sub.id),
+            "generic_webhook_url": format!("{base}/v1/webhooks/results"),
+        })))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct ResultSubscriptionsQuery {
+    #[serde(default)]
+    recipient: Option<String>,
+    #[serde(default)]
+    subscription_id: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+async fn list_result_subscriptions_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<ResultSubscriptionsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let recipient_filter = match &principal {
+            Principal::Operator => match query.recipient.as_deref().map(str::trim) {
+                None | Some("" | "all") => None,
+                Some(r) => Some(state.store.agent_by_name(r).map_err(ApiError::from_store)?.id),
+            },
+            Principal::Agent { agent_id, name } => {
+                let caller = state.store.agent(agent_id).map_err(ApiError::from_store)?;
+                let is_root_admin = caller.parent_id.is_none() && caller.is_admin;
+                match query.recipient.as_deref().map(str::trim) {
+                    None | Some("") => {
+                        if is_root_admin {
+                            None
+                        } else {
+                            Some(caller.id)
+                        }
+                    }
+                    Some("all") => {
+                        if is_root_admin {
+                            None
+                        } else {
+                            return Err(ApiError::forbidden("administrative authority required"));
+                        }
+                    }
+                    Some(r) if r.eq_ignore_ascii_case("self") || r == name => Some(caller.id),
+                    Some(r) => {
+                        let target = state.store.agent_by_name(r).map_err(ApiError::from_store)?;
+                        if target.id != caller.id
+                            && target.parent_id.as_ref() != Some(&caller.id)
+                            && !is_root_admin
+                        {
+                            return Err(ApiError::forbidden("administrative authority required"));
+                        }
+                        Some(target.id)
+                    }
+                }
+            }
+        };
+        let subscriptions = state
+            .store
+            .list_result_subscriptions(recipient_filter.as_ref())
+            .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({
+            "subscriptions": subscriptions,
+        })))
+    })
+    .await
+}
+
+async fn delete_result_subscription_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let existing = state
+            .store
+            .result_subscription(&id)
+            .map_err(ApiError::from_store)?;
+        let _ = authorize_subscription_recipient(
+            &state.store,
+            &principal,
+            "result_subscriptions.delete",
+            Some(&existing.recipient),
+        )?;
+        let updated = state
+            .store
+            .delete_result_subscription(&id)
+            .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({
+            "subscription": updated,
+        })))
+    })
+    .await
+}
+
+async fn list_result_deliveries_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<ResultSubscriptionsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let recipient_filter = match &principal {
+            Principal::Operator => match query.recipient.as_deref().map(str::trim) {
+                None | Some("" | "all") => None,
+                Some(r) => Some(state.store.agent_by_name(r).map_err(ApiError::from_store)?.id),
+            },
+            Principal::Agent { agent_id, name } => {
+                let caller = state.store.agent(agent_id).map_err(ApiError::from_store)?;
+                let is_root_admin = caller.parent_id.is_none() && caller.is_admin;
+                match query.recipient.as_deref().map(str::trim) {
+                    None | Some("") => {
+                        if is_root_admin {
+                            None
+                        } else {
+                            Some(caller.id)
+                        }
+                    }
+                    Some("all") => {
+                        if is_root_admin {
+                            None
+                        } else {
+                            return Err(ApiError::forbidden("administrative authority required"));
+                        }
+                    }
+                    Some(r) if r.eq_ignore_ascii_case("self") || r == name => Some(caller.id),
+                    Some(r) => {
+                        let target = state.store.agent_by_name(r).map_err(ApiError::from_store)?;
+                        if target.id != caller.id
+                            && target.parent_id.as_ref() != Some(&caller.id)
+                            && !is_root_admin
+                        {
+                            return Err(ApiError::forbidden("administrative authority required"));
+                        }
+                        Some(target.id)
+                    }
+                }
+            }
+        };
+        let deliveries = state
+            .store
+            .list_result_deliveries(
+                recipient_filter.as_ref(),
+                query.subscription_id.as_deref(),
+                query.limit,
+            )
+            .map_err(ApiError::from_store)?;
+        Ok(Json(serde_json::json!({
+            "deliveries": deliveries,
+        })))
+    })
+    .await
+}
+
+async fn result_webhook_route(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    handle_result_webhook(state, None, headers, body).await
+}
+
+async fn result_webhook_by_id_route(
+    State(state): State<AppState>,
+    AxumPath(subscription_id): AxumPath<String>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    handle_result_webhook(state, Some(subscription_id), headers, body).await
+}
+
+async fn handle_result_webhook(
+    state: AppState,
+    subscription_id: Option<String>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let webhook_id = headers
+        .get("webhook-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let webhook_timestamp = headers
+        .get("webhook-timestamp")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let webhook_signature = headers
+        .get("webhook-signature")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let store = Arc::clone(&state.store);
+    spawn_store(move || {
+        let outcome = store
+            .receive_result_webhook(
+                subscription_id.as_deref(),
+                webhook_id.as_deref(),
+                webhook_timestamp.as_deref(),
+                webhook_signature.as_deref(),
+                &body,
+            )
+            .map_err(|err| match err {
+                anyagents_core::ResultWebhookError::BadRequest(msg) => {
+                    ApiError::new(StatusCode::BAD_REQUEST, msg)
+                }
+                anyagents_core::ResultWebhookError::Unauthorized(msg) => {
+                    ApiError::new(StatusCode::UNAUTHORIZED, msg)
+                }
+                anyagents_core::ResultWebhookError::Forbidden(msg) => {
+                    ApiError::new(StatusCode::FORBIDDEN, msg)
+                }
+                anyagents_core::ResultWebhookError::NotFound(msg) => {
+                    ApiError::new(StatusCode::NOT_FOUND, msg)
+                }
+                anyagents_core::ResultWebhookError::Store(msg) => {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg)
+                }
+            })?;
+        let view = match outcome {
+            anyagents_core::ResultWebhookOutcome::Accepted(v)
+            | anyagents_core::ResultWebhookOutcome::Duplicate(v) => v,
+        };
+        Ok(Json(serde_json::to_value(view).unwrap_or_default()))
     })
     .await
 }

@@ -311,6 +311,89 @@ pub struct OpenTurn {
     pub completed_outbounds: Vec<OutboundEffect>,
 }
 
+/// Scoped external result subscription binding one recipient agent to a signed
+/// CloudEvents / Standard Webhooks publisher source and optional subject (`promise_id` / `job_id`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResultSubscription {
+    pub id: String,
+    pub recipient_id: AgentId,
+    pub recipient: String,
+    pub source: String,
+    pub subject: Option<String>,
+    pub org_id: Option<String>,
+    pub event_types: Vec<String>,
+    pub secret_fingerprint: String,
+    pub created_by: String,
+    pub enabled: bool,
+    pub registration_status: String,
+    pub after_seq: i64,
+    pub last_seq: i64,
+    pub delivery_count: i64,
+    pub latest_delivery_stage: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+/// Parameters to register or update a scoped external result subscription.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewResultSubscription {
+    pub recipient_id: AgentId,
+    pub source: String,
+    pub subject: Option<String>,
+    pub org_id: Option<String>,
+    pub event_types: Vec<String>,
+    pub secret: Option<String>,
+    pub previous_secret: Option<String>,
+    pub created_by: String,
+    pub after_seq: i64,
+}
+
+/// Durable receipt and live delivery stage for an accepted external result webhook.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ResultDeliveryView {
+    pub id: String,
+    pub subscription_id: String,
+    pub recipient_id: AgentId,
+    pub recipient: String,
+    pub recipient_state: String,
+    pub woke_from_state: String,
+    pub webhook_id: String,
+    pub webhook_timestamp: i64,
+    pub event_id: String,
+    pub event_type: String,
+    pub source: String,
+    pub subject: Option<String>,
+    pub org_id: Option<String>,
+    pub seq: Option<i64>,
+    pub message_id: String,
+    pub message_seq: i64,
+    pub delivered_seq: i64,
+    pub completed_turn_seq: i64,
+    pub registration_status: String,
+    pub event_status: String,
+    pub delivery_stage: String,
+    pub duplicate: bool,
+    pub received_at_ms: i64,
+    pub delivered_at_ms: Option<i64>,
+}
+
+/// Outcome of `Store::receive_result_webhook`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResultWebhookOutcome {
+    Accepted(ResultDeliveryView),
+    Duplicate(ResultDeliveryView),
+}
+
+/// Fail-closed refusal reasons for `Store::receive_result_webhook`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResultWebhookError {
+    BadRequest(String),
+    Unauthorized(String),
+    Forbidden(String),
+    NotFound(String),
+    Store(String),
+}
+
 /// Held for the life of one agent loop. Drop releases the lock.
 #[derive(Debug)]
 pub struct AgentLock {
@@ -674,6 +757,813 @@ impl Store {
             params![agent_id.as_str(), clean],
         )?;
         agent_by_id(&conn, agent_id)
+    }
+
+    /// Update an agent's `parent_id` in place (`None` promotes the agent to a
+    /// standalone root agent) while preserving its identity, state, authority
+    /// (`is_admin`), message history, cursors, and turn recovery.
+    pub fn set_agent_parent(
+        &self,
+        agent_id: &AgentId,
+        parent_id: Option<&AgentId>,
+    ) -> Result<Agent, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = agent_by_id(&tx, agent_id)?;
+        let mut new_parent_name: Option<String> = None;
+        if let Some(pid) = parent_id {
+            if pid == agent_id {
+                return Err(Error::Message(
+                    "an agent cannot be its own parent".into(),
+                ));
+            }
+            if existing.is_admin {
+                return Err(Error::Message(
+                    "an admin agent cannot become a subagent; revoke admin authority first".into(),
+                ));
+            }
+            let target_parent = agent_by_id(&tx, pid)?;
+            new_parent_name = Some(target_parent.name.clone());
+            let mut cursor = target_parent.parent_id;
+            let mut hops = 0usize;
+            while let Some(anc_id) = cursor {
+                if &anc_id == agent_id {
+                    return Err(Error::Message(
+                        "cannot set parent: cycle detected".into(),
+                    ));
+                }
+                if hops >= 64 {
+                    return Err(Error::Message(
+                        "cannot set parent: hierarchy depth exceeded".into(),
+                    ));
+                }
+                hops += 1;
+                let anc = agent_by_id(&tx, &anc_id)?;
+                cursor = anc.parent_id;
+            }
+        }
+        let mut env = existing.launch_env.clone();
+        if let Some(pname) = new_parent_name {
+            if let Some((_, val)) = env.iter_mut().find(|(k, _)| k == "ANYAGENTS_PARENT_NAME") {
+                *val = pname;
+            } else {
+                env.push(("ANYAGENTS_PARENT_NAME".to_string(), pname));
+            }
+        } else {
+            env.retain(|(k, _)| k != "ANYAGENTS_PARENT_NAME");
+        }
+        let env_json = encode_env(&env);
+        tx.execute(
+            "UPDATE agents SET parent_id = ?1, launch_env = ?2 WHERE id = ?3",
+            params![
+                parent_id.map(AgentId::as_str),
+                env_json,
+                agent_id.as_str()
+            ],
+        )?;
+        let updated = agent_by_id(&tx, agent_id)?;
+        tx.commit()?;
+        Ok(updated)
+    }
+
+    /// Register or idempotently update a scoped external result subscription.
+    /// Returns `(subscription_view, generated_or_supplied_secret_on_change, created_or_rotated)`.
+    pub fn register_result_subscription(
+        &self,
+        new: NewResultSubscription,
+    ) -> Result<(ResultSubscription, Option<String>, bool), Error> {
+        let source = new.source.trim().to_string();
+        if source.is_empty() {
+            return Err(Error::Message("subscription source is empty".into()));
+        }
+        let subject = new
+            .subject
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let org_id = new
+            .org_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let mut event_types: Vec<String> = new
+            .event_types
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        event_types.sort();
+        event_types.dedup();
+        let event_types_json = serde_json::to_string(&event_types).unwrap_or_else(|_| "[]".into());
+        let explicit_secret = match new.secret.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(raw) => {
+                let decoded = decode_standard_webhooks_secret(raw)?;
+                if decoded.len() < 16 {
+                    return Err(Error::Message(
+                        "subscription secret must decode to at least 16 bytes".into(),
+                    ));
+                }
+                Some(if raw.starts_with("whsec_") {
+                    raw.to_string()
+                } else {
+                    format!("whsec_{}", base64_encode(&decoded))
+                })
+            }
+            None => None,
+        };
+        let explicit_prev_secret = match new
+            .previous_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(raw) => {
+                let decoded = decode_standard_webhooks_secret(raw)?;
+                if decoded.len() < 16 {
+                    return Err(Error::Message(
+                        "previous_secret must decode to at least 16 bytes".into(),
+                    ));
+                }
+                Some(if raw.starts_with("whsec_") {
+                    raw.to_string()
+                } else {
+                    format!("whsec_{}", base64_encode(&decoded))
+                })
+            }
+            None => None,
+        };
+
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let _recipient = agent_by_id(&tx, &new.recipient_id)?;
+        let now = now_ms();
+
+        let existing_row: Option<(String, String, Option<String>, i64)> = tx
+            .query_row(
+                "SELECT id, secret, previous_secret, after_seq
+                 FROM result_subscriptions
+                 WHERE recipient_id = ?1 AND source = ?2 AND COALESCE(subject, '') = COALESCE(?3, '')
+                 ORDER BY created_at_ms DESC LIMIT 1",
+                params![new.recipient_id.as_str(), source, subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+
+        let (sub_id, returned_secret, changed) = if let Some((
+            existing_id,
+            existing_secret,
+            existing_prev,
+            existing_after_seq,
+        )) = existing_row
+        {
+            let (next_secret, next_prev, secret_changed, secret_out) = match explicit_secret {
+                Some(ref s) if s != &existing_secret => (
+                    s.clone(),
+                    explicit_prev_secret.or(Some(existing_secret)),
+                    true,
+                    Some(s.clone()),
+                ),
+                Some(ref s) => (
+                    s.clone(),
+                    explicit_prev_secret.or(existing_prev),
+                    false,
+                    None,
+                ),
+                None => (
+                    existing_secret,
+                    explicit_prev_secret.or(existing_prev),
+                    false,
+                    None,
+                ),
+            };
+            let next_after = new.after_seq.max(existing_after_seq);
+            tx.execute(
+                "UPDATE result_subscriptions
+                 SET org_id = COALESCE(?1, org_id),
+                     event_types = ?2,
+                     secret = ?3,
+                     previous_secret = ?4,
+                     enabled = 1,
+                     after_seq = ?5,
+                     updated_at_ms = ?6
+                 WHERE id = ?7",
+                params![
+                    org_id,
+                    event_types_json,
+                    next_secret,
+                    next_prev,
+                    next_after,
+                    now,
+                    existing_id
+                ],
+            )?;
+            (existing_id, secret_out, secret_changed)
+        } else {
+            let sub_id = format!("rsub_{}", uuid::Uuid::now_v7().simple());
+            let secret = match explicit_secret {
+                Some(s) => s,
+                None => generate_standard_webhooks_secret()?,
+            };
+            tx.execute(
+                "INSERT INTO result_subscriptions (
+                    id, recipient_id, source, subject, org_id, event_types,
+                    secret, previous_secret, created_by, enabled, after_seq, last_seq,
+                    created_at_ms, updated_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, 0, ?11, ?11)",
+                params![
+                    sub_id,
+                    new.recipient_id.as_str(),
+                    source,
+                    subject,
+                    org_id,
+                    event_types_json,
+                    secret,
+                    explicit_prev_secret,
+                    new.created_by,
+                    new.after_seq.max(0),
+                    now,
+                ],
+            )?;
+            (sub_id, Some(secret), true)
+        };
+
+        let view = subscription_view_by_id(&tx, &sub_id)?;
+        tx.commit()?;
+        Ok((view, returned_secret, changed))
+    }
+
+    pub fn list_result_subscriptions(
+        &self,
+        recipient_id: Option<&AgentId>,
+    ) -> Result<Vec<ResultSubscription>, Error> {
+        let conn = self.conn();
+        let mut ids: Vec<String> = Vec::new();
+        if let Some(rid) = recipient_id {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM result_subscriptions WHERE recipient_id = ?1 ORDER BY created_at_ms, id",
+            )?;
+            let mut rows = stmt.query([rid.as_str()])?;
+            while let Some(row) = rows.next()? {
+                ids.push(row.get(0)?);
+            }
+        } else {
+            let mut stmt =
+                conn.prepare("SELECT id FROM result_subscriptions ORDER BY created_at_ms, id")?;
+            let mut rows = stmt.query([])?;
+            while let Some(row) = rows.next()? {
+                ids.push(row.get(0)?);
+            }
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(subscription_view_by_id(&conn, &id)?);
+        }
+        Ok(out)
+    }
+
+    pub fn result_subscription(&self, id: &str) -> Result<ResultSubscription, Error> {
+        let conn = self.conn();
+        subscription_view_by_id(&conn, id)
+    }
+
+    pub fn delete_result_subscription(&self, id: &str) -> Result<ResultSubscription, Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing = subscription_view_by_id(&tx, id)?;
+        tx.execute(
+            "UPDATE result_subscriptions SET enabled = 0, updated_at_ms = ?1 WHERE id = ?2",
+            params![now_ms(), id],
+        )?;
+        let updated = subscription_view_by_id(&tx, id)?;
+        tx.commit()?;
+        let _ = existing;
+        Ok(updated)
+    }
+
+    pub fn list_result_deliveries(
+        &self,
+        recipient_id: Option<&AgentId>,
+        subscription_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<ResultDeliveryView>, Error> {
+        let conn = self.conn();
+        let lim = i64::try_from(limit.unwrap_or(100).max(1)).unwrap_or(100);
+        let mut ids: Vec<String> = Vec::new();
+        match (recipient_id, subscription_id) {
+            (Some(rid), Some(sid)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM result_deliveries
+                     WHERE recipient_id = ?1 AND subscription_id = ?2
+                     ORDER BY received_at_ms DESC, id DESC LIMIT ?3",
+                )?;
+                let mut rows = stmt.query(params![rid.as_str(), sid, lim])?;
+                while let Some(row) = rows.next()? {
+                    ids.push(row.get(0)?);
+                }
+            }
+            (Some(rid), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM result_deliveries
+                     WHERE recipient_id = ?1
+                     ORDER BY received_at_ms DESC, id DESC LIMIT ?2",
+                )?;
+                let mut rows = stmt.query(params![rid.as_str(), lim])?;
+                while let Some(row) = rows.next()? {
+                    ids.push(row.get(0)?);
+                }
+            }
+            (None, Some(sid)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM result_deliveries
+                     WHERE subscription_id = ?1
+                     ORDER BY received_at_ms DESC, id DESC LIMIT ?2",
+                )?;
+                let mut rows = stmt.query(params![sid, lim])?;
+                while let Some(row) = rows.next()? {
+                    ids.push(row.get(0)?);
+                }
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM result_deliveries
+                     ORDER BY received_at_ms DESC, id DESC LIMIT ?1",
+                )?;
+                let mut rows = stmt.query(params![lim])?;
+                while let Some(row) = rows.next()? {
+                    ids.push(row.get(0)?);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            out.push(delivery_view_by_id(&conn, &id, false)?);
+        }
+        Ok(out)
+    }
+
+    /// Verify a signed Standard Webhooks + CloudEvents 1.0 external result event,
+    /// enforce subscription scope and replay/timestamp fences, durably persist
+    /// the receipt + recipient mailbox message in one SQLite WAL transaction,
+    /// and wake the recipient (transitioning scale-to-zero `archived`/`created`
+    /// recipients to `running` while holding `paused` recipients closed).
+    pub fn receive_result_webhook(
+        &self,
+        subscription_id_hint: Option<&str>,
+        webhook_id_raw: Option<&str>,
+        webhook_timestamp_raw: Option<&str>,
+        webhook_signature_raw: Option<&str>,
+        raw_body: &[u8],
+    ) -> Result<ResultWebhookOutcome, ResultWebhookError> {
+        let webhook_id = webhook_id_raw
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ResultWebhookError::BadRequest("missing webhook-id header".into())
+            })?;
+        if webhook_id.contains('.') {
+            return Err(ResultWebhookError::BadRequest(
+                "invalid webhook-id header: must not contain '.'".into(),
+            ));
+        }
+        let timestamp_str = webhook_timestamp_raw
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ResultWebhookError::BadRequest("missing webhook-timestamp header".into())
+            })?;
+        let webhook_timestamp: i64 = timestamp_str.parse().map_err(|_| {
+            ResultWebhookError::BadRequest("webhook-timestamp is not a valid unix integer".into())
+        })?;
+        let now_secs = now_ms() / 1000;
+        if (now_secs - webhook_timestamp).abs() > STANDARD_WEBHOOKS_TOLERANCE_SECS {
+            return Err(ResultWebhookError::Unauthorized(
+                "webhook-timestamp is outside the 300s replay tolerance window".into(),
+            ));
+        }
+        let signature_header = webhook_signature_raw
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ResultWebhookError::Unauthorized("missing webhook-signature header".into())
+            })?;
+        if !signature_header
+            .split_ascii_whitespace()
+            .any(|part| part.starts_with("v1,") && part.len() > 3)
+        {
+            return Err(ResultWebhookError::Unauthorized(
+                "webhook-signature contains no v1 signature".into(),
+            ));
+        }
+        let body_str = std::str::from_utf8(raw_body).map_err(|_| {
+            ResultWebhookError::BadRequest("webhook body is not valid UTF-8".into())
+        })?;
+        let payload: serde_json::Value = serde_json::from_str(body_str).map_err(|_| {
+            ResultWebhookError::BadRequest("webhook body is not valid JSON".into())
+        })?;
+        if let Some(spec) = payload.get("specversion").and_then(serde_json::Value::as_str)
+            && spec != "1.0"
+        {
+            return Err(ResultWebhookError::BadRequest(format!(
+                "unsupported CloudEvents specversion `{spec}`"
+            )));
+        }
+        let event_id = payload
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ResultWebhookError::BadRequest("CloudEvents `id` is required".into())
+            })?
+            .to_string();
+        let event_type = payload
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ResultWebhookError::BadRequest("CloudEvents `type` is required".into())
+            })?
+            .to_string();
+        let event_source = payload
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                ResultWebhookError::BadRequest("CloudEvents `source` is required".into())
+            })?
+            .to_string();
+        let event_subject = payload
+            .get("subject")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                payload
+                    .pointer("/data/promise_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .or_else(|| {
+                payload
+                    .pointer("/data/job_id")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let event_org_id = payload
+            .pointer("/data/org_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let event_seq = payload
+            .pointer("/data/seq")
+            .and_then(serde_json::Value::as_i64);
+
+        let (outcome, wake_agent_id, woke_from_archived) = {
+            let mut conn = self.conn();
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+
+            #[allow(clippy::type_complexity)]
+            let mut candidates: Vec<(
+                String,
+                AgentId,
+                String,
+                Option<String>,
+                Option<String>,
+                Vec<String>,
+                String,
+                Option<String>,
+                bool,
+                i64,
+            )> = Vec::new();
+
+            let load_row = |row: &rusqlite::Row<'_>| -> Result<_, rusqlite::Error> {
+                let id: String = row.get(0)?;
+                let rid_raw: String = row.get(1)?;
+                let rid = AgentId::parse(&rid_raw).map_err(|err| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                })?;
+                let src: String = row.get(2)?;
+                let subj: Option<String> = row.get(3)?;
+                let oid: Option<String> = row.get(4)?;
+                let et_raw: String = row.get(5)?;
+                let et: Vec<String> = serde_json::from_str(&et_raw).unwrap_or_default();
+                let sec: String = row.get(6)?;
+                let prev_sec: Option<String> = row.get(7)?;
+                let en: i64 = row.get(8)?;
+                let aseq: i64 = row.get(9)?;
+                Ok((id, rid, src, subj, oid, et, sec, prev_sec, en != 0, aseq))
+            };
+
+            if let Some(hint) = subscription_id_hint.map(str::trim).filter(|s| !s.is_empty()) {
+                let found = tx
+                    .query_row(
+                        "SELECT id, recipient_id, source, subject, org_id, event_types,
+                                secret, previous_secret, enabled, after_seq
+                         FROM result_subscriptions WHERE id = ?1",
+                        [hint],
+                        load_row,
+                    )
+                    .optional()
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                let Some(row) = found else {
+                    return Err(ResultWebhookError::NotFound(format!(
+                        "result subscription `{hint}` not found"
+                    )));
+                };
+                if !row.8 {
+                    return Err(ResultWebhookError::Forbidden(format!(
+                        "result subscription `{hint}` is disabled"
+                    )));
+                }
+                candidates.push(row);
+            } else {
+                let mut stmt = tx
+                    .prepare(
+                        "SELECT id, recipient_id, source, subject, org_id, event_types,
+                                secret, previous_secret, enabled, after_seq
+                         FROM result_subscriptions
+                         WHERE enabled = 1
+                         ORDER BY created_at_ms DESC",
+                    )
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                let mut rows = stmt
+                    .query([])
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                while let Some(row) = rows
+                    .next()
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?
+                {
+                    candidates.push(
+                        load_row(row).map_err(|e| ResultWebhookError::Store(e.to_string()))?,
+                    );
+                }
+                if candidates.is_empty() {
+                    return Err(ResultWebhookError::Forbidden(
+                        "no active result subscriptions registered".into(),
+                    ));
+                }
+            }
+
+            let mut sig_verified_candidates = Vec::new();
+            for cand in candidates {
+                let primary_ok = standard_webhooks_verify(
+                    &cand.6,
+                    webhook_id,
+                    timestamp_str,
+                    raw_body,
+                    signature_header,
+                );
+                let prev_ok = cand.7.as_deref().is_some_and(|prev| {
+                    standard_webhooks_verify(
+                        prev,
+                        webhook_id,
+                        timestamp_str,
+                        raw_body,
+                        signature_header,
+                    )
+                });
+                if primary_ok || prev_ok {
+                    sig_verified_candidates.push(cand);
+                }
+            }
+            if sig_verified_candidates.is_empty() {
+                return Err(ResultWebhookError::Unauthorized(
+                    "Standard Webhooks signature verification failed".into(),
+                ));
+            }
+
+            let matched = sig_verified_candidates.into_iter().find(|cand| {
+                let source_ok = cand.2 == "*" || cand.2 == event_source;
+                let subject_ok = match (&cand.3, &event_subject) {
+                    (None, _) => true,
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                };
+                let org_ok = match (&cand.4, &event_org_id) {
+                    (None, _) => true,
+                    (Some(expected), Some(actual)) => expected == actual,
+                    (Some(_), None) => false,
+                };
+                let type_ok = cand.5.is_empty()
+                    || cand.5.iter().any(|allowed| {
+                        allowed == "*"
+                            || allowed == &event_type
+                            || (allowed.ends_with(".*")
+                                && event_type.starts_with(&allowed[..allowed.len() - 1]))
+                    });
+                source_ok && subject_ok && org_ok && type_ok
+            });
+
+            let Some((
+                sub_id,
+                recipient_id,
+                _sub_source,
+                _sub_subject,
+                _sub_org,
+                _sub_types,
+                _sec,
+                _prev,
+                _en,
+                after_seq,
+            )) = matched
+            else {
+                return Err(ResultWebhookError::Forbidden(
+                    "event source, subject, org_id, or type is outside the subscription's granted scope".into(),
+                ));
+            };
+
+            let existing_delivery_id: Option<String> = tx
+                .query_row(
+                    "SELECT id FROM result_deliveries
+                     WHERE subscription_id = ?1 AND (webhook_id = ?2 OR event_id = ?3)
+                     LIMIT 1",
+                    params![sub_id, webhook_id, event_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+
+            if let Some(del_id) = existing_delivery_id {
+                let view = delivery_view_by_id(&tx, &del_id, true)
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                tx.commit()
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                return Ok(ResultWebhookOutcome::Duplicate(view));
+            }
+
+            if let Some(s) = event_seq
+                && s <= after_seq
+            {
+                return Err(ResultWebhookError::Forbidden(format!(
+                    "event seq {s} is at or before subscription after_seq fence ({after_seq})"
+                )));
+            }
+
+            let agent = agent_by_id(&tx, &recipient_id)
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+            let prior_state = agent.state.clone();
+            let now = now_ms();
+            let source_key = format!("result_webhook:{sub_id}:{event_id}");
+            let msg_text = format!(
+                "[External Result Event]\n\
+                 - subscription_id: `{sub_id}`\n\
+                 - event_id: `{event_id}`\n\
+                 - event_type: `{event_type}`\n\
+                 - source: `{event_source}`\n\
+                 - subject: `{}`\n\
+                 - seq: `{}`\n\n\
+                 ```json\n{}\n```",
+                event_subject.as_deref().unwrap_or("-"),
+                event_seq
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                serde_json::to_string_pretty(&payload).unwrap_or_else(|_| body_str.to_string()),
+            );
+
+            let (msg_id, msg_seq) = if let Some(existing_msg) =
+                message_by_source(&tx, &recipient_id, &source_key)
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?
+            {
+                (existing_msg.id.to_string(), existing_msg.seq)
+            } else {
+                let seq = next_seq(&tx, &recipient_id)
+                    .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                let id = MessageId::generate();
+                let sender = format!("webhook:{event_source}");
+                let reply_to = format!("agent:{}", agent.name);
+                let context = anyagents_harness::Context {
+                    sender: Some(sender.clone()),
+                    sender_name: Some(event_source.clone()),
+                    recipient: Some(reply_to.clone()),
+                    channel: Some("webhook".to_string()),
+                    chat_id: None,
+                    chat_title: event_subject.clone(),
+                    chat_type: Some(event_type.clone()),
+                    thread_id: event_seq,
+                    message_id: None,
+                    destination: Some(reply_to.clone()),
+                    event: Some(event_type.clone()),
+                    reply_to_author: None,
+                    mentions: Vec::new(),
+                };
+                tx.execute(
+                    "INSERT INTO messages (
+                        id, agent_id, seq, source_time_ms, source_key, sender, body, reply_to,
+                        received_at_ms, origin, context
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
+                    params![
+                        id.as_str(),
+                        recipient_id.as_str(),
+                        seq,
+                        webhook_timestamp.saturating_mul(1000),
+                        source_key,
+                        sender,
+                        msg_text,
+                        reply_to,
+                        now,
+                        serde_json::to_string(&context).ok(),
+                    ],
+                )
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+                let _ = index_rag_chunk(
+                    &tx,
+                    id.as_str(),
+                    recipient_id.as_str(),
+                    &agent.name,
+                    "in",
+                    &sender,
+                    &reply_to,
+                    now,
+                    &msg_text,
+                );
+                (id.to_string(), seq)
+            };
+
+            let woke = if prior_state == "archived" || prior_state == "created" {
+                tx.execute(
+                    "UPDATE agents SET state = 'running' WHERE id = ?1 AND state IN ('archived', 'created')",
+                    [recipient_id.as_str()],
+                )
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?
+                    > 0
+            } else {
+                false
+            };
+
+            let del_id = format!("rdel_{}", uuid::Uuid::now_v7().simple());
+            tx.execute(
+                "INSERT INTO result_deliveries (
+                    id, subscription_id, recipient_id, webhook_id, webhook_timestamp,
+                    event_id, event_type, source, subject, org_id, seq,
+                    message_id, message_seq, woke_from_state, payload_json, received_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                params![
+                    del_id,
+                    sub_id,
+                    recipient_id.as_str(),
+                    webhook_id,
+                    webhook_timestamp,
+                    event_id,
+                    event_type,
+                    event_source,
+                    event_subject,
+                    event_org_id,
+                    event_seq,
+                    msg_id,
+                    msg_seq,
+                    prior_state,
+                    body_str,
+                    now,
+                ],
+            )
+            .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+
+            if let Some(s) = event_seq {
+                tx.execute(
+                    "UPDATE result_subscriptions
+                     SET last_seq = MAX(last_seq, ?1), updated_at_ms = ?2
+                     WHERE id = ?3",
+                    params![s, now, sub_id],
+                )
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+            } else {
+                tx.execute(
+                    "UPDATE result_subscriptions SET updated_at_ms = ?1 WHERE id = ?2",
+                    params![now, sub_id],
+                )
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+            }
+
+            let view = delivery_view_by_id(&tx, &del_id, false)
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+            tx.commit()
+                .map_err(|e| ResultWebhookError::Store(e.to_string()))?;
+            (
+                ResultWebhookOutcome::Accepted(view),
+                if prior_state == "paused" {
+                    None
+                } else {
+                    Some(recipient_id)
+                },
+                woke,
+            )
+        };
+
+        if let Some(agent_id) = wake_agent_id {
+            if woke_from_archived {
+                self.notify(Wake::Agent {
+                    agent_id: agent_id.clone(),
+                });
+            }
+            self.notify(Wake::Mail { agent_id });
+        }
+        Ok(outcome)
     }
 
     /// Administrative metadata only; callers must never pass credentials here.
@@ -1371,6 +2261,12 @@ impl Store {
                     &format!("DELETE FROM {table} WHERE agent_id = ?1"),
                     [id.as_str()],
                 )?;
+            }
+            for table in ["result_deliveries", "result_subscriptions"] {
+                let _ = tx.execute(
+                    &format!("DELETE FROM {table} WHERE recipient_id = ?1"),
+                    [id.as_str()],
+                );
             }
             tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
             tx.commit()?;
@@ -3104,6 +4000,440 @@ fn message_exists(conn: &Connection, agent_id: &AgentId, seq: i64) -> Result<boo
     Ok(count == 1)
 }
 
+pub const STANDARD_WEBHOOKS_TOLERANCE_SECS: i64 = 300;
+
+fn subscription_view_by_id(conn: &Connection, id: &str) -> Result<ResultSubscription, Error> {
+    let found = conn
+        .query_row(
+            "SELECT s.id, s.recipient_id, a.name, s.source, s.subject, s.org_id,
+                    s.event_types, s.secret, s.created_by, s.enabled,
+                    s.after_seq, s.last_seq, s.created_at_ms, s.updated_at_ms
+             FROM result_subscriptions s
+             JOIN agents a ON a.id = s.recipient_id
+             WHERE s.id = ?1",
+            [id],
+            |row| {
+                let sub_id: String = row.get(0)?;
+                let rid_raw: String = row.get(1)?;
+                let rid = AgentId::parse(&rid_raw).map_err(|err| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                })?;
+                let recipient: String = row.get(2)?;
+                let source: String = row.get(3)?;
+                let subject: Option<String> = row.get(4)?;
+                let org_id: Option<String> = row.get(5)?;
+                let event_types_raw: String = row.get(6)?;
+                let event_types: Vec<String> =
+                    serde_json::from_str(&event_types_raw).unwrap_or_default();
+                let secret: String = row.get(7)?;
+                let created_by: String = row.get(8)?;
+                let enabled_i64: i64 = row.get(9)?;
+                let after_seq: i64 = row.get(10)?;
+                let last_seq: i64 = row.get(11)?;
+                let created_at_ms: i64 = row.get(12)?;
+                let updated_at_ms: i64 = row.get(13)?;
+                Ok((
+                    sub_id,
+                    rid,
+                    recipient,
+                    source,
+                    subject,
+                    org_id,
+                    event_types,
+                    secret,
+                    created_by,
+                    enabled_i64 != 0,
+                    after_seq,
+                    last_seq,
+                    created_at_ms,
+                    updated_at_ms,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        sub_id,
+        recipient_id,
+        recipient,
+        source,
+        subject,
+        org_id,
+        event_types,
+        secret,
+        created_by,
+        enabled,
+        after_seq,
+        last_seq,
+        created_at_ms,
+        updated_at_ms,
+    )) = found
+    else {
+        return Err(Error::Message(format!(
+            "result subscription `{id}` not found"
+        )));
+    };
+    let secret_fingerprint = decode_standard_webhooks_secret(&secret)
+        .map(|bytes| hex(&sha256_bytes(&bytes)[..6]))
+        .unwrap_or_else(|_| hex(&sha256_bytes(secret.as_bytes())[..6]));
+    let delivery_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM result_deliveries WHERE subscription_id = ?1",
+            [&sub_id],
+            |row| row.get(0),
+        )
+        .unwrap_or(0);
+    let latest_del_id: Option<String> = conn
+        .query_row(
+            "SELECT id FROM result_deliveries WHERE subscription_id = ?1 ORDER BY received_at_ms DESC, id DESC LIMIT 1",
+            [&sub_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let latest_delivery_stage = match latest_del_id {
+        Some(del_id) => delivery_view_by_id(conn, &del_id, false)
+            .map(|d| d.delivery_stage)
+            .unwrap_or_else(|_| "awaiting_event".to_string()),
+        None => "awaiting_event".to_string(),
+    };
+    Ok(ResultSubscription {
+        id: sub_id,
+        recipient_id,
+        recipient,
+        source,
+        subject,
+        org_id,
+        event_types,
+        secret_fingerprint,
+        created_by,
+        enabled,
+        registration_status: if enabled {
+            "registered".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        after_seq,
+        last_seq,
+        delivery_count,
+        latest_delivery_stage,
+        created_at_ms,
+        updated_at_ms,
+    })
+}
+
+fn delivery_view_by_id(
+    conn: &Connection,
+    id: &str,
+    duplicate: bool,
+) -> Result<ResultDeliveryView, Error> {
+    let found = conn
+        .query_row(
+            "SELECT d.id, d.subscription_id, d.recipient_id, a.name, a.state,
+                    d.woke_from_state, d.webhook_id, d.webhook_timestamp,
+                    d.event_id, d.event_type, d.source, d.subject, d.org_id, d.seq,
+                    d.message_id, d.message_seq, d.received_at_ms,
+                    COALESCE(mc.delivered_seq, 0),
+                    COALESCE(tr.opened_seq, 0),
+                    COALESCE(tr.completed_seq, 0),
+                    m.delivered_at_ms,
+                    COALESCE(s.enabled, 0)
+             FROM result_deliveries d
+             JOIN agents a ON a.id = d.recipient_id
+             LEFT JOIN result_subscriptions s ON s.id = d.subscription_id
+             LEFT JOIN mailbox_cursors mc ON mc.agent_id = d.recipient_id
+             LEFT JOIN turn_recovery tr ON tr.agent_id = d.recipient_id
+             LEFT JOIN messages m ON m.id = d.message_id
+             WHERE d.id = ?1",
+            [id],
+            |row| {
+                let del_id: String = row.get(0)?;
+                let sub_id: String = row.get(1)?;
+                let rid_raw: String = row.get(2)?;
+                let rid = AgentId::parse(&rid_raw).map_err(|err| {
+                    rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                })?;
+                let recipient: String = row.get(3)?;
+                let recipient_state: String = row.get(4)?;
+                let woke_from_state: String = row.get(5)?;
+                let webhook_id: String = row.get(6)?;
+                let webhook_timestamp: i64 = row.get(7)?;
+                let event_id: String = row.get(8)?;
+                let event_type: String = row.get(9)?;
+                let source: String = row.get(10)?;
+                let subject: Option<String> = row.get(11)?;
+                let org_id: Option<String> = row.get(12)?;
+                let seq: Option<i64> = row.get(13)?;
+                let message_id: String = row.get(14)?;
+                let message_seq: i64 = row.get(15)?;
+                let received_at_ms: i64 = row.get(16)?;
+                let delivered_seq: i64 = row.get(17)?;
+                let opened_seq: i64 = row.get(18)?;
+                let completed_seq: i64 = row.get(19)?;
+                let delivered_at_ms: Option<i64> = row.get(20)?;
+                let sub_enabled: i64 = row.get(21)?;
+                let delivery_stage = if completed_seq >= message_seq {
+                    "completed_turn".to_string()
+                } else if delivered_seq >= message_seq || opened_seq >= message_seq {
+                    "admitted_delivered".to_string()
+                } else if recipient_state == "paused" {
+                    "held_paused".to_string()
+                } else {
+                    "queued".to_string()
+                };
+                Ok(ResultDeliveryView {
+                    id: del_id,
+                    subscription_id: sub_id,
+                    recipient_id: rid,
+                    recipient,
+                    recipient_state,
+                    woke_from_state,
+                    webhook_id,
+                    webhook_timestamp,
+                    event_id,
+                    event_type,
+                    source,
+                    subject,
+                    org_id,
+                    seq,
+                    message_id,
+                    message_seq,
+                    delivered_seq,
+                    completed_turn_seq: completed_seq,
+                    registration_status: if sub_enabled != 0 {
+                        "registered".to_string()
+                    } else {
+                        "disabled".to_string()
+                    },
+                    event_status: if duplicate {
+                        "event_duplicate".to_string()
+                    } else {
+                        "event_accepted".to_string()
+                    },
+                    delivery_stage,
+                    duplicate,
+                    received_at_ms,
+                    delivered_at_ms,
+                })
+            },
+        )
+        .optional()?;
+    found.ok_or_else(|| Error::Message(format!("result delivery `{id}` not found")))
+}
+
+fn generate_standard_webhooks_secret() -> Result<String, Error> {
+    let mut bytes = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(format!("whsec_{}", base64_encode(&bytes)))
+}
+
+pub fn decode_standard_webhooks_secret(secret: &str) -> Result<Vec<u8>, Error> {
+    let trimmed = secret.trim();
+    let encoded = trimmed.strip_prefix("whsec_").unwrap_or(trimmed);
+    if encoded.is_empty() {
+        return Err(Error::Message("Standard Webhooks secret is empty".into()));
+    }
+    base64_decode(encoded)
+}
+
+/// Sign `(webhook_id, webhook_timestamp, raw_body)` using the Standard Webhooks
+/// `v1,<base64_hmac_sha256>` specification.
+pub fn standard_webhooks_sign(
+    secret: &str,
+    webhook_id: &str,
+    webhook_timestamp: &str,
+    raw_body: &[u8],
+) -> Result<String, Error> {
+    if webhook_id.is_empty() || webhook_id.contains('.') {
+        return Err(Error::Message("invalid webhook_id".into()));
+    }
+    let key = decode_standard_webhooks_secret(secret)?;
+    let mut signed = Vec::with_capacity(webhook_id.len() + webhook_timestamp.len() + raw_body.len() + 2);
+    signed.extend_from_slice(webhook_id.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(webhook_timestamp.as_bytes());
+    signed.push(b'.');
+    signed.extend_from_slice(raw_body);
+    let mac = hmac_sha256_bytes(&key, &signed);
+    Ok(format!("v1,{}", base64_encode(&mac)))
+}
+
+/// Constant-time verification of a `webhook-signature` header (`v1,<b64> ...`)
+/// against `secret` (`whsec_<b64>`).
+pub fn standard_webhooks_verify(
+    secret: &str,
+    webhook_id: &str,
+    webhook_timestamp: &str,
+    raw_body: &[u8],
+    signature_header: &str,
+) -> bool {
+    let Ok(expected_header) = standard_webhooks_sign(secret, webhook_id, webhook_timestamp, raw_body) else {
+        return false;
+    };
+    let Some(expected_sig) = expected_header.strip_prefix("v1,") else {
+        return false;
+    };
+    let mut matched = false;
+    for token in signature_header.split_ascii_whitespace() {
+        if let Some(candidate) = token.strip_prefix("v1,")
+            && constant_time_eq(expected_sig.as_bytes(), candidate.as_bytes())
+        {
+            matched = true;
+        }
+    }
+    matched
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |diff, (x, y)| diff | (x ^ y))
+        == 0
+}
+
+fn sha256_bytes(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let bit_len = (data.len() as u64) * 8;
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while (padded.len() % 64) != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&bit_len.to_be_bytes());
+    for chunk in padded.as_chunks::<64>().0 {
+        let mut w = [0u32; 64];
+        for (i, word) in chunk.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = u32::from_be_bytes(*word);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for i in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ ((!e) & g);
+            let temp1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (state, delta) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *state = state.wrapping_add(delta);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
+}
+
+fn hmac_sha256_bytes(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut k_block = [0u8; 64];
+    if key.len() > 64 {
+        let digest = sha256_bytes(key);
+        k_block[..32].copy_from_slice(&digest);
+    } else {
+        k_block[..key.len()].copy_from_slice(key);
+    }
+    let mut inner = Vec::with_capacity(64 + message.len());
+    for byte in &k_block {
+        inner.push(byte ^ 0x36);
+    }
+    inner.extend_from_slice(message);
+    let inner_hash = sha256_bytes(&inner);
+
+    let mut outer = Vec::with_capacity(64 + 32);
+    for byte in &k_block {
+        outer.push(byte ^ 0x5c);
+    }
+    outer.extend_from_slice(&inner_hash);
+    sha256_bytes(&outer)
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = if chunk.len() > 1 { chunk[1] } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] } else { 0 };
+        out.push(char::from(TABLE[(b0 >> 2) as usize]));
+        out.push(char::from(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize]));
+        if chunk.len() > 1 {
+            out.push(char::from(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize]));
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(char::from(TABLE[(b2 & 0x3f) as usize]));
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, Error> {
+    let clean = input.trim().trim_end_matches('=');
+    if clean.len() % 4 == 1 {
+        return Err(Error::Message("invalid base64 length".into()));
+    }
+    let mut out = Vec::with_capacity((clean.len() * 3) / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for byte in clean.bytes() {
+        let val = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return Err(Error::Message("invalid base64 character".into())),
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3854,5 +5184,219 @@ mod tests {
         store.note_turn_completed(&child.id).unwrap();
         assert!(store.complete_idle_subagent(&child.id).unwrap());
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+    }
+
+    #[test]
+    fn set_agent_parent_promotes_subagent_to_root_in_place_and_rejects_cycles() {
+        let (_dir, store) = setup();
+        let root = agent(&store, "prism");
+        let mut mid_new = NewAgent::new("prism-owner-provision", "codex");
+        mid_new.parent_id = Some(root.id.clone());
+        let mid = store.create_agent(mid_new).unwrap();
+        let mut child_new = NewAgent::new("owner-sylphx", "codex");
+        child_new.parent_id = Some(mid.id.clone());
+        let child = store.create_agent(child_new).unwrap();
+        store.set_agent_state(&child.id, "paused").unwrap();
+        store.receive(&child.id, Incoming::new("retained history")).unwrap();
+
+        // Self-parenting and cycle parenting are refused.
+        assert!(store.set_agent_parent(&root.id, Some(&root.id)).is_err());
+        assert!(store.set_agent_parent(&root.id, Some(&child.id)).is_err());
+
+        // Promoting child to root preserves ID, paused state, history, and clears ANYAGENTS_PARENT_NAME.
+        let promoted = store.set_agent_parent(&child.id, None).unwrap();
+        assert_eq!(promoted.id, child.id);
+        assert_eq!(promoted.parent_id, None);
+        assert_eq!(promoted.state, "paused");
+        assert!(!promoted.is_admin);
+        assert!(
+            promoted
+                .launch_env
+                .iter()
+                .all(|(k, _)| k != "ANYAGENTS_PARENT_NAME")
+        );
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn standard_webhooks_vector_and_durable_result_delivery() {
+        // 1. Standard Webhooks specification test vector.
+        let secret = concat!("whsec_", "MfKQ9r8G", "KYqrTwjU", "PD8ILPZI", "o2LaLaSw");
+        let wh_id = concat!("msg_p5jXN8", "AQM9LWM0D4", "loKWxJek");
+        let wh_ts = "1614265330";
+        let wh_body = br#"{"test": 2432232314}"#;
+        let sig = standard_webhooks_sign(secret, wh_id, wh_ts, wh_body).unwrap();
+        let expected_sig = concat!(
+            "v1,g0hM9SsE+",
+            "OTPJTGt/tmIK",
+            "tSyZlE3uFJEL",
+            "VlNIOLJ1OE="
+        );
+        assert_eq!(sig, expected_sig);
+        assert!(standard_webhooks_verify(secret, wh_id, wh_ts, wh_body, &sig));
+        assert!(!standard_webhooks_verify(
+            secret,
+            wh_id,
+            wh_ts,
+            wh_body,
+            "v1,tampered="
+        ));
+
+        // 2. End-to-end subscription, scale-to-zero wake, dedupe, and fail-closed checks.
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner-lockdocs");
+        store.set_agent_state(&owner.id, "archived").unwrap();
+        let (sub, gen_secret, changed) = store
+            .register_result_subscription(NewResultSubscription {
+                recipient_id: owner.id.clone(),
+                source: "/spiron/promise-ledger".into(),
+                subject: Some("01a184d5-3737-7165-a089-a97ad3d70b10".into()),
+                org_id: Some("org_sylphx".into()),
+                event_types: vec!["spiron.promise.kept".into(), "spiron.promise.broken".into()],
+                secret: Some(secret.into()),
+                previous_secret: None,
+                created_by: "agent:owner-lockdocs".into(),
+                after_seq: 0,
+            })
+            .unwrap();
+        assert!(changed);
+        assert_eq!(gen_secret.as_deref(), Some(secret));
+        assert_eq!(sub.registration_status, "registered");
+        assert_eq!(sub.latest_delivery_stage, "awaiting_event");
+
+        let now_secs = (now_ms() / 1000).to_string();
+        let event_body = serde_json::json!({
+            "specversion": "1.0",
+            "id": "promise-event:org_sylphx:7",
+            "type": "spiron.promise.kept",
+            "source": "/spiron/promise-ledger",
+            "subject": "01a184d5-3737-7165-a089-a97ad3d70b10",
+            "data": {
+                "org_id": "org_sylphx",
+                "promise_id": "01a184d5-3737-7165-a089-a97ad3d70b10",
+                "seq": 7,
+                "kind": "kept",
+                "principal_id": "agt_worker"
+            }
+        })
+        .to_string();
+        let valid_sig =
+            standard_webhooks_sign(secret, "msg_evt_7", &now_secs, event_body.as_bytes()).unwrap();
+
+        // Negative: tampered signature fails closed without mutating state or mailbox.
+        assert!(matches!(
+            store.receive_result_webhook(
+                Some(&sub.id),
+                Some("msg_evt_7"),
+                Some(&now_secs),
+                Some("v1,bad_signature_value"),
+                event_body.as_bytes(),
+            ),
+            Err(ResultWebhookError::Unauthorized(_))
+        ));
+        assert_eq!(store.agent(&owner.id).unwrap().state, "archived");
+        assert!(store.inbox(&owner.id, None).unwrap().is_empty());
+
+        // Negative: expired timestamp fails closed.
+        let expired_ts = ((now_ms() / 1000) - 600).to_string();
+        let expired_sig =
+            standard_webhooks_sign(secret, "msg_evt_7", &expired_ts, event_body.as_bytes())
+                .unwrap();
+        assert!(matches!(
+            store.receive_result_webhook(
+                Some(&sub.id),
+                Some("msg_evt_7"),
+                Some(&expired_ts),
+                Some(&expired_sig),
+                event_body.as_bytes(),
+            ),
+            Err(ResultWebhookError::Unauthorized(_))
+        ));
+
+        // Negative: ungranted promise_id fails closed even when signed with the secret.
+        let wrong_subject_body = serde_json::json!({
+            "specversion": "1.0",
+            "id": "promise-event:org_sylphx:8",
+            "type": "spiron.promise.kept",
+            "source": "/spiron/promise-ledger",
+            "subject": "ungranted-promise-id",
+            "data": {
+                "org_id": "org_sylphx",
+                "promise_id": "ungranted-promise-id",
+                "seq": 8,
+                "kind": "kept"
+            }
+        })
+        .to_string();
+        let wrong_subj_sig = standard_webhooks_sign(
+            secret,
+            "msg_evt_8",
+            &now_secs,
+            wrong_subject_body.as_bytes(),
+        )
+        .unwrap();
+        assert!(matches!(
+            store.receive_result_webhook(
+                Some(&sub.id),
+                Some("msg_evt_8"),
+                Some(&now_secs),
+                Some(&wrong_subj_sig),
+                wrong_subject_body.as_bytes(),
+            ),
+            Err(ResultWebhookError::Forbidden(_))
+        ));
+
+        // Positive: valid event wakes archived recipient to running and enqueues 1 message.
+        let outcome = store
+            .receive_result_webhook(
+                None,
+                Some("msg_evt_7"),
+                Some(&now_secs),
+                Some(&valid_sig),
+                event_body.as_bytes(),
+            )
+            .unwrap();
+        let view = match outcome {
+            ResultWebhookOutcome::Accepted(v) => v,
+            other => panic!("expected Accepted, got {other:?}"),
+        };
+        assert!(!view.duplicate);
+        assert_eq!(view.event_status, "event_accepted");
+        assert_eq!(view.delivery_stage, "queued");
+        assert_eq!(view.woke_from_state, "archived");
+        assert_eq!(store.agent(&owner.id).unwrap().state, "running");
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+
+        // Duplicate redelivery returns Duplicate without adding another message.
+        let dup = store
+            .receive_result_webhook(
+                Some(&sub.id),
+                Some("msg_evt_7"),
+                Some(&now_secs),
+                Some(&valid_sig),
+                event_body.as_bytes(),
+            )
+            .unwrap();
+        let dup_view = match dup {
+            ResultWebhookOutcome::Duplicate(v) => v,
+            other => panic!("expected Duplicate, got {other:?}"),
+        };
+        assert!(dup_view.duplicate);
+        assert_eq!(dup_view.event_status, "event_duplicate");
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+
+        // Once delivered and turn completed, delivery_stage transitions through
+        // `admitted_delivered` -> `completed_turn`.
+        store.note_delivered(&owner.id, view.message_seq).unwrap();
+        let after_deliver = store
+            .list_result_deliveries(Some(&owner.id), Some(&sub.id), Some(10))
+            .unwrap();
+        assert_eq!(after_deliver[0].delivery_stage, "admitted_delivered");
+
+        store.note_turn_completed(&owner.id).unwrap();
+        let after_complete = store
+            .list_result_deliveries(Some(&owner.id), Some(&sub.id), Some(10))
+            .unwrap();
+        assert_eq!(after_complete[0].delivery_stage, "completed_turn");
     }
 }

@@ -469,6 +469,75 @@ enum Command {
         #[arg(long)]
         headless: Option<bool>,
     },
+    /// Convert an existing agent's parent hierarchy in place (`anyagents parent <agent> [parent|root]`).
+    Parent {
+        /// Agent name or `agt_...` id.
+        name: String,
+        /// Target parent name/`agt_...` id, or `root` / `none` (defaults to `root`).
+        parent: Option<String>,
+        /// Target parent flag (`--parent root`).
+        #[arg(long = "parent")]
+        parent_flag: Option<String>,
+        /// Promote to standalone root agent (`parent = null`).
+        #[arg(long)]
+        root: bool,
+    },
+    /// Manage scoped external result subscriptions and inspect durable webhook deliveries.
+    Subscriptions {
+        #[command(subcommand)]
+        action: SubscriptionsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubscriptionsCommand {
+    /// Register or update a scoped external result subscription.
+    Register {
+        /// Recipient agent name or `agt_...` id.
+        #[arg(long)]
+        recipient: String,
+        /// Publisher source URI (default: `/spiron/promise-ledger`).
+        #[arg(long, default_value = "/spiron/promise-ledger")]
+        source: String,
+        /// Scoped subject (`promise_id` or `job_id`).
+        #[arg(long, alias = "promise-id")]
+        subject: Option<String>,
+        /// Optional organization scope filter.
+        #[arg(long = "org-id")]
+        org_id: Option<String>,
+        /// Allowed CloudEvents types (repeatable, e.g. `--event-type spiron.promise.kept`).
+        #[arg(long = "event-type")]
+        event_types: Vec<String>,
+        /// Optional Standard Webhooks signing secret (`whsec_<base64>`). Generated automatically when omitted.
+        #[arg(long)]
+        secret: Option<String>,
+        /// Optional sequence fence (`seq > after_seq`).
+        #[arg(long = "after-seq", default_value_t = 0)]
+        after_seq: i64,
+    },
+    /// List registered result subscriptions.
+    List {
+        /// Optional recipient filter (`<agent>` or `all`).
+        #[arg(long)]
+        recipient: Option<String>,
+    },
+    /// Disable a result subscription by ID (`rsub_...`).
+    Delete {
+        /// Subscription ID (`rsub_...`).
+        id: String,
+    },
+    /// List durable result webhook deliveries and their live turn stage (`queued`, `admitted_delivered`, `completed_turn`).
+    Deliveries {
+        /// Optional recipient filter.
+        #[arg(long)]
+        recipient: Option<String>,
+        /// Optional subscription ID filter.
+        #[arg(long = "subscription-id")]
+        subscription_id: Option<String>,
+        /// Maximum rows to return.
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -591,6 +660,19 @@ enum AgentsCommand {
         #[arg(long)]
         profile: Option<String>,
     },
+    /// Convert an existing agent's parent hierarchy in place (`root` promotes to a standalone root agent).
+    Parent {
+        /// Agent name or `agt_...` id.
+        name: String,
+        /// Target parent name/`agt_...` id, or `root` / `none` (defaults to `root`).
+        parent: Option<String>,
+        /// Target parent flag (`--parent root`).
+        #[arg(long = "parent")]
+        parent_flag: Option<String>,
+        /// Promote to standalone root agent (`parent = null`).
+        #[arg(long)]
+        root: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -668,6 +750,20 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             }
         }
         Command::Agents { action } => agent::agents(&data, action),
+        Command::Parent {
+            name,
+            parent,
+            parent_flag,
+            root,
+        } => {
+            let target_parent = if root {
+                Some("root")
+            } else {
+                parent.as_deref().or(parent_flag.as_deref())
+            };
+            agent::parent_cmd(&data, &name, target_parent)
+        }
+        Command::Subscriptions { action } => subscriptions_cmd(&data, action),
         Command::Peers { state, parent } => {
             agent::peers(&data, state.as_deref(), parent.as_deref())
         }
@@ -2064,6 +2160,106 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
             for (group, members) in list {
                 println!("{group}\t{}", members.join(","));
             }
+        }
+    }
+    Ok(())
+}
+
+fn subscriptions_cmd(data: &Path, action: SubscriptionsCommand) -> Result<(), anyagents_core::Error> {
+    match action {
+        SubscriptionsCommand::Register {
+            recipient,
+            source,
+            subject,
+            org_id,
+            event_types,
+            secret,
+            after_seq,
+        } => {
+            let body = serde_json::json!({
+                "recipient": recipient,
+                "source": source,
+                "subject": subject,
+                "org_id": org_id,
+                "event_types": event_types,
+                "secret": secret,
+                "after_seq": after_seq,
+            });
+            let out: serde_json::Value = client::call(
+                data,
+                "POST",
+                "/v1/result-subscriptions",
+                Some(body.to_string().into_bytes()),
+                &client::authority(data),
+            )
+            .map_err(anyagents_core::Error::Message)?
+            .unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+            );
+        }
+        SubscriptionsCommand::List { recipient } => {
+            let path = match recipient.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(r) => format!("/v1/result-subscriptions?recipient={r}"),
+                None => "/v1/result-subscriptions".to_string(),
+            };
+            let out: serde_json::Value =
+                client::call(data, "GET", &path, None, &client::authority(data))
+                    .map_err(anyagents_core::Error::Message)?
+                    .unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+            );
+        }
+        SubscriptionsCommand::Delete { id } => {
+            let out: serde_json::Value = client::call(
+                data,
+                "DELETE",
+                &format!("/v1/result-subscriptions/{}", id.trim()),
+                None,
+                &client::authority(data),
+            )
+            .map_err(anyagents_core::Error::Message)?
+            .unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+            );
+        }
+        SubscriptionsCommand::Deliveries {
+            recipient,
+            subscription_id,
+            limit,
+        } => {
+            let mut params = Vec::new();
+            if let Some(r) = recipient.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                params.push(format!("recipient={r}"));
+            }
+            if let Some(s) = subscription_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                params.push(format!("subscription_id={s}"));
+            }
+            if let Some(l) = limit {
+                params.push(format!("limit={l}"));
+            }
+            let path = if params.is_empty() {
+                "/v1/result-deliveries".to_string()
+            } else {
+                format!("/v1/result-deliveries?{}", params.join("&"))
+            };
+            let out: serde_json::Value =
+                client::call(data, "GET", &path, None, &client::authority(data))
+                    .map_err(anyagents_core::Error::Message)?
+                    .unwrap_or_default();
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string())
+            );
         }
     }
     Ok(())

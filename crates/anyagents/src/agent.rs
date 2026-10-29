@@ -103,7 +103,60 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 profile.as_deref(),
             )?;
         }
+        AgentsCommand::Parent {
+            name,
+            parent,
+            parent_flag,
+            root,
+        } => {
+            let target_parent = if root {
+                Some("root")
+            } else {
+                parent.as_deref().or(parent_flag.as_deref())
+            };
+            parent_cmd(data, &name, target_parent)?;
+        }
     }
+    Ok(())
+}
+
+pub fn parent_cmd(data: &Path, agent: &str, parent: Option<&str>) -> Result<(), Error> {
+    let clean_agent = agent.trim().strip_prefix("agent:").unwrap_or(agent.trim());
+    let parent_val = parent
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("root");
+    let body = serde_json::json!({
+        "parent": parent_val,
+    });
+    if client::can_call_server(data) {
+        match client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/agents/{clean_agent}/parent"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        ) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+                );
+                return Ok(());
+            }
+            Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
+            Err(err) => return Err(Error::Message(err)),
+        }
+    }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "administrative authority required (agent session cannot bypass server boundary)"
+                .into(),
+        ));
+    }
+    let store = open(data)?;
+    let out = crate::create::set_agent_parent(&store, data, "operator", clean_agent, Some(parent_val))?;
+    println!("{out}");
     Ok(())
 }
 
