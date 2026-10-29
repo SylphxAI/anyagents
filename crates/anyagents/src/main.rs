@@ -1330,6 +1330,7 @@ fn browser_cmd(
         key,
         keys: None,
         hold_ms,
+        duration_ms: None,
         repeat: repeat.then_some(true),
         script,
         path,

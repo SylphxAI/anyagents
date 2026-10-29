@@ -167,13 +167,11 @@ pub struct BrowserRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keys: Option<Vec<String>>,
     /// Duration in milliseconds to hold `key` / `keys` down across rendered frames before releasing (`keyUp`), e.g. `hold_ms: 500` for continuous game movement.
-    #[serde(
-        default,
-        alias = "duration_ms",
-        alias = "hold",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, alias = "hold", skip_serializing_if = "Option::is_none")]
     pub hold_ms: Option<u64>,
+    /// Alias of `hold_ms`: duration in milliseconds to hold `key` / `keys` down across rendered frames before releasing (`keyUp`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// Whether to emit auto-repeat `keyDown` events (`autoRepeat: true`) while holding a key for `hold_ms`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat: Option<bool>,
@@ -2640,10 +2638,11 @@ pub fn execute(
             // Release any prior unclosed held keys on this profile before starting a new press/hold.
             let _ = release_recorded_held_keys(data, &profile, &mut cdp);
 
+            let requested_hold = req.hold_ms.or(req.duration_ms);
             let hold_ms = if action == "hold" {
-                req.hold_ms.or(req.wait_ms).unwrap_or(500)
+                requested_hold.or(req.wait_ms).unwrap_or(500)
             } else {
-                req.hold_ms.unwrap_or(0)
+                requested_hold.unwrap_or(0)
             }
             .min(30_000);
             let repeat = req.repeat.unwrap_or(false);
