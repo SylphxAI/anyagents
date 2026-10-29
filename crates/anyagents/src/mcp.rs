@@ -286,13 +286,39 @@ struct ConversationArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct AgentsArgs {
-    /// Optional state filter: `"running"`, `"archived"`, or `"all"` (default `"all"`).
+    /// Action to perform: `"list"` (default: list agents), `"create"` (admin-only: create a
+    /// standalone root agent with no parent), or `"harness"` (admin-only: declaratively update
+    /// an agent's harness/model/profile).
+    #[serde(default)]
+    action: Option<String>,
+    /// Optional state filter for `list`: `"running"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     state: Option<String>,
-    /// Optional parent filter: agent name, `agt_...` ID, `"self"` (children of this agent),
+    /// Optional parent filter for `list`: agent name, `agt_...` ID, `"self"` (children of this agent),
     /// or `"root"` (persistent root agents with no parent).
     #[serde(default)]
     parent: Option<String>,
+    /// Agent name when `action` is `"create"` or `"harness"`.
+    #[serde(default, alias = "agent", alias = "id", alias = "target")]
+    name: Option<String>,
+    /// Harness catalog ID when `action` is `"create"` or `"harness"` (`codex`, `claude-code`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+    #[serde(default)]
+    harness: Option<String>,
+    /// Optional model override when `action` is `"create"` or `"harness"`.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional upstream provider account profile when `action` is `"create"` or `"harness"`.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Optional working directory path when `action = "create"`.
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Optional system/role description or standing instructions when `action = "create"`.
+    #[serde(default, alias = "description", alias = "role")]
+    instructions: Option<String>,
+    /// Optional initial message to deliver when `action = "create"`.
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -561,60 +587,141 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "List agents (persistent and sub-agents, running or archived) with their permanent `agt_...` ID, name, parent, harness, state, and lag. Supports optional `state` (`running` | `archived` | `all`) and `parent` (`self` | `root` | `<name/id>`) filters."
+        description = "List or provision agents (`action`: `list` | `create` | `harness`). Use `list` (default) to list agents with optional `state` (`running` | `archived` | `all`) and `parent` (`self` | `root` | `<name/id>`) filters. Admin agents can use `action = \"create\"` (`name`, `harness`, optional `model`, `profile`, `workdir`, `instructions`, `prompt`) to provision a standalone root agent (`parent = null`), or `action = \"harness\"` to declaratively switch an agent's harness/model/profile."
     )]
     async fn agents(
         &self,
         Parameters(args): Parameters<AgentsArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<AgentsResponse>, String> {
-        let mut response: AgentsResponse = self.client.get("/v1/agents", None).await?;
-        if let Some(state_filter) = args
-            .state
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
-        {
-            response
-                .agents
-                .retain(|a| a.state.eq_ignore_ascii_case(state_filter));
-        }
-        if let Some(parent_filter) = args
-            .parent
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let action = args
+            .action
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            let cleaned = parent_filter
-                .strip_prefix("agent:")
-                .unwrap_or(parent_filter);
-            if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none") {
-                response.agents.retain(|a| a.parent.is_none());
-            } else {
-                let wanted_id = if cleaned.eq_ignore_ascii_case("self")
-                    || cleaned.eq_ignore_ascii_case(&self.agent.name)
-                    || cleaned == self.agent.id.as_str()
+            .unwrap_or("list")
+            .to_ascii_lowercase();
+        match action.as_str() {
+            "list" | "ls" => {
+                let mut response: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                if let Some(state_filter) = args
+                    .state
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
                 {
-                    Some(self.agent.id.to_string())
-                } else {
                     response
                         .agents
-                        .iter()
-                        .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
-                        .map(|a| a.id.clone())
-                        .or_else(|| Some(cleaned.to_string()))
-                };
-                if let Some(wid) = wanted_id {
-                    response
-                        .agents
-                        .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                        .retain(|a| a.state.eq_ignore_ascii_case(state_filter));
                 }
+                if let Some(parent_filter) = args
+                    .parent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let cleaned = parent_filter
+                        .strip_prefix("agent:")
+                        .unwrap_or(parent_filter);
+                    if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none")
+                    {
+                        response.agents.retain(|a| a.parent.is_none());
+                    } else {
+                        let wanted_id = if cleaned.eq_ignore_ascii_case("self")
+                            || cleaned.eq_ignore_ascii_case(&self.agent.name)
+                            || cleaned == self.agent.id.as_str()
+                        {
+                            Some(self.agent.id.to_string())
+                        } else {
+                            response
+                                .agents
+                                .iter()
+                                .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
+                                .map(|a| a.id.clone())
+                                .or_else(|| Some(cleaned.to_string()))
+                        };
+                        if let Some(wid) = wanted_id {
+                            response
+                                .agents
+                                .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                        }
+                    }
+                }
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(response).map_err(|e| e.to_string())?,
+                ))
             }
+            "create" => {
+                let name = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents create` requires `name`".to_string())?
+                    .to_string();
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("codex")
+                    .to_string();
+                let body = CreateAgentRequest {
+                    name,
+                    harness,
+                    model: args.model,
+                    profile: args.profile,
+                    workdir: args.workdir,
+                    instructions: args.instructions,
+                    parent: Some("root".to_string()),
+                    prompt: args.prompt,
+                };
+                let created: AgentView = self
+                    .client
+                    .get(
+                        "/v1/agents",
+                        Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(created).map_err(|e| e.to_string())?,
+                ))
+            }
+            "harness" | "set_harness" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents harness` requires `name`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents harness` requires `harness`".to_string())?;
+                let body = serde_json::json!({
+                    "harness": harness,
+                    "model": args.model,
+                    "profile": args.profile,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/harness"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
+            other => Err(format!(
+                "unknown agents action `{other}`; expected `list`, `create`, or `harness`"
+            )),
         }
-        Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. The sub-agent automatically scales to zero (`state = archived`) once its turn finishes and its mailbox is drained, and automatically wakes/resumes whenever a new message is sent to its ID/name."
+        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. The sub-agent stays `running` across turns until its task is finished and either it calls `archive({})` or its parent calls `subagents({ \"action\": \"archive\", \"agent\": \"<name>\" })`."
     )]
     async fn spawn(
         &self,

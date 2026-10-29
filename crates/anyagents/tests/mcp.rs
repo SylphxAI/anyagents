@@ -10,7 +10,9 @@ use rmcp::{ServiceExt, serde_json};
 use serde::Deserialize;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    cmd.env("ANYAGENTS_TESTS", "1");
+    cmd
 }
 
 /// A `PATH` where creating an agent installs nothing: `npm` answers a version

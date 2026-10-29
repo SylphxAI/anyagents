@@ -604,8 +604,7 @@ fn is_agy_turn_settled_on_disk(config_dir: &Path, opened_at_ms: i64, now_ms: i64
 }
 
 /// Enrich `AgentView` rows from the authoritative SQLite `turn_recovery` table
-/// (`has_open_turn`), and auto-archive any `running` sub-agent whose turn has
-/// settled (`complete_idle_subagent`).
+/// (`has_open_turn`).
 pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
     let Ok(store) = open(data) else {
         return;
@@ -647,16 +646,6 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 view.turn_state = "working".to_string();
             } else if view.turn_state.is_empty() {
                 view.turn_state = "idle".to_string();
-            }
-            if view.parent.is_some()
-                && view.turn_state == "idle"
-                && !open_turn
-                && view.oldest_undelivered_age_ms.is_none()
-                && store.complete_idle_subagent(&id).unwrap_or(false)
-            {
-                let _ = set_state(data, &view.name, "archived");
-                view.state = "archived".to_string();
-                view.process = "down".to_string();
             }
         } else if view.turn_state.is_empty() {
             view.turn_state = "idle".to_string();

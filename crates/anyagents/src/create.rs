@@ -162,7 +162,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
-            "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`)\n"
+            "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `archive({{}})` to retire yourself.\n"
         ));
     } else {
         doc.push_str("- **Role**: Root Agent\n");

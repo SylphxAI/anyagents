@@ -607,7 +607,6 @@ fn run_agent<H: Harness + 'static>(
         written: 0,
         turns_recorded: 0,
         pending_recovery: false,
-        completed_turn_in_session: false,
         quota_started_at: None,
     };
     session.run()
@@ -666,9 +665,6 @@ struct Session<H: Harness> {
     /// so an open turn interrupted by the previous process's exit is resumed
     /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
     pending_recovery: bool,
-    /// Set once at least one turn has completed during this session, enabling
-    /// automatic scale-to-zero (`archived`) for sub-agents when idle.
-    completed_turn_in_session: bool,
     /// Clock timestamp (`now_ms`) when the current quota wait began, so an
     /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
     /// can clear the quota hold before `reset_at`.
@@ -680,6 +676,15 @@ impl<H: Harness + 'static> Session<H> {
         loop {
             if self.stop.load(Ordering::SeqCst) {
                 self.delivery = None;
+                if self.agent.parent_id.is_some()
+                    && self
+                        .inner
+                        .store
+                        .agent(&self.id)
+                        .is_ok_and(|a| a.state == "archived")
+                {
+                    reap_ephemeral_dirs(&self.paths.config_dir, &self.paths.managed_work);
+                }
                 self.publish();
                 return false;
             }
@@ -943,9 +948,6 @@ impl<H: Harness + 'static> Session<H> {
                 if self.pending_recovery && self.recover_once() {
                     return false;
                 }
-                if self.try_auto_archive_subagent() {
-                    return false;
-                }
                 self.inner.clock.wait(
                     Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
                     &self.woken,
@@ -991,7 +993,6 @@ impl<H: Harness + 'static> Session<H> {
             {
                 self.turns_recorded = turns_served;
                 let _ = delivery.store().note_turn_completed(&self.id);
-                self.completed_turn_in_session = true;
             }
             return;
         }
@@ -1014,39 +1015,8 @@ impl<H: Harness + 'static> Session<H> {
             if delivery.harness().health().turn_state == TurnState::Idle {
                 self.turns_recorded = turns_served;
                 let _ = delivery.store().note_turn_completed(&self.id);
-                self.completed_turn_in_session = true;
             }
         }
-    }
-
-    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "archived"`)
-    /// once it has finished its turn and its mailbox is drained. Sending any future
-    /// message to the sub-agent automatically wakes and resumes it.
-    fn try_auto_archive_subagent(&mut self) -> bool {
-        if self.agent.parent_id.is_none() || !self.completed_turn_in_session {
-            return false;
-        }
-        let archived = {
-            let Some(delivery) = self.delivery.as_ref() else {
-                return false;
-            };
-            if delivery.harness().health().turn_state != TurnState::Idle {
-                return false;
-            }
-            delivery
-                .store()
-                .complete_idle_subagent(&self.id)
-                .unwrap_or(false)
-        };
-        if !archived {
-            return false;
-        }
-        self.stop.store(true, Ordering::SeqCst);
-        self.delivery = None;
-        self.restart_at = None;
-        reap_ephemeral_dirs(&self.paths.config_dir, &self.paths.managed_work);
-        self.publish();
-        true
     }
 
     /// Deliver one synthetic `[Recovery]` wake when a newly started harness

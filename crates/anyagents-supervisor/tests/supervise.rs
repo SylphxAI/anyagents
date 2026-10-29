@@ -759,15 +759,17 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
         .unwrap();
     let due = 1_700_000_000_000;
     let mut stepped = 0;
-    while other.agent(&sub.id).unwrap().state != "archived" {
-        assert!(
-            stepped < 40,
-            "sub-agent did not auto-archive after turn completion"
-        );
+    while !log_contains(&log, "subagent-task-1") {
+        assert!(stepped < 40, "sub-agent did not process task 1");
         stepped += 1;
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Completing a single turn must NOT auto-archive the sub-agent.
+    assert_eq!(other.agent(&sub.id).unwrap().state, "running");
+
+    // Explicit archive stops the process and sets state = archived.
+    other.set_agent_state(&sub.id, "archived").unwrap();
     assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
     assert!(wait_until(|| {
         supervisor
@@ -775,28 +777,17 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
             .is_some_and(|live| !live.process_alive && live.pid.is_none())
     }));
 
-    // Sending a follow-up message wakes the sub-agent back up automatically,
-    // runs the second turn, and scales it back to zero when done.
+    // Sending a follow-up message wakes the archived sub-agent back up automatically.
     other
         .receive(&sub.id, Incoming::new("subagent-task-2"))
         .unwrap();
     let mut stepped2 = 0;
-    while !log_contains(&log, "subagent-task-2")
-        || other.agent(&sub.id).unwrap().state != "archived"
-    {
-        assert!(
-            stepped2 < 40,
-            "sub-agent did not wake, process task 2, and re-archive"
-        );
+    while !log_contains(&log, "subagent-task-2") {
+        assert!(stepped2 < 40, "sub-agent did not wake and process task 2");
         stepped2 += 1;
         clock.set_ms(due + 100_000 + i64::from(stepped2) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
-    assert!(wait_until(|| {
-        supervisor
-            .live(&sub.id)
-            .is_some_and(|live| !live.process_alive && live.pid.is_none())
-    }));
+    assert_eq!(other.agent(&sub.id).unwrap().state, "running");
     drop(supervisor);
 }

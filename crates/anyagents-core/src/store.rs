@@ -1264,93 +1264,6 @@ impl Store {
         Ok(changed)
     }
 
-    /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
-    /// `archived` when it has delivered every message in its mailbox and
-    /// completed its latest turn (`completed_seq >= opened_seq >= max_seq > 0`).
-    ///
-    /// Returns `Ok(true)` when the sub-agent transitioned to `archived` (and
-    /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
-    /// mail arrived or a turn is still open.
-    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
-        let (transitioned, silent_completion) = {
-            let mut conn = self.conn();
-            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let silent_info: Option<(AgentId, String, i64)> = tx
-                .query_row(
-                    "SELECT a.parent_id, a.name, tr.completed_seq
-                     FROM agents a
-                     JOIN turn_recovery tr ON tr.agent_id = a.id
-                     WHERE a.id = ?1
-                       AND a.parent_id IS NOT NULL
-                       AND a.state = 'running'
-                       AND NOT EXISTS (
-                           SELECT 1 FROM outbound_messages om
-                           WHERE om.agent_id = ?1
-                             AND om.sent_at_ms >= tr.opened_at_ms
-                       )",
-                    [id.as_str()],
-                    |r| {
-                        let pid: String = r.get(0)?;
-                        let parsed = AgentId::parse(&pid).map_err(|err| {
-                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
-                        })?;
-                        let name: String = r.get(1)?;
-                        let cseq: i64 = r.get(2)?;
-                        Ok((parsed, name, cseq))
-                    },
-                )
-                .optional()?;
-            let updated = tx.execute(
-                "UPDATE agents
-                 SET state = 'archived'
-                 WHERE id = ?1
-                   AND parent_id IS NOT NULL
-                   AND state = 'running'
-                   AND EXISTS (
-                       SELECT 1 FROM turn_recovery tr
-                       WHERE tr.agent_id = ?1
-                         AND tr.completed_seq >= tr.opened_seq
-                         AND tr.completed_seq > 0
-                         AND tr.completed_seq >= COALESCE((
-                             SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-                         ), 0)
-                   )
-                   AND COALESCE((
-                       SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
-                   ), 0) >= COALESCE((
-                       SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
-                   ), 0)",
-                [id.as_str()],
-            )?;
-            tx.commit()?;
-            (updated > 0, if updated > 0 { silent_info } else { None })
-        };
-        if transitioned {
-            self.notify(Wake::Agent {
-                agent_id: id.clone(),
-            });
-            if let Some((parent_id, sub_name, completed_seq)) = silent_completion {
-                let notice = format!(
-                    "[Sub-Agent Completed] Sub-agent `agent:{sub_name}` (`{id}`) finished its turn and scaled to zero (`state = archived`) without sending a direct reply. Call `subagents({{ \"action\": \"inspect\", \"agent\": \"{sub_name}\" }})` to read its output or `subagents({{ \"action\": \"steer\", \"agent\": \"{sub_name}\", \"prompt\": \"...\" }})` to continue."
-                );
-                let _ = self.receive(
-                    &parent_id,
-                    Incoming {
-                        text: notice,
-                        sender: Some(format!("agent:{sub_name}")),
-                        source_time_ms: Some(now_ms()),
-                        source_key: Some(format!("subagent_completed:{id}:{completed_seq}")),
-                        reply_to: Some(format!("agent:{sub_name}")),
-                        quote: None,
-                        origin: None,
-                        received_at_ms: None,
-                    },
-                );
-            }
-        }
-        Ok(transitioned)
-    }
-
     /// Permanently delete an agent and its associated records from the store.
     pub fn delete_agent(&self, id: &AgentId) -> Result<Agent, Error> {
         let deleted = {
@@ -3813,7 +3726,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_idle_subagent_scales_finished_subagent_to_zero_and_wakes_on_new_mail() {
+    fn subagent_stays_running_after_turn_and_archives_only_when_explicitly_archived() {
         let (_dir, store) = setup();
         let root = agent(&store, "root");
         let mut child_new = NewAgent::new("root-worker", "opencode");
@@ -3821,38 +3734,20 @@ mod tests {
         let child = store.create_agent(child_new).unwrap();
         store.set_agent_running(&child.id, "/work").unwrap();
 
-        // Before any message/turn, does not auto-archive.
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
+        // Send initial task message (seq = 1), deliver it, and complete turn 1.
+        store.receive(&child.id, Incoming::new("task 1")).unwrap();
+        store.note_delivered(&child.id, 1).unwrap();
+        store.note_turn_completed(&child.id).unwrap();
+
+        // Completing a single turn must NOT auto-archive the sub-agent.
         assert_eq!(store.agent(&child.id).unwrap().state, "running");
 
-        // Send initial task message (seq = 1).
-        store.receive(&child.id, Incoming::new("task 1")).unwrap();
-        // While undelivered, does not auto-archive.
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        // Deliver seq = 1 (turn is open: opened_seq = 1, completed_seq = 0).
-        store.note_delivered(&child.id, 1).unwrap();
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        // Complete turn 1 (completed_seq = 1 == max_seq).
-        store.note_turn_completed(&child.id).unwrap();
-        // Root agent is never archived by complete_idle_subagent.
-        assert!(!store.complete_idle_subagent(&root.id).unwrap());
-        // Sub-agent automatically transitions to archived!
-        assert!(store.complete_idle_subagent(&child.id).unwrap());
+        // Explicit archive transitions the sub-agent to archived.
+        store.set_agent_state(&child.id, "archived").unwrap();
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
 
-        // Sending a follow-up message (seq = 2) wakes the sub-agent back to running,
-        // and it stays running until seq = 2 is delivered and its turn completes.
+        // Sending a follow-up message wakes an archived sub-agent back to running.
         store.receive(&child.id, Incoming::new("task 2")).unwrap();
         assert_eq!(store.agent(&child.id).unwrap().state, "running");
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        store.note_delivered(&child.id, 2).unwrap();
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        store.note_turn_completed(&child.id).unwrap();
-        assert!(store.complete_idle_subagent(&child.id).unwrap());
-        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
     }
 }
