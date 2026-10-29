@@ -1173,7 +1173,6 @@ fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
     for ptr in [
         "/id_token_email",
         "/tokens/account_id",
-        "/claudeAiOauth/refreshToken",
         "/token/refresh_token",
     ] {
         if let Some(s) = val
@@ -1317,20 +1316,26 @@ pub(crate) fn sync_and_list_provider_profiles(
         let profile_dir = profiles_root.join(&provider).join(&prof_name);
         match provider.as_str() {
             "anthropic" => {
-                for rel in [".credentials.json", ".claude/.credentials.json"] {
-                    let src = cfg.join(rel);
+                let rels = [".credentials.json", ".claude/.credentials.json"];
+                for src_rel in rels {
+                    let src = cfg.join(src_rel);
                     if src.is_file() {
                         ensure_provider_profile_meta(&profile_dir, "anthropic", None);
-                        let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
+                        for dst_rel in rels {
+                            let _ = copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel));
+                        }
                     }
                 }
             }
             "openai" => {
-                for rel in ["auth.json", ".codex/auth.json"] {
-                    let src = cfg.join(rel);
+                let rels = ["auth.json", ".codex/auth.json"];
+                for src_rel in rels {
+                    let src = cfg.join(src_rel);
                     if src.is_file() {
                         ensure_provider_profile_meta(&profile_dir, "openai", None);
-                        let _ = copy_seat_file_if_newer(&src, &profile_dir.join(rel));
+                        for dst_rel in rels {
+                            let _ = copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel));
+                        }
                     }
                 }
             }
@@ -1578,10 +1583,14 @@ pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileE
                 _ => &[],
             };
             let mut updated_any = false;
-            for rel in rels {
-                let src = cfg.join(rel);
-                if src.is_file() && copy_seat_file_if_newer(&src, &profile_dir.join(rel)) {
-                    updated_any = true;
+            for src_rel in rels {
+                let src = cfg.join(src_rel);
+                if src.is_file() {
+                    for dst_rel in rels {
+                        if copy_seat_file_if_newer(&src, &profile_dir.join(dst_rel)) {
+                            updated_any = true;
+                        }
+                    }
                 }
             }
             if updated_any {
@@ -1771,14 +1780,21 @@ fn sync_anthropic_profile_metadata(
     token: &str,
     cred: &mut serde_json::Value,
 ) -> Option<&'static str> {
+    let existing_sub = cred
+        .pointer("/claudeAiOauth/subscriptionType")
+        .and_then(serde_json::Value::as_str);
+    let existing_tier = cred
+        .pointer("/claudeAiOauth/rateLimitTier")
+        .and_then(serde_json::Value::as_str);
     let mut changed = false;
-    if let Ok(resp) = http
-        .get("https://api.anthropic.com/api/oauth/profile")
-        .header("authorization", &format!("Bearer {token}"))
-        .header("anthropic-beta", "oauth-2025-04-20")
-        .header("cache-control", "no-cache")
-        .header("user-agent", "claude-code/2.1.310")
-        .call()
+    if (existing_sub.is_none() || existing_tier.is_none())
+        && let Ok(resp) = http
+            .get("https://api.anthropic.com/api/oauth/profile")
+            .header("authorization", &format!("Bearer {token}"))
+            .header("anthropic-beta", "oauth-2025-04-20")
+            .header("cache-control", "no-cache")
+            .header("user-agent", "claude-code/2.1.310")
+            .call()
         && let Ok(body) = resp.into_body().read_to_string()
         && let Ok(pval) = serde_json::from_str::<serde_json::Value>(&body)
     {
