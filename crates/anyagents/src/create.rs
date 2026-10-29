@@ -194,13 +194,12 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - The `anyagents` CLI binary is primarily for the human operator on the terminal.\n\
          - **Unified Cross-Harness Sub-Agents (`subagents` / `spawn` MCP Tools — Native Harness Sub-Agents Disabled by Default)**:\n\
            - Built-in harness sub-agent tools (`Task`/`Agent`/`task`/`invoke_subagent`) are **disabled by default** so sub-agents are never trapped inside a single vendor CLI.\n\
-           - Always spawn and manage sub-agents via **AnyAgents `subagents` / `spawn` MCP tools**. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default from `subagent-defaults.json` (`codex` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
+           - Always spawn and manage sub-agents via **AnyAgents `subagents` / `spawn` MCP tools**. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`opencode` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
            - Full lifecycle actions on `subagents`:\n\
-             - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"root\"` | `\"all\"`).\n\
+             - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"all\"`).\n\
              - **Inspect**: `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })`.\n\
              - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"workdir\": \"/scratch/wt/...\", \"description\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`).\n\
              - **Steer**: `subagents({ \"action\": \"steer\", \"agent\": \"<name-or-id>\", \"prompt\": \"...\" })`.\n\
-             - **Parent / Promote (`parent`)**: `subagents({ \"action\": \"parent\", \"agent\": \"<name-or-id>\", \"parent\": \"root\" })`.\n\
              - **Control (`wake`, `pause`, `archive`, `delete`)**: `subagents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"agent\": \"<name-or-id>\" })`.\n\
          - **Native SOTA Anti-Detect Browser & Persistent Browser Profiles (`browser` MCP Tool)**:\n\
            - Every harness has native browser automation via the `browser` MCP tool, running real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile anti-detect fingerprinting (WebGL vendor/renderer, Client Hints `Sec-CH-UA`, `navigator.webdriver = false`, WebRTC UDP leak protection, Canvas seed), hardware-trusted CDP input (`event.isTrusted === true`), and persistent `--user-data-dir` login profiles.\n\
@@ -1013,7 +1012,14 @@ pub(crate) fn reconcile_agent_runtime_config(
         .parent_id
         .as_ref()
         .and_then(|pid| store.agent(pid).ok())
-        .map(|p| p.name);
+        .map(|p| p.name)
+        .or_else(|| {
+            agent
+                .launch_env
+                .iter()
+                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+                .map(|(_, v)| v.clone())
+        });
     let seat_hint = resolve_root_seat_hint(store, agent);
     ensure_seat_environment(config);
     seed_harness_credentials(store, data, agent, config);
@@ -1335,98 +1341,6 @@ pub(crate) fn set_agent_harness(
         return Err(Error::Message("harness is empty".into()));
     }
     configure_agent_runtime(store, data, actor, name, Some(harness), model, profile)
-}
-
-/// Declaratively convert an existing agent's parent hierarchy in place (`parent: None`
-/// or `"root"` promotes a child identity to a standalone root agent) while preserving
-/// its original ID, name, harness, model, profile, workdir, role instructions,
-/// capabilities, message history, cursors, turn recovery, and state.
-pub(crate) fn set_agent_parent(
-    store: &Store,
-    data: &Path,
-    actor: &str,
-    name: &str,
-    parent: Option<&str>,
-) -> Result<serde_json::Value, Error> {
-    let existing = store.agent_by_name(name)?;
-    let previous_parent_id = existing.parent_id.clone();
-    let previous_parent_name = previous_parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok())
-        .map(|p| p.name);
-
-    let target_parent = match parent.map(str::trim) {
-        None => None,
-        Some(raw)
-            if raw.is_empty()
-                || raw.eq_ignore_ascii_case("root")
-                || raw.eq_ignore_ascii_case("none")
-                || raw.eq_ignore_ascii_case("null") =>
-        {
-            None
-        }
-        Some(raw) => {
-            let clean = raw.strip_prefix("agent:").unwrap_or(raw).trim();
-            if clean.is_empty()
-                || clean.eq_ignore_ascii_case("root")
-                || clean.eq_ignore_ascii_case("none")
-                || clean.eq_ignore_ascii_case("null")
-            {
-                None
-            } else {
-                Some(store.agent_by_name(clean)?)
-            }
-        }
-    };
-
-    let target_parent_id = target_parent.as_ref().map(|p| p.id.clone());
-    let changed = previous_parent_id != target_parent_id;
-    store.record_admin_audit(actor, "agents.parent", &existing.name)?;
-
-    let updated = store.set_agent_parent(&existing.id, target_parent_id.as_ref())?;
-    let config = agent_config_dir(data, &updated.id);
-    if config.is_dir() {
-        let work_dir = updated
-            .workdir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| agent_work_dir(data, &updated.id));
-        let _ = reconcile_agent_runtime_config(store, data, &updated, &config, &work_dir);
-    }
-
-    let open_turn = store.has_open_turn(&updated.id).unwrap_or(false);
-    let lock_busy = matches!(store.try_lock_agent(&updated.id), Err(Error::AgentBusy));
-    let in_progress_turn = updated.state == "running" && (open_turn || lock_busy);
-    let process = if lock_busy { "alive" } else { "down" };
-    let turn_state = if in_progress_turn { "working" } else { "idle" };
-    let bound_prof = bound_profile_name(&config).unwrap_or_else(|| {
-        format!(
-            "{}/default",
-            upstream_provider_of(&updated.harness, updated.model.as_deref())
-        )
-    });
-
-    Ok(serde_json::json!({
-        "id": updated.id.as_str(),
-        "name": updated.name,
-        "agent": updated.name,
-        "previous_parent_id": previous_parent_id.as_ref().map(|id| id.as_str()),
-        "previous_parent": previous_parent_name,
-        "parent_id": updated.parent_id.as_ref().map(|id| id.as_str()),
-        "parent": target_parent.as_ref().map(|p| p.name.as_str()),
-        "is_root": updated.parent_id.is_none(),
-        "changed": changed,
-        "state": updated.state,
-        "process": process,
-        "turn_state": turn_state,
-        "in_progress_turn": in_progress_turn,
-        "is_admin": updated.is_admin,
-        "harness": updated.harness,
-        "model": updated.model,
-        "profile": bound_prof,
-        "workdir": updated.workdir,
-        "instructions_preserved": updated.instructions == existing.instructions,
-    }))
 }
 
 /// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.

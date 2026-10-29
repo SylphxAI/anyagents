@@ -679,10 +679,6 @@ impl AgentMcp {
                 let mut resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
                 if parent_arg.eq_ignore_ascii_case("all") {
                     resp.agents.retain(|a| a.parent.is_some());
-                } else if parent_arg.eq_ignore_ascii_case("root")
-                    || parent_arg.eq_ignore_ascii_case("none")
-                {
-                    resp.agents.retain(|a| a.parent.is_none());
                 } else {
                     let cleaned = parent_arg.strip_prefix("agent:").unwrap_or(parent_arg);
                     let wanted_id = if cleaned.eq_ignore_ascii_case("self")
@@ -878,32 +874,6 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
-            "parent" | "promote" | "set_parent" => {
-                let target = args
-                    .agent
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| "`subagents parent` requires `agent`".to_string())?;
-                let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let parent_val = args
-                    .parent
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("root");
-                let body = serde_json::json!({
-                    "parent": parent_val,
-                });
-                let updated: serde_json::Value = self
-                    .client
-                    .get(
-                        &format!("/v1/agents/{clean}/parent"),
-                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
-                    )
-                    .await?;
-                Ok(rmcp::handler::server::wrapper::Json(updated))
-            }
             "delete" | "kill" | "remove" => {
                 let target = args
                     .agent
@@ -919,7 +889,7 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(deleted))
             }
             other => Err(format!(
-                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, `harness`, `parent`, or `delete`"
+                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, `harness`, or `delete`"
             )),
         }
     }
