@@ -478,18 +478,61 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
 
 pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
     #[cfg(unix)]
-    if let Some(host_home) = crate::sandbox::host_home_dir() {
-        let op_token_src = host_home.join(".config/op-seat/service-account-token");
-        let op_token_dst = target_config.join(".config/op/service-account-token");
-        if !op_token_src.exists() || op_token_dst.exists() {
-            return;
-        }
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
         let mut parts = seat_launch.split('\t');
         let (Some(launcher), Some(uid), Some(gid), Some(groups)) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
             return;
         };
+        let Ok(target_uid) = uid.parse::<u32>() else {
+            return;
+        };
+        let Ok(target_gid) = gid.parse::<u32>() else {
+            return;
+        };
+        let dot_config = target_config.join(".config");
+        let _ = std::fs::create_dir_all(&dot_config);
+        let _ = std::fs::set_permissions(&dot_config, std::fs::Permissions::from_mode(0o2770));
+        let op_dir = dot_config.join("op");
+        if let Ok(meta) = std::fs::symlink_metadata(&op_dir)
+            && meta.uid() != target_uid
+        {
+            let me = crate::sandbox::server_uid();
+            if meta.uid() == me {
+                let _ = std::fs::remove_dir_all(&op_dir);
+            } else {
+                let old_uid = meta.uid().to_string();
+                let old_gid = meta.gid().to_string();
+                let _ = std::process::Command::new(launcher)
+                    .args([
+                        "--reuid",
+                        &old_uid,
+                        "--regid",
+                        &old_gid,
+                        "--groups",
+                        &old_gid,
+                        "--no-new-privs",
+                        "--",
+                        "rm",
+                        "-rf",
+                    ])
+                    .arg(&op_dir)
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::fs::remove_dir_all(&op_dir);
+            }
+        }
+        let op_token_src = crate::sandbox::host_home_dir()
+            .map(|h| h.join(".config/op-seat/service-account-token"))
+            .filter(|p| p.exists())
+            .unwrap_or_default();
+        let connect_token_src = crate::sandbox::host_home_dir()
+            .map(|h| h.join(".config/op/connect-token"))
+            .filter(|p| p.exists())
+            .unwrap_or_default();
+        let _ = target_gid;
         let _ = std::process::Command::new(launcher)
             .args([
                 "--reuid",
@@ -502,11 +545,12 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
                 "--",
                 "sh",
                 "-c",
-                "cd \"$1\" && mkdir -p .config/op && chmod 0700 .config/op && ln -sfn \"$2\" .config/op/service-account-token",
+                "cd \"$1\" && mkdir -p .config/op && chmod 0700 .config/op && if [ -n \"$2\" ]; then ln -sfn \"$2\" .config/op/service-account-token; fi && if [ -n \"$3\" ]; then ln -sfn \"$3\" .config/op/connect-token; fi",
                 "sh",
             ])
             .arg(target_config)
-            .arg(&op_token_src)
+            .arg(op_token_src.as_os_str())
+            .arg(connect_token_src.as_os_str())
             .stderr(std::process::Stdio::null())
             .status();
     }

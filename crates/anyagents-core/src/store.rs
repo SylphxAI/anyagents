@@ -1264,6 +1264,99 @@ impl Store {
         Ok(changed)
     }
 
+    /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
+    /// `archived` when it has delivered every message in its mailbox, completed
+    /// its latest turn (`completed_seq >= opened_seq >= max_seq > 0`), and has
+    /// no active (`running`) child sub-agents of its own.
+    ///
+    /// Returns `Ok(true)` when the sub-agent transitioned to `archived` (and
+    /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
+    /// mail arrived, a turn is still open, or a child sub-agent is still running.
+    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+        let (transitioned, silent_completion) = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let silent_info: Option<(AgentId, String, i64)> = tx
+                .query_row(
+                    "SELECT a.parent_id, a.name, tr.completed_seq
+                     FROM agents a
+                     JOIN turn_recovery tr ON tr.agent_id = a.id
+                     WHERE a.id = ?1
+                       AND a.parent_id IS NOT NULL
+                       AND a.state = 'running'
+                       AND NOT EXISTS (
+                           SELECT 1 FROM outbound_messages om
+                           WHERE om.agent_id = ?1
+                             AND om.sent_at_ms >= tr.opened_at_ms
+                       )",
+                    [id.as_str()],
+                    |r| {
+                        let pid: String = r.get(0)?;
+                        let parsed = AgentId::parse(&pid).map_err(|err| {
+                            rusqlite::Error::ToSqlConversionFailure(Box::new(err))
+                        })?;
+                        let name: String = r.get(1)?;
+                        let cseq: i64 = r.get(2)?;
+                        Ok((parsed, name, cseq))
+                    },
+                )
+                .optional()?;
+            let updated = tx.execute(
+                "UPDATE agents
+                 SET state = 'archived'
+                 WHERE id = ?1
+                   AND parent_id IS NOT NULL
+                   AND state = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agents child
+                       WHERE child.parent_id = ?1
+                         AND child.state = 'running'
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM turn_recovery tr
+                       WHERE tr.agent_id = ?1
+                         AND tr.completed_seq >= tr.opened_seq
+                         AND tr.completed_seq > 0
+                         AND tr.completed_seq >= COALESCE((
+                             SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+                         ), 0)
+                   )
+                   AND COALESCE((
+                       SELECT mc.delivered_seq FROM mailbox_cursors mc WHERE mc.agent_id = ?1
+                   ), 0) >= COALESCE((
+                       SELECT MAX(m.seq) FROM messages m WHERE m.agent_id = ?1
+                   ), 0)",
+                [id.as_str()],
+            )?;
+            tx.commit()?;
+            (updated > 0, if updated > 0 { silent_info } else { None })
+        };
+        if transitioned {
+            self.notify(Wake::Agent {
+                agent_id: id.clone(),
+            });
+            if let Some((parent_id, sub_name, completed_seq)) = silent_completion {
+                let notice = format!(
+                    "[Sub-Agent Completed] Sub-agent `agent:{sub_name}` (`{id}`) finished its turn and scaled to zero (`state = archived`) without sending a direct reply. Call `subagents({{ \"action\": \"inspect\", \"agent\": \"{sub_name}\" }})` to read its output or `subagents({{ \"action\": \"steer\", \"agent\": \"{sub_name}\", \"prompt\": \"...\" }})` to continue."
+                );
+                let _ = self.receive(
+                    &parent_id,
+                    Incoming {
+                        text: notice,
+                        sender: Some(format!("agent:{sub_name}")),
+                        source_time_ms: Some(now_ms()),
+                        source_key: Some(format!("subagent_completed:{id}:{completed_seq}")),
+                        reply_to: Some(format!("agent:{sub_name}")),
+                        quote: None,
+                        origin: None,
+                        received_at_ms: None,
+                    },
+                );
+            }
+        }
+        Ok(transitioned)
+    }
+
     /// Permanently delete an agent and its associated records from the store.
     pub fn delete_agent(&self, id: &AgentId) -> Result<Agent, Error> {
         let deleted = {

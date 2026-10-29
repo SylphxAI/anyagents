@@ -1191,6 +1191,45 @@ fn load_op_service_account_token() -> Option<String> {
     None
 }
 
+fn ensure_caller_op_config_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let uid = unsafe { libc::geteuid() };
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let candidate = home.join(".config/op");
+            if let Ok(meta) = std::fs::metadata(&candidate)
+                && meta.uid() == uid
+                && (meta.permissions().mode() & 0o777) == 0o700
+            {
+                return Some(candidate);
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("anyagents-op-cfg-{uid}"));
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        if dir.is_dir() {
+            return Some(dir);
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+fn configure_op_command(cmd: &mut Command) {
+    cmd.stdin(Stdio::null());
+    cmd.env("DESK_SECRET_READ", "1");
+    if let Some(cfg_dir) = ensure_caller_op_config_dir() {
+        cmd.env("OP_CONFIG_DIR", cfg_dir);
+    }
+    if let Some(token) = load_op_service_account_token() {
+        cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
+    }
+}
+
 /// Resolve a secret reference (`op://...`, `op-otp://...`, `secret://...`) in memory
 /// without ever echoing the plaintext secret in errors, logs, or responses.
 fn resolve_fill_value(
@@ -1205,45 +1244,67 @@ fn resolve_fill_value(
         .unwrap_or("");
 
     if candidate.starts_with("op://") {
+        let parts: Vec<&str> = candidate
+            .trim_start_matches("op://")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+        if parts.len() < 3 {
+            return Err(Error::Message(
+                "invalid 1Password secret reference format (expected op://<vault>/<item>/<field>)"
+                    .into(),
+            ));
+        }
         let mut cmd = Command::new("op");
         cmd.args(["read", "--no-newline", candidate]);
-        if let Some(token) = load_op_service_account_token() {
-            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
-        }
-        let out = cmd.output().map_err(|err| {
-            Error::Message(format!("failed to invoke `op` CLI for secret ref: {err}"))
+        configure_op_command(&mut cmd);
+        let out = cmd.output().map_err(|_| {
+            Error::Message("failed to invoke `op` CLI for secret reference".into())
         })?;
         if !out.status.success() {
             return Err(Error::Message(format!(
-                "1Password `op read` failed for reference `{candidate}` (exit status {})",
-                out.status
+                "1Password secret resolution failed (exit code {})",
+                out.status.code().unwrap_or(-1)
             )));
         }
         let secret = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if secret.is_empty() {
+            return Err(Error::Message(
+                "1Password secret resolution returned an empty value".into(),
+            ));
+        }
         return Ok((secret, Some(candidate.to_string())));
     }
 
     if let Some(rest) = candidate.strip_prefix("op-otp://") {
         let mut cmd = Command::new("op");
         let trimmed = rest.trim_matches('/');
+        if trimmed.is_empty() {
+            return Err(Error::Message(
+                "invalid 1Password OTP reference format (expected op-otp://<vault>/<item>)".into(),
+            ));
+        }
         if let Some((vault, item)) = trimmed.split_once('/') {
             cmd.args(["item", "get", item, "--vault", vault, "--otp"]);
         } else {
             cmd.args(["item", "get", trimmed, "--otp"]);
         }
-        if let Some(token) = load_op_service_account_token() {
-            cmd.env("OP_SERVICE_ACCOUNT_TOKEN", token);
-        }
-        let out = cmd.output().map_err(|err| {
-            Error::Message(format!("failed to invoke `op` CLI for OTP ref: {err}"))
+        configure_op_command(&mut cmd);
+        let out = cmd.output().map_err(|_| {
+            Error::Message("failed to invoke `op` CLI for OTP reference".into())
         })?;
         if !out.status.success() {
             return Err(Error::Message(format!(
-                "1Password `op item get --otp` failed for `{candidate}` (exit status {})",
-                out.status
+                "1Password OTP resolution failed (exit code {})",
+                out.status.code().unwrap_or(-1)
             )));
         }
         let otp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if otp.is_empty() {
+            return Err(Error::Message(
+                "1Password OTP resolution returned an empty value".into(),
+            ));
+        }
         return Ok((otp, Some(candidate.to_string())));
     }
 

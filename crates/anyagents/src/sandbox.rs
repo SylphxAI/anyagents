@@ -541,6 +541,9 @@ pub fn share_socket_with_seats(path: &Path) {
 
 fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    if dir.ends_with(".config/op") || dir.ends_with(".ssh") || dir.ends_with(".gnupg") {
+        return Ok(());
+    }
     let me = current_uid();
     if let Ok(meta) = std::fs::metadata(dir) {
         if meta.uid() == me {
@@ -588,6 +591,9 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if kind.is_dir() {
+            if (name == "op" && dir.ends_with(".config")) || name == ".ssh" || name == ".gnupg" {
+                continue;
+            }
             let _ = give_tree(&path, gid);
             continue;
         }
