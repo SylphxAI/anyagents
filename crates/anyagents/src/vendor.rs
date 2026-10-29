@@ -242,10 +242,18 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         "MUSE_CONFIG_HOME".to_string(),
         request.config_dir.display().to_string(),
     ));
-    let parent_name = env
-        .iter()
-        .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
-        .map(|(_, v)| v.clone());
+    let store_opt = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
+    let parent_name = request
+        .agent
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store_opt.as_ref().and_then(|s| s.agent(pid).ok()))
+        .map(|p| p.name)
+        .or_else(|| {
+            env.iter()
+                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+                .map(|(_, v)| v.clone())
+        });
     let seat_spec =
         crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, parent_name.as_deref());
     if request.agent.harness == "agy" {
@@ -253,151 +261,24 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         let _ = crate::install::record(&root, &request.agent.harness);
-        crate::create::write_agent_instructions(
-            &request.config_dir,
-            &request.agent,
-            parent_name.as_deref(),
-        );
-    }
-    if let Some((ref seat_user, ref seat_launch)) = seat_spec {
-        crate::create::ensure_seat_environment(&request.config_dir);
-        if let Ok(store) = anyagents_core::Store::open(request.data_dir.join("state.db")) {
-            crate::create::seed_harness_credentials(
-                &store,
+        if let Some(ref store) = store_opt {
+            let _ = crate::create::reconcile_agent_runtime_config(
+                store,
                 &request.data_dir,
                 &request.agent,
                 &request.config_dir,
+                &request.work_dir,
             );
-            let _ = crate::operator::ensure(&store, &request.agent.id);
-            if request.agent.harness == "opencode"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::opencode_config::write(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "codex"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::mcp_config::write_codex_with_model(
-                    &request.config_dir.join("config.toml"),
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "agy"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::mcp_config::write_claude(
-                    &request.config_dir.join(".gemini/config/mcp_config.json"),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "omp"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::grok::write_omp_mcp_config(&request.config_dir, &exe, &mcp_args);
-            } else if request.agent.harness == "dsh"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::dsh::write_dsh_mcp_patch(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "grok"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::grok::write_grok_config(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "muse"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::muse_config::write(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "claude-code"
-                && let Ok(exe) = crate::data::current_exe_clean()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::mcp_config::sanitize_claude_settings(&request.config_dir);
-                let _ = crate::mcp_config::write_claude(
-                    &request.config_dir.join("mcp.json"),
-                    &exe,
-                    &mcp_args,
-                );
-                let _ = crate::mcp_config::write_claude(
-                    &request.config_dir.join(".claude.json"),
-                    &exe,
-                    &mcp_args,
-                );
-            }
+        } else {
+            crate::create::write_agent_instructions(
+                &request.config_dir,
+                &request.agent,
+                parent_name.as_deref(),
+            );
         }
+    }
+    if let Some((ref seat_user, ref seat_launch)) = seat_spec {
+        crate::create::ensure_seat_environment(&request.config_dir);
         let cache_home = request.config_dir.join("cache-home");
         let _ = std::fs::create_dir_all(&cache_home);
         let tmp_dir = request.config_dir.join("tmp");

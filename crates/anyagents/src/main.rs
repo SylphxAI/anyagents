@@ -179,6 +179,8 @@ enum Command {
     Model {
         /// The agent name.
         agent: String,
+        /// Optional positional model ID (or pass `--model <id>`).
+        target_model: Option<String>,
         /// The provider origin, for example https://api.deepseek.com.
         #[arg(long = "base-url")]
         base_url: Option<String>,
@@ -739,20 +741,24 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Flush { agent } => agent::flush(&data, &agent),
         Command::Model {
             agent,
+            target_model,
             base_url,
             model,
             harness,
             key_file,
             profile,
-        } => model_cmd(
-            &data,
-            &agent,
-            base_url.as_deref(),
-            model.as_deref(),
-            harness.as_deref(),
-            key_file.as_deref(),
-            profile.as_deref(),
-        ),
+        } => {
+            let resolved_model = model.or(target_model);
+            model_cmd(
+                &data,
+                &agent,
+                base_url.as_deref(),
+                resolved_model.as_deref(),
+                harness.as_deref(),
+                key_file.as_deref(),
+                profile.as_deref(),
+            )
+        }
         Command::Send {
             to,
             text,
@@ -1231,28 +1237,30 @@ fn model_cmd(
     profile: Option<&str>,
 ) -> Result<(), anyagents_core::Error> {
     use anyagents_core::Error;
+    if profile.is_some() && (key_file.is_some() || base_url.is_some()) {
+        return Err(Error::Message(
+            "profile cannot be combined with a key or base URL".into(),
+        ));
+    }
     if let Some(target_harness) = harness.map(str::trim).filter(|s| !s.is_empty())
         && key_file.is_none()
         && base_url.is_none()
     {
         return agent::harness_cmd(data, agent, target_harness, model, profile);
     }
-    let model = model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| Error::Message("model is required".into()))?;
-    if profile.is_some() && (key_file.is_some() || base_url.is_some()) {
-        return Err(Error::Message(
-            "profile cannot be combined with a key or base URL".into(),
-        ));
+    let clean_model = model.map(str::trim).filter(|s| !s.is_empty());
+    let clean_profile = profile.map(str::trim).filter(|s| !s.is_empty());
+    if key_file.is_none() && base_url.is_none() && clean_model.is_none() && clean_profile.is_none()
+    {
+        return Err(Error::Message("model is required".into()));
     }
     if client::can_call_server(data) {
         let key = key_file.map(std::fs::read_to_string).transpose()?;
         let body = serde_json::json!({
-            "model": model,
+            "model": clean_model,
             "base_url": base_url,
             "key": key,
-            "profile": profile,
+            "profile": clean_profile,
         });
         match client::call::<serde_json::Value>(
             data,
@@ -1272,16 +1280,27 @@ fn model_cmd(
             Err(err) => return Err(Error::Message(err)),
         }
     }
-    if let Some(profile) = profile {
+    if key_file.is_none() && base_url.is_none() {
+        if client::agent_identity().is_some() {
+            return Err(Error::Message(
+                "administrative authority required (agent session cannot bypass server boundary)"
+                    .into(),
+            ));
+        }
         let store = agent::open(data)?;
-        let rec = store.agent_by_name(agent)?;
-        create::bind_profile(&store, &rec, profile, model)?;
-        println!(
-            "{}",
-            serde_json::json!({"agent": rec.name, "model": model, "profile": profile})
-        );
+        let out = create::configure_agent_runtime(
+            &store,
+            data,
+            "operator",
+            agent,
+            None,
+            clean_model,
+            clean_profile,
+        )?;
+        println!("{out}");
         return Ok(());
     }
+    let model = clean_model.ok_or_else(|| Error::Message("model is required".into()))?;
     store_key(
         data,
         agent,

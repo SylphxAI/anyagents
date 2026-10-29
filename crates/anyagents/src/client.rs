@@ -106,7 +106,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         .map_err(|_| "the server did not answer".to_string())?
     })?;
     let (mut status, mut bytes) = answer;
-    if status.as_u16() == 404 {
+    if !status.is_success() {
         let admin_socket = data.join("admin.sock");
         if admin_socket.exists()
             && let Ok(Ok(fallback)) = runtime.block_on(async {
@@ -123,6 +123,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
                 )
                 .await
             })
+            && (fallback.0.is_success() || status.as_u16() == 404)
         {
             (status, bytes) = fallback;
         }

@@ -66,8 +66,6 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         };
         write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"));
     }
-    seed_harness_credentials(store, &data, &agent, &config);
-    ensure_seat_environment(&config);
     let workdir_created = request.workdir.as_ref().is_some_and(|p| !p.exists());
     let cwd = match &request.workdir {
         Some(path) => {
@@ -85,72 +83,25 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             None => std::path::absolute(&managed)?,
         },
     };
-    let command = crate::data::current_exe_clean()?;
-    // The tool server is pointed at the agent's own config directory, where its
-    // capability is; a name on a command line is never an identity.
-    let args = vec![
-        "--data".to_string(),
-        data.display().to_string(),
-        "mcp".to_string(),
-        "--config".to_string(),
-        config.display().to_string(),
-    ];
-    if agent.harness == "codex" {
-        mcp_config::write_codex_with_model(
-            &config.join("config.toml"),
-            agent.model.as_deref(),
-            &command,
-            &args,
-        )?;
-    } else if agent.harness == "opencode" {
-        opencode_config::write(&config, agent.model.as_deref(), &command, &args)?;
-    } else if agent.harness == "agy" {
-        let _ = mcp_config::write_claude(
-            &config.join(".gemini/config/mcp_config.json"),
-            &command,
-            &args,
-        );
-        crate::vendor::ensure_agy_steering_settings(&config, &cwd);
-    } else if agent.harness == "muse" {
-        muse_config::write(&config, agent.model.as_deref(), &command, &args)?;
-        muse_config::point_vendor_home(&config)?;
-    } else if agent.harness == "omp" {
-        crate::grok::write_omp_mcp_config(&config, &command, &args)?;
-    } else if agent.harness == "dsh" {
-        crate::dsh::write_dsh_mcp_patch(&config, agent.model.as_deref(), &command, &args)?;
-    } else if agent.harness == "grok" {
-        crate::grok::write_grok_config(&config, agent.model.as_deref(), &command, &args)?;
-    } else {
-        let _ = mcp_config::sanitize_claude_settings(&config);
-        mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
-        let _ = mcp_config::write_claude(&config.join("mcp.json"), &command, &args);
-    }
-    write_agent_instructions(&config, &agent, parent_name.as_deref());
-    if let Some((_, _, gid, _)) =
-        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
-    {
-        crate::sandbox::share_config_with_seat(&config, gid);
-        if let Some((_, spec)) =
-            crate::sandbox::seat_launch_spec_with_hint(&agent.name, parent_name.as_deref())
-        {
-            ensure_seat_op_config(&config, &spec);
-        }
-        if workdir_created {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if let Ok(c_path) = std::ffi::CString::new(cwd.as_os_str().as_encoded_bytes()) {
-                    unsafe {
-                        let _ = libc::chown(c_path.as_ptr(), u32::MAX, gid);
-                    }
-                }
-                let _ = std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o2775));
-            }
-        }
-    }
     let _ = crate::operator::mint(store, &agent.id);
     store.set_agent_launch_env(&agent.id, &pairs)?;
     let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
+    reconcile_agent_runtime_config(store, &data, &running, &config, &cwd)?;
+    if workdir_created
+        && let Some((_, _, gid, _)) =
+            crate::sandbox::seat_for_agent_with_hint(&running.name, parent_name.as_deref())
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Ok(c_path) = std::ffi::CString::new(cwd.as_os_str().as_encoded_bytes()) {
+                unsafe {
+                    let _ = libc::chown(c_path.as_ptr(), u32::MAX, gid);
+                }
+            }
+            let _ = std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o2775));
+        }
+    }
     Ok(running)
 }
 
@@ -160,33 +111,47 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
     };
     #[cfg(unix)]
     let host_home = crate::sandbox::host_home_dir();
-    let by_id: std::collections::HashMap<String, String> = agents
-        .iter()
-        .map(|a| (a.id.to_string(), a.name.clone()))
-        .collect();
     for agent in &agents {
         let cfg = agent_config_dir(data, &agent.id);
         if !cfg.is_dir() {
             continue;
         }
-        let parent_name = agent
-            .parent_id
-            .as_ref()
-            .and_then(|pid| by_id.get(pid.as_str()).cloned());
-        write_agent_instructions(&cfg, agent, parent_name.as_deref());
+        let work_dir = agent
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| agent_work_dir(data, &agent.id));
+        let _ = reconcile_agent_runtime_config(store, data, agent, &cfg, &work_dir);
         #[cfg(unix)]
         if let Some(ref hh) = host_home {
             ensure_seat_skills(&cfg, hh);
-        }
-        if let Some((_, _, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
-        {
-            crate::sandbox::share_config_with_seat(&cfg, gid);
         }
     }
 }
 
 pub(crate) fn write_agent_instructions(config: &Path, agent: &Agent, parent_name: Option<&str>) {
+    let cached_bridge = std::fs::read_to_string(config.join(".anyagents-session-bridge.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| {
+            let h = v.get("harness").and_then(|x| x.as_str())?;
+            if h != agent.harness {
+                return None;
+            }
+            v.get("summary")
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+        });
+    write_agent_instructions_with_continuity(config, agent, parent_name, cached_bridge.as_deref());
+}
+
+pub(crate) fn write_agent_instructions_with_continuity(
+    config: &Path,
+    agent: &Agent,
+    parent_name: Option<&str>,
+    continuity: Option<&str>,
+) {
+    let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
     let mut doc = format!(
         "# AnyAgents Identity & Environment Awareness\n\n\
          ## 1. Your Identity (Who You Are)\n\n\
@@ -245,11 +210,9 @@ pub(crate) fn write_agent_instructions(config: &Path, agent: &Agent, parent_name
          - **Memory, History & Hybrid RAG Search (`conversation` / `search`)**: Incoming messages are pushed automatically to your session — never poll an inbox. Use `conversation({ \"query\": \"...\", \"agent\": \"all\", \"limit\": 20 })` or `search({ \"query\": \"...\" })` to run Hybrid RAG search (dense vector embedding `voyageai/voyage-4-large` + SQLite FTS5 BM25) across all agents' historical and live conversations since September without loading the full history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n",
     );
 
-    if let Ok(continuity) = std::fs::read_to_string(config.join(".anyagents-harness-continuity.md"))
-        && !continuity.trim().is_empty()
-    {
+    if let Some(cont) = continuity.map(str::trim).filter(|s| !s.is_empty()) {
         doc.push('\n');
-        doc.push_str(continuity.trim());
+        doc.push_str(cont);
         doc.push('\n');
     }
 
@@ -827,164 +790,338 @@ pub(crate) struct ProviderProfileEntry {
     pub usage: Option<String>,
 }
 
-/// Bind only an existing named provider profile, never a caller-supplied path.
-pub(crate) fn bind_profile(
-    store: &Store,
-    agent: &Agent,
-    profile: &str,
-    model: &str,
-) -> Result<(), Error> {
-    let provider = upstream_provider_of(&agent.harness, Some(model));
-    let (named_provider, name) = profile.split_once('/').unwrap_or((&provider, profile));
-    let valid = |s: &str| {
-        !s.is_empty()
-            && s != "."
-            && s != ".."
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
-    };
-    if named_provider != provider || !valid(name) || !valid(named_provider) {
-        return Err(Error::Message("invalid provider profile".into()));
+pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
+    match harness {
+        "codex" => Some("codex-session-id"),
+        "opencode" => Some("opencode-session-id"),
+        "claude-code" => Some("claude-session-id"),
+        "agy" => Some("agy-session-id"),
+        "muse" => Some("muse-session-id"),
+        "omp" => Some("omp-session-id"),
+        "dsh" => Some("dsh-session-id"),
+        "grok" => Some("grok-session-id"),
+        _ => None,
     }
-    let source = store.data_dir().join("profiles").join(&provider).join(name);
-    if !source.is_dir() {
-        return Err(Error::Message("provider profile not found".into()));
-    }
-    let config = agent_config_dir(store.data_dir(), &agent.id);
-    fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
-        std::fs::create_dir_all(target)?;
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            let target = target.join(entry.file_name());
-            if kind.is_dir() {
-                copy_files(&entry.path(), &target)?;
-            } else if kind.is_file() && entry.file_name() != "profile.json" {
-                if let Ok(bytes) = std::fs::read(entry.path()) {
-                    let _ = write_seat_shared_file(&target, &bytes, 0o660);
-                }
-            }
-        }
-        Ok(())
-    }
-    copy_files(&source, &config)
-        .map_err(|_| Error::Message("could not bind provider profile".into()))?;
-    let normalized = format!("{provider}/{name}\n");
-    write_profile_marker(&config, ".anyagents-profile", &normalized);
-    write_profile_marker(&config, ".anyagents-seeded-profile", &normalized);
-    write_profile_marker(
-        &config,
-        ".anyagents-profile-rotated-ms",
-        &format!("{}\n", anyagents_core::now_ms()),
-    );
-    store.set_agent_model(&agent.id, model)?;
-    if agent.harness == "opencode" {
-        let command = crate::data::current_exe_clean()?;
-        let args = vec![
-            "--data".into(),
-            store.data_dir().display().to_string(),
-            "mcp".into(),
-            "--config".into(),
-            config.display().to_string(),
-        ];
-        opencode_config::write(&config, Some(model), &command, &args)?;
-    } else if agent.harness == "codex" {
-        let command = crate::data::current_exe_clean()?;
-        let args = vec![
-            "--data".into(),
-            store.data_dir().display().to_string(),
-            "mcp".into(),
-            "--config".into(),
-            config.display().to_string(),
-        ];
-        crate::mcp_config::write_codex_with_model(
-            &config.join("config.toml"),
-            Some(model),
-            &command,
-            &args,
-        )?;
-    } else if agent.harness == "claude-code" {
-        let _ = crate::mcp_config::sanitize_claude_settings(&config);
-    }
-    Ok(())
 }
 
 pub(crate) fn build_harness_continuity_summary(
     store: &Store,
     agent: &Agent,
-    previous_harness: &str,
+    previous_harness: Option<&str>,
     target_harness: &str,
-) -> String {
+) -> Option<String> {
+    let turns = store.conversation(&agent.id, None, None, Some(10)).ok()?;
+    if turns.is_empty() {
+        return None;
+    }
+    let header_pair = match previous_harness.filter(|p| !p.is_empty() && *p != target_harness) {
+        Some(prev) => format!("`{prev}` -> `{target_harness}`"),
+        None => format!("`state.db` -> `{target_harness}`"),
+    };
     let mut out = format!(
-        "## 4. Cross-Harness Session Continuity (`{previous_harness}` -> `{target_harness}`)\n\n\
-         - This existing AnyAgents identity (`{}` / `{}`) was transitioned in place from harness `{previous_harness}` to `{target_harness}` while retaining its AnyAgents ID, role description, model (`{}`), workdir (`{}`), mailbox cursor, and external Spiron execution custody.\n\
+        "## 4. Cross-Harness Session Continuity ({header_pair})\n\n\
+         - This AnyAgents identity (`{}` / `{}`) is running on harness `{target_harness}` while retaining its AnyAgents ID, role description, model (`{}`), workdir (`{}`), mailbox cursor, and external Spiron execution custody.\n\
          - **Do NOT replay or repeat already-completed `[OUT]` turns or external side effects** listed below; your mailbox cursor (`delivered_seq`) is already advanced past all prior delivered messages.\n\
-         - **Do NOT reopen paused, archived, or restricted product work** merely because the harness changed; act only on the new incoming `<message>` envelope delivered in the current turn.\n\
-         - Your full historical two-way transcript from `{previous_harness}` remains queryable on demand via `conversation({{ \"agent\": \"self\", \"limit\": 30 }})`.\n",
+         - **Do NOT reopen paused, archived, or restricted product work** merely because the harness session started; act only on the new incoming `<message>` envelope delivered in the current turn.\n\
+         - Your full historical two-way transcript in `state.db` remains queryable on demand via `conversation({{ \"agent\": \"self\", \"limit\": 30 }})`.\n\n\
+         ### Recent Completed Two-Way Turns (`state.db`)\n\n",
         agent.name,
         agent.id.as_str(),
         agent.model.as_deref().unwrap_or("default"),
         agent.workdir.as_deref().unwrap_or("."),
     );
-    if let Ok(turns) = store.conversation(&agent.id, None, None, Some(10))
-        && !turns.is_empty()
-    {
-        out.push_str("\n### Recent Completed Two-Way Turns (`state.db`)\n\n");
-        for turn in turns {
-            let dir_tag = if turn.direction == "out" {
-                "OUT (already sent/completed)"
-            } else {
-                "IN (already delivered)"
-            };
-            let peer = if turn.direction == "out" {
-                turn.to.as_str()
-            } else {
-                turn.from.as_str()
-            };
-            let snippet: String = turn
-                .text
-                .lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .collect::<Vec<_>>()
-                .join(" ");
-            let truncated: String = if snippet.chars().count() > 360 {
-                let head: String = snippet.chars().take(360).collect();
-                format!("{head}...")
-            } else {
-                snippet
-            };
-            out.push_str(&format!(
-                "- `[{dir_tag}]` `{}` (`ts={}`, peer=`{peer}`): {}\n",
-                turn.id, turn.timestamp_ms, truncated
-            ));
-        }
+    for turn in turns {
+        let dir_tag = if turn.direction == "out" {
+            "OUT (already sent/completed)"
+        } else {
+            "IN (already delivered)"
+        };
+        let peer = if turn.direction == "out" {
+            turn.to.as_str()
+        } else {
+            turn.from.as_str()
+        };
+        let snippet: String = turn
+            .text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let truncated: String = if snippet.chars().count() > 360 {
+            let head: String = snippet.chars().take(360).collect();
+            format!("{head}...")
+        } else {
+            snippet
+        };
+        out.push_str(&format!(
+            "- `[{dir_tag}]` `{}` (`ts={}`, peer=`{peer}`): {}\n",
+            turn.id, turn.timestamp_ms, truncated
+        ));
     }
-    out
+    Some(out)
 }
 
-/// Change an existing agent's harness in place without deleting or recreating its identity,
-/// killing an in-progress turn, replaying already-delivered messages, or reopening paused scope.
-pub(crate) fn set_agent_harness(
+/// Declaratively computes cross-harness session continuity from `state.db` (`SSOT`)
+/// whenever an identity with prior history in `state.db` starts a cold session on
+/// `agent.harness` or switches back after turns on another harness, while keeping
+/// the bridge static across subsequent turns of the same active harness session
+/// so LLM prompt-prefix KV caches stay warm.
+pub(crate) fn compute_live_session_continuity(
+    store: &Store,
+    agent: &Agent,
+    config: &Path,
+) -> Option<String> {
+    let _ = std::fs::remove_file(config.join(".anyagents-harness-continuity.md"));
+    let bridge_cache_path = config.join(".anyagents-session-bridge.json");
+    let turns = store.conversation(&agent.id, None, None, Some(10)).ok()?;
+    if turns.is_empty() {
+        let _ = std::fs::remove_file(&bridge_cache_path);
+        return None;
+    }
+
+    let active_sess_file = harness_session_filename(&agent.harness).map(|f| config.join(f));
+    let active_sess_mtime = active_sess_file.as_ref().and_then(|p| {
+        let text = std::fs::read_to_string(p).ok()?;
+        if text.trim().is_empty() {
+            return None;
+        }
+        std::fs::metadata(p).ok()?.modified().ok()
+    });
+
+    let mut newest_other: Option<(&str, std::time::SystemTime)> = None;
+    for candidate in [
+        "codex",
+        "opencode",
+        "claude-code",
+        "agy",
+        "muse",
+        "omp",
+        "dsh",
+        "grok",
+    ] {
+        if candidate == agent.harness {
+            continue;
+        }
+        if let Some(fname) = harness_session_filename(candidate) {
+            let p = config.join(fname);
+            if let Ok(text) = std::fs::read_to_string(&p)
+                && !text.trim().is_empty()
+                && let Ok(meta) = std::fs::metadata(&p)
+                && let Ok(mtime) = meta.modified()
+                && newest_other.is_none_or(|(_, prev_t)| mtime > prev_t)
+            {
+                newest_other = Some((candidate, mtime));
+            }
+        }
+    }
+
+    let other_is_newer = match (active_sess_mtime, newest_other) {
+        (Some(act_t), Some((_, oth_t))) => oth_t > act_t,
+        (None, _) => true,
+        (Some(_), None) => false,
+    };
+
+    if other_is_newer {
+        if active_sess_mtime.is_some()
+            && let Some(ref p) = active_sess_file
+        {
+            let _ = std::fs::remove_file(p);
+        }
+        let prev_harness = newest_other.map(|(h, _)| h);
+        let summary = build_harness_continuity_summary(store, agent, prev_harness, &agent.harness)?;
+        let payload = serde_json::json!({
+            "harness": agent.harness,
+            "previous_harness": prev_harness,
+            "summary": summary,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+            let _ = write_seat_shared_file(&bridge_cache_path, &bytes, 0o664);
+        }
+        return Some(summary);
+    }
+
+    if let Ok(text) = std::fs::read_to_string(&bridge_cache_path)
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+        && val.get("harness").and_then(|v| v.as_str()) == Some(agent.harness.as_str())
+        && let Some(cached) = val
+            .get("summary")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+    {
+        return Some(cached.to_string());
+    }
+
+    if let Some((prev_h, _)) = newest_other {
+        let summary = build_harness_continuity_summary(store, agent, Some(prev_h), &agent.harness)?;
+        let payload = serde_json::json!({
+            "harness": agent.harness,
+            "previous_harness": prev_h,
+            "summary": summary,
+        });
+        if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+            let _ = write_seat_shared_file(&bridge_cache_path, &bytes, 0o664);
+        }
+        return Some(summary);
+    }
+
+    None
+}
+
+/// Canonical, idempotent runtime reconciliation for an agent: resolves the
+/// authoritative parent from `state.db`, seeds credentials and model catalogs,
+/// ensures the mailbox capability, computes cross-harness continuity from
+/// `state.db` when needed, writes all instruction surfaces and the active
+/// harness's MCP/model config, and shares permissions with the agent's OS seat.
+pub(crate) fn reconcile_agent_runtime_config(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    config: &Path,
+    work_dir: &Path,
+) -> Result<Option<String>, Error> {
+    std::fs::create_dir_all(config)?;
+    let parent_name = agent
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok())
+        .map(|p| p.name)
+        .or_else(|| {
+            agent
+                .launch_env
+                .iter()
+                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+                .map(|(_, v)| v.clone())
+        });
+    ensure_seat_environment(config);
+    seed_harness_credentials(store, data, agent, config);
+    if !config.join("mcp-capability").is_file()
+        && crate::operator::ensure(store, &agent.id).is_err()
+    {
+        #[cfg(unix)]
+        if let Some(op_tok) = crate::operator::operator_token(data)
+            && let Ok(mut stream) =
+                std::os::unix::net::UnixStream::connect(data.join("anyagents.sock"))
+        {
+            use std::io::{Read as _, Write as _};
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+            let req = format!(
+                "POST /v1/operator/agents/{}/capability HTTP/1.1\r\nHost: localhost\r\n{}: {op_tok}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                agent.name,
+                crate::operator::HEADER
+            );
+            let _ = stream.write_all(req.as_bytes());
+            let mut buf = String::new();
+            let _ = stream.read_to_string(&mut buf);
+        }
+    }
+
+    let continuity = compute_live_session_continuity(store, agent, config);
+    write_agent_instructions_with_continuity(
+        config,
+        agent,
+        parent_name.as_deref(),
+        continuity.as_deref(),
+    );
+
+    if let Ok(command) = crate::data::current_exe_clean() {
+        let args = vec![
+            "--data".to_string(),
+            data.display().to_string(),
+            "mcp".to_string(),
+            "--config".to_string(),
+            config.display().to_string(),
+        ];
+        match agent.harness.as_str() {
+            "codex" => {
+                let codex_toml = config.join("config.toml");
+                mcp_config::write_codex_with_model(
+                    &codex_toml,
+                    agent.model.as_deref(),
+                    &command,
+                    &args,
+                )?;
+                let _ = mcp_config::sync_codex_developer_instructions(
+                    &codex_toml,
+                    continuity.as_deref(),
+                );
+            }
+            "opencode" => {
+                opencode_config::write(config, agent.model.as_deref(), &command, &args)?;
+            }
+            "agy" => {
+                let _ = mcp_config::write_claude(
+                    &config.join(".gemini/config/mcp_config.json"),
+                    &command,
+                    &args,
+                );
+                crate::vendor::ensure_agy_steering_settings(config, work_dir);
+            }
+            "muse" => {
+                muse_config::write(config, agent.model.as_deref(), &command, &args)?;
+                let _ = muse_config::point_vendor_home(config);
+            }
+            "omp" => {
+                let _ = crate::grok::write_omp_mcp_config(config, &command, &args);
+            }
+            "dsh" => {
+                let _ = crate::dsh::write_dsh_mcp_patch(
+                    config,
+                    agent.model.as_deref(),
+                    &command,
+                    &args,
+                );
+            }
+            "grok" => {
+                let _ =
+                    crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args);
+            }
+            _ => {
+                let _ = mcp_config::sanitize_claude_settings(config);
+                let _ = mcp_config::write_claude(&config.join(".claude.json"), &command, &args);
+                let _ = mcp_config::write_claude(&config.join("mcp.json"), &command, &args);
+            }
+        }
+    }
+
+    if let Some((_, _, gid, _)) =
+        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+    {
+        crate::sandbox::share_config_with_seat(config, gid);
+        if let Some((_, spec)) =
+            crate::sandbox::seat_launch_spec_with_hint(&agent.name, parent_name.as_deref())
+        {
+            ensure_seat_op_config(config, &spec);
+        }
+    }
+    Ok(continuity)
+}
+
+/// Declaratively update an existing agent's runtime configuration (`harness`, `model`, `profile`)
+/// in `state.db` without deleting or recreating its identity, killing an in-progress turn,
+/// replaying already-delivered messages, or reopening paused scope.
+pub(crate) fn configure_agent_runtime(
     store: &Store,
     data: &Path,
     actor: &str,
     name: &str,
-    harness: &str,
+    harness: Option<&str>,
     model: Option<&str>,
     profile: Option<&str>,
 ) -> Result<serde_json::Value, Error> {
-    let target_harness = harness.trim();
-    if target_harness.is_empty() {
-        return Err(Error::Message("harness is empty".into()));
-    }
-    let _adapter = crate::install::adapter(target_harness)?;
-    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
-    {
-        crate::install::record(data, target_harness).map_err(Error::Message)?;
-    }
     let existing = store.agent_by_name(name)?;
     let previous_harness = existing.harness.clone();
+    let target_harness = match harness.map(str::trim) {
+        Some("") => return Err(Error::Message("harness is empty".into())),
+        Some(h) => h.to_string(),
+        None => existing.harness.clone(),
+    };
+    let _adapter = crate::install::adapter(&target_harness)?;
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    {
+        crate::install::record(data, &target_harness).map_err(Error::Message)?;
+    }
     let resolved_model = model
         .map(str::trim)
         .filter(|s| !s.is_empty())
@@ -999,22 +1136,27 @@ pub(crate) fn set_agent_harness(
                 (p.trim().to_string(), n.trim().to_string())
             } else {
                 (
-                    upstream_provider_of(target_harness, resolved_model.as_deref()),
+                    upstream_provider_of(&target_harness, resolved_model.as_deref()),
                     explicit_prof.to_string(),
                 )
             }
         } else if let Some(ref bound) = current_bound {
             if let Some((p, n)) = bound.split_once('/') {
-                (p.trim().to_string(), n.trim().to_string())
+                let target_prov = upstream_provider_of(&target_harness, resolved_model.as_deref());
+                if model.is_some() && p.trim() != target_prov {
+                    (target_prov, "default".to_string())
+                } else {
+                    (p.trim().to_string(), n.trim().to_string())
+                }
             } else {
                 (
-                    upstream_provider_of(target_harness, resolved_model.as_deref()),
+                    upstream_provider_of(&target_harness, resolved_model.as_deref()),
                     bound.trim().to_string(),
                 )
             }
         } else {
             (
-                upstream_provider_of(target_harness, resolved_model.as_deref()),
+                upstream_provider_of(&target_harness, resolved_model.as_deref()),
                 "default".to_string(),
             )
         };
@@ -1052,7 +1194,7 @@ pub(crate) fn set_agent_harness(
     } else {
         default_compat
     };
-    if !compatible_harnesses.iter().any(|h| h == target_harness) {
+    if !compatible_harnesses.iter().any(|h| h == &target_harness) {
         return Err(Error::Message(format!(
             "harness `{target_harness}` is not compatible with provider profile `{provider}/{profile_name}` (compatible harnesses: {})",
             compatible_harnesses.join(", ")
@@ -1068,8 +1210,15 @@ pub(crate) fn set_agent_harness(
     let lock_busy = matches!(store.try_lock_agent(&existing.id), Err(Error::AgentBusy));
     let in_progress_turn = existing.state == "running" && (open_turn || lock_busy);
 
-    store.record_admin_audit(actor, "agents.harness", &existing.name)?;
-    store.set_agent_harness(&existing.id, target_harness)?;
+    let audit_action = if harness.is_some() {
+        "agents.harness"
+    } else {
+        "agents.model"
+    };
+    store.record_admin_audit(actor, audit_action, &existing.name)?;
+    if existing.harness != target_harness {
+        store.set_agent_harness(&existing.id, &target_harness)?;
+    }
     if let Some(ref m) = resolved_model
         && existing.model.as_deref() != Some(m.as_str())
     {
@@ -1079,102 +1228,43 @@ pub(crate) fn set_agent_harness(
 
     std::fs::create_dir_all(&config)?;
     let normalized_profile = format!("{provider}/{profile_name}");
+    if profile.is_some() && profile_dir.is_dir() {
+        fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
+            std::fs::create_dir_all(target)?;
+            for entry in std::fs::read_dir(source)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                let target = target.join(entry.file_name());
+                if kind.is_dir() {
+                    copy_files(&entry.path(), &target)?;
+                } else if kind.is_file()
+                    && entry.file_name() != "profile.json"
+                    && let Ok(bytes) = std::fs::read(entry.path())
+                {
+                    let _ = write_seat_shared_file(&target, &bytes, 0o660);
+                }
+            }
+            Ok(())
+        }
+        let _ = copy_files(&profile_dir, &config);
+        write_profile_marker(
+            &config,
+            ".anyagents-profile-rotated-ms",
+            &format!("{}\n", anyagents_core::now_ms()),
+        );
+    }
     write_profile_marker(
         &config,
         ".anyagents-profile",
         &format!("{normalized_profile}\n"),
     );
-    write_profile_marker(
-        &config,
-        ".anyagents-configured-harness",
-        &format!("{target_harness}\n"),
-    );
 
-    let continuity_summary = if previous_harness != target_harness {
-        let summary =
-            build_harness_continuity_summary(store, &updated, &previous_harness, target_harness);
-        let _ = write_seat_shared_file(
-            &config.join(".anyagents-harness-continuity.md"),
-            summary.as_bytes(),
-            0o664,
-        );
-        Some(summary)
-    } else {
-        std::fs::read_to_string(config.join(".anyagents-harness-continuity.md")).ok()
-    };
-
-    let parent_name = updated
-        .parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok())
-        .map(|p| p.name);
-    ensure_seat_environment(&config);
-    seed_harness_credentials(store, data, &updated, &config);
-    write_agent_instructions(&config, &updated, parent_name.as_deref());
-    if !config.join("mcp-capability").is_file()
-        && crate::operator::ensure(store, &updated.id).is_err()
-    {
-        #[cfg(unix)]
-        if let Some(op_tok) = crate::operator::operator_token(data)
-            && let Ok(mut stream) =
-                std::os::unix::net::UnixStream::connect(data.join("anyagents.sock"))
-        {
-            use std::io::{Read as _, Write as _};
-            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-            let req = format!(
-                "POST /v1/operator/agents/{}/capability HTTP/1.1\r\nHost: localhost\r\n{}: {op_tok}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
-                updated.name,
-                crate::operator::HEADER
-            );
-            let _ = stream.write_all(req.as_bytes());
-            let mut buf = String::new();
-            let _ = stream.read_to_string(&mut buf);
-        }
-    }
-
-    let command = crate::data::current_exe_clean()?;
-    let args = vec![
-        "--data".into(),
-        data.display().to_string(),
-        "mcp".into(),
-        "--config".into(),
-        config.display().to_string(),
-    ];
-    match target_harness {
-        "codex" => {
-            let codex_toml = config.join("config.toml");
-            let _ = std::fs::remove_file(&codex_toml);
-            crate::mcp_config::write_codex_with_model(
-                &codex_toml,
-                updated.model.as_deref(),
-                &command,
-                &args,
-            )?;
-            if let Some(ref cont) = continuity_summary
-                && !cont.trim().is_empty()
-            {
-                let _ = crate::mcp_config::set_codex_developer_instructions(&codex_toml, cont);
-            }
-        }
-        "opencode" => {
-            opencode_config::write(&config, updated.model.as_deref(), &command, &args)?;
-        }
-        "claude-code" => {
-            crate::mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
-            let _ = crate::mcp_config::sanitize_claude_settings(&config);
-        }
-        "muse" => {
-            crate::muse_config::write(&config, updated.model.as_deref(), &command, &args)?;
-        }
-        _ => {}
-    }
-
-    if let Some((_, _, gid, _)) =
-        crate::sandbox::seat_for_agent_with_hint(&updated.name, parent_name.as_deref())
-    {
-        crate::sandbox::share_config_with_seat(&config, gid);
-    }
+    let work_dir = updated
+        .workdir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| agent_work_dir(data, &updated.id));
+    reconcile_agent_runtime_config(store, data, &updated, &config, &work_dir)?;
 
     let process = if lock_busy { "alive" } else { "down" };
     let turn_state = if in_progress_turn { "working" } else { "idle" };
@@ -1189,6 +1279,7 @@ pub(crate) fn set_agent_harness(
     Ok(serde_json::json!({
         "id": updated.id.as_str(),
         "name": updated.name,
+        "agent": updated.name,
         "parent": updated.parent_id.as_ref().map(|p| p.as_str()),
         "previous_harness": previous_harness,
         "harness": updated.harness,
@@ -1202,6 +1293,21 @@ pub(crate) fn set_agent_harness(
         "cutover_status": cutover_status,
         "description_preserved": updated.instructions.is_some(),
     }))
+}
+
+pub(crate) fn set_agent_harness(
+    store: &Store,
+    data: &Path,
+    actor: &str,
+    name: &str,
+    harness: &str,
+    model: Option<&str>,
+    profile: Option<&str>,
+) -> Result<serde_json::Value, Error> {
+    if harness.trim().is_empty() {
+        return Err(Error::Message("harness is empty".into()));
+    }
+    configure_agent_runtime(store, data, actor, name, Some(harness), model, profile)
 }
 
 /// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.
@@ -4005,5 +4111,50 @@ mod tests {
         assert!(toml_text.contains("model_provider = \"sylphx\""));
         assert!(toml_text.contains("developer_instructions = "));
         assert!(toml_text.contains("Completed initial AnyMD audit"));
+        assert!(!cfg.join(".anyagents-harness-continuity.md").exists());
+
+        // Simulate an older opencode session vs a newer codex session + new state.db turn,
+        // then switch back to opencode and verify declarative round-trip continuity.
+        std::fs::write(cfg.join("opencode-session-id"), "ses_old_opencode\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(cfg.join("codex-session-id"), "thread_new_codex\n").unwrap();
+        let _ = store.record_outbound(
+            &owner.id,
+            "agent:prism",
+            None,
+            "Completed second turn on Codex",
+        );
+        let roundtrip = configure_agent_runtime(
+            &store,
+            data,
+            "operator",
+            "owner-anymd",
+            Some("opencode"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(roundtrip["harness"], "opencode");
+        assert!(!cfg.join("opencode-session-id").exists());
+        let agents_md = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+        assert!(agents_md.contains("Completed second turn on Codex"));
+
+        // Verify model-only update preserves bound profile without requiring --profile.
+        let model_only = configure_agent_runtime(
+            &store,
+            data,
+            "operator",
+            "owner-anymd",
+            Some("codex"),
+            Some("sylphx/openai/gpt-5.4-mini#medium"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(model_only["harness"], "codex");
+        assert_eq!(model_only["model"], "sylphx/openai/gpt-5.4-mini#medium");
+        assert_eq!(model_only["profile"], "sylphx/default");
+        let toml_after = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(toml_after.contains("model = \"gpt-5.4-mini\""));
+        assert!(toml_after.contains("model_reasoning_effort = \"medium\""));
     }
 }

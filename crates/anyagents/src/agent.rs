@@ -264,18 +264,13 @@ pub fn describe_cmd(
     } else if let Some(ref text) = new_desc {
         rec = store.set_agent_instructions(&rec.id, Some(text))?;
     }
-    let parent_name = rec
-        .parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok())
-        .map(|p| p.name);
     let cfg = anyagents_core::agent_config_dir(data, &rec.id);
-    crate::create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
-    if let Some((_, _, gid, _)) =
-        crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
-    {
-        crate::sandbox::share_config_with_seat(&cfg, gid);
-    }
+    let work_dir = rec
+        .workdir
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &rec.id));
+    let _ = crate::create::reconcile_agent_runtime_config(&store, data, &rec, &cfg, &work_dir);
     if new_desc.is_some() || clear {
         println!(
             "updated\t{}\t{}",

@@ -240,7 +240,10 @@ pub fn write_codex_with_model(
     Ok(())
 }
 
-pub fn set_codex_developer_instructions(path: &Path, instructions: &str) -> Result<(), Error> {
+pub fn sync_codex_developer_instructions(
+    path: &Path,
+    instructions: Option<&str>,
+) -> Result<(), Error> {
     let existing = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(err)
@@ -253,12 +256,40 @@ pub fn set_codex_developer_instructions(path: &Path, instructions: &str) -> Resu
         }
         Err(err) => return Err(err.into()),
     };
-    let updated = upsert_top_key(
-        &existing,
-        "developer_instructions",
-        &format!("\"{}\"", toml_escape(instructions)),
-    );
+    let updated = match instructions.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => upsert_top_key(
+            &existing,
+            "developer_instructions",
+            &format!("\"{}\"", toml_escape(text)),
+        ),
+        None => remove_top_key(&existing, "developer_instructions"),
+    };
+    if updated == existing && path.is_file() {
+        return Ok(());
+    }
     atomic_write_shared(path, updated.as_bytes())
+}
+
+fn remove_top_key(text: &str, key: &str) -> String {
+    let prefix = format!("{key} =");
+    let tight = format!("{key}=");
+    let mut lines: Vec<String> = Vec::new();
+    let mut in_section = false;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_section = true;
+        }
+        if !in_section && (trimmed.starts_with(&prefix) || trimmed.starts_with(&tight)) {
+            continue;
+        }
+        lines.push(line.to_string());
+    }
+    let mut out = lines.join("\n");
+    if !out.ends_with('\n') && !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 fn upsert_top_key(text: &str, key: &str, value_literal: &str) -> String {

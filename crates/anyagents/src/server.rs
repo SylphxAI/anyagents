@@ -755,25 +755,45 @@ async fn model_route(
         .store
         .agent_by_name(&name)
         .map_err(ApiError::from_store)?;
-    if let Some(ref harness) = body
-        .harness
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        && body.key.is_none()
-        && body.base_url.is_none()
-    {
-        let out = create::set_agent_harness(
-            &state.store,
-            state.store.data_dir(),
-            &actor,
-            &agent.name,
-            harness,
-            body.model.as_deref(),
-            body.profile.as_deref(),
-        )
-        .map_err(ApiError::from_store)?;
-        return Ok(Json(out));
+    if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "profile cannot be combined with a key or base URL",
+        ));
+    }
+    if body.key.is_none() && body.base_url.is_none() {
+        let has_harness = body
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_model = body
+            .model
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_profile = body
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !has_harness && !has_model && !has_profile {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+        }
+        return spawn_store(move || {
+            let out = create::configure_agent_runtime(
+                &state.store,
+                state.store.data_dir(),
+                &actor,
+                &agent.name,
+                body.harness.as_deref(),
+                body.model.as_deref(),
+                body.profile.as_deref(),
+            )
+            .map_err(ApiError::from_store)?;
+            Ok(Json(out))
+        })
+        .await;
     }
     let model_str = body
         .model
@@ -781,30 +801,19 @@ async fn model_route(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
-    if let Some(profile) = body.profile {
-        if body.key.is_some() || body.base_url.is_some() {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "profile cannot be combined with a key or base URL",
-            ));
-        }
-        create::bind_profile(&state.store, &agent, &profile, model_str)
-            .map_err(ApiError::from_store)?;
-    } else {
-        let key = body.key.as_deref().unwrap_or("").trim();
-        if key.is_empty() || key.contains(char::is_whitespace) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a nonempty single-line key is required",
-            ));
-        }
-        let base_url = body
-            .base_url
-            .as_deref()
-            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
-        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
-            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
+    let key = body.key.as_deref().unwrap_or("").trim();
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a nonempty single-line key is required",
+        ));
     }
+    let base_url = body
+        .base_url
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
+    crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
     Ok(Json(
         serde_json::json!({"agent": agent.name, "model": model_str}),
     ))
@@ -1006,18 +1015,19 @@ async fn set_description_route(
                 )
                 .map_err(ApiError::from_store)?;
         }
-        let parent_name = rec
-            .parent_id
-            .as_ref()
-            .and_then(|pid| state.store.agent(pid).ok())
-            .map(|p| p.name);
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
-        if let Some((_, _, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
-        {
-            crate::sandbox::share_config_with_seat(&cfg, gid);
-        }
+        let work_dir = rec
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &rec.id));
+        let _ = create::reconcile_agent_runtime_config(
+            &state.store,
+            state.store.data_dir(),
+            &rec,
+            &cfg,
+            &work_dir,
+        );
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
