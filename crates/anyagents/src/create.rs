@@ -497,7 +497,7 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
         let _ = std::fs::set_permissions(&dot_config, std::fs::Permissions::from_mode(0o2770));
         let op_dir = dot_config.join("op");
         if let Ok(meta) = std::fs::symlink_metadata(&op_dir)
-            && meta.uid() != target_uid
+            && (meta.uid() != target_uid || meta.gid() != target_gid)
         {
             let me = crate::sandbox::server_uid();
             if meta.uid() == me {
@@ -532,7 +532,6 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
             .map(|h| h.join(".config/op/connect-token"))
             .filter(|p| p.exists())
             .unwrap_or_default();
-        let _ = target_gid;
         let _ = std::process::Command::new(launcher)
             .args([
                 "--reuid",
@@ -545,7 +544,7 @@ pub(crate) fn ensure_seat_op_config(target_config: &Path, seat_launch: &str) {
                 "--",
                 "sh",
                 "-c",
-                "cd \"$1\" && mkdir -p .config/op && chmod 0700 .config/op && if [ -n \"$2\" ]; then ln -sfn \"$2\" .config/op/service-account-token; fi && if [ -n \"$3\" ]; then ln -sfn \"$3\" .config/op/connect-token; fi",
+                "cd \"$1\" && mkdir -p .config/op && chmod 00700 .config/op && if [ -n \"$2\" ]; then ln -sfn \"$2\" .config/op/service-account-token; fi && if [ -n \"$3\" ]; then ln -sfn \"$3\" .config/op/connect-token; fi",
                 "sh",
             ])
             .arg(target_config)
@@ -1039,6 +1038,31 @@ pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<Str
     })
 }
 
+/// Resolve an agent's authoritative `(seat_user, uid, gid, seat_launch_spec)`
+/// using the exact same root-parent hint and `seat_launch_spec_with_hint`
+/// lookup that `vendor_launch` and `ensure_seat_op_config` use.
+pub(crate) fn resolved_agent_seat_info(
+    store: &Store,
+    agent: &Agent,
+) -> Option<(String, u32, u32, Option<String>)> {
+    let seat_hint = resolve_root_seat_hint(store, agent);
+    if let Some((user, spec)) =
+        crate::sandbox::seat_launch_spec_with_hint(&agent.name, seat_hint.as_deref())
+    {
+        let mut parts = spec.split('\t');
+        let (_launcher, Some(uid_s), Some(gid_s)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return None;
+        };
+        if let (Ok(uid), Ok(gid)) = (uid_s.parse::<u32>(), gid_s.parse::<u32>()) {
+            return Some((user, uid, gid, Some(spec)));
+        }
+    }
+    let (user, uid, gid, _) =
+        crate::sandbox::seat_for_agent_with_hint(&agent.name, seat_hint.as_deref())?;
+    Some((user, uid, gid, None))
+}
+
 /// Canonical, idempotent runtime reconciliation for an agent: resolves the
 /// authoritative parent from `state.db`, seeds credentials and model catalogs,
 /// ensures the mailbox capability, computes cross-harness continuity from
@@ -1064,7 +1088,6 @@ pub(crate) fn reconcile_agent_runtime_config(
                 .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
                 .map(|(_, v)| v.clone())
         });
-    let seat_hint = resolve_root_seat_hint(store, agent);
     ensure_seat_environment(config);
     seed_harness_credentials(store, data, agent, config);
     if !config.join("mcp-capability").is_file()
@@ -1157,13 +1180,9 @@ pub(crate) fn reconcile_agent_runtime_config(
         }
     }
 
-    if let Some((_, _, gid, _)) =
-        crate::sandbox::seat_for_agent_with_hint(&agent.name, seat_hint.as_deref())
-    {
+    if let Some((_, _uid, gid, spec_opt)) = resolved_agent_seat_info(store, agent) {
         crate::sandbox::share_config_with_seat(config, gid);
-        if let Some((_, spec)) =
-            crate::sandbox::seat_launch_spec_with_hint(&agent.name, seat_hint.as_deref())
-        {
+        if let Some(spec) = spec_opt {
             ensure_seat_op_config(config, &spec);
         }
     }

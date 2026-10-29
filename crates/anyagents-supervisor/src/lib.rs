@@ -1019,19 +1019,24 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "archived"`)
-    /// once it has finished its turn, its mailbox is drained, and it has no active
-    /// child sub-agents. Its config directory and session are preserved so sending
-    /// any future message to the sub-agent automatically wakes and resumes it.
+    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "idle"`)
+    /// once it has finished its turn, its mailbox is drained, it has no active
+    /// child sub-agents, and its harness process has no in-flight background commands.
+    /// Its config directory and session are preserved so sending any future message
+    /// to the sub-agent automatically wakes and resumes it.
     fn try_auto_archive_subagent(&mut self) -> bool {
         if self.agent.parent_id.is_none() || !self.completed_turn_in_session {
             return false;
         }
-        let archived = {
+        let scaled = {
             let Some(delivery) = self.delivery.as_ref() else {
                 return false;
             };
-            if delivery.harness().health().turn_state != TurnState::Idle {
+            let health = delivery.harness().health();
+            if health.turn_state != TurnState::Idle {
+                return false;
+            }
+            if harness_has_inflight_processes(delivery.harness().process_id()) {
                 return false;
             }
             delivery
@@ -1039,7 +1044,7 @@ impl<H: Harness + 'static> Session<H> {
                 .complete_idle_subagent(&self.id)
                 .unwrap_or(false)
         };
-        if !archived {
+        if !scaled {
             return false;
         }
         self.stop.store(true, Ordering::SeqCst);
@@ -1112,6 +1117,78 @@ impl<H: Harness + 'static> Session<H> {
             Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
             &self.woken,
         );
+    }
+}
+
+/// Return `true` when `root_pid` has any non-zombie descendant process in `/proc`
+/// other than an idle persistent sidecar (`anyagents ... mcp`, `codex-code-mode-host`,
+/// or `language_server_linux`) that itself has no child processes.
+fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
+    let Some(root_pid) = root_pid.filter(|&p| p > 0) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let mut ppid = 0u32;
+            let mut state_ch = ' ';
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("PPid:") {
+                    ppid = rest.trim().parse::<u32>().unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("State:") {
+                    state_ch = rest.trim().chars().next().unwrap_or(' ');
+                }
+            }
+            if ppid > 0 && !matches!(state_ch, 'Z' | 'X') {
+                children_of.entry(ppid).or_default().push(pid);
+            }
+        }
+        let Some(direct_children) = children_of.get(&root_pid) else {
+            return false;
+        };
+        for &cpid in direct_children {
+            let cmdline = fs::read(format!("/proc/{cpid}/cmdline"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| if b == 0 { b' ' } else { b })
+                .collect::<Vec<u8>>();
+            let cmd = String::from_utf8_lossy(&cmdline);
+            let cmd_trimmed = cmd.trim();
+            let is_persistent_sidecar = cmd_trimmed.contains(" mcp ")
+                || cmd_trimmed.ends_with(" mcp")
+                || cmd_trimmed.contains("codex-code-mode-host")
+                || cmd_trimmed.contains("language_server_linux");
+            if is_persistent_sidecar {
+                if children_of
+                    .get(&cpid)
+                    .is_some_and(|grandkids| !grandkids.is_empty())
+                {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root_pid;
+        false
     }
 }
 

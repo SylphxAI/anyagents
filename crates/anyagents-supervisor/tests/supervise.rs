@@ -765,19 +765,15 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    // Completing a single turn must NOT auto-archive the sub-agent.
-    assert_eq!(other.agent(&sub.id).unwrap().state, "running");
-
-    // Explicit archive stops the process and sets state = archived.
-    other.set_agent_state(&sub.id, "archived").unwrap();
-    assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
+    // Completing the turn automatically scales the sub-agent to `idle` and releases its process.
     assert!(wait_until(|| {
-        supervisor
-            .live(&sub.id)
-            .is_some_and(|live| !live.process_alive && live.pid.is_none())
+        other.agent(&sub.id).unwrap().state == "idle"
+            && supervisor
+                .live(&sub.id)
+                .is_some_and(|live| !live.process_alive && live.pid.is_none())
     }));
 
-    // Sending a follow-up message wakes the archived sub-agent back up automatically.
+    // Sending a follow-up message wakes the `idle` sub-agent back up automatically.
     other
         .receive(&sub.id, Incoming::new("subagent-task-2"))
         .unwrap();
@@ -788,6 +784,8 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
         clock.set_ms(due + 100_000 + i64::from(stepped2) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(other.agent(&sub.id).unwrap().state, "running");
+    assert!(wait_until(|| {
+        other.agent(&sub.id).unwrap().state == "idle"
+    }));
     drop(supervisor);
 }

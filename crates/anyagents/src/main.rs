@@ -1813,6 +1813,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             {
                 for a in rows {
                     let (mode, steer) = anyagents_supervisor::declared(&a.harness);
+                    let seat_info = create::resolved_agent_seat_info(&store, &a);
                     fallback.push(api::AgentView {
                         id: a.id.to_string(),
                         name: a.name,
@@ -1829,6 +1830,9 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         oldest_undelivered_age_ms: None,
                         install: "recorded".to_string(),
                         description: a.instructions,
+                        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+                        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+                        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
                     });
                 }
             }

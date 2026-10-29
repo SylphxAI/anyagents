@@ -1373,6 +1373,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     {
         quota = None;
     }
+    let seat_info = create::resolved_agent_seat_info(store, agent);
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name.clone(),
@@ -1389,6 +1390,9 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: install_state(store, agent),
         description: agent.instructions.clone(),
+        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
     })
 }
 

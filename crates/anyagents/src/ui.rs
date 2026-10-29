@@ -210,6 +210,7 @@ pub fn format_agent_status(
             yellow("○ starting")
         }
         ("running", other, _) => cyan(&format!("● {other}")),
+        ("idle", _, _) => dim("◌ idle"),
         ("paused", _, _) => yellow("◐ paused"),
         ("archived", _, _) => dim("▫ archived"),
         (other, _, _) => dim(other),
@@ -325,6 +326,7 @@ fn state_rank(state: &str, process: &str, turn_state: &str) -> u8 {
         ("running", "alive", "working") => 0,
         ("running", "alive", _) => 1,
         ("running", _, _) => 2,
+        ("idle", _, _) => 2,
         ("paused", _, _) => 3,
         ("archived", _, _) => 4,
         _ => 5,
@@ -363,6 +365,7 @@ pub fn print_agents_table(
         })
         .count();
     let idle = running.saturating_sub(working).saturating_sub(quota_count);
+    let scaled_idle = agents.iter().filter(|a| a.state == "idle").count();
     let paused = agents.iter().filter(|a| a.state == "paused").count();
     let archived = agents.iter().filter(|a| a.state == "archived").count();
 
@@ -393,6 +396,9 @@ pub fn print_agents_table(
             )
         };
         summary.push(detail);
+    }
+    if scaled_idle > 0 {
+        summary.push(dim(&format!("{scaled_idle} idle (process released)")));
     }
     if paused > 0 {
         summary.push(yellow(&format!("{paused} paused")));

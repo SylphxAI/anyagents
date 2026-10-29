@@ -180,6 +180,9 @@ pub fn describe_cmd(
     };
     if client::can_call_server(data) {
         if target_name.eq_ignore_ascii_case("all") && new_desc.is_none() && !clear {
+            if let Ok(store) = Store::open(data.join("state.db")) {
+                crate::create::sync_all_agent_instructions(&store, data);
+            }
             let listed = client::call::<AgentsResponse>(
                 data,
                 "GET",
@@ -436,6 +439,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
     let (mode, steer) = declared(&agent.harness);
+    let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
@@ -452,6 +456,9 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
         description: agent.instructions,
+        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
     })
 }
 
@@ -525,6 +532,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         .lag(&agent.id, anyagents_core::now_ms())
         .map_err(|err| err.to_string())?;
     let (mode, steer) = declared(&agent.harness);
+    let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
@@ -541,6 +549,9 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
         description: agent.instructions,
+        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
     })
 }
 
@@ -614,6 +625,14 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         let Ok(id) = AgentId::parse(&view.id) else {
             continue;
         };
+        if (view.seat_user.is_none() || view.seat_uid.is_none() || view.seat_gid.is_none())
+            && let Ok(agent_rec) = store.agent(&id)
+            && let Some((u, uid, gid, _)) = crate::create::resolved_agent_seat_info(&store, &agent_rec)
+        {
+            view.seat_user = Some(u);
+            view.seat_uid = Some(uid);
+            view.seat_gid = Some(gid);
+        }
         let cfg = anyagents_core::agent_config_dir(data, &id);
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
             view.quota_reset_at_ms =
@@ -760,6 +779,7 @@ fn list_filtered(
         }
         let lag = store.lag(&agent.id, now)?;
         let (mode, steer) = declared(&agent.harness);
+        let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
         if crate::ui::is_pretty() {
             fallback_views.push(AgentView {
                 id: agent.id.to_string(),
@@ -777,6 +797,9 @@ fn list_filtered(
                 oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
                 install: "-".to_string(),
                 description: agent.instructions,
+                seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+                seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+                seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
             });
             continue;
         }

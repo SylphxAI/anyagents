@@ -28,6 +28,15 @@ pub struct AgentView {
     /// Standing role description / current responsibilities (`instructions` column in SQLite).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-rhea`, `seat-worker`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_user: Option<String>,
+    /// Assigned OS seat numeric UID from the agent's `seat_launch` spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_uid: Option<u32>,
+    /// Assigned OS seat numeric GID from the agent's `seat_launch` spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_gid: Option<u32>,
 }
 
 fn default_harness() -> String {
