@@ -169,7 +169,105 @@ pub fn child_env() -> Vec<(String, String)> {
     env
 }
 
+pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, Option<i64>)> {
+    let raw = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let ts = val
+        .get("timestamp_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if ts <= rotated_ms {
+        return None;
+    }
+    let err = val
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let reset = val.get("quota_reset_at_ms").and_then(|v| v.as_i64());
+    Some((err, reset))
+}
+
+pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at_ms: Option<i64>) {
+    let path = config_dir.join(".anyagents-last-error.json");
+    match error.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(err) => {
+            let now_ms = anyagents_core::now_ms();
+            let payload = serde_json::json!({
+                "error": err,
+                "quota_reset_at_ms": quota_reset_at_ms,
+                "timestamp_ms": now_ms,
+            });
+            let _ = std::fs::write(&path, payload.to_string());
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    let config_dir = request.config_dir.clone();
+    let res = vendor_launch_inner(request);
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
+        match &res {
+            Ok(vh) => {
+                let h = vh.health();
+                if h.process_alive {
+                    if let Some((_, Some(reset_ms))) = read_persisted_last_error(&config_dir)
+                        && reset_ms > anyagents_core::now_ms()
+                    {
+                        // Keep active quota reset window intact.
+                    } else {
+                        persist_last_error(&config_dir, None, None);
+                    }
+                }
+            }
+            Err(err) => {
+                persist_last_error(&config_dir, Some(err), None);
+            }
+        }
+    }
+    res
+}
+
+fn read_muse_exit_error(config_dir: &Path) -> Option<String> {
+    for rel in [
+        "data-home/muse/serve-exit.jsonl",
+        ".local/share/muse/serve-exit.jsonl",
+        "muse/serve-exit.jsonl",
+    ] {
+        let path = config_dir.join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(last_line) = text.lines().rev().find(|l| !l.trim().is_empty())
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(last_line)
+            && val.pointer("/reason/kind").and_then(|v| v.as_str()) == Some("error")
+            && let Some(detail) = val.pointer("/reason/detail").and_then(|v| v.as_str())
+            && !detail.trim().is_empty()
+        {
+            return Some(format!("muse serve exit error: {}", detail.trim()));
+        }
+    }
+    None
+}
+
+fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
+    let path = config_dir.join("data-home/opencode/log/opencode.log");
+    let text = std::fs::read_to_string(&path).ok()?;
+    for line in text.lines().rev() {
+        if line.contains("level=ERROR") {
+            return Some(format!("opencode serve error: {}", line.trim()));
+        }
+    }
+    None
+}
+
+fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> {
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = request
         .extra_env
@@ -291,10 +389,10 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             let _ = std::fs::create_dir_all(&dot_config);
             dot_config
         };
-        if let Some((_, _, gid, _)) =
+        if let Some((_, uid, gid, _)) =
             crate::sandbox::seat_for_agent_with_hint(&request.agent.name, seat_hint.as_deref())
         {
-            crate::sandbox::share_config_with_seat(&request.config_dir, gid);
+            crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
@@ -421,6 +519,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 "--model".to_string(),
                 model,
                 "--disable-request-user-input".to_string(),
+                "--disable-sandbox".to_string(),
                 "--trust-workspace".to_string(),
                 "-c".to_string(),
                 "context.foreign_personal_rules=false".to_string(),
@@ -435,7 +534,13 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             &pairs(&env),
             Some(&request.work_dir),
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            read_muse_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
+        })?;
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !harness.health().process_alive {
+            return Err(read_muse_exit_error(&request.config_dir)
+                .unwrap_or_else(|| "muse serve exited during startup handshake".to_string()));
+        }
         let vh = VendorHarness::Muse(
             Box::new(harness),
             request.config_dir.join("muse-session-id"),
@@ -558,7 +663,9 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             Some(&request.work_dir),
             &request.config_dir,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            read_opencode_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
+        })?;
         Ok(VendorHarness::OpenCode(Box::new(harness)))
     } else if request.agent.harness == "codex" {
         env.push((

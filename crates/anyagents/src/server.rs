@@ -1520,14 +1520,14 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let (session_quota, session_error) = if agent.harness == "claude-code" {
+        let (_, persisted_err) =
+            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
         (
             anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
-            None,
+            persisted_err,
         )
-    } else if agent.harness == "agy" {
-        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
     } else {
-        (None, None)
+        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
     };
     let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
         .ok()

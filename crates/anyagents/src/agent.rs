@@ -271,6 +271,19 @@ pub fn harness_cmd(
             &client::authority(data),
         ) {
             Ok(result) => {
+                if client::agent_identity().is_none()
+                    && let Ok(store) = open(data)
+                {
+                    let _ = crate::create::set_agent_harness(
+                        &store,
+                        data,
+                        "operator",
+                        clean_agent,
+                        harness,
+                        model,
+                        profile,
+                    );
+                }
                 println!(
                     "{}",
                     result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
@@ -820,18 +833,16 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             }
         }
         let cfg = anyagents_core::agent_config_dir(data, &id);
+        let (persisted_q, persisted_err) =
+            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
             view.quota_reset_at_ms =
-                anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now);
-        } else if view.harness == "agy" {
-            let (agy_q, agy_err) =
-                anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
-            if view.quota_reset_at_ms.is_none() {
-                view.quota_reset_at_ms = agy_q;
-            }
-            if view.last_error.is_none() {
-                view.last_error = agy_err;
-            }
+                anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now).or(persisted_q);
+        } else if view.quota_reset_at_ms.is_none() {
+            view.quota_reset_at_ms = persisted_q;
+        }
+        if view.last_error.is_none() {
+            view.last_error = persisted_err;
         }
         if view.quota_reset_at_ms.is_some_and(|ms| ms > now)
             && let Ok(agent_rec) = store.agent(&id)

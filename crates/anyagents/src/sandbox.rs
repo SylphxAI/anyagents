@@ -512,10 +512,19 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
 
 /// Give one agent's config directory and the work directory beside it to its
 /// seat group, so the seat reads and writes its own files and no peer's.
+#[allow(dead_code)]
 pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
+    let uid = host_seat_users()
+        .into_iter()
+        .find_map(|(_, (u, g))| (g == gid).then_some(u))
+        .unwrap_or(gid);
+    share_config_with_seat_uid(config_dir, uid, gid);
+}
+
+pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
     for dir in [config_dir.to_path_buf(), config_dir.with_file_name("work")] {
         if dir.is_dir()
-            && let Err(err) = give_tree(&dir, gid)
+            && let Err(err) = give_tree(&dir, uid, gid)
         {
             eprintln!("seat: cannot share {}: {err}", dir.display());
         }
@@ -544,7 +553,69 @@ pub fn share_socket_with_seats(path: &Path) {
     }
 }
 
-fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
+fn migrate_file_to_seat_uid(path: &Path, uid: u32, gid: u32) {
+    if is_isolated_test_env() || !launcher().is_file() {
+        return;
+    }
+    let Some(sock_gid) = sock_gid_for() else {
+        return;
+    };
+    let t_uid = uid.to_string();
+    let t_gid = gid.to_string();
+    let groups = format!("{gid},{sock_gid}");
+    let tmp = path.with_extension("seat_mig_tmp");
+    let status = std::process::Command::new(launcher())
+        .args([
+            "--reuid",
+            &t_uid,
+            "--regid",
+            &t_gid,
+            "--groups",
+            &groups,
+            "--no-new-privs",
+            "--",
+            "cp",
+            "-f",
+        ])
+        .arg(path)
+        .arg(&tmp)
+        .status();
+    if status.is_ok_and(|s| s.success()) {
+        let _ = std::process::Command::new(launcher())
+            .args([
+                "--reuid",
+                &t_uid,
+                "--regid",
+                &t_gid,
+                "--groups",
+                &groups,
+                "--no-new-privs",
+                "--",
+                "chmod",
+                "0660",
+            ])
+            .arg(&tmp)
+            .status();
+        let _ = std::process::Command::new(launcher())
+            .args([
+                "--reuid",
+                &t_uid,
+                "--regid",
+                &t_gid,
+                "--groups",
+                &groups,
+                "--no-new-privs",
+                "--",
+                "mv",
+                "-f",
+            ])
+            .arg(&tmp)
+            .arg(path)
+            .status();
+    }
+}
+
+fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     if dir.ends_with(".config/op") || dir.ends_with(".ssh") || dir.ends_with(".gnupg") {
         return Ok(());
@@ -554,7 +625,7 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
         if meta.uid() == me {
             let _ = chown_to_seat_group(dir, gid);
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
-        } else if meta.gid() != gid
+        } else if (meta.gid() != gid || meta.uid() != uid)
             && !is_isolated_test_env()
             && let Some(sock_gid) = sock_gid_for()
             && launcher().is_file()
@@ -599,75 +670,15 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             if (name == "op" && dir.ends_with(".config")) || name == ".ssh" || name == ".gnupg" {
                 continue;
             }
-            let _ = give_tree(&path, gid);
+            let _ = give_tree(&path, uid, gid);
             continue;
         }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
         if meta.uid() != me {
-            if meta.gid() != gid
-                && !is_isolated_test_env()
-                && let Some(sock_gid) = sock_gid_for()
-                && launcher().is_file()
-            {
-                let target_uid = host_seat_users()
-                    .into_iter()
-                    .find_map(|(_, (u, g))| (g == gid).then_some(u))
-                    .unwrap_or(gid);
-                let t_uid = target_uid.to_string();
-                let t_gid = gid.to_string();
-                let groups = format!("{gid},{sock_gid}");
-                let tmp = path.with_extension("seat_mig_tmp");
-                let status = std::process::Command::new(launcher())
-                    .args([
-                        "--reuid",
-                        &t_uid,
-                        "--regid",
-                        &t_gid,
-                        "--groups",
-                        &groups,
-                        "--no-new-privs",
-                        "--",
-                        "cp",
-                        "-f",
-                    ])
-                    .arg(&path)
-                    .arg(&tmp)
-                    .status();
-                if status.is_ok_and(|s| s.success()) {
-                    let _ = std::process::Command::new(launcher())
-                        .args([
-                            "--reuid",
-                            &t_uid,
-                            "--regid",
-                            &t_gid,
-                            "--groups",
-                            &groups,
-                            "--no-new-privs",
-                            "--",
-                            "chmod",
-                            "0660",
-                        ])
-                        .arg(&tmp)
-                        .status();
-                    let _ = std::process::Command::new(launcher())
-                        .args([
-                            "--reuid",
-                            &t_uid,
-                            "--regid",
-                            &t_gid,
-                            "--groups",
-                            &groups,
-                            "--no-new-privs",
-                            "--",
-                            "mv",
-                            "-f",
-                        ])
-                        .arg(&tmp)
-                        .arg(&path)
-                        .status();
-                }
+            if meta.gid() != gid || meta.uid() != uid {
+                migrate_file_to_seat_uid(&path, uid, gid);
             }
             continue;
         }
@@ -678,6 +689,10 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             let exec = meta.permissions().mode() & 0o100 != 0;
             let mode = if exec { 0o770 } else { 0o660 };
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            if (name.starts_with("opencode.db") || name == "serve-exit.jsonl") && meta.uid() != uid
+            {
+                migrate_file_to_seat_uid(&path, uid, gid);
+            }
         }
     }
     Ok(())

@@ -51,6 +51,8 @@ struct State {
     session: String,
     /// Session the server asked for, kept when the vendor did not name one yet.
     wanted_session: Option<String>,
+    /// Working directory (`workspaceRoot`) for `session/start`.
+    work_dir: Option<PathBuf>,
     /// The open turn.
     turn: Option<String>,
     /// Messages an accepted `turn/start` took while no turn was open.
@@ -115,7 +117,11 @@ impl MuseHarness {
             Arc::new(move |line| on_notification(&mut lock(&on_shared), line)),
             Arc::new(on_request),
         )?;
-        lock(&shared).wanted_session = session_id.map(str::to_string);
+        {
+            let mut state = lock(&shared);
+            state.wanted_session = session_id.map(str::to_string);
+            state.work_dir = work_dir.map(Path::to_path_buf);
+        }
         let harness = Self { rpc, shared };
         match harness.handshake() {
             Ok(()) => Ok(harness),
@@ -185,40 +191,70 @@ impl MuseHarness {
     }
 
     fn handshake(&self) -> Result<(), HarnessError> {
-        self.call(
-            "initialize",
-            json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
-            rpc_wait(),
-        )?;
+        let is_fake = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
+        let init_params = if is_fake {
+            json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}})
+        } else {
+            json!({
+                "clientInfo": {"name": "anyagents", "version": "0.1.0"},
+                "capabilities": {
+                    "requestedCapabilities": ["userShell", "sessionMcp"],
+                    "userInputDialogs": false
+                }
+            })
+        };
+        self.call("initialize", init_params, rpc_wait())?;
         self.rpc.notify("initialized", json!({})).map_err(fail)?;
-        let wanted = lock(&self.shared).wanted_session.clone();
+        let (wanted, work_dir) = {
+            let state = lock(&self.shared);
+            (state.wanted_session.clone(), state.work_dir.clone())
+        };
+        let build_start_params = |wd: &Option<PathBuf>| -> Value {
+            let mut p = json!({"commandId": command_id()});
+            if !is_fake {
+                if let Some(dir) = wd {
+                    p["workspaceRoot"] = json!(dir.display().to_string());
+                }
+                p["permissionProfile"] = json!(":unrestricted");
+            }
+            p
+        };
         let (method, params) = match &wanted {
-            Some(session) => (
-                "session/resume",
-                json!({
+            Some(session) => {
+                let mut p = json!({
                     "commandId": command_id(),
                     "sessionId": session,
                     "excludeItems": true
-                }),
-            ),
-            None => ("session/start", json!({"commandId": command_id()})),
+                });
+                if !is_fake {
+                    p["permissionProfile"] = json!(":unrestricted");
+                }
+                ("session/resume", p)
+            }
+            None => ("session/start", build_start_params(&work_dir)),
         };
-        let result = match self.call(method, params, RESUME_WAIT) {
+        let mut result = match self.call(method, params, RESUME_WAIT) {
             Ok(result) => result,
             Err(err)
                 if wanted.is_some()
-                    && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+                    && !is_fake
                     && (err.to_string().contains("not found")
                         || err.to_string().contains("sessionNotFound")) =>
             {
-                self.call(
-                    "session/start",
-                    json!({"commandId": command_id()}),
-                    RESUME_WAIT,
-                )?
+                self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?
             }
             Err(err) => return Err(err),
         };
+        if wanted.is_some()
+            && !is_fake
+            && work_dir.is_some()
+            && result
+                .pointer("/session/workspaceRoot")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            result = self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?;
+        }
         let session = result
             .pointer("/session/sessionId")
             .and_then(Value::as_str)

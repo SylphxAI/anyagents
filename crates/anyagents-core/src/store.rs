@@ -1702,15 +1702,28 @@ impl Store {
         let conn = self.conn();
         let since = since_ms.unwrap_or(0);
         let lim = i64::try_from(limit.unwrap_or(50).max(1)).unwrap_or(50);
-        let mut turns = Vec::new();
-        let mut stmt = conn.prepare(
+        let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
+        let fetch_limit = if peer_filter.is_some() {
+            lim.saturating_mul(4)
+        } else {
+            lim
+        };
+        let sql = if since_ms.is_some() {
             "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
              FROM rag_chunks
              WHERE timestamp_ms > ?1
-             ORDER BY timestamp_ms DESC
-             LIMIT ?2",
-        )?;
-        let mut rows = stmt.query(params![since, lim * 4])?;
+             ORDER BY timestamp_ms ASC, chunk_id ASC
+             LIMIT ?2"
+        } else {
+            "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+             FROM rag_chunks
+             WHERE timestamp_ms > ?1
+             ORDER BY timestamp_ms DESC, chunk_id DESC
+             LIMIT ?2"
+        };
+        let mut turns = Vec::new();
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![since, fetch_limit])?;
         while let Some(row) = rows.next()? {
             turns.push(ConversationTurn {
                 id: row.get(0)?,
@@ -1722,7 +1735,7 @@ impl Store {
                 timestamp_ms: row.get(5)?,
             });
         }
-        if let Some(peer) = with_peer.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(peer) = peer_filter {
             turns.retain(|turn| matches_conversation_peer(turn, peer));
         }
         turns.sort_by(|a, b| {
@@ -1730,10 +1743,12 @@ impl Store {
                 .cmp(&b.timestamp_ms)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        if let Some(limit) = limit
-            && turns.len() > limit
-        {
-            turns.drain(..turns.len() - limit);
+        if let Some(limit) = limit {
+            if since_ms.is_none() && turns.len() > limit {
+                turns.drain(..turns.len() - limit);
+            } else if turns.len() > limit {
+                turns.truncate(limit);
+            }
         }
         Ok(turns)
     }

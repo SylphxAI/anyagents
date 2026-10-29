@@ -1486,8 +1486,8 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .is_some_and(|entries| entries.flatten().any(|e| e.file_name() != "profile.json"));
         if has_stored_creds && let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
             create::seed_harness_credentials(&store, data, &rec, &cfg);
-            if let Some((_, _, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
-                crate::sandbox::share_config_with_seat(&cfg, gid);
+            if let Some((_, uid, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
+                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
             println!("signed in\t{target}\t{}\tprofile:{normalized}", rec.harness);
             return Ok(());

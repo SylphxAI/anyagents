@@ -83,6 +83,10 @@ pub struct InteractiveRef {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -775,6 +779,7 @@ fn select_page_target(
 
 /// Pure-Rust local RFC 6455 WebSocket client for Chrome DevTools Protocol (`127.0.0.1:<port>`).
 struct CdpSession {
+    port: u16,
     stream: TcpStream,
     read_buf: Vec<u8>,
     next_id: u64,
@@ -828,6 +833,7 @@ impl CdpSession {
         }
         let leftover = buf[header_end..].to_vec();
         Ok(Self {
+            port,
             stream,
             read_buf: leftover,
             next_id: 1,
@@ -839,14 +845,26 @@ impl CdpSession {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, Error> {
+        self.call_in_session(None, method, params)
+    }
+
+    fn call_in_session(
+        &mut self,
+        session_id: Option<&str>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, Error> {
         let id = self.next_id;
         self.next_id += 1;
-        let payload = serde_json::json!({
+        let mut msg = serde_json::json!({
             "id": id,
             "method": method,
             "params": params,
-        })
-        .to_string();
+        });
+        if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+            msg["sessionId"] = serde_json::Value::String(sid.to_string());
+        }
+        let payload = msg.to_string();
         self.send_text_frame(payload.as_bytes())?;
         loop {
             let msg_text = self.read_text_message()?;
@@ -1007,14 +1025,24 @@ fn apply_stealth(cdp: &mut CdpSession, fp: &BrowserFingerprint) -> Result<(), Er
 }
 
 fn eval_js(cdp: &mut CdpSession, expression: &str) -> Result<serde_json::Value, Error> {
-    let res = cdp.call(
-        "Runtime.evaluate",
-        serde_json::json!({
-            "expression": expression,
-            "awaitPromise": true,
-            "returnByValue": true,
-        }),
-    )?;
+    eval_js_with_session(cdp, None, None, expression)
+}
+
+fn eval_js_with_session(
+    cdp: &mut CdpSession,
+    session_id: Option<&str>,
+    context_id: Option<u64>,
+    expression: &str,
+) -> Result<serde_json::Value, Error> {
+    let mut params = serde_json::json!({
+        "expression": expression,
+        "awaitPromise": true,
+        "returnByValue": true,
+    });
+    if let Some(cid) = context_id {
+        params["contextId"] = serde_json::json!(cid);
+    }
+    let res = cdp.call_in_session(session_id, "Runtime.evaluate", params)?;
     if let Some(exc) = res.get("exceptionDetails") {
         let text = exc
             .get("text")
@@ -1034,40 +1062,198 @@ fn eval_js(cdp: &mut CdpSession, expression: &str) -> Result<serde_json::Value, 
         .unwrap_or(serde_json::Value::Null))
 }
 
-const SNAPSHOT_JS: &str = r#"(() => {
-  const isVisible = (el) => {
+#[derive(Clone, Debug)]
+struct ChildFrameInfo {
+    pub frame_id: String,
+    pub url: String,
+    pub offset_x: f64,
+    pub offset_y: f64,
+}
+
+fn collect_frame_tree_nodes(
+    node: &serde_json::Value,
+    main_id: &str,
+    out: &mut Vec<(String, String, String)>,
+) {
+    if let Some(frame) = node.get("frame") {
+        let id = frame.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+        let url = frame
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let name = frame
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if !id.is_empty() && id != main_id {
+            out.push((id.to_string(), url.to_string(), name.to_string()));
+        }
+    }
+    if let Some(children) = node.get("childFrames").and_then(|v| v.as_array()) {
+        for child in children {
+            collect_frame_tree_nodes(child, main_id, out);
+        }
+    }
+}
+
+const IFRAME_RECTS_JS: &str = r#"(() => {
+  return Array.from(document.querySelectorAll('iframe')).map(f => {
+    const r = f.getBoundingClientRect();
+    return {
+      src: f.src || f.getAttribute('src') || '',
+      name: f.name || '',
+      id: f.id || '',
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    };
+  });
+})()"#;
+
+fn discover_child_frames(cdp: &mut CdpSession) -> Vec<ChildFrameInfo> {
+    let iframe_rects = eval_js(cdp, IFRAME_RECTS_JS)
+        .ok()
+        .and_then(|v| v.as_array().cloned())
+        .unwrap_or_default();
+
+    let mut raw_frames: Vec<(String, String, String)> = Vec::new();
+    if let Ok(tree_res) = cdp.call("Page.getFrameTree", serde_json::json!({}))
+        && let Some(root) = tree_res.get("frameTree")
+    {
+        let main_id = root
+            .pointer("/frame/id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        collect_frame_tree_nodes(root, &main_id, &mut raw_frames);
+    }
+    if let Ok(body) = cdp_http_get(cdp.port, "/json/list")
+        && let Ok(all) = serde_json::from_slice::<Vec<CdpTarget>>(&body)
+    {
+        for t in all {
+            if t.target_type == "iframe"
+                && !t.id.is_empty()
+                && !raw_frames.iter().any(|(id, _, _)| id == &t.id)
+            {
+                raw_frames.push((t.id, t.url, String::new()));
+            }
+        }
+    }
+    if let Ok(targets_res) = cdp.call("Target.getTargets", serde_json::json!({}))
+        && let Some(infos) = targets_res.get("targetInfos").and_then(|v| v.as_array())
+    {
+        for info in infos {
+            if info.get("type").and_then(|v| v.as_str()) == Some("iframe") {
+                let tid = info
+                    .get("targetId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let url = info.get("url").and_then(|v| v.as_str()).unwrap_or_default();
+                if !tid.is_empty() && !raw_frames.iter().any(|(id, _, _)| id == tid) {
+                    raw_frames.push((tid.to_string(), url.to_string(), String::new()));
+                }
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    for (idx, (fid, furl, fname)) in raw_frames.into_iter().enumerate() {
+        let mut offset_x = 0.0;
+        let mut offset_y = 0.0;
+        let matched = iframe_rects
+            .iter()
+            .find(|r| {
+                let r_src = r.get("src").and_then(|v| v.as_str()).unwrap_or_default();
+                let r_name = r.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+                let r_id = r.get("id").and_then(|v| v.as_str()).unwrap_or_default();
+                (!furl.is_empty()
+                    && !r_src.is_empty()
+                    && (r_src == furl || furl.starts_with(r_src) || r_src.starts_with(&furl)))
+                    || (!fname.is_empty() && (r_name == fname || r_id == fname))
+            })
+            .or_else(|| iframe_rects.get(idx));
+        if let Some(m) = matched {
+            offset_x = m.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            offset_y = m.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        }
+        out.push(ChildFrameInfo {
+            frame_id: fid,
+            url: furl,
+            offset_x,
+            offset_y,
+        });
+    }
+    out
+}
+
+fn eval_js_in_frame(
+    cdp: &mut CdpSession,
+    frame_id: Option<&str>,
+    expression: &str,
+) -> Result<serde_json::Value, Error> {
+    let Some(fid) = frame_id.filter(|s| !s.is_empty()) else {
+        return eval_js(cdp, expression);
+    };
+    // 1. Out-Of-Process Iframe (OOPIF): connect directly to its target WebSocket `/devtools/page/<fid>`.
+    if let Ok(mut sub_cdp) = CdpSession::connect(cdp.port, &format!("/devtools/page/{fid}")) {
+        let _ = sub_cdp.call("Runtime.enable", serde_json::json!({}));
+        if let Ok(val) = eval_js(&mut sub_cdp, expression) {
+            return Ok(val);
+        }
+    }
+    // 2. Fallback: in-process child frame via Page.createIsolatedWorld.
+    let world = cdp.call(
+        "Page.createIsolatedWorld",
+        serde_json::json!({
+            "frameId": fid,
+            "worldName": "anyagents",
+            "grantUniveralAccess": true,
+        }),
+    )?;
+    let ctx_id = world
+        .get("executionContextId")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| Error::Message(format!("missing executionContextId for frame {fid}")))?;
+    eval_js_with_session(cdp, None, Some(ctx_id), expression)
+}
+
+fn snapshot_js_with_offset(start_idx: usize) -> String {
+    format!(
+        r#"(() => {{
+  const isVisible = (el) => {{
     const rect = el.getBoundingClientRect();
     if (rect.width < 2 || rect.height < 2) return false;
     const style = window.getComputedStyle(el);
     if (style.visibility === 'hidden' || style.display === 'none' || parseFloat(style.opacity || '1') === 0) return false;
     return true;
-  };
-  const cssPath = (el) => {
+  }};
+  const cssPath = (el) => {{
     if (el.id && /^[a-zA-Z][\w-]*$/.test(el.id)) return '#' + el.id;
     const parts = [];
     let cur = el;
-    while (cur && cur.nodeType === 1 && parts.length < 5) {
+    while (cur && cur.nodeType === 1 && parts.length < 5) {{
       let part = cur.nodeName.toLowerCase();
-      if (cur.id && /^[a-zA-Z][\w-]*$/.test(cur.id)) {
+      if (cur.id && /^[a-zA-Z][\w-]*$/.test(cur.id)) {{
         parts.unshift('#' + cur.id);
         break;
-      }
+      }}
       let sib = cur, nth = 1;
-      while ((sib = sib.previousElementSibling)) {
+      while ((sib = sib.previousElementSibling)) {{
         if (sib.nodeName === cur.nodeName) nth++;
-      }
+      }}
       if (nth > 1) part += ':nth-of-type(' + nth + ')';
       parts.unshift(part);
       cur = cur.parentElement;
-    }
+    }}
     return parts.join(' > ');
-  };
+  }};
   const candidates = Array.from(document.querySelectorAll(
     'a[href], button, input, textarea, select, summary, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="switch"], [contenteditable="true"]'
   ));
   const elements = [];
-  let idx = 1;
-  for (const el of candidates) {
+  let idx = {start_idx};
+  for (const el of candidates) {{
     if (!isVisible(el)) continue;
     if (elements.length >= 120) break;
     const rect = el.getBoundingClientRect();
@@ -1085,7 +1271,7 @@ const SNAPSHOT_JS: &str = r#"(() => {
       el.value ||
       ''
     ).replace(/\s+/g, ' ').trim().slice(0, 120);
-    elements.push({
+    elements.push({{
       ref: refId,
       tag,
       role,
@@ -1099,17 +1285,17 @@ const SNAPSHOT_JS: &str = r#"(() => {
       y: Math.round(rect.top + rect.height / 2),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
-    });
-  }
+    }});
+  }}
   const bodyText = (document.body ? document.body.innerText : '')
-    .replace(/\n{3,}/g, '\n\n')
+    .replace(/\n{{3,}}/g, '\n\n')
     .trim()
     .slice(0, 12000);
-  return {
+  return {{
     url: location.href,
     title: document.title || '',
     text: bodyText,
-    elements: elements.map(e => ({
+    elements: elements.map(e => ({{
       ref: e.ref,
       tag: e.tag,
       role: e.role,
@@ -1122,36 +1308,92 @@ const SNAPSHOT_JS: &str = r#"(() => {
       y: e.y,
       width: e.width,
       height: e.height,
-    })),
-  };
-})()"#;
+    }})),
+  }};
+}})()"#
+    )
+}
 
 fn capture_snapshot(
     data: &Path,
     profile: &str,
     cdp: &mut CdpSession,
 ) -> Result<serde_json::Value, Error> {
-    let val = eval_js(cdp, SNAPSHOT_JS)?;
-    if let Ok(elements) = serde_json::from_value::<Vec<InteractiveRef>>(
-        val.get("elements").cloned().unwrap_or_default(),
-    ) {
-        let stored = StoredRefs {
-            url: val
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_string(),
-            captured_at_ms: now_ms(),
-            elements,
-        };
-        if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
-            let _ = std::fs::write(profile_dir(data, profile).join("refs.json"), bytes);
+    let mut val = eval_js(cdp, &snapshot_js_with_offset(1))?;
+    let mut all_elements: Vec<InteractiveRef> =
+        serde_json::from_value(val.get("elements").cloned().unwrap_or_default())
+            .unwrap_or_default();
+    let mut combined_text = val
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    for cf in discover_child_frames(cdp) {
+        let next_idx = all_elements.len() + 1;
+        if next_idx > 160 {
+            break;
         }
+        let Ok(fval) =
+            eval_js_in_frame(cdp, Some(&cf.frame_id), &snapshot_js_with_offset(next_idx))
+        else {
+            continue;
+        };
+        let furl = fval
+            .get("url")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&cf.url)
+            .to_string();
+        if let Some(ftext) = fval
+            .get("text")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if !combined_text.is_empty() {
+                combined_text.push_str("\n\n");
+            }
+            combined_text.push_str(&format!("[iframe: {furl}]\n{ftext}"));
+        }
+        if let Ok(felems) = serde_json::from_value::<Vec<InteractiveRef>>(
+            fval.get("elements").cloned().unwrap_or_default(),
+        ) {
+            for mut el in felems {
+                el.x += cf.offset_x;
+                el.y += cf.offset_y;
+                el.frame_id = Some(cf.frame_id.clone());
+                el.frame_url = Some(furl.clone());
+                all_elements.push(el);
+            }
+        }
+    }
+
+    val["text"] = serde_json::Value::String(combined_text);
+    val["elements"] = serde_json::to_value(&all_elements).unwrap_or_default();
+
+    let stored = StoredRefs {
+        url: val
+            .get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string(),
+        captured_at_ms: now_ms(),
+        elements: all_elements,
+    };
+    if let Ok(bytes) = serde_json::to_vec_pretty(&stored) {
+        let _ = std::fs::write(profile_dir(data, profile).join("refs.json"), bytes);
     }
     Ok(val)
 }
 
-fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> (String, Option<(f64, f64)>) {
+struct ResolvedTarget {
+    css_selector: String,
+    fallback_xy: Option<(f64, f64)>,
+    frame_id: Option<String>,
+}
+
+fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> ResolvedTarget {
     let trimmed = raw_target.trim();
     if trimmed.starts_with("@e") {
         let refs_path = profile_dir(data, profile).join("refs.json");
@@ -1159,14 +1401,23 @@ fn resolve_selector(data: &Path, profile: &str, raw_target: &str) -> (String, Op
             && let Ok(stored) = serde_json::from_slice::<StoredRefs>(&bytes)
             && let Some(found) = stored.elements.iter().find(|e| e.r#ref == trimmed)
         {
-            return (
-                format!("[data-anyagents-ref=\"{}\"], {}", trimmed, found.selector),
-                Some((found.x, found.y)),
-            );
+            return ResolvedTarget {
+                css_selector: format!("[data-anyagents-ref=\"{}\"], {}", trimmed, found.selector),
+                fallback_xy: Some((found.x, found.y)),
+                frame_id: found.frame_id.clone(),
+            };
         }
-        return (format!("[data-anyagents-ref=\"{trimmed}\"]"), None);
+        return ResolvedTarget {
+            css_selector: format!("[data-anyagents-ref=\"{trimmed}\"]"),
+            fallback_xy: None,
+            frame_id: None,
+        };
     }
-    (trimmed.to_string(), None)
+    ResolvedTarget {
+        css_selector: trimmed.to_string(),
+        fallback_xy: None,
+        frame_id: None,
+    }
 }
 
 fn load_op_service_account_token() -> Option<String> {
@@ -1604,8 +1855,9 @@ pub fn execute(
                         "browser click requires `selector` (e.g. `@e1` or CSS selector)".into(),
                     )
                 })?;
-            let (css_sel, fallback_xy) = resolve_selector(data, &profile, raw_sel);
-            let sel_json = serde_json::to_string(&css_sel).unwrap_or_else(|_| "\"body\"".into());
+            let resolved = resolve_selector(data, &profile, raw_sel);
+            let sel_json =
+                serde_json::to_string(&resolved.css_selector).unwrap_or_else(|_| "\"body\"".into());
             let prep_js = format!(
                 r#"(() => {{
                   const el = document.querySelector({sel_json});
@@ -1623,10 +1875,29 @@ pub fn execute(
                   }};
                 }})()"#
             );
-            let target_info = eval_js(&mut cdp, &prep_js)?;
+            let child_frames = discover_child_frames(&mut cdp);
+            let mut active_frame_id = resolved.frame_id.clone();
+            let mut target_info = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &prep_js)
+                .unwrap_or_else(|_| serde_json::json!({ "found": false }));
+            if target_info.get("found").and_then(|v| v.as_bool()) != Some(true) {
+                for cf in &child_frames {
+                    if let Ok(info) = eval_js_in_frame(&mut cdp, Some(&cf.frame_id), &prep_js)
+                        && info.get("found").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        active_frame_id = Some(cf.frame_id.clone());
+                        target_info = info;
+                        break;
+                    }
+                }
+            }
             if target_info.get("found").and_then(|v| v.as_bool()) == Some(true) {
-                let x = target_info.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-                let y = target_info.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                let (off_x, off_y) = active_frame_id
+                    .as_deref()
+                    .and_then(|fid| child_frames.iter().find(|cf| cf.frame_id == fid))
+                    .map(|cf| (cf.offset_x, cf.offset_y))
+                    .unwrap_or((0.0, 0.0));
+                let x = target_info.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_x;
+                let y = target_info.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_y;
                 let _ = dispatch_trusted_click(&mut cdp, x, y);
                 let check_js = format!(
                     r#"(() => {{
@@ -1636,8 +1907,8 @@ pub fn execute(
                       return false;
                     }})()"#
                 );
-                let _ = eval_js(&mut cdp, &check_js);
-            } else if let Some((x, y)) = fallback_xy {
+                let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &check_js);
+            } else if let Some((x, y)) = resolved.fallback_xy {
                 let _ = dispatch_trusted_click(&mut cdp, x, y);
             } else {
                 return Err(Error::Message(format!(
@@ -1673,8 +1944,9 @@ pub fn execute(
                 })?;
             let (text_val, secret_source) =
                 resolve_fill_value(data, req.text.as_deref(), req.secret_ref.as_deref())?;
-            let (css_sel, _) = resolve_selector(data, &profile, raw_sel);
-            let sel_json = serde_json::to_string(&css_sel).unwrap_or_else(|_| "\"input\"".into());
+            let resolved = resolve_selector(data, &profile, raw_sel);
+            let sel_json = serde_json::to_string(&resolved.css_selector)
+                .unwrap_or_else(|_| "\"input\"".into());
             let val_json = serde_json::to_string(&text_val).unwrap_or_else(|_| "\"\"".into());
             let submit = req.submit.unwrap_or(false);
 
@@ -1702,6 +1974,7 @@ pub fn execute(
                     el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     return {{ found: true, kind: 'select', tag }};
                   }}
+                  try {{ window.focus && window.focus(); }} catch (_) {{}}
                   el.focus();
                   let hadContent = false;
                   if (typeof el.value === 'string') {{
@@ -1732,11 +2005,39 @@ pub fn execute(
                   }};
                 }})()"#
             );
-            let prep = eval_js(&mut cdp, &prep_js)?;
+            let child_frames = discover_child_frames(&mut cdp);
+            let mut active_frame_id = resolved.frame_id.clone();
+            let mut prep = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &prep_js)
+                .unwrap_or_else(|_| serde_json::json!({ "found": false }));
+            if prep.get("found").and_then(|v| v.as_bool()) != Some(true) {
+                for cf in &child_frames {
+                    if let Ok(info) = eval_js_in_frame(&mut cdp, Some(&cf.frame_id), &prep_js)
+                        && info.get("found").and_then(|v| v.as_bool()) == Some(true)
+                    {
+                        active_frame_id = Some(cf.frame_id.clone());
+                        prep = info;
+                        break;
+                    }
+                }
+            }
             if prep.get("found").and_then(|v| v.as_bool()) != Some(true) {
                 return Err(Error::Message(format!(
                     "input element `{raw_sel}` not found on page; run `snapshot` first"
                 )));
+            }
+
+            if active_frame_id.is_some() {
+                let (off_x, off_y) = active_frame_id
+                    .as_deref()
+                    .and_then(|fid| child_frames.iter().find(|cf| cf.frame_id == fid))
+                    .map(|cf| (cf.offset_x, cf.offset_y))
+                    .unwrap_or((0.0, 0.0));
+                let click_x = prep.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_x;
+                let click_y = prep.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0) + off_y;
+                if click_x > 0.0 || click_y > 0.0 {
+                    let _ = dispatch_trusted_click(&mut cdp, click_x, click_y);
+                    let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &prep_js);
+                }
             }
 
             if prep.get("kind").and_then(|v| v.as_str()) != Some("select") {
@@ -1795,14 +2096,16 @@ pub fn execute(
                     );
                 }
 
-                // Verify and fire `change` event (or apply native setter fallback if a custom control ignored key events).
+                // Verify and fire `change` event (or apply native setter fallback if a custom control or cross-origin frame missed key events).
                 let finalize_js = format!(
                     r#"(() => {{
                       const el = document.querySelector({sel_json});
                       if (!el) return;
                       if (typeof el.value === 'string' && el.value !== {val_json} && (!el.maxLength || el.maxLength < 0 || {val_json}.length <= el.maxLength)) {{
                         const proto = Object.getPrototypeOf(el);
-                        const desc = Object.getOwnPropertyDescriptor(proto, 'value') || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value');
+                        const desc = Object.getOwnPropertyDescriptor(proto, 'value')
+                          || Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')
+                          || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
                         if (desc && desc.set) {{
                           desc.set.call(el, {val_json});
                         }} else {{
@@ -1813,7 +2116,7 @@ pub fn execute(
                       el.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     }})()"#
                 );
-                let _ = eval_js(&mut cdp, &finalize_js);
+                let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &finalize_js);
             }
 
             if submit {
@@ -1837,6 +2140,17 @@ pub fn execute(
                         "nativeVirtualKeyCode": 13,
                     }),
                 );
+                if active_frame_id.is_some() {
+                    let submit_js = format!(
+                        r#"(() => {{
+                          const el = document.querySelector({sel_json});
+                          if (!el) return;
+                          el.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+                          el.dispatchEvent(new KeyboardEvent('keyup', {{ key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true }}));
+                        }})()"#
+                    );
+                    let _ = eval_js_in_frame(&mut cdp, active_frame_id.as_deref(), &submit_js);
+                }
             }
             let mut resp = serde_json::json!({
                 "profile": profile,
@@ -1844,6 +2158,9 @@ pub fn execute(
                 "submitted": submit,
                 "trusted_input": true,
             });
+            if let Some(fid) = active_frame_id {
+                resp["frame_id"] = serde_json::Value::String(fid);
+            }
             if let Some(src) = secret_source {
                 resp["secret_injected"] = serde_json::Value::Bool(true);
                 resp["secret_source"] = serde_json::Value::String(src);
@@ -1876,6 +2193,28 @@ pub fn execute(
                 "Space" | " " => 32,
                 _ => 0,
             };
+            let mut target_frame_id = None;
+            if let Some(raw_sel) = req
+                .selector
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let resolved = resolve_selector(data, &profile, raw_sel);
+                target_frame_id = resolved.frame_id.clone();
+                let sel_json = serde_json::to_string(&resolved.css_selector)
+                    .unwrap_or_else(|_| "\"body\"".into());
+                let focus_js = format!(
+                    r#"(() => {{
+                      const el = document.querySelector({sel_json});
+                      if (!el) return false;
+                      try {{ window.focus && window.focus(); }} catch (_) {{}}
+                      el.focus && el.focus();
+                      return true;
+                    }})()"#
+                );
+                let _ = eval_js_in_frame(&mut cdp, target_frame_id.as_deref(), &focus_js);
+            }
             cdp.call(
                 "Input.dispatchKeyEvent",
                 serde_json::json!({
@@ -1896,6 +2235,19 @@ pub fn execute(
                     "nativeVirtualKeyCode": vk,
                 }),
             )?;
+            if let Some(fid) = target_frame_id.as_deref() {
+                let key_json =
+                    serde_json::to_string(key_name).unwrap_or_else(|_| "\"Enter\"".into());
+                let press_js = format!(
+                    r#"(() => {{
+                      const el = document.activeElement || document.body;
+                      if (!el) return;
+                      el.dispatchEvent(new KeyboardEvent('keydown', {{ key: {key_json}, code: {key_json}, keyCode: {vk}, which: {vk}, bubbles: true }}));
+                      el.dispatchEvent(new KeyboardEvent('keyup', {{ key: {key_json}, code: {key_json}, keyCode: {vk}, which: {vk}, bubbles: true }}));
+                    }})()"#
+                );
+                let _ = eval_js_in_frame(&mut cdp, Some(fid), &press_js);
+            }
             Ok(serde_json::json!({
                 "profile": profile,
                 "pressed": key_name,
@@ -1994,4 +2346,192 @@ fn decode_base64(input: &str) -> Result<Vec<u8>, Error> {
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyagents_core::{CredentialStore, FileCredentialStore};
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    fn spawn_html_server(bind_ip: &str, html: String) -> u16 {
+        let listener = TcpListener::bind(format!("{bind_ip}:0")).expect("bind local test server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let html = html.clone();
+                std::thread::spawn(move || {
+                    let mut stream = stream;
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                    let mut req_buf = Vec::with_capacity(1024);
+                    let mut chunk = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut chunk) {
+                        if n == 0 {
+                            break;
+                        }
+                        req_buf.extend_from_slice(&chunk[..n]);
+                        if req_buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        html.len(),
+                        html
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                    let _ = stream.flush();
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                });
+            }
+        });
+        port
+    }
+
+    #[test]
+    fn cross_origin_iframe_snapshot_fill_and_click_with_secret_ref() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let iframe_html = r#"<!doctype html>
+<html>
+<head><title>Auth Frame</title></head>
+<body>
+  <h2>Sign in to Apple Account</h2>
+  <input id="account_name_text_field" type="text" placeholder="Email or Phone Number" />
+  <input id="password_text_field" type="password" placeholder="Password" />
+  <button id="sign_in" onclick="document.getElementById('result').innerText = 'OK:' + document.getElementById('account_name_text_field').value + ':' + document.getElementById('password_text_field').value">Continue</button>
+  <div id="result">pending</div>
+</body>
+</html>"#
+            .to_string();
+        let iframe_port = spawn_html_server("127.0.0.2", iframe_html);
+        // Use `127.0.0.2:<iframe_port>` for the iframe while using `127.0.0.1:<parent_port>` for the parent page so Chromium treats it as cross-origin/cross-site without IPv6 `::1` races.
+        let parent_html = format!(
+            r#"<!doctype html>
+<html>
+<head><title>App Store Connect</title></head>
+<body>
+  <h1>Parent Shell</h1>
+  <iframe id="aid-auth-widget-iFrame" src="http://127.0.0.2:{iframe_port}/auth" width="600" height="400"></iframe>
+</body>
+</html>"#
+        );
+        let parent_port = spawn_html_server("127.0.0.1", parent_html);
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileCredentialStore::new(dir.path());
+        store.write("apple/password", b"s3cr3t-iframe-pw").unwrap();
+
+        let open_res = execute(
+            dir.path(),
+            "test-iframe",
+            BrowserRequest {
+                action: "open".into(),
+                profile: Some("test-iframe".into()),
+                url: Some(format!("http://127.0.0.1:{parent_port}/")),
+                headless: Some(true),
+                wait_ms: Some(1200),
+                ..Default::default()
+            },
+        )
+        .expect("browser open");
+
+        let elems = open_res["interactive_elements"]
+            .as_array()
+            .expect("interactive_elements array");
+        assert!(
+            elems.len() >= 3,
+            "expected cross-origin iframe elements in snapshot, got: {open_res}"
+        );
+
+        let email_ref = elems
+            .iter()
+            .find(|e| e["selector"].as_str() == Some("#account_name_text_field"))
+            .and_then(|e| e["ref"].as_str())
+            .expect("email input @e ref")
+            .to_string();
+        let pw_ref = elems
+            .iter()
+            .find(|e| e["selector"].as_str() == Some("#password_text_field"))
+            .and_then(|e| e["ref"].as_str())
+            .expect("password input @e ref")
+            .to_string();
+        let btn_ref = elems
+            .iter()
+            .find(|e| e["selector"].as_str() == Some("#sign_in"))
+            .and_then(|e| e["ref"].as_str())
+            .expect("sign_in button @e ref")
+            .to_string();
+
+        execute(
+            dir.path(),
+            "test-iframe",
+            BrowserRequest {
+                action: "fill".into(),
+                profile: Some("test-iframe".into()),
+                selector: Some(email_ref),
+                text: Some("hi@kylet.se".into()),
+                ..Default::default()
+            },
+        )
+        .expect("fill email in cross-origin iframe");
+
+        let pw_fill = execute(
+            dir.path(),
+            "test-iframe",
+            BrowserRequest {
+                action: "fill".into(),
+                profile: Some("test-iframe".into()),
+                selector: Some(pw_ref),
+                secret_ref: Some("secret://apple/password".into()),
+                ..Default::default()
+            },
+        )
+        .expect("fill secret_ref in cross-origin iframe");
+        assert_eq!(pw_fill["secret_injected"], true);
+        assert!(
+            !pw_fill.to_string().contains("s3cr3t-iframe-pw"),
+            "secret plaintext must never appear in fill response"
+        );
+
+        execute(
+            dir.path(),
+            "test-iframe",
+            BrowserRequest {
+                action: "click".into(),
+                profile: Some("test-iframe".into()),
+                selector: Some(btn_ref),
+                wait_ms: Some(300),
+                ..Default::default()
+            },
+        )
+        .expect("click button in cross-origin iframe");
+
+        let snap = execute(
+            dir.path(),
+            "test-iframe",
+            BrowserRequest {
+                action: "snapshot".into(),
+                profile: Some("test-iframe".into()),
+                ..Default::default()
+            },
+        )
+        .expect("snapshot after click");
+        let text = snap["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("OK:hi@kylet.se:s3cr3t-iframe-pw"),
+            "expected iframe DOM to receive email + secret password, got text: {text}"
+        );
+
+        let _ = execute(
+            dir.path(),
+            "test-iframe",
+            BrowserRequest {
+                action: "close".into(),
+                profile: Some("test-iframe".into()),
+                ..Default::default()
+            },
+        );
+    }
 }

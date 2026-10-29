@@ -1200,10 +1200,23 @@ pub(crate) fn reconcile_agent_runtime_config(
         }
     }
 
-    if let Some((_, _uid, gid, spec_opt)) = resolved_agent_seat_info(store, agent) {
-        crate::sandbox::share_config_with_seat(config, gid);
-        if let Some(spec) = spec_opt {
-            ensure_seat_op_config(config, &spec);
+    if let Some((_, uid, gid, spec_opt)) = resolved_agent_seat_info(store, agent) {
+        crate::sandbox::share_config_with_seat_uid(config, uid, gid);
+        if let Some(ref spec) = spec_opt {
+            ensure_seat_op_config(config, spec);
+        }
+        if agent.harness == "muse"
+            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && !crate::sandbox::is_isolated_test_env()
+        {
+            muse_config::ensure_workspace_session(
+                data,
+                agent.id.as_str(),
+                config,
+                work_dir,
+                agent.model.as_deref(),
+                spec_opt.as_deref(),
+            );
         }
     }
     Ok(continuity)
@@ -1592,10 +1605,10 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
                 .as_ref()
                 .and_then(|pid| all_agents.iter().find(|p| &p.id == pid))
                 .map(|p| p.name.as_str());
-            if let Some((_, _, gid, _)) =
+            if let Some((_, uid, gid, _)) =
                 crate::sandbox::seat_for_agent_with_hint(&a.name, parent_name)
             {
-                crate::sandbox::share_config_with_seat(&cfg, gid);
+                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
         }
     }
@@ -3641,10 +3654,10 @@ pub(crate) fn rotate_agent_to_profile(
         .as_ref()
         .and_then(|pid| store.agent(pid).ok())
         .map(|p| p.name);
-    if let Some((_, _, gid, _)) =
+    if let Some((_, uid, gid, _)) =
         crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
     {
-        crate::sandbox::share_config_with_seat(&cfg, gid);
+        crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
     }
     if !store.has_open_turn(&agent.id).unwrap_or(false) {
         restart_agent_harness_process(store, agent);
