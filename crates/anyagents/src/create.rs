@@ -245,6 +245,14 @@ pub(crate) fn write_agent_instructions(config: &Path, agent: &Agent, parent_name
          - **Memory, History & Hybrid RAG Search (`conversation` / `search`)**: Incoming messages are pushed automatically to your session — never poll an inbox. Use `conversation({ \"query\": \"...\", \"agent\": \"all\", \"limit\": 20 })` or `search({ \"query\": \"...\" })` to run Hybrid RAG search (dense vector embedding `voyageai/voyage-4-large` + SQLite FTS5 BM25) across all agents' historical and live conversations since September without loading the full history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n",
     );
 
+    if let Ok(continuity) = std::fs::read_to_string(config.join(".anyagents-harness-continuity.md"))
+        && !continuity.trim().is_empty()
+    {
+        doc.push('\n');
+        doc.push_str(continuity.trim());
+        doc.push('\n');
+    }
+
     let paths = [
         config.join("SYSTEM_PROMPT.md"),
         config.join("AGENTS.md"),
@@ -363,12 +371,10 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
     let data_skills = data_dir.join("skills");
-    let resolved_skills = std::fs::canonicalize(&data_skills)
-        .ok()
-        .or_else(|| {
-            let wt = PathBuf::from("/scratch/wt/sylphx-skills/skills");
-            wt.is_dir().then_some(wt)
-        });
+    let resolved_skills = std::fs::canonicalize(&data_skills).ok().or_else(|| {
+        let wt = PathBuf::from("/scratch/wt/sylphx-skills/skills");
+        wt.is_dir().then_some(wt)
+    });
     if let Some(skills_dir) = resolved_skills
         && let Some(repo_root) = skills_dir.parent()
         && repo_root.join(".git").exists()
@@ -699,6 +705,8 @@ pub(crate) fn seed_harness_credentials(
                     ".claude/.credentials.json",
                     "auth.json",
                     ".codex/auth.json",
+                    "models_cache.json",
+                    "model-catalog-direct.json",
                     ".gemini/antigravity-cli/antigravity-oauth-token",
                 ] {
                     let other_src = other_cfg.join(rel);
@@ -899,6 +907,301 @@ pub(crate) fn bind_profile(
         let _ = crate::mcp_config::sanitize_claude_settings(&config);
     }
     Ok(())
+}
+
+pub(crate) fn build_harness_continuity_summary(
+    store: &Store,
+    agent: &Agent,
+    previous_harness: &str,
+    target_harness: &str,
+) -> String {
+    let mut out = format!(
+        "## 4. Cross-Harness Session Continuity (`{previous_harness}` -> `{target_harness}`)\n\n\
+         - This existing AnyAgents identity (`{}` / `{}`) was transitioned in place from harness `{previous_harness}` to `{target_harness}` while retaining its AnyAgents ID, role description, model (`{}`), workdir (`{}`), mailbox cursor, and external Spiron execution custody.\n\
+         - **Do NOT replay or repeat already-completed `[OUT]` turns or external side effects** listed below; your mailbox cursor (`delivered_seq`) is already advanced past all prior delivered messages.\n\
+         - **Do NOT reopen paused, archived, or restricted product work** merely because the harness changed; act only on the new incoming `<message>` envelope delivered in the current turn.\n\
+         - Your full historical two-way transcript from `{previous_harness}` remains queryable on demand via `conversation({{ \"agent\": \"self\", \"limit\": 30 }})`.\n",
+        agent.name,
+        agent.id.as_str(),
+        agent.model.as_deref().unwrap_or("default"),
+        agent.workdir.as_deref().unwrap_or("."),
+    );
+    if let Ok(turns) = store.conversation(&agent.id, None, None, Some(10))
+        && !turns.is_empty()
+    {
+        out.push_str("\n### Recent Completed Two-Way Turns (`state.db`)\n\n");
+        for turn in turns {
+            let dir_tag = if turn.direction == "out" {
+                "OUT (already sent/completed)"
+            } else {
+                "IN (already delivered)"
+            };
+            let peer = if turn.direction == "out" {
+                turn.to.as_str()
+            } else {
+                turn.from.as_str()
+            };
+            let snippet: String = turn
+                .text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let truncated: String = if snippet.chars().count() > 360 {
+                let head: String = snippet.chars().take(360).collect();
+                format!("{head}...")
+            } else {
+                snippet
+            };
+            out.push_str(&format!(
+                "- `[{dir_tag}]` `{}` (`ts={}`, peer=`{peer}`): {}\n",
+                turn.id, turn.timestamp_ms, truncated
+            ));
+        }
+    }
+    out
+}
+
+/// Change an existing agent's harness in place without deleting or recreating its identity,
+/// killing an in-progress turn, replaying already-delivered messages, or reopening paused scope.
+pub(crate) fn set_agent_harness(
+    store: &Store,
+    data: &Path,
+    actor: &str,
+    name: &str,
+    harness: &str,
+    model: Option<&str>,
+    profile: Option<&str>,
+) -> Result<serde_json::Value, Error> {
+    let target_harness = harness.trim();
+    if target_harness.is_empty() {
+        return Err(Error::Message("harness is empty".into()));
+    }
+    let _adapter = crate::install::adapter(target_harness)?;
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    {
+        crate::install::record(data, target_harness).map_err(Error::Message)?;
+    }
+    let existing = store.agent_by_name(name)?;
+    let previous_harness = existing.harness.clone();
+    let resolved_model = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| existing.model.clone());
+    let config = agent_config_dir(data, &existing.id);
+    let current_bound = bound_profile_name(&config);
+
+    let (provider, profile_name) =
+        if let Some(explicit_prof) = profile.map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some((p, n)) = explicit_prof.split_once('/') {
+                (p.trim().to_string(), n.trim().to_string())
+            } else {
+                (
+                    upstream_provider_of(target_harness, resolved_model.as_deref()),
+                    explicit_prof.to_string(),
+                )
+            }
+        } else if let Some(ref bound) = current_bound {
+            if let Some((p, n)) = bound.split_once('/') {
+                (p.trim().to_string(), n.trim().to_string())
+            } else {
+                (
+                    upstream_provider_of(target_harness, resolved_model.as_deref()),
+                    bound.trim().to_string(),
+                )
+            }
+        } else {
+            (
+                upstream_provider_of(target_harness, resolved_model.as_deref()),
+                "default".to_string(),
+            )
+        };
+
+    let valid_token = |s: &str| {
+        !s.is_empty()
+            && s != "."
+            && s != ".."
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
+    };
+    if !valid_token(&provider) || !valid_token(&profile_name) {
+        return Err(Error::Message(format!(
+            "invalid provider profile `{provider}/{profile_name}`"
+        )));
+    }
+    let (_, default_compat) = default_kind_and_harnesses(&provider);
+    let profile_dir = data.join("profiles").join(&provider).join(&profile_name);
+    let compatible_harnesses = if profile_dir.join("profile.json").is_file() {
+        std::fs::read_to_string(profile_dir.join("profile.json"))
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .and_then(|v| {
+                v.get("compatible_harnesses")
+                    .and_then(|a| a.as_array())
+                    .cloned()
+            })
+            .map(|arr| {
+                arr.into_iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty())
+            .unwrap_or(default_compat)
+    } else {
+        default_compat
+    };
+    if !compatible_harnesses.iter().any(|h| h == target_harness) {
+        return Err(Error::Message(format!(
+            "harness `{target_harness}` is not compatible with provider profile `{provider}/{profile_name}` (compatible harnesses: {})",
+            compatible_harnesses.join(", ")
+        )));
+    }
+    if data.join("profiles").is_dir() && !profile_dir.is_dir() {
+        return Err(Error::Message(format!(
+            "provider profile not found: `{provider}/{profile_name}`"
+        )));
+    }
+
+    let open_turn = store.has_open_turn(&existing.id).unwrap_or(false);
+    let lock_busy = matches!(store.try_lock_agent(&existing.id), Err(Error::AgentBusy));
+    let in_progress_turn = existing.state == "running" && (open_turn || lock_busy);
+
+    store.record_admin_audit(actor, "agents.harness", &existing.name)?;
+    store.set_agent_harness(&existing.id, target_harness)?;
+    if let Some(ref m) = resolved_model
+        && existing.model.as_deref() != Some(m.as_str())
+    {
+        store.set_agent_model(&existing.id, m)?;
+    }
+    let updated = store.agent(&existing.id)?;
+
+    std::fs::create_dir_all(&config)?;
+    let normalized_profile = format!("{provider}/{profile_name}");
+    write_profile_marker(
+        &config,
+        ".anyagents-profile",
+        &format!("{normalized_profile}\n"),
+    );
+    write_profile_marker(
+        &config,
+        ".anyagents-configured-harness",
+        &format!("{target_harness}\n"),
+    );
+
+    let continuity_summary = if previous_harness != target_harness {
+        let summary =
+            build_harness_continuity_summary(store, &updated, &previous_harness, target_harness);
+        let _ = write_seat_shared_file(
+            &config.join(".anyagents-harness-continuity.md"),
+            summary.as_bytes(),
+            0o664,
+        );
+        Some(summary)
+    } else {
+        std::fs::read_to_string(config.join(".anyagents-harness-continuity.md")).ok()
+    };
+
+    let parent_name = updated
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok())
+        .map(|p| p.name);
+    ensure_seat_environment(&config);
+    seed_harness_credentials(store, data, &updated, &config);
+    write_agent_instructions(&config, &updated, parent_name.as_deref());
+    if !config.join("mcp-capability").is_file()
+        && crate::operator::ensure(store, &updated.id).is_err()
+    {
+        #[cfg(unix)]
+        if let Some(op_tok) = crate::operator::operator_token(data)
+            && let Ok(mut stream) =
+                std::os::unix::net::UnixStream::connect(data.join("anyagents.sock"))
+        {
+            use std::io::{Read as _, Write as _};
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+            let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+            let req = format!(
+                "POST /v1/operator/agents/{}/capability HTTP/1.1\r\nHost: localhost\r\n{}: {op_tok}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
+                updated.name,
+                crate::operator::HEADER
+            );
+            let _ = stream.write_all(req.as_bytes());
+            let mut buf = String::new();
+            let _ = stream.read_to_string(&mut buf);
+        }
+    }
+
+    let command = crate::data::current_exe_clean()?;
+    let args = vec![
+        "--data".into(),
+        data.display().to_string(),
+        "mcp".into(),
+        "--config".into(),
+        config.display().to_string(),
+    ];
+    match target_harness {
+        "codex" => {
+            let codex_toml = config.join("config.toml");
+            let _ = std::fs::remove_file(&codex_toml);
+            crate::mcp_config::write_codex_with_model(
+                &codex_toml,
+                updated.model.as_deref(),
+                &command,
+                &args,
+            )?;
+            if let Some(ref cont) = continuity_summary
+                && !cont.trim().is_empty()
+            {
+                let _ = crate::mcp_config::set_codex_developer_instructions(&codex_toml, cont);
+            }
+        }
+        "opencode" => {
+            opencode_config::write(&config, updated.model.as_deref(), &command, &args)?;
+        }
+        "claude-code" => {
+            crate::mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
+            let _ = crate::mcp_config::sanitize_claude_settings(&config);
+        }
+        "muse" => {
+            crate::muse_config::write(&config, updated.model.as_deref(), &command, &args)?;
+        }
+        _ => {}
+    }
+
+    if let Some((_, _, gid, _)) =
+        crate::sandbox::seat_for_agent_with_hint(&updated.name, parent_name.as_deref())
+    {
+        crate::sandbox::share_config_with_seat(&config, gid);
+    }
+
+    let process = if lock_busy { "alive" } else { "down" };
+    let turn_state = if in_progress_turn { "working" } else { "idle" };
+    let cutover_status = if in_progress_turn {
+        "pending_active_turn"
+    } else if lock_busy && previous_harness == target_harness {
+        "running"
+    } else {
+        "ready_on_next_wake"
+    };
+
+    Ok(serde_json::json!({
+        "id": updated.id.as_str(),
+        "name": updated.name,
+        "parent": updated.parent_id.as_ref().map(|p| p.as_str()),
+        "previous_harness": previous_harness,
+        "harness": updated.harness,
+        "model": updated.model,
+        "profile": normalized_profile,
+        "workdir": updated.workdir,
+        "state": updated.state,
+        "process": process,
+        "turn_state": turn_state,
+        "in_progress_turn": in_progress_turn,
+        "cutover_status": cutover_status,
+        "description_preserved": updated.instructions.is_some(),
+    }))
 }
 
 /// Create or update a named provider profile in `<data>/profiles/<provider>/<profile>`.
@@ -3614,5 +3917,93 @@ mod tests {
         assert_eq!(status, 5);
         assert!(ed.is_none());
         assert_eq!(sp, b" \x05*\x03\xd2\x01\x00");
+    }
+
+    #[test]
+    fn set_agent_harness_preserves_identity_history_and_refuses_incompatible() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        std::fs::create_dir_all(data.join("profiles/sylphx/default")).unwrap();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent {
+                name: "prism".to_string(),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
+                workdir: Some("/scratch/wt/owners-main".to_string()),
+                instructions: Some("Root coordinator".to_string()),
+                parent_id: None,
+            })
+            .unwrap();
+        let owner = store
+            .create_agent(anyagents_core::NewAgent {
+                name: "owner-anymd".to_string(),
+                harness: "opencode".to_string(),
+                model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
+                workdir: Some("/scratch/wt/owners-main".to_string()),
+                instructions: Some("Product Owner for AnyMD. Paused scope.".to_string()),
+                parent_id: Some(parent.id.clone()),
+            })
+            .unwrap();
+        let cfg = agent_config_dir(data, &owner.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "sylphx/default\n");
+        let mut inc = anyagents_core::Incoming::new("Initial owner task");
+        inc.sender = Some("agent:prism".to_string());
+        let _ = store.receive(&owner.id, inc).unwrap();
+        let _ = store.record_outbound(
+            &owner.id,
+            "agent:prism",
+            None,
+            "Completed initial AnyMD audit",
+        );
+        let _ = store.set_agent_state(&owner.id, "archived").unwrap();
+
+        let bad_harness = set_agent_harness(
+            &store,
+            data,
+            "operator",
+            "owner-anymd",
+            "unknown-harness",
+            None,
+            None,
+        );
+        assert!(bad_harness.is_err());
+
+        let incompat =
+            set_agent_harness(&store, data, "operator", "owner-anymd", "agy", None, None);
+        assert!(incompat.is_err());
+        assert_eq!(store.agent(&owner.id).unwrap().harness, "opencode");
+
+        let receipt =
+            set_agent_harness(&store, data, "operator", "owner-anymd", "codex", None, None)
+                .unwrap();
+        assert_eq!(receipt["id"], owner.id.as_str());
+        assert_eq!(receipt["name"], "owner-anymd");
+        assert_eq!(receipt["previous_harness"], "opencode");
+        assert_eq!(receipt["harness"], "codex");
+        assert_eq!(receipt["model"], "sylphx/openai/gpt-6.1-sol#xhigh");
+        assert_eq!(receipt["profile"], "sylphx/default");
+        assert_eq!(receipt["state"], "archived");
+        assert_eq!(receipt["cutover_status"], "ready_on_next_wake");
+
+        let after = store.agent(&owner.id).unwrap();
+        assert_eq!(after.id, owner.id);
+        assert_eq!(after.harness, "codex");
+        assert_eq!(
+            after.model.as_deref(),
+            Some("sylphx/openai/gpt-6.1-sol#xhigh")
+        );
+        assert_eq!(after.state, "archived");
+        assert_eq!(
+            after.instructions.as_deref(),
+            Some("Product Owner for AnyMD. Paused scope.")
+        );
+        let toml_text = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+        assert!(toml_text.contains("model = \"gpt-6.1-sol\""));
+        assert!(toml_text.contains("model_reasoning_effort = \"xhigh\""));
+        assert!(toml_text.contains("model_provider = \"sylphx\""));
+        assert!(toml_text.contains("developer_instructions = "));
+        assert!(toml_text.contains("Completed initial AnyMD audit"));
     }
 }

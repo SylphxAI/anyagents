@@ -198,11 +198,23 @@ pub fn write_codex_with_model(
         };
         updated = upsert_named_table(&updated, "[model_providers.sylphx]", &provider_table);
     }
+    if !updated.contains("[projects.\"/scratch/wt/owners-main\"]") {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("\n[projects.\"/scratch/wt/owners-main\"]\ntrust_level = \"trusted\"\n");
+    }
     if !updated.contains("[projects.\"/\"]") {
         if !updated.ends_with('\n') {
             updated.push('\n');
         }
         updated.push_str("\n[projects.\"/\"]\ntrust_level = \"trusted\"\n");
+    }
+    if !updated.contains("[memories]") {
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str("\n[memories]\ngenerate_memories = false\nuse_memories = false\n");
     }
     if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
         && !updated.contains("[features]")
@@ -210,7 +222,9 @@ pub fn write_codex_with_model(
         if !updated.ends_with('\n') {
             updated.push('\n');
         }
-        updated.push_str("\n[features]\nmulti_agent = false\n");
+        updated.push_str(
+            "\n[features]\napps = false\ncode_mode = false\ncode_mode_only = false\nmulti_agent = false\n",
+        );
     }
     let tmp_path = path.with_extension("toml.new");
     std::fs::write(&tmp_path, &updated)?;
@@ -224,6 +238,27 @@ pub fn write_codex_with_model(
         std::fs::rename(&tmp_path, path)?;
     }
     Ok(())
+}
+
+pub fn set_codex_developer_instructions(path: &Path, instructions: &str) -> Result<(), Error> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+            ) =>
+        {
+            String::new()
+        }
+        Err(err) => return Err(err.into()),
+    };
+    let updated = upsert_top_key(
+        &existing,
+        "developer_instructions",
+        &format!("\"{}\"", toml_escape(instructions)),
+    );
+    atomic_write_shared(path, updated.as_bytes())
 }
 
 fn upsert_top_key(text: &str, key: &str, value_literal: &str) -> String {
@@ -351,7 +386,19 @@ fn toml_args(args: &[String]) -> String {
 }
 
 fn toml_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    let mut out = String::with_capacity(text.len() + 16);
+    for ch in text.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 #[cfg(test)]

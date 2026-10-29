@@ -191,14 +191,51 @@ impl Mode {
 
 /// The agent one capability authenticates, read from the store.
 pub fn agent_for_capability(store: &Store, token: &str) -> Result<Principal, AuthError> {
-    let agent_id = store
-        .authenticate_capability(token)
-        .map_err(|_| AuthError::Unauthenticated("the session is not authenticated".into()))?;
-    let name = store
-        .agent(&agent_id)
-        .map_err(|_| AuthError::Unauthenticated("the agent is gone".into()))?
-        .name;
-    Ok(Principal::Agent { agent_id, name })
+    if let Ok(agent_id) = store.authenticate_capability(token) {
+        let name = store
+            .agent(&agent_id)
+            .map_err(|_| AuthError::Unauthenticated("the agent is gone".into()))?
+            .name;
+        return Ok(Principal::Agent { agent_id, name });
+    }
+    #[cfg(unix)]
+    if let Some(principal) = verify_capability_via_primary_socket(store.data_dir(), token) {
+        return Ok(principal);
+    }
+    Err(AuthError::Unauthenticated(
+        "the session is not authenticated".into(),
+    ))
+}
+
+#[cfg(unix)]
+fn verify_capability_via_primary_socket(data_dir: &Path, token: &str) -> Option<Principal> {
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixStream;
+    if token.contains('\r') || token.contains('\n') {
+        return None;
+    }
+    let sock = data_dir.join("anyagents.sock");
+    let mut stream = UnixStream::connect(sock).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let req = format!(
+        "GET /v1/whoami HTTP/1.1\r\nHost: localhost\r\n{}: {token}\r\nConnection: close\r\n\r\n",
+        operator::AGENT_HEADER
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).ok()?;
+    let (head, body) = resp.split_once("\r\n\r\n")?;
+    if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    let json_start = body.find('{')?;
+    let json_end = body.rfind('}')?;
+    let val: serde_json::Value = serde_json::from_str(&body[json_start..=json_end]).ok()?;
+    let id_str = val.get("agent_id")?.as_str()?;
+    let name = val.get("name")?.as_str()?.to_string();
+    let agent_id = AgentId::parse(id_str).ok()?;
+    Some(Principal::Agent { agent_id, name })
 }
 
 /// The agent a route names: a name or an id, resolved in the store.

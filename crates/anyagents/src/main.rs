@@ -52,6 +52,9 @@ struct Cli {
 enum Command {
     /// Run the server.
     Serve,
+    /// Run the authenticated admin API sidecar on `<data>/admin.sock`.
+    #[command(hide = true)]
+    ServeAdmin,
     /// Inspect server health, boundary/token state, installed harnesses, master profiles, and agents.
     Status {
         /// Output machine-readable JSON.
@@ -172,7 +175,7 @@ enum Command {
         /// Agent name or `agt_...` id.
         name: String,
     },
-    /// Store the provider key an agent's model runs on (API key mode), or bind a named provider profile.
+    /// Store the provider key an agent's model runs on (API key mode), bind a named provider profile, or switch its harness.
     Model {
         /// The agent name.
         agent: String,
@@ -181,7 +184,10 @@ enum Command {
         base_url: Option<String>,
         /// The model id the provider serves, for example deepseek-chat.
         #[arg(long)]
-        model: String,
+        model: Option<String>,
+        /// Optional target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        #[arg(long)]
+        harness: Option<String>,
         /// A file holding the key, on its own line. The key is never an argument.
         #[arg(long = "key-file")]
         key_file: Option<PathBuf>,
@@ -378,12 +384,21 @@ enum Command {
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
     FakeOpencode,
-    /// Test double for a harness: obeys the adapter contract for the harness
-    /// named in `<config>`, an agent's `adapter.json`.
-    #[command(hide = true)]
+    /// Switch an existing agent's harness while preserving its identity, model, profile, workdir, history, and lifecycle state (or run the hidden test double when given a single `adapter.json` path).
     Harness {
-        /// The `adapter.json` the agent was created with.
+        /// Agent name (`owner-anymd`) or `agt_...` ID (or `adapter.json` path for the test double).
         config: PathBuf,
+        /// Target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        harness: Option<String>,
+        /// Optional target harness ID flag (`--harness codex`).
+        #[arg(long = "harness")]
+        harness_flag: Option<String>,
+        /// Optional model override (retains existing model when omitted).
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional `<provider>/<profile>` override (retains existing bound profile when omitted).
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Put one agent's mailbox into its harness now, if the running server has
     /// not. Reads the store directly, so it also covers a server that was just
@@ -558,6 +573,22 @@ enum AgentsCommand {
         #[arg(long)]
         clear: bool,
     },
+    /// Switch an existing agent's harness in place while preserving its identity, model, profile, workdir, history, and lifecycle state.
+    Harness {
+        /// Agent name or `agt_...` id.
+        name: String,
+        /// Target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        harness: Option<String>,
+        /// Target harness ID flag (`--harness codex`).
+        #[arg(long = "harness")]
+        harness_flag: Option<String>,
+        /// Optional model override (retains existing model when omitted).
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional `<provider>/<profile>` override (retains existing bound profile when omitted).
+        #[arg(long)]
+        profile: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -585,6 +616,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     let data = resolve_data_dir(cli.data, matches!(cli.command, Command::Serve));
     match cli.command {
         Command::Serve => server::run(&data),
+        Command::ServeAdmin => server::run_admin(&data),
         Command::Status { json } => status_cmd(&data, json),
         Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
         Command::Harnesses { action } => match action {
@@ -609,7 +641,30 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
         Command::FakeOpencode => fake_opencode::run(),
-        Command::Harness { config } => harness_double::run(&config),
+        Command::Harness {
+            config,
+            harness,
+            harness_flag,
+            model,
+            profile,
+        } => {
+            if let Some(target_harness) = harness
+                .as_deref()
+                .or(harness_flag.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                agent::harness_cmd(
+                    &data,
+                    &config.to_string_lossy(),
+                    target_harness,
+                    model.as_deref(),
+                    profile.as_deref(),
+                )
+            } else {
+                harness_double::run(&config)
+            }
+        }
         Command::Agents { action } => agent::agents(&data, action),
         Command::Peers { state, parent } => {
             agent::peers(&data, state.as_deref(), parent.as_deref())
@@ -686,13 +741,15 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             agent,
             base_url,
             model,
+            harness,
             key_file,
             profile,
         } => model_cmd(
             &data,
             &agent,
             base_url.as_deref(),
-            &model,
+            model.as_deref(),
+            harness.as_deref(),
             key_file.as_deref(),
             profile.as_deref(),
         ),
@@ -1168,11 +1225,22 @@ fn model_cmd(
     data: &Path,
     agent: &str,
     base_url: Option<&str>,
-    model: &str,
+    model: Option<&str>,
+    harness: Option<&str>,
     key_file: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<(), anyagents_core::Error> {
     use anyagents_core::Error;
+    if let Some(target_harness) = harness.map(str::trim).filter(|s| !s.is_empty())
+        && key_file.is_none()
+        && base_url.is_none()
+    {
+        return agent::harness_cmd(data, agent, target_harness, model, profile);
+    }
+    let model = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| Error::Message("model is required".into()))?;
     if profile.is_some() && (key_file.is_some() || base_url.is_some()) {
         return Err(Error::Message(
             "profile cannot be combined with a key or base URL".into(),

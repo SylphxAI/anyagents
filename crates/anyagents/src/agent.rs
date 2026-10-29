@@ -77,7 +77,85 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
         } => {
             describe_cmd(data, Some(name), instructions, clear)?;
         }
+        AgentsCommand::Harness {
+            name,
+            harness,
+            harness_flag,
+            model,
+            profile,
+        } => {
+            let target_harness = harness
+                .as_deref()
+                .or(harness_flag.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    Error::Message(
+                        "usage: anyagents agents harness <agent> <harness> [--model ...] [--profile ...]"
+                            .into(),
+                    )
+                })?;
+            harness_cmd(
+                data,
+                &name,
+                target_harness,
+                model.as_deref(),
+                profile.as_deref(),
+            )?;
+        }
     }
+    Ok(())
+}
+
+pub fn harness_cmd(
+    data: &Path,
+    agent: &str,
+    harness: &str,
+    model: Option<&str>,
+    profile: Option<&str>,
+) -> Result<(), Error> {
+    let clean_agent = agent.trim().strip_prefix("agent:").unwrap_or(agent.trim());
+    let body = serde_json::json!({
+        "harness": harness,
+        "model": model,
+        "profile": profile,
+    });
+    if client::can_call_server(data) {
+        match client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/agents/{clean_agent}/harness"),
+            Some(body.to_string().into_bytes()),
+            &client::authority(data),
+        ) {
+            Ok(result) => {
+                println!(
+                    "{}",
+                    result.ok_or_else(|| Error::Message("the server answered nothing".into()))?
+                );
+                return Ok(());
+            }
+            Err(err) if err.contains("404") && client::agent_identity().is_none() => {}
+            Err(err) => return Err(Error::Message(err)),
+        }
+    }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "administrative authority required (agent session cannot bypass server boundary)"
+                .into(),
+        ));
+    }
+    let store = open(data)?;
+    let out = crate::create::set_agent_harness(
+        &store,
+        data,
+        "operator",
+        clean_agent,
+        harness,
+        model,
+        profile,
+    )?;
+    println!("{out}");
     Ok(())
 }
 

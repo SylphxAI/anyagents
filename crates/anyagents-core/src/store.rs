@@ -662,6 +662,20 @@ impl Store {
         Ok(())
     }
 
+    pub fn set_agent_harness(&self, agent_id: &AgentId, harness: &str) -> Result<Agent, Error> {
+        let clean = harness.trim();
+        if clean.is_empty() {
+            return Err(Error::Message("harness is empty".into()));
+        }
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        conn.execute(
+            "UPDATE agents SET harness = ?2 WHERE id = ?1",
+            params![agent_id.as_str(), clean],
+        )?;
+        agent_by_id(&conn, agent_id)
+    }
+
     /// Administrative metadata only; callers must never pass credentials here.
     pub fn record_admin_audit(&self, actor: &str, action: &str, target: &str) -> Result<(), Error> {
         self.conn().execute(

@@ -172,7 +172,8 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let (status, bytes) = request_naming(
+        let body_clone = body.clone();
+        let (mut status, mut bytes) = request_naming(
             &self.socket,
             method,
             path,
@@ -182,6 +183,25 @@ impl Client {
             named.as_deref(),
         )
         .await?;
+        if status.as_u16() == 404
+            && let Some(parent_dir) = self.socket.parent()
+        {
+            let admin_socket = parent_dir.join("admin.sock");
+            if admin_socket.exists()
+                && let Ok(fallback) = request_naming(
+                    &admin_socket,
+                    method,
+                    path,
+                    body_clone,
+                    Some(&cap),
+                    None,
+                    named.as_deref(),
+                )
+                .await
+            {
+                (status, bytes) = fallback;
+            }
+        }
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
@@ -826,6 +846,34 @@ impl AgentMcp {
                     serde_json::to_value(view).map_err(|e| e.to_string())?,
                 ))
             }
+            "harness" | "set_harness" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents harness` requires `agent`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents harness` requires `harness`".to_string())?;
+                let body = serde_json::json!({
+                    "harness": harness,
+                    "model": args.model,
+                    "profile": args.profile,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/harness"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
             "delete" | "kill" | "remove" => {
                 let target = args
                     .agent
@@ -841,7 +889,7 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(deleted))
             }
             other => Err(format!(
-                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, or `delete`"
+                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, `harness`, or `delete`"
             )),
         }
     }

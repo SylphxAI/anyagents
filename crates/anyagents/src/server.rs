@@ -263,6 +263,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/model", post(model_route))
+        .route("/v1/agents/{name}/harness", post(harness_route))
         .route(
             "/v1/agents/{name}/description",
             get(get_description_route).post(set_description_route),
@@ -327,6 +328,92 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// Serve the authenticated HTTP API on `<data>/admin.sock` without starting a
+/// second `Supervisor` or `Poller`. Allows newly shipped API routes (such as
+/// `POST /v1/agents/{name}/harness`) to answer authenticated callers across the
+/// OS seat boundary (`anyagents-sock`) while an existing `anyagents serve`
+/// daemon keeps running uninterrupted on `anyagents.sock`.
+pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let store = Arc::new(Store::open(data.join("state.db"))?);
+    runtime.block_on(async move {
+        let auth = deployment_mode(data);
+        let path = data.join("admin.sock");
+        if path.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err(Error::Message(format!(
+                "socket path is longer than {MAX_SOCKET_PATH} bytes"
+            )));
+        }
+        prepare_socket(&path)?;
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        set_socket_mode(&path)?;
+        if auth.is_confined() {
+            crate::sandbox::share_socket_with_seats(&path);
+        }
+        let state = AppState {
+            send_namespace: capability_key()?[..16].to_string(),
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
+            auth,
+        };
+        let app = Router::new()
+            .route("/v1/agents", get(list_agents).post(create_agent_route))
+            .route("/v1/agents/{name}/admin", post(set_admin_route))
+            .route("/v1/agents/{name}/model", post(model_route))
+            .route("/v1/agents/{name}/harness", post(harness_route))
+            .route(
+                "/v1/agents/{name}/description",
+                get(get_description_route).post(set_description_route),
+            )
+            .route(
+                "/v1/agents/{name}/instructions",
+                get(get_description_route).post(set_description_route),
+            )
+            .route("/v1/browser", post(browser_route))
+            .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+            .route(
+                "/v1/subagent-defaults",
+                get(get_subagent_defaults_route).post(set_subagent_defaults_route),
+            )
+            .route("/v1/channels", get(channels_route).post(add_channel_route))
+            .route("/v1/agents/{name}/inbox", get(inbox))
+            .route("/v1/agents/{name}/conversation", get(conversation_route))
+            .route("/v1/agents/{name}/archive", post(archive_agent_route))
+            .route("/v1/agents/{name}/pause", post(pause_agent_route))
+            .route("/v1/agents/{name}/wake", post(wake_agent_route))
+            .route(
+                "/v1/agents/{name}",
+                axum::routing::delete(delete_agent_route),
+            )
+            .route(
+                "/v1/groups",
+                get(list_groups_route).post(group_action_route),
+            )
+            .route("/v1/send", post(send))
+            .route("/v1/interact", post(interact_route))
+            .route(
+                "/v1/operator/agents/{name}/capability",
+                post(mint_capability),
+            )
+            .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
+            .route("/v1/whoami", get(whoami))
+            .with_state(state);
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            })
+            .await;
+        let _ = std::fs::remove_file(&path);
+        result.map_err(Error::from)
+    })
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -603,10 +690,58 @@ async fn set_admin_route(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelRequest {
-    model: String,
+    model: Option<String>,
+    harness: Option<String>,
     base_url: Option<String>,
     key: Option<String>,
     profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessRequest {
+    harness: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+async fn harness_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<HarnessRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let actor = match &principal {
+            Principal::Agent {
+                agent_id,
+                name: caller_name,
+            } if found.parent_id.as_ref() == Some(agent_id) => {
+                format!("agent:{caller_name}")
+            }
+            _ => {
+                require_admin_or_operator(&state.store, &principal, "agents.harness", &found.name)?
+            }
+        };
+        let out = create::set_agent_harness(
+            &state.store,
+            state.store.data_dir(),
+            &actor,
+            &found.name,
+            &body.harness,
+            body.model.as_deref(),
+            body.profile.as_deref(),
+        )
+        .map_err(ApiError::from_store)?;
+        Ok(Json(out))
+    })
+    .await
 }
 
 async fn model_route(
@@ -615,11 +750,37 @@ async fn model_route(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+    let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
     let agent = state
         .store
         .agent_by_name(&name)
         .map_err(ApiError::from_store)?;
+    if let Some(ref harness) = body
+        .harness
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && body.key.is_none()
+        && body.base_url.is_none()
+    {
+        let out = create::set_agent_harness(
+            &state.store,
+            state.store.data_dir(),
+            &actor,
+            &agent.name,
+            harness,
+            body.model.as_deref(),
+            body.profile.as_deref(),
+        )
+        .map_err(ApiError::from_store)?;
+        return Ok(Json(out));
+    }
+    let model_str = body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
     if let Some(profile) = body.profile {
         if body.key.is_some() || body.base_url.is_some() {
             return Err(ApiError::new(
@@ -627,7 +788,7 @@ async fn model_route(
                 "profile cannot be combined with a key or base URL",
             ));
         }
-        create::bind_profile(&state.store, &agent, &profile, &body.model)
+        create::bind_profile(&state.store, &agent, &profile, model_str)
             .map_err(ApiError::from_store)?;
     } else {
         let key = body.key.as_deref().unwrap_or("").trim();
@@ -641,11 +802,11 @@ async fn model_route(
             .base_url
             .as_deref()
             .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
-        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, &body.model, key)
+        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
             .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
     }
     Ok(Json(
-        serde_json::json!({"agent": agent.name, "model": body.model}),
+        serde_json::json!({"agent": agent.name, "model": model_str}),
     ))
 }
 
@@ -1395,18 +1556,7 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
     let seat_ids = detect_seat_ids(&config_dir);
-    for rel in [
-        "cache-home",
-        "state-home",
-        "tmp",
-        ".rustup",
-        ".cargo",
-        "data-home/opencode",
-        "opencode-session-id",
-        "claude-session-id",
-        ".claude/projects",
-        ".codex/sessions",
-    ] {
+    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }

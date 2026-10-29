@@ -1112,18 +1112,7 @@ impl<H: Harness + 'static> Session<H> {
 
 fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
-    for rel in [
-        "cache-home",
-        "state-home",
-        "tmp",
-        ".rustup",
-        ".cargo",
-        "data-home/opencode",
-        "opencode-session-id",
-        "claude-session-id",
-        ".claude/projects",
-        ".codex/sessions",
-    ] {
+    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
