@@ -450,6 +450,9 @@ enum Command {
         /// Explicit text override for `fill` / `type`.
         #[arg(long)]
         text: Option<String>,
+        /// Secret reference (`op://vault/item/field` or `op-otp://vault/item`) resolved in memory for `fill` / `type`.
+        #[arg(long = "secret-ref")]
+        secret_ref: Option<String>,
         /// Explicit JS code override for `eval`.
         #[arg(long)]
         script: Option<String>,
@@ -947,6 +950,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             url,
             selector,
             text,
+            secret_ref,
             script,
             path,
             submit,
@@ -954,8 +958,8 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             wait_ms,
             headless,
         } => browser_cmd(
-            &data, action, target, value, profile, url, selector, text, script, path, submit,
-            full_page, wait_ms, headless,
+            &data, action, target, value, profile, url, selector, text, secret_ref, script, path,
+            submit, full_page, wait_ms, headless,
         ),
     }
 }
@@ -970,6 +974,7 @@ fn browser_cmd(
     url: Option<String>,
     selector: Option<String>,
     text: Option<String>,
+    secret_ref: Option<String>,
     script: Option<String>,
     path: Option<String>,
     submit: bool,
@@ -984,7 +989,7 @@ fn browser_cmd(
         url,
         selector,
         text,
-        secret_ref: None,
+        secret_ref,
         key: None,
         script,
         path,
@@ -1011,7 +1016,7 @@ fn browser_cmd(
             if req.selector.is_none() {
                 req.selector = target;
             }
-            if req.text.is_none() {
+            if req.text.is_none() && req.secret_ref.is_none() {
                 req.text = value;
             }
         }
