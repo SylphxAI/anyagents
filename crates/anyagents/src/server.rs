@@ -361,11 +361,120 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
 /// `POST /v1/agents/{name}/harness`) to answer authenticated callers across the
 /// OS seat boundary (`anyagents-sock`) while an existing `anyagents serve`
 /// daemon keeps running uninterrupted on `anyagents.sock`.
+#[derive(Default)]
+struct AdminReconcileState {
+    initialized: bool,
+    watermark_seq: std::collections::HashMap<String, i64>,
+    last_backoff_reset_ms: std::collections::HashMap<String, i64>,
+}
+
+fn reconcile_stopped_and_backed_off_agents(
+    store: &Store,
+    health: &HealthBoard,
+    data: &Path,
+    reconcile: &std::sync::Mutex<AdminReconcileState>,
+    now_ms: i64,
+) {
+    let Ok(agents) = store.list_agents() else {
+        return;
+    };
+    let mut guard = match reconcile.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !guard.initialized {
+        for agent in &agents {
+            let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
+            let has_lag = store
+                .lag(&agent.id, now_ms)
+                .ok()
+                .and_then(|l| l.oldest_undelivered_age_ms)
+                .is_some();
+            if !has_lag {
+                guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                continue;
+            }
+            let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+            let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+        }
+        guard.initialized = true;
+    }
+
+    for agent in &agents {
+        let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
+        let oldest_age_ms = store
+            .lag(&agent.id, now_ms)
+            .ok()
+            .and_then(|l| l.oldest_undelivered_age_ms);
+        if agent.state == "archived" {
+            if oldest_age_ms.is_some() {
+                let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+                let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+                let prev_wm = guard
+                    .watermark_seq
+                    .get(agent.id.as_str())
+                    .copied()
+                    .unwrap_or(delivered);
+                if max_seq > delivered && max_seq > prev_wm {
+                    let should_wake = undelivered.iter().filter(|m| m.seq > prev_wm).any(|m| {
+                        !(agent.parent_id.is_none()
+                            && m.text.trim_start().starts_with("[Sub-Agent Completed]"))
+                    });
+                    if should_wake {
+                        if store.set_agent_state(&agent.id, "running").is_ok() {
+                            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                            create::poke_agent_wake_socket_mail(data, &agent.id);
+                        }
+                    } else {
+                        guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                    }
+                }
+            } else {
+                guard.watermark_seq.insert(agent.id.to_string(), delivered);
+            }
+        } else if agent.state == "running" {
+            if oldest_age_ms.is_none() {
+                guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                continue;
+            }
+            let is_down_without_quota = health.get(&agent.id).is_some_and(|live| {
+                !live.process_alive
+                    && live.quota_reset_at_ms.is_none()
+                    && live.restart_at_ms.is_some_and(|r| r >= 15_000)
+            });
+            if is_down_without_quota && oldest_age_ms.is_some_and(|age| age >= 15_000) {
+                let last_reset = guard
+                    .last_backoff_reset_ms
+                    .get(agent.id.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                if now_ms.saturating_sub(last_reset) >= 60_000 {
+                    guard
+                        .last_backoff_reset_ms
+                        .insert(agent.id.to_string(), now_ms);
+                    let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                    let _ = std::fs::write(
+                        cfg.join(".anyagents-profile-rotated-ms"),
+                        now_ms.to_string(),
+                    );
+                    let _ = store.set_agent_state(&agent.id, "paused");
+                    create::poke_agent_wake_socket(data, &agent.id);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let _ = store.set_agent_state(&agent.id, "running");
+                    create::poke_agent_wake_socket_mail(data, &agent.id);
+                }
+            }
+        }
+    }
+}
+
 pub fn run_admin(data: &Path) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
-    runtime.block_on(async move {
+    let res = runtime.block_on(async move {
         let auth = deployment_mode(data);
+        let send_namespace = capability_key()?[..16].to_string();
         let path = data.join("admin.sock");
         if path.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(Error::Message(format!(
@@ -383,22 +492,52 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         let sched_store = Arc::clone(&store);
         let sched_health = health.clone();
         let sched_data = data.to_path_buf();
-        tokio::spawn(async move {
+        let reconcile_state = Arc::new(std::sync::Mutex::new(AdminReconcileState::default()));
+        let sched_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut ticks: u64 = 0;
             loop {
                 interval.tick().await;
+                ticks = ticks.wrapping_add(1);
+                let sync_health = ticks.is_multiple_of(5);
                 let st = Arc::clone(&sched_store);
                 let hb = sched_health.clone();
                 let dd = sched_data.clone();
+                let rec = Arc::clone(&reconcile_state);
                 let _ = tokio::task::spawn_blocking(move || {
-                    sync_health_from_primary_socket(&dd, &hb);
-                    crate::schedule::tick_schedules_once(&st, &hb, now_ms());
+                    if sync_health {
+                        sync_health_from_primary_socket(&dd, &hb);
+                    }
+                    let now = now_ms();
+                    reconcile_stopped_and_backed_off_agents(&st, &hb, &dd, &rec, now);
+                    crate::schedule::tick_schedules_once(&st, &hb, now);
                 })
                 .await;
             }
         });
+        let reaper_handle = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && !crate::sandbox::is_isolated_test_env()
+        {
+            let reaper_root = data.to_path_buf();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let root = reaper_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::browser::reap_idle_browsers(&root);
+                        crate::create::sync_fresher_bound_agent_credentials(&root);
+                        #[cfg(unix)]
+                        crate::create::sync_canonical_skills(&root);
+                    })
+                    .await;
+                }
+            }))
+        } else {
+            None
+        };
         let state = AppState {
-            send_namespace: capability_key()?[..16].to_string(),
+            send_namespace,
             store: Arc::clone(&store),
             health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
@@ -467,9 +606,15 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
                 }
             })
             .await;
+        sched_handle.abort();
+        if let Some(h) = reaper_handle {
+            h.abort();
+        }
         let _ = std::fs::remove_file(&path);
         result.map_err(Error::from)
-    })
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+    res
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -812,14 +957,14 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
         let Ok(mut stream) = UnixStream::connect(&sock) else {
             return;
         };
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(3000)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(3000)));
         let auth_hdr = match crate::operator::operator_token(data) {
             Some(tok) => format!("{}: {tok}\r\n", crate::operator::HEADER),
             None => String::new(),
         };
         let req = format!(
-            "GET /v1/agents HTTP/1.1\r\nHost: localhost\r\n{auth_hdr}Connection: close\r\n\r\n"
+            "GET /v1/agents HTTP/1.0\r\nHost: localhost\r\n{auth_hdr}Connection: close\r\n\r\n"
         );
         if stream.write_all(req.as_bytes()).is_err() {
             return;
@@ -880,7 +1025,9 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
                     quota_reset_at_ms: item
                         .get("quota_reset_at_ms")
                         .and_then(serde_json::Value::as_i64),
-                    restart_at_ms: None,
+                    restart_at_ms: item
+                        .get("restart_at_ms")
+                        .and_then(serde_json::Value::as_i64),
                     pid: None,
                     live_harness: item
                         .get("live_harness")
@@ -3870,7 +4017,13 @@ fn deliver_agent(
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
     if agent.state == "archived" {
-        let _ = store.set_agent_state(&agent.id, "running");
+        let is_auto_subagent_completed = body
+            .text
+            .trim_start()
+            .starts_with("[Sub-Agent Completed]");
+        if !(agent.parent_id.is_none() && is_auto_subagent_completed) {
+            let _ = store.set_agent_state(&agent.id, "running");
+        }
     }
     let outcome = store
         .receive(

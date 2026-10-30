@@ -196,7 +196,7 @@ impl Client {
             (Some(adm), false) if adm.exists() => (self.socket.as_path(), Some(adm.as_path())),
             _ => (self.socket.as_path(), None),
         };
-        let (mut status, mut bytes) = request_naming(
+        let primary_res = request_naming(
             primary_sock,
             method,
             path,
@@ -205,7 +205,26 @@ impl Client {
             None,
             named.as_deref(),
         )
-        .await?;
+        .await;
+        let (mut status, mut bytes) = match primary_res {
+            Ok(ans) => ans,
+            Err(primary_err) => {
+                if let Some(sec_sock) = secondary_sock {
+                    request_naming(
+                        sec_sock,
+                        method,
+                        path,
+                        body_clone.clone(),
+                        Some(&cap),
+                        None,
+                        named.as_deref(),
+                    )
+                    .await?
+                } else {
+                    return Err(primary_err);
+                }
+            }
+        };
         if !status.is_success()
             && let Some(sec_sock) = secondary_sock
             && let Ok(fallback) = request_naming(
