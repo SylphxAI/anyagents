@@ -15,7 +15,7 @@ cargo install --locked --path crates/anyagents --bin anyagents
 anyagents --version
 ```
 
-The npm launcher is in this repository, but `@sylphx/anyagents` has not been published. Homebrew and Scoop packages are not available. Native Windows is not supported by the current Unix-socket implementation.
+The npm launcher and platform packages are defined in this repository. Check [npm](https://www.npmjs.com/package/@sylphx/anyagents) for published versions. Homebrew and Scoop packages are not available. Native Windows is not supported by the current Unix-socket implementation.
 
 ## Why
 

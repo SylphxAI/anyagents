@@ -2,11 +2,11 @@
 
 Run any coding agent harness as a long-lived agent on your own machine or server: install and sign in Claude Code, Codex, OpenCode, Gemini CLI and more, keep every agent running, connect each one to Telegram, and see what each one costs.
 
-The npm package is not published yet. Build from source using the [repository installation instructions](https://github.com/SylphxAI/anyagents#install-from-source).
+Check [npm](https://www.npmjs.com/package/@sylphx/anyagents) for published versions, or build from source using the [repository installation instructions](https://github.com/SylphxAI/anyagents#install-from-source).
 
 This package is a thin launcher. Installing it also installs the `anyagents` binary for your platform as an optional dependency (`@sylphx/anyagents-<platform>`), so there is no toolchain and no build step.
 
-Once published:
+Install a published version:
 
 ```bash
 npx @sylphx/anyagents --help
