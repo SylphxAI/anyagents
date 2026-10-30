@@ -273,11 +273,18 @@ async fn mcp_tools_use_the_server_socket() {
 
     let tools = alpha.list_all_tools().await.unwrap();
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
-    assert!(names.contains(&"send".to_string()), "{names:?}");
-    assert!(names.contains(&"conversation".to_string()), "{names:?}");
-    assert!(names.contains(&"search".to_string()), "{names:?}");
-    assert!(!names.contains(&"inbox".to_string()), "{names:?}");
-    assert!(names.contains(&"agents".to_string()), "{names:?}");
+    assert_eq!(
+        names,
+        vec![
+            "agents".to_string(),
+            "browser".to_string(),
+            "conversation".to_string(),
+            "groups".to_string(),
+            "schedule".to_string(),
+            "send".to_string(),
+        ],
+        "expected consolidated 6 canonical orthogonal MCP tools, got {names:?}"
+    );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
     assert_eq!(listed.agents.len(), 2);
@@ -373,6 +380,19 @@ async fn mcp_tools_use_the_server_socket() {
         in_room.turns.iter().any(|line| line.text == "room line"),
         "{:?}",
         in_room.turns.len()
+    );
+    let searched_conv: ConversationResponse = ok_json(
+        call(
+            &alpha,
+            "conversation",
+            serde_json::json!({"query": "room line", "limit": 5}),
+        )
+        .await,
+    );
+    assert!(
+        searched_conv.turns.iter().any(|line| line.text == "room line"),
+        "{:?}",
+        searched_conv.turns
     );
     let searched: ConversationResponse = ok_json(
         call(
@@ -500,12 +520,12 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(archived.state, "archived");
 
     // While archived, `group:all` skips it.
-    // Also pause `worker-1` after joining `crew` to verify `skipped` reports paused agents with reason.
+    // Also pause `worker-1` via unified `agents` tool after joining `crew` to verify `skipped` reports paused agents with reason.
     let paused_worker: AgentView = ok_json(
         call(
             &alpha,
-            "subagents",
-            serde_json::json!({"action": "pause", "agent": &spawned.id}),
+            "agents",
+            serde_json::json!({"action": "pause", "name": &spawned.id}),
         )
         .await,
     );
@@ -528,8 +548,14 @@ async fn mcp_tools_use_the_server_socket() {
         to_all_with_paused.skipped
     );
 
-    let archived: AgentView =
-        ok_json(call(&alpha, "archive", serde_json::json!({"agent": &spawned.id})).await);
+    let archived: AgentView = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "archive", "name": &spawned.id}),
+        )
+        .await,
+    );
     assert_eq!(archived.state, "archived");
 
     let to_all: SendResponse = ok_json(
