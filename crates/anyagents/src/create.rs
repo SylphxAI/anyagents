@@ -2344,17 +2344,10 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         );
-        if let Some(a) = agent_rec {
-            let parent_name = a
-                .parent_id
-                .as_ref()
-                .and_then(|pid| all_agents.iter().find(|p| &p.id == pid))
-                .map(|p| p.name.as_str());
-            if let Some((_, uid, gid, _)) =
-                crate::sandbox::seat_for_agent_with_hint(&a.name, parent_name)
-            {
-                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
-            }
+        if let (Some(s), Some(a)) = (store_opt.as_ref(), agent_rec)
+            && let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, a)
+        {
+            crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
         }
     }
 }
@@ -2563,6 +2556,14 @@ pub(crate) fn sync_and_list_provider_profiles(
     store: &Store,
     data: &Path,
 ) -> Vec<ProviderProfileEntry> {
+    sync_and_list_provider_profiles_with_options(store, data, true)
+}
+
+pub(crate) fn sync_and_list_provider_profiles_with_options(
+    store: &Store,
+    data: &Path,
+    probe_usage: bool,
+) -> Vec<ProviderProfileEntry> {
     let agents = store.list_agents().unwrap_or_default();
     let profiles_root = data.join("profiles");
     let _ = std::fs::create_dir_all(&profiles_root);
@@ -2747,7 +2748,9 @@ pub(crate) fn sync_and_list_provider_profiles(
     }
 
     entries.sort_by(|a, b| (&a.provider, &a.profile).cmp(&(&b.provider, &b.profile)));
-    enrich_profiles_usage(data, &mut entries);
+    if probe_usage {
+        enrich_profiles_usage(data, &mut entries);
+    }
 
     // Bind active agents to their resolved `<provider>/<profile>`, restore affinity
     // (`<provider>/<agent.name>`) when a dedicated profile recovers quota (`>= 10%`),
@@ -2849,13 +2852,7 @@ pub(crate) fn sync_and_list_provider_profiles(
     entries
 }
 
-/// Syncs any fresher OAuth credentials from active seats back into
-/// `<data>/profiles/<provider>/<profile>` and probes native upstream usage,
-/// quota, or balance for each profile in parallel.
-pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileEntry]) {
-    if crate::sandbox::is_isolated_test_env() || entries.is_empty() {
-        return;
-    }
+pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
     let profiles_root = data.join("profiles");
     if let Ok(store) = Store::open(data.join("state.db"))
         && let Ok(agents) = store.list_agents()
@@ -2897,6 +2894,67 @@ pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileE
             }
         }
     }
+    let anth_root = profiles_root.join("anthropic");
+    if let Ok(entries) = std::fs::read_dir(&anth_root) {
+        let now_ms = anyagents_core::now_ms();
+        let mut profs: Vec<(String, PathBuf, i64, Option<String>, Vec<u8>)> = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let bytes = std::fs::read(p.join(".credentials.json"))
+                .or_else(|_| std::fs::read(p.join(".claude/.credentials.json")))
+                .unwrap_or_default();
+            let exp = json_oauth_expires_at(&bytes).unwrap_or(0);
+            let acct = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("/claudeAiOauth/accountUuid")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                });
+            profs.push((name, p, exp, acct, bytes));
+        }
+        if let Some((_, _, best_exp, best_acct, best_bytes)) = profs
+            .iter()
+            .filter(|(_, _, exp, _, bytes)| *exp > now_ms && !bytes.is_empty())
+            .max_by_key(|(_, _, exp, _, _)| *exp)
+            .cloned()
+        {
+            for (name, dir, exp, acct, _) in &profs {
+                let same_acct = match (&best_acct, acct) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => true,
+                };
+                if *exp < best_exp && (*exp <= now_ms || same_acct) {
+                    let _ = std::fs::create_dir_all(dir.join(".claude"));
+                    let _ = std::fs::write(dir.join(".credentials.json"), &best_bytes);
+                    let _ = std::fs::write(dir.join(".claude/.credentials.json"), &best_bytes);
+                    propagate_profile_files_to_bound_agents(
+                        data,
+                        "anthropic",
+                        name,
+                        &[".credentials.json", ".claude/.credentials.json"],
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Syncs any fresher OAuth credentials from active seats back into
+/// `<data>/profiles/<provider>/<profile>` and probes native upstream usage,
+/// quota, or balance for each profile in parallel.
+pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileEntry]) {
+    if crate::sandbox::is_isolated_test_env() || entries.is_empty() {
+        return;
+    }
+    sync_fresher_bound_agent_credentials(data);
 
     std::thread::scope(|s| {
         let mut handles = Vec::new();
@@ -3078,6 +3136,7 @@ fn sync_anthropic_profile_metadata(
     profile: &str,
     token: &str,
     cred: &mut serde_json::Value,
+    force: bool,
 ) -> Option<&'static str> {
     let existing_sub = cred
         .pointer("/claudeAiOauth/subscriptionType")
@@ -3085,8 +3144,17 @@ fn sync_anthropic_profile_metadata(
     let existing_tier = cred
         .pointer("/claudeAiOauth/rateLimitTier")
         .and_then(serde_json::Value::as_str);
+    let now_ms = anyagents_core::now_ms();
+    let meta_sync_path = prof_dir.join(".anyagents-profile-meta-sync-ms");
+    let last_sync_ms = std::fs::read_to_string(&meta_sync_path)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
     let mut changed = false;
-    if (existing_sub.is_none() || existing_tier.is_none())
+    if (force
+        || existing_sub.is_none()
+        || existing_tier.is_none()
+        || now_ms.saturating_sub(last_sync_ms) >= 300_000)
         && let Ok(resp) = http
             .get("https://api.anthropic.com/api/oauth/profile")
             .header("authorization", &format!("Bearer {token}"))
@@ -3097,6 +3165,7 @@ fn sync_anthropic_profile_metadata(
         && let Ok(body) = resp.into_body().read_to_string()
         && let Ok(pval) = serde_json::from_str::<serde_json::Value>(&body)
     {
+        let _ = std::fs::write(&meta_sync_path, format!("{now_ms}\n"));
         let org_type = pval
             .pointer("/organization/organization_type")
             .and_then(serde_json::Value::as_str);
@@ -3110,10 +3179,25 @@ fn sync_anthropic_profile_metadata(
         let live_tier = pval
             .pointer("/organization/rate_limit_tier")
             .and_then(serde_json::Value::as_str);
+        let acct_uuid = pval
+            .pointer("/account/uuid")
+            .and_then(serde_json::Value::as_str);
         if let Some(oauth) = cred
             .get_mut("claudeAiOauth")
             .and_then(serde_json::Value::as_object_mut)
         {
+            if let Some(au) = acct_uuid
+                && oauth
+                    .get("accountUuid")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(au)
+            {
+                oauth.insert(
+                    "accountUuid".to_string(),
+                    serde_json::Value::String(au.to_string()),
+                );
+                changed = true;
+            }
             if let Some(ms) = mapped_sub
                 && oauth
                     .get("subscriptionType")
@@ -3271,9 +3355,28 @@ pub(crate) fn probe_one_profile_usage(
                 let body = resp.into_body().read_to_string().ok()?;
                 serde_json::from_str(&body).ok()
             };
-            let val = match fetch_usage(&token) {
+            let now_ms = anyagents_core::now_ms();
+            let expires_at = cred
+                .pointer("/claudeAiOauth/expiresAt")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(i64::MAX);
+            let expiring_soon = now_ms.saturating_add(30 * 60 * 1000) >= expires_at;
+            let initial_usage = if expiring_soon {
+                None
+            } else {
+                fetch_usage(&token)
+            };
+            let val = match initial_usage {
                 Some(v) => v,
                 None => {
+                    let attempt_path = prof_dir.join(".anyagents-oauth-refresh-attempt-ms");
+                    let last_attempt_ms = std::fs::read_to_string(&attempt_path)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                    if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                        fetch_usage(&token)?
+                    } else {
                     let rtok = cred
                         .pointer("/claudeAiOauth/refreshToken")
                         .and_then(serde_json::Value::as_str)?
@@ -3282,6 +3385,7 @@ pub(crate) fn probe_one_profile_usage(
                     if rtok.is_empty() {
                         return None;
                     }
+                    let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
                     let req_body = serde_json::json!({
                         "grant_type": "refresh_token",
                         "refresh_token": rtok,
@@ -3317,10 +3421,6 @@ pub(crate) fn probe_one_profile_usage(
                         if let Some(exp_in) =
                             rval.get("expires_in").and_then(serde_json::Value::as_i64)
                         {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_millis() as i64)
-                                .unwrap_or(0);
                             oauth.insert(
                                 "expiresAt".to_string(),
                                 serde_json::Value::Number((now_ms + exp_in * 1000).into()),
@@ -3341,12 +3441,14 @@ pub(crate) fn probe_one_profile_usage(
                             );
                         }
                     }
-                    token = new_acc;
-                    fetch_usage(&token)?
+                        token = new_acc;
+                        fetch_usage(&token)?
+                    }
                 }
             };
-            let tier_badge =
-                sync_anthropic_profile_metadata(&http, data, &prof_dir, profile, &token, &mut cred);
+            let tier_badge = sync_anthropic_profile_metadata(
+                &http, data, &prof_dir, profile, &token, &mut cred, false,
+            );
             let tier_suffix = tier_badge.map(|t| format!(" ({t})")).unwrap_or_default();
             let u5 = val
                 .pointer("/five_hour/utilization")
@@ -4220,6 +4322,7 @@ pub(crate) fn probe_profile_remaining_pct(
     profile: &str,
     model: Option<&str>,
 ) -> Option<i64> {
+    sync_fresher_bound_agent_credentials(data);
     let usage = probe_one_profile_usage(data, provider, profile)?;
     parse_remaining_pct_from_usage(&usage, model)
 }
@@ -4242,14 +4345,12 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
     let filter = target.map(str::trim).filter(|s| {
         !s.is_empty() && !s.eq_ignore_ascii_case("refresh") && !s.eq_ignore_ascii_case("reset")
     });
+    sync_fresher_bound_agent_credentials(data);
+    let now_ms = anyagents_core::now_ms();
     if let Ok(agents_dir) = std::fs::read_dir(data.join("agents")) {
         for entry in agents_dir.flatten() {
-            let _ = std::fs::remove_file(
-                entry
-                    .path()
-                    .join("config")
-                    .join(".anyagents-last-quota-check-ms"),
-            );
+            let cfg = entry.path().join("config");
+            let _ = std::fs::remove_file(cfg.join(".anyagents-last-quota-check-ms"));
         }
     }
     let http = ureq::Agent::config_builder()
@@ -4283,6 +4384,8 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
             {
                 continue;
             }
+            let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
+            let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
             match provider.as_str() {
                 "anthropic" => {
                     let Ok(cred_text) = std::fs::read_to_string(prof_dir.join(".credentials.json"))
@@ -4307,7 +4410,26 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
                         .unwrap_or("")
                         .trim()
                         .to_string();
-                    if !rtok.is_empty() {
+                    let expires_at = cred
+                        .pointer("/claudeAiOauth/expiresAt")
+                        .and_then(serde_json::Value::as_i64)
+                        .unwrap_or(0);
+                    let tok_valid = !tok.is_empty()
+                        && expires_at > now_ms + 300_000
+                        && http
+                            .get("https://api.anthropic.com/api/oauth/usage")
+                            .header("authorization", &format!("Bearer {tok}"))
+                            .header("anthropic-beta", "oauth-2025-04-20")
+                            .header("cache-control", "no-cache")
+                            .header("user-agent", "claude-code/2.1.310")
+                            .call()
+                            .is_ok();
+                    let mut refreshed_token = false;
+                    if !tok_valid && !rtok.is_empty() {
+                        let _ = std::fs::write(
+                            prof_dir.join(".anyagents-oauth-refresh-attempt-ms"),
+                            format!("{now_ms}\n"),
+                        );
                         let req_body = serde_json::json!({
                             "grant_type": "refresh_token",
                             "refresh_token": rtok,
@@ -4328,6 +4450,7 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
                             && !new_acc.is_empty()
                         {
                             tok = new_acc.clone();
+                            refreshed_token = true;
                             if let Some(oauth) = cred
                                 .get_mut("claudeAiOauth")
                                 .and_then(serde_json::Value::as_object_mut)
@@ -4348,7 +4471,6 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
                                 if let Some(exp_in) =
                                     rval.get("expires_in").and_then(serde_json::Value::as_i64)
                                 {
-                                    let now_ms = anyagents_core::now_ms();
                                     oauth.insert(
                                         "expiresAt".to_string(),
                                         serde_json::Value::Number((now_ms + exp_in * 1000).into()),
@@ -4359,9 +4481,11 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
                     }
                     if !tok.is_empty() {
                         let _ = sync_anthropic_profile_metadata(
-                            &http, data, &prof_dir, &profile, &tok, &mut cred,
+                            &http, data, &prof_dir, &profile, &tok, &mut cred, true,
                         );
-                        if let Ok(updated) = serde_json::to_string(&cred) {
+                        if refreshed_token
+                            && let Ok(updated) = serde_json::to_string(&cred)
+                        {
                             let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
                             let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
                             let _ = std::fs::write(
@@ -4755,7 +4879,12 @@ pub(crate) fn try_rotate_exhausted_profile(
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .unwrap_or(0);
-            if rotated_ms >= last_check && now_ms.saturating_sub(rotated_ms) < 120_000 {
+            let cleared_ms = std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0)
+                .max(rotated_ms);
+            if cleared_ms >= last_check && now_ms.saturating_sub(cleared_ms) < 120_000 {
                 return Some(format!("{provider}/{current_prof}"));
             }
             return None;
@@ -4771,12 +4900,9 @@ pub(crate) fn try_rotate_exhausted_profile(
     if has_active_quota_hold && cur_pct.is_some_and(|p| p > 5) {
         write_profile_marker(
             &cfg,
-            ".anyagents-profile-rotated-ms",
+            ".anyagents-quota-cleared-ms",
             &format!("{now_ms}\n"),
         );
-        if !store.has_open_turn(&agent.id).unwrap_or(false) {
-            restart_agent_harness_process(store, agent);
-        }
         if agent.harness == "agy" {
             clear_stale_agy_quota_error_steps(&cfg);
         }

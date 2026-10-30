@@ -2179,7 +2179,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
 
     let provider_profiles = anyagents_core::Store::open(data.join("state.db"))
         .ok()
-        .map(|s| create::sync_and_list_provider_profiles(&s, data))
+        .map(|s| create::sync_and_list_provider_profiles_with_options(&s, data, false))
         .unwrap_or_default();
 
     let mut harness_rows = Vec::new();

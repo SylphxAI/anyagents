@@ -690,7 +690,9 @@ fn apply_result(state: &mut State, value: &Value) {
     // turn: its ids finish, but with the vendor's own reason instead of usage.
     if let Some(reason) = result_error(value) {
         let is_oauth_expired = reason.contains("OAuth session expired")
-            || reason.contains("Failed to authenticate: OAuth");
+            || reason.contains("Failed to authenticate: OAuth")
+            || reason.contains("Not logged in")
+            || reason.contains("authentication_failed");
         let ids = std::mem::take(&mut state.open);
         for id in ids {
             if is_oauth_expired {
@@ -872,6 +874,11 @@ pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
+    let cleared_ms = std::fs::read_to_string(config_dir.join(".anyagents-quota-cleared-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(rotated_ms);
     let projects_dir = config_dir.join("projects");
     let Ok(project_entries) = std::fs::read_dir(&projects_dir) else {
         return None;
@@ -915,10 +922,10 @@ pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i
     };
     let mut file = std::fs::File::open(target_jsonl).ok()?;
     let meta = file.metadata().ok()?;
-    if rotated_ms > 0
+    if cleared_ms > 0
         && let Ok(mtime) = meta.modified()
         && let Ok(dur) = mtime.duration_since(UNIX_EPOCH)
-        && (dur.as_millis() as i64) <= rotated_ms
+        && (dur.as_millis() as i64) <= cleared_ms
     {
         return None;
     }

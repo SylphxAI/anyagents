@@ -950,10 +950,15 @@ impl<H: Harness + 'static> Session<H> {
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .is_some_and(|ms| ms >= started_at);
+        let cleared_after_start =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-quota-cleared-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .is_some_and(|ms| ms >= started_at);
         let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
             fresh.harness != self.agent.harness || fresh.model != self.agent.model
         });
-        if rotated_after_start || config_switched || now >= reset_at {
+        if rotated_after_start || cleared_after_start || config_switched || now >= reset_at {
             self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();

@@ -1667,18 +1667,25 @@ pub fn detect_agy_session_quota_and_error(
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
+    let cleared_ms = std::fs::read_to_string(config_dir.join(".anyagents-quota-cleared-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let reset_floor_ms = rotated_ms.max(cleared_ms);
     if let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json"))
         && let Ok(val) = serde_json::from_str::<Value>(&raw)
     {
         let ts = val.get("timestamp_ms").and_then(Value::as_i64).unwrap_or(0);
-        if ts > rotated_ms {
+        if ts > reset_floor_ms {
             let err = val.get("error").and_then(Value::as_str).map(str::to_string);
-            let reset = val
-                .get("quota_reset_at_ms")
-                .and_then(Value::as_i64)
-                .filter(|&r| r > now_ms);
-            if reset.is_some() || err.is_some() {
-                return (reset, err);
+            if let Some(raw_reset) = val.get("quota_reset_at_ms").and_then(Value::as_i64) {
+                if raw_reset > now_ms {
+                    return (Some(raw_reset), err);
+                }
+                return (None, None);
+            }
+            if err.is_some() {
+                return (None, err);
             }
         }
     }
@@ -1694,13 +1701,13 @@ pub fn detect_agy_session_quota_and_error(
         };
         if !name.starts_with("cli-") || !name.ends_with(".log") {
             continue;
-        }
+        };
         if let Ok(meta) = entry.metadata()
             && let Ok(mtime) = meta.modified()
             && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
         {
             let mtime_ms = dur.as_millis() as i64;
-            if mtime_ms > rotated_ms {
+            if mtime_ms > reset_floor_ms {
                 logs.push((mtime_ms, p));
             }
         }
@@ -1713,10 +1720,14 @@ pub fn detect_agy_session_quota_and_error(
         for line in text.lines().rev() {
             if let Some((_, after)) = line.split_once("run ended with error and no response: ") {
                 let err_str = after.trim().to_string();
-                let reset = parse_resets_in_ms(&err_str)
-                    .map(|d| mtime_ms.saturating_add(d))
-                    .filter(|&r| r > now_ms);
-                return (reset, Some(err_str));
+                if let Some(dur_ms) = parse_resets_in_ms(&err_str) {
+                    let raw_reset = mtime_ms.saturating_add(dur_ms);
+                    if raw_reset > now_ms {
+                        return (Some(raw_reset), Some(err_str));
+                    }
+                    return (None, None);
+                }
+                return (None, Some(err_str));
             }
             if line.contains("Sending user message to conversation")
                 && !text.contains("run ended with error and no response:")

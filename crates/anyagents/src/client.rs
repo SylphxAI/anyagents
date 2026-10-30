@@ -113,7 +113,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         .build()
         .map_err(|err| err.to_string())?;
     let body_clone = body.clone();
-    let answer = runtime.block_on(async {
+    let primary_res = runtime.block_on(async {
         tokio::time::timeout(
             TIMEOUT,
             crate::mcp::request(
@@ -127,8 +127,31 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         )
         .await
         .map_err(|_| "the server did not answer".to_string())?
-    })?;
-    let (mut status, mut bytes) = answer;
+    });
+    let (mut status, mut bytes) = match primary_res {
+        Ok(ans) => ans,
+        Err(primary_err) => {
+            if let Some(sec_sock) = secondary_sock {
+                runtime.block_on(async {
+                    tokio::time::timeout(
+                        TIMEOUT,
+                        crate::mcp::request(
+                            sec_sock,
+                            method,
+                            path,
+                            body_clone.clone(),
+                            agent_token.as_deref(),
+                            operator_token.as_deref(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| "the server did not answer".to_string())?
+                })?
+            } else {
+                return Err(primary_err);
+            }
+        }
+    };
     if !status.is_success()
         && let Some(sec_sock) = secondary_sock
         && let Ok(Ok(fallback)) = runtime.block_on(async {
