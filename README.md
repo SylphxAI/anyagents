@@ -4,6 +4,19 @@ Run any coding agent harness as a long-lived agent on your own machine, containe
 
 > Status: early development. Working today: the durable per-agent mailbox with ordered, idempotent delivery and real-time FIFO steering, the server on a Unix socket (plus optional HTTP webhook listener), the `send`, `interact`, `inbox`, `conversation`, `agents`, `groups`, `spawn`, `archive` and `wake` MCP tools, a Telegram channel adapter (long polling and instant webhook push, DMs, supergroups, forum topics, reactions, polls, media and checklists), native adapters for `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh` and `grok`, a supervisor that keeps each running agent alive and auto-wakes archived agents on message arrival, per-turn usage accounting, and the built-in protocol gateway crate for API-key routing across Anthropic Messages and OpenAI Chat/Responses protocols. The design is in [docs/](docs/).
 
+## Install from source
+
+AnyAgents is available as source for Linux and macOS. Install Rust 1.98 or newer, then build the existing CLI:
+
+```bash
+git clone https://github.com/SylphxAI/anyagents.git
+cd anyagents
+cargo install --locked --path crates/anyagents --bin anyagents
+anyagents --version
+```
+
+The npm launcher is in this repository, but `@sylphx/anyagents` has not been published. Homebrew and Scoop packages are not available. Native Windows is not supported by the current Unix-socket implementation.
+
 ## Why
 
 - **Any harness, any model.** Pick the harness, the model and how you pay separately. With an API key, any model runs in any harness through the built-in protocol gateway. With a subscription, the vendor's own tool runs the vendor's own models.
