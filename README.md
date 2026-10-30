@@ -13,6 +13,15 @@ npm install -g @sylphx/anyagents
 anyagents --version
 ```
 
+Homebrew also installs the native binary on macOS and Linux:
+
+```bash
+brew install sylphxai/tap/anyagents
+anyagents --version
+```
+
+If Homebrew reports the tap as untrusted, run `brew trust --tap sylphxai/tap` and repeat the install command.
+
 You can also download the native archives from [GitHub Releases](https://github.com/SylphxAI/anyagents/releases). Native Windows is not supported.
 
 ### Build from source
