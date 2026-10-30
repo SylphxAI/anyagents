@@ -105,6 +105,7 @@ fn default_harness() -> String {
 /// Body of `POST /v1/agents`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
+    #[serde(alias = "agent", alias = "id", alias = "agent_id", alias = "target")]
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,

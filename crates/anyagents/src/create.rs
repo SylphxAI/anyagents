@@ -44,178 +44,172 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     new.parent_id = request.parent_id;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
-    // Nothing is installed until an agent needs it: this is that moment. A
-    // failure is the reason the agent's first turn cannot start, reported here
-    // and never retried in a loop.
-    install::record(&data, &agent.harness).map_err(Error::Message)?;
-    // The gateway origin and this agent's own token, kept so a restart starts
-    // the same agent the same way.
-    let mut pairs = crate::gateway::agent_env(&data, &agent.id);
-    let parent_name = agent
-        .parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok())
-        .map(|p| p.name);
-    if let Some(ref pname) = parent_name {
-        pairs.push(("ANYAGENTS_PARENT_NAME".to_string(), pname.clone()));
-    }
-    store.set_agent_launch_env(&agent.id, &pairs)?;
-    let managed = agent_work_dir(&data, &agent.id);
-    std::fs::create_dir_all(&managed)?;
-    let config = agent_config_dir(&data, &agent.id);
-    std::fs::create_dir_all(&config)?;
-    let _ = std::fs::create_dir_all(config.join("tmp"));
-    if let Some(prof) = request
-        .profile
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        let normalized = if prof.contains('/') {
-            prof.to_string()
-        } else {
-            format!(
-                "{}/{prof}",
-                upstream_provider_of(&agent.harness, agent.model.as_deref())
-            )
-        };
-        write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"));
-    }
-    let wd_str = request
-        .workdir
-        .as_ref()
-        .and_then(|p| p.to_str())
-        .map(str::trim)
-        .unwrap_or("");
-    let wd_is_worktree_keyword = matches!(
-        wd_str.to_ascii_lowercase().as_str(),
-        "worktree" | "branch" | "isolated"
-    );
-    let wd_is_private_keyword = matches!(
-        wd_str.to_ascii_lowercase().as_str(),
-        "private" | "sandbox" | "self"
-    );
-    let wd_is_inherit_keyword = matches!(
-        wd_str.to_ascii_lowercase().as_str(),
-        "inherit" | "parent"
-    );
-    let effective_repo = request
-        .repo
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or(if wd_is_worktree_keyword {
-            Some("inherit")
-        } else {
-            None
-        });
-    let explicit_workdir = if wd_str.is_empty()
-        || wd_is_worktree_keyword
-        || wd_is_private_keyword
-        || wd_is_inherit_keyword
-    {
-        None
-    } else {
-        request.workdir.clone()
-    };
-    let workdir_created =
-        explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
-    let cwd = if let Some(repo_raw) = effective_repo {
-        let target_wt = match &explicit_workdir {
-            Some(path) => std::path::absolute(path)?,
-            None => std::path::absolute(&managed)?,
-        };
-        if let Err(err) = provision_managed_worktree(
-            store,
-            &data,
-            &agent,
-            &config,
-            repo_raw,
-            request.branch.as_deref(),
-            request.base.as_deref(),
-            &target_wt,
-            parent_name.as_deref(),
-        ) {
-            let _ = store.delete_agent(&agent.id);
-            let _ = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()));
-            return Err(err);
-        }
-        target_wt
-    } else if wd_is_private_keyword {
-        std::path::absolute(&managed)?
-    } else if wd_is_inherit_keyword {
-        let inherited_parent_wd = agent
+    let finish = (|| -> Result<Agent, Error> {
+        // Nothing is installed until an agent needs it: this is that moment. A
+        // failure is the reason the agent's first turn cannot start, reported here
+        // and never retried in a loop.
+        install::record(&data, &agent.harness).map_err(Error::Message)?;
+        // The gateway origin and this agent's own token, kept so a restart starts
+        // the same agent the same way.
+        let mut pairs = crate::gateway::agent_env(&data, &agent.id);
+        let parent_name = agent
             .parent_id
             .as_ref()
             .and_then(|pid| store.agent(pid).ok())
-            .and_then(|p| p.workdir)
-            .map(PathBuf::from)
-            .filter(|p| p.is_dir());
-        if let Some(parent_wd) = inherited_parent_wd {
-            std::path::absolute(&parent_wd)?
-        } else {
-            std::path::absolute(&managed)?
+            .map(|p| p.name);
+        if let Some(ref pname) = parent_name {
+            pairs.push(("ANYAGENTS_PARENT_NAME".to_string(), pname.clone()));
         }
-    } else {
-        match &explicit_workdir {
-            Some(path) => {
-                std::fs::create_dir_all(path)?;
-                let abs = std::path::absolute(path)?;
-                if agent.parent_id.is_some()
-                    && abs.join(".git").is_file()
-                    && !config.join(".anyagents-managed-worktree.json").exists()
-                {
-                    record_managed_worktree_marker(
-                        &config,
-                        &abs,
-                        "explicit-worktree",
-                        request.branch.as_deref(),
-                    );
-                }
-                abs
+        store.set_agent_launch_env(&agent.id, &pairs)?;
+        let managed = agent_work_dir(&data, &agent.id);
+        std::fs::create_dir_all(&managed)?;
+        let config = agent_config_dir(&data, &agent.id);
+        std::fs::create_dir_all(&config)?;
+        let _ = std::fs::create_dir_all(config.join("tmp"));
+        if let Some(prof) = request
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let normalized = if prof.contains('/') {
+                prof.to_string()
+            } else {
+                format!(
+                    "{}/{prof}",
+                    upstream_provider_of(&agent.harness, agent.model.as_deref())
+                )
+            };
+            write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"));
+        }
+        let wd_str = request
+            .workdir
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .map(str::trim)
+            .unwrap_or("");
+        let wd_is_worktree_keyword = matches!(
+            wd_str.to_ascii_lowercase().as_str(),
+            "worktree" | "branch" | "isolated"
+        );
+        let wd_is_private_keyword = matches!(
+            wd_str.to_ascii_lowercase().as_str(),
+            "private" | "sandbox" | "self"
+        );
+        let wd_is_inherit_keyword = matches!(
+            wd_str.to_ascii_lowercase().as_str(),
+            "inherit" | "parent"
+        );
+        let effective_repo = request
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or(if wd_is_worktree_keyword {
+                Some("inherit")
+            } else {
+                None
+            });
+        let explicit_workdir = if wd_str.is_empty()
+            || wd_is_worktree_keyword
+            || wd_is_private_keyword
+            || wd_is_inherit_keyword
+        {
+            None
+        } else {
+            request.workdir.clone()
+        };
+        let workdir_created =
+            explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
+        let managed_abs = std::path::absolute(&managed)?;
+        let cwd = if let Some(repo_raw) = effective_repo {
+            let target_wt = match &explicit_workdir {
+                Some(path) => std::path::absolute(path)?,
+                None => managed_abs.clone(),
+            };
+            provision_managed_worktree(
+                store,
+                &data,
+                &agent,
+                &config,
+                repo_raw,
+                request.branch.as_deref(),
+                request.base.as_deref(),
+                &target_wt,
+                parent_name.as_deref(),
+            )?;
+            target_wt
+        } else if wd_is_private_keyword {
+            managed_abs.clone()
+        } else if wd_is_inherit_keyword {
+            let inherited_parent_wd = agent
+                .parent_id
+                .as_ref()
+                .and_then(|pid| store.agent(pid).ok())
+                .and_then(|p| p.workdir)
+                .map(PathBuf::from)
+                .filter(|p| p.is_dir());
+            if let Some(parent_wd) = inherited_parent_wd {
+                std::path::absolute(&parent_wd)?
+            } else {
+                managed_abs.clone()
             }
-            None => {
-                if agent.parent_id.is_some() {
-                    std::path::absolute(&managed)?
-                } else {
-                    match &request.workdir_default {
-                        Some(shared) => {
-                            std::fs::create_dir_all(shared)?;
-                            std::path::absolute(shared)?
+        } else {
+            match &explicit_workdir {
+                Some(path) => {
+                    std::fs::create_dir_all(path)?;
+                    let abs = std::path::absolute(path)?;
+                    if agent.parent_id.is_some()
+                        && abs.join(".git").is_file()
+                        && !config.join(".anyagents-managed-worktree.json").exists()
+                    {
+                        record_managed_worktree_marker(
+                            &config,
+                            &abs,
+                            "explicit-worktree",
+                            request.branch.as_deref(),
+                        );
+                    }
+                    abs
+                }
+                None => {
+                    if agent.parent_id.is_some() {
+                        managed_abs.clone()
+                    } else {
+                        match &request.workdir_default {
+                            Some(shared) => {
+                                std::fs::create_dir_all(shared)?;
+                                std::path::absolute(shared)?
+                            }
+                            None => managed_abs.clone(),
                         }
-                        None => std::path::absolute(&managed)?,
                     }
                 }
             }
+        };
+        let _ = crate::operator::mint(store, &agent.id);
+        store.set_agent_launch_env(&agent.id, &pairs)?;
+        let mut pre_running = agent.clone();
+        pre_running.workdir = Some(cwd.display().to_string());
+        reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd)?;
+        let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
+        let should_share_cwd = (workdir_created
+            || cwd == managed_abs
+            || (agent.parent_id.is_some() && explicit_workdir.is_some()))
+            && cwd != Path::new("/scratch/wt/owners-main")
+            && cwd != Path::new("/scratch/wt");
+        if should_share_cwd
+            && let Some((_, _, gid, _)) = resolved_agent_seat_info(store, &running)
+        {
+            crate::sandbox::share_worktree_with_seat(&cwd, gid);
         }
-    };
-    let _ = crate::operator::mint(store, &agent.id);
-    store.set_agent_launch_env(&agent.id, &pairs)?;
-    let mut pre_running = agent.clone();
-    pre_running.workdir = Some(cwd.display().to_string());
-    if let Err(err) = reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd) {
+        Ok(running)
+    })();
+    if finish.is_err() {
         let _ = store.delete_agent(&agent.id);
         let _ = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()));
-        return Err(err);
     }
-    let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
-    let should_share_cwd = (workdir_created
-        || (agent.parent_id.is_some() && explicit_workdir.is_some()))
-        && cwd != Path::new("/scratch/wt/owners-main")
-        && cwd != Path::new("/scratch/wt");
-    if should_share_cwd && let Some((_, _, gid, _)) = resolved_agent_seat_info(store, &running) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            if let Ok(c_path) = std::ffi::CString::new(cwd.as_os_str().as_encoded_bytes()) {
-                unsafe {
-                    let _ = libc::chown(c_path.as_ptr(), u32::MAX, gid);
-                }
-            }
-            let _ = std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o2775));
-        }
-    }
-    Ok(running)
+    finish
 }
 
 pub(crate) fn provision_managed_worktree(
@@ -391,42 +385,7 @@ pub(crate) fn provision_managed_worktree(
         crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name)
             .map(|(u, uid, gid, _)| (u, uid, gid, None))
     }) {
-        let gid_s = gid.to_string();
-        let _ = std::process::Command::new("chgrp")
-            .args(["-R", &gid_s])
-            .arg(target_wt)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        let _ = std::process::Command::new("chmod")
-            .args(["-R", "g+rwX"])
-            .arg(target_wt)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if let Ok(gd_out) = std::process::Command::new("git")
-            .arg("-C")
-            .arg(target_wt)
-            .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-            .output()
-            && gd_out.status.success()
-        {
-            let gd = PathBuf::from(String::from_utf8_lossy(&gd_out.stdout).trim());
-            if gd.is_dir() {
-                let _ = std::process::Command::new("chgrp")
-                    .args(["-R", &gid_s])
-                    .arg(&gd)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                let _ = std::process::Command::new("chmod")
-                    .args(["-R", "g+rwX"])
-                    .arg(&gd)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        }
+        crate::sandbox::share_worktree_with_seat(target_wt, gid);
     }
 
     record_managed_worktree_marker(config, target_wt, repo_raw, Some(&branch));
@@ -620,8 +579,8 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - Incoming messages are pushed automatically to your session — never poll an inbox. Pass `query` (`conversation({ \"query\": \"...\", \"agent\": \"all\", \"limit\": 20 })`) to run Hybrid RAG search (dense vector embedding `voyageai/voyage-4-large` + SQLite FTS5 BM25) across all agents' historical and live conversations without loading the full history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n\
          - **4. Internal Multi-Agent Groups (`groups` MCP Tool)**:\n\
            - `groups({ \"action\": \"list\" })` (returns `members` + full `roster` with each member's `description`), `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
-         - **5. Self-Wakes & Event Watches (`schedule` MCP Tool)**:\n\
-           - Schedule your own one-off (`at`) or recurring (`every`) wakes (`schedule({ \"every\": \"15m\", \"prompt\": \"...\" })`, `schedule({ \"at\": \"1m\", \"prompt\": \"...\" })`) or external event watches (`schedule({ \"watch\": \"github:pr:<owner>/<repo>#<num>\" | \"github:check:<owner>/<repo>@<ref>\" | \"spiron:promise:<id>\" | \"agent:idle:<name>\", \"prompt\": \"...\" })`), list them (`schedule({ \"action\": \"list\" })`), or cancel them (`schedule({ \"action\": \"cancel\", \"id\": \"<sch_...>\" | \"all\" })`). Wakes fire only when you are idle and not quota-blocked, and a missed wake never double-fires.\n\
+         - **5. Self-Wakes & Event Watches (`schedule` MCP Tool — Native Harness Timers/Monitors Disabled by Default)**:\n\
+           - Schedule your own one-off (`at`) or recurring (`every`) wakes (`schedule({ \"every\": \"15m\", \"prompt\": \"...\" })`, `schedule({ \"at\": \"1m\", \"prompt\": \"...\" })`) or external/local event watches (`schedule({ \"watch\": \"github:pr:<owner>/<repo>#<num>\" | \"github:check:<owner>/<repo>@<ref>\" | \"spiron:promise:<id>\" | \"agent:idle:<name>\" | \"pid:<pid>\" | \"file:<path>\", \"prompt\": \"...\" })`), list them (`schedule({ \"action\": \"list\" })`), or cancel them (`schedule({ \"action\": \"cancel\", \"id\": \"<sch_...>\" | \"all\" })`). Wakes fire only when you are idle and not quota-blocked, and a missed wake never double-fires.\n\
          - **6. Native SOTA Anti-Detect Browser & Persistent Browser Profiles (`browser` MCP Tool)**:\n\
            - Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile anti-detect fingerprinting (WebGL vendor/renderer, Client Hints `Sec-CH-UA`, `navigator.webdriver = false`, WebRTC UDP leak protection, Canvas seed), hardware-trusted CDP input (`event.isTrusted === true`), and persistent `--user-data-dir` login profiles.\n\
            - **Zero-Knowledge Credential & 2FA OTP Fill**: Never read a plaintext password into your LLM context to type it into a browser. Pass a 1Password or credential reference directly in `text` or `secret_ref` (`browser({ \"action\": \"fill\", \"selector\": \"@e2\", \"secret_ref\": \"op://Vault/Item/password\" })` or `\"op-otp://Vault/Item\"` for live 6-digit 2FA TOTP, or `\"secret://<ref>\"`); the daemon resolves and types it via hardware CDP in memory without exposing the secret to LLM logs.\n\

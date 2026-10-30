@@ -537,7 +537,7 @@ impl Harness for CodexHarness {
                 json!({
                     "threadId": thread_id,
                     "expectedTurnId": turn_id,
-                    "input": input,
+                    "input": input.clone(),
                     "clientUserMessageId": message.id,
                 }),
             )
@@ -551,15 +551,46 @@ impl Harness for CodexHarness {
                 }),
             )
         };
-        let rpc = self.call(method, params);
+        let mut effective_steering = steering;
+        let rpc = match self.call(method, params) {
+            Err(CallFail::Failed(_)) if effective_steering.is_some() => {
+                {
+                    let mut state = lock(&self.shared);
+                    if state.turn_id == effective_steering {
+                        state.turn_id = None;
+                    }
+                }
+                effective_steering = None;
+                self.call(
+                    "turn/start",
+                    json!({
+                        "threadId": thread_id,
+                        "input": input.clone(),
+                        "clientUserMessageId": message.id,
+                    }),
+                )
+            }
+            other => other,
+        };
+        let effective_method = if effective_steering.is_some() {
+            "turn/steer"
+        } else {
+            "turn/start"
+        };
         let mut state = lock(&self.shared);
         match rpc {
             Ok(result) => {
-                if steering.is_none() {
+                if effective_steering.is_none() {
                     state.last_turn_input =
                         Some((thread_id, input, message.id.clone()));
                 }
-                commit_delivery(&mut state, &message.id, steering.is_none(), method, &result);
+                commit_delivery(
+                    &mut state,
+                    &message.id,
+                    effective_steering.is_none(),
+                    effective_method,
+                    &result,
+                );
                 Ok(DeliverOutcome::Accepted {
                     turn_finished: state.finished.contains(&message.id),
                 })
@@ -959,6 +990,16 @@ fn persist_codex_fault_error(config_dir: Option<&Path>, err: Option<&str>) {
 fn on_notification(state: &mut State, method: &str, params: &Value) {
     match method {
         "thread/tokenUsage/updated" => state.last_usage = Some(usage_from_codex(params)),
+        "turn/started" => {
+            if let Some(tid) = params
+                .pointer("/turn/id")
+                .or_else(|| params.get("turnId"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                state.turn_id = Some(tid.to_string());
+            }
+        }
         "error" | "codex/event/error" | "codex/event/stream_error" => {
             if let Some(msg) = extract_turn_error(params) {
                 state.pending_turn_error = Some(msg);

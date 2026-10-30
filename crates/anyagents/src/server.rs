@@ -407,7 +407,7 @@ fn reconcile_stopped_and_backed_off_agents(
             .lag(&agent.id, now_ms)
             .ok()
             .and_then(|l| l.oldest_undelivered_age_ms);
-        if agent.state == "archived" {
+        if agent.state == "archived" || agent.state == "idle" {
             if oldest_age_ms.is_some() {
                 let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                 let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
@@ -424,6 +424,7 @@ fn reconcile_stopped_and_backed_off_agents(
                     if should_wake {
                         if store.set_agent_state(&agent.id, "running").is_ok() {
                             guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                            create::poke_agent_wake_socket(data, &agent.id);
                             create::poke_agent_wake_socket_mail(data, &agent.id);
                         }
                     } else {
@@ -438,12 +439,20 @@ fn reconcile_stopped_and_backed_off_agents(
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
                 continue;
             }
-            let is_down_without_quota = health.get(&agent.id).is_some_and(|live| {
-                !live.process_alive
-                    && live.quota_reset_at_ms.is_none()
-                    && live.restart_at_ms.is_some_and(|r| r >= 15_000)
-            });
-            if is_down_without_quota && oldest_age_ms.is_some_and(|age| age >= 15_000) {
+            let is_down_without_quota = match health.get(&agent.id) {
+                Some(live) => {
+                    !live.process_alive
+                        && live.quota_reset_at_ms.is_none()
+                        && (live.restart_at_ms.is_none()
+                            || live.restart_at_ms.is_some_and(|r| r >= 15_000))
+                }
+                None => true,
+            };
+            if is_down_without_quota
+                && oldest_age_ms.is_some_and(|age| age >= 15_000)
+                && crate::schedule::agent_wake_block_reason(store, health, agent, now_ms)
+                    != Some("quota_blocked")
+            {
                 let last_reset = guard
                     .last_backoff_reset_ms
                     .get(agent.id.as_str())
@@ -462,6 +471,7 @@ fn reconcile_stopped_and_backed_off_agents(
                     create::poke_agent_wake_socket(data, &agent.id);
                     std::thread::sleep(std::time::Duration::from_millis(250));
                     let _ = store.set_agent_state(&agent.id, "running");
+                    create::poke_agent_wake_socket(data, &agent.id);
                     create::poke_agent_wake_socket_mail(data, &agent.id);
                 }
             }

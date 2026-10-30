@@ -487,7 +487,13 @@ struct AgentsArgs {
 struct SpawnArgs {
     /// Optional short agent name (`[a-z0-9][a-z0-9_-]*`). If omitted, a unique
     /// `<caller>-sub-<id>` name is generated automatically.
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "agent",
+        alias = "id",
+        alias = "agent_id",
+        alias = "target"
+    )]
     name: Option<String>,
     /// Optional short role label for the spawned agent.
     #[serde(default)]
@@ -675,6 +681,8 @@ struct ScheduleArgs {
     /// - `"github:check:<owner>/<repo>@<ref>"` (GitHub check runs reaching a terminal state)
     /// - `"spiron:promise:<id>"` (Spiron promise state change pulled from the public API)
     /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
+    /// - `"pid:<pid>"` / `"process:<pid>"` (local background process PID exiting)
+    /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
     #[serde(default)]
     watch: Option<String>,
     /// Prompt delivered to the agent when the schedule or event watch fires.

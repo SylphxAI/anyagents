@@ -1106,7 +1106,7 @@ fn read_stdout(
                 .and_then(Value::as_str)
             {
                 state.last_turn_step_type = Some(step_type.to_string());
-                if step_type == "user_input" {
+                if step_type == "user_input" || state.turn_user_inputs == 0 {
                     state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
                 }
             }

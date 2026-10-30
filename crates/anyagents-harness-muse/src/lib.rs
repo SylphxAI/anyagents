@@ -311,7 +311,8 @@ impl Harness for MuseHarness {
             if state.session.is_empty() {
                 return Err(HarnessError::Failed("no session".into()));
             }
-            let in_turn = state.turn.is_some();
+            let in_turn =
+                state.turn.is_some() || !state.open.is_empty() || !state.taken.is_empty();
             if !in_turn {
                 state.taken.push(message.id.clone());
             }

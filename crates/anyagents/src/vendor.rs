@@ -898,7 +898,10 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             args.push(request.agent.name.clone());
             if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
                 args.push("--disallowedTools".to_string());
-                args.push("Task,Agent".to_string());
+                args.push(
+                    "Task,Agent,TeamCreate,TeamDelete,SendMessage,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification"
+                        .to_string(),
+                );
             }
             let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
             if sys_prompt.is_file() {
@@ -984,16 +987,44 @@ pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
                 allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
                 changed = true;
             }
-            if let Some(deny_arr) = perms_obj.get_mut("deny").and_then(|v| v.as_array_mut()) {
-                let before = deny_arr.len();
-                deny_arr.retain(|v| {
-                    !matches!(
-                        v.as_str(),
-                        Some("invoke_subagent" | "define_subagent" | "manage_subagents")
-                    )
-                });
-                if deny_arr.len() != before {
-                    changed = true;
+            let deny = perms_obj
+                .entry("deny".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !deny.is_array() {
+                *deny = serde_json::json!([]);
+                changed = true;
+            }
+            if let Some(deny_arr) = deny.as_array_mut() {
+                if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                    for tool in [
+                        "invoke_subagent",
+                        "define_subagent",
+                        "manage_subagents",
+                        "send_message",
+                        "schedule",
+                    ] {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                            deny_arr.push(serde_json::Value::String(tool.to_string()));
+                            changed = true;
+                        }
+                    }
+                } else {
+                    let before = deny_arr.len();
+                    deny_arr.retain(|v| {
+                        !matches!(
+                            v.as_str(),
+                            Some(
+                                "invoke_subagent"
+                                    | "define_subagent"
+                                    | "manage_subagents"
+                                    | "send_message"
+                                    | "schedule"
+                            )
+                        )
+                    });
+                    if deny_arr.len() != before {
+                        changed = true;
+                    }
                 }
             }
         }
@@ -1286,6 +1317,16 @@ mod tests {
         assert_eq!(
             json["permissions"]["allow"],
             serde_json::json!(["mcp(anyagents/*)"])
+        );
+        assert_eq!(
+            json["permissions"]["deny"],
+            serde_json::json!([
+                "invoke_subagent",
+                "define_subagent",
+                "manage_subagents",
+                "send_message",
+                "schedule"
+            ])
         );
         assert_eq!(
             json["trustedWorkspaces"],

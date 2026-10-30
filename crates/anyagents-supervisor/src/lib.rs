@@ -267,7 +267,6 @@ pub fn steer_name(steer: SteerSupport) -> &'static str {
 struct Slot {
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
-    busy: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -529,8 +528,7 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
         if let Some(slot) = workers.get_mut(&id) {
             let finished = slot.done.load(Ordering::SeqCst);
             let stopping = slot.stop.load(Ordering::SeqCst);
-            let busy = slot.busy.load(Ordering::SeqCst);
-            if (!finished && !stopping) || busy {
+            if !finished && !stopping {
                 slot.woken.store(true, Ordering::SeqCst);
                 drop(workers);
                 inner.clock.poke();
@@ -552,20 +550,16 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicBool::new(false));
-    let busy = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let run_inner = Arc::clone(inner);
     let run_id = id.clone();
     let run_stop = Arc::clone(&stop);
     let run_woken = Arc::clone(&woken);
-    let run_busy = Arc::clone(&busy);
     let run_done = Arc::clone(&done);
     let thread = thread::Builder::new()
         .name("anyagents-agent".into())
         .spawn(move || {
-            if run_agent(run_inner, run_id, run_stop, run_woken) {
-                run_busy.store(true, Ordering::SeqCst);
-            }
+            let _ = run_agent(run_inner, run_id, run_stop, run_woken);
             run_done.store(true, Ordering::SeqCst);
         });
     let Ok(thread) = thread else {
@@ -576,7 +570,6 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
         Slot {
             stop,
             woken,
-            busy,
             done,
             thread: Some(thread),
         },

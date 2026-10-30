@@ -14,7 +14,7 @@ use anyagents_supervisor::HealthBoard;
 
 use crate::api::ScheduleView;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum WatchTarget {
     GitHubPr {
         owner: String,
@@ -32,6 +32,12 @@ pub enum WatchTarget {
     },
     AgentIdle {
         target: String,
+    },
+    ProcessExit {
+        pid: u32,
+    },
+    PathChanged {
+        path: String,
     },
 }
 
@@ -315,8 +321,43 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
         return parse_gh_pr_coords(spec.trim());
     }
 
+    // Local process exit forms:
+    // "pid:<pid>", "process:<pid>", "proc:<pid>", "pid:<pid>:exit"
+    if let Some(pid_str) = s
+        .strip_prefix("pid:")
+        .or_else(|| s.strip_prefix("process:"))
+        .or_else(|| s.strip_prefix("proc:"))
+    {
+        let clean = pid_str
+            .trim()
+            .strip_suffix(":exit")
+            .unwrap_or(pid_str.trim());
+        let pid = clean
+            .parse::<u32>()
+            .map_err(|_| format!("invalid process PID `{clean}` in watch spec `{raw}`"))?;
+        if pid == 0 {
+            return Err("process PID must be > 0".to_string());
+        }
+        return Ok(WatchTarget::ProcessExit { pid });
+    }
+
+    // Local file / path change forms:
+    // "file:<path>", "path:<path>"
+    if let Some(path_str) = s
+        .strip_prefix("file:")
+        .or_else(|| s.strip_prefix("path:"))
+    {
+        let clean = path_str.trim();
+        if clean.is_empty() {
+            return Err("`file:<path>` requires a non-empty path".to_string());
+        }
+        return Ok(WatchTarget::PathChanged {
+            path: clean.to_string(),
+        });
+    }
+
     Err(format!(
-        "unsupported watch spec `{raw}`; expected `github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, or `agent:idle:<name>`"
+        "unsupported watch spec `{raw}`; expected `github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name>`, `pid:<pid>`, or `file:<path>`"
     ))
 }
 
@@ -495,6 +536,15 @@ fn initial_watch_baseline(
         WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. } => {
             Some("pending".to_string())
         }
+        WatchTarget::ProcessExit { pid } => Some(
+            if probe_process_alive(*pid) {
+                "running"
+            } else {
+                "exited"
+            }
+            .to_string(),
+        ),
+        WatchTarget::PathChanged { path } => Some(probe_path_fingerprint(path)),
     }
 }
 
@@ -671,6 +721,12 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 }
             }
             "watch" => {
+                if block.is_some() {
+                    // Defer evaluating one-shot event watches while the owning agent is busy,
+                    // paused, or quota-blocked so external APIs are not polled needlessly and
+                    // terminal events are delivered as soon as the agent becomes idle.
+                    continue;
+                }
                 let eval = evaluate_watch(store, health, &sched, now);
                 if !eval.triggered {
                     if eval.baseline.is_some() || eval.observed.is_some() {
@@ -680,19 +736,6 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                             eval.observed.as_deref(),
                         );
                     }
-                    continue;
-                }
-                if let Some(reason) = block {
-                    // Triggered while busy/quota-blocked/paused: consume so a missed wake never fires twice.
-                    let _ = store.claim_schedule_tick(
-                        &sched.id,
-                        None,
-                        "fired",
-                        None,
-                        None,
-                        eval.baseline.as_deref(),
-                        Some(&format!("skipped:{reason}")),
-                    );
                     continue;
                 }
                 if store
@@ -746,6 +789,8 @@ fn deliver_scheduled_wake(
             received_at_ms: Some(now),
         },
     );
+    crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
+    crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
 }
 
 struct WatchEval {
@@ -836,7 +881,8 @@ fn evaluate_watch(
             repo,
             number,
         } => {
-            let Some((is_terminal, state_desc)) = probe_github_pr_terminal(&owner, &repo, number)
+            let Some((is_terminal, state_desc)) =
+                probe_github_pr_terminal(&owner, &repo, number, sched.agent_id.as_str(), now)
             else {
                 return WatchEval {
                     triggered: false,
@@ -855,9 +901,13 @@ fn evaluate_watch(
             repo,
             reference,
         } => {
-            let Some((is_terminal, state_desc)) =
-                probe_github_check_terminal(&owner, &repo, &reference)
-            else {
+            let Some((is_terminal, state_desc)) = probe_github_check_terminal(
+                &owner,
+                &repo,
+                &reference,
+                sched.agent_id.as_str(),
+                now,
+            ) else {
                 return WatchEval {
                     triggered: false,
                     observed: None,
@@ -870,6 +920,99 @@ fn evaluate_watch(
                 baseline: sched.watch_baseline.clone(),
             }
         }
+        WatchTarget::ProcessExit { pid } => {
+            if probe_process_alive(pid) {
+                WatchEval {
+                    triggered: false,
+                    observed: Some("running".to_string()),
+                    baseline: Some("running".to_string()),
+                }
+            } else {
+                WatchEval {
+                    triggered: true,
+                    observed: Some("exited".to_string()),
+                    baseline: sched.watch_baseline.clone(),
+                }
+            }
+        }
+        WatchTarget::PathChanged { path } => {
+            let current = probe_path_fingerprint(&path);
+            match &sched.watch_baseline {
+                Some(base) => {
+                    if &current != base {
+                        WatchEval {
+                            triggered: true,
+                            observed: Some(format!("{base}->{current}")),
+                            baseline: Some(base.clone()),
+                        }
+                    } else {
+                        WatchEval {
+                            triggered: false,
+                            observed: Some(current),
+                            baseline: Some(base.clone()),
+                        }
+                    }
+                }
+                None => {
+                    if current != "missing" {
+                        WatchEval {
+                            triggered: true,
+                            observed: Some(current.clone()),
+                            baseline: Some(current),
+                        }
+                    } else {
+                        WatchEval {
+                            triggered: false,
+                            observed: Some(current.clone()),
+                            baseline: Some(current),
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn probe_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let stat_path = format!("/proc/{pid}/stat");
+        let Ok(raw) = std::fs::read_to_string(&stat_path) else {
+            return false;
+        };
+        if let Some((_, rest)) = raw.rsplit_once(')') {
+            let state_char = rest.trim_start().chars().next().unwrap_or(' ');
+            if matches!(state_char, 'Z' | 'X' | 'x') {
+                return false;
+            }
+        }
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}
+
+fn probe_path_fingerprint(path: &str) -> String {
+    match std::fs::metadata(path) {
+        Ok(meta) => {
+            let mtime_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("exists:{mtime_ms}:{}", meta.len())
+        }
+        Err(_) => "missing".to_string(),
     }
 }
 
@@ -951,7 +1094,19 @@ pub fn probe_spiron_state(id: &str, kind: &str) -> Option<String> {
     None
 }
 
-fn probe_github_pr_terminal(owner: &str, repo: &str, number: u64) -> Option<(bool, String)> {
+static GH_PROBE_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (i64, Option<(bool, String)>)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const GH_CLI_PROBE_TTL_MS: i64 = 15_000;
+
+fn probe_github_pr_terminal(
+    owner: &str,
+    repo: &str,
+    number: u64,
+    agent_id: &str,
+    now_ms: i64,
+) -> Option<(bool, String)> {
     if let Ok(base) = std::env::var("ANYAGENTS_GITHUB_API_BASE")
         && !base.trim().is_empty()
     {
@@ -972,7 +1127,16 @@ fn probe_github_pr_terminal(owner: &str, repo: &str, number: u64) -> Option<(boo
         return None;
     }
 
+    let cache_key = format!("pr:{owner}/{repo}#{number}");
+    if let Ok(guard) = GH_PROBE_CACHE.lock()
+        && let Some((ts, cached)) = guard.get(&cache_key)
+        && now_ms.saturating_sub(*ts) < GH_CLI_PROBE_TTL_MS
+    {
+        return cached.clone();
+    }
+
     let out = std::process::Command::new("gh")
+        .env("ANYAGENTS_AGENT_ID", agent_id)
         .args([
             "pr",
             "view",
@@ -984,11 +1148,17 @@ fn probe_github_pr_terminal(owner: &str, repo: &str, number: u64) -> Option<(boo
         ])
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
+    let res = if out.status.success() {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .and_then(|val| evaluate_pr_json(&val))
+    } else {
+        None
+    };
+    if let Ok(mut guard) = GH_PROBE_CACHE.lock() {
+        guard.insert(cache_key, (now_ms, res.clone()));
     }
-    let val: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    evaluate_pr_json(&val)
+    res
 }
 
 fn evaluate_pr_json(val: &serde_json::Value) -> Option<(bool, String)> {
@@ -1037,12 +1207,18 @@ fn check_item_is_terminal(item: &serde_json::Value) -> bool {
     false
 }
 
-fn probe_github_check_terminal(owner: &str, repo: &str, reference: &str) -> Option<(bool, String)> {
+fn probe_github_check_terminal(
+    owner: &str,
+    repo: &str,
+    reference: &str,
+    agent_id: &str,
+    now_ms: i64,
+) -> Option<(bool, String)> {
     let clean_ref = reference.strip_prefix('#').unwrap_or(reference);
     if clean_ref.chars().all(|c| c.is_ascii_digit())
         && let Ok(pr_num) = clean_ref.parse::<u64>()
     {
-        return probe_github_pr_terminal(owner, repo, pr_num);
+        return probe_github_pr_terminal(owner, repo, pr_num, agent_id, now_ms);
     }
     if let Ok(base) = std::env::var("ANYAGENTS_GITHUB_API_BASE")
         && !base.trim().is_empty()
@@ -1064,18 +1240,33 @@ fn probe_github_check_terminal(owner: &str, repo: &str, reference: &str) -> Opti
         return None;
     }
 
+    let cache_key = format!("check:{owner}/{repo}@{clean_ref}");
+    if let Ok(guard) = GH_PROBE_CACHE.lock()
+        && let Some((ts, cached)) = guard.get(&cache_key)
+        && now_ms.saturating_sub(*ts) < GH_CLI_PROBE_TTL_MS
+    {
+        return cached.clone();
+    }
+
     let out = std::process::Command::new("gh")
+        .env("ANYAGENTS_AGENT_ID", agent_id)
         .args([
             "api",
             &format!("repos/{owner}/{repo}/commits/{clean_ref}/check-runs"),
         ])
         .output()
         .ok()?;
-    if !out.status.success() {
-        return None;
+    let res = if out.status.success() {
+        serde_json::from_slice::<serde_json::Value>(&out.stdout)
+            .ok()
+            .and_then(|val| evaluate_check_runs_json(&val))
+    } else {
+        None
+    };
+    if let Ok(mut guard) = GH_PROBE_CACHE.lock() {
+        guard.insert(cache_key, (now_ms, res.clone()));
     }
-    let val: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-    evaluate_check_runs_json(&val)
+    res
 }
 
 fn evaluate_check_runs_json(val: &serde_json::Value) -> Option<(bool, String)> {
@@ -1136,6 +1327,89 @@ mod tests {
                 target: "worker-1".to_string(),
             }
         );
+        assert_eq!(
+            parse_watch_spec("pid:4242").unwrap(),
+            WatchTarget::ProcessExit { pid: 4242 }
+        );
+        assert_eq!(
+            parse_watch_spec("file:/tmp/out.json").unwrap(),
+            WatchTarget::PathChanged {
+                path: "/tmp/out.json".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn watch_schedule_defers_while_owner_busy_and_fires_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("owner-watch", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+        let child = store
+            .create_agent(NewAgent::new("worker-sub", "opencode"))
+            .unwrap();
+        store.set_agent_running(&child.id, "/work").unwrap();
+
+        let _sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            None,
+            Some("agent:idle:worker-sub"),
+            "subagent finished",
+        )
+        .unwrap();
+
+        // While owner is busy (InTurn), even though worker-sub is idle, the one-shot watch
+        // is deferred rather than swallowed as `skipped:busy`.
+        health.publish(
+            &owner.id,
+            LiveState {
+                process_alive: true,
+                turn_state: TurnState::InTurn,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some("codex".to_string()),
+                live_model: None,
+                process_started_at_ms: Some(1000),
+                last_error: None,
+            },
+        );
+        let now = anyagents_core::now_ms();
+        assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 0);
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].state, "active");
+
+        // Once owner finishes its turn and is Idle, the watch fires and wakes the owner.
+        health.publish(
+            &owner.id,
+            LiveState {
+                process_alive: true,
+                turn_state: TurnState::Idle,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some("codex".to_string()),
+                live_model: None,
+                process_started_at_ms: Some(1000),
+                last_error: None,
+            },
+        );
+        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].text, "subagent finished");
     }
 
     #[test]

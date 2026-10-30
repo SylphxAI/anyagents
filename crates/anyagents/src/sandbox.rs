@@ -328,10 +328,20 @@ fn fallback_seat(agent_name: &str, parent_name: Option<&str>) -> Option<(String,
             return Some((candidate, (uid, gid)));
         }
     }
-    let seats = host_seat_users();
-    if seats.is_empty() {
+    let all_seats = host_seat_users();
+    if all_seats.is_empty() {
         return None;
     }
+    let primary_seats: Vec<(String, (u32, u32))> = all_seats
+        .iter()
+        .filter(|(_, (uid, gid))| uid == gid)
+        .cloned()
+        .collect();
+    let seats = if primary_seats.is_empty() {
+        &all_seats
+    } else {
+        &primary_seats
+    };
     let hash = agent_name.bytes().fold(0usize, |acc, b| {
         acc.wrapping_mul(31).wrapping_add(b as usize)
     });
@@ -518,24 +528,29 @@ pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Opti
             });
             by_marker
                 .or_else(|| {
-                    let mut child_uids = Vec::new();
+                    for key_file in ["state_5.sqlite", "installation_id", "logs_2.sqlite"] {
+                        if let Ok(m) = std::fs::metadata(config_dir.join(key_file)) {
+                            let f_uid = m.uid();
+                            if let Some(found) =
+                                candidates.iter().find(|(_, (uid, _))| *uid == f_uid)
+                            {
+                                return Some(found.clone());
+                            }
+                        }
+                    }
+                    let mut uid_counts = std::collections::HashMap::<u32, usize>::new();
                     if let Ok(entries) = std::fs::read_dir(config_dir) {
                         for entry in entries.flatten() {
                             if let Ok(em) = entry.metadata() {
-                                child_uids.push(em.uid());
+                                *uid_counts.entry(em.uid()).or_insert(0) += 1;
                             }
                         }
                     }
                     candidates
                         .iter()
-                        .find(|(_, (uid, gid))| *uid != *gid && child_uids.contains(uid))
+                        .filter(|(_, (uid, _))| uid_counts.contains_key(uid))
+                        .max_by_key(|(_, (uid, _))| uid_counts.get(uid).copied().unwrap_or(0))
                         .cloned()
-                        .or_else(|| {
-                            candidates
-                                .iter()
-                                .find(|(_, (uid, _))| child_uids.contains(uid))
-                                .cloned()
-                        })
                 })
                 .or_else(|| candidates.into_iter().next())
         };
@@ -608,15 +623,94 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
     let work_dir = config_dir.with_file_name("work");
     if work_dir.is_dir() {
         if work_dir.join(".git").exists() {
-            let _ = chown_to_seat_group(&work_dir, eff_gid);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                let _ = std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o2775));
-            }
+            share_worktree_with_seat(&work_dir, eff_gid);
         } else if let Err(err) = give_tree(&work_dir, eff_uid, eff_gid) {
             eprintln!("seat: cannot share {}: {err}", work_dir.display());
         }
+    }
+}
+
+/// Share a worktree or explicit working directory (and its git metadata dir when
+/// present) with the target seat group (`gid`), falling back to `anyagents-sock`
+/// (`sock_gid_for()`) so both the server user and every `seat-*` user can write
+/// and commit inside the worktree without `EPERM`.
+pub fn share_worktree_with_seat(path: &Path, gid: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if is_isolated_test_env() {
+            return;
+        }
+        let _ = chown_to_seat_group(path, gid);
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2775));
+        let apply_recursive = |target: &Path| {
+            let mut chgrp_ok = false;
+            if server_user_in_group_db(gid) && launcher().is_file() {
+                let me = current_uid().to_string();
+                let my_gid = server_gid().to_string();
+                let target_gid = gid.to_string();
+                if let Ok(st) = std::process::Command::new(launcher())
+                    .args([
+                        "--reuid",
+                        &me,
+                        "--regid",
+                        &my_gid,
+                        "--groups",
+                        &target_gid,
+                        "--no-new-privs",
+                        "--",
+                        "chgrp",
+                        "-R",
+                        &target_gid,
+                    ])
+                    .arg(target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    chgrp_ok = st.success();
+                }
+            }
+            if !chgrp_ok {
+                let fallback_gid = sock_gid_for().unwrap_or(gid).to_string();
+                let _ = std::process::Command::new("chgrp")
+                    .args(["-R", &fallback_gid])
+                    .arg(target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            let _ = std::process::Command::new("chmod")
+                .args(["-R", "g+rwX"])
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::process::Command::new("find")
+                .arg(target)
+                .args(["-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        };
+        apply_recursive(path);
+        if path.join(".git").exists()
+            && let Ok(gd_out) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+                .output()
+            && gd_out.status.success()
+        {
+            let gd = PathBuf::from(String::from_utf8_lossy(&gd_out.stdout).trim());
+            if gd.is_dir() {
+                apply_recursive(&gd);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, gid);
     }
 }
 

@@ -70,12 +70,40 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
             "skipDangerousModePermissionPrompt".to_string(),
             serde_json::json!(true),
         );
-        obj.entry("permissions".to_string()).or_insert_with(|| {
+        let perms = obj.entry("permissions".to_string()).or_insert_with(|| {
             serde_json::json!({
                 "defaultMode": "bypassPermissions",
                 "deny": ["SendFeedback"]
             })
         });
+        if let Some(perms_obj) = perms.as_object_mut() {
+            let deny = perms_obj
+                .entry("deny".to_string())
+                .or_insert_with(|| serde_json::json!(["SendFeedback"]));
+            if let Some(deny_arr) = deny.as_array_mut()
+                && std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
+            {
+                for tool in [
+                    "SendFeedback",
+                    "Task",
+                    "Agent",
+                    "TeamCreate",
+                    "TeamDelete",
+                    "SendMessage",
+                    "ScheduleWakeup",
+                    "Monitor",
+                    "CronCreate",
+                    "CronDelete",
+                    "CronList",
+                    "RemoteTrigger",
+                    "PushNotification",
+                ] {
+                    if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                        deny_arr.push(serde_json::Value::String(tool.to_string()));
+                    }
+                }
+            }
+        }
     }
     let mut bytes =
         serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
@@ -214,14 +242,11 @@ pub fn write_codex_with_model(
         }
         updated.push_str("\n[memories]\ngenerate_memories = false\nuse_memories = false\n");
     }
-    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none()
-        && !updated.contains("[features]")
-    {
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str(
-            "\n[features]\napps = false\ncode_mode = false\ncode_mode_only = false\nmulti_agent = false\n",
+    if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+        updated = upsert_named_table(
+            &updated,
+            "[features]",
+            "[features]\napps = false\ncode_mode = false\ncode_mode_only = false\nmulti_agent = false\n",
         );
     }
     atomic_write_shared(path, updated.as_bytes())
