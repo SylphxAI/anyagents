@@ -81,19 +81,47 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         };
         write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"));
     }
-    let workdir_created = request.workdir.as_ref().is_some_and(|p| !p.exists())
-        || request
-            .repo
-            .as_deref()
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty());
-    let cwd = if let Some(repo_raw) = request
+    let wd_str = request
+        .workdir
+        .as_ref()
+        .and_then(|p| p.to_str())
+        .map(str::trim)
+        .unwrap_or("");
+    let wd_is_worktree_keyword = matches!(
+        wd_str.to_ascii_lowercase().as_str(),
+        "worktree" | "branch" | "isolated"
+    );
+    let wd_is_private_keyword = matches!(
+        wd_str.to_ascii_lowercase().as_str(),
+        "private" | "sandbox" | "self"
+    );
+    let wd_is_inherit_keyword = matches!(
+        wd_str.to_ascii_lowercase().as_str(),
+        "inherit" | "parent"
+    );
+    let effective_repo = request
         .repo
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
+        .or(if wd_is_worktree_keyword {
+            Some("inherit")
+        } else {
+            None
+        });
+    let explicit_workdir = if wd_str.is_empty()
+        || wd_is_worktree_keyword
+        || wd_is_private_keyword
+        || wd_is_inherit_keyword
     {
-        let target_wt = match &request.workdir {
+        None
+    } else {
+        request.workdir.clone()
+    };
+    let workdir_created =
+        explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
+    let cwd = if let Some(repo_raw) = effective_repo {
+        let target_wt = match &explicit_workdir {
             Some(path) => std::path::absolute(path)?,
             None => std::path::absolute(&managed)?,
         };
@@ -113,8 +141,10 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             return Err(err);
         }
         target_wt
+    } else if wd_is_private_keyword {
+        std::path::absolute(&managed)?
     } else {
-        match &request.workdir {
+        match &explicit_workdir {
             Some(path) => {
                 std::fs::create_dir_all(path)?;
                 std::path::absolute(path)?
@@ -207,7 +237,10 @@ pub(crate) fn provision_managed_worktree(
         .unwrap_or_else(|| format!("agent/{}", agent.name));
     let base = base_opt.map(str::trim).filter(|s| !s.is_empty());
 
-    if repo_raw.eq_ignore_ascii_case("inherit") || repo_raw.eq_ignore_ascii_case("parent") {
+    if matches!(
+        repo_raw.to_ascii_lowercase().as_str(),
+        "inherit" | "parent" | "worktree" | "branch" | "isolated"
+    ) {
         let parent_wd = agent
             .parent_id
             .as_ref()
@@ -227,7 +260,16 @@ pub(crate) fn provision_managed_worktree(
         let hub_fallback = Path::new("/workspace-data/desk-git-hubs")
             .join(repo_raw.replacen('/', "-", 1));
         let data_hub_fallback = data.join("git-hubs").join(repo_raw);
-        if desk_hub_bin.is_file() && !crate::sandbox::is_isolated_test_env() {
+        let data_repos_hub = data.join("repos").join(
+            repo_raw
+                .trim_start_matches("https://github.com/")
+                .trim_end_matches(".git"),
+        );
+        if desk_hub_bin.is_file()
+            && !crate::sandbox::is_isolated_test_env()
+            && !repo_raw.starts_with("http://")
+            && !repo_raw.starts_with("https://")
+        {
             if let Some(b) = base
                 && !b.starts_with("origin/")
                 && b != "HEAD"
@@ -266,6 +308,8 @@ pub(crate) fn provision_managed_worktree(
             }
         } else if data_hub_fallback.is_dir() && is_git_repo_dir(&data_hub_fallback) {
             add_git_worktree_from_local_repo(&data_hub_fallback, target_wt, &branch, base)?;
+        } else if data_repos_hub.is_dir() && is_git_repo_dir(&data_repos_hub) {
+            add_git_worktree_from_local_repo(&data_repos_hub, target_wt, &branch, base)?;
         } else if hub_fallback.is_dir() && is_git_repo_dir(&hub_fallback) {
             add_git_worktree_from_local_repo(
                 &hub_fallback,
@@ -273,9 +317,37 @@ pub(crate) fn provision_managed_worktree(
                 &branch,
                 Some(base.unwrap_or("origin/HEAD")),
             )?;
+        } else if !crate::sandbox::is_isolated_test_env() {
+            let remote_url = if repo_raw.starts_with("http://")
+                || repo_raw.starts_with("https://")
+                || repo_raw.starts_with("git@")
+            {
+                repo_raw.to_string()
+            } else {
+                format!("https://github.com/{repo_raw}.git")
+            };
+            if let Some(parent_hub) = data_repos_hub.parent() {
+                std::fs::create_dir_all(parent_hub)?;
+            }
+            let clone_out = std::process::Command::new("git")
+                .args(["clone", "--no-checkout", &remote_url])
+                .arg(&data_repos_hub)
+                .output()?;
+            if !clone_out.status.success() {
+                let stderr = String::from_utf8_lossy(&clone_out.stderr).trim().to_string();
+                return Err(Error::Message(format!(
+                    "git clone for `{repo_raw}` failed: {stderr}"
+                )));
+            }
+            add_git_worktree_from_local_repo(
+                &data_repos_hub,
+                target_wt,
+                &branch,
+                Some(base.unwrap_or("origin/HEAD")),
+            )?;
         } else {
             return Err(Error::Message(format!(
-                "repository `{repo_raw}` not found locally and desk-git-hub is unavailable"
+                "repository `{repo_raw}` not found locally"
             )));
         }
     } else {
@@ -430,7 +502,6 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
         #[cfg(unix)]
         if let Some(ref hh) = host_home {
             ensure_seat_skills(&cfg, hh);
-            ensure_shared_agents_md(&cfg, hh);
         }
         let work_dir = agent
             .workdir
@@ -520,9 +591,18 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - Full lifecycle actions on `subagents`:\n\
              - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"all\"`).\n\
              - **Inspect**: `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })`.\n\
-             - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"workdir\": \"<optional-path>\", \"description\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"`) to automatically provision a clean Git worktree and branch (auto-reaped on archive when clean/pushed, preserved when dirty); omit `repo` and `workdir` to inherit your current `workdir`.\n\
+             - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"base\": \"<optional-base>\", \"workdir\": \"<optional-path-or-mode>\", \"description\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`).\n\
              - **Steer**: `subagents({ \"action\": \"steer\", \"agent\": \"<name-or-id>\", \"prompt\": \"...\" })`.\n\
              - **Control (`wake`, `pause`, `archive`, `delete`)**: `subagents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"agent\": \"<name-or-id>\" })`.\n\
+         - **Per-Agent Workspace (`workdir` / `repo`), Managed Git Worktrees & Shared Context Architecture**:\n\
+           - **Every Agent Owns Its Own Workspace**: Working directories and Git worktrees belong to each individual agent (`<data>/agents/<id>/work` or a chosen path), never a single system-wide directory. Multi-level sub-agent trees (Root -> L1 -> L2+) are supported at any depth.\n\
+           - **Choosing a Sub-Agent's Workspace (`repo` & `workdir`)**:\n\
+             - **Target a Specific Repository (`repo: \"<org>/<repo>\"` or git path/URL)**: Automatically provisions an isolated Git worktree for that agent at `<data>/agents/<id>/work` on branch `agent/<name>` (or custom `branch` from `base`).\n\
+             - **Isolated Branch of Your Current Repository (`repo: \"inherit\"` or `workdir: \"worktree\"`)**: Branches a new isolated Git worktree at `<data>/agents/<id>/work` from your current Git repo and `HEAD` — use this whenever spawning parallel coding sub-agents on the same repo so they never collide on `.git/index.lock` or uncommitted edits.\n\
+             - **Private Empty Sandbox (`workdir: \"private\"`)**: Gives the agent its own clean directory at `<data>/agents/<id>/work`.\n\
+             - **Default When `repo` and `workdir` Are Omitted**: A sub-agent inherits its parent's `workdir` (`\"inherit\"`) so it immediately works in the same directory/repo as its parent; a root agent defaults to its own isolated `<data>/agents/<id>/work`.\n\
+           - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
+           - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **Native SOTA Anti-Detect Browser & Persistent Browser Profiles (`browser` MCP Tool)**:\n\
            - Every harness has native browser automation via the `browser` MCP tool, running real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile anti-detect fingerprinting (WebGL vendor/renderer, Client Hints `Sec-CH-UA`, `navigator.webdriver = false`, WebRTC UDP leak protection, Canvas seed), hardware-trusted CDP input (`event.isTrusted === true`), and persistent `--user-data-dir` login profiles.\n\
            - **Zero-Knowledge Credential & 2FA OTP Fill**: Never read a plaintext password into your LLM context to type it into a browser. Pass a 1Password or credential reference directly in `text` or `secret_ref` (`browser({ \"action\": \"fill\", \"selector\": \"@e2\", \"secret_ref\": \"op://Vault/Item/password\" })` or `\"op-otp://Vault/Item\"` for live 6-digit 2FA TOTP, or `\"secret://<ref>\"`); the daemon resolves and types it via hardware CDP in memory without exposing the secret to LLM logs.\n\
@@ -720,7 +800,6 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
             }
         }
         ensure_seat_skills(target_config, &host_home);
-        ensure_shared_agents_md(target_config, &host_home);
     }
 }
 
@@ -744,36 +823,9 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
 }
 
 #[cfg(unix)]
-pub(crate) fn ensure_shared_agents_md(target_config: &Path, host_home: &Path) {
-    let Some(data_dir) = data_dir_from_config(target_config) else {
-        return;
-    };
-    let data_agents_md = data_dir.join("AGENTS.md");
-    if data_agents_md.exists() || crate::sandbox::is_isolated_test_env() {
-        return;
-    }
-    let candidate_owner = host_home.join("workspace/github.com/SylphxAI/owner/AGENTS.md");
-    let candidate_wt = PathBuf::from("/scratch/wt/owners-main/AGENTS.md");
-    let canonical = if candidate_owner.is_file() {
-        Some(candidate_owner)
-    } else if candidate_wt.is_file() {
-        Some(candidate_wt)
-    } else {
-        None
-    };
-    if let Some(src) = canonical {
-        let _ = std::os::unix::fs::symlink(&src, &data_agents_md);
-    }
-}
-
-#[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
     let data_skills = data_dir.join("skills");
-    let resolved_skills = std::fs::canonicalize(&data_skills).ok().or_else(|| {
-        let wt = PathBuf::from("/scratch/wt/sylphx-skills/skills");
-        wt.is_dir().then_some(wt)
-    });
-    if let Some(skills_dir) = resolved_skills
+    if let Ok(skills_dir) = std::fs::canonicalize(&data_skills)
         && let Some(repo_root) = skills_dir.parent()
         && repo_root.join(".git").exists()
     {
@@ -794,45 +846,23 @@ pub(crate) fn sync_canonical_skills(data_dir: &Path) {
                 .status();
         }
     }
-    let owners_main = Path::new("/scratch/wt/owners-main");
-    if owners_main.is_dir() && data_skills.is_dir() {
-        let agents_dir = owners_main.join(".agents");
-        let _ = std::fs::create_dir_all(&agents_dir);
-        let dst = agents_dir.join("skills");
-        if !dst.exists() {
-            let _ = std::os::unix::fs::symlink(&data_skills, &dst);
-        }
-    }
 }
 
 #[cfg(unix)]
-pub(crate) fn ensure_seat_skills(target_config: &Path, host_home: &Path) {
-    let data_skills = target_config
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|data_dir| data_dir.join("skills"));
-    let canonical_skills = [
-        data_skills.as_deref(),
-        Some(Path::new("/scratch/wt/sylphx-skills/skills")),
-    ]
-    .into_iter()
-    .flatten()
-    .find(|p| p.is_dir())
-    .map(Path::to_path_buf)
-    .or_else(|| {
-        let candidate = host_home.join("workspace/github.com/SylphxAI/skills/skills");
-        candidate.is_dir().then_some(candidate)
-    });
-    let Some(mut skills_root) = canonical_skills else {
+pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
+    let data_skills = data_dir_from_config(target_config)
+        .map(|d| d.join("skills"))
+        .filter(|p| p.is_dir())
+        .or_else(|| {
+            target_config
+                .parent()
+                .and_then(|p| p.parent())
+                .map(|d| d.join("skills"))
+                .filter(|p| p.is_dir())
+        });
+    let Some(skills_root) = data_skills else {
         return;
     };
-    if let Some(ref data_sk) = data_skills
-        && !data_sk.exists()
-        && skills_root != *data_sk
-        && std::os::unix::fs::symlink(&skills_root, data_sk).is_ok()
-    {
-        skills_root = data_sk.clone();
-    }
     for rel in [
         "skills",
         ".agents/skills",

@@ -202,12 +202,6 @@ pub fn write_codex_with_model(
         };
         updated = upsert_named_table(&updated, "[model_providers.sylphx]", &provider_table);
     }
-    if !updated.contains("[projects.\"/scratch/wt/owners-main\"]") {
-        if !updated.ends_with('\n') {
-            updated.push('\n');
-        }
-        updated.push_str("\n[projects.\"/scratch/wt/owners-main\"]\ntrust_level = \"trusted\"\n");
-    }
     if !updated.contains("[projects.\"/\"]") {
         if !updated.ends_with('\n') {
             updated.push('\n');
