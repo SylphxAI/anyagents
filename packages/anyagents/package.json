@@ -17,8 +17,7 @@
     "@sylphx/anyagents-darwin-arm64": "0.1.0",
     "@sylphx/anyagents-darwin-x64": "0.1.0",
     "@sylphx/anyagents-linux-x64-gnu": "0.1.0",
-    "@sylphx/anyagents-linux-arm64-gnu": "0.1.0",
-    "@sylphx/anyagents-win32-x64-msvc": "0.1.0"
+    "@sylphx/anyagents-linux-arm64-gnu": "0.1.0"
   },
   "keywords": [
     "anyagents",

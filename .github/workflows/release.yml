@@ -1,0 +1,33 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    if: github.event.repository.private == false && github.ref == 'refs/heads/main'
+    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@bd65aeeafbba0ed9353fbd6bb85c1e49382099c0
+    permissions:
+      contents: write
+      id-token: write
+      packages: write
+    secrets:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    with:
+      kit-ref: bd65aeeafbba0ed9353fbd6bb85c1e49382099c0
+      name: anyagents
+      npm-package: '@sylphx/anyagents'
+      platforms: darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu
+      version-arg: --version
+      smoke: |
+        npx -y "@sylphx/anyagents@$V" --version
+        npx -y "@sylphx/anyagents@$V" --help
