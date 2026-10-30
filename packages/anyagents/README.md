@@ -15,7 +15,7 @@ npm install -g @sylphx/anyagents
 anyagents serve
 ```
 
-Supported platforms: macOS (arm64 and x64), Linux glibc (x64 and arm64). If optional dependencies were skipped during install, reinstall without `--no-optional`. To run a binary you built yourself, set `ANYAGENTS_BIN=/path/to/anyagents`.
+Supported platforms: macOS (arm64 and x64), Linux glibc (x64 and arm64). Linux requires glibc 2.34 or newer and kernel 5.9 or newer. If optional dependencies were skipped during install, reinstall without `--no-optional`. To run a binary you built yourself, set `ANYAGENTS_BIN=/path/to/anyagents`.
 
 Documentation, the design and the source are at [github.com/SylphxAI/anyagents](https://github.com/SylphxAI/anyagents).
 

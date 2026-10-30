@@ -6,7 +6,7 @@ Run any coding agent harness as a long-lived agent on your own machine, containe
 
 ## Install from source
 
-AnyAgents is available as source for Linux and macOS. Install Rust 1.98 or newer, then build the existing CLI:
+AnyAgents is available as source for Linux and macOS. Linux requires glibc 2.34 or newer and kernel 5.9 or newer for inherited file-descriptor cleanup. Install Rust 1.98 or newer, then build the existing CLI:
 
 ```bash
 git clone https://github.com/SylphxAI/anyagents.git

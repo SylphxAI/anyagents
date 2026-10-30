@@ -1,7 +1,7 @@
 {
   "name": "@sylphx/anyagents-linux-arm64-gnu",
   "version": "0.1.0",
-  "description": "anyagents native binary for linux-arm64-gnu. Installed as an optional dependency of @sylphx/anyagents.",
+  "description": "anyagents native binary for linux-arm64-gnu. Installed as an optional dependency of @sylphx/anyagents. Requires glibc 2.34+ and Linux 5.9+.",
   "os": [
     "linux"
   ],
