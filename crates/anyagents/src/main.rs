@@ -93,19 +93,37 @@ enum Command {
     /// List all agents and sub-agents with their parent, harness, model, state, and process health.
     Peers {
         /// Optional state filter: `running`, `archived`, or `all`.
-        #[arg(long)]
+        #[arg(short = 's', long)]
         state: Option<String>,
         /// Optional parent filter: agent name, `agt_...` id, `self`, or `root`.
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
+        /// Expand full multi-level sub-agent tree (`L1 -> L2 -> L3+`).
+        #[arg(short = 't', long)]
+        tree: bool,
+        /// Maximum sub-agent tree depth to expand (`0` = roots only, `1` = L1, `2` = L2, ...).
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Show wide table including `agt_...` IDs without terminal truncation.
+        #[arg(short = 'w', long)]
+        wide: bool,
     },
     /// List sub-agents or configure default sub-agent harness/model/profile (`anyagents subagents default ...`).
     Subagents {
         /// Optional action (`default`, `list`) or parent agent name (`self`, `all`, `<agent>`).
         parent: Option<String>,
         /// Optional state filter (`running`, `paused`, `archived`, or `all`).
-        #[arg(long)]
+        #[arg(short = 's', long)]
         state: Option<String>,
+        /// Expand full multi-level sub-agent tree (`L1 -> L2 -> L3+`).
+        #[arg(short = 't', long)]
+        tree: bool,
+        /// Maximum sub-agent tree depth to expand (`0` = roots only, `1` = L1, `2` = L2, ...).
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Show wide table including `agt_...` IDs without terminal truncation.
+        #[arg(short = 'w', long)]
+        wide: bool,
         /// Set sub-agent default to inherit parent's harness, model, and profile (`subagents default --inherit`).
         #[arg(long)]
         inherit: bool,
@@ -664,11 +682,20 @@ enum AgentsCommand {
     /// List agents.
     List {
         /// Optional state filter: `running`, `paused`, `archived`, or `all`.
-        #[arg(long)]
+        #[arg(short = 's', long)]
         state: Option<String>,
         /// Optional parent filter: agent name, `agt_...` id, `self`, or `root`.
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
+        /// Expand full multi-level sub-agent tree (`L1 -> L2 -> L3+`).
+        #[arg(short = 't', long)]
+        tree: bool,
+        /// Maximum sub-agent tree depth to expand (`0` = roots only, `1` = L1, `2` = L2, ...).
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Show wide table including `agt_...` IDs without terminal truncation.
+        #[arg(short = 'w', long)]
+        wide: bool,
     },
     /// View or update an agent's standing role instructions and refresh its injected system prompt.
     Instructions {
@@ -773,12 +800,26 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             }
         }
         Command::Agents { action } => agent::agents(&data, action),
-        Command::Peers { state, parent } => {
-            agent::peers(&data, state.as_deref(), parent.as_deref())
-        }
+        Command::Peers {
+            state,
+            parent,
+            tree,
+            depth,
+            wide,
+        } => agent::peers_with_options(
+            &data,
+            state.as_deref(),
+            parent.as_deref(),
+            tree,
+            depth,
+            wide,
+        ),
         Command::Subagents {
             parent,
             state,
+            tree,
+            depth,
+            wide,
             inherit,
             harness,
             model,
@@ -815,7 +856,14 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                         Some("subagents".to_owned())
                     }
                 });
-                agent::peers(&data, state.as_deref(), parent_filter.as_deref())
+                agent::peers_with_options(
+                    &data,
+                    state.as_deref(),
+                    parent_filter.as_deref(),
+                    tree,
+                    depth,
+                    wide,
+                )
             }
         }
         Command::Spawn {

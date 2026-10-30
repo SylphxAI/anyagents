@@ -79,8 +79,22 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
         AgentsCommand::Delete { name } => {
             delete_cmd(data, &name)?;
         }
-        AgentsCommand::List { state, parent } => {
-            list_filtered(data, state.as_deref(), parent.as_deref(), false)?
+        AgentsCommand::List {
+            state,
+            parent,
+            tree,
+            depth,
+            wide,
+        } => {
+            list_filtered(
+                data,
+                state.as_deref(),
+                parent.as_deref(),
+                false,
+                tree,
+                depth,
+                wide,
+            )?;
         }
         AgentsCommand::Instructions {
             name,
@@ -582,8 +596,15 @@ pub fn resume_cmd(data: &Path, name: &str, prompt: Option<String>) -> Result<(),
     Ok(())
 }
 
-pub fn peers(data: &Path, state: Option<&str>, parent: Option<&str>) -> Result<(), Error> {
-    list_filtered(data, state, parent, true)
+pub fn peers_with_options(
+    data: &Path,
+    state: Option<&str>,
+    parent: Option<&str>,
+    tree: bool,
+    depth: Option<usize>,
+    wide: bool,
+) -> Result<(), Error> {
+    list_filtered(data, state, parent, true, tree, depth, wide)
 }
 
 fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
@@ -952,13 +973,102 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
     }
 }
 
+fn apply_parent_filter_for_views(
+    agents: &mut Vec<AgentView>,
+    parent_filter: Option<&str>,
+    pretty: bool,
+) -> bool {
+    let Some(pf) = parent_filter.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let cleaned = pf.strip_prefix("agent:").unwrap_or(pf);
+    if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none") {
+        if !pretty {
+            agents.retain(|a| a.parent.is_none());
+        }
+        return false;
+    }
+    if cleaned.eq_ignore_ascii_case("subagents") || cleaned.eq_ignore_ascii_case("all") {
+        if !pretty {
+            agents.retain(|a| a.parent.is_some());
+        }
+        return true;
+    }
+    let wanted_id = if cleaned.eq_ignore_ascii_case("self") {
+        client::agent_identity().map(|id| id.to_string())
+    } else {
+        agents
+            .iter()
+            .find(|a| {
+                a.name.eq_ignore_ascii_case(cleaned)
+                    || a.id == cleaned
+                    || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(cleaned))
+            })
+            .map(|a| a.id.clone())
+            .or_else(|| Some(cleaned.to_string()))
+    };
+    if let Some(pid) = wanted_id {
+        if pretty {
+            let mut keep_ids = std::collections::HashSet::new();
+            keep_ids.insert(pid.clone());
+            loop {
+                let mut added = false;
+                for a in agents.iter() {
+                    if let Some(ref p) = a.parent
+                        && keep_ids.contains(p)
+                        && keep_ids.insert(a.id.clone())
+                    {
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+            agents.retain(|a| keep_ids.contains(&a.id));
+            for a in agents.iter_mut() {
+                if a.id == pid {
+                    a.parent = None;
+                }
+            }
+        } else {
+            agents.retain(|a| a.parent.as_deref() == Some(pid.as_str()));
+        }
+    }
+    false
+}
+
 /// `agents list` / `peers`: the server's view when it is there, else the stored rows.
 fn list_filtered(
     data: &Path,
     state_filter: Option<&str>,
     parent_filter: Option<&str>,
     show_parent: bool,
+    tree: bool,
+    depth: Option<usize>,
+    wide: bool,
 ) -> Result<(), Error> {
+    let pretty = crate::ui::is_pretty();
+    let is_root_only_filter = parent_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|pf| pf.strip_prefix("agent:").unwrap_or(pf))
+        .is_some_and(|c| c.eq_ignore_ascii_case("root") || c.eq_ignore_ascii_case("none"));
+    let has_specific_or_subagents_parent = parent_filter
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some()
+        && !is_root_only_filter;
+    let effective_max_depth = if is_root_only_filter && !tree && depth.is_none() {
+        Some(0)
+    } else if let Some(d) = depth {
+        Some(d)
+    } else if tree || has_specific_or_subagents_parent {
+        None
+    } else {
+        Some(0)
+    };
+
     if client::can_call_server(data) {
         let mut params = Vec::new();
         if let Some(s) = state_filter.map(str::trim).filter(|s| !s.is_empty()) {
@@ -983,42 +1093,23 @@ fn list_filtered(
             {
                 listed.agents.retain(|a| a.state.eq_ignore_ascii_case(sf));
             }
-            if let Some(pf) = parent_filter.map(str::trim).filter(|s| !s.is_empty()) {
-                let cleaned = pf.strip_prefix("agent:").unwrap_or(pf);
-                if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none") {
-                    listed.agents.retain(|a| a.parent.is_none());
-                } else if cleaned.eq_ignore_ascii_case("subagents")
-                    || cleaned.eq_ignore_ascii_case("all")
-                {
-                    listed.agents.retain(|a| a.parent.is_some());
-                } else {
-                    let wanted_id = if cleaned.eq_ignore_ascii_case("self") {
-                        client::agent_identity().map(|id| id.to_string())
-                    } else {
-                        listed
-                            .agents
-                            .iter()
-                            .find(|a| {
-                                a.name.eq_ignore_ascii_case(cleaned)
-                                    || a.id == cleaned
-                                    || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(cleaned))
-                            })
-                            .map(|a| a.id.clone())
-                            .or_else(|| Some(cleaned.to_string()))
-                    };
-                    if let Some(pid) = wanted_id {
-                        listed
-                            .agents
-                            .retain(|a| a.parent.as_deref() == Some(pid.as_str()));
-                    }
-                }
-            }
+            let only_with_subagents =
+                apply_parent_filter_for_views(&mut listed.agents, parent_filter, pretty);
             let include_archived = state_filter.is_some_and(|sf| {
                 let sf = sf.trim();
                 sf.eq_ignore_ascii_case("all") || sf.eq_ignore_ascii_case("archived")
             });
-            if crate::ui::is_pretty() {
-                crate::ui::print_agents_table(&listed.agents, None, include_archived);
+            if pretty {
+                crate::ui::print_agents_table_with_options(
+                    &listed.agents,
+                    None,
+                    crate::ui::AgentsTableOptions {
+                        include_archived,
+                        max_depth: effective_max_depth,
+                        only_with_subagents,
+                        wide,
+                    },
+                );
                 return Ok(());
             }
             for agent in listed.agents {
@@ -1065,7 +1156,7 @@ fn list_filtered(
         let (mode, steer) = declared(&agent.harness);
         let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
         let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
-        if crate::ui::is_pretty() {
+        if pretty {
             fallback_views.push(AgentView {
                 id: agent.id.to_string(),
                 name: agent.name,
@@ -1127,12 +1218,23 @@ fn list_filtered(
             });
         }
     }
-    if crate::ui::is_pretty() {
+    if pretty {
+        let only_with_subagents =
+            apply_parent_filter_for_views(&mut fallback_views, parent_filter, true);
         let include_archived = state_filter.is_some_and(|sf| {
             let sf = sf.trim();
             sf.eq_ignore_ascii_case("all") || sf.eq_ignore_ascii_case("archived")
         });
-        crate::ui::print_agents_table(&fallback_views, None, include_archived);
+        crate::ui::print_agents_table_with_options(
+            &fallback_views,
+            None,
+            crate::ui::AgentsTableOptions {
+                include_archived,
+                max_depth: effective_max_depth,
+                only_with_subagents,
+                wide,
+            },
+        );
     }
     Ok(())
 }
