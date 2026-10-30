@@ -16,7 +16,6 @@ const PLATFORMS = {
   "darwin-x64": "darwin-x64",
   "linux-x64": "linux-x64-gnu",
   "linux-arm64": "linux-arm64-gnu",
-  "win32-x64": "win32-x64-msvc",
 };
 
 function resolveBinary() {
@@ -41,7 +40,7 @@ const bin = resolveBinary();
 if (!bin) {
   console.error(
     `${name}: no native binary for ${process.platform}-${process.arch}.\n` +
-      "Supported: macOS (arm64, x64), Linux glibc (x64, arm64), Windows x64.\n" +
+      "Supported: macOS (arm64, x64), Linux glibc (x64, arm64).\n" +
       "If optional dependencies were skipped, reinstall without --no-optional."
   );
   process.exit(1);
