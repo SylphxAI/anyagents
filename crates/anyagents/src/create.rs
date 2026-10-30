@@ -1313,6 +1313,8 @@ pub(crate) struct ProviderProfileEntry {
     pub kind: String,
     pub compatible_harnesses: Vec<String>,
     pub assigned_agents: Vec<String>,
+    #[serde(default)]
+    pub subagent_count: usize,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<String>,
 }
@@ -2737,6 +2739,7 @@ pub(crate) fn sync_and_list_provider_profiles(
                     kind,
                     compatible_harnesses,
                     assigned_agents: Vec::new(),
+                    subagent_count: 0,
                     usage: None,
                 });
             }
@@ -2756,10 +2759,11 @@ pub(crate) fn sync_and_list_provider_profiles(
         .filter(|a| a.state == "running")
         .map(|a| a.name.clone())
         .collect();
-    for agent in &agents {
-        if agent.state == "archived" {
-            continue;
-        }
+    let mut ordered_agents: Vec<&Agent> =
+        agents.iter().filter(|a| a.state != "archived").collect();
+    ordered_agents.sort_by_key(|a| a.parent_id.is_some());
+    for agent in ordered_agents {
+        let is_root = agent.parent_id.is_none();
         let cfg = agent_config_dir(data, &agent.id);
         let expected_provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
         let bound = bound_profile_name(&cfg);
@@ -2774,7 +2778,7 @@ pub(crate) fn sync_and_list_provider_profiles(
         let has_dedicated = entries
             .iter()
             .any(|e| e.provider == expected_provider && e.profile == agent.name);
-        if bound_prov == expected_provider && bound_prof != agent.name && has_dedicated {
+        if is_root && bound_prov == expected_provider && bound_prof != agent.name && has_dedicated {
             let affinity_pct = entries
                 .iter()
                 .find(|e| e.provider == expected_provider && e.profile == agent.name)
@@ -2820,18 +2824,27 @@ pub(crate) fn sync_and_list_provider_profiles(
         if bound.as_deref() != Some(normalized.as_str()) {
             write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"));
         }
-        if let Some(entry) = entries
-            .iter_mut()
-            .find(|e| e.provider == bound_prov && e.profile == bound_prof)
+        let target_idx = entries
+            .iter()
+            .position(|e| e.provider == bound_prov && e.profile == bound_prof)
+            .or_else(|| entries.iter().position(|e| e.provider == expected_provider));
+        if let Some(idx) = target_idx
+            && let Some(entry) = entries.get_mut(idx)
         {
-            entry.assigned_agents.push(agent.name.clone());
-        } else if let Some(entry) = entries.iter_mut().find(|e| e.provider == expected_provider) {
-            entry.assigned_agents.push(agent.name.clone());
+            if is_root {
+                entry.assigned_agents.push(agent.name.clone());
+            } else {
+                entry.subagent_count += 1;
+            }
         }
     }
 
     for entry in &mut entries {
-        entry.assigned_agents.sort();
+        entry.assigned_agents.sort_by(|a, b| {
+            a.starts_with("owner-")
+                .cmp(&b.starts_with("owner-"))
+                .then_with(|| a.cmp(b))
+        });
     }
     entries
 }
@@ -3153,6 +3166,74 @@ fn sync_anthropic_profile_metadata(
     anthropic_tier_label(sub_type, rate_tier)
 }
 
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m_adj = if m > 2 { (m - 3) as u64 } else { (m + 9) as u64 };
+    let doy = (153 * m_adj + 2) / 5 + (d as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + (doe as i64) - 719_468
+}
+
+fn parse_iso_utc_epoch_secs(s: &str) -> Option<i64> {
+    let s = s.trim();
+    if s.len() < 19 {
+        return None;
+    }
+    let year: i64 = s.get(0..4)?.parse().ok()?;
+    let month: i64 = s.get(5..7)?.parse().ok()?;
+    let day: i64 = s.get(8..10)?.parse().ok()?;
+    let hour: i64 = s.get(11..13)?.parse().ok()?;
+    let min: i64 = s.get(14..16)?.parse().ok()?;
+    let sec: i64 = s.get(17..19)?.parse().ok()?;
+    let days = days_from_civil(year, month, day);
+    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+fn format_reset_eta_secs(rem_secs: i64) -> Option<String> {
+    if rem_secs <= 0 {
+        return None;
+    }
+    if rem_secs < 3_600 {
+        let m = ((rem_secs + 59) / 60).max(1);
+        return Some(format!("{m}m"));
+    }
+    if rem_secs < 86_400 {
+        let h = rem_secs / 3_600;
+        let m = (rem_secs % 3_600) / 60;
+        return if m == 0 {
+            Some(format!("{h}h"))
+        } else {
+            Some(format!("{h}h{m:02}m"))
+        };
+    }
+    let d = rem_secs / 86_400;
+    let h = (rem_secs % 86_400) / 3_600;
+    if h == 0 {
+        Some(format!("{d}d"))
+    } else {
+        Some(format!("{d}d{h:02}h"))
+    }
+}
+
+fn format_reset_eta_iso(iso_str: &str) -> Option<String> {
+    let target_secs = parse_iso_utc_epoch_secs(iso_str)?;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as i64;
+    format_reset_eta_secs(target_secs - now_secs)
+}
+
+fn format_reset_eta_epoch_ms(target_ms: i64) -> Option<String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    format_reset_eta_secs((target_ms - now_ms) / 1_000)
+}
+
 pub(crate) fn probe_one_profile_usage(
     data: &Path,
     provider: &str,
@@ -3276,20 +3357,27 @@ pub(crate) fn probe_one_profile_usage(
                 .unwrap_or(0.0);
             let rem_5h = (100.0 - u5).clamp(0.0, 100.0).round() as i64;
             let rem_7d = (100.0 - u7).clamp(0.0, 100.0).round() as i64;
-            if rem_5h == 0
-                && let Some(resets_at) = val
-                    .pointer("/five_hour/resets_at")
-                    .and_then(serde_json::Value::as_str)
-                && let Some(hhmm) = resets_at.split('T').nth(1).and_then(|t| t.get(..5))
-            {
-                Some(format!(
-                    "5h: 0% left (resets {hhmm}Z) · 7d: {rem_7d}% left{tier_suffix}"
-                ))
-            } else {
-                Some(format!(
-                    "5h: {rem_5h}% left · 7d: {rem_7d}% left{tier_suffix}"
-                ))
-            }
+            let eta_5h = (rem_5h < 100)
+                .then(|| {
+                    val.pointer("/five_hour/resets_at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(format_reset_eta_iso)
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            let eta_7d = (rem_7d < 100)
+                .then(|| {
+                    val.pointer("/seven_day/resets_at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(format_reset_eta_iso)
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            Some(format!(
+                "5h: {rem_5h}% left{eta_5h} · 7d: {rem_7d}% left{eta_7d}{tier_suffix}"
+            ))
         }
         "openai" => {
             let auth_text = std::fs::read_to_string(prof_dir.join("auth.json"))
@@ -3383,9 +3471,18 @@ pub(crate) fn probe_one_profile_usage(
                 .pointer("/rate_limit/primary_window/used_percent")
                 .and_then(serde_json::Value::as_f64)?;
             let rem = (100.0 - used).clamp(0.0, 100.0).round() as i64;
+            let eta = (rem < 100)
+                .then(|| {
+                    val.pointer("/rate_limit/primary_window/reset_after_seconds")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(format_reset_eta_secs)
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
             match val.get("plan_type").and_then(serde_json::Value::as_str) {
-                Some(plan) if !plan.is_empty() => Some(format!("7d: {rem}% left ({plan})")),
-                _ => Some(format!("7d: {rem}% left")),
+                Some(plan) if !plan.is_empty() => Some(format!("7d: {rem}% left{eta} ({plan})")),
+                _ => Some(format!("7d: {rem}% left{eta}")),
             }
         }
         "google-antigravity" => {
@@ -3472,10 +3569,10 @@ pub(crate) fn probe_one_profile_usage(
             if let Some(ref sv) = summary_val
                 && let Some(groups) = sv.get("groups").and_then(serde_json::Value::as_array)
             {
-                let mut gem_5h = None;
-                let mut gem_7d = None;
-                let mut opus_5h = None;
-                let mut opus_7d = None;
+                let mut gem_5h: Option<(i64, Option<String>)> = None;
+                let mut gem_7d: Option<(i64, Option<String>)> = None;
+                let mut opus_5h: Option<(i64, Option<String>)> = None;
+                let mut opus_7d: Option<(i64, Option<String>)> = None;
                 for g in groups {
                     let Some(buckets) = g.get("buckets").and_then(serde_json::Value::as_array)
                     else {
@@ -3486,34 +3583,63 @@ pub(crate) fn probe_one_profile_usage(
                             .get("bucketId")
                             .and_then(serde_json::Value::as_str)
                             .unwrap_or("");
-                        let disabled = b
-                            .get("disabled")
-                            .and_then(serde_json::Value::as_bool)
-                            .unwrap_or(false);
-                        let frac = if disabled {
-                            0.0
-                        } else {
-                            b.get("remainingFraction")
-                                .and_then(serde_json::Value::as_f64)
-                                .unwrap_or(0.0)
-                        };
+                        let frac = b
+                            .get("remainingFraction")
+                            .and_then(serde_json::Value::as_f64)
+                            .unwrap_or(0.0);
                         let pct = (frac * 100.0).clamp(0.0, 100.0).round() as i64;
+                        let eta = (pct < 100)
+                            .then(|| {
+                                b.get("resetTime")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(format_reset_eta_iso)
+                            })
+                            .flatten();
                         match bid {
-                            "gemini-5h" => gem_5h = Some(pct),
-                            "gemini-weekly" => gem_7d = Some(pct),
-                            "3p-5h" => opus_5h = Some(pct),
-                            "3p-weekly" => opus_7d = Some(pct),
+                            "gemini-5h" => gem_5h = Some((pct, eta)),
+                            "gemini-weekly" => gem_7d = Some((pct, eta)),
+                            "3p-5h" => opus_5h = Some((pct, eta)),
+                            "3p-weekly" => opus_7d = Some((pct, eta)),
                             _ => {}
                         }
                     }
                 }
-                if let (Some(g5), Some(g7), Some(o5), Some(o7)) = (gem_5h, gem_7d, opus_5h, opus_7d)
+                if let (
+                    Some((g5, g5_eta)),
+                    Some((g7, g7_eta)),
+                    Some((o5, o5_eta)),
+                    Some((o7, o7_eta)),
+                ) = (gem_5h, gem_7d, opus_5h, opus_7d)
                 {
-                    let gem = g5.min(g7);
-                    let opus = o5.min(o7);
-                    return Some(format!(
-                        "gemini: {gem}% left (5h: {g5}%, 7d: {g7}%) · opus: {opus}% left (5h: {o5}%, 7d: {o7}%)"
-                    ));
+                    let fmt_pool =
+                        |label: &str, p5: i64, e5: Option<String>, p7: i64, e7: Option<String>| {
+                            let p = p5.min(p7);
+                            let mut parts = Vec::new();
+                            if p5 < 100 {
+                                let es = e5.map(|e| format!(" ↻{e}")).unwrap_or_default();
+                                if p5 == p && p5 < p7 {
+                                    parts.push(format!("5h{es}"));
+                                } else {
+                                    parts.push(format!("5h {p5}%{es}"));
+                                }
+                            }
+                            if p7 < 100 {
+                                let es = e7.map(|e| format!(" ↻{e}")).unwrap_or_default();
+                                if p7 == p {
+                                    parts.push(format!("7d{es}"));
+                                } else {
+                                    parts.push(format!("7d {p7}%{es}"));
+                                }
+                            }
+                            if parts.is_empty() {
+                                format!("{label}: {p}% left")
+                            } else {
+                                format!("{label}: {p}% left ({})", parts.join(", "))
+                            }
+                        };
+                    let gem_s = fmt_pool("gemini", g5, g5_eta, g7, g7_eta);
+                    let opus_s = fmt_pool("opus", o5, o5_eta, o7, o7_eta);
+                    return Some(format!("{gem_s} · {opus_s}"));
                 }
             }
             let val = fetch_models(&active_token)?;
@@ -3580,7 +3706,28 @@ pub(crate) fn probe_one_profile_usage(
                 let rm = parse_num("/usage/remaining").unwrap_or(0.0);
                 (rm / lm * 100.0).clamp(0.0, 100.0).round() as i64
             };
-            Some(format!("5h: {pct_5h}% left · mo: {pct_mo}% left"))
+            let eta_5h = (pct_5h < 100)
+                .then(|| {
+                    val.pointer("/usages/limit_5h/reset_time")
+                        .or_else(|| val.pointer("/limits/0/detail/resetTime"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(format_reset_eta_iso)
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            let eta_mo = (pct_mo < 100)
+                .then(|| {
+                    val.pointer("/usages/limit_month_total/reset_time")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(format_reset_eta_iso)
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            Some(format!(
+                "5h: {pct_5h}% left{eta_5h} · mo: {pct_mo}% left{eta_mo}"
+            ))
         }
         "minimax-code-plan" => {
             let key = read_first_non_empty_file(
@@ -3598,25 +3745,59 @@ pub(crate) fn probe_one_profile_usage(
             let body = resp.into_body().read_to_string().ok()?;
             let val: serde_json::Value = serde_json::from_str(&body).ok()?;
             let m0 = val.pointer("/model_remains/0")?;
-            let tot_5h = m0
-                .get("current_interval_total_count")
-                .and_then(serde_json::Value::as_f64)?
-                .max(1.0);
-            let rem_5h = m0
-                .get("current_interval_usage_count")
+            let pct_5h = if let Some(p) = m0
+                .get("current_interval_remaining_percent")
                 .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            let tot_7d = m0
-                .get("current_weekly_total_count")
-                .and_then(serde_json::Value::as_f64)?
-                .max(1.0);
-            let rem_7d = m0
-                .get("current_weekly_usage_count")
+            {
+                p.clamp(0.0, 100.0).round() as i64
+            } else {
+                let tot_5h = m0
+                    .get("current_interval_total_count")
+                    .and_then(serde_json::Value::as_f64)?
+                    .max(1.0);
+                let rem_5h = m0
+                    .get("current_interval_usage_count")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                (rem_5h / tot_5h * 100.0).clamp(0.0, 100.0).round() as i64
+            };
+            let pct_7d = if let Some(p) = m0
+                .get("current_weekly_remaining_percent")
                 .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            let pct_5h = (rem_5h / tot_5h * 100.0).clamp(0.0, 100.0).round() as i64;
-            let pct_7d = (rem_7d / tot_7d * 100.0).clamp(0.0, 100.0).round() as i64;
-            Some(format!("5h: {pct_5h}% left · 7d: {pct_7d}% left"))
+            {
+                p.clamp(0.0, 100.0).round() as i64
+            } else {
+                let tot_7d = m0
+                    .get("current_weekly_total_count")
+                    .and_then(serde_json::Value::as_f64)?
+                    .max(1.0);
+                let rem_7d = m0
+                    .get("current_weekly_usage_count")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                (rem_7d / tot_7d * 100.0).clamp(0.0, 100.0).round() as i64
+            };
+            let eta_5h = (pct_5h < 100)
+                .then(|| {
+                    m0.get("remains_time")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|ms| format_reset_eta_secs(ms / 1_000))
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            let eta_7d = (pct_7d < 100)
+                .then(|| {
+                    m0.get("weekly_remains_time")
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|ms| format_reset_eta_secs(ms / 1_000))
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            Some(format!(
+                "5h: {pct_5h}% left{eta_5h} · 7d: {pct_7d}% left{eta_7d}"
+            ))
         }
         "glm-code-plan" => {
             let key = read_first_non_empty_file(
@@ -3635,7 +3816,9 @@ pub(crate) fn probe_one_profile_usage(
             let val: serde_json::Value = serde_json::from_str(&body).ok()?;
             let limits = val.pointer("/data/limits")?.as_array()?;
             let mut rem_5h = None;
+            let mut eta_5h = None;
             let mut rem_7d = None;
+            let mut eta_7d = None;
             for item in limits {
                 if item.get("type").and_then(serde_json::Value::as_str) != Some("TOKENS_LIMIT") {
                     continue;
@@ -3646,17 +3829,26 @@ pub(crate) fn probe_one_profile_usage(
                     .and_then(serde_json::Value::as_i64)
                     .unwrap_or(0);
                 let rem = (100 - pct).clamp(0, 100);
+                let eta = (rem < 100)
+                    .then(|| {
+                        item.get("nextResetTime")
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(format_reset_eta_epoch_ms)
+                    })
+                    .flatten();
                 if unit == Some(3) {
                     rem_5h = Some(rem);
+                    eta_5h = eta;
                 } else if unit == Some(6) {
                     rem_7d = Some(rem);
+                    eta_7d = eta;
                 }
             }
-            Some(format!(
-                "5h: {}% left · 7d: {}% left",
-                rem_5h?,
-                rem_7d.unwrap_or(100)
-            ))
+            let r5 = rem_5h?;
+            let r7 = rem_7d.unwrap_or(100);
+            let e5 = eta_5h.map(|e| format!(" ↻{e}")).unwrap_or_default();
+            let e7 = eta_7d.map(|e| format!(" ↻{e}")).unwrap_or_default();
+            Some(format!("5h: {r5}% left{e5} · 7d: {r7}% left{e7}"))
         }
         "deepseek" => {
             let api_dir = data.join("profiles/deepseek/api");
@@ -3923,18 +4115,17 @@ pub(crate) fn probe_one_profile_usage(
                 .or_else(|| val.get("creditUsagePercent"))
                 .and_then(serde_json::Value::as_f64)?;
             let rem = (100.0 - used).clamp(0.0, 100.0).round() as i64;
-            if rem == 0
-                && let Some(end_str) = val
-                    .pointer("/config/currentPeriod/end")
-                    .or_else(|| val.pointer("/currentPeriod/end"))
-                    .and_then(serde_json::Value::as_str)
-                && let Some((date_part, time_part)) = end_str.split_once('T')
-                && let (Some(mmdd), Some(hhmm)) = (date_part.get(5..10), time_part.get(..5))
-            {
-                Some(format!("7d: 0% left (resets {mmdd} {hhmm}Z)"))
-            } else {
-                Some(format!("7d: {rem}% left"))
-            }
+            let eta = (rem < 100)
+                .then(|| {
+                    val.pointer("/config/currentPeriod/end")
+                        .or_else(|| val.pointer("/currentPeriod/end"))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(format_reset_eta_iso)
+                })
+                .flatten()
+                .map(|e| format!(" ↻{e}"))
+                .unwrap_or_default();
+            Some(format!("7d: {rem}% left{eta}"))
         }
         "qwen-token-plan" => {
             let key = read_first_non_empty_file(
@@ -4014,12 +4205,13 @@ pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -
         }
         return extract_after("gemini:");
     }
+    let mut min_pct: Option<i64> = None;
     for prefix in ["5h:", "7d:", "mo:"] {
         if let Some(p) = extract_after(prefix) {
-            return Some(p);
+            min_pct = Some(min_pct.map_or(p, |cur| cur.min(p)));
         }
     }
-    None
+    min_pct
 }
 
 pub(crate) fn probe_profile_remaining_pct(

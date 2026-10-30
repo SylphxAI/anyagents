@@ -2093,61 +2093,19 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             || format!("{}/{}", e.provider, e.profile) == f_trimmed
             || e.compatible_harnesses.iter().any(|h| h == f_trimmed)
     };
+    let filtered: Vec<create::ProviderProfileEntry> = entries
+        .into_iter()
+        .filter(|e| filter.is_none_or(|f| matches_filter(e, f.trim())))
+        .collect();
     if ui::is_pretty() {
-        println!("\n  {}\n", ui::bold_cyan("Provider Profiles"));
-        let mut table = ui::Table::new(&[
-            ("PROVIDER", false),
-            ("PROFILE", false),
-            ("KIND", false),
-            ("USAGE / BALANCE", false),
-            ("COMPATIBLE HARNESSES", false),
-            ("AGENTS", false),
-        ]);
-        for e in entries {
-            if let Some(f) = filter
-                && !matches_filter(&e, f.trim())
-            {
-                continue;
-            }
-            let kind_badge = match e.kind.as_str() {
-                "oauth" | "subscription" => ui::green(&e.kind),
-                "coding-plan" => ui::cyan(&e.kind),
-                _ => ui::yellow(&e.kind),
-            };
-            let usage_cell = match e.usage.as_deref() {
-                Some(u) if u.contains(": 0% left") || u.starts_with("0% left") => ui::red(u),
-                Some(u) => ui::green(u),
-                None => ui::dim("-"),
-            };
-            let harnesses = ui::dim(&e.compatible_harnesses.join(", "));
-            let agents = if e.assigned_agents.is_empty() {
-                ui::dim("-")
-            } else {
-                ui::bold(&e.assigned_agents.join(", "))
-            };
-            table.add_row(vec![
-                ui::bold(&e.provider),
-                e.profile,
-                kind_badge,
-                usage_cell,
-                harnesses,
-                agents,
-            ]);
-        }
-        table.print();
-        println!();
+        ui::print_profiles_pretty(&filtered);
         return Ok(());
     }
     println!(
         "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\tAGENTS",
         "PROVIDER", "PROFILE", "KIND", "USAGE / BALANCE", "COMPATIBLE HARNESSES"
     );
-    for e in entries {
-        if let Some(f) = filter
-            && !matches_filter(&e, f.trim())
-        {
-            continue;
-        }
+    for e in filtered {
         let usage = e.usage.as_deref().unwrap_or("-");
         let harnesses = e.compatible_harnesses.join(",");
         let agents = if e.assigned_agents.is_empty() {

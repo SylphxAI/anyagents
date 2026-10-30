@@ -207,7 +207,7 @@ pub fn terminal_width() -> usize {
             }
         }
     }
-    120
+    160
 }
 
 /// Pad a potentially ANSI-styled string on the right to `target_width` visible chars.
@@ -378,7 +378,7 @@ impl Table {
             let prefix_cols: usize = visible_width(self.indent)
                 + widths[..cols - 1].iter().sum::<usize>()
                 + 2 * (cols - 1);
-            Some(terminal_width().saturating_sub(prefix_cols).max(16))
+            Some(terminal_width().saturating_sub(prefix_cols).max(24))
         } else {
             None
         };
@@ -1043,6 +1043,208 @@ pub fn print_agents_table_with_options(
         }
         table.add_row(row);
     }
+    table.print();
+    println!();
+}
+
+/// Style the suffix after `<pct>% left` so reset countdowns (`↻40m`, `↻8h01m`) pop out
+/// while parenthetical breakdowns and tier tags (`(max 20x)`, `(promax)`) are dimmed.
+fn style_usage_suffix(suffix: &str, is_exhausted: bool) -> String {
+    let mut out = String::new();
+    let mut plain_buf = String::new();
+    let mut chars = suffix.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '↻' {
+            if !plain_buf.is_empty() {
+                out.push_str(&dim(&plain_buf));
+                plain_buf.clear();
+            }
+            let mut eta = String::from('↻');
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_alphanumeric() {
+                    eta.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if is_exhausted {
+                out.push_str(&yellow(&eta));
+            } else {
+                out.push_str(&cyan(&eta));
+            }
+        } else {
+            plain_buf.push(ch);
+        }
+    }
+    if !plain_buf.is_empty() {
+        out.push_str(&dim(&plain_buf));
+    }
+    out
+}
+
+/// Format a profile's `usage` string with semantic per-window colors and highlighted reset timers.
+pub fn format_profile_usage(usage: Option<&str>) -> String {
+    let Some(u) = usage.map(str::trim).filter(|s| !s.is_empty()) else {
+        return dim("-");
+    };
+    let mut styled_segments = Vec::new();
+    for seg in u.split(" · ") {
+        if let Some((before_left, after_left)) = seg.split_once("% left") {
+            if let Some((label, pct_str)) = before_left.split_once(':') {
+                let label = label.trim();
+                let pct = pct_str.trim().parse::<i64>().unwrap_or(100);
+                let styled_label = if label == "gemini" || label == "opus" {
+                    bold(&format!("{label}:"))
+                } else {
+                    dim(&format!("{label}:"))
+                };
+                let pct_badge = format!("{pct}% left");
+                let styled_pct = if pct <= 0 {
+                    red(&bold(&pct_badge))
+                } else if pct <= 25 {
+                    yellow(&pct_badge)
+                } else {
+                    green(&pct_badge)
+                };
+                let styled_after = style_usage_suffix(after_left, pct <= 0);
+                styled_segments.push(format!("{styled_label} {styled_pct}{styled_after}"));
+                continue;
+            }
+        }
+        if let Some((head, tail)) = seg.split_once(" (") {
+            styled_segments.push(format!("{} {}", green(head), dim(&format!("({tail}"))));
+        } else {
+            styled_segments.push(green(seg));
+        }
+    }
+    styled_segments.join(&dim(" · "))
+}
+
+/// Pretty-print upstream provider profiles (`anyagents profiles`).
+pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEntry]) {
+    if entries.is_empty() {
+        println!("\n  {} {}\n", bold_cyan("Provider Profiles"), dim("none configured"));
+        return;
+    }
+    let total = entries.len();
+    let mut sub_count = 0usize;
+    let mut plan_count = 0usize;
+    let mut key_count = 0usize;
+    let mut in_use_count = 0usize;
+    let mut exhausted_count = 0usize;
+
+    for e in entries {
+        match e.kind.as_str() {
+            "subscription" | "oauth" => sub_count += 1,
+            "coding-plan" => plan_count += 1,
+            _ => key_count += 1,
+        }
+        if !e.assigned_agents.is_empty() || e.subagent_count > 0 {
+            in_use_count += 1;
+        }
+        if e.usage
+            .as_deref()
+            .is_some_and(|u| u.contains(": 0% left") || u.starts_with("0% left"))
+        {
+            exhausted_count += 1;
+        }
+    }
+
+    let health_summary = if exhausted_count > 0 {
+        format!(
+            "{} · {}",
+            green(&format!("{} ready", total.saturating_sub(exhausted_count))),
+            red(&format!("{exhausted_count} exhausted"))
+        )
+    } else {
+        green("all ready")
+    };
+
+    println!(
+        "\n  {}  {} {} · {} · {}\n",
+        bold_cyan("Provider Profiles"),
+        bold(&format!("{total} configured")),
+        dim(&format!(
+            "({sub_count} subscription · {plan_count} coding-plan · {key_count} api-key)"
+        )),
+        cyan(&format!("{in_use_count} in use")),
+        health_summary,
+    );
+
+    let mut table = Table::new(&[
+        ("PROVIDER", false),
+        ("PROFILE", false),
+        ("KIND", false),
+        ("USAGE / BALANCE", false),
+        ("AGENTS", false),
+        ("HARNESSES", false),
+    ]);
+
+    for e in entries {
+        let is_exhausted = e
+            .usage
+            .as_deref()
+            .is_some_and(|u| u.contains(": 0% left") || u.starts_with("0% left"));
+        let provider_cell = if is_exhausted {
+            red(&bold(&e.provider))
+        } else {
+            bold(&e.provider)
+        };
+        let profile_cell = if is_exhausted {
+            red(&e.profile)
+        } else if e.profile == "default" {
+            dim("default")
+        } else {
+            cyan(&e.profile)
+        };
+        let kind_badge = match e.kind.as_str() {
+            "oauth" | "subscription" => green(&e.kind),
+            "coding-plan" => cyan(&e.kind),
+            _ => yellow(&e.kind),
+        };
+        let usage_cell = format_profile_usage(e.usage.as_deref());
+
+        let agents_cell = if e.assigned_agents.is_empty() && e.subagent_count == 0 {
+            dim("-")
+        } else {
+            let mut parts = Vec::new();
+            if !e.assigned_agents.is_empty() {
+                let shown: Vec<&str> = e.assigned_agents.iter().take(3).map(String::as_str).collect();
+                let base = bold(&shown.join(", "));
+                if e.assigned_agents.len() > 3 {
+                    parts.push(format!(
+                        "{base} {}",
+                        cyan(&format!("+{}", e.assigned_agents.len() - 3))
+                    ));
+                } else {
+                    parts.push(base);
+                }
+            }
+            if e.subagent_count > 0 {
+                parts.push(dim(&format!("(+{} sub)", e.subagent_count)));
+            }
+            parts.join(" ")
+        };
+
+        let harnesses_cell = if e.compatible_harnesses.len() <= 3 {
+            dim(&e.compatible_harnesses.join(", "))
+        } else {
+            let first_two = e.compatible_harnesses[..2].join(", ");
+            let rem = e.compatible_harnesses.len() - 2;
+            dim(&format!("{first_two} +{rem}"))
+        };
+
+        table.add_row(vec![
+            provider_cell,
+            profile_cell,
+            kind_badge,
+            usage_cell,
+            agents_cell,
+            harnesses_cell,
+        ]);
+    }
+
     table.print();
     println!();
 }
