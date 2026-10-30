@@ -15,7 +15,7 @@ concurrency:
 jobs:
   release:
     if: github.event.repository.private == false && github.ref == 'refs/heads/main'
-    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@bd65aeeafbba0ed9353fbd6bb85c1e49382099c0
+    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@ef675524e619fe3dde5b88213e8598046f0aaff6
     permissions:
       contents: write
       id-token: write
@@ -23,10 +23,11 @@ jobs:
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     with:
-      kit-ref: bd65aeeafbba0ed9353fbd6bb85c1e49382099c0
+      kit-ref: ef675524e619fe3dde5b88213e8598046f0aaff6
       name: anyagents
       npm-package: '@sylphx/anyagents'
       platforms: darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu
+      linux-glibc: '2.34'
       version-arg: --version
       smoke: |
         npx -y "@sylphx/anyagents@$V" --version
