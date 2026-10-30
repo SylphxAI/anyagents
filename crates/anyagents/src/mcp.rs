@@ -410,6 +410,15 @@ struct AgentsArgs {
     /// Optional upstream provider account profile when `action` is `"create"` or `"harness"`.
     #[serde(default)]
     profile: Option<String>,
+    /// Optional repository (`"<org>/<repo>"` or `"inherit"`) to automatically provision a managed Git worktree for the agent when `action = "create"`.
+    #[serde(default)]
+    repo: Option<String>,
+    /// Optional Git branch name for the managed worktree when `repo` is provided (defaults to `agent/<name>`).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional starting Git ref/branch when `repo` is provided (defaults to `origin/HEAD`).
+    #[serde(default)]
+    base: Option<String>,
     /// Optional working directory path when `action = "create"`.
     #[serde(default)]
     workdir: Option<String>,
@@ -440,7 +449,16 @@ struct SpawnArgs {
     /// Optional upstream provider account profile (e.g. `acct-a`, `openai/default`, `sylphx/default`).
     #[serde(default)]
     profile: Option<String>,
-    /// Optional working directory path.
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) to automatically provision an isolated, lifecycle-managed Git worktree as the sub-agent's `workdir`.
+    #[serde(default)]
+    repo: Option<String>,
+    /// Optional Git branch name to create in the managed worktree when `repo` is provided (defaults to `agent/<name>`).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional starting Git ref/branch for the managed worktree when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional working directory path (when `repo` is omitted, defaults to inheriting the parent agent's `workdir`).
     #[serde(default)]
     workdir: Option<String>,
     /// Optional system/role description or standing instructions for the spawned agent.
@@ -503,6 +521,15 @@ struct SubagentsArgs {
     /// Optional account profile when `action = "spawn"`.
     #[serde(default)]
     profile: Option<String>,
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"`) when `action = "spawn"` to automatically provision an isolated, lifecycle-managed Git worktree.
+    #[serde(default)]
+    repo: Option<String>,
+    /// Optional Git branch name for the managed worktree when `action = "spawn"` and `repo` is set (defaults to `agent/<name>`).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional starting Git ref/branch when `action = "spawn"` and `repo` is set (defaults to `origin/HEAD` or parent `HEAD`).
+    #[serde(default)]
+    base: Option<String>,
     /// Optional working directory when `action = "spawn"`.
     #[serde(default)]
     workdir: Option<String>,
@@ -814,6 +841,9 @@ impl AgentMcp {
                     harness,
                     model: args.model,
                     profile: args.profile,
+                    repo: args.repo,
+                    branch: args.branch,
+                    base: args.base,
                     workdir: args.workdir,
                     instructions: args.instructions,
                     parent: Some("root".to_string()),
@@ -952,7 +982,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. The sub-agent stays `running` across turns until its task is finished and either it calls `archive({})` or its parent calls `subagents({ \"action\": \"archive\", \"agent\": \"<name>\" })`."
+        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree as its `workdir` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, inherits your `workdir`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
     )]
     async fn spawn(
         &self,
@@ -978,6 +1008,9 @@ impl AgentMcp {
             harness,
             model: args.model,
             profile: args.profile,
+            repo: args.repo,
+            branch: args.branch,
+            base: args.base,
             workdir: args.workdir,
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
@@ -1121,6 +1154,9 @@ impl AgentMcp {
                         harness: args.harness,
                         model: args.model,
                         profile: args.profile,
+                        repo: args.repo,
+                        branch: args.branch,
+                        base: args.base,
                         workdir: args.workdir,
                         instructions: args.instructions,
                         prompt: args.prompt,

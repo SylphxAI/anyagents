@@ -14,6 +14,9 @@ pub struct CreateRequest {
     pub harness: String,
     pub model: Option<String>,
     pub profile: Option<String>,
+    pub repo: Option<String>,
+    pub branch: Option<String>,
+    pub base: Option<String>,
     pub workdir: Option<PathBuf>,
     /// The working directory an owner agent gets when none is named.
     pub workdir_default: Option<PathBuf>,
@@ -78,22 +81,65 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         };
         write_profile_marker(&config, ".anyagents-profile", &format!("{normalized}\n"));
     }
-    let workdir_created = request.workdir.as_ref().is_some_and(|p| !p.exists());
-    let cwd = match &request.workdir {
-        Some(path) => {
-            std::fs::create_dir_all(path)?;
-            std::path::absolute(path)?
-        }
-        // Every owner agent hosted by AnyAgents works in one shared checkout,
-        // so it loads the same company rules and skills as the owner sessions
-        // the desk has always run. A caller can still name its own directory.
-        None => match &request.workdir_default {
-            Some(shared) => {
-                std::fs::create_dir_all(shared)?;
-                std::path::absolute(shared)?
-            }
+    let workdir_created = request.workdir.as_ref().is_some_and(|p| !p.exists())
+        || request
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+    let cwd = if let Some(repo_raw) = request
+        .repo
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let target_wt = match &request.workdir {
+            Some(path) => std::path::absolute(path)?,
             None => std::path::absolute(&managed)?,
-        },
+        };
+        if let Err(err) = provision_managed_worktree(
+            store,
+            &data,
+            &agent,
+            &config,
+            repo_raw,
+            request.branch.as_deref(),
+            request.base.as_deref(),
+            &target_wt,
+            parent_name.as_deref(),
+        ) {
+            let _ = store.delete_agent(&agent.id);
+            let _ = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()));
+            return Err(err);
+        }
+        target_wt
+    } else {
+        match &request.workdir {
+            Some(path) => {
+                std::fs::create_dir_all(path)?;
+                std::path::absolute(path)?
+            }
+            None => {
+                let inherited_parent_wd = agent
+                    .parent_id
+                    .as_ref()
+                    .and_then(|pid| store.agent(pid).ok())
+                    .and_then(|p| p.workdir)
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_dir());
+                if let Some(parent_wd) = inherited_parent_wd {
+                    std::path::absolute(&parent_wd)?
+                } else {
+                    match &request.workdir_default {
+                        Some(shared) => {
+                            std::fs::create_dir_all(shared)?;
+                            std::path::absolute(shared)?
+                        }
+                        None => std::path::absolute(&managed)?,
+                    }
+                }
+            }
+        }
     };
     let _ = crate::operator::mint(store, &agent.id);
     store.set_agent_launch_env(&agent.id, &pairs)?;
@@ -123,6 +169,253 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     Ok(running)
 }
 
+pub(crate) fn provision_managed_worktree(
+    store: &Store,
+    data: &Path,
+    agent: &Agent,
+    config: &Path,
+    repo_raw: &str,
+    branch_opt: Option<&str>,
+    base_opt: Option<&str>,
+    target_wt: &Path,
+    parent_name: Option<&str>,
+) -> Result<(), Error> {
+    if target_wt.exists() {
+        if target_wt.join(".git").exists() {
+            record_managed_worktree_marker(config, target_wt, repo_raw, branch_opt);
+            return Ok(());
+        }
+        let is_empty = std::fs::read_dir(target_wt)
+            .ok()
+            .is_some_and(|mut d| d.next().is_none());
+        if is_empty {
+            let _ = std::fs::remove_dir(target_wt);
+        } else {
+            return Err(Error::Message(format!(
+                "target workdir `{}` already exists and is not empty",
+                target_wt.display()
+            )));
+        }
+    }
+    if let Some(parent_dir) = target_wt.parent() {
+        std::fs::create_dir_all(parent_dir)?;
+    }
+    let branch = branch_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent/{}", agent.name));
+    let base = base_opt.map(str::trim).filter(|s| !s.is_empty());
+
+    if repo_raw.eq_ignore_ascii_case("inherit") || repo_raw.eq_ignore_ascii_case("parent") {
+        let parent_wd = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .and_then(|p| p.workdir)
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                Error::Message(
+                    "repo=\"inherit\" requires a parent agent with an active git workdir".into(),
+                )
+            })?;
+        add_git_worktree_from_local_repo(&parent_wd, target_wt, &branch, base)?;
+    } else if Path::new(repo_raw).is_dir() && is_git_repo_dir(Path::new(repo_raw)) {
+        add_git_worktree_from_local_repo(Path::new(repo_raw), target_wt, &branch, base)?;
+    } else if repo_raw.contains('/') && !repo_raw.contains("..") {
+        let desk_hub_bin = Path::new("/home/kyle/.local/bin/desk-git-hub");
+        let hub_fallback = Path::new("/workspace-data/desk-git-hubs")
+            .join(repo_raw.replacen('/', "-", 1));
+        let data_hub_fallback = data.join("git-hubs").join(repo_raw);
+        if desk_hub_bin.is_file() && !crate::sandbox::is_isolated_test_env() {
+            if let Some(b) = base
+                && !b.starts_with("origin/")
+                && b != "HEAD"
+            {
+                let _ = std::process::Command::new(desk_hub_bin)
+                    .args(["fetch", repo_raw, b])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            let mut cmd = std::process::Command::new(desk_hub_bin);
+            cmd.args(["worktree", repo_raw]).arg(target_wt).arg(&branch);
+            if let Some(b) = base {
+                let start_ref = if b.starts_with("origin/") || b == "HEAD" {
+                    b.to_string()
+                } else {
+                    format!("origin/{b}")
+                };
+                cmd.arg(start_ref);
+            }
+            let out = cmd.output()?;
+            if !out.status.success() {
+                if hub_fallback.is_dir() && is_git_repo_dir(&hub_fallback) {
+                    add_git_worktree_from_local_repo(
+                        &hub_fallback,
+                        target_wt,
+                        &branch,
+                        Some(base.unwrap_or("origin/HEAD")),
+                    )?;
+                } else {
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    return Err(Error::Message(format!(
+                        "failed to provision worktree for `{repo_raw}`: {stderr}"
+                    )));
+                }
+            }
+        } else if data_hub_fallback.is_dir() && is_git_repo_dir(&data_hub_fallback) {
+            add_git_worktree_from_local_repo(&data_hub_fallback, target_wt, &branch, base)?;
+        } else if hub_fallback.is_dir() && is_git_repo_dir(&hub_fallback) {
+            add_git_worktree_from_local_repo(
+                &hub_fallback,
+                target_wt,
+                &branch,
+                Some(base.unwrap_or("origin/HEAD")),
+            )?;
+        } else {
+            return Err(Error::Message(format!(
+                "repository `{repo_raw}` not found locally and desk-git-hub is unavailable"
+            )));
+        }
+    } else {
+        return Err(Error::Message(format!(
+            "invalid `repo` value `{repo_raw}`: pass `<org>/<repo>`, `\"inherit\"`, or a local git repository path"
+        )));
+    }
+
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_wt)
+        .args(["config", "--local", "user.name", "Kyle Tse"])
+        .status();
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_wt)
+        .args(["config", "--local", "user.email", "hi@kylet.se"])
+        .status();
+
+    #[cfg(unix)]
+    if let Some((_, _, gid, _)) =
+        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name)
+    {
+        let gid_s = gid.to_string();
+        let _ = std::process::Command::new("chgrp")
+            .args(["-R", &gid_s])
+            .arg(target_wt)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = std::process::Command::new("chmod")
+            .args(["-R", "g+rwX"])
+            .arg(target_wt)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if let Ok(gd_out) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(target_wt)
+            .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+            .output()
+            && gd_out.status.success()
+        {
+            let gd = PathBuf::from(String::from_utf8_lossy(&gd_out.stdout).trim());
+            if gd.is_dir() {
+                let _ = std::process::Command::new("chgrp")
+                    .args(["-R", &gid_s])
+                    .arg(&gd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = std::process::Command::new("chmod")
+                    .args(["-R", "g+rwX"])
+                    .arg(&gd)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+        }
+    }
+
+    record_managed_worktree_marker(config, target_wt, repo_raw, Some(&branch));
+    Ok(())
+}
+
+fn is_git_repo_dir(path: &Path) -> bool {
+    std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--git-dir"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn add_git_worktree_from_local_repo(
+    source_repo: &Path,
+    target_wt: &Path,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<(), Error> {
+    let start_ref = base.unwrap_or("HEAD");
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_repo)
+        .args(["worktree", "add", "-B", branch])
+        .arg(target_wt)
+        .arg(start_ref)
+        .output()?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let fallback = std::process::Command::new("git")
+        .arg("-C")
+        .arg(source_repo)
+        .args(["worktree", "add", "--detach"])
+        .arg(target_wt)
+        .arg(start_ref)
+        .output()?;
+    if fallback.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    Err(Error::Message(format!(
+        "git worktree add from `{}` failed: {stderr}",
+        source_repo.display()
+    )))
+}
+
+fn record_managed_worktree_marker(
+    config: &Path,
+    target_wt: &Path,
+    repo_raw: &str,
+    branch: Option<&str>,
+) {
+    let initial_head = std::process::Command::new("git")
+        .arg("-C")
+        .arg(target_wt)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let payload = serde_json::json!({
+        "path": target_wt.display().to_string(),
+        "repo": repo_raw,
+        "branch": branch.unwrap_or(""),
+        "initial_head": initial_head,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+        let _ = write_seat_shared_file(
+            &config.join(".anyagents-managed-worktree.json"),
+            &bytes,
+            0o664,
+        );
+    }
+}
+
 pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
     let Ok(agents) = store.list_agents() else {
         return;
@@ -134,16 +427,17 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
         if !cfg.is_dir() {
             continue;
         }
+        #[cfg(unix)]
+        if let Some(ref hh) = host_home {
+            ensure_seat_skills(&cfg, hh);
+            ensure_shared_agents_md(&cfg, hh);
+        }
         let work_dir = agent
             .workdir
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| agent_work_dir(data, &agent.id));
         let _ = reconcile_agent_runtime_config(store, data, agent, &cfg, &work_dir);
-        #[cfg(unix)]
-        if let Some(ref hh) = host_home {
-            ensure_seat_skills(&cfg, hh);
-        }
     }
 }
 
@@ -226,7 +520,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - Full lifecycle actions on `subagents`:\n\
              - **List**: `subagents({ \"action\": \"list\" })` (optional `state`: `\"running\"` | `\"paused\"` | `\"archived\"` | `\"all\"`, `parent`: `\"self\"` | `\"all\"`).\n\
              - **Inspect**: `subagents({ \"action\": \"inspect\", \"agent\": \"<name-or-id>\", \"limit\": 10 })`.\n\
-             - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"workdir\": \"/scratch/wt/...\", \"description\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`).\n\
+             - **Spawn**: `subagents({ \"action\": \"spawn\", \"agent\": \"<name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"workdir\": \"<optional-path>\", \"description\": \"...\", \"prompt\": \"...\" })` (or `spawn({ ... })`). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"`) to automatically provision a clean Git worktree and branch (auto-reaped on archive when clean/pushed, preserved when dirty); omit `repo` and `workdir` to inherit your current `workdir`.\n\
              - **Steer**: `subagents({ \"action\": \"steer\", \"agent\": \"<name-or-id>\", \"prompt\": \"...\" })`.\n\
              - **Control (`wake`, `pause`, `archive`, `delete`)**: `subagents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"agent\": \"<name-or-id>\" })`.\n\
          - **Native SOTA Anti-Detect Browser & Persistent Browser Profiles (`browser` MCP Tool)**:\n\
@@ -237,6 +531,12 @@ pub(crate) fn write_agent_instructions_with_continuity(
          - **Channel & Message Interactions (`interact`)**: Use the `interact` MCP tool with `target` set to the `anyagents:reply:msg_...` token from the message header (or `telegram:chat:<chat_id>:<message_id>`) and `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]` or option text, and optional `text` rationale), `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"`.\n\
          - **Memory, History & Hybrid RAG Search (`conversation` / `search`)**: Incoming messages are pushed automatically to your session — never poll an inbox. Use `conversation({ \"query\": \"...\", \"agent\": \"all\", \"limit\": 20 })` or `search({ \"query\": \"...\" })` to run Hybrid RAG search (dense vector embedding `voyageai/voyage-4-large` + SQLite FTS5 BM25) across all agents' historical and live conversations since September without loading the full history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n",
     );
+
+    if let Some(shared) = read_shared_agents_md(config) {
+        doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
+        doc.push_str(&shared);
+        doc.push('\n');
+    }
 
     if let Some(cont) = continuity.map(str::trim).filter(|s| !s.is_empty()) {
         doc.push('\n');
@@ -420,6 +720,49 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
             }
         }
         ensure_seat_skills(target_config, &host_home);
+        ensure_shared_agents_md(target_config, &host_home);
+    }
+}
+
+pub(crate) fn data_dir_from_config(config: &Path) -> Option<PathBuf> {
+    let parent1 = config.parent()?;
+    let parent2 = parent1.parent()?;
+    if parent2.file_name().and_then(|s| s.to_str()) == Some("agents") {
+        parent2.parent().map(Path::to_path_buf)
+    } else {
+        Some(parent1.to_path_buf())
+    }
+}
+
+pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
+    let data_dir = data_dir_from_config(config)?;
+    let path = data_dir.join("AGENTS.md");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+#[cfg(unix)]
+pub(crate) fn ensure_shared_agents_md(target_config: &Path, host_home: &Path) {
+    let Some(data_dir) = data_dir_from_config(target_config) else {
+        return;
+    };
+    let data_agents_md = data_dir.join("AGENTS.md");
+    if data_agents_md.exists() || crate::sandbox::is_isolated_test_env() {
+        return;
+    }
+    let candidate_owner = host_home.join("workspace/github.com/SylphxAI/owner/AGENTS.md");
+    let candidate_wt = PathBuf::from("/scratch/wt/owners-main/AGENTS.md");
+    let canonical = if candidate_owner.is_file() {
+        Some(candidate_owner)
+    } else if candidate_wt.is_file() {
+        Some(candidate_wt)
+    } else {
+        None
+    };
+    if let Some(src) = canonical {
+        let _ = std::os::unix::fs::symlink(&src, &data_agents_md);
     }
 }
 
@@ -1236,9 +1579,9 @@ pub(crate) fn reconcile_agent_runtime_config(
         continuity.as_deref(),
     );
 
-    if std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_none()
-        && let Ok(command) = crate::data::current_exe_clean()
-    {
+    let suppress_config_write = std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        || data.join(".anyagents-suppress-config-write").exists();
+    if !suppress_config_write && let Ok(command) = crate::data::current_exe_clean() {
         let args = vec![
             "--data".to_string(),
             data.display().to_string(),
@@ -4837,9 +5180,7 @@ mod tests {
             "unexpected err: {err2}"
         );
 
-        unsafe {
-            std::env::set_var("ANYAGENTS_SUPPRESS_CONFIG_WRITE", "1");
-        }
+        std::fs::write(data.join(".anyagents-suppress-config-write"), "1").unwrap();
         let res = create(
             &store,
             data,
@@ -4849,15 +5190,16 @@ mod tests {
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
                 profile: None,
+                repo: None,
+                branch: None,
+                base: None,
                 workdir: None,
                 workdir_default: Some(data.to_path_buf()),
                 instructions: Some("Should never start".to_string()),
                 parent_id: None,
             },
         );
-        unsafe {
-            std::env::remove_var("ANYAGENTS_SUPPRESS_CONFIG_WRITE");
-        }
+        let _ = std::fs::remove_file(data.join(".anyagents-suppress-config-write"));
         assert!(res.is_err(), "expected spawn to fail when config write suppressed");
         assert!(
             store.agent_by_name("broken-spawn-child").is_err(),
@@ -4880,6 +5222,9 @@ mod tests {
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
                 profile: None,
+                repo: None,
+                branch: None,
+                base: None,
                 workdir: None,
                 workdir_default: Some(data.to_path_buf()),
                 instructions: Some("Parent".to_string()),
@@ -4897,6 +5242,9 @@ mod tests {
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
                 profile: None,
+                repo: None,
+                branch: None,
+                base: None,
                 workdir: None,
                 workdir_default: Some(data.to_path_buf()),
                 instructions: Some("Child".to_string()),
@@ -4976,6 +5324,174 @@ mod tests {
         assert!(
             store.next_undelivered(&parent.id).unwrap().is_none(),
             "parent should only be notified once per error"
+        );
+    }
+
+    #[test]
+    fn shared_agents_md_and_managed_repo_worktree_lifecycle() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+
+        // 1. Seed shared company AGENTS.md at <data>/AGENTS.md
+        std::fs::write(
+            data.join("AGENTS.md"),
+            "# SylphxAI Shared Constitution\nAlways reason from first principles.\n",
+        )
+        .unwrap();
+
+        // 2. Seed a local Git repository to test declarative `repo` worktree provisioning
+        let hub_repo = data.join("git-hubs/SylphxAI/demo");
+        std::fs::create_dir_all(&hub_repo).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&hub_repo)
+                .args(["init", "-b", "main"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&hub_repo)
+            .args(["config", "user.name", "Kyle Tse"])
+            .status()
+            .unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&hub_repo)
+            .args(["config", "user.email", "hi@kylet.se"])
+            .status()
+            .unwrap();
+        std::fs::write(hub_repo.join("README.md"), "# Demo Repo\n").unwrap();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&hub_repo)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&hub_repo)
+                .args(["commit", "-m", "Initial commit"])
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        // 3. Create L0 Root Agent
+        let root_wd = data.join("root-workspace");
+        std::fs::create_dir_all(&root_wd).unwrap();
+        let root = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "root-argon".to_string(),
+                role: Some("Owner".to_string()),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: Some(root_wd.clone()),
+                workdir_default: Some(root_wd.clone()),
+                instructions: Some("Root owner role description.".to_string()),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+
+        // 4. Create L1 Sub-Agent with declarative `repo: "SylphxAI/demo"` (provisions isolated git worktree)
+        let l1 = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "l1-feature-worker".to_string(),
+                role: Some("Feature Worker".to_string()),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
+                profile: None,
+                repo: Some("SylphxAI/demo".to_string()),
+                branch: Some("feat/l1-work".to_string()),
+                base: Some("main".to_string()),
+                workdir: None,
+                workdir_default: Some(root_wd.clone()),
+                instructions: Some("L1 worker role description.".to_string()),
+                parent_id: Some(root.id.clone()),
+            },
+        )
+        .unwrap();
+
+        let l1_wt = PathBuf::from(l1.workdir.as_deref().unwrap());
+        assert!(l1_wt.join(".git").exists(), "L1 should have a git worktree");
+        assert!(l1_wt.join("README.md").is_file());
+
+        // 5. Create L2 Nested Sub-Agent with `repo: "inherit"` (branches from L1's git repo)
+        let l2 = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "l2-nested-worker".to_string(),
+                role: Some("Nested Worker".to_string()),
+                harness: "codex".to_string(),
+                model: Some("sylphx/openai/gpt-5.4#xhigh".to_string()),
+                profile: None,
+                repo: Some("inherit".to_string()),
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: Some(root_wd.clone()),
+                instructions: Some("L2 nested worker role description.".to_string()),
+                parent_id: Some(l1.id.clone()),
+            },
+        )
+        .unwrap();
+        let l2_wt = PathBuf::from(l2.workdir.as_deref().unwrap());
+        assert_ne!(l2_wt, l1_wt);
+        assert!(l2_wt.join(".git").exists(), "L2 should have its own isolated git worktree");
+        assert!(l2_wt.join("README.md").is_file());
+
+        // 6. Verify L0, L1, and L2 all receive the shared AGENTS.md in their config/AGENTS.md
+        // AND their own role description in `## 2. Role, Responsibilities & Standing Description`
+        for (ag, expected_desc) in [
+            (&root, "Root owner role description."),
+            (&l1, "L1 worker role description."),
+            (&l2, "L2 nested worker role description."),
+        ] {
+            let cfg = anyagents_core::agent_config_dir(data, &ag.id);
+            let prompt = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+            assert!(
+                prompt.contains(expected_desc),
+                "missing role description for {}",
+                ag.name
+            );
+            assert!(
+                prompt.contains("## 4. Shared Instructions (AGENTS.md)")
+                    && prompt.contains("# SylphxAI Shared Constitution"),
+                "missing shared AGENTS.md for {}",
+                ag.name
+            );
+            let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
+            assert!(toml.contains("project_doc_max_bytes = 131072"));
+        }
+
+        // 7. Safe Worktree GC:
+        //    - L2's worktree is clean and unmodified -> reaping L2 removes `l2_wt` cleanly.
+        crate::server::reap_subagent_ephemeral_dirs(data, &l2.id);
+        assert!(
+            !l2_wt.exists(),
+            "clean unmodified worktree should be reaped on archive"
+        );
+
+        //    - Dirty L1's worktree with an uncommitted file -> reaping L1 MUST preserve `l1_wt`!
+        std::fs::write(l1_wt.join("uncommitted.txt"), "work in progress\n").unwrap();
+        crate::server::reap_subagent_ephemeral_dirs(data, &l1.id);
+        assert!(
+            l1_wt.join("uncommitted.txt").is_file(),
+            "dirty worktree must NEVER be deleted on archive"
         );
     }
 }

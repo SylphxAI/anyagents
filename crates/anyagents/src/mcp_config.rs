@@ -183,6 +183,9 @@ pub fn write_codex_with_model(
     if !existing.contains("sandbox_mode") {
         existing = upsert_top_key(&existing, "sandbox_mode", "\"danger-full-access\"");
     }
+    if !existing.contains("project_doc_max_bytes") {
+        existing = upsert_top_key(&existing, "project_doc_max_bytes", "131072");
+    }
     let mut updated = upsert_table(&existing, &body);
     if use_sylphx {
         let (base_url, api_key) = resolve_sylphx_codex_provider(config_dir);

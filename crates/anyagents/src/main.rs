@@ -136,6 +136,15 @@ enum Command {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
@@ -626,6 +635,15 @@ enum AgentsCommand {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
@@ -805,6 +823,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             harness,
             model,
             profile,
+            repo,
+            branch,
+            base,
             workdir,
             instructions,
             parent,
@@ -815,6 +836,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             harness,
             model,
             profile,
+            repo,
+            branch,
+            base,
             workdir,
             instructions,
             parent,

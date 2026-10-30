@@ -549,11 +549,22 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
         None => (uid, gid),
     };
-    for dir in [config_dir.to_path_buf(), config_dir.with_file_name("work")] {
-        if dir.is_dir()
-            && let Err(err) = give_tree(&dir, eff_uid, eff_gid)
-        {
-            eprintln!("seat: cannot share {}: {err}", dir.display());
+    if config_dir.is_dir()
+        && let Err(err) = give_tree(config_dir, eff_uid, eff_gid)
+    {
+        eprintln!("seat: cannot share {}: {err}", config_dir.display());
+    }
+    let work_dir = config_dir.with_file_name("work");
+    if work_dir.is_dir() {
+        if work_dir.join(".git").exists() {
+            let _ = chown_to_seat_group(&work_dir, eff_gid);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let _ = std::fs::set_permissions(&work_dir, std::fs::Permissions::from_mode(0o2775));
+            }
+        } else if let Err(err) = give_tree(&work_dir, eff_uid, eff_gid) {
+            eprintln!("seat: cannot share {}: {err}", work_dir.display());
         }
     }
 }

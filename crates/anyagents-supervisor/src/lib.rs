@@ -1337,7 +1337,9 @@ fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::P
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
-    remove_path_with_seat(managed_work, seat_ids);
+    if !managed_work.join(".git").exists() {
+        remove_path_with_seat(managed_work, seat_ids);
+    }
 }
 
 #[cfg(unix)]

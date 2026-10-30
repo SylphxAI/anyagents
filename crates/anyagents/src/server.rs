@@ -2109,6 +2109,9 @@ async fn create_agent_route(
                 harness,
                 model,
                 profile,
+                repo: body.repo,
+                branch: body.branch,
+                base: body.base,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
                 instructions: body.instructions,
@@ -2231,8 +2234,110 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
+    let marker_path = config_dir.join(".anyagents-managed-worktree.json");
+    let marker_val = std::fs::read_to_string(&marker_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let initial_head = marker_val
+        .as_ref()
+        .and_then(|v| v.get("initial_head"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let recorded_wt = marker_val
+        .as_ref()
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
     let work_dir = agent_root.join("work");
-    remove_path_with_seat(&work_dir, seat_ids);
+    if let Some(ref wt_path) = recorded_wt
+        && wt_path != &work_dir
+        && wt_path.join(".git").exists()
+        && is_git_worktree_safe_to_reap(wt_path, initial_head.as_deref())
+    {
+        reap_git_worktree_cleanly(wt_path, seat_ids);
+    }
+    if work_dir.join(".git").exists() {
+        if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
+            reap_git_worktree_cleanly(&work_dir, seat_ids);
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    } else {
+        remove_path_with_seat(&work_dir, seat_ids);
+        if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    }
+}
+
+pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, initial_head: Option<&str>) -> bool {
+    let Ok(status_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["status", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    if !status_out.status.success() || !status_out.stdout.is_empty() {
+        return false;
+    }
+    let Ok(head_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+    else {
+        return false;
+    };
+    if !head_out.status.success() {
+        return false;
+    }
+    let current_head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    if current_head.is_empty() {
+        return false;
+    }
+    if initial_head.map(str::trim) == Some(current_head.as_str()) {
+        return true;
+    }
+    let Ok(remote_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["branch", "-r", "--contains", &current_head])
+        .output()
+    else {
+        return false;
+    };
+    remote_out.status.success()
+        && !String::from_utf8_lossy(&remote_out.stdout)
+            .trim()
+            .is_empty()
+}
+
+fn reap_git_worktree_cleanly(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) {
+    let git_dir = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(wt_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    remove_path_with_seat(wt_path, seat_ids);
+    if let Some(gd) = git_dir
+        && gd.components().any(|c| c.as_os_str() == "worktrees")
+        && gd.exists()
+    {
+        remove_path_with_seat(&gd, seat_ids);
+    }
 }
 
 #[cfg(unix)]
@@ -2420,8 +2525,10 @@ async fn delete_agent_route(
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
         reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
         remove_path_with_seat(&agent_dir.join("config"), seat_ids);
-        remove_path_with_seat(&agent_dir, seat_ids);
-        let _ = std::fs::remove_dir_all(&agent_dir);
+        if !agent_dir.join("work").exists() {
+            remove_path_with_seat(&agent_dir, seat_ids);
+            let _ = std::fs::remove_dir_all(&agent_dir);
+        }
         Ok(Json(serde_json::json!({
             "id": deleted.id.as_str(),
             "name": deleted.name,
