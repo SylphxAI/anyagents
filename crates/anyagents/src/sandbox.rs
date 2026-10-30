@@ -200,7 +200,12 @@ pub fn pinned_uid(agent_name: &str) -> Option<u32> {
 
 /// The seat user name a host provisions for one agent: `seat-<name>`.
 fn seat_user(agent_name: &str) -> String {
-    format!("seat-{}", agent_name.to_ascii_lowercase())
+    let lower = agent_name.to_ascii_lowercase();
+    if lower.starts_with("seat-") {
+        lower
+    } else {
+        format!("seat-{lower}")
+    }
 }
 
 fn lookup_user(name: &str) -> Option<(u32, u32)> {
@@ -492,13 +497,53 @@ pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Opti
         if dir_gid == 0 || dir_gid == server_gid() {
             return None;
         }
-        for (user, (uid, gid)) in host_seat_users() {
-            if gid == dir_gid {
-                let spec = sock_gid_for().filter(|_| launcher().is_file()).map(|sock_gid| {
-                    format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
-                });
-                return Some((user, uid, gid, spec));
-            }
+        let candidates: Vec<(String, (u32, u32))> = host_seat_users()
+            .into_iter()
+            .filter(|(_, (_, gid))| *gid == dir_gid)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let chosen = if candidates.len() == 1 {
+            candidates.into_iter().next()
+        } else {
+            let marker = std::fs::read_to_string(config_dir.join(".anyagents-seat"))
+                .ok()
+                .map(|s| seat_user(s.trim()));
+            let by_marker = marker.and_then(|m| {
+                candidates
+                    .iter()
+                    .find(|(u, _)| u == &m)
+                    .cloned()
+            });
+            by_marker
+                .or_else(|| {
+                    let mut child_uids = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(config_dir) {
+                        for entry in entries.flatten() {
+                            if let Ok(em) = entry.metadata() {
+                                child_uids.push(em.uid());
+                            }
+                        }
+                    }
+                    candidates
+                        .iter()
+                        .find(|(_, (uid, gid))| *uid != *gid && child_uids.contains(uid))
+                        .cloned()
+                        .or_else(|| {
+                            candidates
+                                .iter()
+                                .find(|(_, (uid, _))| child_uids.contains(uid))
+                                .cloned()
+                        })
+                })
+                .or_else(|| candidates.into_iter().next())
+        };
+        if let Some((user, (uid, gid))) = chosen {
+            let spec = sock_gid_for().filter(|_| launcher().is_file()).map(|sock_gid| {
+                format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
+            });
+            return Some((user, uid, gid, spec));
         }
     }
     None
@@ -549,10 +594,16 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
         Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
         None => (uid, gid),
     };
-    if config_dir.is_dir()
-        && let Err(err) = give_tree(config_dir, eff_uid, eff_gid)
-    {
-        eprintln!("seat: cannot share {}: {err}", config_dir.display());
+    if config_dir.is_dir() {
+        if let Some((user, _)) = host_seat_users()
+            .into_iter()
+            .find(|(_, (u, g))| *u == eff_uid && *g == eff_gid)
+        {
+            let _ = std::fs::write(config_dir.join(".anyagents-seat"), format!("{user}\n"));
+        }
+        if let Err(err) = give_tree(config_dir, eff_uid, eff_gid) {
+            eprintln!("seat: cannot share {}: {err}", config_dir.display());
+        }
     }
     let work_dir = config_dir.with_file_name("work");
     if work_dir.is_dir() {

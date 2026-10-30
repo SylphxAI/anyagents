@@ -498,8 +498,16 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
                 .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
                 .map(|(_, v)| v.clone())
         });
-    let seat_spec =
-        crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, seat_hint.as_deref());
+    let resolved_seat = store_opt
+        .as_ref()
+        .and_then(|s| crate::create::resolved_agent_seat_info(s, &request.agent))
+        .or_else(|| crate::sandbox::existing_config_seat(&request.config_dir));
+    let seat_spec = resolved_seat
+        .as_ref()
+        .and_then(|(user, _, _, spec_opt)| spec_opt.as_ref().map(|s| (user.clone(), s.clone())))
+        .or_else(|| {
+            crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, seat_hint.as_deref())
+        });
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir);
     }
@@ -551,9 +559,10 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             let _ = std::fs::create_dir_all(&dot_config);
             dot_config
         };
-        if let Some((_, uid, gid, _)) =
+        if let Some((_, uid, gid, _)) = resolved_seat.or_else(|| {
             crate::sandbox::seat_for_agent_with_hint(&request.agent.name, seat_hint.as_deref())
-        {
+                .map(|(u, uid, gid, _)| (u, uid, gid, None))
+        }) {
             crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);

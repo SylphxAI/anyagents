@@ -514,7 +514,7 @@ fn compute_subtree_stats<'a>(
                 .as_deref()
                 .is_some_and(|r| !r.trim().is_empty());
             let has_lag = kid.oldest_undelivered_age_ms.is_some_and(|ms| ms >= 120_000);
-            if kid.state != "archived" && (on_quota || is_blocked || has_lag) {
+            if kid.state != "archived" && kid.state != "paused" && (on_quota || is_blocked || has_lag) {
                 stats.lagging += 1;
             }
             stats.working += child_stats.working;

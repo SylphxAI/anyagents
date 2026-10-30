@@ -143,22 +143,40 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         target_wt
     } else if wd_is_private_keyword {
         std::path::absolute(&managed)?
+    } else if wd_is_inherit_keyword {
+        let inherited_parent_wd = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .and_then(|p| p.workdir)
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir());
+        if let Some(parent_wd) = inherited_parent_wd {
+            std::path::absolute(&parent_wd)?
+        } else {
+            std::path::absolute(&managed)?
+        }
     } else {
         match &explicit_workdir {
             Some(path) => {
                 std::fs::create_dir_all(path)?;
-                std::path::absolute(path)?
+                let abs = std::path::absolute(path)?;
+                if agent.parent_id.is_some()
+                    && abs.join(".git").is_file()
+                    && !config.join(".anyagents-managed-worktree.json").exists()
+                {
+                    record_managed_worktree_marker(
+                        &config,
+                        &abs,
+                        "explicit-worktree",
+                        request.branch.as_deref(),
+                    );
+                }
+                abs
             }
             None => {
-                let inherited_parent_wd = agent
-                    .parent_id
-                    .as_ref()
-                    .and_then(|pid| store.agent(pid).ok())
-                    .and_then(|p| p.workdir)
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_dir());
-                if let Some(parent_wd) = inherited_parent_wd {
-                    std::path::absolute(&parent_wd)?
+                if agent.parent_id.is_some() {
+                    std::path::absolute(&managed)?
                 } else {
                     match &request.workdir_default {
                         Some(shared) => {
@@ -181,10 +199,11 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         return Err(err);
     }
     let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
-    if workdir_created
-        && let Some((_, _, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&running.name, parent_name.as_deref())
-    {
+    let should_share_cwd = (workdir_created
+        || (agent.parent_id.is_some() && explicit_workdir.is_some()))
+        && cwd != Path::new("/scratch/wt/owners-main")
+        && cwd != Path::new("/scratch/wt");
+    if should_share_cwd && let Some((_, _, gid, _)) = resolved_agent_seat_info(store, &running) {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -368,9 +387,10 @@ pub(crate) fn provision_managed_worktree(
         .status();
 
     #[cfg(unix)]
-    if let Some((_, _, gid, _)) =
+    if let Some((_, _, gid, _)) = resolved_agent_seat_info(store, agent).or_else(|| {
         crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name)
-    {
+            .map(|(u, uid, gid, _)| (u, uid, gid, None))
+    }) {
         let gid_s = gid.to_string();
         let _ = std::process::Command::new("chgrp")
             .args(["-R", &gid_s])
@@ -1476,24 +1496,29 @@ pub(crate) fn compute_live_session_continuity(
 }
 
 /// Walks `parent_id` in `state.db` up to the root ancestor so multi-hop sub-agents
-/// (e.g. `prism -> prism-owner-provision -> owner-lootling`) inherit the root
-/// agent's OS seat (`seat-prism`).
+/// (e.g. `prism -> prism-owner-provision -> owner-lootling` or renamed roots
+/// like `helios` running on `seat-rhea`) inherit the ancestor's authoritative OS seat.
 pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<String> {
     let mut curr = agent.parent_id.clone();
     let mut hops = 0usize;
     let mut last_name = None;
+    let mut ancestor_seat = None;
     while let Some(pid) = curr {
         if hops >= 16 {
             break;
         }
         hops += 1;
+        let parent_cfg = agent_config_dir(store.data_dir(), &pid);
+        if let Some((seat_user, _, _, _)) = crate::sandbox::existing_config_seat(&parent_cfg) {
+            ancestor_seat = Some(seat_user);
+        }
         let Ok(parent) = store.agent(&pid) else {
             break;
         };
         last_name = Some(parent.name);
         curr = parent.parent_id;
     }
-    last_name.or_else(|| {
+    ancestor_seat.or(last_name).or_else(|| {
         agent
             .launch_env
             .iter()
@@ -4302,16 +4327,10 @@ pub(crate) fn clear_stale_agy_quota_error_steps(config_dir: &Path) {
 fn restart_agent_harness_process(store: &Store, agent: &Agent) {
     #[cfg(unix)]
     {
-        let parent_name = agent
-            .parent_id
-            .as_ref()
-            .and_then(|pid| store.agent(pid).ok())
-            .map(|p| p.name);
         if agent.state == "running"
             && !crate::sandbox::is_isolated_test_env()
             && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-            && let Some((_, uid, gid, _)) =
-                crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
+            && let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent)
         {
             let uid_s = uid.to_string();
             let gid_s = gid.to_string();
@@ -4367,14 +4386,7 @@ pub(crate) fn rotate_agent_to_profile(
     );
     let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
     seed_harness_credentials(store, data, agent, &cfg);
-    let parent_name = agent
-        .parent_id
-        .as_ref()
-        .and_then(|pid| store.agent(pid).ok())
-        .map(|p| p.name);
-    if let Some((_, uid, gid, _)) =
-        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
-    {
+    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
         crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
     }
     if !store.has_open_turn(&agent.id).unwrap_or(false) {
