@@ -1319,7 +1319,9 @@ pub(crate) fn build_harness_continuity_summary(
     target_harness: &str,
 ) -> Option<String> {
     let turns = store.conversation(&agent.id, None, None, Some(10)).ok()?;
-    if turns.is_empty() {
+    let last_out_idx = turns.iter().rposition(|t| t.direction == "out")?;
+    let completed_turns = &turns[..=last_out_idx];
+    if completed_turns.is_empty() {
         return None;
     }
     let header_pair = match previous_harness.filter(|p| !p.is_empty() && *p != target_harness) {
@@ -1338,7 +1340,7 @@ pub(crate) fn build_harness_continuity_summary(
         agent.model.as_deref().unwrap_or("default"),
         agent.workdir.as_deref().unwrap_or("."),
     );
-    for turn in turns {
+    for turn in completed_turns {
         let dir_tag = if turn.direction == "out" {
             "OUT (already sent/completed)"
         } else {

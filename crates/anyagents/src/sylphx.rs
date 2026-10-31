@@ -1705,7 +1705,7 @@ fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
             "You are a Sylphx Agent running inside AnyAgents. Always use the `send` tool to reply to the sender of an incoming `<message>`.".to_string(),
         );
     }
-    let skills_idx = discover_skills_index(work_dir);
+    let skills_idx = discover_skills_index(work_dir, config_dir);
     if !skills_idx.is_empty() {
         parts.push(skills_idx);
     }
@@ -1721,11 +1721,16 @@ fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     parts.join("\n\n")
 }
 
-fn discover_skills_dirs(work_dir: &Path) -> Vec<PathBuf> {
+fn discover_skills_dirs(work_dir: &Path, config_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    let work_skills = work_dir.join(".agents/skills");
-    if work_skills.is_dir() {
-        dirs.push(work_skills);
+    for cand in [
+        config_dir.join("skills"),
+        config_dir.join(".agents/skills"),
+        work_dir.join(".agents/skills"),
+    ] {
+        if cand.is_dir() && !dirs.contains(&cand) {
+            dirs.push(cand);
+        }
     }
     let owner_skills = PathBuf::from("/home/kyle/workspace/github.com/SylphxAI/owner/.agents/skills");
     if owner_skills.is_dir() && !dirs.contains(&owner_skills) {
@@ -1762,9 +1767,9 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     Some((name?, desc.unwrap_or_default()))
 }
 
-fn discover_skills_index(work_dir: &Path) -> String {
+fn discover_skills_index(work_dir: &Path, config_dir: &Path) -> String {
     let mut seen = std::collections::BTreeMap::new();
-    for dir in discover_skills_dirs(work_dir) {
+    for dir in discover_skills_dirs(work_dir, config_dir) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -2269,7 +2274,7 @@ fn execute_sylphx_tool(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            for dir in discover_skills_dirs(work_dir) {
+            for dir in discover_skills_dirs(work_dir, config_dir) {
                 let skill_dir = dir.join(skill_name);
                 let skill_md = skill_dir.join("SKILL.md");
                 if skill_md.is_file() {
