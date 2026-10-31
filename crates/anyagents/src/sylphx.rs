@@ -1721,7 +1721,7 @@ fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     parts.join("\n\n")
 }
 
-fn discover_skills_Dirs(work_dir: &Path) -> Vec<PathBuf> {
+fn discover_skills_dirs(work_dir: &Path) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let work_skills = work_dir.join(".agents/skills");
     if work_skills.is_dir() {
@@ -1764,7 +1764,7 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
 
 fn discover_skills_index(work_dir: &Path) -> String {
     let mut seen = std::collections::BTreeMap::new();
-    for dir in discover_skills_Dirs(work_dir) {
+    for dir in discover_skills_dirs(work_dir) {
         let Ok(entries) = std::fs::read_dir(dir) else {
             continue;
         };
@@ -2269,7 +2269,7 @@ fn execute_sylphx_tool(
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            for dir in discover_skills_Dirs(work_dir) {
+            for dir in discover_skills_dirs(work_dir) {
                 let skill_dir = dir.join(skill_name);
                 let skill_md = skill_dir.join("SKILL.md");
                 if skill_md.is_file() {
