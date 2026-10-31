@@ -3031,30 +3031,40 @@ fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
     None
 }
 
-fn extract_agy_oauth_client() -> Option<(String, String)> {
-    let agy_bin = ["/home/kyle/.local/bin/agy", "/usr/local/bin/agy"]
+fn extract_agy_oauth_clients() -> Vec<(String, String)> {
+    let Some(agy_bin) = ["/home/kyle/.local/bin/agy", "/usr/local/bin/agy"]
         .into_iter()
         .map(Path::new)
-        .find(|p| p.is_file())?;
-    let bytes = std::fs::read(agy_bin).ok()?;
+        .find(|p| p.is_file())
+    else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(agy_bin) else {
+        return Vec::new();
+    };
     let cid_needle = b"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
     if !bytes.windows(cid_needle.len()).any(|w| w == cid_needle) {
-        return None;
+        return Vec::new();
     }
+    let Ok(cid) = String::from_utf8(cid_needle.to_vec()) else {
+        return Vec::new();
+    };
     let sec_prefix = b"GOCSPX-";
+    let mut out = Vec::new();
     for idx in 0..bytes.len().saturating_sub(35) {
         if &bytes[idx..idx + 7] == sec_prefix {
             let candidate = &bytes[idx..idx + 35];
             if candidate[7..]
                 .iter()
                 .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+                && let Ok(secret) = String::from_utf8(candidate.to_vec())
+                && !out.iter().any(|(_, s)| s == &secret)
             {
-                let secret = String::from_utf8(candidate.to_vec()).ok()?;
-                return Some((String::from_utf8(cid_needle.to_vec()).ok()?, secret));
+                out.push((cid.clone(), secret));
             }
         }
     }
-    None
+    out
 }
 
 fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
@@ -3345,6 +3355,142 @@ fn format_reset_eta_epoch_ms(target_ms: i64) -> Option<String> {
     format_reset_eta_secs((target_ms - now_ms) / 1_000)
 }
 
+fn format_anthropic_usage_summary(
+    val: &serde_json::Value,
+    tier_badge: Option<&str>,
+) -> Option<String> {
+    let tier_suffix = tier_badge.map(|t| format!(" ({t})")).unwrap_or_default();
+    let limits = val.get("limits").and_then(serde_json::Value::as_array);
+
+    let find_limit = |want_kind: &str, want_group: &str| -> Option<(f64, Option<&str>)> {
+        let arr = limits?;
+        for item in arr {
+            if item.get("is_active").and_then(serde_json::Value::as_bool) == Some(false) {
+                continue;
+            }
+            let kind = item
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let group = item
+                .get("group")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let scope_null = item.get("scope").is_none_or(serde_json::Value::is_null);
+            if kind == want_kind || (group == want_group && scope_null) {
+                let pct = item.get("percent").and_then(serde_json::Value::as_f64)?;
+                let resets = item.get("resets_at").and_then(serde_json::Value::as_str);
+                return Some((pct, resets));
+            }
+        }
+        None
+    };
+
+    let mut parts = Vec::new();
+
+    let window_5h = val
+        .pointer("/five_hour/utilization")
+        .and_then(serde_json::Value::as_f64)
+        .map(|u| {
+            (
+                u,
+                val.pointer("/five_hour/resets_at")
+                    .and_then(serde_json::Value::as_str),
+            )
+        })
+        .or_else(|| find_limit("five_hour_all", "five_hour"));
+
+    if let Some((u5, resets_5h)) = window_5h {
+        let rem_5h = (100.0 - u5).clamp(0.0, 100.0).round() as i64;
+        let eta_5h = (rem_5h < 100)
+            .then(|| resets_5h.and_then(format_reset_eta_iso))
+            .flatten()
+            .map(|e| format!(" ↻{e}"))
+            .unwrap_or_default();
+        parts.push(format!("5h: {rem_5h}% left{eta_5h}"));
+    }
+
+    let window_7d = val
+        .pointer("/seven_day/utilization")
+        .and_then(serde_json::Value::as_f64)
+        .map(|u| {
+            (
+                u,
+                val.pointer("/seven_day/resets_at")
+                    .and_then(serde_json::Value::as_str),
+            )
+        })
+        .or_else(|| find_limit("weekly_all", "weekly"));
+
+    if let Some((u7, resets_7d)) = window_7d {
+        let rem_7d = (100.0 - u7).clamp(0.0, 100.0).round() as i64;
+        let eta_7d = (rem_7d < 100)
+            .then(|| resets_7d.and_then(format_reset_eta_iso))
+            .flatten()
+            .map(|e| format!(" ↻{e}"))
+            .unwrap_or_default();
+        parts.push(format!("7d: {rem_7d}% left{eta_7d}"));
+    }
+
+    if let Some(u_opus) = val
+        .pointer("/seven_day_opus/utilization")
+        .and_then(serde_json::Value::as_f64)
+    {
+        let rem_opus = (100.0 - u_opus).clamp(0.0, 100.0).round() as i64;
+        let eta_opus = (rem_opus < 100)
+            .then(|| {
+                val.pointer("/seven_day_opus/resets_at")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(format_reset_eta_iso)
+            })
+            .flatten()
+            .map(|e| format!(" ↻{e}"))
+            .unwrap_or_default();
+        parts.push(format!("opus: {rem_opus}% left{eta_opus}"));
+    }
+
+    if let Some(minor) = val
+        .pointer("/spend/balance/amount_minor")
+        .and_then(serde_json::Value::as_i64)
+    {
+        let exp = val
+            .pointer("/spend/balance/exponent")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(2) as i32;
+        let dollars = (minor as f64) / 10f64.powi(exp);
+        parts.push(format!("${dollars:.2} left"));
+    } else if let Some(rem_d) = val
+        .pointer("/seven_day/remaining_dollars")
+        .and_then(serde_json::Value::as_f64)
+    {
+        parts.push(format!("${rem_d:.2} left"));
+    } else if val
+        .pointer("/extra_usage/is_enabled")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+        && let Some(limit) = val
+            .pointer("/extra_usage/monthly_limit")
+            .and_then(serde_json::Value::as_f64)
+    {
+        let used = val
+            .pointer("/extra_usage/used_credits")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
+        let exp = val
+            .pointer("/extra_usage/decimal_places")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(2) as i32;
+        let scale = if limit > 1000.0 && exp == 2 { 100.0 } else { 1.0 };
+        let rem_d = ((limit - used) / scale).max(0.0);
+        parts.push(format!("extra: ${rem_d:.2} left"));
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+    Some(format!("{}{tier_suffix}", parts.join(" · ")))
+}
+
 pub(crate) fn probe_one_profile_usage(
     data: &Path,
     provider: &str,
@@ -3476,37 +3622,7 @@ pub(crate) fn probe_one_profile_usage(
             let tier_badge = sync_anthropic_profile_metadata(
                 &http, data, &prof_dir, profile, &token, &mut cred, false,
             );
-            let tier_suffix = tier_badge.map(|t| format!(" ({t})")).unwrap_or_default();
-            let u5 = val
-                .pointer("/five_hour/utilization")
-                .and_then(serde_json::Value::as_f64)?;
-            let u7 = val
-                .pointer("/seven_day/utilization")
-                .and_then(serde_json::Value::as_f64)
-                .unwrap_or(0.0);
-            let rem_5h = (100.0 - u5).clamp(0.0, 100.0).round() as i64;
-            let rem_7d = (100.0 - u7).clamp(0.0, 100.0).round() as i64;
-            let eta_5h = (rem_5h < 100)
-                .then(|| {
-                    val.pointer("/five_hour/resets_at")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(format_reset_eta_iso)
-                })
-                .flatten()
-                .map(|e| format!(" ↻{e}"))
-                .unwrap_or_default();
-            let eta_7d = (rem_7d < 100)
-                .then(|| {
-                    val.pointer("/seven_day/resets_at")
-                        .and_then(serde_json::Value::as_str)
-                        .and_then(format_reset_eta_iso)
-                })
-                .flatten()
-                .map(|e| format!(" ↻{e}"))
-                .unwrap_or_default();
-            Some(format!(
-                "5h: {rem_5h}% left{eta_5h} · 7d: {rem_7d}% left{eta_7d}{tier_suffix}"
-            ))
+            format_anthropic_usage_summary(&val, tier_badge)
         }
         "openai" => {
             let auth_text = std::fs::read_to_string(prof_dir.join("auth.json"))
@@ -3662,18 +3778,28 @@ pub(crate) fn probe_one_profile_usage(
                 if rtok.is_empty() {
                     return None;
                 }
-                let (cid, csec) = extract_agy_oauth_client()?;
-                let form_body = format!(
-                    "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
-                );
-                let rresp = http
-                    .post("https://oauth2.googleapis.com/token")
-                    .header("content-type", "application/x-www-form-urlencoded")
-                    .send(form_body.as_bytes())
-                    .ok()?;
-                let rbody = rresp.into_body().read_to_string().ok()?;
-                let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
-                let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
+                let mut refreshed_acc = None;
+                for (cid, csec) in extract_agy_oauth_clients() {
+                    let form_body = format!(
+                        "client_id={cid}&client_secret={csec}&refresh_token={rtok}&grant_type=refresh_token"
+                    );
+                    if let Ok(rresp) = http
+                        .post("https://oauth2.googleapis.com/token")
+                        .header("content-type", "application/x-www-form-urlencoded")
+                        .send(form_body.as_bytes())
+                        && let Ok(rbody) = rresp.into_body().read_to_string()
+                        && let Ok(rval) = serde_json::from_str::<serde_json::Value>(&rbody)
+                        && let Some(acc) = rval
+                            .get("access_token")
+                            .and_then(serde_json::Value::as_str)
+                            .map(|s| s.trim().to_string())
+                        && !acc.is_empty()
+                    {
+                        refreshed_acc = Some(acc);
+                        break;
+                    }
+                }
+                let new_acc = refreshed_acc?;
                 if let Some(tok_obj) = tok_val
                     .get_mut("token")
                     .and_then(serde_json::Value::as_object_mut)
@@ -5891,5 +6017,62 @@ mod tests {
             l1_wt.join("uncommitted.txt").is_file(),
             "dirty worktree must NEVER be deleted on archive"
         );
+    }
+
+    #[test]
+    fn anthropic_usage_formats_weekly_only_when_five_hour_is_null() {
+        let payload = serde_json::json!({
+            "five_hour": null,
+            "seven_day": {
+                "utilization": 75.0,
+                "resets_at": "2099-11-05T14:59:59.917112+00:00",
+                "limit_dollars": null,
+                "used_dollars": null,
+                "remaining_dollars": null,
+                "locked_reason": null
+            },
+            "limits": [
+                {
+                    "kind": "weekly_all",
+                    "group": "weekly",
+                    "percent": 75,
+                    "severity": "warning",
+                    "resets_at": "2099-11-05T14:59:59.917112+00:00",
+                    "scope": null,
+                    "is_active": true
+                }
+            ],
+            "spend": {
+                "used": { "amount_minor": 0, "currency": "USD", "exponent": 2 },
+                "limit": null,
+                "percent": 0,
+                "enabled": false,
+                "balance": null
+            }
+        });
+        let formatted = format_anthropic_usage_summary(&payload, Some("max 20x")).unwrap();
+        assert!(formatted.starts_with("7d: 25% left ↻"), "got: {formatted}");
+        assert!(formatted.ends_with(" (max 20x)"), "got: {formatted}");
+    }
+
+    #[test]
+    fn anthropic_usage_formats_both_windows_and_spend_balance() {
+        let payload = serde_json::json!({
+            "five_hour": {
+                "utilization": 10.0,
+                "resets_at": "2099-11-01T02:00:00Z"
+            },
+            "seven_day": {
+                "utilization": 40.0,
+                "resets_at": "2099-11-05T15:00:00Z"
+            },
+            "spend": {
+                "balance": { "amount_minor": 4250, "currency": "USD", "exponent": 2 }
+            }
+        });
+        let formatted = format_anthropic_usage_summary(&payload, Some("max 5x")).unwrap();
+        assert!(formatted.contains("5h: 90% left ↻"), "got: {formatted}");
+        assert!(formatted.contains(" · 7d: 60% left ↻"), "got: {formatted}");
+        assert!(formatted.contains(" · $42.50 left (max 5x)"), "got: {formatted}");
     }
 }
