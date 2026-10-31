@@ -1631,6 +1631,8 @@ async fn get_description_route(
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
+            "harness": rec.harness,
+            "model": rec.model,
             "aliases": aliases,
             "description": rec.instructions,
             "system_prompt": system_prompt,
@@ -2337,12 +2339,21 @@ async fn archive_agent_route(
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AgentView>, ApiError> {
     spawn_store(move || {
-        let found = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
+        let clean_name = name.trim().strip_prefix("agent:").unwrap_or(name.trim());
+        let found = if clean_name.eq_ignore_ascii_case("self")
+            && let Principal::Agent { ref agent_id, .. } = principal
+        {
+            state.store.agent(agent_id).map_err(ApiError::from_store)?
+        } else {
+            state
+                .store
+                .agent_by_name(clean_name)
+                .map_err(ApiError::from_store)?
+        };
+        let is_self =
+            matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
         if found.parent_id.is_none() {
-            if matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id) {
+            if is_self {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "a root agent cannot archive itself; pass a target agent name or id in `agent`",
@@ -2365,16 +2376,18 @@ async fn archive_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            if state
-                .health
-                .get(&found.id)
-                .is_none_or(|live| !live.process_alive)
-            {
-                break;
+        if !is_self {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if state
+                    .health
+                    .get(&found.id)
+                    .is_none_or(|live| !live.process_alive)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         if found.parent_id.is_some() {
             reap_subagent_ephemeral_dirs(state.store.data_dir(), &found.id);
@@ -3470,12 +3483,19 @@ fn plan_send(
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
     let mut plan = SendPlan::parse(store, actor, body)?;
-    let reply = crate::reply::resolve(
+    let has_telegram_target = plan
+        .targets
+        .iter()
+        .any(|t| matches!(t, Target::Telegram { .. }));
+    let reply = match crate::reply::resolve(
         principal,
         |id| own_message(store, principal, actor, id),
         body.reply_to.as_deref(),
-    )
-    .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+    ) {
+        Ok(dest) => dest,
+        Err(_why) if !plan.targets.is_empty() && !has_telegram_target => None,
+        Err(why) => return Err(ApiError::new(StatusCode::BAD_REQUEST, why)),
+    };
     if let Some(destination) = reply {
         if plan.targets.is_empty() {
             plan.targets = vec![target_of(&destination)];

@@ -1244,9 +1244,10 @@ fn run_native_gateway_turn(
             cb();
         }
 
-        let Some(choice_msg) = resp.pointer("/choices/0/message").cloned() else {
+        let Some(raw_choice_msg) = resp.pointer("/choices/0/message").cloned() else {
             return Err("Sylphx gateway response missing choices[0].message".to_string());
         };
+        let choice_msg = sanitize_assistant_message(&raw_choice_msg);
 
         append_transcript_message(&transcript_path, &choice_msg);
         messages.push(choice_msg.clone());
@@ -1258,6 +1259,7 @@ fn run_native_gateway_turn(
             .unwrap_or_default();
 
         if !tool_calls.is_empty() {
+            let mut self_archived = false;
             for tc in tool_calls {
                 if cancel_flag.load(Ordering::SeqCst) {
                     break;
@@ -1279,8 +1281,28 @@ fn run_native_gateway_turn(
                 let parsed_args: Value =
                     serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
 
-                if fn_name == "send" || fn_name == "mcp__anyagents__send" {
+                let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
+                if norm_fn == "send" {
                     sent_any_reply = true;
+                }
+                if (norm_fn == "archive"
+                    && parsed_args
+                        .get("agent")
+                        .or_else(|| parsed_args.get("name"))
+                        .and_then(Value::as_str)
+                        .is_none_or(|s| s.trim().is_empty() || s.eq_ignore_ascii_case("self")))
+                    || ((norm_fn == "agents" || norm_fn == "subagents")
+                        && parsed_args
+                            .get("action")
+                            .and_then(Value::as_str)
+                            .is_some_and(|a| a.eq_ignore_ascii_case("archive"))
+                        && parsed_args
+                            .get("name")
+                            .or_else(|| parsed_args.get("agent"))
+                            .and_then(Value::as_str)
+                            .is_none_or(|s| s.trim().is_empty() || s.eq_ignore_ascii_case("self")))
+                {
+                    self_archived = true;
                 }
 
                 let output = execute_sylphx_tool(
@@ -1298,6 +1320,9 @@ fn run_native_gateway_turn(
                 });
                 append_transcript_message(&transcript_path, &tool_msg);
                 messages.push(tool_msg);
+            }
+            if self_archived {
+                break;
             }
             continue;
         }
@@ -1627,6 +1652,50 @@ fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     }
 }
 
+/// Strips response-only fields (`annotations`, `refusal`, `audio`, `reasoning`, etc.)
+/// from an assistant message before it is persisted or echoed back to the
+/// Sylphx AI Gateway (`https://api.models.sylphx.ai/v1/chat/completions`), which
+/// rejects unknown fields on assistant messages (`HTTP 400: Unknown parameter: annotations`).
+fn sanitize_assistant_message(msg: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert("role".to_string(), Value::String("assistant".to_string()));
+    match msg.get("content") {
+        Some(Value::String(s)) => {
+            out.insert("content".to_string(), Value::String(s.clone()));
+        }
+        _ => {
+            out.insert("content".to_string(), Value::Null);
+        }
+    }
+    if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array)
+        && !tcs.is_empty()
+    {
+        let clean_tcs: Vec<Value> = tcs
+            .iter()
+            .filter_map(|tc| {
+                let id = tc.get("id").and_then(Value::as_str)?;
+                let fn_name = tc.pointer("/function/name").and_then(Value::as_str)?;
+                let fn_args = tc
+                    .pointer("/function/arguments")
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                Some(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": fn_name,
+                        "arguments": fn_args,
+                    }
+                }))
+            })
+            .collect();
+        if !clean_tcs.is_empty() {
+            out.insert("tool_calls".to_string(), Value::Array(clean_tcs));
+        }
+    }
+    Value::Object(out)
+}
+
 fn load_transcript_messages(transcript_path: &Path, system_prompt: &str) -> Vec<Value> {
     let mut out = vec![json!({
         "role": "system",
@@ -1639,6 +1708,13 @@ fn load_transcript_messages(transcript_path: &Path, system_prompt: &str) -> Vec<
         .lines()
         .map_while(Result::ok)
         .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
+        .map(|m| {
+            if m.get("role").and_then(Value::as_str) == Some("assistant") {
+                sanitize_assistant_message(&m)
+            } else {
+                m
+            }
+        })
         .collect();
     if history.len() > 80 {
         let split = history.len() - 80;
@@ -1677,12 +1753,43 @@ fn build_tool_definitions() -> Vec<Value> {
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "to": { "type": "string", "description": "Recipient(s): `agent:<name>`, bare name, `parent`, `children`, `group:<name>`, or `telegram:chat:<id>[:<topic>]`." },
+                        "to": {
+                            "description": "Recipient(s): a string or array of strings (`\"parent\"` or `[\"parent\"]`, `agent:<name>`, bare name, `children`, `group:<name>`, or `telegram:chat:<id>[:<topic>]`)."
+                        },
                         "text": { "type": "string", "description": "Message text or caption." },
                         "reply_to": { "type": "string", "description": "Optional reply reference (`anyagents:reply:msg_...`)." },
                         "action": { "type": "string", "description": "Optional interaction action (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`)." },
                         "target": { "type": "string", "description": "Target message for interaction actions." },
                         "emoji": { "type": "string", "description": "Emoji for `react`." }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "describe",
+                "description": "Read or update an agent's role & responsibility description (`agent`: `\"self\"` | `\"all\"` | `\"<agent>\"`, optional `description`, `role`, `clear`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": { "type": "string", "description": "Target agent (`\"self\"`, `\"all\"`, or agent name). Defaults to `\"self\"`." },
+                        "description": { "type": "string", "description": "Updated role/responsibility description." },
+                        "role": { "type": "string", "description": "Optional short role label." },
+                        "clear": { "type": "boolean", "description": "Clear existing description." }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "archive",
+                "description": "Archive an agent or sub-agent (`agent`: `\"self\"` or `<agent-name>`) to scale its process to zero while preserving its permanent `agt_...` ID and session.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "agent": { "type": "string", "description": "Target agent (`\"self\"` or sub-agent name). Defaults to `\"self\"`." }
                     }
                 }
             }
@@ -1861,7 +1968,8 @@ fn execute_sylphx_tool(
 ) -> String {
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
     match normalized {
-        "agents" | "subagents" | "send" | "conversation" | "groups" | "schedule" | "browser" => {
+        "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
+        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
             call_anyagents_mcp_tool(mcp_command, mcp_args, env, normalized, args)
         }
         "bash" | "shell" => {
@@ -2294,5 +2402,32 @@ mod tests {
         assert_eq!(sub.parent_id.as_ref(), Some(&root.id));
         let sub_cfg = anyagents_core::agent_config_dir(&data, &sub.id);
         assert!(sub_cfg.join("sylphx-agent.json").is_file());
+    }
+
+    #[test]
+    fn sanitize_assistant_message_strips_annotations_and_refusal() {
+        let raw = json!({
+            "role": "assistant",
+            "content": null,
+            "refusal": null,
+            "annotations": [],
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {
+                        "name": "describe",
+                        "arguments": "{\"agent\":\"self\"}"
+                    }
+                }
+            ]
+        });
+        let cleaned = sanitize_assistant_message(&raw);
+        assert!(cleaned.get("annotations").is_none());
+        assert!(cleaned.get("refusal").is_none());
+        assert_eq!(cleaned["role"], "assistant");
+        assert!(cleaned["content"].is_null());
+        assert_eq!(cleaned["tool_calls"][0]["id"], "call_123");
+        assert_eq!(cleaned["tool_calls"][0]["function"]["name"], "describe");
     }
 }

@@ -275,6 +275,13 @@ impl Client {
                     for view in &mut resp.agents {
                         if let Some(adm) = by_id.get(&view.id) {
                             view.name = adm.name.clone();
+                            view.harness = adm.harness.clone();
+                            if adm.model.is_some() {
+                                view.model = adm.model.clone();
+                            }
+                            view.install = adm.install.clone();
+                            view.delivery_mode = adm.delivery_mode.clone();
+                            view.steer_support = adm.steer_support.clone();
                             if adm.role.is_some() {
                                 view.role = adm.role.clone();
                             }
@@ -1587,8 +1594,9 @@ impl AgentMcp {
             .agent
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
             .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .filter(|s| !s.eq_ignore_ascii_case("self"))
             .unwrap_or_else(|| self.agent.id.to_string());
         let response = self
             .client

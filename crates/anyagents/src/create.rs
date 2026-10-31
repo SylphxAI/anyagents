@@ -41,9 +41,16 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     };
     // A harness is installed only if an adapter can start it.
     install::adapter(&normalized_harness)?;
-    let mut new = NewAgent::new(request.name, normalized_harness);
+    let mut new = NewAgent::new(request.name, normalized_harness.clone());
     new.role = request.role;
-    new.model = request.model;
+    new.model = request
+        .model
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            (normalized_harness == "sylphx")
+                .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+        });
     new.instructions = request.instructions;
     new.parent_id = request.parent_id;
     let agent = store.create_agent(new)?;
@@ -199,7 +206,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
         let should_share_cwd = (workdir_created
             || cwd == managed_abs
-            || (agent.parent_id.is_some() && explicit_workdir.is_some()))
+            || explicit_workdir.is_some())
             && cwd != Path::new("/scratch/wt/owners-main")
             && cwd != Path::new("/scratch/wt");
         if should_share_cwd
@@ -1471,29 +1478,23 @@ pub(crate) fn compute_live_session_continuity(
 }
 
 /// Walks `parent_id` in `state.db` up to the root ancestor so multi-hop sub-agents
-/// (e.g. `prism -> prism-owner-provision -> owner-lootling` or renamed roots
-/// like `helios` running on `seat-rhea`) inherit the ancestor's authoritative OS seat.
+/// inherit the root ancestor's hint consistently across `serve-admin` and `serve`.
 pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<String> {
     let mut curr = agent.parent_id.clone();
     let mut hops = 0usize;
     let mut last_name = None;
-    let mut ancestor_seat = None;
     while let Some(pid) = curr {
         if hops >= 16 {
             break;
         }
         hops += 1;
-        let parent_cfg = agent_config_dir(store.data_dir(), &pid);
-        if let Some((seat_user, _, _, _)) = crate::sandbox::existing_config_seat(&parent_cfg) {
-            ancestor_seat = Some(seat_user);
-        }
         let Ok(parent) = store.agent(&pid) else {
             break;
         };
         last_name = Some(parent.name);
         curr = parent.parent_id;
     }
-    ancestor_seat.or(last_name).or_else(|| {
+    last_name.or_else(|| {
         agent
             .launch_env
             .iter()
@@ -1674,6 +1675,14 @@ pub(crate) fn reconcile_agent_runtime_config(
             ensure_seat_op_config(config, spec);
         }
         crate::sandbox::share_config_with_seat_uid(config, uid, gid);
+        if work_dir != Path::new("/scratch/wt/owners-main")
+            && work_dir != Path::new("/scratch/wt")
+            && (agent.parent_id.is_some()
+                || work_dir.starts_with("/scratch/tmp")
+                || work_dir.starts_with(data))
+        {
+            crate::sandbox::share_worktree_with_seat(work_dir, gid);
+        }
         if agent.harness == "muse"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
@@ -2047,9 +2056,16 @@ pub(crate) fn configure_agent_runtime(
                     .cloned()
             })
             .map(|arr| {
-                arr.into_iter()
+                let mut v: Vec<String> = arr
+                    .into_iter()
                     .filter_map(|x| x.as_str().map(str::to_string))
-                    .collect::<Vec<_>>()
+                    .collect();
+                for d in &default_compat {
+                    if !v.iter().any(|x| x == d) {
+                        v.push(d.clone());
+                    }
+                }
+                v
             })
             .filter(|v| !v.is_empty())
             .unwrap_or(default_compat)
@@ -5179,7 +5195,11 @@ pub(crate) fn resolve_subagent_defaults(
         };
         let model = m_trim
             .filter(|m| !m.eq_ignore_ascii_case("inherit"))
-            .map(str::to_string);
+            .map(str::to_string)
+            .or_else(|| {
+                matches!(harness.as_str(), "sylphx" | "sylphx-agent" | "sylphx_agent")
+                    .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+            });
         let profile = p_trim
             .filter(|p| !p.eq_ignore_ascii_case("inherit"))
             .map(str::to_string);
@@ -5244,7 +5264,21 @@ pub(crate) fn resolve_subagent_defaults(
             })
     } else {
         None
-    };
+    }
+    .or_else(|| {
+        matches!(
+            resolved_harness.as_str(),
+            "sylphx" | "sylphx-agent" | "sylphx_agent"
+        )
+        .then(|| {
+            spec.model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| m.starts_with("sylphx/"))
+                .map(str::to_string)
+                .unwrap_or_else(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
+        })
+    });
 
     let target_provider = upstream_provider_of(&resolved_harness, resolved_model.as_deref());
     let inherit_profile_if_compatible = || {

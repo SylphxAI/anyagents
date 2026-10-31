@@ -332,20 +332,10 @@ fn fallback_seat(agent_name: &str, parent_name: Option<&str>) -> Option<(String,
     if all_seats.is_empty() {
         return None;
     }
-    let primary_seats: Vec<(String, (u32, u32))> = all_seats
-        .iter()
-        .filter(|(_, (uid, gid))| uid == gid)
-        .cloned()
-        .collect();
-    let seats = if primary_seats.is_empty() {
-        &all_seats
-    } else {
-        &primary_seats
-    };
     let hash = agent_name.bytes().fold(0usize, |acc, b| {
         acc.wrapping_mul(31).wrapping_add(b as usize)
     });
-    seats.get(hash % seats.len()).cloned()
+    all_seats.get(hash % all_seats.len()).cloned()
 }
 
 fn host_seat_users() -> Vec<(String, (u32, u32))> {
