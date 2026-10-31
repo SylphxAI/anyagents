@@ -2476,6 +2476,8 @@ fn json_oauth_expires_at(bytes: &[u8]) -> Option<i64> {
 fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
     let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     for ptr in [
+        "/claudeAiOauth/accountUuid",
+        "/claudeAiOauth/refreshToken",
         "/id_token_email",
         "/tokens/account_id",
         "/token/refresh_token",
@@ -2779,16 +2781,8 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
         enrich_profiles_usage(data, &mut entries);
     }
 
-    // Bind active agents to their resolved `<provider>/<profile>`, restore affinity
-    // (`<provider>/<agent.name>`) when a dedicated profile recovers quota (`>= 10%`),
-    // auto-failover any agent bound to an exhausted (`0% left`) profile when another
-    // profile under the same upstream provider has healthy quota (`>= 20% left`), and
-    // auto-clear any stale session quota hold when the bound profile now has `> 0%` left.
-    let active_names: std::collections::BTreeSet<String> = agents
-        .iter()
-        .filter(|a| a.state == "running")
-        .map(|a| a.name.clone())
-        .collect();
+    // Bind active agents to their resolved `<provider>/<profile>` without cross-profile
+    // fallback or cross-profile rotation (strict 1-account-per-profile isolation).
     let mut ordered_agents: Vec<&Agent> =
         agents.iter().filter(|a| a.state != "archived").collect();
     ordered_agents.sort_by_key(|a| a.parent_id.is_some());
@@ -2797,7 +2791,7 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
         let cfg = agent_config_dir(data, &agent.id);
         let expected_provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
         let bound = bound_profile_name(&cfg);
-        let (bound_prov, mut bound_prof) = match bound.as_deref() {
+        let (bound_prov, bound_prof) = match bound.as_deref() {
             Some(s) if s.contains('/') => {
                 let (p, n) = s.split_once('/').unwrap_or((&expected_provider, "default"));
                 (p.to_string(), n.to_string())
@@ -2805,51 +2799,6 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
             Some(s) if !s.is_empty() => (expected_provider.clone(), s.to_string()),
             _ => (expected_provider.clone(), "default".to_string()),
         };
-        let has_dedicated = entries
-            .iter()
-            .any(|e| e.provider == expected_provider && e.profile == agent.name);
-        if is_root && bound_prov == expected_provider && bound_prof != agent.name && has_dedicated {
-            let affinity_pct = entries
-                .iter()
-                .find(|e| e.provider == expected_provider && e.profile == agent.name)
-                .and_then(|e| e.usage.as_deref())
-                .and_then(|u| parse_remaining_pct_from_usage(u, agent.model.as_deref()));
-            let current_occupied = entries
-                .iter()
-                .find(|e| e.provider == bound_prov && e.profile == bound_prof)
-                .is_some_and(|e| !e.assigned_agents.is_empty());
-            if affinity_pct.is_some_and(|p| p >= 10) || current_occupied {
-                rotate_agent_to_profile(store, data, agent, &expected_provider, &agent.name);
-                bound_prof = agent.name.clone();
-            }
-        }
-        let cur_pct = entries
-            .iter()
-            .find(|e| e.provider == bound_prov && e.profile == bound_prof)
-            .and_then(|e| e.usage.as_deref())
-            .and_then(|u| parse_remaining_pct_from_usage(u, agent.model.as_deref()));
-        if agent.state == "running" && cur_pct == Some(0) {
-            if let Some((best_alt, _)) = entries
-                .iter()
-                .filter(|e| {
-                    e.provider == bound_prov
-                        && e.profile != bound_prof
-                        && e.assigned_agents.is_empty()
-                        && !active_names.contains(&e.profile)
-                })
-                .filter_map(|e| {
-                    let pct = parse_remaining_pct_from_usage(
-                        e.usage.as_deref()?,
-                        agent.model.as_deref(),
-                    )?;
-                    (pct >= 20).then_some((e.profile.clone(), pct))
-                })
-                .max_by_key(|(_, pct)| *pct)
-            {
-                rotate_agent_to_profile(store, data, agent, &bound_prov, &best_alt);
-                bound_prof = best_alt;
-            }
-        }
         let normalized = format!("{bound_prov}/{bound_prof}");
         if bound.as_deref() != Some(normalized.as_str()) {
             write_profile_marker(&cfg, ".anyagents-profile", &format!("{normalized}\n"));
@@ -2918,57 +2867,6 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
             }
             if updated_any {
                 propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels);
-            }
-        }
-    }
-    let anth_root = profiles_root.join("anthropic");
-    if let Ok(entries) = std::fs::read_dir(&anth_root) {
-        let now_ms = anyagents_core::now_ms();
-        let mut profs: Vec<(String, PathBuf, i64, Option<String>, Vec<u8>)> = Vec::new();
-        for entry in entries.flatten() {
-            let p = entry.path();
-            if !p.is_dir() {
-                continue;
-            }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
-            let bytes = std::fs::read(p.join(".credentials.json"))
-                .or_else(|_| std::fs::read(p.join(".claude/.credentials.json")))
-                .unwrap_or_default();
-            let exp = json_oauth_expires_at(&bytes).unwrap_or(0);
-            let acct = serde_json::from_slice::<serde_json::Value>(&bytes)
-                .ok()
-                .and_then(|v| {
-                    v.pointer("/claudeAiOauth/accountUuid")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string)
-                });
-            profs.push((name, p, exp, acct, bytes));
-        }
-        if let Some((_, _, best_exp, best_acct, best_bytes)) = profs
-            .iter()
-            .filter(|(_, _, exp, _, bytes)| *exp > now_ms && !bytes.is_empty())
-            .max_by_key(|(_, _, exp, _, _)| *exp)
-            .cloned()
-        {
-            for (name, dir, exp, acct, _) in &profs {
-                let same_acct = match (&best_acct, acct) {
-                    (Some(a), Some(b)) => a == b,
-                    _ => true,
-                };
-                if *exp < best_exp && (*exp <= now_ms || same_acct) {
-                    let _ = std::fs::create_dir_all(dir.join(".claude"));
-                    let _ = std::fs::write(dir.join(".credentials.json"), &best_bytes);
-                    let _ = std::fs::write(dir.join(".claude/.credentials.json"), &best_bytes);
-                    propagate_profile_files_to_bound_agents(
-                        data,
-                        "anthropic",
-                        name,
-                        &[".credentials.json", ".claude/.credentials.json"],
-                    );
-                }
             }
         }
     }
@@ -4790,80 +4688,6 @@ pub(crate) fn clear_stale_agy_quota_error_steps(config_dir: &Path) {
     }
 }
 
-fn restart_agent_harness_process(store: &Store, agent: &Agent) {
-    #[cfg(unix)]
-    {
-        if agent.state == "running"
-            && !crate::sandbox::is_isolated_test_env()
-            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-            && let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent)
-        {
-            let uid_s = uid.to_string();
-            let gid_s = gid.to_string();
-            let proc_pat = match agent.harness.as_str() {
-                "claude-code" => "claude",
-                "agy" => "agy",
-                "codex" => "codex",
-                _ => "",
-            };
-            if !proc_pat.is_empty() {
-                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
-                    .args([
-                        "--reuid",
-                        &uid_s,
-                        "--regid",
-                        &gid_s,
-                        "--groups",
-                        &gid_s,
-                        "--no-new-privs",
-                        "--",
-                        "/usr/bin/pkill",
-                        "-TERM",
-                        "-u",
-                        &uid_s,
-                        "-x",
-                        proc_pat,
-                    ])
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (store, agent);
-    }
-}
-
-pub(crate) fn rotate_agent_to_profile(
-    store: &Store,
-    data: &Path,
-    agent: &Agent,
-    provider: &str,
-    new_profile: &str,
-) {
-    let cfg = agent_config_dir(data, &agent.id);
-    let normalized = format!("{provider}/{new_profile}\n");
-    write_profile_marker(&cfg, ".anyagents-profile", &normalized);
-    write_profile_marker(
-        &cfg,
-        ".anyagents-profile-rotated-ms",
-        &format!("{}\n", anyagents_core::now_ms()),
-    );
-    let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
-    seed_harness_credentials(store, data, agent, &cfg);
-    if let Some((_, uid, gid, _)) = resolved_agent_seat_info(store, agent) {
-        crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
-    }
-    if !store.has_open_turn(&agent.id).unwrap_or(false) {
-        restart_agent_harness_process(store, agent);
-    }
-    if agent.harness == "agy" {
-        clear_stale_agy_quota_error_steps(&cfg);
-    }
-    poke_agent_wake_socket(data, &agent.id);
-}
-
 /// Probes the exact model catalog and per-model quota availability for upstream
 /// provider profiles (especially `google-antigravity/<profile>`).
 pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) -> serde_json::Value {
@@ -5045,6 +4869,7 @@ pub(crate) fn try_rotate_exhausted_profile(
             &format!("{now_ms}\n"),
         );
     }
+    let _ = store;
     let cur_pct =
         probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
     if has_active_quota_hold && cur_pct.is_some_and(|p| p > 5) {
@@ -5059,48 +4884,7 @@ pub(crate) fn try_rotate_exhausted_profile(
         poke_agent_wake_socket(data, &agent.id);
         return Some(format!("{provider}/{current_prof}"));
     }
-    let available = list_harness_profiles(data, &provider);
-    if available.len() <= 1 {
-        return None;
-    }
-    let is_exhausted =
-        cur_pct == Some(0) || (has_active_quota_hold && cur_pct.is_none_or(|p| p <= 5));
-    if !is_exhausted {
-        return None;
-    }
-    let all_agents = store.list_agents().unwrap_or_default();
-    let mut counts: std::collections::BTreeMap<String, usize> = available
-        .iter()
-        .map(|(name, _)| (name.clone(), 0usize))
-        .collect();
-    for other in &all_agents {
-        if other.id != agent.id
-            && other.state == "running"
-            && upstream_provider_of(&other.harness, other.model.as_deref()) == provider
-        {
-            if let Some(c) = counts.get_mut(&other.name) {
-                *c += 1;
-            }
-            let other_cfg = agent_config_dir(data, &other.id);
-            if let Some(p) = bound_profile_name(&other_cfg) {
-                let prof_name = p.split_once('/').map(|(_, n)| n).unwrap_or(p.as_str());
-                if let Some(c) = counts.get_mut(prof_name) {
-                    *c += 1;
-                }
-            }
-        }
-    }
-    let best_alt = available
-        .iter()
-        .filter(|(name, _)| name != &current_prof && counts.get(name).copied().unwrap_or(0) == 0)
-        .filter_map(|(name, _)| {
-            let pct = probe_profile_remaining_pct(data, &provider, name, agent.model.as_deref())?;
-            (pct >= 20).then_some((name.clone(), pct))
-        })
-        .max_by_key(|(_, pct)| *pct)
-        .map(|(name, _)| name)?;
-    rotate_agent_to_profile(store, data, agent, &provider, &best_alt);
-    Some(format!("{provider}/{best_alt}"))
+    None
 }
 
 /// Lists all available Master Profiles for `provider_or_harness` under `<data>/profiles/<provider>/<profile>`.
@@ -5233,6 +5017,9 @@ fn select_or_bind_profile(
             &format!("{provider}/{}\n", chosen.0),
         );
         roots.push(chosen.1.clone());
+        if chosen.0 != "default" {
+            return roots;
+        }
     } else {
         write_profile_marker(
             target_config,
@@ -6074,5 +5861,49 @@ mod tests {
         assert!(formatted.contains("5h: 90% left ↻"), "got: {formatted}");
         assert!(formatted.contains(" · 7d: 60% left ↻"), "got: {formatted}");
         assert!(formatted.contains(" · $42.50 left (max 5x)"), "got: {formatted}");
+    }
+
+    #[test]
+    fn anthropic_profiles_never_cross_contaminate_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let def_dir = data.join("profiles/anthropic/default");
+        let vul_dir = data.join("profiles/anthropic/vulcan");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        std::fs::create_dir_all(&vul_dir).unwrap();
+
+        let now_ms = anyagents_core::now_ms();
+        let def_cred = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "mock-oat-default-fresh",
+                "refreshToken": "mock-ort-default-refresh",
+                "expiresAt": now_ms + 3_600_000,
+                "accountUuid": "acct-default-uuid"
+            }
+        });
+        let vul_cred = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "mock-oat-vulcan-expired",
+                "refreshToken": "mock-ort-vulcan-refresh",
+                "expiresAt": now_ms - 60_000,
+                "accountUuid": "acct-vulcan-uuid"
+            }
+        });
+        std::fs::write(def_dir.join(".credentials.json"), def_cred.to_string()).unwrap();
+        std::fs::write(vul_dir.join(".credentials.json"), vul_cred.to_string()).unwrap();
+
+        sync_fresher_bound_agent_credentials(data);
+
+        let after_vul: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(vul_dir.join(".credentials.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            after_vul
+                .pointer("/claudeAiOauth/refreshToken")
+                .and_then(serde_json::Value::as_str),
+            Some("mock-ort-vulcan-refresh"),
+            "vulcan profile must never be overwritten by default profile credentials"
+        );
     }
 }
