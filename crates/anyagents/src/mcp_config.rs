@@ -400,8 +400,6 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
                 break;
             }
         }
-        key_candidates.push(dir.join(".config/opencode/sylphx.key"));
-        key_candidates.push(dir.join(".config/desk/sylphx-ai/key"));
         if let Some(data_dir) = dir.parent().and_then(Path::parent).and_then(Path::parent) {
             let prof_name = std::fs::read_to_string(dir.join(".anyagents-profile"))
                 .ok()
@@ -414,13 +412,23 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
             key_candidates.push(prof_dir.join(".config/opencode/sylphx.key"));
             key_candidates.push(prof_dir.join(".config/desk/sylphx-ai/key"));
         }
+        key_candidates.push(dir.join(".config/opencode/sylphx.key"));
+        key_candidates.push(dir.join(".config/desk/sylphx-ai/key"));
     }
-    let api_key = key_candidates.into_iter().find_map(|p| {
-        std::fs::read_to_string(p)
-            .ok()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    });
+    let mut resolved_keys: Vec<String> = key_candidates
+        .into_iter()
+        .filter_map(|p| {
+            std::fs::read_to_string(p)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .collect();
+    let api_key = resolved_keys
+        .iter()
+        .find(|k| !k.starts_with("sylphx_sk_"))
+        .cloned()
+        .or_else(|| resolved_keys.drain(..).next());
     (base_url, api_key)
 }
 

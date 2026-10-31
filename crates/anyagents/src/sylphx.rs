@@ -1354,6 +1354,7 @@ fn run_native_gateway_turn(
                 let output = execute_sylphx_tool(
                     &fn_name,
                     &parsed_args,
+                    config_dir,
                     work_dir,
                     env,
                     mcp_command,
@@ -1368,6 +1369,7 @@ fn run_native_gateway_turn(
                 input_items.push(tool_out_item);
             }
             if self_archived {
+                release_persisted_sandbox_lease(config_dir);
                 break;
             }
             continue;
@@ -1953,8 +1955,25 @@ fn build_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "sandbox",
+                "description": "Manage or execute inside this agent's isolated Cloud Kata microVM Sandbox pod (`https://api.sylphx.com/v1/{parent}/leases`, `template:agent`). Actions: `status`, `ensure`, `exec`, `read_file`, `write_file`, `release`. Once `ensure` is called (or when `SYLPHX_SANDBOX=cloud`), `bash`, `read_file`, `write_file`, and `edit_file` automatically run inside the isolated cloud pod.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "`status`, `ensure`, `exec`, `read_file`, `write_file`, or `release`." },
+                        "command": { "type": "string", "description": "Shell command for `exec`." },
+                        "path": { "type": "string", "description": "File path inside the sandbox for `read_file` or `write_file`." },
+                        "content": { "type": "string", "description": "File content for `write_file`." }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "bash",
-                "description": "Execute a bash command in the agent's working directory.",
+                "description": "Execute a bash command in the agent's working directory (or inside the isolated Cloud Kata microVM Sandbox pod when a cloud sandbox lease is active).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2018,21 +2037,104 @@ fn build_tool_definitions() -> Vec<Value> {
 fn execute_sylphx_tool(
     name: &str,
     args: &Value,
+    config_dir: &Path,
     work_dir: &Path,
     env: &[(String, String)],
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> String {
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
+    let sandbox_mode = resolve_sandbox_mode(config_dir, env);
     match normalized {
         "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
         | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
             call_anyagents_mcp_tool(mcp_command, mcp_args, env, normalized, args)
         }
+        "sandbox" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .unwrap_or("status")
+                .trim();
+            match action {
+                "status" => {
+                    let lease_path = config_dir.join("sylphx-sandbox-lease.json");
+                    if let Ok(raw) = std::fs::read_to_string(&lease_path)
+                        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+                    {
+                        return serde_json::to_string_pretty(&json!({
+                            "mode": sandbox_mode,
+                            "active_lease": val,
+                        }))
+                        .unwrap_or_default();
+                    }
+                    serde_json::to_string_pretty(&json!({
+                        "mode": sandbox_mode,
+                        "active_lease": null,
+                    }))
+                    .unwrap_or_default()
+                }
+                "ensure" | "create" => match ensure_cloud_sandbox_lease(config_dir, env) {
+                    Ok((lease_name, uid)) => serde_json::to_string_pretty(&json!({
+                        "status": "ready",
+                        "lease": lease_name,
+                        "uid": uid,
+                        "image": "template:agent",
+                        "shape": "sandbox_shapes/linux-xs",
+                    }))
+                    .unwrap_or_default(),
+                    Err(e) => format!("error ensuring cloud sandbox lease: {e}"),
+                },
+                "exec" => {
+                    let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
+                        return "error: missing `command`".to_string();
+                    };
+                    match exec_in_cloud_sandbox(config_dir, env, cmd_str) {
+                        Ok(out) => out,
+                        Err(e) => format!("error executing in cloud sandbox: {e}"),
+                    }
+                }
+                "read_file" => {
+                    let Some(rel) = args.get("path").and_then(Value::as_str) else {
+                        return "error: missing `path`".to_string();
+                    };
+                    match read_file_in_cloud_sandbox(config_dir, env, rel) {
+                        Ok(s) => s,
+                        Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
+                    }
+                }
+                "write_file" => {
+                    let Some(rel) = args.get("path").and_then(Value::as_str) else {
+                        return "error: missing `path`".to_string();
+                    };
+                    let Some(content) = args.get("content").and_then(Value::as_str) else {
+                        return "error: missing `content`".to_string();
+                    };
+                    match write_file_in_cloud_sandbox(config_dir, env, rel, content) {
+                        Ok(s) => s,
+                        Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
+                    }
+                }
+                "release" | "delete" | "stop" => {
+                    release_persisted_sandbox_lease(config_dir);
+                    "released cloud sandbox lease".to_string()
+                }
+                other => format!("error: unknown sandbox action `{other}`"),
+            }
+        }
         "bash" | "shell" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
             let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
                 return "error: missing `command`".to_string();
             };
+            if sandbox_mode == "cloud" {
+                return match exec_in_cloud_sandbox(config_dir, env, cmd_str) {
+                    Ok(out) => out,
+                    Err(e) => format!("error executing in cloud sandbox: {e}"),
+                };
+            }
             let mut cmd = Command::new("bash");
             cmd.arg("-c")
                 .arg(cmd_str)
@@ -2069,9 +2171,36 @@ fn execute_sylphx_tool(
             }
         }
         "read_file" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
+            if sandbox_mode == "cloud" {
+                return match read_file_in_cloud_sandbox(config_dir, env, rel) {
+                    Ok(content) => {
+                        let start = args
+                            .get("start_line")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(1)
+                            .max(1) as usize;
+                        let lines: Vec<&str> = content.lines().collect();
+                        let end = args
+                            .get("end_line")
+                            .and_then(Value::as_u64)
+                            .map(|n| n as usize)
+                            .unwrap_or(lines.len())
+                            .min(lines.len());
+                        if start > lines.len() {
+                            String::new()
+                        } else {
+                            lines[start - 1..end].join("\n")
+                        }
+                    }
+                    Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
+                };
+            }
             let target = resolve_workspace_path(work_dir, rel);
             match std::fs::read_to_string(&target) {
                 Ok(content) => {
@@ -2096,12 +2225,21 @@ fn execute_sylphx_tool(
             }
         }
         "write_file" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
             let Some(content) = args.get("content").and_then(Value::as_str) else {
                 return "error: missing `content`".to_string();
             };
+            if sandbox_mode == "cloud" {
+                return match write_file_in_cloud_sandbox(config_dir, env, rel, content) {
+                    Ok(msg) => msg,
+                    Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
+                };
+            }
             let target = resolve_workspace_path(work_dir, rel);
             if let Some(p) = target.parent() {
                 let _ = std::fs::create_dir_all(p);
@@ -2112,6 +2250,9 @@ fn execute_sylphx_tool(
             }
         }
         "edit_file" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
@@ -2121,6 +2262,21 @@ fn execute_sylphx_tool(
             let Some(new_str) = args.get("replacement").and_then(Value::as_str) else {
                 return "error: missing `replacement`".to_string();
             };
+            if sandbox_mode == "cloud" {
+                return match read_file_in_cloud_sandbox(config_dir, env, rel) {
+                    Ok(existing) => {
+                        if !existing.contains(old_str) {
+                            return format!("error: target string not found in `{rel}`");
+                        }
+                        let updated = existing.replace(old_str, new_str);
+                        match write_file_in_cloud_sandbox(config_dir, env, rel, &updated) {
+                            Ok(_) => format!("edited `{rel}` in cloud sandbox"),
+                            Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
+                        }
+                    }
+                    Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
+                };
+            }
             let target = resolve_workspace_path(work_dir, rel);
             match std::fs::read_to_string(&target) {
                 Ok(existing) => {
@@ -2138,6 +2294,303 @@ fn execute_sylphx_tool(
         }
         other => format!("error: unknown tool `{other}`"),
     }
+}
+
+const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
+
+fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) -> String {
+    let raw = env
+        .iter()
+        .find(|(k, v)| k == "SYLPHX_SANDBOX" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+        .or_else(|| {
+            std::env::var("SYLPHX_SANDBOX")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+        })
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("sandbox")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_ascii_lowercase())
+                })
+        });
+    match raw.as_deref() {
+        Some("none" | "stateless" | "off" | "false" | "0") => "none".to_string(),
+        Some("cloud" | "pod" | "kata" | "microvm") => "cloud".to_string(),
+        Some("local" | "host") => "local".to_string(),
+        _ => {
+            if config_dir.join("sylphx-sandbox-lease.json").is_file() {
+                "cloud".to_string()
+            } else {
+                "local".to_string()
+            }
+        }
+    }
+}
+
+fn resolve_sylphx_cloud_access_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
+    let mut candidate_dirs = vec![config_dir.to_path_buf()];
+    if let Some(data_dir) = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        candidate_dirs.push(data_dir.join("profiles/sylphx/default"));
+    }
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        candidate_dirs.push(home);
+    }
+    for dir in &candidate_dirs {
+        let creds_path = dir.join(".config/sylphx/credentials.json");
+        if let Ok(raw) = std::fs::read_to_string(&creds_path)
+            && let Ok(val) = serde_json::from_str::<Value>(&raw)
+            && let Some(k) = val
+                .get("api_key")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Some(k.to_string());
+        }
+    }
+    resolve_sylphx_api_key(config_dir, env)
+}
+
+pub fn ensure_cloud_sandbox_lease(
+    config_dir: &Path,
+    env: &[(String, String)],
+) -> Result<(String, String), String> {
+    let access_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
+        "missing Sylphx Cloud access key; run `anyagents sign-in sylphx` first".to_string()
+    })?;
+    let lease_file = config_dir.join("sylphx-sandbox-lease.json");
+    if let Ok(raw) = std::fs::read_to_string(&lease_file)
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        && let Some(name) = val.get("name").and_then(Value::as_str)
+    {
+        let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{name}");
+        if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
+            && let Ok(live) = serde_json::from_str::<Value>(&body)
+            && live.pointer("/status/state").and_then(Value::as_str) == Some("ready")
+        {
+            let uid = live
+                .get("uid")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            return Ok((name.to_string(), uid));
+        }
+    }
+
+    let parent = env
+        .iter()
+        .find(|(k, v)| k == "SYLPHX_SANDBOX_PARENT" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_string())
+        .or_else(|| {
+            std::env::var("SYLPHX_SANDBOX_PARENT")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
+
+    let create_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{parent}/leases");
+    let req_body = json!({
+        "spec": {
+            "shape": "sandbox_shapes/linux-xs",
+            "image": "template:agent",
+            "ttl": "1800s",
+        }
+    });
+    let (status, raw) = curl_post_json(&create_url, Some(&access_key), &req_body)?;
+    if !(200..300).contains(&status) {
+        return Err(format!("CreateLease HTTP {status}: {}", raw.trim()));
+    }
+    let lease_val: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid Lease JSON: {e}"))?;
+    let lease_name = lease_val
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "CreateLease response missing `name`".to_string())?
+        .to_string();
+    let uid = lease_val
+        .get("uid")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if let Ok(pretty) = serde_json::to_string_pretty(&lease_val) {
+        let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
+    }
+    Ok((lease_name, uid))
+}
+
+pub fn release_persisted_sandbox_lease(config_dir: &Path) {
+    let lease_file = config_dir.join("sylphx-sandbox-lease.json");
+    let Ok(raw) = std::fs::read_to_string(&lease_file) else {
+        return;
+    };
+    let _ = std::fs::remove_file(&lease_file);
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        return;
+    };
+    let Some(lease_name) = val.get("name").and_then(Value::as_str) else {
+        return;
+    };
+    let Some(access_key) = resolve_sylphx_cloud_access_key(config_dir, &[]) else {
+        return;
+    };
+    let release_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:release");
+    let _ = curl_post_json(&release_url, Some(&access_key), &json!({}));
+}
+
+fn exec_in_cloud_sandbox(
+    config_dir: &Path,
+    env: &[(String, String)],
+    cmd_str: &str,
+) -> Result<String, String> {
+    let (lease_name, _) = ensure_cloud_sandbox_lease(config_dir, env)?;
+    let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
+        .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let exec_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:exec");
+    let (status, raw) = curl_post_json(
+        &exec_url,
+        Some(&access_key),
+        &json!({
+            "command": ["bash", "-lc", cmd_str],
+            "timeout": "120s",
+        }),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(format!("ExecLease HTTP {status}: {}", raw.trim()));
+    }
+    let val: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid ExecLease JSON: {e}"))?;
+    let code = val.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    let stdout_b64 = val.get("stdout").and_then(Value::as_str).unwrap_or("");
+    let stderr_b64 = val.get("stderr").and_then(Value::as_str).unwrap_or("");
+    let stdout = String::from_utf8_lossy(&base64_decode(stdout_b64)).into_owned();
+    let stderr = String::from_utf8_lossy(&base64_decode(stderr_b64)).into_owned();
+    let mut combined = format!("exit_code: {code}\n");
+    if !stdout.is_empty() {
+        combined.push_str(&stdout);
+    }
+    if !stderr.is_empty() {
+        if !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str("stderr:\n");
+        combined.push_str(&stderr);
+    }
+    if combined.len() > 32_000 {
+        combined.truncate(32_000);
+        combined.push_str("\n...[truncated]");
+    }
+    Ok(combined)
+}
+
+fn read_file_in_cloud_sandbox(
+    config_dir: &Path,
+    env: &[(String, String)],
+    path: &str,
+) -> Result<String, String> {
+    let (lease_name, _) = ensure_cloud_sandbox_lease(config_dir, env)?;
+    let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
+        .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:readFile");
+    let (status, raw) = curl_post_json(&url, Some(&access_key), &json!({ "path": path }))?;
+    if !(200..300).contains(&status) {
+        return Err(format!("ReadFile HTTP {status}: {}", raw.trim()));
+    }
+    let val: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid ReadFile JSON: {e}"))?;
+    let content_b64 = val.get("content").and_then(Value::as_str).unwrap_or("");
+    Ok(String::from_utf8_lossy(&base64_decode(content_b64)).into_owned())
+}
+
+fn write_file_in_cloud_sandbox(
+    config_dir: &Path,
+    env: &[(String, String)],
+    path: &str,
+    content: &str,
+) -> Result<String, String> {
+    let (lease_name, _) = ensure_cloud_sandbox_lease(config_dir, env)?;
+    let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
+        .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:writeFile");
+    let (status, raw) = curl_post_json(
+        &url,
+        Some(&access_key),
+        &json!({
+            "path": path,
+            "content": base64_encode(content.as_bytes()),
+        }),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(format!("WriteFile HTTP {status}: {}", raw.trim()));
+    }
+    Ok(format!(
+        "wrote `{path}` ({} bytes) in cloud sandbox `{lease_name}`",
+        content.len()
+    ))
+}
+
+fn base64_encode(input: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn base64_decode(input: &str) -> Vec<u8> {
+    fn val(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' | b'-' => Some(62),
+            b'/' | b'_' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for &b in input.as_bytes() {
+        if b == b'=' {
+            break;
+        }
+        if let Some(v) = val(b) {
+            buf = (buf << 6) | (v as u32);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push(((buf >> bits) & 0xff) as u8);
+            }
+        }
+    }
+    out
 }
 
 fn resolve_workspace_path(work_dir: &Path, raw: &str) -> PathBuf {

@@ -463,6 +463,159 @@ fn spawn_admin_sylphx_delivery(
     });
 }
 
+fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{Read as _, Write as _};
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+        let Some((_, seat_uid, seat_gid, seat_spec)) =
+            create::resolved_agent_seat_info(store, agent)
+                .or_else(|| crate::sandbox::existing_config_seat(cfg))
+        else {
+            return false;
+        };
+        let uid_str = seat_uid.to_string();
+        let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        let mut found_pid_csrf: Option<(u32, String)> = None;
+        for entry in proc_entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(status_text) = std::fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let matches_uid = status_text
+                .lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .is_some_and(|u| u == uid_str);
+            if !matches_uid {
+                continue;
+            }
+            let Ok(cmd_bytes) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let args: Vec<&str> = cmd_bytes
+                .split(|b| *b == 0)
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if args
+                .first()
+                .is_some_and(|p| p.ends_with("/agy") || *p == "agy")
+                && let Some(idx) = args.iter().position(|a| *a == "--csrf_token")
+                && let Some(csrf) = args.get(idx + 1)
+            {
+                found_pid_csrf = Some((pid, (*csrf).to_string()));
+                break;
+            }
+        }
+        let Some((pid, csrf)) = found_pid_csrf else {
+            return false;
+        };
+        let Ok(tcp_text) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) else {
+            return false;
+        };
+        let mut found_port: Option<u16> = None;
+        for line in tcp_text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 9 && parts[3] == "0A" && parts[7] == uid_str {
+                if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
+                    && ip_hex == "0100007F"
+                    && let Ok(port) = u16::from_str_radix(port_hex, 16)
+                {
+                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+                    if let Ok(mut stream) =
+                        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+                    {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let _ =
+                            stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+                        let req = format!(
+                            "POST /exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories HTTP/1.0\r\n\
+                             Host: 127.0.0.1:{port}\r\n\
+                             Content-Type: application/json\r\n\
+                             x-codeium-csrf-token: {csrf}\r\n\
+                             Content-Length: 2\r\n\
+                             Connection: close\r\n\r\n{{}}"
+                        );
+                        let mut resp = String::new();
+                        if stream.write_all(req.as_bytes()).is_ok()
+                            && stream.read_to_string(&mut resp).is_ok()
+                            && (resp.starts_with("HTTP/1.1 200")
+                                || resp.starts_with("HTTP/1.0 200"))
+                        {
+                            found_port = Some(port);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(port) = found_port else {
+            return false;
+        };
+        let log_path = cfg.join(".gemini/antigravity-cli/cli.log");
+        let expected = format!(
+            "Starting language server process with pid {pid}\nLanguage server listening on random port at {port} for HTTP\n"
+        );
+        if std::fs::read_to_string(&log_path)
+            .ok()
+            .is_some_and(|cur| cur.contains(&expected))
+        {
+            return true;
+        }
+        let _ = std::fs::remove_file(&log_path);
+        if std::fs::write(&log_path, &expected).is_ok() {
+            return true;
+        }
+        if let Some(spec) = seat_spec {
+            let parts: Vec<&str> = spec.split('\t').collect();
+            if let [launcher, u, g, grps] = parts.as_slice() {
+                let script = format!(
+                    "/bin/rm -f '{}' && printf '%s' '{}' > '{}' && /bin/chmod 664 '{}'",
+                    log_path.display(),
+                    expected,
+                    log_path.display(),
+                    log_path.display()
+                );
+                let _ = std::process::Command::new(launcher)
+                    .args([
+                        "--reuid",
+                        u,
+                        "--regid",
+                        g,
+                        "--groups",
+                        grps,
+                        "--no-new-privs",
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        &script,
+                    ])
+                    .status();
+            } else {
+                let _ = (seat_uid, seat_gid);
+            }
+        }
+        std::fs::read_to_string(&log_path)
+            .ok()
+            .is_some_and(|cur| cur.contains(&expected))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (store, cfg, agent);
+        false
+    }
+}
+
 fn reconcile_stopped_and_backed_off_agents(
     store: &Store,
     health: &HealthBoard,
@@ -587,9 +740,53 @@ fn reconcile_stopped_and_backed_off_agents(
                 }
                 continue;
             }
+            if agent.harness == "codex" && store.has_open_turn(&agent.id).unwrap_or(false) {
+                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                if crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms).is_some() {
+                    let last_reset = guard
+                        .last_backoff_reset_ms
+                        .get(agent.id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    if now_ms.saturating_sub(last_reset) >= 60_000 {
+                        guard
+                            .last_backoff_reset_ms
+                            .insert(agent.id.to_string(), now_ms);
+                        let work_dir = agent
+                            .workdir
+                            .as_deref()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &agent.id));
+                        let _ = create::reconcile_agent_runtime_config(
+                            store, data, agent, &cfg, &work_dir,
+                        );
+                        let _ = std::fs::write(
+                            cfg.join(".anyagents-profile-rotated-ms"),
+                            now_ms.to_string(),
+                        );
+                        let _ = store.set_agent_state(&agent.id, "paused");
+                        create::poke_agent_wake_socket(data, &agent.id);
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let _ = store.set_agent_state(&agent.id, "running");
+                        create::poke_agent_wake_socket(data, &agent.id);
+                        create::poke_agent_wake_socket_mail(data, &agent.id);
+                        continue;
+                    }
+                }
+            }
             if oldest_age_ms.is_none() {
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
                 continue;
+            }
+            if agent.harness == "agy" && oldest_age_ms.is_some_and(|age| age >= 3_000) {
+                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                if sync_agy_cli_port_hint(store, &cfg, agent) {
+                    create::poke_agent_wake_socket_mail(data, &agent.id);
+                }
             }
             let is_down_without_quota = match health.get(&agent.id) {
                 Some(live) => {
@@ -2257,7 +2454,9 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         .ok()
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
-    let (session_quota, mut session_error) = if agent.harness == "claude-code" {
+    let (session_quota, mut session_error) = if agent.state == "archived" {
+        (None, None)
+    } else if agent.harness == "claude-code" {
         let (_, persisted_err) =
             anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
         (
@@ -2267,7 +2466,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     } else {
         anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
     };
-    if session_error.is_none() && agent.harness == "codex" {
+    if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
         session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
     }
     let (
@@ -2588,6 +2787,7 @@ async fn archive_agent_route(
 pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
+    crate::sylphx::release_persisted_sandbox_lease(&config_dir);
     let seat_ids = detect_seat_ids(&config_dir);
     for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);

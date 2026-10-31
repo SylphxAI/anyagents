@@ -1381,14 +1381,29 @@ fn resolve_agy_http_port_from_proc(pid: u32, csrf_token: &str) -> Option<u16> {
             }
         }
     }
-    if inodes.is_empty() {
+    let process_uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|st| {
+            st.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(str::to_string)
+        });
+    if inodes.is_empty() && process_uid.is_none() {
         return None;
     }
     let tcp_text = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).ok()?;
     let mut candidate_ports = Vec::new();
     for line in tcp_text.lines() {
         let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() > 9 && parts[3] == "0A" && inodes.contains(parts[9]) {
+        let matched = if !inodes.is_empty() {
+            parts.len() > 9 && parts[3] == "0A" && inodes.contains(parts[9])
+        } else if let Some(ref uid) = process_uid {
+            parts.len() > 9 && parts[3] == "0A" && parts[7] == uid
+        } else {
+            false
+        };
+        if matched {
             if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
                 && ip_hex == "0100007F"
                 && let Ok(port) = u16::from_str_radix(port_hex, 16)

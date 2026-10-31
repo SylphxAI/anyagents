@@ -868,6 +868,19 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
     };
     let now = anyagents_core::now_ms();
     for view in views.iter_mut() {
+        if view.state == "archived" {
+            if view.harness == "sylphx" {
+                view.install = "installed".to_string();
+                if view
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("unknown harness: sylphx"))
+                {
+                    view.last_error = None;
+                }
+            }
+            continue;
+        }
         let Ok(id) = AgentId::parse(&view.id) else {
             continue;
         };
