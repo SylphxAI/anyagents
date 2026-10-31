@@ -73,6 +73,9 @@ impl VendorHarness {
 fn adapter_config(config_dir: &Path, harness: &str) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config_dir.join("adapter.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("mode").and_then(|v| v.as_str()) == Some("sylphx-native") {
+        return None;
+    }
     let named = value.get("harness").and_then(|item| item.as_str())?;
     (named == harness).then(|| config_dir.join("adapter.json"))
 }

@@ -739,7 +739,8 @@ fn main() -> ExitCode {
 
 fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
     if raw == Path::new(".anyagents")
-        && !raw.exists()
+        && (!raw.exists()
+            || (!raw.join("anyagents.sock").exists() && !crate::sandbox::is_isolated_test_env()))
         && let Some(env_dir) = data::data_dir()
     {
         return env_dir;

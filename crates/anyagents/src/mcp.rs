@@ -451,7 +451,7 @@ struct AgentsArgs {
     /// Set `true` to clear the description or role label when `action` is `"describe"` or `"role"`.
     #[serde(default)]
     clear: Option<bool>,
-    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
+    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`sylphx`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
     #[serde(default)]
     harness: Option<String>,
     /// Optional model override when `action` is `"spawn"`, `"create"`, or `"harness"`.

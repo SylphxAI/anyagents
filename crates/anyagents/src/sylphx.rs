@@ -303,6 +303,10 @@ pub fn run_device_flow_login(
 
 /// Writes the Sylphx credentials to `.config/sylphx/credentials.json`,
 /// `.config/opencode/sylphx.key`, and `.config/desk/sylphx-ai/key` under `base_dir`.
+///
+/// Preserves any existing project-environment gateway key (`sk-sx-...`) in
+/// `.config/opencode/sylphx.key` and `.config/desk/sylphx-ai/key` when `creds.api_key`
+/// is an org-wide device flow key (`sylphx_sk_...`).
 pub fn save_sylphx_credentials(
     base_dir: &Path,
     creds: &SylphxCredentials,
@@ -315,12 +319,27 @@ pub fn save_sylphx_credentials(
 
     let key_trimmed = creds.api_key.trim();
     if !key_trimmed.is_empty() {
+        let fallback_gw_key = if key_trimmed.starts_with("sylphx_sk_") {
+            crate::sandbox::host_home_dir()
+                .and_then(|h| read_sylphx_gateway_key_from_dir(&h))
+                .filter(|k| k.starts_with("sk-sx-"))
+                .unwrap_or_else(|| key_trimmed.to_string())
+        } else {
+            key_trimmed.to_string()
+        };
         for rel in [".config/opencode/sylphx.key", ".config/desk/sylphx-ai/key"] {
             let p = base_dir.join(rel);
+            let existing_is_project_key = std::fs::read_to_string(&p)
+                .ok()
+                .map(|s| s.trim().starts_with("sk-sx-"))
+                .unwrap_or(false);
+            if existing_is_project_key && key_trimmed.starts_with("sylphx_sk_") {
+                continue;
+            }
             if let Some(parent) = p.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_secret_file(&p, &format!("{key_trimmed}\n"))?;
+            write_secret_file(&p, &format!("{fallback_gw_key}\n"))?;
         }
     }
     Ok(())
@@ -336,8 +355,9 @@ fn write_secret_file(path: &Path, content: &str) -> Result<(), std::io::Error> {
     Ok(())
 }
 
-/// Writes `<config_dir>/sylphx-agent.json` (and keeps `.config/opencode/opencode.json`
-/// in sync) for an agent running on `--harness sylphx`.
+/// Writes `<config_dir>/sylphx-agent.json`, `<config_dir>/adapter.json`
+/// (`"mode": "sylphx-native"`), and keeps `.config/opencode/opencode.json`
+/// in sync for an agent running on `--harness sylphx`.
 pub fn write_sylphx_config(
     config_dir: &Path,
     model: Option<&str>,
@@ -386,11 +406,25 @@ pub fn write_sylphx_config(
     let text = serde_json::to_string_pretty(&doc)
         .map_err(|e| anyagents_core::Error::Message(e.to_string()))?;
     std::fs::write(config_dir.join("sylphx-agent.json"), format!("{text}\n"))?;
+
+    let adapter_doc = json!({
+        "harness": "sylphx",
+        "mode": "sylphx-native",
+        "config_dir": config_dir.display().to_string(),
+        "model": resolved_model,
+        "mcp_command": mcp_command.display().to_string(),
+        "mcp_args": mcp_args,
+    });
+    if let Ok(adapter_text) = serde_json::to_string_pretty(&adapter_doc) {
+        let _ = std::fs::write(config_dir.join("adapter.json"), format!("{adapter_text}\n"));
+    }
+
     let _ = crate::opencode_config::write(config_dir, Some(resolved_model), mcp_command, mcp_args);
     Ok(())
 }
 
-/// Resolves the Sylphx API key from environment, agent config directory, or host home.
+/// Resolves the Sylphx Cloud Platform API key (`https://api.sylphx.com/v1/...`),
+/// prioritizing `.config/sylphx/credentials.json` (`sylphx_sk_...`).
 pub fn resolve_sylphx_api_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
     for (k, v) in env {
         if (k == "SYLPHX_API_KEY" || k == "SYLPHX_AI_KEY") && !v.trim().is_empty() {
@@ -407,10 +441,76 @@ pub fn resolve_sylphx_api_key(config_dir: &Path, env: &[(String, String)]) -> Op
     if let Some(key) = read_sylphx_key_from_dir(config_dir) {
         return Some(key);
     }
+    if let Some(data_dir) = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        && let Some(key) = read_sylphx_key_from_dir(&data_dir.join("profiles/sylphx/default"))
+    {
+        return Some(key);
+    }
     if let Some(home) = crate::sandbox::host_home_dir()
         && let Some(key) = read_sylphx_key_from_dir(&home)
     {
         return Some(key);
+    }
+    None
+}
+
+/// Resolves the Sylphx AI Gateway key (`https://api.models.sylphx.ai/v1/chat/completions`),
+/// prioritizing project-environment keys (`sk-sx-...` in `.config/desk/sylphx-ai/key` or
+/// `.config/opencode/sylphx.key`) before falling back to `.config/sylphx/credentials.json`.
+pub fn resolve_sylphx_gateway_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
+    for (k, v) in env {
+        if (k == "SYLPHX_AI_KEY" || k == "SYLPHX_API_KEY") && !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    for k in ["SYLPHX_AI_KEY", "SYLPHX_API_KEY"] {
+        if let Ok(v) = std::env::var(k)
+            && !v.trim().is_empty()
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    let mut candidate_dirs = vec![config_dir.to_path_buf()];
+    if let Some(data_dir) = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        candidate_dirs.push(data_dir.join("profiles/sylphx/default"));
+    }
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        candidate_dirs.push(home);
+    }
+    for dir in &candidate_dirs {
+        if let Some(k) = read_sylphx_gateway_key_from_dir(dir)
+            && k.starts_with("sk-sx-")
+        {
+            return Some(k);
+        }
+    }
+    for dir in &candidate_dirs {
+        if let Some(k) = read_sylphx_gateway_key_from_dir(dir) {
+            return Some(k);
+        }
+    }
+    resolve_sylphx_api_key(config_dir, env)
+}
+
+pub fn read_sylphx_gateway_key_from_dir(base: &Path) -> Option<String> {
+    for rel in [
+        ".config/desk/sylphx-ai/key",
+        ".config/opencode/sylphx.key",
+        "sylphx.key",
+    ] {
+        if let Ok(raw) = std::fs::read_to_string(base.join(rel)) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
     }
     None
 }
@@ -1061,7 +1161,7 @@ fn run_native_gateway_turn(
     mcp_args: &[String],
     initial_user_message: &str,
 ) -> Result<TurnUsage, String> {
-    let api_key = resolve_sylphx_api_key(config_dir, env).ok_or_else(|| {
+    let api_key = resolve_sylphx_gateway_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
     })?;
     let gateway_base = env
@@ -1235,6 +1335,251 @@ fn run_native_gateway_turn(
     })
 }
 
+/// Runs `SylphxHarness` as a stdio stream adapter (`anyagents-harness harness <config>`)
+/// when launched by an older `anyagents serve` process via `<config_dir>/adapter.json`.
+pub fn run_stdio_adapter(
+    config_path: &Path,
+    config_val: &Value,
+) -> Result<(), anyagents_core::Error> {
+    let config_dir = config_val
+        .get("config_dir")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| config_path.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."));
+    let work_dir = std::env::current_dir().unwrap_or_else(|_| config_dir.clone());
+    let model = config_val
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
+        });
+    let mcp_command = config_val
+        .get("mcp_command")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| {
+                    v.pointer("/mcpServers/anyagents/command")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from)
+                })
+        })
+        .unwrap_or_else(|| {
+            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"))
+        });
+    let mcp_args: Vec<String> = config_val
+        .get("mcp_args")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| {
+                    v.pointer("/mcpServers/anyagents/args")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|x| x.as_str().map(str::to_string))
+                                .collect()
+                        })
+                })
+        })
+        .unwrap_or_default();
+
+    let env: Vec<(String, String)> = std::env::vars().collect();
+    let session_id = std::fs::read_to_string(config_dir.join("sylphx-session-id"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| format!("sylphx_ses_{}", anyagents_core::now_ms()));
+    let _ = std::fs::write(
+        config_dir.join("sylphx-session-id"),
+        format!("{session_id}\n"),
+    );
+
+    let state = Arc::new(Mutex::new(SharedState {
+        session_id: Some(session_id.clone()),
+        ..SharedState::default()
+    }));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let steered_in_turn = Arc::new(Mutex::new(0usize));
+
+    let stdin = std::io::stdin();
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let kind = msg.get("type").and_then(Value::as_str).unwrap_or("");
+        if kind == "cancel" || kind == "interrupt" {
+            cancel_flag.store(true, Ordering::SeqCst);
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.steer_queue.clear();
+            g.in_turn = false;
+            continue;
+        }
+        if kind != "user" && kind != "prompt" {
+            continue;
+        }
+        let user_text = msg
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if user_text.trim().is_empty() {
+            continue;
+        }
+
+        let already_in_turn = {
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            if g.in_turn {
+                g.steer_queue.push_back(user_text.clone());
+                g.last_activity = Some(Instant::now());
+                true
+            } else {
+                g.in_turn = true;
+                g.last_activity = Some(Instant::now());
+                false
+            }
+        };
+
+        if already_in_turn {
+            let mut sc = steered_in_turn.lock().unwrap_or_else(PoisonError::into_inner);
+            *sc += 1;
+            continue;
+        }
+
+        cancel_flag.store(false, Ordering::SeqCst);
+        *steered_in_turn.lock().unwrap_or_else(PoisonError::into_inner) = 0;
+
+        let state_cl = Arc::clone(&state);
+        let cancel_cl = Arc::clone(&cancel_flag);
+        let steered_cl = Arc::clone(&steered_in_turn);
+        let cfg_cl = config_dir.clone();
+        let work_cl = work_dir.clone();
+        let model_cl = model.clone();
+        let env_cl = env.clone();
+        let mcp_cmd_cl = mcp_command.clone();
+        let mcp_args_cl = mcp_args.clone();
+        let sess_cl = session_id.clone();
+
+        std::thread::spawn(move || {
+            let cloud_env = env_cl
+                .iter()
+                .find(|(k, v)| k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty())
+                .map(|(_, v)| v.trim().to_string());
+            let outcome = if let Some(env_slug) = cloud_env {
+                run_cloud_session_turn(
+                    &state_cl,
+                    &cancel_cl,
+                    &cfg_cl,
+                    &work_cl,
+                    model_cl.as_deref(),
+                    &env_cl,
+                    &mcp_cmd_cl,
+                    &mcp_args_cl,
+                    &env_slug,
+                    &user_text,
+                )
+            } else {
+                run_native_gateway_turn(
+                    &state_cl,
+                    &cancel_cl,
+                    &cfg_cl,
+                    &work_cl,
+                    model_cl.as_deref(),
+                    &env_cl,
+                    &mcp_cmd_cl,
+                    &mcp_args_cl,
+                    &user_text,
+                )
+            };
+
+            let extra_followups = {
+                let mut g = state_cl.lock().unwrap_or_else(PoisonError::into_inner);
+                g.in_turn = false;
+                g.last_activity = Some(Instant::now());
+                let mut sc = steered_cl.lock().unwrap_or_else(PoisonError::into_inner);
+                let count = *sc;
+                *sc = 0;
+                count
+            };
+
+            let mut out = std::io::stdout().lock();
+            match outcome {
+                Ok(usage) => {
+                    let _ = std::fs::remove_file(cfg_cl.join(".anyagents-last-error.json"));
+                    let done_evt = json!({
+                        "type": "done",
+                        "session_id": sess_cl,
+                        "usage": {
+                            "input_tokens": usage.input_tokens,
+                            "output_tokens": usage.output_tokens,
+                        }
+                    });
+                    let _ = writeln!(out, "{done_evt}");
+                    if extra_followups > 0 {
+                        let followup_done = json!({
+                            "type": "done",
+                            "session_id": sess_cl,
+                            "usage": {
+                                "input_tokens": 0,
+                                "output_tokens": 0,
+                            }
+                        });
+                        let _ = writeln!(out, "{followup_done}");
+                    }
+                    let _ = out.flush();
+                }
+                Err(err_msg) => {
+                    persist_turn_error(&cfg_cl, &err_msg);
+                    let err_evt = json!({
+                        "type": "done",
+                        "session_id": sess_cl,
+                        "error": err_msg,
+                        "usage": {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                        }
+                    });
+                    let _ = writeln!(out, "{err_evt}");
+                    if extra_followups > 0 {
+                        let _ = writeln!(out, "{err_evt}");
+                    }
+                    let _ = out.flush();
+                }
+            }
+        });
+    }
+
+    for _ in 0..2400 {
+        let busy = state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .in_turn;
+        if !busy {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    Ok(())
+}
+
 fn drain_steered_messages(
     state: &Arc<Mutex<SharedState>>,
     transcript_path: &Path,
@@ -1346,20 +1691,24 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agents",
-                "description": "List, inspect, spawn, configure, wake, archive, pause, or delete agents and sub-agents (`list`, `get`, `spawn`, `configure`, `subagent_defaults`, `wake`, `archive`, `pause`, `delete`).",
+                "description": "List, inspect, spawn, configure, wake, archive, pause, or delete agents and sub-agents (`list`, `inspect`, `get`, `spawn`, `create`, `describe`, `steer`, `wake`, `archive`, `pause`, `delete`, `rename`, `role`, `harness`, `models`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "description": "`list`, `get`, `spawn`, `configure`, `subagent_defaults`, `wake`, `archive`, `pause`, or `delete`." },
-                        "name": { "type": "string", "description": "Agent name." },
+                        "action": { "type": "string", "description": "`list`, `inspect`, `get`, `spawn`, `create`, `describe`, `steer`, `wake`, `archive`, `pause`, `delete`, `rename`, `role`, `harness`, or `models`." },
+                        "name": { "type": "string", "description": "Target agent or sub-agent name." },
+                        "agent": { "type": "string", "description": "Alias for `name`." },
+                        "parent": { "type": "string", "description": "Parent filter (`self`, `subagents`, `root`, or agent name)." },
+                        "state": { "type": "string", "description": "State filter (`running`, `working`, `paused`, `archived`, `all`)." },
                         "role": { "type": "string", "description": "Short 2-5 word role title when spawning." },
-                        "harness": { "type": "string", "description": "Harness (`sylphx`, `codex`, `claude-code`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`)." },
+                        "harness": { "type": "string", "description": "Harness (`sylphx`, `codex`, `claude-code`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `inherit`)." },
                         "model": { "type": "string", "description": "Model ID." },
                         "profile": { "type": "string", "description": "Provider profile (`<provider>/<profile>`)." },
                         "repo": { "type": "string", "description": "Repository (`<org>/<repo>`, local path, or `inherit`)." },
                         "branch": { "type": "string" },
                         "base": { "type": "string" },
                         "workdir": { "type": "string" },
+                        "description": { "type": "string", "description": "Role/responsibility description or standing instructions." },
                         "instructions": { "type": "string" },
                         "prompt": { "type": "string", "description": "Initial task prompt delivered to the spawned or woken agent." }
                     }
@@ -1512,7 +1861,7 @@ fn execute_sylphx_tool(
 ) -> String {
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
     match normalized {
-        "agents" | "send" | "conversation" | "groups" | "schedule" | "browser" => {
+        "agents" | "subagents" | "send" | "conversation" | "groups" | "schedule" | "browser" => {
             call_anyagents_mcp_tool(mcp_command, mcp_args, env, normalized, args)
         }
         "bash" | "shell" => {

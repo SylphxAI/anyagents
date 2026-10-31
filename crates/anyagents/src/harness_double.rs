@@ -37,6 +37,9 @@ pub fn run(config: &std::path::Path) -> Result<(), Error> {
             return Err(Error::Message(err.to_string()));
         }
     };
+    if value.get("mode").and_then(serde_json::Value::as_str) == Some("sylphx-native") {
+        return crate::sylphx::run_stdio_adapter(config, &value);
+    }
     let reply_with = value
         .get("reply_with")
         .and_then(serde_json::Value::as_str)
