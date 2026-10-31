@@ -1379,6 +1379,16 @@ fn run_native_gateway_turn(
             continue;
         }
 
+        if let Some(goal_continuation) = load_active_goal_continuation_prompt(config_dir) {
+            let cont_msg = json!({
+                "role": "user",
+                "content": goal_continuation,
+            });
+            append_transcript_message(&transcript_path, &cont_msg);
+            input_items.push(cont_msg);
+            continue;
+        }
+
         let content_text = assistant_texts.join("\n\n");
         if !sent_any_reply
             && !content_text.trim().is_empty()
@@ -1691,10 +1701,120 @@ fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
         parts.push(agents_md);
     }
     if parts.is_empty() {
-        "You are a Sylphx Agent running inside AnyAgents. Always use the `send` tool to reply to the sender of an incoming `<message>`.".to_string()
-    } else {
-        parts.join("\n\n")
+        parts.push(
+            "You are a Sylphx Agent running inside AnyAgents. Always use the `send` tool to reply to the sender of an incoming `<message>`.".to_string(),
+        );
     }
+    let skills_idx = discover_skills_index(work_dir);
+    if !skills_idx.is_empty() {
+        parts.push(skills_idx);
+    }
+    if let Ok(goal_raw) = std::fs::read_to_string(config_dir.join("sylphx-goal.json"))
+        && let Ok(goal_val) = serde_json::from_str::<Value>(&goal_raw)
+        && goal_val.get("state").and_then(Value::as_str) == Some("active")
+    {
+        parts.push(format!(
+            "<active_goal>\n{}\n</active_goal>",
+            serde_json::to_string_pretty(&goal_val).unwrap_or_default()
+        ));
+    }
+    parts.join("\n\n")
+}
+
+fn discover_skills_Dirs(work_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let work_skills = work_dir.join(".agents/skills");
+    if work_skills.is_dir() {
+        dirs.push(work_skills);
+    }
+    let owner_skills = PathBuf::from("/home/kyle/workspace/github.com/SylphxAI/owner/.agents/skills");
+    if owner_skills.is_dir() && !dirs.contains(&owner_skills) {
+        dirs.push(owner_skills);
+    }
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        for rel in [".agents/skills", ".gemini/antigravity-cli/builtin/skills"] {
+            let p = home.join(rel);
+            if p.is_dir() && !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs
+}
+
+fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
+    let trimmed = content.trim_start();
+    if !trimmed.starts_with("---") {
+        return None;
+    }
+    let rest = &trimmed[3..];
+    let end = rest.find("\n---")?;
+    let fm = &rest[..end];
+    let mut name = None;
+    let mut desc = None;
+    for line in fm.lines() {
+        if let Some(v) = line.strip_prefix("name:") {
+            name = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+        } else if let Some(v) = line.strip_prefix("description:") {
+            desc = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+        }
+    }
+    Some((name?, desc.unwrap_or_default()))
+}
+
+fn discover_skills_index(work_dir: &Path) -> String {
+    let mut seen = std::collections::BTreeMap::new();
+    for dir in discover_skills_Dirs(work_dir) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let skill_md = entry.path().join("SKILL.md");
+            if let Ok(raw) = std::fs::read_to_string(&skill_md)
+                && let Some((name, desc)) = parse_skill_frontmatter(&raw)
+            {
+                seen.entry(name).or_insert(desc);
+            }
+        }
+    }
+    if seen.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "<skills>\nAvailable skills (call `activate_skill` with `name` to load full `SKILL.md` instructions and `references/*.md`):\n",
+    );
+    for (name, desc) in seen {
+        out.push_str(&format!("- {name}: {desc}\n"));
+    }
+    out.push_str("</skills>");
+    out
+}
+
+fn load_active_goal_continuation_prompt(config_dir: &Path) -> Option<String> {
+    let goal_path = config_dir.join("sylphx-goal.json");
+    let raw = std::fs::read_to_string(&goal_path).ok()?;
+    let mut val: Value = serde_json::from_str(&raw).ok()?;
+    if val.get("state").and_then(Value::as_str) != Some("active") {
+        return None;
+    }
+    let continuations = val
+        .get("auto_continuations")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    if continuations >= 12 {
+        return None;
+    }
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("auto_continuations".to_string(), json!(continuations + 1));
+    }
+    let _ = std::fs::write(
+        &goal_path,
+        serde_json::to_string_pretty(&val).unwrap_or_default(),
+    );
+    Some(format!(
+        "[Session Goal state] {}\nContinue executing toward the active Goal's acceptance criteria, or call `goal` with `action: \"complete\"` (or `\"pause\"` / `\"cancel\"`) once verified.",
+        serde_json::to_string(&val).unwrap_or_default()
+    ))
 }
 
 /// Loads persisted transcript items for `/v1/responses` (`input`), automatically
@@ -2031,6 +2151,96 @@ fn build_tool_definitions() -> Vec<Value> {
                 }
             }
         }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "apply_patch",
+                "description": "Apply a unified diff patch (`git apply` / unified diff format) to the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "patch": { "type": "string", "description": "Unified diff patch text." }
+                    },
+                    "required": ["patch"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "grep",
+                "description": "Fast regex or literal search across the workspace (`rg` / ripgrep).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Regex or literal pattern to search for." },
+                        "path": { "type": "string", "description": "Optional directory or file path (defaults to `.`)." },
+                        "glob": { "type": "string", "description": "Optional file glob filter (e.g. `*.rs`)." }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "description": "Find files matching a glob pattern in the workspace.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "pattern": { "type": "string", "description": "Glob pattern (e.g. `**/*.rs`)." },
+                        "path": { "type": "string", "description": "Optional base directory." }
+                    },
+                    "required": ["pattern"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List entries in a workspace directory.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string", "description": "Directory path (defaults to `.`)." }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "activate_skill",
+                "description": "Load the full `SKILL.md` instructions (and list or read `references/*.md`) for a named skill from `.agents/skills`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Skill name (e.g. `deliver-and-verify`, `self-challenge`, `prove-it`, `clear-writing`, `author-item`, `unblock`, `swarm-fuse`, `refactor`)." },
+                        "reference": { "type": "string", "description": "Optional reference filename inside `references/` (e.g. `architecture.md`)." }
+                    },
+                    "required": ["name"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "goal",
+                "description": "Manage the session's durable Goal (`create`, `update`, `complete`, `pause`, `cancel`, `status`). While a Goal is `active`, the harness automatically continues turns until the Goal's acceptance criteria are verified and `complete` is called.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "description": "`create`, `update`, `complete`, `pause`, `cancel`, or `status`." },
+                        "title": { "type": "string", "description": "Goal title." },
+                        "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "Observable acceptance test cases." },
+                        "progress": { "type": "string", "description": "Progress notes or verification evidence." }
+                    },
+                    "required": ["action"]
+                }
+            }
+        }),
     ]
 }
 
@@ -2049,6 +2259,202 @@ fn execute_sylphx_tool(
         "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
         | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
             call_anyagents_mcp_tool(mcp_command, mcp_args, env, normalized, args)
+        }
+        "activate_skill" | "skill" => {
+            let Some(skill_name) = args.get("name").and_then(Value::as_str).map(str::trim) else {
+                return "error: missing `name`".to_string();
+            };
+            let ref_name = args
+                .get("reference")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            for dir in discover_skills_Dirs(work_dir) {
+                let skill_dir = dir.join(skill_name);
+                let skill_md = skill_dir.join("SKILL.md");
+                if skill_md.is_file() {
+                    if let Some(r) = ref_name {
+                        let ref_file = if r.ends_with(".md") {
+                            skill_dir.join("references").join(r)
+                        } else {
+                            skill_dir.join("references").join(format!("{r}.md"))
+                        };
+                        return std::fs::read_to_string(&ref_file)
+                            .unwrap_or_else(|e| format!("error reading {}: {e}", ref_file.display()));
+                    }
+                    let body = std::fs::read_to_string(&skill_md).unwrap_or_default();
+                    let mut refs = Vec::new();
+                    if let Ok(entries) = std::fs::read_dir(skill_dir.join("references")) {
+                        for e in entries.flatten() {
+                            if let Some(n) = e.file_name().to_str() {
+                                refs.push(n.to_string());
+                            }
+                        }
+                    }
+                    refs.sort();
+                    if refs.is_empty() {
+                        return body;
+                    }
+                    return format!(
+                        "{body}\n\nAvailable references (call `activate_skill` with `name: \"{skill_name}\"` and `reference`): {}",
+                        refs.join(", ")
+                    );
+                }
+            }
+            format!("error: skill `{skill_name}` not found")
+        }
+        "goal" | "create_goal" | "update_goal" | "complete_goal" | "pause_goal" | "cancel_goal"
+        | "get_goal" => {
+            let action = match normalized {
+                "create_goal" => "create",
+                "update_goal" => "update",
+                "complete_goal" => "complete",
+                "pause_goal" => "pause",
+                "cancel_goal" => "cancel",
+                "get_goal" => "status",
+                _ => args
+                    .get("action")
+                    .and_then(Value::as_str)
+                    .unwrap_or("status")
+                    .trim(),
+            };
+            let goal_path = config_dir.join("sylphx-goal.json");
+            let mut current = std::fs::read_to_string(&goal_path)
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .unwrap_or_else(|| json!({ "state": "none" }));
+            match action {
+                "create" | "set" => {
+                    let title = args.get("title").and_then(Value::as_str).unwrap_or("Goal");
+                    let criteria = args
+                        .get("acceptance_criteria")
+                        .cloned()
+                        .unwrap_or_else(|| json!([]));
+                    current = json!({
+                        "id": format!("goal_{}", anyagents_core::now_ms()),
+                        "title": title,
+                        "acceptance_criteria": criteria,
+                        "state": "active",
+                        "progress": args.get("progress").and_then(Value::as_str).unwrap_or(""),
+                        "auto_continuations": 0,
+                        "updated_at_ms": anyagents_core::now_ms(),
+                    });
+                    let _ = std::fs::write(
+                        &goal_path,
+                        serde_json::to_string_pretty(&current).unwrap_or_default(),
+                    );
+                }
+                "update" => {
+                    if let Some(obj) = current.as_object_mut() {
+                        if let Some(t) = args.get("title").and_then(Value::as_str) {
+                            obj.insert("title".to_string(), json!(t));
+                        }
+                        if let Some(c) = args.get("acceptance_criteria") {
+                            obj.insert("acceptance_criteria".to_string(), c.clone());
+                        }
+                        if let Some(p) = args.get("progress").and_then(Value::as_str) {
+                            obj.insert("progress".to_string(), json!(p));
+                        }
+                        obj.insert("auto_continuations".to_string(), json!(0));
+                        obj.insert("updated_at_ms".to_string(), json!(anyagents_core::now_ms()));
+                    }
+                    let _ = std::fs::write(
+                        &goal_path,
+                        serde_json::to_string_pretty(&current).unwrap_or_default(),
+                    );
+                }
+                "complete" | "pause" | "cancel" => {
+                    let new_state = match action {
+                        "complete" => "completed",
+                        "pause" => "paused",
+                        _ => "cancelled",
+                    };
+                    if let Some(obj) = current.as_object_mut() {
+                        obj.insert("state".to_string(), json!(new_state));
+                        if let Some(p) = args.get("progress").and_then(Value::as_str) {
+                            obj.insert("progress".to_string(), json!(p));
+                        }
+                        obj.insert("updated_at_ms".to_string(), json!(anyagents_core::now_ms()));
+                    }
+                    let _ = std::fs::write(
+                        &goal_path,
+                        serde_json::to_string_pretty(&current).unwrap_or_default(),
+                    );
+                }
+                _ => {}
+            }
+            serde_json::to_string_pretty(&current).unwrap_or_default()
+        }
+        "apply_patch" => {
+            let Some(patch_str) = args.get("patch").and_then(Value::as_str) else {
+                return "error: missing `patch`".to_string();
+            };
+            let patch_b64 = base64_encode(patch_str.as_bytes());
+            let script = format!("printf '%s' '{patch_b64}' | base64 -d | git apply --whitespace=nowarn -");
+            execute_sylphx_tool(
+                "bash",
+                &json!({ "command": script }),
+                config_dir,
+                work_dir,
+                env,
+                mcp_command,
+                mcp_args,
+            )
+        }
+        "grep" => {
+            let Some(pat) = args.get("pattern").and_then(Value::as_str) else {
+                return "error: missing `pattern`".to_string();
+            };
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let glob_arg = args
+                .get("glob")
+                .and_then(Value::as_str)
+                .map(|g| format!(" --glob '{}'", g.replace('\'', "'\\''")))
+                .unwrap_or_default();
+            let escaped_pat = pat.replace('\'', "'\\''");
+            let escaped_path = path.replace('\'', "'\\''");
+            let script = format!("rg -n --max-count 100{glob_arg} -- '{escaped_pat}' '{escaped_path}' | head -n 200");
+            execute_sylphx_tool(
+                "bash",
+                &json!({ "command": script }),
+                config_dir,
+                work_dir,
+                env,
+                mcp_command,
+                mcp_args,
+            )
+        }
+        "glob" => {
+            let Some(pat) = args.get("pattern").and_then(Value::as_str) else {
+                return "error: missing `pattern`".to_string();
+            };
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let escaped_pat = pat.replace('\'', "'\\''");
+            let escaped_path = path.replace('\'', "'\\''");
+            let script = format!("rg --files -g '{escaped_pat}' '{escaped_path}' | head -n 200");
+            execute_sylphx_tool(
+                "bash",
+                &json!({ "command": script }),
+                config_dir,
+                work_dir,
+                env,
+                mcp_command,
+                mcp_args,
+            )
+        }
+        "list_dir" => {
+            let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            let escaped_path = path.replace('\'', "'\\''");
+            let script = format!("ls -la '{escaped_path}' | head -n 200");
+            execute_sylphx_tool(
+                "bash",
+                &json!({ "command": script }),
+                config_dir,
+                work_dir,
+                env,
+                mcp_command,
+                mcp_args,
+            )
         }
         "sandbox" => {
             let action = args
