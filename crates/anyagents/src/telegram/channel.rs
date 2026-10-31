@@ -244,6 +244,25 @@ fn poll_channel(
         memory.bot = Some(format!("{}:{}", identity.id, identity.username));
         store.set_channel_state(&channel.id, &memory.to_state())?;
     }
+    if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none() {
+        let bot_tag = memory.bot.clone().unwrap_or_default();
+        let group_ids: Vec<i64> = memory
+            .chats
+            .iter()
+            .filter(|c| c.chat_id < 0)
+            .map(|c| c.chat_id)
+            .collect();
+        let mut pruned_any = false;
+        for gid in group_ids {
+            if !bot_tag.is_empty() && !cached_probe_members(&token, gid, &bot_tag) {
+                memory.chats.retain(|l| l.chat_id != gid);
+                pruned_any = true;
+            }
+        }
+        if pruned_any {
+            let _ = store.set_channel_state(&channel.id, &memory.to_state());
+        }
+    }
     if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none()
         && memory.chats.iter().any(|c| c.title.is_none())
     {
@@ -259,7 +278,7 @@ fn poll_channel(
                 method: "getChat".to_string(),
                 body: serde_json::json!({ "chat_id": cid }),
             };
-            let resolved = call_api(&token, &call, 5, Some(&channel.id))
+            let Some(resolved) = call_api(&token, &call, 5, Some(&channel.id))
                 .ok()
                 .and_then(|resp| serde_json::from_str::<serde_json::Value>(&resp).ok())
                 .and_then(|val| {
@@ -305,7 +324,13 @@ fn poll_channel(
                         });
                     Some((title.unwrap_or_else(|| "-".to_string()), ct))
                 })
-                .unwrap_or_else(|| ("-".to_string(), None));
+            else {
+                if cid < 0 {
+                    memory.chats.retain(|l| l.chat_id != cid);
+                    updated_titles = true;
+                }
+                continue;
+            };
             for link in memory.chats.iter_mut().filter(|l| l.chat_id == cid) {
                 link.title = Some(resolved.0.clone());
                 if link.chat_type.is_none()
@@ -348,6 +373,15 @@ fn ingest_updates(
     body: &str,
     method: &str,
 ) -> Result<(), anyagents_core::Error> {
+    if let Ok(channels) = store.list_channels()
+        && let Some(fresh) = channels.into_iter().find(|c| c.id == channel.id)
+    {
+        let fresh_mem = Memory::from_state(&fresh.state);
+        memory.chats = fresh_mem.chats;
+        if fresh_mem.bot.is_some() {
+            memory.bot = fresh_mem.bot;
+        }
+    }
     let mut poll = Poll::resume(memory.offset);
     let before = poll.offset;
     let routed = poll.route("bot", agent_id.as_str(), body).map_err(|_| {
@@ -368,28 +402,61 @@ fn ingest_updates(
         // This bot answers in the chat its update came from, so a post it makes
         // there reaches the other agents on that chat.
         if let Routed::ToAgent { inbound, .. } = &mut one {
+            if inbound.text.starts_with("[Member removed/left group:")
+                || inbound.text.starts_with("[Member joined group:")
+            {
+                invalidate_membership_cache(inbound.chat_id);
+            }
+            if inbound.text.starts_with("[Member removed/left group:") {
+                let lower_text = inbound.text.to_ascii_lowercase();
+                let removed_own_bot = own_bots.iter().any(|(bot_id, bot_user)| {
+                    (!bot_user.is_empty() && lower_text.contains(&format!("@{bot_user}")))
+                        || bot_id.is_some_and(|id| lower_text.contains(&id.to_string()))
+                });
+                if removed_own_bot {
+                    let before_len = memory.chats.len();
+                    if let Some(my_bot) = memory.bot.as_deref()
+                        && let Some((_, my_user)) = my_bot.split_once(':')
+                        && lower_text.contains(&format!("@{}", my_user.to_ascii_lowercase()))
+                    {
+                        memory.chats.retain(|link| link.chat_id != inbound.chat_id);
+                        if memory.chats.len() != before_len {
+                            grew = true;
+                        }
+                    }
+                    detach_removed_own_bots_from_chat(store, inbound.chat_id, &lower_text);
+                    continue;
+                }
+            }
             let known = memory
                 .chats
                 .iter()
                 .any(|link| link.agent == agent_id.as_str() && link.chat_id == inbound.chat_id);
             let old_title = memory.title_of(inbound.chat_id).map(str::to_string);
-            memory.attach_typed_titled(
-                agent_id.as_str(),
-                inbound.chat_id,
-                Some(&inbound.chat_type),
-                inbound.chat_title.as_deref(),
-            );
-            if !known && probe_members(token, inbound.chat_id, memory.bot.as_deref().unwrap_or(""))
-            {
-                // Confirmed by Telegram rather than inferred from a message.
+            let is_group = inbound.chat_type == "group" || inbound.chat_type == "supergroup";
+            let is_live = std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
+            if known || !is_group || !is_live {
                 memory.attach_typed_titled(
                     agent_id.as_str(),
                     inbound.chat_id,
                     Some(&inbound.chat_type),
                     inbound.chat_title.as_deref(),
                 );
+            } else if cached_probe_members(
+                token,
+                inbound.chat_id,
+                memory.bot.as_deref().unwrap_or(""),
+            ) {
+                memory.attach_typed_titled(
+                    agent_id.as_str(),
+                    inbound.chat_id,
+                    Some(&inbound.chat_type),
+                    inbound.chat_title.as_deref(),
+                );
+            } else {
+                continue;
             }
-            if !known && (inbound.chat_type == "group" || inbound.chat_type == "supergroup") {
+            if is_group {
                 discover_peer_bots_in_chat(
                     store,
                     token,
@@ -429,6 +496,7 @@ fn ingest_updates(
             ..
         } = &one
         {
+            invalidate_membership_cache(*chat_id);
             if *joined {
                 memory.attach_typed(agent_id.as_str(), *chat_id, chat_type.as_deref());
                 let _ = store.receive(
@@ -554,6 +622,34 @@ fn is_own_bot(
     })
 }
 
+fn detach_removed_own_bots_from_chat(store: &Store, chat_id: i64, lower_removal_text: &str) {
+    let Ok(channels) = store.list_channels() else {
+        return;
+    };
+    for ch in channels {
+        if ch.kind != "telegram" {
+            continue;
+        }
+        let mut mem = Memory::from_state(&ch.state);
+        let matched = mem
+            .bot
+            .as_deref()
+            .and_then(|b| b.split_once(':'))
+            .is_some_and(|(id_s, u)| {
+                let u_low = u.trim().trim_start_matches('@').to_ascii_lowercase();
+                (!u_low.is_empty() && lower_removal_text.contains(&format!("@{u_low}")))
+                    || (!id_s.trim().is_empty() && lower_removal_text.contains(id_s.trim()))
+            });
+        if matched {
+            let before = mem.chats.len();
+            mem.chats.retain(|l| l.chat_id != chat_id);
+            if mem.chats.len() != before {
+                let _ = store.set_channel_state(&ch.id, &mem.to_state());
+            }
+        }
+    }
+}
+
 fn download_inbound_media(
     data_dir: &std::path::Path,
     token: &str,
@@ -657,15 +753,53 @@ fn download_inbound_media(
     notes
 }
 
-fn probed_chat_bots() -> &'static std::sync::Mutex<std::collections::HashSet<(i64, String)>> {
-    static PROBED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<(i64, String)>>> =
-        std::sync::OnceLock::new();
-    PROBED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+const MEMBERSHIP_CACHE_TTL: Duration = Duration::from_secs(120);
+
+#[allow(clippy::type_complexity)]
+fn live_membership_cache()
+-> &'static std::sync::Mutex<std::collections::HashMap<(i64, String), (bool, std::time::Instant)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<(i64, String), (bool, std::time::Instant)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Passively check whether any other configured Telegram bot is also a member
-/// of `chat_id`, and attach it so internal group relay reaches all member bots
-/// even before they receive a direct mention.
+fn invalidate_membership_cache(chat_id: i64) {
+    if let Ok(mut guard) = live_membership_cache().lock() {
+        guard.retain(|(cid, _), _| *cid != chat_id);
+    }
+}
+
+fn cached_probe_members(token: &str, chat_id: i64, bot: &str) -> bool {
+    if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some() {
+        return probe_members(token, chat_id, bot);
+    }
+    let Some(bot_id) = bot
+        .split(':')
+        .next()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    let key = (chat_id, bot_id.to_string());
+    if let Ok(guard) = live_membership_cache().lock()
+        && let Some((is_in, checked_at)) = guard.get(&key)
+        && checked_at.elapsed() < MEMBERSHIP_CACHE_TTL
+    {
+        return *is_in;
+    }
+    let is_in = probe_members(token, chat_id, bot);
+    if let Ok(mut guard) = live_membership_cache().lock() {
+        guard.insert(key, (is_in, std::time::Instant::now()));
+    }
+    is_in
+}
+
+/// Reconcile configured Telegram bots' membership in `chat_id` against
+/// Telegram's authoritative `getChatMember` (backed by the event-invalidated
+/// read-through TTL cache): attach bots that are present and prune bots that
+/// have been removed or left.
 fn discover_peer_bots_in_chat(
     store: &Store,
     token: &str,
@@ -673,6 +807,7 @@ fn discover_peer_bots_in_chat(
     chat_id: i64,
     chat_type: &str,
 ) {
+    let is_live = std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
     let Ok(channels) = store.list_channels() else {
         return;
     };
@@ -684,21 +819,20 @@ fn discover_peer_bots_in_chat(
             continue;
         };
         let mut other_mem = Memory::from_state(&other.state);
-        if other_mem.chats.iter().any(|l| l.chat_id == chat_id) {
+        let already_attached = other_mem.chats.iter().any(|l| l.chat_id == chat_id);
+        if !is_live && already_attached {
             continue;
         }
-        if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none() {
-            let key = (chat_id, other.id.to_string());
-            if let Ok(mut guard) = probed_chat_bots().lock()
-                && !guard.insert(key)
-            {
-                continue;
+        let Some(bot) = other_mem.bot.as_deref().map(str::to_string) else {
+            continue;
+        };
+        if cached_probe_members(token, chat_id, &bot) {
+            if !already_attached {
+                other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
+                let _ = store.set_channel_state(&other.id, &other_mem.to_state());
             }
-        }
-        if let Some(bot) = other_mem.bot.as_deref()
-            && probe_members(token, chat_id, bot)
-        {
-            other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
+        } else if is_live && already_attached {
+            other_mem.chats.retain(|l| l.chat_id != chat_id);
             let _ = store.set_channel_state(&other.id, &other_mem.to_state());
         }
     }
@@ -847,10 +981,10 @@ pub(crate) fn outbound_call(
     })
 }
 
-/// Maximum characters per Telegram `sendMessage` chunk before HTML expansion.
-const MAX_TELEGRAM_CHUNK_CHARS: usize = 3800;
+/// Maximum characters per Telegram `sendRichMessage` chunk (Bot API 10.1+ allows up to 32,768 UTF-8 chars).
+const MAX_TELEGRAM_CHUNK_CHARS: usize = 30000;
 
-/// Split a long message into chunks that stay within Telegram's 4096-character limit.
+/// Split a long message into chunks that stay within Telegram's 32,768-character limit.
 fn split_telegram_chunks(text: &str) -> Vec<&str> {
     if text.chars().count() <= MAX_TELEGRAM_CHUNK_CHARS {
         return vec![text];
@@ -935,6 +1069,16 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
                 {
                     agent_to_bot.push((name_lower, bot_username.to_string()));
                 }
+                if let Ok(aliases) = store.agent_aliases(&agent.id) {
+                    for alias in aliases {
+                        let al = alias.to_ascii_lowercase();
+                        if !al.eq_ignore_ascii_case(bot_username)
+                            && !agent_to_bot.iter().any(|(n, _)| n == &al)
+                        {
+                            agent_to_bot.push((al, bot_username.to_string()));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1004,6 +1148,50 @@ fn translate_agent_mentions_for_telegram(store: &Store, text: &str) -> String {
     out
 }
 
+fn format_telegram_bot_display_name(name: &str, role: Option<&str>) -> String {
+    let mut chars = name.chars();
+    let title = match chars.next() {
+        Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+        None => String::new(),
+    };
+    match role.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => format!("{title} · {r}"),
+        None => title,
+    }
+}
+
+/// Synchronizes the attached Telegram bot's display name (`setMyName`) with
+/// `format_telegram_bot_display_name(&agent.name, agent.role.as_deref())` (e.g. `"Plutus · Revenue"`).
+pub fn sync_agent_telegram_bot_name(
+    store: &Store,
+    data_dir: &std::path::Path,
+    agent: &anyagents_core::Agent,
+) {
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+        || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+    {
+        return;
+    }
+    let Ok(channel) = channel_for(store, &agent.name) else {
+        return;
+    };
+    let Some(credential_ref) = channel.credential_ref.as_deref() else {
+        return;
+    };
+    let Ok(token) = token_of(&FileCredentialStore::new(data_dir), credential_ref) else {
+        return;
+    };
+    let raw_name = format_telegram_bot_display_name(&agent.name, agent.role.as_deref());
+    let bot_name: String = raw_name.chars().take(64).collect();
+    let call = BotCall {
+        method: "setMyName".to_string(),
+        body: serde_json::json!({ "name": bot_name }),
+    };
+    let _ = call_api(&token, &call, 10, Some(&channel.id));
+}
+
 /// Post one text through the agent's bot. The token is read for this call only.
 #[allow(clippy::too_many_arguments)]
 pub fn post_text(
@@ -1035,7 +1223,7 @@ pub fn post_text(
         )?;
         let message_id = sent_message_id(&response).map_err(|_| {
             api_error(
-                "sendMessage",
+                &outbound.call.method,
                 Some(&outbound.channel_id),
                 "invalid_response",
                 None,
@@ -2029,9 +2217,10 @@ fn api_error(
 ) -> anyagents_core::Error {
     // BotCall is internal today, but do not make that a redaction dependency.
     let method = match method {
-        "sendMessage" | "sendPhoto" | "sendVideo" | "sendAudio" | "sendVoice" | "sendDocument"
-        | "sendAnimation" | "sendLocation" | "sendVenue" | "sendPoll" | "getFile"
-        | "getUpdates" | "getMe" | "getChatMember" | "setWebhook" | "deleteWebhook" => method,
+        "sendMessage" | "sendRichMessage" | "editMessageText" | "sendPhoto" | "sendVideo"
+        | "sendAudio" | "sendVoice" | "sendDocument" | "sendAnimation" | "sendLocation"
+        | "sendVenue" | "sendPoll" | "getFile" | "getUpdates" | "getMe" | "getChatMember"
+        | "setWebhook" | "deleteWebhook" | "setMyName" => method,
         _ => "unknown",
     };
     anyagents_core::Error::Message(format!(
@@ -2319,7 +2508,7 @@ fn call_api(
             retry_after,
         ));
     }
-    if call.method == "sendMessage"
+    if (call.method == "sendMessage" || call.method == "sendRichMessage")
         && value
             .pointer("/result/message_id")
             .and_then(serde_json::Value::as_i64)
@@ -2401,10 +2590,11 @@ mod tests {
 
         let sent = outbound_call(&store, "bea", 100, "hello", Some(5), Some(3)).unwrap();
         assert_eq!(sent.credential_ref, "channels/bea");
-        assert_eq!(sent.call.method, "sendMessage");
+        assert_eq!(sent.call.method, "sendRichMessage");
         assert_eq!(sent.call.body["chat_id"], 100);
-        assert_eq!(sent.call.body["text"], "hello");
+        assert_eq!(sent.call.body["rich_message"]["markdown"], "hello");
         assert_eq!(sent.call.body["reply_to_message_id"], 5);
+        assert_eq!(sent.call.body["reply_parameters"]["message_id"], 5);
         assert_eq!(sent.call.body["message_thread_id"], 3);
         assert!(!sent.call.body.to_string().contains("token"));
 
@@ -2430,7 +2620,7 @@ mod tests {
         store.attach_channel(&channel.id, &ada.id).unwrap();
         let sent = outbound_call(&store, "ada", 100, "hello", None, None).unwrap();
         assert_eq!(sent.credential_ref, "channels/ada");
-        assert_eq!(sent.call.method, "sendMessage");
+        assert_eq!(sent.call.method, "sendRichMessage");
         // There is no default bot: another agent does not post through it.
         let bea = store
             .create_agent(anyagents_core::NewAgent::new("bea", "codex"))

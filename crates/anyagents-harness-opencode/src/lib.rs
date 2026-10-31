@@ -73,6 +73,7 @@ struct State {
     last_usage_poll: Option<Instant>,
     last_usage_written: usize,
     cached_usage: TurnUsage,
+    quota_reset_at_ms: Option<i64>,
 }
 
 impl OpenCodeHarness {
@@ -481,6 +482,16 @@ impl Harness for OpenCodeHarness {
         if !self.lock().alive {
             return Err(HarnessError::Dead);
         }
+        if let Some(reset_at_ms) = self.lock().quota_reset_at_ms {
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            if reset_at_ms > now_ms {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
+            self.lock().quota_reset_at_ms = None;
+        }
         // An id already written is not written again: a replay after a crash
         // must not prompt the agent twice.
         if self.lock().written.iter().any(|one| one == &message.id) {
@@ -542,16 +553,20 @@ impl Harness for OpenCodeHarness {
         let state = self.lock();
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.turn_open {
+            turn_state: if state.turn_open && state.quota_reset_at_ms.is_none() {
                 TurnState::InTurn
             } else {
                 TurnState::Idle
             },
             delivery_mode: DeliveryMode::Steer,
             steer_support: SteerSupport::Yes,
-            quota_reset_at_ms: None,
+            quota_reset_at_ms: state.quota_reset_at_ms,
             sign_in_fault: None,
         }
+    }
+
+    fn clear_quota(&mut self) {
+        self.lock().quota_reset_at_ms = None;
     }
 
     fn turns_served(&self) -> u32 {

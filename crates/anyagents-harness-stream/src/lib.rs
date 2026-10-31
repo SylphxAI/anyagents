@@ -118,14 +118,19 @@ impl StreamSpec {
             .pointer("/result/status")
             .and_then(Value::as_str)
             .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"));
-        let finishes = !is_error
+        let quota_reset_at_ms = quota_of(value);
+        let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
-                LineProtocol::Result | LineProtocol::ResultWithCost => kind == Some("result"),
+                LineProtocol::Result | LineProtocol::ResultWithCost => {
+                    kind == Some("result") && (!is_error || self.name == "anyagents-agy")
+                }
                 LineProtocol::Done => {
-                    kind == Some("done")
-                        || kind == Some("session_settled")
-                        || (kind == Some("prompt_result")
-                            && value.get("sessionSettled").and_then(Value::as_bool) != Some(false))
+                    !is_error
+                        && (kind == Some("done")
+                            || kind == Some("session_settled")
+                            || (kind == Some("prompt_result")
+                                && value.get("sessionSettled").and_then(Value::as_bool)
+                                    != Some(false)))
                 }
             };
         LineEffect {
@@ -140,7 +145,7 @@ impl StreamSpec {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             usage: finishes.then(|| self.usage_of(value)),
-            quota_reset_at_ms: quota_of(value),
+            quota_reset_at_ms,
             text: self.text_of(value, finishes),
         }
     }
@@ -237,6 +242,7 @@ struct State {
     generation: u64,
     input_blocked: bool,
     turn_user_inputs: usize,
+    last_turn_step_type: Option<String>,
     idle_since: Option<Instant>,
     planner_config: Option<Value>,
     http_port: Option<u16>,
@@ -473,6 +479,7 @@ impl StreamHarness {
                 state.open.clear();
                 state.followups.clear();
                 state.turn_user_inputs = 0;
+                state.last_turn_step_type = None;
                 state.idle_since = None;
                 return Ok(());
             }
@@ -490,6 +497,7 @@ impl StreamHarness {
         state.open.clear();
         state.followups.clear();
         state.turn_user_inputs = 0;
+        state.last_turn_step_type = None;
         state.idle_since = None;
         Ok(())
     }
@@ -552,6 +560,11 @@ impl StreamHarness {
                     return Ok(DeliverOutcome::Deferred);
                 }
             } else {
+                if let Some(reset_at_ms) = state.quota_reset_at_ms
+                    && !state.finished.contains(&message.id)
+                {
+                    return Ok(DeliverOutcome::Quota { reset_at_ms });
+                }
                 if state.seen.contains(&message.id) {
                     return Ok(DeliverOutcome::Accepted {
                         turn_finished: state.finished.contains(&message.id),
@@ -608,7 +621,7 @@ impl StreamHarness {
                 }
             }
         }
-        if let Some((rpc, session_id, child_pid, cached_port, mut planner_config, generation)) =
+        if let Some((rpc, mut session_id, child_pid, cached_port, mut planner_config, generation)) =
             agy_steer_ctx
         {
             let Some(port) = resolve_agy_http_port(&rpc, cached_port, child_pid) else {
@@ -625,8 +638,15 @@ impl StreamHarness {
                 }
                 state.http_port = Some(port);
             }
-            let running = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
+            let (resolved_sid, running) = agy_rpc_is_running(port, &rpc.csrf_token, &session_id)
                 .map_err(HarnessError::Failed)?;
+            if resolved_sid != session_id {
+                session_id = resolved_sid;
+                let mut state = lock(&self.shared);
+                if state.generation == generation && state.alive {
+                    state.session_id = Some(session_id.clone());
+                }
+            }
             if running {
                 let mut state = lock(&self.shared);
                 if state.generation != generation || !state.alive {
@@ -852,6 +872,7 @@ impl StreamHarness {
             state.open.clear();
             state.followups.clear();
             state.turn_user_inputs = 0;
+            state.last_turn_step_type = None;
             state.idle_since = None;
             state.planner_config = None;
             state.http_port = self.agy_rpc.as_ref().and_then(|r| r.port_override);
@@ -889,9 +910,10 @@ impl StreamHarness {
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
+        let agy_rpc = self.agy_rpc.clone();
         match thread::Builder::new()
             .name(spec.name.clone())
-            .spawn(move || read_stdout(stdout, shared, wake, spec, generation))
+            .spawn(move || read_stdout(stdout, shared, wake, spec, agy_rpc, generation))
         {
             Ok(handle) => self.reader = Some(handle),
             Err(err) => {
@@ -926,6 +948,7 @@ impl StreamHarness {
         state.open.clear();
         state.followups.clear();
         state.turn_user_inputs = 0;
+        state.last_turn_step_type = None;
         state.idle_since = None;
         state.planner_config = None;
         state.http_port = None;
@@ -975,6 +998,7 @@ impl State {
             open: Vec::new(),
             followups: Vec::new(),
             turn_user_inputs: 0,
+            last_turn_step_type: None,
             idle_since: None,
             planner_config: None,
             http_port: None,
@@ -994,6 +1018,7 @@ fn read_stdout(
     shared: Arc<Mutex<State>>,
     wake: Arc<Condvar>,
     spec: StreamSpec,
+    agy_rpc: Option<AgyRpcConfig>,
     generation: u64,
 ) {
     for line in BufReader::new(stdout).lines() {
@@ -1004,7 +1029,71 @@ fn read_stdout(
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let effect = spec.effect(&value);
+        let mut effect = spec.effect(&value);
+        let kind = value
+            .get("type")
+            .or_else(|| value.get("event"))
+            .and_then(Value::as_str);
+        if spec.name == "anyagents-agy" && effect.quota_reset_at_ms.is_some() {
+            let (last_step_type, session_id, child_pid, cached_port) = {
+                let state = lock(&shared);
+                (
+                    state.last_turn_step_type.clone(),
+                    effect
+                        .session_id
+                        .clone()
+                        .or_else(|| state.session_id.clone()),
+                    state.child.as_ref().map(Child::id),
+                    state.http_port,
+                )
+            };
+            let mut is_stale_quota = last_step_type.as_deref().is_some_and(|st| {
+                st != "error_message" && st != "user_input" && st != "system_message"
+            });
+            if !is_stale_quota
+                && let (Some(rpc), Some(sid)) = (agy_rpc.as_ref(), session_id.as_deref())
+                && let Some(port) = resolve_agy_http_port(rpc, cached_port, child_pid)
+            {
+                lock(&shared).http_port = Some(port);
+                if matches!(
+                    agy_rpc_is_latest_step_quota_error(port, &rpc.csrf_token, sid),
+                    Ok(false)
+                ) {
+                    is_stale_quota = true;
+                }
+            }
+            if is_stale_quota {
+                effect.quota_reset_at_ms = None;
+                if kind == Some("result") {
+                    effect.finishes_turn = true;
+                    effect.usage = Some(spec.usage_of(&value));
+                }
+            }
+        }
+        if let Some(ref rpc) = agy_rpc {
+            if let Some(reset_at_ms) = effect.quota_reset_at_ms {
+                let err_msg = value
+                    .pointer("/result/error")
+                    .or_else(|| value.get("error"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("RESOURCE_EXHAUSTED: quota reached");
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let _ = std::fs::write(
+                    rpc.config_dir.join(".anyagents-last-error.json"),
+                    serde_json::json!({
+                        "error": err_msg,
+                        "quota_reset_at_ms": reset_at_ms,
+                        "timestamp_ms": now_ms,
+                    })
+                    .to_string(),
+                );
+            } else if effect.finishes_turn {
+                let _ = std::fs::remove_file(rpc.config_dir.join(".anyagents-last-error.json"));
+            }
+        }
         {
             let mut state = lock(&shared);
             if state.generation != generation {
@@ -1012,15 +1101,21 @@ fn read_stdout(
             }
             state.idle_since = None;
             note_markers(&mut state, &value);
-            if value
+            if let Some(step_type) = value
                 .pointer("/step_update/step_type")
                 .and_then(Value::as_str)
-                == Some("user_input")
             {
-                state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+                state.last_turn_step_type = Some(step_type.to_string());
+                if step_type == "user_input" || state.turn_user_inputs == 0 {
+                    state.turn_user_inputs = state.turn_user_inputs.saturating_add(1);
+                }
             }
             if let Some(reset_at_ms) = effect.quota_reset_at_ms {
                 state.quota_reset_at_ms = Some(reset_at_ms);
+                let rejected_ids = std::mem::take(&mut state.open);
+                for id in rejected_ids {
+                    state.seen.remove(&id);
+                }
             }
             if let Some(session_id) = effect.session_id
                 && !session_id.is_empty()
@@ -1094,6 +1189,7 @@ fn id_for_quiet(state: &mut State, id: &str) {
     state.open.clear();
     state.followups.clear();
     state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
     state.idle_since = None;
     state.finished.insert(id.to_string());
     state.text = text;
@@ -1101,6 +1197,7 @@ fn id_for_quiet(state: &mut State, id: &str) {
 
 fn finish_open(state: &mut State, usage: TurnUsage) {
     state.turn_user_inputs = 0;
+    state.last_turn_step_type = None;
     state.idle_since = None;
     if state.open.is_empty() {
         return;
@@ -1236,29 +1333,91 @@ fn resolve_agy_http_port(
         return Some(port);
     }
     let log_path = rpc.config_dir.join(".gemini/antigravity-cli/cli.log");
-    let text = std::fs::read_to_string(&log_path).ok()?;
-    let pid_needle =
-        child_pid.map(|pid| format!("Starting language server process with pid {pid}"));
-    let mut pid_matched = pid_needle.is_none();
-    let mut found_port = None;
-    for line in text.lines() {
-        if let Some(ref needle) = pid_needle
-            && line.contains(needle)
-        {
-            pid_matched = true;
-            found_port = None;
-            continue;
+    if let Ok(text) = std::fs::read_to_string(&log_path) {
+        let pid_needle =
+            child_pid.map(|pid| format!("Starting language server process with pid {pid}"));
+        let mut pid_matched = pid_needle.is_none();
+        let mut found_port = None;
+        for line in text.lines() {
+            if let Some(ref needle) = pid_needle
+                && line.contains(needle)
+            {
+                pid_matched = true;
+                found_port = None;
+                continue;
+            }
+            if pid_matched
+                && let Some((_, after)) =
+                    line.split_once("Language server listening on random port at ")
+                && let Some(port_str) = after.strip_suffix(" for HTTP")
+                && let Ok(port) = port_str.trim().parse::<u16>()
+            {
+                found_port = Some(port);
+            }
         }
-        if pid_matched
-            && let Some((_, after)) =
-                line.split_once("Language server listening on random port at ")
-            && let Some(port_str) = after.strip_suffix(" for HTTP")
-            && let Ok(port) = port_str.trim().parse::<u16>()
-        {
-            found_port = Some(port);
+        if found_port.is_some() {
+            return found_port;
         }
     }
-    found_port
+    #[cfg(target_os = "linux")]
+    if let Some(pid) = child_pid {
+        return resolve_agy_http_port_from_proc(pid, &rpc.csrf_token);
+    }
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_agy_http_port_from_proc(pid: u32, csrf_token: &str) -> Option<u16> {
+    let fd_dir = format!("/proc/{pid}/fd");
+    let mut inodes = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(&fd_dir) {
+        for entry in entries.flatten() {
+            if let Ok(target) = std::fs::read_link(entry.path())
+                && let Some(s) = target.to_str()
+                && let Some(rest) = s.strip_prefix("socket:[")
+                && let Some(inode) = rest.strip_suffix(']')
+            {
+                inodes.insert(inode.to_string());
+            }
+        }
+    }
+    let process_uid = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|st| {
+            st.lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .map(str::to_string)
+        });
+    if inodes.is_empty() && process_uid.is_none() {
+        return None;
+    }
+    let tcp_text = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")).ok()?;
+    let mut candidate_ports = Vec::new();
+    for line in tcp_text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let matched = if !inodes.is_empty() {
+            parts.len() > 9 && parts[3] == "0A" && inodes.contains(parts[9])
+        } else if let Some(ref uid) = process_uid {
+            parts.len() > 9 && parts[3] == "0A" && parts[7] == uid
+        } else {
+            false
+        };
+        if matched {
+            if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
+                && ip_hex == "0100007F"
+                && let Ok(port) = u16::from_str_radix(port_hex, 16)
+            {
+                candidate_ports.push(port);
+            }
+        }
+    }
+    for port in candidate_ports {
+        if agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({})).is_ok() {
+            return Some(port);
+        }
+    }
+    None
 }
 
 fn agy_rpc_post(
@@ -1320,15 +1479,80 @@ fn agy_rpc_post(
 /// accept a new invocation via `SendUserCascadeMessage` with `plannerConfig`.
 const AGY_TURN_CLOSE_GRACE: Duration = Duration::from_millis(200);
 
-fn agy_rpc_is_running(port: u16, csrf_token: &str, session_id: &str) -> Result<bool, String> {
+fn agy_rpc_is_running(
+    port: u16,
+    csrf_token: &str,
+    session_id: &str,
+) -> Result<(String, bool), String> {
     let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
-    let status = resp
+    let Some(summaries) = resp.get("trajectorySummaries").and_then(Value::as_object) else {
+        return Ok((session_id.to_string(), false));
+    };
+    if let Some(entry) = summaries.get(session_id) {
+        let status = entry
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return Ok((
+            session_id.to_string(),
+            status == "CASCADE_RUN_STATUS_RUNNING",
+        ));
+    }
+    if let Some((cid, _)) = summaries.iter().find(|(_, v)| {
+        v.get("status").and_then(Value::as_str) == Some("CASCADE_RUN_STATUS_RUNNING")
+    }) {
+        return Ok((cid.clone(), true));
+    }
+    if summaries.len() == 1
+        && let Some((cid, v)) = summaries.iter().next()
+    {
+        let status = v.get("status").and_then(Value::as_str).unwrap_or_default();
+        return Ok((cid.clone(), status == "CASCADE_RUN_STATUS_RUNNING"));
+    }
+    Ok((session_id.to_string(), false))
+}
+
+fn agy_rpc_is_latest_step_quota_error(
+    port: u16,
+    csrf_token: &str,
+    session_id: &str,
+) -> Result<bool, String> {
+    let resp = agy_rpc_post(port, csrf_token, "GetAllCascadeTrajectories", &json!({}))?;
+    let Some(step_count) = resp
         .get("trajectorySummaries")
         .and_then(|m| m.get(session_id))
-        .and_then(|s| s.get("status"))
+        .and_then(|s| s.get("stepCount"))
+        .and_then(Value::as_u64)
+    else {
+        return Ok(true);
+    };
+    if step_count == 0 {
+        return Ok(false);
+    }
+    let offset = step_count.saturating_sub(2);
+    let steps_resp = agy_rpc_post(
+        port,
+        csrf_token,
+        "GetCascadeTrajectorySteps",
+        &json!({ "cascadeId": session_id, "stepOffset": offset }),
+    )?;
+    let Some(last_step) = steps_resp
+        .get("steps")
+        .and_then(Value::as_array)
+        .and_then(|arr| arr.last())
+    else {
+        return Ok(true);
+    };
+    let step_type = last_step.get("type").and_then(Value::as_str).unwrap_or("");
+    let status = last_step
+        .get("status")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    Ok(status == "CASCADE_RUN_STATUS_RUNNING")
+        .unwrap_or("");
+    if step_type != "CORTEX_STEP_TYPE_ERROR_MESSAGE" || status == "CORTEX_STEP_STATUS_CLEARED" {
+        return Ok(false);
+    }
+    let raw = last_step.to_string().to_ascii_lowercase();
+    Ok(raw.contains("resets in ") || raw.contains("resource_exhausted"))
 }
 
 fn agy_rpc_fetch_planner_config(
@@ -1444,6 +1668,90 @@ fn parse_resets_in_ms(text: &str) -> Option<i64> {
         }
     }
     (matched_unit && !has_digits && total_ms > 0).then_some(total_ms)
+}
+
+/// Inspect `<config_dir>/.anyagents-last-error.json` and the latest Antigravity
+/// CLI log under `<config_dir>/.gemini/antigravity-cli/log/cli-*.log` to detect
+/// an active quota reset timestamp (`> now_ms`) and the latest sanitized harness
+/// delivery error after any profile/model rotation.
+pub fn detect_agy_session_quota_and_error(
+    config_dir: &Path,
+    now_ms: i64,
+) -> (Option<i64>, Option<String>) {
+    let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let cleared_ms = std::fs::read_to_string(config_dir.join(".anyagents-quota-cleared-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let reset_floor_ms = rotated_ms.max(cleared_ms);
+    if let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+    {
+        let ts = val.get("timestamp_ms").and_then(Value::as_i64).unwrap_or(0);
+        if ts > reset_floor_ms {
+            let err = val.get("error").and_then(Value::as_str).map(str::to_string);
+            if let Some(raw_reset) = val.get("quota_reset_at_ms").and_then(Value::as_i64) {
+                if raw_reset > now_ms {
+                    return (Some(raw_reset), err);
+                }
+                return (None, None);
+            }
+            if err.is_some() {
+                return (None, err);
+            }
+        }
+    }
+    let log_dir = config_dir.join(".gemini/antigravity-cli/log");
+    let Ok(entries) = std::fs::read_dir(&log_dir) else {
+        return (None, None);
+    };
+    let mut logs: Vec<(i64, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.starts_with("cli-") || !name.ends_with(".log") {
+            continue;
+        };
+        if let Ok(meta) = entry.metadata()
+            && let Ok(mtime) = meta.modified()
+            && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+        {
+            let mtime_ms = dur.as_millis() as i64;
+            if mtime_ms > reset_floor_ms {
+                logs.push((mtime_ms, p));
+            }
+        }
+    }
+    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    for (mtime_ms, path) in logs.into_iter().take(3) {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines().rev() {
+            if let Some((_, after)) = line.split_once("run ended with error and no response: ") {
+                let err_str = after.trim().to_string();
+                if let Some(dur_ms) = parse_resets_in_ms(&err_str) {
+                    let raw_reset = mtime_ms.saturating_add(dur_ms);
+                    if raw_reset > now_ms {
+                        return (Some(raw_reset), Some(err_str));
+                    }
+                    return (None, None);
+                }
+                return (None, Some(err_str));
+            }
+            if line.contains("Sending user message to conversation")
+                && !text.contains("run ended with error and no response:")
+            {
+                return (None, None);
+            }
+        }
+    }
+    (None, None)
 }
 
 /// The line that puts one message into the child.

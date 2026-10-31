@@ -36,7 +36,7 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
      reply_to, received_at_ms, delivered_at_ms, origin, context";
 
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id, is_admin";
+     created_at_ms, launch_env, parent_id, is_admin, role";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub struct Agent {
     pub is_admin: bool,
     pub id: AgentId,
     pub name: String,
+    pub role: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
@@ -61,6 +62,7 @@ pub struct Agent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewAgent {
     pub name: String,
+    pub role: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
@@ -72,6 +74,7 @@ impl NewAgent {
     pub fn new(name: impl Into<String>, harness: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            role: None,
             harness: harness.into(),
             model: None,
             workdir: None,
@@ -79,6 +82,40 @@ impl NewAgent {
             parent_id: None,
         }
     }
+}
+
+/// One self-scheduled wake (`at`, `every`) or event watch (`watch`) owned by an agent.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AgentSchedule {
+    pub id: String,
+    pub agent_id: AgentId,
+    pub kind: String,
+    pub spec: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_baseline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed: Option<String>,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+/// Input for [`Store::create_schedule`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NewSchedule {
+    pub agent_id: AgentId,
+    pub kind: String,
+    pub spec: String,
+    pub prompt: String,
+    pub interval_ms: Option<i64>,
+    pub next_fire_at_ms: Option<i64>,
+    pub watch_baseline: Option<String>,
 }
 
 /// A channel adapter and the bot or account it speaks as.
@@ -360,6 +397,10 @@ impl Store {
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
+        let _ = conn.execute(
+            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('running', 'paused', 'archived')",
+            [],
+        );
         Ok(Self {
             conn: Mutex::new(conn),
             data_dir: data_dir_for(path),
@@ -586,10 +627,17 @@ impl Store {
         if new.harness.is_empty() {
             return Err(Error::Message("harness is empty".into()));
         }
+        let clean_role = new
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         let agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
+            role: clean_role,
             harness: new.harness,
             model: new.model,
             workdir: new.workdir,
@@ -611,8 +659,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -622,6 +670,7 @@ impl Store {
                 agent.instructions,
                 agent.created_at_ms,
                 agent.parent_id.as_ref().map(|id| id.as_str()),
+                agent.role,
             ],
         )?;
         tx.execute(
@@ -659,7 +708,102 @@ impl Store {
             "UPDATE agents SET model = ?2 WHERE id = ?1",
             params![agent_id.as_str(), model],
         )?;
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
         Ok(())
+    }
+
+    pub fn set_agent_harness(&self, agent_id: &AgentId, harness: &str) -> Result<Agent, Error> {
+        let clean = harness.trim();
+        if clean.is_empty() {
+            return Err(Error::Message("harness is empty".into()));
+        }
+        let updated = {
+            let conn = self.conn();
+            agent_by_id(&conn, agent_id)?;
+            conn.execute(
+                "UPDATE agents SET harness = ?2 WHERE id = ?1",
+                params![agent_id.as_str(), clean],
+            )?;
+            agent_by_id(&conn, agent_id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(updated)
+    }
+
+    /// Rename an agent in place while preserving its immutable `AgentId`,
+    /// mailbox, sessions, grants, and recording the old name in `agent_aliases`.
+    pub fn rename_agent(&self, agent_id: &AgentId, new_name: &str) -> Result<Agent, Error> {
+        let clean = new_name
+            .trim()
+            .strip_prefix("agent:")
+            .unwrap_or(new_name.trim());
+        validate_token(clean, "agent name")?;
+        let updated = {
+            let mut conn = self.conn();
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = agent_by_id(&tx, agent_id)?;
+            if current.name == clean {
+                return Ok(current);
+            }
+            let taken: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM agents WHERE name = ?1 AND id != ?2",
+                params![clean, agent_id.as_str()],
+                |row| row.get(0),
+            )?;
+            if taken != 0 {
+                return Err(Error::AgentExists(clean.to_string()));
+            }
+            tx.execute(
+                "UPDATE agents SET name = ?2 WHERE id = ?1",
+                params![agent_id.as_str(), clean],
+            )?;
+            tx.execute(
+                "INSERT OR REPLACE INTO agent_aliases (alias, agent_id, created_at_ms) VALUES (?1, ?2, ?3)",
+                params![current.name, agent_id.as_str(), now_ms()],
+            )?;
+            tx.execute("DELETE FROM agent_aliases WHERE alias = ?1", [clean])?;
+            let _ = tx.execute(
+                "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1",
+                params![agent_id.as_str(), clean],
+            );
+            let updated = agent_by_id(&tx, agent_id)?;
+            tx.commit()?;
+            updated
+        };
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(updated)
+    }
+
+    /// Set or clear an agent's short role label (e.g. `"Spiron"`, `"Design"`, `"Revenue"`).
+    pub fn set_agent_role(&self, id: &AgentId, role: Option<&str>) -> Result<Agent, Error> {
+        let clean = role.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn();
+        agent_by_id(&conn, id)?;
+        conn.execute(
+            "UPDATE agents SET role = ?1 WHERE id = ?2",
+            params![clean, id.as_str()],
+        )?;
+        agent_by_id(&conn, id)
+    }
+
+    /// Former names recorded for this agent via `rename_agent`.
+    pub fn agent_aliases(&self, id: &AgentId) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT alias FROM agent_aliases WHERE agent_id = ?1 ORDER BY created_at_ms DESC",
+        )?;
+        let mut rows = stmt.query([id.as_str()])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            out.push(row.get(0)?);
+        }
+        Ok(out)
     }
 
     /// Administrative metadata only; callers must never pass credentials here.
@@ -696,7 +840,21 @@ impl Store {
                 agent_from_row,
             )
             .optional()?;
-        found.ok_or_else(|| Error::AgentNotFound(name.to_string()))
+        if let Some(agent) = found {
+            return Ok(agent);
+        }
+        let aliased = conn
+            .query_row(
+                "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
+                        a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role \
+                 FROM agent_aliases al \
+                 JOIN agents a ON a.id = al.agent_id \
+                 WHERE al.alias = ?1",
+                [lookup],
+                agent_from_row,
+            )
+            .optional()?;
+        aliased.ok_or_else(|| Error::AgentNotFound(name.to_string()))
     }
 
     pub fn list_agents(&self) -> Result<Vec<Agent>, Error> {
@@ -745,14 +903,18 @@ impl Store {
         let author = sender
             .as_deref()
             .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+        let author_id = author
+            .as_deref()
+            .and_then(|a| self.agent_by_name(a).ok().map(|ag| ag.id));
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
-            if agent.state == "archived" || agent.state == "paused" {
+            if agent.state != "running" {
                 continue;
             }
             if author.as_deref() == Some(agent.name.as_str())
                 || author.as_deref() == Some(agent.id.as_str())
+                || author_id.as_ref() == Some(&agent.id)
             {
                 continue;
             }
@@ -805,7 +967,7 @@ impl Store {
             let names = self
                 .list_agents()?
                 .into_iter()
-                .filter(|agent| agent.state != "archived" && agent.state != "paused")
+                .filter(|agent| agent.state == "running")
                 .map(|agent| agent.name)
                 .collect();
             return Ok(Some(names));
@@ -1140,8 +1302,8 @@ impl Store {
                 serde_json::to_string(&message.context).ok(),
             ],
         )?;
-        let woke_archived = tx.execute(
-            "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'archived'",
+        let woke_idle = tx.execute(
+            "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'idle'",
             [agent_id.as_str()],
         )? > 0;
         if let Ok(agent) = agent_by_id(&tx, agent_id) {
@@ -1162,7 +1324,7 @@ impl Store {
         }
         tx.commit()?;
         drop(conn);
-        if woke_archived {
+        if woke_idle {
             self.notify(Wake::Agent {
                 agent_id: agent_id.clone(),
             });
@@ -1230,7 +1392,7 @@ impl Store {
         Ok(changed)
     }
 
-    /// Update an agent's lifecycle state (`running`, `paused`, `archived`, `stopped`) and
+    /// Update an agent's lifecycle state (`running`, `idle`, `paused`, `archived`, `stopped`) and
     /// notify the supervisor so it starts or stops the worker slot.
     pub fn set_agent_state(&self, id: &AgentId, state: &str) -> Result<Agent, Error> {
         let changed = {
@@ -1251,16 +1413,29 @@ impl Store {
     }
 
     /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
-    /// `archived` when it has delivered every message in its mailbox and
-    /// completed its latest turn (`completed_seq >= opened_seq >= max_seq > 0`).
+    /// `idle` (process released / scaled to zero) when it has delivered every
+    /// message in its mailbox, completed its latest turn
+    /// (`completed_seq >= opened_seq >= max_seq > 0`), and has no active
+    /// (`running`) child sub-agents of its own.
     ///
-    /// Returns `Ok(true)` when the sub-agent transitioned to `archived` (and
+    /// Returns `Ok(true)` when the sub-agent transitioned to `idle` (and
     /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
-    /// mail arrived or a turn is still open.
+    /// mail arrived, a turn is still open, or a child sub-agent is still running.
     pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
-        let (transitioned, silent_completion) = {
+        let (transitioned, parent_to_wake, silent_completion) = {
             let mut conn = self.conn();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let parent_id_opt: Option<AgentId> = tx
+                .query_row(
+                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
+                    [id.as_str()],
+                    |r| {
+                        let pid: String = r.get(0)?;
+                        AgentId::parse(&pid)
+                            .map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))
+                    },
+                )
+                .optional()?;
             let silent_info: Option<(AgentId, String, i64)> = tx
                 .query_row(
                     "SELECT a.parent_id, a.name, tr.completed_seq
@@ -1288,10 +1463,15 @@ impl Store {
                 .optional()?;
             let updated = tx.execute(
                 "UPDATE agents
-                 SET state = 'archived'
+                 SET state = 'idle'
                  WHERE id = ?1
                    AND parent_id IS NOT NULL
                    AND state = 'running'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM agents child
+                       WHERE child.parent_id = ?1
+                         AND child.state = 'running'
+                   )
                    AND EXISTS (
                        SELECT 1 FROM turn_recovery tr
                        WHERE tr.agent_id = ?1
@@ -1309,15 +1489,22 @@ impl Store {
                 [id.as_str()],
             )?;
             tx.commit()?;
-            (updated > 0, if updated > 0 { silent_info } else { None })
+            (
+                updated > 0,
+                if updated > 0 { parent_id_opt } else { None },
+                if updated > 0 { silent_info } else { None },
+            )
         };
         if transitioned {
             self.notify(Wake::Agent {
                 agent_id: id.clone(),
             });
+            if let Some(pid) = parent_to_wake {
+                self.notify(Wake::Agent { agent_id: pid });
+            }
             if let Some((parent_id, sub_name, completed_seq)) = silent_completion {
                 let notice = format!(
-                    "[Sub-Agent Completed] Sub-agent `agent:{sub_name}` (`{id}`) finished its turn and scaled to zero (`state = archived`) without sending a direct reply. Call `subagents({{ \"action\": \"inspect\", \"agent\": \"{sub_name}\" }})` to read its output or `subagents({{ \"action\": \"steer\", \"agent\": \"{sub_name}\", \"prompt\": \"...\" }})` to continue."
+                    "[Sub-Agent Completed] Sub-agent `agent:{sub_name}` (`{id}`) finished its turn and scaled to zero (`state = idle`) without sending a direct reply. Call `subagents({{ \"action\": \"inspect\", \"agent\": \"{sub_name}\" }})` to read its output or `subagents({{ \"action\": \"steer\", \"agent\": \"{sub_name}\", \"prompt\": \"...\" }})` to continue."
                 );
                 let _ = self.receive(
                     &parent_id,
@@ -1344,6 +1531,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let agent = agent_by_id(&tx, id)?;
             for table in [
+                "agent_aliases",
                 "agent_capabilities",
                 "usage_records",
                 "mailbox_cursors",
@@ -1552,15 +1740,28 @@ impl Store {
         let conn = self.conn();
         let since = since_ms.unwrap_or(0);
         let lim = i64::try_from(limit.unwrap_or(50).max(1)).unwrap_or(50);
-        let mut turns = Vec::new();
-        let mut stmt = conn.prepare(
+        let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
+        let fetch_limit = if peer_filter.is_some() {
+            lim.saturating_mul(4)
+        } else {
+            lim
+        };
+        let sql = if since_ms.is_some() {
             "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
              FROM rag_chunks
              WHERE timestamp_ms > ?1
-             ORDER BY timestamp_ms DESC
-             LIMIT ?2",
-        )?;
-        let mut rows = stmt.query(params![since, lim * 4])?;
+             ORDER BY timestamp_ms ASC, chunk_id ASC
+             LIMIT ?2"
+        } else {
+            "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+             FROM rag_chunks
+             WHERE timestamp_ms > ?1
+             ORDER BY timestamp_ms DESC, chunk_id DESC
+             LIMIT ?2"
+        };
+        let mut turns = Vec::new();
+        let mut stmt = conn.prepare(sql)?;
+        let mut rows = stmt.query(params![since, fetch_limit])?;
         while let Some(row) = rows.next()? {
             turns.push(ConversationTurn {
                 id: row.get(0)?,
@@ -1572,7 +1773,7 @@ impl Store {
                 timestamp_ms: row.get(5)?,
             });
         }
-        if let Some(peer) = with_peer.map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(peer) = peer_filter {
             turns.retain(|turn| matches_conversation_peer(turn, peer));
         }
         turns.sort_by(|a, b| {
@@ -1580,10 +1781,12 @@ impl Store {
                 .cmp(&b.timestamp_ms)
                 .then_with(|| a.id.cmp(&b.id))
         });
-        if let Some(limit) = limit
-            && turns.len() > limit
-        {
-            turns.drain(..turns.len() - limit);
+        if let Some(limit) = limit {
+            if since_ms.is_none() && turns.len() > limit {
+                turns.drain(..turns.len() - limit);
+            } else if turns.len() > limit {
+                turns.truncate(limit);
+            }
         }
         Ok(turns)
     }
@@ -2208,6 +2411,286 @@ impl Store {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
+        let now = now_ms();
+        let mut rand_bytes = [0u8; 8];
+        if let Ok(mut f) = File::open("/dev/urandom") {
+            let _ = f.read_exact(&mut rand_bytes);
+        }
+        let id = format!("sch_{:012x}{}", now, hex(&rand_bytes));
+        let conn = self.conn();
+        agent_by_id(&conn, &input.agent_id)?;
+        // Deduplicate identical active recurring/watch schedules for the same agent.
+        if (input.kind == "every" || input.kind == "watch")
+            && let Some(existing_id) = conn
+                .query_row(
+                    "SELECT id FROM agent_schedules
+                     WHERE agent_id = ?1 AND kind = ?2 AND spec = ?3 AND prompt = ?4 AND state = 'active'
+                     LIMIT 1",
+                    params![input.agent_id.as_str(), input.kind, input.spec, input.prompt],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+        {
+            conn.execute(
+                "UPDATE agent_schedules
+                 SET interval_ms = ?2, next_fire_at_ms = ?3, watch_baseline = COALESCE(?4, watch_baseline)
+                 WHERE id = ?1",
+                params![
+                    existing_id,
+                    input.interval_ms,
+                    input.next_fire_at_ms,
+                    input.watch_baseline
+                ],
+            )?;
+            return schedule_by_id(&conn, &existing_id);
+        }
+        conn.execute(
+            "INSERT INTO agent_schedules (
+                id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, ?8, ?8, 'active', ?9)",
+            params![
+                id,
+                input.agent_id.as_str(),
+                input.kind,
+                input.spec,
+                input.prompt,
+                input.interval_ms,
+                input.next_fire_at_ms,
+                input.watch_baseline,
+                now,
+            ],
+        )?;
+        schedule_by_id(&conn, &id)
+    }
+
+    pub fn list_schedules(
+        &self,
+        agent_id: Option<&AgentId>,
+        active_only: bool,
+    ) -> Result<Vec<AgentSchedule>, Error> {
+        let conn = self.conn();
+        let mut out = Vec::new();
+        match (agent_id, active_only) {
+            (Some(aid), true) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     WHERE agent_id = ?1 AND state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            (Some(aid), false) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     WHERE agent_id = ?1
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([aid.as_str()], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            (None, true) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     WHERE state = 'active'
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+            (None, false) => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                            last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+                     FROM agent_schedules
+                     ORDER BY created_at_ms ASC, id ASC",
+                )?;
+                let rows = stmt.query_map([], schedule_from_row)?;
+                for row in rows {
+                    out.push(row?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn get_schedule(&self, id: &str) -> Result<Option<AgentSchedule>, Error> {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                    last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+             FROM agent_schedules WHERE id = ?1",
+            [id.trim()],
+            schedule_from_row,
+        )
+        .optional()
+        .map_err(Error::from)
+    }
+
+    pub fn cancel_schedule(
+        &self,
+        agent_id: Option<&AgentId>,
+        id_or_all: &str,
+    ) -> Result<usize, Error> {
+        let target = id_or_all.trim();
+        let conn = self.conn();
+        let count = if target.eq_ignore_ascii_case("all") || target == "*" {
+            match agent_id {
+                Some(aid) => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE agent_id = ?1 AND state = 'active'",
+                    [aid.as_str()],
+                )?,
+                None => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE state = 'active'",
+                    [],
+                )?,
+            }
+        } else {
+            match agent_id {
+                Some(aid) => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE id = ?1 AND agent_id = ?2 AND state = 'active'",
+                    params![target, aid.as_str()],
+                )?,
+                None => conn.execute(
+                    "UPDATE agent_schedules
+                     SET state = 'cancelled', next_fire_at_ms = NULL
+                     WHERE id = ?1 AND state = 'active'",
+                    [target],
+                )?,
+            }
+        };
+        Ok(count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claim_schedule_tick(
+        &self,
+        id: &str,
+        expected_next_fire_at_ms: Option<i64>,
+        new_state: &str,
+        new_next_fire_at_ms: Option<i64>,
+        fired_at_ms: Option<i64>,
+        watch_baseline: Option<&str>,
+        last_observed: Option<&str>,
+    ) -> Result<bool, Error> {
+        let conn = self.conn();
+        let updated = match expected_next_fire_at_ms {
+            Some(expected) => conn.execute(
+                "UPDATE agent_schedules
+                 SET state = ?3,
+                     next_fire_at_ms = ?4,
+                     last_fired_at_ms = COALESCE(?5, last_fired_at_ms),
+                     watch_baseline = COALESCE(?6, watch_baseline),
+                     last_observed = COALESCE(?7, last_observed)
+                 WHERE id = ?1 AND state = 'active' AND next_fire_at_ms = ?2",
+                params![
+                    id,
+                    expected,
+                    new_state,
+                    new_next_fire_at_ms,
+                    fired_at_ms,
+                    watch_baseline,
+                    last_observed
+                ],
+            )?,
+            None => conn.execute(
+                "UPDATE agent_schedules
+                 SET state = ?2,
+                     next_fire_at_ms = ?3,
+                     last_fired_at_ms = COALESCE(?4, last_fired_at_ms),
+                     watch_baseline = COALESCE(?5, watch_baseline),
+                     last_observed = COALESCE(?6, last_observed)
+                 WHERE id = ?1 AND state = 'active'",
+                params![
+                    id,
+                    new_state,
+                    new_next_fire_at_ms,
+                    fired_at_ms,
+                    watch_baseline,
+                    last_observed
+                ],
+            )?,
+        };
+        Ok(updated == 1)
+    }
+
+    pub fn update_schedule_watch_observation(
+        &self,
+        id: &str,
+        watch_baseline: Option<&str>,
+        last_observed: Option<&str>,
+    ) -> Result<(), Error> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE agent_schedules
+             SET watch_baseline = COALESCE(?2, watch_baseline),
+                 last_observed = COALESCE(?3, last_observed)
+             WHERE id = ?1 AND state = 'active'",
+            params![id, watch_baseline, last_observed],
+        )?;
+        Ok(())
+    }
+}
+
+fn schedule_by_id(conn: &Connection, id: &str) -> Result<AgentSchedule, Error> {
+    conn.query_row(
+        "SELECT id, agent_id, kind, spec, prompt, interval_ms, next_fire_at_ms,
+                last_fired_at_ms, watch_baseline, last_observed, state, created_at_ms
+         FROM agent_schedules WHERE id = ?1",
+        [id],
+        schedule_from_row,
+    )
+    .optional()?
+    .ok_or_else(|| Error::Message(format!("schedule not found: {id}")))
+}
+
+fn schedule_from_row(row: &rusqlite::Row<'_>) -> Result<AgentSchedule, rusqlite::Error> {
+    let raw_aid: String = row.get(1)?;
+    let agent_id = AgentId::parse(&raw_aid).map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )),
+        )
+    })?;
+    Ok(AgentSchedule {
+        id: row.get(0)?,
+        agent_id,
+        kind: row.get(2)?,
+        spec: row.get(3)?,
+        prompt: row.get(4)?,
+        interval_ms: row.get(5)?,
+        next_fire_at_ms: row.get(6)?,
+        last_fired_at_ms: row.get(7)?,
+        watch_baseline: row.get(8)?,
+        last_observed: row.get(9)?,
+        state: row.get(10)?,
+        created_at_ms: row.get(11)?,
+    })
 }
 
 /// `{data}/agents/{id}/work`.
@@ -2497,6 +2980,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         is_admin: row.get(10)?,
         id: agent_id,
         name: row.get(1)?,
+        role: row.get(11)?,
         harness: row.get(2)?,
         model: row.get(3)?,
         workdir: row.get(4)?,
@@ -3686,9 +4170,9 @@ mod tests {
             )
             .unwrap();
 
-        // Archive alice, then send a message with @bob_helper_bot, @alice, and pinned event.
-        store.set_agent_state(&alice.id, "archived").unwrap();
-        assert_eq!(store.agent_by_name("alice").unwrap().state, "archived");
+        // Put alice in idle (scaled-to-zero), then send a message with @bob_helper_bot, @alice, and pinned event.
+        store.set_agent_state(&alice.id, "idle").unwrap();
+        assert_eq!(store.agent_by_name("alice").unwrap().state, "idle");
 
         let origin = Origin {
             chat_id: Some(-100123),
@@ -3799,7 +4283,7 @@ mod tests {
     }
 
     #[test]
-    fn complete_idle_subagent_scales_finished_subagent_to_zero_and_wakes_on_new_mail() {
+    fn subagent_scales_to_idle_when_done_wakes_on_message_and_stays_archived_when_retired() {
         let (_dir, store) = setup();
         let root = agent(&store, "root");
         let mut child_new = NewAgent::new("root-worker", "opencode");
@@ -3807,38 +4291,61 @@ mod tests {
         let child = store.create_agent(child_new).unwrap();
         store.set_agent_running(&child.id, "/work").unwrap();
 
-        // Before any message/turn, does not auto-archive.
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-        assert_eq!(store.agent(&child.id).unwrap().state, "running");
-
-        // Send initial task message (seq = 1).
+        // Send initial task message (seq = 1), deliver it, and complete turn 1.
         store.receive(&child.id, Incoming::new("task 1")).unwrap();
-        // While undelivered, does not auto-archive.
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        // Deliver seq = 1 (turn is open: opened_seq = 1, completed_seq = 0).
         store.note_delivered(&child.id, 1).unwrap();
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        // Complete turn 1 (completed_seq = 1 == max_seq).
         store.note_turn_completed(&child.id).unwrap();
-        // Root agent is never archived by complete_idle_subagent.
-        assert!(!store.complete_idle_subagent(&root.id).unwrap());
-        // Sub-agent automatically transitions to archived!
-        assert!(store.complete_idle_subagent(&child.id).unwrap());
-        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
 
-        // Sending a follow-up message (seq = 2) wakes the sub-agent back to running,
-        // and it stays running until seq = 2 is delivered and its turn completes.
+        // complete_idle_subagent transitions the sub-agent to `idle` (scaled to zero).
+        assert!(store.complete_idle_subagent(&child.id).unwrap());
+        assert_eq!(store.agent(&child.id).unwrap().state, "idle");
+
+        // Sending a follow-up message wakes an `idle` sub-agent back to `running`.
         store.receive(&child.id, Incoming::new("task 2")).unwrap();
         assert_eq!(store.agent(&child.id).unwrap().state, "running");
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
 
-        store.note_delivered(&child.id, 2).unwrap();
-        assert!(!store.complete_idle_subagent(&child.id).unwrap());
-
-        store.note_turn_completed(&child.id).unwrap();
-        assert!(store.complete_idle_subagent(&child.id).unwrap());
+        // Explicit archive transitions the sub-agent to `archived` (retired), which does NOT auto-wake.
+        store.set_agent_state(&child.id, "archived").unwrap();
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        store.receive(&child.id, Incoming::new("task 3")).unwrap();
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+    }
+
+    #[test]
+    fn rename_agent_preserves_id_grants_history_and_resolves_old_alias_and_role() {
+        let (_dir, store) = setup();
+        let argon = agent(&store, "argon");
+        store.set_agent_admin(&argon.id, true).unwrap();
+        store.join_group("owners", &argon.id).unwrap();
+        store
+            .receive(&argon.id, Incoming::new("revenue check"))
+            .unwrap();
+
+        let renamed = store.rename_agent(&argon.id, "plutus").unwrap();
+        assert_eq!(renamed.id, argon.id);
+        assert_eq!(renamed.name, "plutus");
+        assert!(renamed.is_admin);
+
+        let with_role = store.set_agent_role(&argon.id, Some("Revenue")).unwrap();
+        assert_eq!(with_role.role.as_deref(), Some("Revenue"));
+
+        // Old name resolves via alias table
+        let by_old = store.agent_by_name("argon").unwrap();
+        assert_eq!(by_old.id, argon.id);
+        assert_eq!(by_old.name, "plutus");
+        assert_eq!(by_old.role.as_deref(), Some("Revenue"));
+
+        let by_prefixed = store.agent_by_name("agent:argon").unwrap();
+        assert_eq!(by_prefixed.id, argon.id);
+
+        assert_eq!(
+            store.agent_aliases(&argon.id).unwrap(),
+            vec!["argon".to_string()]
+        );
+        assert_eq!(
+            store.group_members("owners").unwrap(),
+            vec!["plutus".to_string()]
+        );
+        assert_eq!(store.inbox(&argon.id, None).unwrap().len(), 1);
     }
 }

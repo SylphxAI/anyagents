@@ -85,16 +85,40 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
     // A boundary refuses a call that has no credential rather than answering
     // with nothing, so a client notices instead of reading an empty deployment.
     let socket = server::socket_path(data);
+    let admin_socket = data.join("admin.sock");
+    let prefer_admin = admin_socket.exists()
+        && ((method == "POST" && path == "/v1/agents")
+            || (method == "GET" && path == "/v1/agents")
+            || path.ends_with("/harness")
+            || path.ends_with("/model")
+            || path.ends_with("/rename")
+            || path.ends_with("/role")
+            || path.ends_with("/description")
+            || path.ends_with("/wake")
+            || path.ends_with("/pause")
+            || path.ends_with("/archive")
+            || path.starts_with("/v1/subagent-defaults")
+            || path.starts_with("/v1/profiles")
+            || path.starts_with("/v1/schedules")
+            || path.starts_with("/v1/browser")
+            || path.starts_with("/v1/send")
+            || path.contains("/schedules")
+            || path.contains("/conversation"));
+    let (primary_sock, secondary_sock) = if prefer_admin {
+        (&admin_socket, Some(&socket))
+    } else {
+        (&socket, admin_socket.exists().then_some(&admin_socket))
+    };
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|err| err.to_string())?;
     let body_clone = body.clone();
-    let answer = runtime.block_on(async {
+    let primary_res = runtime.block_on(async {
         tokio::time::timeout(
             TIMEOUT,
             crate::mcp::request(
-                &socket,
+                primary_sock,
                 method,
                 path,
                 body,
@@ -104,28 +128,50 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
         )
         .await
         .map_err(|_| "the server did not answer".to_string())?
-    })?;
-    let (mut status, mut bytes) = answer;
-    if status.as_u16() == 404 {
-        let admin_socket = data.join("admin.sock");
-        if admin_socket.exists()
-            && let Ok(Ok(fallback)) = runtime.block_on(async {
-                tokio::time::timeout(
-                    TIMEOUT,
-                    crate::mcp::request(
-                        &admin_socket,
-                        method,
-                        path,
-                        body_clone,
-                        agent_token.as_deref(),
-                        operator_token.as_deref(),
-                    ),
-                )
-                .await
-            })
-        {
-            (status, bytes) = fallback;
+    });
+    let (mut status, mut bytes) = match primary_res {
+        Ok(ans) => ans,
+        Err(primary_err) => {
+            if let Some(sec_sock) = secondary_sock {
+                runtime.block_on(async {
+                    tokio::time::timeout(
+                        TIMEOUT,
+                        crate::mcp::request(
+                            sec_sock,
+                            method,
+                            path,
+                            body_clone.clone(),
+                            agent_token.as_deref(),
+                            operator_token.as_deref(),
+                        ),
+                    )
+                    .await
+                    .map_err(|_| "the server did not answer".to_string())?
+                })?
+            } else {
+                return Err(primary_err);
+            }
         }
+    };
+    if !status.is_success()
+        && let Some(sec_sock) = secondary_sock
+        && let Ok(Ok(fallback)) = runtime.block_on(async {
+            tokio::time::timeout(
+                TIMEOUT,
+                crate::mcp::request(
+                    sec_sock,
+                    method,
+                    path,
+                    body_clone,
+                    agent_token.as_deref(),
+                    operator_token.as_deref(),
+                ),
+            )
+            .await
+        })
+        && (fallback.0.is_success() || status.as_u16() == 404)
+    {
+        (status, bytes) = fallback;
     }
     if !status.is_success() {
         let msg = error_message(&bytes);

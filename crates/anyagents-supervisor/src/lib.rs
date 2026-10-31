@@ -203,6 +203,10 @@ pub struct LiveState {
     pub quota_reset_at_ms: Option<i64>,
     pub restart_at_ms: Option<i64>,
     pub pid: Option<u32>,
+    pub live_harness: Option<String>,
+    pub live_model: Option<String>,
+    pub process_started_at_ms: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 /// Latest [`LiveState`] for each agent the supervisor has touched.
@@ -237,9 +241,8 @@ impl HealthBoard {
 /// have no wired, confirmed consumption acknowledgement.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
     match harness {
-        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok" => {
-            (DeliveryMode::Steer, SteerSupport::Yes)
-        }
+        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
+        | "sylphx" => (DeliveryMode::Steer, SteerSupport::Yes),
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -263,7 +266,6 @@ pub fn steer_name(steer: SteerSupport) -> &'static str {
 struct Slot {
     stop: Arc<AtomicBool>,
     woken: Arc<AtomicBool>,
-    busy: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
 }
@@ -489,6 +491,10 @@ fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
                 quota_reset_at_ms: None,
                 restart_at_ms: None,
                 pid: None,
+                live_harness: None,
+                live_model: None,
+                process_started_at_ms: None,
+                last_error: None,
             },
         );
     }
@@ -521,8 +527,10 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
         if let Some(slot) = workers.get_mut(&id) {
             let finished = slot.done.load(Ordering::SeqCst);
             let stopping = slot.stop.load(Ordering::SeqCst);
-            let busy = slot.busy.load(Ordering::SeqCst);
-            if (!finished && !stopping) || busy {
+            if !finished && !stopping {
+                slot.woken.store(true, Ordering::SeqCst);
+                drop(workers);
+                inner.clock.poke();
                 return;
             }
             let thread = slot.thread.take();
@@ -541,20 +549,16 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
     }
     let stop = Arc::new(AtomicBool::new(false));
     let woken = Arc::new(AtomicBool::new(false));
-    let busy = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
     let run_inner = Arc::clone(inner);
     let run_id = id.clone();
     let run_stop = Arc::clone(&stop);
     let run_woken = Arc::clone(&woken);
-    let run_busy = Arc::clone(&busy);
     let run_done = Arc::clone(&done);
     let thread = thread::Builder::new()
         .name("anyagents-agent".into())
         .spawn(move || {
-            if run_agent(run_inner, run_id, run_stop, run_woken) {
-                run_busy.store(true, Ordering::SeqCst);
-            }
+            let _ = run_agent(run_inner, run_id, run_stop, run_woken);
             run_done.store(true, Ordering::SeqCst);
         });
     let Ok(thread) = thread else {
@@ -565,7 +569,6 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
         Slot {
             stop,
             woken,
-            busy,
             done,
             thread: Some(thread),
         },
@@ -605,6 +608,11 @@ fn run_agent<H: Harness + 'static>(
         turns_recorded: 0,
         pending_recovery: false,
         completed_turn_in_session: false,
+        quota_started_at: None,
+        process_started_at: None,
+        process_profile_rotated_ms: 0,
+        last_error: None,
+        consecutive_turn_errors: 0,
     };
     session.run()
 }
@@ -665,6 +673,14 @@ struct Session<H: Harness> {
     /// Set once at least one turn has completed during this session, enabling
     /// automatic scale-to-zero (`archived`) for sub-agents when idle.
     completed_turn_in_session: bool,
+    /// Clock timestamp (`now_ms`) when the current quota wait began, so an
+    /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
+    /// can clear the quota hold before `reset_at`.
+    quota_started_at: Option<i64>,
+    process_started_at: Option<i64>,
+    process_profile_rotated_ms: i64,
+    last_error: Option<String>,
+    consecutive_turn_errors: u32,
 }
 
 impl<H: Harness + 'static> Session<H> {
@@ -728,7 +744,7 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    fn boot(&self) -> Boot<H> {
+    fn boot(&mut self) -> Boot<H> {
         let store = match Store::open(self.inner.store.data_dir().join("state.db")) {
             Ok(store) => store,
             Err(_) => return Boot::Retry,
@@ -744,17 +760,43 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    fn launch_harness(&self) -> Result<H, String> {
+    fn launch_harness(&mut self) -> Result<H, String> {
+        if let Ok(fresh) = self.inner.store.agent(&self.id) {
+            self.paths = AgentPaths::from_store(&self.inner.store, &fresh);
+            self.agent = fresh;
+        }
         let _ = fs::create_dir_all(&self.paths.config_dir);
         let _ = fs::create_dir_all(&self.paths.managed_work);
         let _ = fs::create_dir_all(&self.paths.work_dir);
-        (self.inner.launch)(LaunchRequest {
+        let rotated_ms =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        let res = (self.inner.launch)(LaunchRequest {
             agent: self.agent.clone(),
             data_dir: self.inner.store.data_dir().to_path_buf(),
             config_dir: self.paths.config_dir.clone(),
             work_dir: self.paths.work_dir.clone(),
             extra_env: self.inner.extra_env.clone(),
-        })
+        });
+        match &res {
+            Ok(_) => {
+                let rotated_advanced = rotated_ms > self.process_profile_rotated_ms;
+                self.process_started_at = Some(self.inner.clock.now_ms());
+                self.process_profile_rotated_ms = rotated_ms;
+                if rotated_advanced || self.consecutive_turn_errors == 0 {
+                    self.last_error = None;
+                    if rotated_advanced {
+                        self.consecutive_turn_errors = 0;
+                    }
+                }
+            }
+            Err(err) => {
+                self.last_error = Some(err.clone());
+            }
+        }
+        res
     }
 
     fn process_alive(&self) -> bool {
@@ -791,6 +833,18 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         None
                     },
+                    live_harness: health.process_alive.then(|| self.agent.harness.clone()),
+                    live_model: if health.process_alive {
+                        self.agent.model.clone()
+                    } else {
+                        None
+                    },
+                    process_started_at_ms: if health.process_alive {
+                        self.process_started_at
+                    } else {
+                        None
+                    },
+                    last_error: health.sign_in_fault.or_else(|| self.last_error.clone()),
                 }
             }
             None => {
@@ -803,6 +857,10 @@ impl<H: Harness + 'static> Session<H> {
                     quota_reset_at_ms: None,
                     restart_at_ms: self.restart_at,
                     pid: None,
+                    live_harness: None,
+                    live_model: None,
+                    process_started_at_ms: None,
+                    last_error: self.last_error.clone(),
                 }
             }
         };
@@ -810,10 +868,11 @@ impl<H: Harness + 'static> Session<H> {
     }
 
     fn wait_backoff(&mut self) -> bool {
+        let started_at = self.inner.clock.now_ms();
         if self.restart_at.is_none() {
             self.attempt = self.attempt.saturating_add(1);
             let delay = restart_delay_ms(self.attempt, salt_for(&self.id, self.attempt));
-            self.restart_at = Some(self.inner.clock.now_ms().saturating_add(delay));
+            self.restart_at = Some(started_at.saturating_add(delay));
         }
         self.publish();
         let Some(deadline) = self.restart_at else {
@@ -822,6 +881,15 @@ impl<H: Harness + 'static> Session<H> {
         while self.inner.clock.now_ms() < deadline {
             if self.stop.load(Ordering::SeqCst) {
                 return false;
+            }
+            let rotated =
+                fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .is_some_and(|ms| ms >= started_at);
+            if rotated {
+                self.attempt = 0;
+                break;
             }
             self.inner.clock.wait(Some(deadline), &self.woken);
         }
@@ -864,11 +932,31 @@ impl<H: Harness + 'static> Session<H> {
             .as_ref()
             .and_then(|delivery| delivery.harness().health().quota_reset_at_ms);
         let Some(reset_at) = reset_at else {
+            self.quota_started_at = None;
             return false;
         };
-        if self.inner.clock.now_ms() >= reset_at {
+        let now = self.inner.clock.now_ms();
+        let started_at = *self.quota_started_at.get_or_insert(now);
+        let rotated_after_start =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .is_some_and(|ms| ms >= started_at);
+        let cleared_after_start =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-quota-cleared-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .is_some_and(|ms| ms >= started_at);
+        let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
+            fresh.harness != self.agent.harness || fresh.model != self.agent.model
+        });
+        if rotated_after_start || cleared_after_start || config_switched || now >= reset_at {
+            self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
                 delivery.clear_quota();
+            }
+            if rotated_after_start || config_switched {
+                self.replace_process();
             }
             return false;
         }
@@ -895,6 +983,7 @@ impl<H: Harness + 'static> Session<H> {
                 // New mailbox messages just woke the session directly; any open
                 // turn from before a process restart is now superseded by them.
                 self.pending_recovery = false;
+                self.last_error = None;
                 self.written = self
                     .written
                     .saturating_add(delivered.clamp(0, u64::from(u32::MAX)) as u32);
@@ -905,6 +994,9 @@ impl<H: Harness + 'static> Session<H> {
                 // The mailbox has drained, so whatever the vendor reported for
                 // this burst is read once and recorded.
                 self.record_usage();
+                if self.try_apply_pending_switch() {
+                    return false;
+                }
                 if self.pending_recovery && self.recover_once() {
                     return false;
                 }
@@ -924,7 +1016,20 @@ impl<H: Harness + 'static> Session<H> {
                 self.replace_process();
                 false
             }
-            Err(anyagents_agent::Error::HarnessFailed(_)) => {
+            Err(anyagents_agent::Error::HarnessFailed(err)) => {
+                self.consecutive_turn_errors = self.consecutive_turn_errors.saturating_add(1);
+                let lower = err.to_ascii_lowercase();
+                let is_auth_401 = lower.contains("(401)")
+                    || lower.contains(" 401 ")
+                    || lower.contains("status 401")
+                    || lower.contains("http 401")
+                    || lower.contains("unauthorized")
+                    || lower.contains("invalid_api_key");
+                self.last_error = Some(err);
+                if is_auth_401 || self.consecutive_turn_errors >= 3 {
+                    self.pending_recovery = false;
+                }
+                self.publish();
                 if !self.wait_backoff() {
                     return false;
                 }
@@ -939,6 +1044,41 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
+    /// When a running agent's configured harness, model, or profile changed
+    /// while it was working, replace the live process automatically as soon as
+    /// the current turn and any background commands finish.
+    fn try_apply_pending_switch(&mut self) -> bool {
+        let (is_idle, pid) = {
+            let Some(delivery) = self.delivery.as_ref() else {
+                return false;
+            };
+            let health = delivery.harness().health();
+            (
+                health.turn_state == TurnState::Idle,
+                delivery.harness().process_id(),
+            )
+        };
+        if !is_idle || harness_has_inflight_processes(pid) {
+            return false;
+        }
+        let Ok(fresh) = self.inner.store.agent(&self.id) else {
+            return false;
+        };
+        let current_rotated_ms =
+            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        let config_changed = fresh.harness != self.agent.harness
+            || fresh.model != self.agent.model
+            || current_rotated_ms > self.process_profile_rotated_ms;
+        if !config_changed {
+            return false;
+        }
+        self.replace_process();
+        true
+    }
+
     /// Record the usage the harness served since the last row. It is read when
     /// the mailbox has drained, never holds a line back, and adds nothing while
     /// the harness has served nothing new.
@@ -951,12 +1091,15 @@ impl<H: Harness + 'static> Session<H> {
         let turns_served = delivery.harness().turns_served();
 
         if served == before {
-            if turns_served > self.turns_recorded
-                && delivery.harness().health().turn_state == TurnState::Idle
-            {
+            let health = delivery.harness().health();
+            if turns_served > self.turns_recorded && health.turn_state == TurnState::Idle {
                 self.turns_recorded = turns_served;
-                let _ = delivery.store().note_turn_completed(&self.id);
-                self.completed_turn_in_session = true;
+                if health.sign_in_fault.is_none() {
+                    let _ = delivery.store().note_turn_completed(&self.id);
+                    self.completed_turn_in_session = true;
+                    self.consecutive_turn_errors = 0;
+                    self.last_error = None;
+                }
             }
             return;
         }
@@ -976,26 +1119,40 @@ impl<H: Harness + 'static> Session<H> {
         if recorded {
             self.served = Some(served);
             self.written = 0;
-            self.turns_recorded = turns_served;
-            if delivery.harness().health().turn_state == TurnState::Idle {
-                let _ = delivery.store().note_turn_completed(&self.id);
-                self.completed_turn_in_session = true;
+            let health = delivery.harness().health();
+            if health.turn_state == TurnState::Idle {
+                self.turns_recorded = turns_served;
+                if health.sign_in_fault.is_none() {
+                    let _ = delivery.store().note_turn_completed(&self.id);
+                    self.completed_turn_in_session = true;
+                    self.consecutive_turn_errors = 0;
+                    self.last_error = None;
+                }
             }
         }
     }
 
-    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "archived"`)
-    /// once it has finished its turn and its mailbox is drained. Sending any future
-    /// message to the sub-agent automatically wakes and resumes it.
+    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "idle"`)
+    /// once it has finished its turn, its mailbox is drained, it has no active
+    /// child sub-agents, and its harness process has no in-flight background commands.
+    /// Its config directory and session are preserved so sending any future message
+    /// to the sub-agent automatically wakes and resumes it.
     fn try_auto_archive_subagent(&mut self) -> bool {
-        if self.agent.parent_id.is_none() || !self.completed_turn_in_session {
+        if self.agent.parent_id.is_none()
+            || !self.completed_turn_in_session
+            || self.last_error.is_some()
+        {
             return false;
         }
-        let archived = {
+        let scaled = {
             let Some(delivery) = self.delivery.as_ref() else {
                 return false;
             };
-            if delivery.harness().health().turn_state != TurnState::Idle {
+            let health = delivery.harness().health();
+            if health.turn_state != TurnState::Idle || health.sign_in_fault.is_some() {
+                return false;
+            }
+            if harness_has_inflight_processes(delivery.harness().process_id()) {
                 return false;
             }
             delivery
@@ -1003,7 +1160,7 @@ impl<H: Harness + 'static> Session<H> {
                 .complete_idle_subagent(&self.id)
                 .unwrap_or(false)
         };
-        if !archived {
+        if !scaled {
             return false;
         }
         self.stop.store(true, Ordering::SeqCst);
@@ -1040,8 +1197,28 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Ok(DeliverOutcome::Deferred) | Ok(DeliverOutcome::Quota { .. }) => false,
-            Err(anyagents_agent::Error::HarnessDown)
-            | Err(anyagents_agent::Error::HarnessFailed(_)) => {
+            Err(anyagents_agent::Error::HarnessDown) => {
+                if !self.wait_backoff() {
+                    return true;
+                }
+                self.replace_process();
+                true
+            }
+            Err(anyagents_agent::Error::HarnessFailed(err)) => {
+                self.consecutive_turn_errors = self.consecutive_turn_errors.saturating_add(1);
+                let lower = err.to_ascii_lowercase();
+                let is_auth_401 = lower.contains("(401)")
+                    || lower.contains(" 401 ")
+                    || lower.contains("status 401")
+                    || lower.contains("http 401")
+                    || lower.contains("unauthorized")
+                    || lower.contains("invalid_api_key");
+                self.last_error = Some(err);
+                if is_auth_401 || self.consecutive_turn_errors >= 3 {
+                    self.pending_recovery = false;
+                    self.publish();
+                    return false;
+                }
                 if !self.wait_backoff() {
                     return true;
                 }
@@ -1079,24 +1256,87 @@ impl<H: Harness + 'static> Session<H> {
     }
 }
 
+/// Return `true` when `root_pid` has any non-zombie descendant process in `/proc`
+/// other than an idle persistent sidecar (`anyagents ... mcp`, `codex-code-mode-host`,
+/// or `language_server_linux`) that itself has no child processes.
+fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
+    let Some(root_pid) = root_pid.filter(|&p| p > 0) else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return false;
+        };
+        let mut children_of: HashMap<u32, Vec<u32>> = HashMap::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(status) = fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let mut ppid = 0u32;
+            let mut state_ch = ' ';
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("PPid:") {
+                    ppid = rest.trim().parse::<u32>().unwrap_or(0);
+                } else if let Some(rest) = line.strip_prefix("State:") {
+                    state_ch = rest.trim().chars().next().unwrap_or(' ');
+                }
+            }
+            if ppid > 0 && !matches!(state_ch, 'Z' | 'X') {
+                children_of.entry(ppid).or_default().push(pid);
+            }
+        }
+        let Some(direct_children) = children_of.get(&root_pid) else {
+            return false;
+        };
+        for &cpid in direct_children {
+            let cmdline = fs::read(format!("/proc/{cpid}/cmdline"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|b| if b == 0 { b' ' } else { b })
+                .collect::<Vec<u8>>();
+            let cmd = String::from_utf8_lossy(&cmdline);
+            let cmd_trimmed = cmd.trim();
+            let is_persistent_sidecar = cmd_trimmed.contains(" mcp ")
+                || cmd_trimmed.ends_with(" mcp")
+                || cmd_trimmed.contains("codex-code-mode-host")
+                || cmd_trimmed.contains("language_server_linux");
+            if is_persistent_sidecar {
+                if children_of
+                    .get(&cpid)
+                    .is_some_and(|grandkids| !grandkids.is_empty())
+                {
+                    return true;
+                }
+            } else {
+                return true;
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = root_pid;
+        false
+    }
+}
+
 fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
-    for rel in [
-        "cache-home",
-        "state-home",
-        "tmp",
-        ".rustup",
-        ".cargo",
-        "data-home/opencode",
-        "opencode-session-id",
-        "claude-session-id",
-        ".claude/projects",
-        ".codex/sessions",
-    ] {
+    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
-    remove_path_with_seat(managed_work, seat_ids);
+    if !managed_work.join(".git").exists() {
+        remove_path_with_seat(managed_work, seat_ids);
+    }
 }
 
 #[cfg(unix)]
@@ -1250,6 +1490,7 @@ mod tests {
             "omp",
             "dsh",
             "grok",
+            "sylphx",
         ] {
             assert_eq!(
                 super::declared(harness),

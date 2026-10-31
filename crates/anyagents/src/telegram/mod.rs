@@ -10,6 +10,6 @@ pub(crate) use channel::outbound_call;
 pub use channel::{
     WebhookError, chat_member_is_in, close_poll, delete_chat_message, edit_message, pin_message,
     post_article, post_checklist, post_location, post_media, post_poll, post_text, react_message,
-    receive_webhook, record_chat,
+    receive_webhook, record_chat, sync_agent_telegram_bot_name,
 };
 pub use poller::Poller;

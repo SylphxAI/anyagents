@@ -20,6 +20,7 @@ use anyagents_supervisor::LaunchRequest;
 
 use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
+use crate::sylphx::SylphxHarness;
 
 pub enum VendorHarness {
     Claude(Box<ClaudeHarness>, PathBuf),
@@ -30,11 +31,18 @@ pub enum VendorHarness {
     Omp(Box<OmpHarness>, PathBuf),
     Dsh(Box<DshHarness>, PathBuf),
     Grok(Box<GrokHarness>, PathBuf),
+    Sylphx(Box<SylphxHarness>, PathBuf),
     Contract(Box<ContractHarness>),
 }
 
 impl VendorHarness {
     fn sync_session(&self) {
+        if let Self::Codex(harness, path) = self
+            && harness.thread_invalidated()
+        {
+            let _ = std::fs::remove_file(path);
+            return;
+        }
         let (session, path) = match self {
             Self::Claude(harness, path) => (harness.session_id(), Some(path)),
             Self::Codex(harness, path) => (harness.session_id(), Some(path)),
@@ -43,6 +51,7 @@ impl VendorHarness {
             Self::Omp(harness, path) => (harness.session_id(), Some(path)),
             Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
             Self::Grok(harness, path) => (harness.session_id(), Some(path)),
+            Self::Sylphx(harness, path) => (harness.session_id(), Some(path)),
             Self::OpenCode(_) | Self::Contract(_) => (None, None),
         };
         if let (Some(id), Some(path)) = (session, path) {
@@ -64,6 +73,9 @@ impl VendorHarness {
 fn adapter_config(config_dir: &Path, harness: &str) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config_dir.join("adapter.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    if value.get("mode").and_then(|v| v.as_str()) == Some("sylphx-native") {
+        return None;
+    }
     let named = value.get("harness").and_then(|item| item.as_str())?;
     (named == harness).then(|| config_dir.join("adapter.json"))
 }
@@ -163,7 +175,254 @@ pub fn child_env() -> Vec<(String, String)> {
     env
 }
 
+pub fn read_persisted_last_error(config_dir: &Path) -> Option<(Option<String>, Option<i64>)> {
+    let raw = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")).ok()?;
+    let val = serde_json::from_str::<serde_json::Value>(&raw).ok()?;
+    let rotated_ms = std::fs::read_to_string(config_dir.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let ts = val
+        .get("timestamp_ms")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    if ts <= rotated_ms {
+        return None;
+    }
+    let err = val
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let reset = val.get("quota_reset_at_ms").and_then(|v| v.as_i64());
+    Some((err, reset))
+}
+
+fn has_persisted_turn_error(config_dir: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(config_dir.join(".anyagents-last-error.json")) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    val.get("consecutive_turn_errors")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        > 0
+}
+
+pub fn detect_codex_session_turn_error(config_dir: &Path, min_ts_ms: i64) -> Option<String> {
+    if let Some((Some(err), None)) = read_persisted_last_error(config_dir)
+        && !err.trim().is_empty()
+    {
+        return Some(err);
+    }
+    let sessions_dir = config_dir.join("sessions");
+    if !sessions_dir.is_dir() {
+        return None;
+    }
+    let mut latest_file: Option<(std::time::SystemTime, PathBuf)> = None;
+    if let Ok(years) = std::fs::read_dir(&sessions_dir) {
+        for y in years.flatten() {
+            let Ok(months) = std::fs::read_dir(y.path()) else {
+                continue;
+            };
+            for m in months.flatten() {
+                let Ok(days) = std::fs::read_dir(m.path()) else {
+                    continue;
+                };
+                for d in days.flatten() {
+                    let Ok(files) = std::fs::read_dir(d.path()) else {
+                        continue;
+                    };
+                    for f in files.flatten() {
+                        let path = f.path();
+                        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                            continue;
+                        };
+                        if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                            continue;
+                        }
+                        let Ok(meta) = f.metadata() else {
+                            continue;
+                        };
+                        let Ok(mtime) = meta.modified() else {
+                            continue;
+                        };
+                        if latest_file
+                            .as_ref()
+                            .is_none_or(|(prev_m, _)| mtime > *prev_m)
+                        {
+                            latest_file = Some((mtime, path));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (mtime, path) = latest_file?;
+    let mtime_ms = mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if mtime_ms <= min_ts_ms {
+        return None;
+    }
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let tail_offset = len.saturating_sub(65_536);
+    if tail_offset > 0 {
+        let _ = file.seek(SeekFrom::Start(tail_offset));
+    }
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    let lines_iter: Box<dyn Iterator<Item = &str>> = if tail_offset > 0 {
+        Box::new(buf.lines().skip(1))
+    } else {
+        Box::new(buf.lines())
+    };
+    let mut consec_err = 0u32;
+    let mut last_err: Option<String> = None;
+    for line in lines_iter {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let t = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let payload = val.get("payload");
+        let pt = payload
+            .and_then(|p| p.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let role = payload
+            .and_then(|p| p.get("role"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if t == "token_usage_record"
+            || (t == "response_item"
+                && (role == "assistant"
+                    || matches!(pt, "function_call" | "custom_tool_call" | "reasoning")))
+        {
+            consec_err = 0;
+            last_err = None;
+        } else if t == "event_msg" && pt == "task_complete" {
+            let err_opt = payload
+                .and_then(|p| p.get("error"))
+                .and_then(|e| {
+                    e.get("message")
+                        .and_then(|m| m.as_str())
+                        .or_else(|| e.as_str())
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            if let Some(msg) = err_opt {
+                consec_err = consec_err.saturating_add(1);
+                last_err = Some(msg.to_string());
+            } else {
+                consec_err = 0;
+                last_err = None;
+            }
+        }
+    }
+    let err = last_err?;
+    let lower = err.to_ascii_lowercase();
+    let is_auth_401 = lower.contains("(401)")
+        || lower.contains(" 401 ")
+        || lower.contains("status 401")
+        || lower.contains("http 401")
+        || lower.contains("unauthorized")
+        || lower.contains("invalid_api_key")
+        || lower.contains("authentication failed");
+    if is_auth_401 || consec_err >= 3 {
+        Some(err)
+    } else {
+        None
+    }
+}
+
+pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at_ms: Option<i64>) {
+    let path = config_dir.join(".anyagents-last-error.json");
+    match error.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(err) => {
+            let now_ms = anyagents_core::now_ms();
+            let payload = serde_json::json!({
+                "error": err,
+                "quota_reset_at_ms": quota_reset_at_ms,
+                "timestamp_ms": now_ms,
+            });
+            let _ = std::fs::write(&path, payload.to_string());
+        }
+        None => {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    let config_dir = request.config_dir.clone();
+    let res = vendor_launch_inner(request);
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
+        match &res {
+            Ok(vh) => {
+                let h = vh.health();
+                if h.process_alive {
+                    if let Some((_, Some(reset_ms))) = read_persisted_last_error(&config_dir)
+                        && reset_ms > anyagents_core::now_ms()
+                    {
+                        // Keep active quota reset window intact.
+                    } else if has_persisted_turn_error(&config_dir) {
+                        // Keep active turn-level error intact until a turn succeeds or wake clears it.
+                    } else {
+                        persist_last_error(&config_dir, None, None);
+                    }
+                }
+            }
+            Err(err) => {
+                persist_last_error(&config_dir, Some(err), None);
+            }
+        }
+    }
+    res
+}
+
+fn read_muse_exit_error(config_dir: &Path) -> Option<String> {
+    for rel in [
+        "data-home/muse/serve-exit.jsonl",
+        ".local/share/muse/serve-exit.jsonl",
+        "muse/serve-exit.jsonl",
+    ] {
+        let path = config_dir.join(rel);
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(last_line) = text.lines().rev().find(|l| !l.trim().is_empty())
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(last_line)
+            && val.pointer("/reason/kind").and_then(|v| v.as_str()) == Some("error")
+            && let Some(detail) = val.pointer("/reason/detail").and_then(|v| v.as_str())
+            && !detail.trim().is_empty()
+        {
+            return Some(format!("muse serve exit error: {}", detail.trim()));
+        }
+    }
+    None
+}
+
+fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
+    let path = config_dir.join("data-home/opencode/log/opencode.log");
+    let text = std::fs::read_to_string(&path).ok()?;
+    for line in text.lines().rev() {
+        if line.contains("level=ERROR") {
+            return Some(format!("opencode serve error: {}", line.trim()));
+        }
+    }
+    None
+}
+
+fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> {
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = request
         .extra_env
@@ -236,176 +495,95 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         "MUSE_CONFIG_HOME".to_string(),
         request.config_dir.display().to_string(),
     ));
-    let parent_name = env
-        .iter()
-        .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
-        .map(|(_, v)| v.clone());
-    let seat_spec =
-        crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, parent_name.as_deref());
+    let store_opt = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
+    let seat_hint = store_opt
+        .as_ref()
+        .and_then(|s| crate::create::resolve_root_seat_hint(s, &request.agent))
+        .or_else(|| {
+            env.iter()
+                .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
+                .map(|(_, v)| v.clone())
+        });
+    let resolved_seat = store_opt
+        .as_ref()
+        .and_then(|s| crate::create::resolved_agent_seat_info(s, &request.agent))
+        .or_else(|| crate::sandbox::existing_config_seat(&request.config_dir));
+    let seat_spec = resolved_seat
+        .as_ref()
+        .and_then(|(user, _, _, spec_opt)| spec_opt.as_ref().map(|s| (user.clone(), s.clone())))
+        .or_else(|| {
+            crate::sandbox::seat_launch_spec_with_hint(&request.agent.name, seat_hint.as_deref())
+        });
     if request.agent.harness == "agy" {
         ensure_agy_steering_settings(&request.config_dir, &request.work_dir);
     }
+    if std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some() {
+        return Err(format!(
+            "harness config verification failed for {} ({}): config write suppressed",
+            request.agent.name, request.agent.harness
+        ));
+    }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         let _ = crate::install::record(&root, &request.agent.harness);
-        crate::create::write_agent_instructions(
-            &request.config_dir,
-            &request.agent,
-            parent_name.as_deref(),
-        );
-    }
-    if let Some((ref seat_user, ref seat_launch)) = seat_spec {
-        crate::create::ensure_seat_environment(&request.config_dir);
-        if let Ok(store) = anyagents_core::Store::open(request.data_dir.join("state.db")) {
-            crate::create::seed_harness_credentials(
-                &store,
+        if let Some(ref store) = store_opt {
+            crate::create::reconcile_agent_runtime_config(
+                store,
                 &request.data_dir,
                 &request.agent,
                 &request.config_dir,
+                &request.work_dir,
+            )
+            .map_err(|e| e.to_string())?;
+        } else {
+            crate::create::write_agent_instructions(
+                &request.config_dir,
+                &request.agent,
+                seat_hint.as_deref(),
             );
-            let _ = crate::operator::ensure(&store, &request.agent.id);
-            if request.agent.harness == "opencode"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::opencode_config::write(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "codex"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::mcp_config::write_codex_with_model(
-                    &request.config_dir.join("config.toml"),
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "agy"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::mcp_config::write_claude(
-                    &request.config_dir.join(".gemini/config/mcp_config.json"),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "omp"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::grok::write_omp_mcp_config(&request.config_dir, &exe, &mcp_args);
-            } else if request.agent.harness == "dsh"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::dsh::write_dsh_mcp_patch(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "grok"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::grok::write_grok_config(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "muse"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::muse_config::write(
-                    &request.config_dir,
-                    request.agent.model.as_deref(),
-                    &exe,
-                    &mcp_args,
-                );
-            } else if request.agent.harness == "claude-code"
-                && let Ok(exe) = std::env::current_exe()
-            {
-                let mcp_args = vec![
-                    "--data".to_string(),
-                    request.data_dir.display().to_string(),
-                    "mcp".to_string(),
-                    "--config".to_string(),
-                    request.config_dir.display().to_string(),
-                ];
-                let _ = crate::mcp_config::write_claude(
-                    &request.config_dir.join("mcp.json"),
-                    &exe,
-                    &mcp_args,
-                );
-                let _ = crate::mcp_config::write_claude(
-                    &request.config_dir.join(".claude.json"),
-                    &exe,
-                    &mcp_args,
-                );
-            }
+            crate::create::verify_harness_runtime_config(
+                &request.config_dir,
+                &request.agent.harness,
+                request.agent.model.as_deref(),
+            )
+            .map_err(|e| e.to_string())?;
         }
+    }
+    if let Some((ref seat_user, ref seat_launch)) = seat_spec {
+        crate::create::ensure_seat_environment(&request.config_dir);
         let cache_home = request.config_dir.join("cache-home");
         let _ = std::fs::create_dir_all(&cache_home);
         let tmp_dir = request.config_dir.join("tmp");
         let _ = std::fs::create_dir_all(&tmp_dir);
-        let _ = std::fs::create_dir_all(request.config_dir.join("data-home"));
-        let _ = std::fs::create_dir_all(request.config_dir.join("state-home"));
-        if let Some((_, _, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&request.agent.name, parent_name.as_deref())
-        {
-            crate::sandbox::share_config_with_seat(&request.config_dir, gid);
+        let data_home = request.config_dir.join("data-home");
+        let _ = std::fs::create_dir_all(&data_home);
+        let state_home = request.config_dir.join("state-home");
+        let _ = std::fs::create_dir_all(&state_home);
+        let xdg_config_home = if matches!(request.agent.harness.as_str(), "opencode" | "muse") {
+            request.config_dir.clone()
+        } else {
+            let dot_config = request.config_dir.join(".config");
+            let _ = std::fs::create_dir_all(&dot_config);
+            dot_config
+        };
+        if let Some((_, uid, gid, _)) = resolved_seat.or_else(|| {
+            crate::sandbox::seat_for_agent_with_hint(&request.agent.name, seat_hint.as_deref())
+                .map(|(u, uid, gid, _)| (u, uid, gid, None))
+        }) {
+            crate::sandbox::share_config_with_seat_uid(&request.config_dir, uid, gid);
         }
         crate::create::ensure_seat_op_config(&request.config_dir, seat_launch);
         env.push(("HOME".to_string(), request.config_dir.display().to_string()));
         env.push(("USER".to_string(), seat_user.clone()));
         env.push(("LOGNAME".to_string(), seat_user.clone()));
+        env.push((
+            "XDG_CONFIG_HOME".to_string(),
+            xdg_config_home.display().to_string(),
+        ));
+        env.push(("XDG_DATA_HOME".to_string(), data_home.display().to_string()));
+        env.push((
+            "XDG_STATE_HOME".to_string(),
+            state_home.display().to_string(),
+        ));
         env.push((
             "XDG_CACHE_HOME".to_string(),
             cache_home.display().to_string(),
@@ -455,6 +633,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         return Ok(VendorHarness::Contract(Box::new(harness)));
     }
     if request.agent.harness == "agy" {
+        crate::create::clear_stale_agy_quota_error_steps(&request.config_dir);
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         let session = session_from_file(&request.config_dir, "agy-session-id");
         let harness = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
@@ -517,6 +696,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
                 "--model".to_string(),
                 model,
                 "--disable-request-user-input".to_string(),
+                "--disable-sandbox".to_string(),
                 "--trust-workspace".to_string(),
                 "-c".to_string(),
                 "context.foreign_personal_rules=false".to_string(),
@@ -531,7 +711,13 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             &pairs(&env),
             Some(&request.work_dir),
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            read_muse_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
+        })?;
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !harness.health().process_alive {
+            return Err(read_muse_exit_error(&request.config_dir)
+                .unwrap_or_else(|| "muse serve exited during startup handshake".to_string()));
+        }
         let vh = VendorHarness::Muse(
             Box::new(harness),
             request.config_dir.join("muse-session-id"),
@@ -626,6 +812,32 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         );
         vh.sync_session();
         Ok(vh)
+    } else if request.agent.harness == "sylphx" {
+        let session = session_from_file(&request.config_dir, "sylphx-session-id");
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+        let mcp_args = vec![
+            "--data".to_string(),
+            request.data_dir.display().to_string(),
+            "mcp".to_string(),
+            "--config".to_string(),
+            request.config_dir.display().to_string(),
+        ];
+        let harness = SylphxHarness::start(
+            &request.config_dir,
+            &request.work_dir,
+            request.agent.model.as_deref(),
+            session.as_deref(),
+            &pairs(&env),
+            &exe,
+            &mcp_args,
+        )
+        .map_err(|err| err.to_string())?;
+        let vh = VendorHarness::Sylphx(
+            Box::new(harness),
+            request.config_dir.join("sylphx-session-id"),
+        );
+        vh.sync_session();
+        Ok(vh)
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
         // shares ~/.local/share/opencode/opencode.db with the desk's own
@@ -654,7 +866,9 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             Some(&request.work_dir),
             &request.config_dir,
         )
-        .map_err(|err| err.to_string())?;
+        .map_err(|err| {
+            read_opencode_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
+        })?;
         Ok(VendorHarness::OpenCode(Box::new(harness)))
     } else if request.agent.harness == "codex" {
         env.push((
@@ -716,7 +930,10 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
             args.push(request.agent.name.clone());
             if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
                 args.push("--disallowedTools".to_string());
-                args.push("Task,Agent".to_string());
+                args.push(
+                    "Task,Agent,TeamCreate,TeamDelete,SendMessage,ScheduleWakeup,Monitor,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification"
+                        .to_string(),
+                );
             }
             let sys_prompt = request.config_dir.join("SYSTEM_PROMPT.md");
             if sys_prompt.is_file() {
@@ -802,16 +1019,44 @@ pub(crate) fn ensure_agy_steering_settings(config_dir: &Path, work_dir: &Path) {
                 allow_arr.push(serde_json::Value::String("mcp(anyagents/*)".to_string()));
                 changed = true;
             }
-            if let Some(deny_arr) = perms_obj.get_mut("deny").and_then(|v| v.as_array_mut()) {
-                let before = deny_arr.len();
-                deny_arr.retain(|v| {
-                    !matches!(
-                        v.as_str(),
-                        Some("invoke_subagent" | "define_subagent" | "manage_subagents")
-                    )
-                });
-                if deny_arr.len() != before {
-                    changed = true;
+            let deny = perms_obj
+                .entry("deny".to_string())
+                .or_insert_with(|| serde_json::json!([]));
+            if !deny.is_array() {
+                *deny = serde_json::json!([]);
+                changed = true;
+            }
+            if let Some(deny_arr) = deny.as_array_mut() {
+                if std::env::var_os("ANYAGENTS_ALLOW_NATIVE_SUBAGENTS").is_none() {
+                    for tool in [
+                        "invoke_subagent",
+                        "define_subagent",
+                        "manage_subagents",
+                        "send_message",
+                        "schedule",
+                    ] {
+                        if !deny_arr.iter().any(|v| v.as_str() == Some(tool)) {
+                            deny_arr.push(serde_json::Value::String(tool.to_string()));
+                            changed = true;
+                        }
+                    }
+                } else {
+                    let before = deny_arr.len();
+                    deny_arr.retain(|v| {
+                        !matches!(
+                            v.as_str(),
+                            Some(
+                                "invoke_subagent"
+                                    | "define_subagent"
+                                    | "manage_subagents"
+                                    | "send_message"
+                                    | "schedule"
+                            )
+                        )
+                    });
+                    if deny_arr.len() != before {
+                        changed = true;
+                    }
                 }
             }
         }
@@ -894,6 +1139,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.deliver(message),
             Self::Dsh(harness, _) => harness.deliver(message),
             Self::Grok(harness, _) => harness.deliver(message),
+            Self::Sylphx(harness, _) => harness.deliver(message),
             Self::Contract(harness) => harness.deliver(message),
         };
         self.sync_session();
@@ -910,6 +1156,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.background(),
             Self::Dsh(harness, _) => harness.background(),
             Self::Grok(harness, _) => harness.background(),
+            Self::Sylphx(harness, _) => harness.background(),
             Self::Contract(harness) => harness.background(),
         }
     }
@@ -924,6 +1171,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.resume(session),
             Self::Dsh(harness, _) => harness.resume(session),
             Self::Grok(harness, _) => harness.resume(session),
+            Self::Sylphx(harness, _) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
         };
         self.sync_session();
@@ -940,6 +1188,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.cancel(),
             Self::Dsh(harness, _) => harness.cancel(),
             Self::Grok(harness, _) => harness.cancel(),
+            Self::Sylphx(harness, _) => harness.cancel(),
             Self::Contract(harness) => harness.cancel(),
         }
     }
@@ -955,6 +1204,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.health(),
             Self::Dsh(harness, _) => harness.health(),
             Self::Grok(harness, _) => harness.health(),
+            Self::Sylphx(harness, _) => harness.health(),
             Self::Contract(harness) => harness.health(),
         }
     }
@@ -969,6 +1219,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.input_ready(),
             Self::Dsh(harness, _) => harness.input_ready(),
             Self::Grok(harness, _) => harness.input_ready(),
+            Self::Sylphx(harness, _) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
         }
     }
@@ -984,6 +1235,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.last_usage(),
             Self::Dsh(harness, _) => harness.last_usage(),
             Self::Grok(harness, _) => harness.last_usage(),
+            Self::Sylphx(harness, _) => harness.last_usage(),
             Self::Contract(harness) => harness.last_usage(),
         }
     }
@@ -998,6 +1250,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.turns_served(),
             Self::Dsh(harness, _) => harness.turns_served(),
             Self::Grok(harness, _) => harness.turns_served(),
+            Self::Sylphx(harness, _) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
         }
     }
@@ -1012,6 +1265,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Dsh(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Grok(harness, _) => harness.quiet_for(id, quiet, patience),
+            Self::Sylphx(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
         }
     }
@@ -1026,6 +1280,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.ends_on_quiet(),
             Self::Dsh(harness, _) => harness.ends_on_quiet(),
             Self::Grok(harness, _) => harness.ends_on_quiet(),
+            Self::Sylphx(harness, _) => harness.ends_on_quiet(),
             Self::Contract(harness) => harness.ends_on_quiet(),
         }
     }
@@ -1040,6 +1295,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.clear_quota(),
             Self::Dsh(harness, _) => harness.clear_quota(),
             Self::Grok(harness, _) => harness.clear_quota(),
+            Self::Sylphx(harness, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
         }
     }
@@ -1054,6 +1310,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.process_id(),
             Self::Dsh(harness, _) => harness.process_id(),
             Self::Grok(harness, _) => harness.process_id(),
+            Self::Sylphx(harness, _) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
         }
     }
@@ -1068,6 +1325,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.watch_activity(notify),
             Self::Dsh(harness, _) => harness.watch_activity(notify),
             Self::Grok(harness, _) => harness.watch_activity(notify),
+            Self::Sylphx(harness, _) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
         }
     }
@@ -1104,6 +1362,16 @@ mod tests {
         assert_eq!(
             json["permissions"]["allow"],
             serde_json::json!(["mcp(anyagents/*)"])
+        );
+        assert_eq!(
+            json["permissions"]["deny"],
+            serde_json::json!([
+                "invoke_subagent",
+                "define_subagent",
+                "manage_subagents",
+                "send_message",
+                "schedule"
+            ])
         );
         assert_eq!(
             json["trustedWorkspaces"],

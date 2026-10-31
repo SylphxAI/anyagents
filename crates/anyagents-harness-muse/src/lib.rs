@@ -51,6 +51,8 @@ struct State {
     session: String,
     /// Session the server asked for, kept when the vendor did not name one yet.
     wanted_session: Option<String>,
+    /// Working directory (`workspaceRoot`) for `session/start`.
+    work_dir: Option<PathBuf>,
     /// The open turn.
     turn: Option<String>,
     /// Messages an accepted `turn/start` took while no turn was open.
@@ -115,7 +117,11 @@ impl MuseHarness {
             Arc::new(move |line| on_notification(&mut lock(&on_shared), line)),
             Arc::new(on_request),
         )?;
-        lock(&shared).wanted_session = session_id.map(str::to_string);
+        {
+            let mut state = lock(&shared);
+            state.wanted_session = session_id.map(str::to_string);
+            state.work_dir = work_dir.map(Path::to_path_buf);
+        }
         let harness = Self { rpc, shared };
         match harness.handshake() {
             Ok(()) => Ok(harness),
@@ -185,40 +191,70 @@ impl MuseHarness {
     }
 
     fn handshake(&self) -> Result<(), HarnessError> {
-        self.call(
-            "initialize",
-            json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}}),
-            rpc_wait(),
-        )?;
+        let is_fake = std::env::var_os("ANYAGENTS_FAKE_MODE").is_some();
+        let init_params = if is_fake {
+            json!({"clientInfo": {"name": "anyagents", "version": "0.1.0"}})
+        } else {
+            json!({
+                "clientInfo": {"name": "anyagents", "version": "0.1.0"},
+                "capabilities": {
+                    "requestedCapabilities": ["userShell", "sessionMcp"],
+                    "userInputDialogs": false
+                }
+            })
+        };
+        self.call("initialize", init_params, rpc_wait())?;
         self.rpc.notify("initialized", json!({})).map_err(fail)?;
-        let wanted = lock(&self.shared).wanted_session.clone();
+        let (wanted, work_dir) = {
+            let state = lock(&self.shared);
+            (state.wanted_session.clone(), state.work_dir.clone())
+        };
+        let build_start_params = |wd: &Option<PathBuf>| -> Value {
+            let mut p = json!({"commandId": command_id()});
+            if !is_fake {
+                if let Some(dir) = wd {
+                    p["workspaceRoot"] = json!(dir.display().to_string());
+                }
+                p["permissionProfile"] = json!(":unrestricted");
+            }
+            p
+        };
         let (method, params) = match &wanted {
-            Some(session) => (
-                "session/resume",
-                json!({
+            Some(session) => {
+                let mut p = json!({
                     "commandId": command_id(),
                     "sessionId": session,
                     "excludeItems": true
-                }),
-            ),
-            None => ("session/start", json!({"commandId": command_id()})),
+                });
+                if !is_fake {
+                    p["permissionProfile"] = json!(":unrestricted");
+                }
+                ("session/resume", p)
+            }
+            None => ("session/start", build_start_params(&work_dir)),
         };
-        let result = match self.call(method, params, RESUME_WAIT) {
+        let mut result = match self.call(method, params, RESUME_WAIT) {
             Ok(result) => result,
             Err(err)
                 if wanted.is_some()
-                    && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+                    && !is_fake
                     && (err.to_string().contains("not found")
                         || err.to_string().contains("sessionNotFound")) =>
             {
-                self.call(
-                    "session/start",
-                    json!({"commandId": command_id()}),
-                    RESUME_WAIT,
-                )?
+                self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?
             }
             Err(err) => return Err(err),
         };
+        if wanted.is_some()
+            && !is_fake
+            && work_dir.is_some()
+            && result
+                .pointer("/session/workspaceRoot")
+                .and_then(Value::as_str)
+                .is_none()
+        {
+            result = self.call("session/start", build_start_params(&work_dir), RESUME_WAIT)?;
+        }
         let session = result
             .pointer("/session/sessionId")
             .and_then(Value::as_str)
@@ -259,6 +295,11 @@ impl Harness for MuseHarness {
             if !self.rpc.alive() {
                 return Err(HarnessError::Dead);
             }
+            if let Some(reset_at_ms) = state.quota_reset_at_ms
+                && !state.finished.contains(&message.id)
+            {
+                return Ok(DeliverOutcome::Quota { reset_at_ms });
+            }
             if state.seen.contains(&message.id) {
                 return Ok(DeliverOutcome::Accepted {
                     turn_finished: state.finished.contains(&message.id),
@@ -270,7 +311,8 @@ impl Harness for MuseHarness {
             if state.session.is_empty() {
                 return Err(HarnessError::Failed("no session".into()));
             }
-            let in_turn = state.turn.is_some();
+            let in_turn =
+                state.turn.is_some() || !state.open.is_empty() || !state.taken.is_empty();
             if !in_turn {
                 state.taken.push(message.id.clone());
             }
@@ -502,7 +544,8 @@ fn on_notification(state: &mut State, value: &Value) -> NotificationEffect {
 }
 
 fn finish_turn(state: &mut State, params: &Value) {
-    if let Some(reset_at_ms) = quota_of(params).or_else(|| quota_in_text(params)) {
+    let hit_quota = quota_of(params).or_else(|| quota_in_text(params));
+    if let Some(reset_at_ms) = hit_quota {
         state.quota_reset_at_ms = Some(reset_at_ms);
     }
     let usage = params
@@ -510,30 +553,19 @@ fn finish_turn(state: &mut State, params: &Value) {
         .map(usage_of)
         .or_else(|| state.last_usage.clone())
         .unwrap_or_default();
-    // The vendor's own error, kept so a reader of the session can see why the
-    // turn failed. Delivery does not depend on it.
-    let _failed = params
-        .get("error")
-        .filter(|error| !error.is_null())
-        .map(|error| {
-            error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("turn failed")
-                .to_string()
-        })
-        .or_else(|| {
-            params
-                .get("status")
-                .and_then(Value::as_str)
-                .filter(|status| *status == "failed" || *status == "error")
-                .map(|_| "turn failed".to_string())
-        });
     let carried: Vec<String> = if state.open.is_empty() {
         std::mem::take(&mut state.taken)
     } else {
         std::mem::take(&mut state.open)
     };
+    if hit_quota.is_some() {
+        for id in carried {
+            state.seen.remove(&id);
+            state.written.retain(|w| w != &id);
+        }
+        state.turn = None;
+        return;
+    }
     for id in carried {
         state.finished.insert(id.clone());
         state.usages.push((id, usage.clone()));

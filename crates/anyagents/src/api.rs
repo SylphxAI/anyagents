@@ -9,9 +9,21 @@ pub struct AgentView {
     pub id: String,
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     pub harness: String,
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_harness: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_started_at_ms: Option<i64>,
+    #[serde(default)]
+    pub pending_switch: bool,
     pub workdir: Option<String>,
     pub state: String,
     pub process: String,
@@ -20,6 +32,10 @@ pub struct AgentView {
     pub delivery_mode: String,
     pub steer_support: String,
     pub quota_reset_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
     /// Age of the oldest message the harness has not taken yet.
     pub oldest_undelivered_age_ms: Option<i64>,
     /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
@@ -28,6 +44,58 @@ pub struct AgentView {
     /// Standing role description / current responsibilities (`instructions` column in SQLite).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-rhea`, `seat-worker`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_user: Option<String>,
+    /// Assigned OS seat numeric UID from the agent's `seat_launch` spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_uid: Option<u32>,
+    /// Assigned OS seat numeric GID from the agent's `seat_launch` spec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_gid: Option<u32>,
+    /// Active self-scheduled wakes (`at`, `every`) and event watches (`watch`) owned by this agent.
+    #[serde(default)]
+    pub schedules: Vec<ScheduleView>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ScheduleView {
+    pub id: String,
+    pub agent_id: String,
+    pub kind: String,
+    pub spec: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interval_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_fire_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_fired_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch_baseline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_observed: Option<String>,
+    pub state: String,
+    pub created_at_ms: i64,
+}
+
+impl From<anyagents_core::AgentSchedule> for ScheduleView {
+    fn from(s: anyagents_core::AgentSchedule) -> Self {
+        Self {
+            id: s.id,
+            agent_id: s.agent_id.to_string(),
+            kind: s.kind,
+            spec: s.spec,
+            prompt: s.prompt,
+            interval_ms: s.interval_ms,
+            next_fire_at_ms: s.next_fire_at_ms,
+            last_fired_at_ms: s.last_fired_at_ms,
+            watch_baseline: s.watch_baseline,
+            last_observed: s.last_observed,
+            state: s.state,
+            created_at_ms: s.created_at_ms,
+        }
+    }
 }
 
 fn default_harness() -> String {
@@ -37,13 +105,22 @@ fn default_harness() -> String {
 /// Body of `POST /v1/agents`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
+    #[serde(alias = "agent", alias = "id", alias = "agent_id", alias = "target")]
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     #[serde(default = "default_harness")]
     pub harness: String,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
     #[serde(default, alias = "description")]
@@ -58,6 +135,8 @@ pub struct CreateAgentRequest {
 pub struct GroupMemberView {
     pub id: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -268,9 +347,17 @@ pub struct Delivery {
     pub duplicate: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct SkippedDelivery {
+    pub to: String,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct SendResponse {
     pub deliveries: Vec<Delivery>,
+    #[serde(default)]
+    pub skipped: Vec<SkippedDelivery>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]

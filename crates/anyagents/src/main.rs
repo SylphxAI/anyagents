@@ -26,8 +26,10 @@ mod opencode_config;
 mod operator;
 mod reply;
 mod sandbox;
+mod schedule;
 mod server;
 mod signin;
+mod sylphx;
 mod telegram;
 mod ui;
 mod vendor;
@@ -52,6 +54,9 @@ struct Cli {
 enum Command {
     /// Run the server.
     Serve,
+    /// Run the authenticated admin API sidecar on `<data>/admin.sock`.
+    #[command(hide = true)]
+    ServeAdmin,
     /// Inspect server health, boundary/token state, installed harnesses, master profiles, and agents.
     Status {
         /// Output machine-readable JSON.
@@ -60,7 +65,7 @@ enum Command {
     },
     /// Sign an agent's harness or a server master profile in through the vendor's own command.
     SignIn {
-        /// Agent name or harness ID (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        /// Agent name or harness ID (`sylphx`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
         agent: String,
         /// Optional master profile name (e.g. `acct-1`, `acct-2`, `default`).
         #[arg(long)]
@@ -89,23 +94,41 @@ enum Command {
     /// List all agents and sub-agents with their parent, harness, model, state, and process health.
     Peers {
         /// Optional state filter: `running`, `archived`, or `all`.
-        #[arg(long)]
+        #[arg(short = 's', long)]
         state: Option<String>,
         /// Optional parent filter: agent name, `agt_...` id, `self`, or `root`.
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
+        /// Expand full multi-level sub-agent tree (`L1 -> L2 -> L3+`).
+        #[arg(short = 't', long)]
+        tree: bool,
+        /// Maximum sub-agent tree depth to expand (`0` = roots only, `1` = L1, `2` = L2, ...).
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Show wide table including `agt_...` IDs without terminal truncation.
+        #[arg(short = 'w', long)]
+        wide: bool,
     },
     /// List sub-agents or configure default sub-agent harness/model/profile (`anyagents subagents default ...`).
     Subagents {
         /// Optional action (`default`, `list`) or parent agent name (`self`, `all`, `<agent>`).
         parent: Option<String>,
         /// Optional state filter (`running`, `paused`, `archived`, or `all`).
-        #[arg(long)]
+        #[arg(short = 's', long)]
         state: Option<String>,
+        /// Expand full multi-level sub-agent tree (`L1 -> L2 -> L3+`).
+        #[arg(short = 't', long)]
+        tree: bool,
+        /// Maximum sub-agent tree depth to expand (`0` = roots only, `1` = L1, `2` = L2, ...).
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Show wide table including `agt_...` IDs without terminal truncation.
+        #[arg(short = 'w', long)]
+        wide: bool,
         /// Set sub-agent default to inherit parent's harness, model, and profile (`subagents default --inherit`).
         #[arg(long)]
         inherit: bool,
-        /// Set sub-agent default harness (`subagents default --harness opencode`).
+        /// Set sub-agent default harness (`subagents default --harness sylphx`).
         #[arg(long)]
         harness: Option<String>,
         /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#xhigh`).
@@ -132,6 +155,15 @@ enum Command {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
@@ -172,16 +204,21 @@ enum Command {
         /// Agent name or `agt_...` id.
         name: String,
     },
-    /// Store the provider key an agent's model runs on (API key mode), or bind a named provider profile.
+    /// Store the provider key an agent's model runs on (API key mode), bind a named provider profile, or switch its harness.
     Model {
         /// The agent name.
         agent: String,
+        /// Optional positional model ID (or pass `--model <id>`).
+        target_model: Option<String>,
         /// The provider origin, for example https://api.deepseek.com.
         #[arg(long = "base-url")]
         base_url: Option<String>,
         /// The model id the provider serves, for example deepseek-chat.
         #[arg(long)]
-        model: String,
+        model: Option<String>,
+        /// Optional target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        #[arg(long)]
+        harness: Option<String>,
         /// A file holding the key, on its own line. The key is never an argument.
         #[arg(long = "key-file")]
         key_file: Option<PathBuf>,
@@ -378,12 +415,21 @@ enum Command {
     /// and records its argv and stdin when `ANYAGENTS_FAKE_LOG` names a file.
     #[command(hide = true)]
     FakeOpencode,
-    /// Test double for a harness: obeys the adapter contract for the harness
-    /// named in `<config>`, an agent's `adapter.json`.
-    #[command(hide = true)]
+    /// Switch an existing agent's harness while preserving its identity, model, profile, workdir, history, and lifecycle state (or run the hidden test double when given a single `adapter.json` path).
     Harness {
-        /// The `adapter.json` the agent was created with.
+        /// Agent name (`owner-anymd`) or `agt_...` ID (or `adapter.json` path for the test double).
         config: PathBuf,
+        /// Target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        harness: Option<String>,
+        /// Optional target harness ID flag (`--harness codex`).
+        #[arg(long = "harness")]
+        harness_flag: Option<String>,
+        /// Optional model override (retains existing model when omitted).
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional `<provider>/<profile>` override (retains existing bound profile when omitted).
+        #[arg(long)]
+        profile: Option<String>,
     },
     /// Put one agent's mailbox into its harness now, if the running server has
     /// not. Reads the store directly, so it also covers a server that was just
@@ -408,7 +454,27 @@ enum Command {
         agent: Option<String>,
         /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
         description: Option<String>,
+        /// Optional short role label (`Spiron`, `Design`, `Revenue`, `Growth`, `Lead`, `Standards`, ...).
+        #[arg(long)]
+        role: Option<String>,
         /// Clear custom description.
+        #[arg(long)]
+        clear: bool,
+    },
+    /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
+    Rename {
+        /// Current agent name or `agt_...` ID.
+        agent: String,
+        /// New agent name (`[a-z0-9][a-z0-9_-]*`).
+        new_name: String,
+    },
+    /// Set or clear an agent's short role label (`anyagents role <agent> <role>`).
+    Role {
+        /// Target agent name or `agt_...` ID.
+        agent: String,
+        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        role: Option<String>,
+        /// Clear the role label.
         #[arg(long)]
         clear: bool,
     },
@@ -433,6 +499,9 @@ enum Command {
         /// Explicit text override for `fill` / `type`.
         #[arg(long)]
         text: Option<String>,
+        /// Secret reference (`op://vault/item/field` or `op-otp://vault/item`) resolved in memory for `fill` / `type`.
+        #[arg(long = "secret-ref")]
+        secret_ref: Option<String>,
         /// Explicit JS code override for `eval`.
         #[arg(long)]
         script: Option<String>,
@@ -448,9 +517,52 @@ enum Command {
         /// Wait duration in milliseconds after `open` or `click`.
         #[arg(long = "wait-ms")]
         wait_ms: Option<u64>,
+        /// Hold duration in milliseconds for `press` / `hold` (`keydown` held across rendered frames, then `keyup`).
+        #[arg(long = "hold-ms", alias = "duration-ms")]
+        hold_ms: Option<u64>,
+        /// Key name override for `press` / `hold` / `key_down` / `key_up`.
+        #[arg(long)]
+        key: Option<String>,
+        /// Emit repeated `keydown` events (`autoRepeat: true`) while holding a key.
+        #[arg(long)]
+        repeat: bool,
         /// Force headless mode (`false` by default: uses `xvfb-run` real headed GUI for anti-detect stealth).
         #[arg(long)]
         headless: Option<bool>,
+    },
+    /// Schedule one-off (`--at`), recurring (`--every`), or event-watch (`--watch`) wakes, or list/cancel (`--cancel`) schedules.
+    Schedule {
+        /// Optional target agent name or `agt_...` id (defaults to this agent when run inside an agent).
+        agent: Option<String>,
+        /// One-off wake time (`1m`, `30s`, `2026-10-29T16:30:00Z`).
+        #[arg(long)]
+        at: Option<String>,
+        /// Recurring wake interval (`1m`, `5m`, `15m`, `1h`).
+        #[arg(long)]
+        every: Option<String>,
+        /// Event watch (`github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`).
+        #[arg(long)]
+        watch: Option<String>,
+        /// Prompt delivered when the schedule or event watch fires.
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Cancel schedule by `sch_...` ID or `all`.
+        #[arg(long)]
+        cancel: Option<String>,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect an agent's live state, schedules, quota/block status, and recent conversation turns.
+    Inspect {
+        /// Agent name or `agt_...` ID (defaults to `self` inside an agent).
+        agent: Option<String>,
+        /// Number of recent turns to include (default 10).
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Output machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -512,9 +624,29 @@ enum AgentsCommand {
     GrantAdmin { agent: String },
     /// Revoke administrative authority immediately (operator only).
     RevokeAdmin { agent: String },
+    /// Rename an agent in place while preserving its `agt_...` ID, history, mailbox, grants, seat, and Telegram binding, and keeping the old name as a live alias.
+    Rename {
+        /// Current agent name or `agt_...` ID.
+        agent: String,
+        /// New agent name (`[a-z0-9][a-z0-9_-]*`).
+        new_name: String,
+    },
+    /// Set or clear an agent's short role label (`anyagents agents role <agent> <role>`).
+    Role {
+        /// Target agent name or `agt_...` ID.
+        agent: String,
+        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        role: Option<String>,
+        /// Clear the role label.
+        #[arg(long)]
+        clear: bool,
+    },
     /// Record an agent. The harness is a catalog key.
     Create {
         name: String,
+        /// Optional short role label (`Spiron`, `Design`, `Revenue`, ...).
+        #[arg(long)]
+        role: Option<String>,
         #[arg(long, default_value = "")]
         harness: String,
         #[arg(long)]
@@ -522,6 +654,15 @@ enum AgentsCommand {
         /// Optional upstream provider account profile (e.g. `acct-a`, `acct-b`, `anthropic/acct-b`).
         #[arg(long)]
         profile: Option<String>,
+        /// Optional repository (`<org>/<repo>`, local repo path, or `inherit`) to provision a managed Git worktree.
+        #[arg(long)]
+        repo: Option<String>,
+        /// Optional Git branch name for the managed worktree when `--repo` is set (defaults to `agent/<name>`).
+        #[arg(long)]
+        branch: Option<String>,
+        /// Optional starting Git ref/branch when `--repo` is set (defaults to `origin/HEAD`).
+        #[arg(long)]
+        base: Option<String>,
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
@@ -542,11 +683,20 @@ enum AgentsCommand {
     /// List agents.
     List {
         /// Optional state filter: `running`, `paused`, `archived`, or `all`.
-        #[arg(long)]
+        #[arg(short = 's', long)]
         state: Option<String>,
         /// Optional parent filter: agent name, `agt_...` id, `self`, or `root`.
-        #[arg(long)]
+        #[arg(short = 'p', long)]
         parent: Option<String>,
+        /// Expand full multi-level sub-agent tree (`L1 -> L2 -> L3+`).
+        #[arg(short = 't', long)]
+        tree: bool,
+        /// Maximum sub-agent tree depth to expand (`0` = roots only, `1` = L1, `2` = L2, ...).
+        #[arg(short = 'd', long)]
+        depth: Option<usize>,
+        /// Show wide table including `agt_...` IDs without terminal truncation.
+        #[arg(short = 'w', long)]
+        wide: bool,
     },
     /// View or update an agent's standing role instructions and refresh its injected system prompt.
     Instructions {
@@ -557,6 +707,22 @@ enum AgentsCommand {
         /// Clear custom standing instructions.
         #[arg(long)]
         clear: bool,
+    },
+    /// Switch an existing agent's harness in place while preserving its identity, model, profile, workdir, history, and lifecycle state.
+    Harness {
+        /// Agent name or `agt_...` id.
+        name: String,
+        /// Target harness ID (`codex`, `opencode`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        harness: Option<String>,
+        /// Target harness ID flag (`--harness codex`).
+        #[arg(long = "harness")]
+        harness_flag: Option<String>,
+        /// Optional model override (retains existing model when omitted).
+        #[arg(long)]
+        model: Option<String>,
+        /// Optional `<provider>/<profile>` override (retains existing bound profile when omitted).
+        #[arg(long)]
+        profile: Option<String>,
     },
 }
 
@@ -573,7 +739,8 @@ fn main() -> ExitCode {
 
 fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
     if raw == Path::new(".anyagents")
-        && !raw.exists()
+        && (!raw.exists()
+            || (!raw.join("anyagents.sock").exists() && !crate::sandbox::is_isolated_test_env()))
         && let Some(env_dir) = data::data_dir()
     {
         return env_dir;
@@ -585,6 +752,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     let data = resolve_data_dir(cli.data, matches!(cli.command, Command::Serve));
     match cli.command {
         Command::Serve => server::run(&data),
+        Command::ServeAdmin => server::run_admin(&data),
         Command::Status { json } => status_cmd(&data, json),
         Command::SignIn { agent, profile } => sign_in(&data, &agent, profile.as_deref()),
         Command::Harnesses { action } => match action {
@@ -609,14 +777,51 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::AgentRun { config, command } => sandbox::run(&data, config.as_deref(), &command),
         Command::Boundary => print_boundary(&data),
         Command::FakeOpencode => fake_opencode::run(),
-        Command::Harness { config } => harness_double::run(&config),
-        Command::Agents { action } => agent::agents(&data, action),
-        Command::Peers { state, parent } => {
-            agent::peers(&data, state.as_deref(), parent.as_deref())
+        Command::Harness {
+            config,
+            harness,
+            harness_flag,
+            model,
+            profile,
+        } => {
+            if let Some(target_harness) = harness
+                .as_deref()
+                .or(harness_flag.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                agent::harness_cmd(
+                    &data,
+                    &config.to_string_lossy(),
+                    target_harness,
+                    model.as_deref(),
+                    profile.as_deref(),
+                )
+            } else {
+                harness_double::run(&config)
+            }
         }
+        Command::Agents { action } => agent::agents(&data, action),
+        Command::Peers {
+            state,
+            parent,
+            tree,
+            depth,
+            wide,
+        } => agent::peers_with_options(
+            &data,
+            state.as_deref(),
+            parent.as_deref(),
+            tree,
+            depth,
+            wide,
+        ),
         Command::Subagents {
             parent,
             state,
+            tree,
+            depth,
+            wide,
             inherit,
             harness,
             model,
@@ -653,7 +858,14 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
                         Some("subagents".to_owned())
                     }
                 });
-                agent::peers(&data, state.as_deref(), parent_filter.as_deref())
+                agent::peers_with_options(
+                    &data,
+                    state.as_deref(),
+                    parent_filter.as_deref(),
+                    tree,
+                    depth,
+                    wide,
+                )
             }
         }
         Command::Spawn {
@@ -661,6 +873,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             harness,
             model,
             profile,
+            repo,
+            branch,
+            base,
             workdir,
             instructions,
             parent,
@@ -671,6 +886,9 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             harness,
             model,
             profile,
+            repo,
+            branch,
+            base,
             workdir,
             instructions,
             parent,
@@ -684,18 +902,24 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Flush { agent } => agent::flush(&data, &agent),
         Command::Model {
             agent,
+            target_model,
             base_url,
             model,
+            harness,
             key_file,
             profile,
-        } => model_cmd(
-            &data,
-            &agent,
-            base_url.as_deref(),
-            &model,
-            key_file.as_deref(),
-            profile.as_deref(),
-        ),
+        } => {
+            let resolved_model = model.or(target_model);
+            model_cmd(
+                &data,
+                &agent,
+                base_url.as_deref(),
+                resolved_model.as_deref(),
+                harness.as_deref(),
+                key_file.as_deref(),
+                profile.as_deref(),
+            )
+        }
         Command::Send {
             to,
             text,
@@ -874,8 +1098,13 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Describe {
             agent,
             description,
+            role,
             clear,
-        } => agent::describe_cmd(&data, agent, description, clear),
+        } => agent::describe_cmd(&data, agent, description, role, clear),
+        Command::Rename { agent, new_name } => agent::rename_cmd(&data, &agent, &new_name),
+        Command::Role { agent, role, clear } => {
+            agent::role_cmd(&data, &agent, role.as_deref(), clear)
+        }
         Command::Browser {
             action,
             target,
@@ -884,17 +1113,263 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             url,
             selector,
             text,
+            secret_ref,
             script,
             path,
             submit,
             full_page,
             wait_ms,
+            hold_ms,
+            key,
+            repeat,
             headless,
         } => browser_cmd(
-            &data, action, target, value, profile, url, selector, text, script, path, submit,
-            full_page, wait_ms, headless,
+            &data, action, target, value, profile, url, selector, text, secret_ref, script, path,
+            submit, full_page, wait_ms, hold_ms, key, repeat, headless,
         ),
+        Command::Schedule {
+            agent,
+            at,
+            every,
+            watch,
+            prompt,
+            cancel,
+            json,
+        } => schedule_cmd(&data, agent, at, every, watch, prompt, cancel, json),
+        Command::Inspect { agent, limit, json } => inspect_cmd(&data, agent, limit, json),
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_cmd(
+    data: &Path,
+    agent: Option<String>,
+    at: Option<String>,
+    every: Option<String>,
+    watch: Option<String>,
+    prompt: Option<String>,
+    cancel: Option<String>,
+    json: bool,
+) -> Result<(), anyagents_core::Error> {
+    let target = agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+        .or_else(|| client::agent_identity().map(|id| id.to_string()));
+    let action = if cancel.is_some() {
+        "cancel"
+    } else if at.is_some() || every.is_some() || watch.is_some() {
+        "set"
+    } else {
+        "list"
+    };
+    let body = serde_json::json!({
+        "action": action,
+        "at": at,
+        "every": every,
+        "watch": watch,
+        "prompt": prompt,
+        "id": cancel,
+        "agent": target,
+    });
+    if client::can_call_server(data) {
+        let path = match target.as_deref() {
+            Some(t) => format!("/v1/agents/{t}/schedules"),
+            None => "/v1/schedules".to_string(),
+        };
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+        if let Ok(Some(val)) = client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &path,
+            Some(bytes),
+            &client::authority(data),
+        ) {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&val)
+                        .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            } else if let Some(s) = val.get("schedule") {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    s.get("id").and_then(|v| v.as_str()).unwrap_or("-"),
+                    s.get("kind").and_then(|v| v.as_str()).unwrap_or("-"),
+                    s.get("spec").and_then(|v| v.as_str()).unwrap_or("-"),
+                    s.get("prompt").and_then(|v| v.as_str()).unwrap_or("-")
+                );
+            } else if let Some(arr) = val.get("schedules").and_then(|v| v.as_array()) {
+                for s in arr {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        s.get("id").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("kind").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("spec").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("state").and_then(|v| v.as_str()).unwrap_or("-"),
+                        s.get("prompt").and_then(|v| v.as_str()).unwrap_or("-")
+                    );
+                }
+            } else {
+                println!("{val}");
+            }
+            return Ok(());
+        }
+    }
+    let store = anyagents_core::Store::open(data.join("state.db"))?;
+    let target_name = target.ok_or_else(|| {
+        anyagents_core::Error::Message("schedule requires an agent name or id".into())
+    })?;
+    let rec = store.agent_by_name(&target_name)?;
+    match action {
+        "cancel" => {
+            let cid = cancel.unwrap_or_default();
+            let count = schedule::cancel_agent_schedule(&store, &rec.id, &cid)
+                .map_err(anyagents_core::Error::Message)?;
+            let out = serde_json::json!({
+                "agent_id": rec.id.to_string(),
+                "agent": rec.name,
+                "cancelled": count,
+                "schedules": schedule::list_agent_schedules(&store, &rec.id, false),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out)
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+            );
+        }
+        "set" => {
+            let prompt_text = prompt.unwrap_or_default();
+            let health = anyagents_supervisor::HealthBoard::default();
+            let created = schedule::create_agent_schedule(
+                &store,
+                &health,
+                &rec,
+                at.as_deref(),
+                every.as_deref(),
+                watch.as_deref(),
+                &prompt_text,
+            )
+            .map_err(anyagents_core::Error::Message)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "agent_id": rec.id.to_string(),
+                        "agent": rec.name,
+                        "schedule": created,
+                    }))
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            } else {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    created.id, created.kind, created.spec, created.prompt
+                );
+            }
+        }
+        _ => {
+            let list = schedule::list_agent_schedules(&store, &rec.id, false);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "agent_id": rec.id.to_string(),
+                        "agent": rec.name,
+                        "schedules": list,
+                    }))
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+                );
+            } else {
+                for s in list {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}",
+                        s.id, s.kind, s.spec, s.state, s.prompt
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn inspect_cmd(
+    data: &Path,
+    agent: Option<String>,
+    limit: usize,
+    _json: bool,
+) -> Result<(), anyagents_core::Error> {
+    let target = agent
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+        .or_else(|| client::agent_identity().map(|id| id.to_string()))
+        .ok_or_else(|| {
+            anyagents_core::Error::Message("inspect requires an agent name or id".into())
+        })?;
+    if client::can_call_server(data)
+        && let Ok(Some(mut listed)) = client::call::<api::AgentsResponse>(
+            data,
+            "GET",
+            "/v1/agents",
+            None,
+            &client::authority(data),
+        )
+    {
+        agent::reconcile_and_enrich_views(data, &mut listed.agents);
+        if let Some(view) = listed.agents.into_iter().find(|a| {
+            a.name.eq_ignore_ascii_case(&target)
+                || a.id == target
+                || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(&target))
+        }) {
+            let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
+            let conv = client::call::<api::ConversationResponse>(
+                data,
+                "GET",
+                &conv_path,
+                None,
+                &client::authority(data),
+            )
+            .ok()
+            .flatten();
+            let schedules = view.schedules.clone();
+            let out = serde_json::json!({
+                "agent": view,
+                "schedules": schedules,
+                "recent_turns": conv.map(|c| c.turns).unwrap_or_default(),
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&out)
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+            );
+            return Ok(());
+        }
+    }
+    let store = anyagents_core::Store::open(data.join("state.db"))?;
+    let rec = store.agent_by_name(&target)?;
+    let schedules = schedule::list_agent_schedules(&store, &rec.id, false);
+    let out = serde_json::json!({
+        "agent": {
+            "id": rec.id.to_string(),
+            "name": rec.name,
+            "role": rec.role,
+            "harness": rec.harness,
+            "model": rec.model,
+            "state": rec.state,
+            "schedules": schedules,
+        },
+        "schedules": schedules,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&out)
+            .map_err(|e| anyagents_core::Error::Message(e.to_string()))?
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -907,11 +1382,15 @@ fn browser_cmd(
     url: Option<String>,
     selector: Option<String>,
     text: Option<String>,
+    secret_ref: Option<String>,
     script: Option<String>,
     path: Option<String>,
     submit: bool,
     full_page: bool,
     wait_ms: Option<u64>,
+    hold_ms: Option<u64>,
+    key: Option<String>,
+    repeat: bool,
     headless: Option<bool>,
 ) -> Result<(), anyagents_core::Error> {
     let act = action.trim().to_ascii_lowercase();
@@ -921,8 +1400,12 @@ fn browser_cmd(
         url,
         selector,
         text,
-        secret_ref: None,
-        key: None,
+        secret_ref,
+        key,
+        keys: None,
+        hold_ms,
+        duration_ms: None,
+        repeat: repeat.then_some(true),
         script,
         path,
         submit: submit.then_some(true),
@@ -948,13 +1431,20 @@ fn browser_cmd(
             if req.selector.is_none() {
                 req.selector = target;
             }
-            if req.text.is_none() {
+            if req.text.is_none() && req.secret_ref.is_none() {
                 req.text = value;
             }
         }
-        "press" | "key" => {
+        "press" | "key" | "hold" | "key_down" | "keydown" | "key_up" | "keyup" | "release"
+        | "release_keys" => {
             if req.key.is_none() {
                 req.key = target;
+            }
+            if req.hold_ms.is_none()
+                && let Some(ms_str) = value.as_deref()
+                && let Ok(parsed) = ms_str.trim().parse::<u64>()
+            {
+                req.hold_ms = Some(parsed);
             }
         }
         "eval" | "evaluate" | "js" => {
@@ -1168,7 +1658,8 @@ fn model_cmd(
     data: &Path,
     agent: &str,
     base_url: Option<&str>,
-    model: &str,
+    model: Option<&str>,
+    harness: Option<&str>,
     key_file: Option<&Path>,
     profile: Option<&str>,
 ) -> Result<(), anyagents_core::Error> {
@@ -1178,13 +1669,25 @@ fn model_cmd(
             "profile cannot be combined with a key or base URL".into(),
         ));
     }
+    if let Some(target_harness) = harness.map(str::trim).filter(|s| !s.is_empty())
+        && key_file.is_none()
+        && base_url.is_none()
+    {
+        return agent::harness_cmd(data, agent, target_harness, model, profile);
+    }
+    let clean_model = model.map(str::trim).filter(|s| !s.is_empty());
+    let clean_profile = profile.map(str::trim).filter(|s| !s.is_empty());
+    if key_file.is_none() && base_url.is_none() && clean_model.is_none() && clean_profile.is_none()
+    {
+        return Err(Error::Message("model is required".into()));
+    }
     if client::can_call_server(data) {
         let key = key_file.map(std::fs::read_to_string).transpose()?;
         let body = serde_json::json!({
-            "model": model,
+            "model": clean_model,
             "base_url": base_url,
             "key": key,
-            "profile": profile,
+            "profile": clean_profile,
         });
         match client::call::<serde_json::Value>(
             data,
@@ -1204,16 +1707,27 @@ fn model_cmd(
             Err(err) => return Err(Error::Message(err)),
         }
     }
-    if let Some(profile) = profile {
+    if key_file.is_none() && base_url.is_none() {
+        if client::agent_identity().is_some() {
+            return Err(Error::Message(
+                "administrative authority required (agent session cannot bypass server boundary)"
+                    .into(),
+            ));
+        }
         let store = agent::open(data)?;
-        let rec = store.agent_by_name(agent)?;
-        create::bind_profile(&store, &rec, profile, model)?;
-        println!(
-            "{}",
-            serde_json::json!({"agent": rec.name, "model": model, "profile": profile})
-        );
+        let out = create::configure_agent_runtime(
+            &store,
+            data,
+            "operator",
+            agent,
+            None,
+            clean_model,
+            clean_profile,
+        )?;
+        println!("{out}");
         return Ok(());
     }
+    let model = clean_model.ok_or_else(|| Error::Message("model is required".into()))?;
     store_key(
         data,
         agent,
@@ -1271,6 +1785,36 @@ fn profiles_cmd(
             println!("{}", serde_json::json!({"provider": prov, "profile": prof}));
             Ok(())
         }
+        Some("refresh") | Some("reset") => {
+            create::force_refresh_provider_profiles(data, target);
+            list_profiles_cmd(data, target)
+        }
+        Some("models") | Some("catalog") => {
+            let catalogs = if client::can_call_server(data) {
+                let path = match target.map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(t) => format!("/v1/profiles/models?filter={t}"),
+                    None => "/v1/profiles/models".to_string(),
+                };
+                match client::call::<serde_json::Value>(
+                    data,
+                    "GET",
+                    &path,
+                    None,
+                    &client::authority(data),
+                ) {
+                    Ok(Some(val)) => val,
+                    Ok(None) | Err(_) => create::probe_profile_models_catalog(data, target),
+                }
+            } else {
+                create::probe_profile_models_catalog(data, target)
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&catalogs)
+                    .map_err(|e| Error::Message(e.to_string()))?
+            );
+            Ok(())
+        }
         Some("list") => list_profiles_cmd(data, target),
         other => list_profiles_cmd(data, other),
     }
@@ -1282,6 +1826,10 @@ fn profiles_cmd(
 fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyagents_core::Error> {
     let mut runner = signin::ProcessRunner;
     let mut sink = signin::TerminalSink;
+    let target = match target.trim() {
+        "sylphx-agent" | "sylphx_agent" => "sylphx",
+        other => other,
+    };
     if signin::signable(target) {
         let prof = profile
             .map(str::trim)
@@ -1319,8 +1867,8 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .is_some_and(|entries| entries.flatten().any(|e| e.file_name() != "profile.json"));
         if has_stored_creds && let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
             create::seed_harness_credentials(&store, data, &rec, &cfg);
-            if let Some((_, _, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
-                crate::sandbox::share_config_with_seat(&cfg, gid);
+            if let Some((_, uid, gid, _)) = crate::sandbox::seat_for_agent(&rec.name) {
+                crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
             println!("signed in\t{target}\t{}\tprofile:{normalized}", rec.harness);
             return Ok(());
@@ -1515,8 +2063,16 @@ fn apply_local_subagent_default(
 }
 
 fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_core::Error> {
-    let filter = filter.filter(|f| !f.trim().eq_ignore_ascii_case("list"));
-    let entries = if client::can_call_server(data) {
+    let filter = filter.filter(|f| {
+        let t = f.trim();
+        !t.is_empty()
+            && !t.eq_ignore_ascii_case("list")
+            && !t.eq_ignore_ascii_case("refresh")
+            && !t.eq_ignore_ascii_case("reset")
+    });
+    let mut entries = if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+        create::sync_and_list_provider_profiles(&store, data)
+    } else if client::can_call_server(data) {
         match client::call::<Vec<create::ProviderProfileEntry>>(
             data,
             "GET",
@@ -1530,67 +2086,33 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
                     "the server answered nothing".into(),
                 ));
             }
-            Err(err) if err.contains("404") => {
-                let store = anyagents_core::Store::open(data.join("state.db"))?;
-                create::sync_and_list_provider_profiles(&store, data)
-            }
             Err(err) => return Err(anyagents_core::Error::Message(err)),
         }
     } else {
         let store = anyagents_core::Store::open(data.join("state.db"))?;
         create::sync_and_list_provider_profiles(&store, data)
     };
+    create::enrich_profiles_usage(data, &mut entries);
+    let matches_filter = |e: &create::ProviderProfileEntry, f_trimmed: &str| -> bool {
+        e.provider == f_trimmed
+            || e.profile == f_trimmed
+            || format!("{}/{}", e.provider, e.profile) == f_trimmed
+            || e.compatible_harnesses.iter().any(|h| h == f_trimmed)
+    };
+    let filtered: Vec<create::ProviderProfileEntry> = entries
+        .into_iter()
+        .filter(|e| filter.is_none_or(|f| matches_filter(e, f.trim())))
+        .collect();
     if ui::is_pretty() {
-        println!("\n  {}\n", ui::bold_cyan("Provider Profiles"));
-        let mut table = ui::Table::new(&[
-            ("PROVIDER", false),
-            ("PROFILE", false),
-            ("KIND", false),
-            ("COMPATIBLE HARNESSES", false),
-            ("AGENTS", false),
-        ]);
-        for e in entries {
-            if let Some(f) = filter {
-                let f_trimmed = f.trim();
-                if e.provider != f_trimmed && !e.compatible_harnesses.iter().any(|h| h == f_trimmed)
-                {
-                    continue;
-                }
-            }
-            let kind_badge = match e.kind.as_str() {
-                "oauth" | "subscription" => ui::green(&e.kind),
-                "coding-plan" => ui::cyan(&e.kind),
-                _ => ui::yellow(&e.kind),
-            };
-            let harnesses = ui::dim(&e.compatible_harnesses.join(", "));
-            let agents = if e.assigned_agents.is_empty() {
-                ui::dim("-")
-            } else {
-                ui::bold(&e.assigned_agents.join(", "))
-            };
-            table.add_row(vec![
-                ui::bold(&e.provider),
-                e.profile,
-                kind_badge,
-                harnesses,
-                agents,
-            ]);
-        }
-        table.print();
-        println!();
+        ui::print_profiles_pretty(&filtered);
         return Ok(());
     }
     println!(
-        "{:<20}\t{:<10}\t{:<13}\t{:<44}\tAGENTS",
-        "PROVIDER", "PROFILE", "KIND", "COMPATIBLE HARNESSES"
+        "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\tAGENTS",
+        "PROVIDER", "PROFILE", "KIND", "USAGE / BALANCE", "COMPATIBLE HARNESSES"
     );
-    for e in entries {
-        if let Some(f) = filter {
-            let f_trimmed = f.trim();
-            if e.provider != f_trimmed && !e.compatible_harnesses.iter().any(|h| h == f_trimmed) {
-                continue;
-            }
-        }
+    for e in filtered {
+        let usage = e.usage.as_deref().unwrap_or("-");
         let harnesses = e.compatible_harnesses.join(",");
         let agents = if e.assigned_agents.is_empty() {
             "-".to_string()
@@ -1598,8 +2120,8 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
             e.assigned_agents.join(",")
         };
         println!(
-            "{:<20}\t{:<10}\t{:<13}\t{:<44}\t{}",
-            e.provider, e.profile, e.kind, harnesses, agents
+            "{:<20}\t{:<10}\t{:<13}\t{:<36}\t{:<44}\t{}",
+            e.provider, e.profile, e.kind, usage, harnesses, agents
         );
     }
     Ok(())
@@ -1663,7 +2185,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
 
     let provider_profiles = anyagents_core::Store::open(data.join("state.db"))
         .ok()
-        .map(|s| create::sync_and_list_provider_profiles(&s, data))
+        .map(|s| create::sync_and_list_provider_profiles_with_options(&s, data, false))
         .unwrap_or_default();
 
     let mut harness_rows = Vec::new();
@@ -1701,12 +2223,20 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
             {
                 for a in rows {
                     let (mode, steer) = anyagents_supervisor::declared(&a.harness);
+                    let seat_info = create::resolved_agent_seat_info(&store, &a);
+                    let aliases = store.agent_aliases(&a.id).unwrap_or_default();
                     fallback.push(api::AgentView {
                         id: a.id.to_string(),
                         name: a.name,
+                        role: a.role,
+                        aliases,
                         parent: a.parent_id.map(|p| p.to_string()),
                         harness: a.harness,
                         model: a.model,
+                        live_harness: None,
+                        live_model: None,
+                        process_started_at_ms: None,
+                        pending_switch: false,
                         workdir: a.workdir,
                         state: a.state,
                         process: "offline".to_string(),
@@ -1714,9 +2244,15 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         delivery_mode: anyagents_supervisor::mode_name(mode).to_string(),
                         steer_support: anyagents_supervisor::steer_name(steer).to_string(),
                         quota_reset_at_ms: None,
+                        block_reason: None,
+                        last_error: None,
                         oldest_undelivered_age_ms: None,
                         install: "recorded".to_string(),
                         description: a.instructions,
+                        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+                        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+                        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+                        schedules: schedule::list_agent_schedules(&store, &a.id, false),
                     });
                 }
             }
@@ -1914,13 +2450,26 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
         GroupsCommand::Members { group } => {
             let members = agent::group_members(data, &group)?;
             if ui::is_pretty() {
+                let role_map: std::collections::HashMap<String, Option<String>> =
+                    anyagents_core::Store::open(data.join("state.db"))
+                        .ok()
+                        .and_then(|s| s.list_agents().ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.name, a.role))
+                        .collect();
                 println!(
                     "\n  {}  {} members\n",
                     ui::bold_cyan(&format!("Group · {group}")),
                     ui::bold(&members.len().to_string())
                 );
                 for name in members {
-                    println!("  • {}", ui::bold(&name));
+                    let role = role_map.get(&name).and_then(|r| r.as_deref());
+                    let display = match role.map(str::trim).filter(|s| !s.is_empty()) {
+                        Some(r) => format!("{} {}", ui::bold(&name), ui::dim(&format!("· {r}"))),
+                        None => ui::bold(&name),
+                    };
+                    println!("  • {display}");
                 }
                 println!();
                 return Ok(());
@@ -1936,6 +2485,14 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
                     println!("  {}", ui::dim("No groups found."));
                     return Ok(());
                 }
+                let role_map: std::collections::HashMap<String, Option<String>> =
+                    anyagents_core::Store::open(data.join("state.db"))
+                        .ok()
+                        .and_then(|s| s.list_agents().ok())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|a| (a.name, a.role))
+                        .collect();
                 println!(
                     "\n  {}  {} total\n",
                     ui::bold_cyan("Groups"),
@@ -1944,10 +2501,17 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
                 let mut table =
                     ui::Table::new(&[("GROUP", false), ("COUNT", true), ("MEMBERS", false)]);
                 for (group, members) in list {
+                    let formatted_members: Vec<String> = members
+                        .iter()
+                        .map(|m| {
+                            let r = role_map.get(m).and_then(|v| v.as_deref());
+                            create::format_agent_display(m, r)
+                        })
+                        .collect();
                     table.add_row(vec![
                         ui::bold(&ui::cyan(&group)),
                         ui::dim(&members.len().to_string()),
-                        members.join(", "),
+                        formatted_members.join(", "),
                     ]);
                 }
                 table.print();

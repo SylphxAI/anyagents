@@ -192,11 +192,19 @@ fn answer(
                 json!({"ok": true, "result": batch})
             }
         }
-        "sendMessage" => {
+        "sendMessage" | "sendRichMessage" => {
+            let text = request["text"]
+                .as_str()
+                .or_else(|| request["rich_message"]["markdown"].as_str())
+                .unwrap_or_default()
+                .to_string();
+            let reply_to = request["reply_to_message_id"]
+                .as_i64()
+                .or_else(|| request["reply_parameters"]["message_id"].as_i64());
             sent.lock().unwrap().push(Sent {
                 chat_id: request["chat_id"].as_i64().unwrap(),
-                text: request["text"].as_str().unwrap_or_default().to_string(),
-                reply_to: request["reply_to_message_id"].as_i64(),
+                text,
+                reply_to,
                 thread: request["message_thread_id"].as_i64(),
             });
             let id = 900 + sent.lock().unwrap().len() as i64;

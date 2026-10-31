@@ -209,6 +209,9 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                 let root = reaper_root.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     crate::browser::reap_idle_browsers(&root);
+                    crate::create::sync_fresher_bound_agent_credentials(&root);
+                    #[cfg(unix)]
+                    crate::create::sync_canonical_skills(&root);
                 })
                 .await;
             }
@@ -231,6 +234,20 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                             );
                         }
                     }
+                })
+                .await;
+            }
+        });
+        let sched_store = Arc::clone(&store);
+        let sched_health = state.health.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                let st = Arc::clone(&sched_store);
+                let hb = sched_health.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::schedule::tick_schedules_once(&st, &hb, now_ms());
                 })
                 .await;
             }
@@ -260,7 +277,18 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     let app = Router::new()
         .route("/v1/agents", get(list_agents).post(create_agent_route))
         .route("/v1/agents/{name}/admin", post(set_admin_route))
+        .route("/v1/agents/{name}/rename", post(rename_agent_route))
+        .route("/v1/agents/{name}/role", post(role_agent_route))
         .route("/v1/agents/{name}/model", post(model_route))
+        .route("/v1/agents/{name}/harness", post(harness_route))
+        .route(
+            "/v1/agents/{name}/schedules",
+            get(list_schedules_route).post(schedules_action_route),
+        )
+        .route(
+            "/v1/schedules",
+            get(list_self_schedules_route).post(self_schedules_action_route),
+        )
         .route(
             "/v1/agents/{name}/description",
             get(get_description_route).post(set_description_route),
@@ -271,6 +299,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         )
         .route("/v1/browser", post(browser_route))
         .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+        .route("/v1/profiles/models", get(profile_models_route))
         .route(
             "/v1/subagent-defaults",
             get(get_subagent_defaults_route).post(set_subagent_defaults_route),
@@ -325,6 +354,626 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     drop(supervisor);
     let _ = std::fs::remove_file(&path);
     result.map_err(Error::from)
+}
+
+/// Serve the authenticated HTTP API on `<data>/admin.sock` without starting a
+/// second `Supervisor` or `Poller`. Allows newly shipped API routes (such as
+/// `POST /v1/agents/{name}/harness`) to answer authenticated callers across the
+/// OS seat boundary (`anyagents-sock`) while an existing `anyagents serve`
+/// daemon keeps running uninterrupted on `anyagents.sock`.
+#[derive(Default)]
+struct AdminReconcileState {
+    initialized: bool,
+    watermark_seq: std::collections::HashMap<String, i64>,
+    last_backoff_reset_ms: std::collections::HashMap<String, i64>,
+    flushing_sylphx: std::collections::HashSet<String>,
+}
+
+fn spawn_admin_sylphx_delivery(
+    data: PathBuf,
+    agent: Agent,
+    health: HealthBoard,
+    reconcile: Arc<std::sync::Mutex<AdminReconcileState>>,
+) {
+    std::thread::spawn(move || {
+        let (delivery_mode, steer_support) = declared(&agent.harness);
+        let cfg = anyagents_core::agent_config_dir(&data, &agent.id);
+        let work_dir = agent
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(&data, &agent.id));
+        health.publish(
+            &agent.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::InTurn,
+                delivery_mode,
+                steer_support,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: Some(std::process::id()),
+                live_harness: Some(agent.harness.clone()),
+                live_model: agent.model.clone(),
+                process_started_at_ms: Some(now_ms()),
+                last_error: None,
+            },
+        );
+        if let Ok(store) = Store::open(data.join("state.db")) {
+            let req = anyagents_supervisor::LaunchRequest {
+                agent: agent.clone(),
+                data_dir: data.clone(),
+                config_dir: cfg.clone(),
+                work_dir,
+                extra_env: Vec::new(),
+            };
+            match crate::vendor::vendor_launch(req) {
+                Ok(mut harness) => {
+                    while let Ok(Some(message)) = store.next_undelivered(&agent.id) {
+                        let outbound = anyagents_harness::OutboundMessage {
+                            id: message.id.as_str().to_string(),
+                            seq: message.seq,
+                            text: message.text.clone(),
+                            sender: message.sender.clone(),
+                            reply_to: message.reply_to.clone(),
+                            source_time_ms: message.source_time_ms,
+                            context: anyagents_harness::Context::default(),
+                        };
+                        match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
+                            Ok(_) => {
+                                let _ = store.note_delivered(&agent.id, message.seq);
+                                let _ = store.note_turn_completed(&agent.id);
+                                crate::vendor::persist_last_error(&cfg, None, None);
+                            }
+                            Err(err) => {
+                                let _ = store.note_turn_completed(&agent.id);
+                                crate::vendor::persist_last_error(&cfg, Some(&err.to_string()), None);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    crate::vendor::persist_last_error(&cfg, Some(&reason), None);
+                }
+            }
+        }
+        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+        health.publish(
+            &agent.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::Idle,
+                delivery_mode,
+                steer_support,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some(agent.harness.clone()),
+                live_model: agent.model.clone(),
+                process_started_at_ms: None,
+                last_error: persisted_err,
+            },
+        );
+        let mut guard = match reconcile.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.flushing_sylphx.remove(agent.id.as_str());
+    });
+}
+
+fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::{Read as _, Write as _};
+        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+        let Some((_, seat_uid, seat_gid, seat_spec)) =
+            create::resolved_agent_seat_info(store, agent)
+                .or_else(|| crate::sandbox::existing_config_seat(cfg))
+        else {
+            return false;
+        };
+        let uid_str = seat_uid.to_string();
+        let Ok(proc_entries) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        let mut found_pid_csrf: Option<(u32, String)> = None;
+        for entry in proc_entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u32>() else {
+                continue;
+            };
+            let Ok(status_text) = std::fs::read_to_string(entry.path().join("status")) else {
+                continue;
+            };
+            let matches_uid = status_text
+                .lines()
+                .find(|l| l.starts_with("Uid:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .is_some_and(|u| u == uid_str);
+            if !matches_uid {
+                continue;
+            }
+            let Ok(cmd_bytes) = std::fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let args: Vec<&str> = cmd_bytes
+                .split(|b| *b == 0)
+                .filter_map(|s| std::str::from_utf8(s).ok())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if args
+                .first()
+                .is_some_and(|p| p.ends_with("/agy") || *p == "agy")
+                && let Some(idx) = args.iter().position(|a| *a == "--csrf_token")
+                && let Some(csrf) = args.get(idx + 1)
+            {
+                found_pid_csrf = Some((pid, (*csrf).to_string()));
+                break;
+            }
+        }
+        let Some((pid, csrf)) = found_pid_csrf else {
+            return false;
+        };
+        let Ok(tcp_text) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) else {
+            return false;
+        };
+        let mut found_port: Option<u16> = None;
+        for line in tcp_text.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() > 9 && parts[3] == "0A" && parts[7] == uid_str {
+                if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
+                    && ip_hex == "0100007F"
+                    && let Ok(port) = u16::from_str_radix(port_hex, 16)
+                {
+                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+                    if let Ok(mut stream) =
+                        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+                    {
+                        let _ =
+                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                        let _ =
+                            stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+                        let req = format!(
+                            "POST /exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories HTTP/1.0\r\n\
+                             Host: 127.0.0.1:{port}\r\n\
+                             Content-Type: application/json\r\n\
+                             x-codeium-csrf-token: {csrf}\r\n\
+                             Content-Length: 2\r\n\
+                             Connection: close\r\n\r\n{{}}"
+                        );
+                        let mut resp = String::new();
+                        if stream.write_all(req.as_bytes()).is_ok()
+                            && stream.read_to_string(&mut resp).is_ok()
+                            && (resp.starts_with("HTTP/1.1 200")
+                                || resp.starts_with("HTTP/1.0 200"))
+                        {
+                            found_port = Some(port);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        let Some(port) = found_port else {
+            return false;
+        };
+        let log_path = cfg.join(".gemini/antigravity-cli/cli.log");
+        let expected = format!(
+            "Starting language server process with pid {pid}\nLanguage server listening on random port at {port} for HTTP\n"
+        );
+        if std::fs::read_to_string(&log_path)
+            .ok()
+            .is_some_and(|cur| cur.contains(&expected))
+        {
+            return true;
+        }
+        let _ = std::fs::remove_file(&log_path);
+        if std::fs::write(&log_path, &expected).is_ok() {
+            return true;
+        }
+        if let Some(spec) = seat_spec {
+            let parts: Vec<&str> = spec.split('\t').collect();
+            if let [launcher, u, g, grps] = parts.as_slice() {
+                let script = format!(
+                    "/bin/rm -f '{}' && printf '%s' '{}' > '{}' && /bin/chmod 664 '{}'",
+                    log_path.display(),
+                    expected,
+                    log_path.display(),
+                    log_path.display()
+                );
+                let _ = std::process::Command::new(launcher)
+                    .args([
+                        "--reuid",
+                        u,
+                        "--regid",
+                        g,
+                        "--groups",
+                        grps,
+                        "--no-new-privs",
+                        "--",
+                        "/bin/sh",
+                        "-c",
+                        &script,
+                    ])
+                    .status();
+            } else {
+                let _ = (seat_uid, seat_gid);
+            }
+        }
+        std::fs::read_to_string(&log_path)
+            .ok()
+            .is_some_and(|cur| cur.contains(&expected))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (store, cfg, agent);
+        false
+    }
+}
+
+fn reconcile_stopped_and_backed_off_agents(
+    store: &Store,
+    health: &HealthBoard,
+    data: &Path,
+    reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
+    now_ms: i64,
+) {
+    let Ok(agents) = store.list_agents() else {
+        return;
+    };
+    let mut guard = match reconcile.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !guard.initialized {
+        for agent in &agents {
+            let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
+            let has_lag = store
+                .lag(&agent.id, now_ms)
+                .ok()
+                .and_then(|l| l.oldest_undelivered_age_ms)
+                .is_some();
+            if !has_lag {
+                guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                continue;
+            }
+            let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+            let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+        }
+        guard.initialized = true;
+    }
+
+    for agent in &agents {
+        let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
+        let oldest_age_ms = store
+            .lag(&agent.id, now_ms)
+            .ok()
+            .and_then(|l| l.oldest_undelivered_age_ms);
+        if agent.state == "archived" || agent.state == "idle" {
+            if oldest_age_ms.is_some() {
+                let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+                let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+                let prev_wm = guard
+                    .watermark_seq
+                    .get(agent.id.as_str())
+                    .copied()
+                    .unwrap_or(delivered);
+                if max_seq > delivered && max_seq > prev_wm {
+                    let should_wake = undelivered.iter().filter(|m| m.seq > prev_wm).any(|m| {
+                        !(agent.parent_id.is_none()
+                            && m.text.trim_start().starts_with("[Sub-Agent Completed]"))
+                    });
+                    if should_wake {
+                        if store.set_agent_state(&agent.id, "running").is_ok() {
+                            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                            create::poke_agent_wake_socket(data, &agent.id);
+                            create::poke_agent_wake_socket_mail(data, &agent.id);
+                        }
+                    } else {
+                        guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                    }
+                }
+            } else {
+                guard.watermark_seq.insert(agent.id.to_string(), delivered);
+            }
+        } else if agent.state == "running" {
+            if agent.harness == "sylphx" {
+                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                let persisted_err =
+                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                if !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                    let (delivery_mode, steer_support) = declared(&agent.harness);
+                    health.publish(
+                        &agent.id,
+                        anyagents_supervisor::LiveState {
+                            process_alive: true,
+                            turn_state: anyagents_harness::TurnState::Idle,
+                            delivery_mode,
+                            steer_support,
+                            quota_reset_at_ms: None,
+                            restart_at_ms: None,
+                            pid: None,
+                            live_harness: Some(agent.harness.clone()),
+                            live_model: agent.model.clone(),
+                            process_started_at_ms: None,
+                            last_error: persisted_err.clone(),
+                        },
+                    );
+                }
+                if oldest_age_ms.is_some() && !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                    let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+                    let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+                    let prev_wm = guard
+                        .watermark_seq
+                        .get(agent.id.as_str())
+                        .copied()
+                        .unwrap_or(delivered);
+                    let last_try = guard
+                        .last_backoff_reset_ms
+                        .get(agent.id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    if persisted_err.is_none()
+                        || max_seq > prev_wm
+                        || now_ms.saturating_sub(last_try) >= 15_000
+                    {
+                        guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                        guard
+                            .last_backoff_reset_ms
+                            .insert(agent.id.to_string(), now_ms);
+                        guard.flushing_sylphx.insert(agent.id.to_string());
+                        spawn_admin_sylphx_delivery(
+                            data.to_path_buf(),
+                            agent.clone(),
+                            health.clone(),
+                            Arc::clone(reconcile),
+                        );
+                    }
+                } else if oldest_age_ms.is_none() {
+                    guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                }
+                continue;
+            }
+            if agent.harness == "codex" && store.has_open_turn(&agent.id).unwrap_or(false) {
+                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .unwrap_or(0);
+                if crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms).is_some() {
+                    let last_reset = guard
+                        .last_backoff_reset_ms
+                        .get(agent.id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    if now_ms.saturating_sub(last_reset) >= 60_000 {
+                        guard
+                            .last_backoff_reset_ms
+                            .insert(agent.id.to_string(), now_ms);
+                        let work_dir = agent
+                            .workdir
+                            .as_deref()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &agent.id));
+                        let _ = create::reconcile_agent_runtime_config(
+                            store, data, agent, &cfg, &work_dir,
+                        );
+                        let _ = std::fs::write(
+                            cfg.join(".anyagents-profile-rotated-ms"),
+                            now_ms.to_string(),
+                        );
+                        let _ = store.set_agent_state(&agent.id, "paused");
+                        create::poke_agent_wake_socket(data, &agent.id);
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let _ = store.set_agent_state(&agent.id, "running");
+                        create::poke_agent_wake_socket(data, &agent.id);
+                        create::poke_agent_wake_socket_mail(data, &agent.id);
+                        continue;
+                    }
+                }
+            }
+            if oldest_age_ms.is_none() {
+                guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                continue;
+            }
+            if agent.harness == "agy" && oldest_age_ms.is_some_and(|age| age >= 3_000) {
+                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                if sync_agy_cli_port_hint(store, &cfg, agent) {
+                    create::poke_agent_wake_socket_mail(data, &agent.id);
+                }
+            }
+            let is_down_without_quota = match health.get(&agent.id) {
+                Some(live) => {
+                    !live.process_alive
+                        && live.quota_reset_at_ms.is_none()
+                        && (live.restart_at_ms.is_none()
+                            || live.restart_at_ms.is_some_and(|r| r >= 15_000))
+                }
+                None => true,
+            };
+            if is_down_without_quota
+                && oldest_age_ms.is_some_and(|age| age >= 15_000)
+                && crate::schedule::agent_wake_block_reason(store, health, agent, now_ms)
+                    != Some("quota_blocked")
+            {
+                let last_reset = guard
+                    .last_backoff_reset_ms
+                    .get(agent.id.as_str())
+                    .copied()
+                    .unwrap_or(0);
+                if now_ms.saturating_sub(last_reset) >= 60_000 {
+                    guard
+                        .last_backoff_reset_ms
+                        .insert(agent.id.to_string(), now_ms);
+                    let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                    let _ = std::fs::write(
+                        cfg.join(".anyagents-profile-rotated-ms"),
+                        now_ms.to_string(),
+                    );
+                    let _ = store.set_agent_state(&agent.id, "paused");
+                    create::poke_agent_wake_socket(data, &agent.id);
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                    let _ = store.set_agent_state(&agent.id, "running");
+                    create::poke_agent_wake_socket(data, &agent.id);
+                    create::poke_agent_wake_socket_mail(data, &agent.id);
+                }
+            }
+        }
+    }
+}
+
+pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let store = Arc::new(Store::open(data.join("state.db"))?);
+    let res = runtime.block_on(async move {
+        let auth = deployment_mode(data);
+        let send_namespace = capability_key()?[..16].to_string();
+        let path = data.join("admin.sock");
+        if path.as_os_str().len() > MAX_SOCKET_PATH {
+            return Err(Error::Message(format!(
+                "socket path is longer than {MAX_SOCKET_PATH} bytes"
+            )));
+        }
+        prepare_socket(&path)?;
+        let listener = tokio::net::UnixListener::bind(&path)?;
+        set_socket_mode(&path)?;
+        if auth.is_confined() {
+            crate::sandbox::share_socket_with_seats(&path);
+        }
+        let health = HealthBoard::default();
+        sync_health_from_primary_socket(data, &health);
+        let sched_store = Arc::clone(&store);
+        let sched_health = health.clone();
+        let sched_data = data.to_path_buf();
+        let reconcile_state = Arc::new(std::sync::Mutex::new(AdminReconcileState::default()));
+        let sched_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            let mut ticks: u64 = 0;
+            loop {
+                interval.tick().await;
+                ticks = ticks.wrapping_add(1);
+                let sync_health = ticks.is_multiple_of(5);
+                let st = Arc::clone(&sched_store);
+                let hb = sched_health.clone();
+                let dd = sched_data.clone();
+                let rec = Arc::clone(&reconcile_state);
+                let _ = tokio::task::spawn_blocking(move || {
+                    if sync_health {
+                        sync_health_from_primary_socket(&dd, &hb);
+                    }
+                    let now = now_ms();
+                    reconcile_stopped_and_backed_off_agents(&st, &hb, &dd, &rec, now);
+                    crate::schedule::tick_schedules_once(&st, &hb, now);
+                })
+                .await;
+            }
+        });
+        let reaper_handle = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && !crate::sandbox::is_isolated_test_env()
+        {
+            let reaper_root = data.to_path_buf();
+            Some(tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let root = reaper_root.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::browser::reap_idle_browsers(&root);
+                        crate::create::sync_fresher_bound_agent_credentials(&root);
+                        #[cfg(unix)]
+                        crate::create::sync_canonical_skills(&root);
+                    })
+                    .await;
+                }
+            }))
+        } else {
+            None
+        };
+        let state = AppState {
+            send_namespace,
+            store: Arc::clone(&store),
+            health,
+            sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
+            auth,
+        };
+        let app = Router::new()
+            .route("/v1/agents", get(list_agents).post(create_agent_route))
+            .route("/v1/agents/{name}/admin", post(set_admin_route))
+            .route("/v1/agents/{name}/rename", post(rename_agent_route))
+            .route("/v1/agents/{name}/role", post(role_agent_route))
+            .route("/v1/agents/{name}/model", post(model_route))
+            .route("/v1/agents/{name}/harness", post(harness_route))
+            .route(
+                "/v1/agents/{name}/schedules",
+                get(list_schedules_route).post(schedules_action_route),
+            )
+            .route(
+                "/v1/schedules",
+                get(list_self_schedules_route).post(self_schedules_action_route),
+            )
+            .route(
+                "/v1/agents/{name}/description",
+                get(get_description_route).post(set_description_route),
+            )
+            .route(
+                "/v1/agents/{name}/instructions",
+                get(get_description_route).post(set_description_route),
+            )
+            .route("/v1/browser", post(browser_route))
+            .route("/v1/profiles", get(profiles_route).post(set_profile_route))
+            .route("/v1/profiles/models", get(profile_models_route))
+            .route(
+                "/v1/subagent-defaults",
+                get(get_subagent_defaults_route).post(set_subagent_defaults_route),
+            )
+            .route("/v1/channels", get(channels_route).post(add_channel_route))
+            .route("/v1/agents/{name}/inbox", get(inbox))
+            .route("/v1/agents/{name}/conversation", get(conversation_route))
+            .route("/v1/agents/{name}/archive", post(archive_agent_route))
+            .route("/v1/agents/{name}/pause", post(pause_agent_route))
+            .route("/v1/agents/{name}/wake", post(wake_agent_route))
+            .route(
+                "/v1/agents/{name}",
+                axum::routing::delete(delete_agent_route),
+            )
+            .route(
+                "/v1/groups",
+                get(list_groups_route).post(group_action_route),
+            )
+            .route("/v1/send", post(send))
+            .route("/v1/interact", post(interact_route))
+            .route(
+                "/v1/operator/agents/{name}/capability",
+                post(mint_capability),
+            )
+            .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
+            .route("/v1/whoami", get(whoami))
+            .with_state(state);
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let result = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = terminate.recv() => {}
+                }
+            })
+            .await;
+        sched_handle.abort();
+        if let Some(h) = reaper_handle {
+            h.abort();
+        }
+        let _ = std::fs::remove_file(&path);
+        result.map_err(Error::from)
+    });
+    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
+    res
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -601,10 +1250,444 @@ async fn set_admin_route(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ModelRequest {
-    model: String,
+    model: Option<String>,
+    harness: Option<String>,
     base_url: Option<String>,
     key: Option<String>,
     profile: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HarnessRequest {
+    harness: String,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+async fn harness_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<HarnessRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let actor = match &principal {
+            Principal::Agent {
+                agent_id,
+                name: caller_name,
+            } if found.parent_id.as_ref() == Some(agent_id) => {
+                format!("agent:{caller_name}")
+            }
+            _ => {
+                require_admin_or_operator(&state.store, &principal, "agents.harness", &found.name)?
+            }
+        };
+        let out = create::set_agent_harness(
+            &state.store,
+            state.store.data_dir(),
+            &actor,
+            &found.name,
+            &body.harness,
+            body.model.as_deref(),
+            body.profile.as_deref(),
+        )
+        .map_err(ApiError::from_store)?;
+        Ok(Json(out))
+    })
+    .await
+}
+
+fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
+    #[cfg(unix)]
+    {
+        use std::io::{Read as _, Write as _};
+        use std::os::unix::net::UnixStream;
+        let sock = data.join("anyagents.sock");
+        if !sock.exists() {
+            return;
+        }
+        let Ok(mut stream) = UnixStream::connect(&sock) else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(3000)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(3000)));
+        let auth_hdr = match crate::operator::operator_token(data) {
+            Some(tok) => format!("{}: {tok}\r\n", crate::operator::HEADER),
+            None => String::new(),
+        };
+        let req = format!(
+            "GET /v1/agents HTTP/1.0\r\nHost: localhost\r\n{auth_hdr}Connection: close\r\n\r\n"
+        );
+        if stream.write_all(req.as_bytes()).is_err() {
+            return;
+        }
+        let mut resp = String::new();
+        if stream.read_to_string(&mut resp).is_err() {
+            return;
+        }
+        let Some((head, body)) = resp.split_once("\r\n\r\n") else {
+            return;
+        };
+        if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
+            return;
+        }
+        let Some(start) = body.find('{') else {
+            return;
+        };
+        let Some(end) = body.rfind('}') else {
+            return;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&body[start..=end]) else {
+            return;
+        };
+        let Some(arr) = val.get("agents").and_then(serde_json::Value::as_array) else {
+            return;
+        };
+        for item in arr {
+            let Some(id_str) = item.get("id").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            let Ok(id) = anyagents_core::AgentId::parse(id_str) else {
+                continue;
+            };
+            let alive = item
+                .get("process")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|p| p == "alive");
+            let working = item
+                .get("turn_state")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|t| t == "working");
+            let harness_str = item
+                .get("harness")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("codex");
+            let (delivery_mode, steer_support) = declared(harness_str);
+            let raw_last_error = item
+                .get("last_error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if harness_str == "sylphx"
+                && raw_last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("unknown harness: sylphx"))
+            {
+                if health
+                    .get(&id)
+                    .is_some_and(|cur| cur.turn_state == anyagents_harness::TurnState::InTurn)
+                {
+                    continue;
+                }
+                let cfg = anyagents_core::agent_config_dir(data, &id);
+                let persisted_err =
+                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                health.publish(
+                    &id,
+                    anyagents_supervisor::LiveState {
+                        process_alive: true,
+                        turn_state: anyagents_harness::TurnState::Idle,
+                        delivery_mode,
+                        steer_support,
+                        quota_reset_at_ms: None,
+                        restart_at_ms: None,
+                        pid: None,
+                        live_harness: Some("sylphx".to_string()),
+                        live_model: item
+                            .get("model")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        process_started_at_ms: None,
+                        last_error: persisted_err,
+                    },
+                );
+                continue;
+            }
+            health.publish(
+                &id,
+                anyagents_supervisor::LiveState {
+                    process_alive: alive,
+                    turn_state: if working {
+                        anyagents_harness::TurnState::InTurn
+                    } else {
+                        anyagents_harness::TurnState::Idle
+                    },
+                    delivery_mode,
+                    steer_support,
+                    quota_reset_at_ms: item
+                        .get("quota_reset_at_ms")
+                        .and_then(serde_json::Value::as_i64),
+                    restart_at_ms: item
+                        .get("restart_at_ms")
+                        .and_then(serde_json::Value::as_i64),
+                    pid: None,
+                    live_harness: item
+                        .get("live_harness")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    live_model: item
+                        .get("live_model")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string),
+                    process_started_at_ms: item
+                        .get("process_started_at_ms")
+                        .and_then(serde_json::Value::as_i64),
+                    last_error: raw_last_error,
+                },
+            );
+        }
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct ScheduleRequest {
+    #[serde(default)]
+    action: Option<String>,
+    #[serde(default)]
+    at: Option<String>,
+    #[serde(default)]
+    every: Option<String>,
+    #[serde(default)]
+    watch: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default, alias = "schedule_id")]
+    id: Option<String>,
+    #[serde(default, alias = "name")]
+    agent: Option<String>,
+}
+
+fn authorize_schedule_target(
+    store: &Store,
+    principal: &Principal,
+    target_name: Option<&str>,
+) -> Result<Agent, ApiError> {
+    match (
+        principal,
+        target_name.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Principal::Agent { agent_id, .. }, None) => {
+            store.agent(agent_id).map_err(ApiError::from_store)
+        }
+        (Principal::Agent { agent_id, .. }, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            if clean.eq_ignore_ascii_case("self") {
+                return store.agent(agent_id).map_err(ApiError::from_store);
+            }
+            let found = store.agent_by_name(clean).map_err(ApiError::from_store)?;
+            if &found.id == agent_id || found.parent_id.as_ref() == Some(agent_id) {
+                return Ok(found);
+            }
+            require_admin_or_operator(store, principal, "agents.schedule", &found.name)?;
+            Ok(found)
+        }
+        (Principal::Operator, Some(name)) => {
+            let clean = name.strip_prefix("agent:").unwrap_or(name);
+            store.agent_by_name(clean).map_err(ApiError::from_store)
+        }
+        (Principal::Operator, None) => Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "operator schedule call requires an agent name",
+        )),
+    }
+}
+
+async fn list_schedules_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let target = authorize_schedule_target(&state.store, &principal, Some(&name))?;
+        let schedules: Vec<crate::api::ScheduleView> = state
+            .store
+            .list_schedules(Some(&target.id), true)
+            .map_err(ApiError::from_store)?
+            .into_iter()
+            .map(crate::api::ScheduleView::from)
+            .collect();
+        Ok(Json(serde_json::json!({
+            "agent": target.name,
+            "agent_id": target.id.as_str(),
+            "schedules": schedules,
+        })))
+    })
+    .await
+}
+
+async fn list_self_schedules_route(
+    principal: Principal,
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || match &principal {
+        Principal::Agent { agent_id, name } => {
+            let schedules: Vec<crate::api::ScheduleView> = state
+                .store
+                .list_schedules(Some(agent_id), true)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(crate::api::ScheduleView::from)
+                .collect();
+            Ok(Json(serde_json::json!({
+                "agent": name,
+                "agent_id": agent_id.as_str(),
+                "schedules": schedules,
+            })))
+        }
+        Principal::Operator => {
+            let schedules: Vec<crate::api::ScheduleView> = state
+                .store
+                .list_schedules(None, true)
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(crate::api::ScheduleView::from)
+                .collect();
+            Ok(Json(serde_json::json!({
+                "schedules": schedules,
+            })))
+        }
+    })
+    .await
+}
+
+async fn schedules_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(mut body): Json<ScheduleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    body.agent = Some(name);
+    handle_schedule_action(principal, state, body).await
+}
+
+async fn self_schedules_action_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Json(body): Json<ScheduleRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    handle_schedule_action(principal, state, body).await
+}
+
+async fn handle_schedule_action(
+    principal: Principal,
+    state: AppState,
+    body: ScheduleRequest,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let has_spec = body.at.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || body.every.as_deref().is_some_and(|s| !s.trim().is_empty())
+            || body.watch.as_deref().is_some_and(|s| !s.trim().is_empty());
+        let action = body
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if has_spec {
+                "create"
+            } else if body.id.is_some() {
+                "cancel"
+            } else {
+                "list"
+            })
+            .to_ascii_lowercase();
+
+        match action.as_str() {
+            "list" | "ls" => {
+                if matches!(principal, Principal::Operator) && body.agent.is_none() {
+                    let schedules: Vec<crate::api::ScheduleView> = state
+                        .store
+                        .list_schedules(None, true)
+                        .map_err(ApiError::from_store)?
+                        .into_iter()
+                        .map(crate::api::ScheduleView::from)
+                        .collect();
+                    return Ok(Json(serde_json::json!({ "schedules": schedules })));
+                }
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "schedules": schedules,
+                })))
+            }
+            "create" | "set" | "add" | "schedule" => {
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let prompt = body.prompt.as_deref().unwrap_or("");
+                let created = crate::schedule::create_agent_schedule(
+                    &state.store,
+                    &state.health,
+                    &target,
+                    body.at.as_deref(),
+                    body.every.as_deref(),
+                    body.watch.as_deref(),
+                    prompt,
+                )
+                .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "schedule": created,
+                    "schedules": schedules,
+                })))
+            }
+            "cancel" | "delete" | "remove" | "clear" | "off" => {
+                let target =
+                    authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
+                let id_or_all = body
+                    .id
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("all");
+                let cancelled = state
+                    .store
+                    .cancel_schedule(Some(&target.id), id_or_all)
+                    .map_err(ApiError::from_store)?;
+                let schedules: Vec<crate::api::ScheduleView> = state
+                    .store
+                    .list_schedules(Some(&target.id), true)
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(crate::api::ScheduleView::from)
+                    .collect();
+                Ok(Json(serde_json::json!({
+                    "agent": target.name,
+                    "agent_id": target.id.as_str(),
+                    "cancelled": cancelled,
+                    "schedules": schedules,
+                })))
+            }
+            other => Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown schedule action `{other}`; expected `create`, `list`, or `cancel`"
+                ),
+            )),
+        }
+    })
+    .await
 }
 
 async fn model_route(
@@ -613,38 +1696,200 @@ async fn model_route(
     AxumPath(name): AxumPath<String>,
     Json(body): Json<ModelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
+    let actor = require_admin_or_operator(&state.store, &principal, "agents.model", &name)?;
     let agent = state
         .store
         .agent_by_name(&name)
         .map_err(ApiError::from_store)?;
-    if let Some(profile) = body.profile {
-        if body.key.is_some() || body.base_url.is_some() {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "profile cannot be combined with a key or base URL",
-            ));
-        }
-        create::bind_profile(&state.store, &agent, &profile, &body.model)
-            .map_err(ApiError::from_store)?;
-    } else {
-        let key = body.key.as_deref().unwrap_or("").trim();
-        if key.is_empty() || key.contains(char::is_whitespace) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a nonempty single-line key is required",
-            ));
-        }
-        let base_url = body
-            .base_url
-            .as_deref()
-            .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
-        crate::gateway::store_key(state.store.data_dir(), &agent, base_url, &body.model, key)
-            .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
+    if body.profile.is_some() && (body.key.is_some() || body.base_url.is_some()) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "profile cannot be combined with a key or base URL",
+        ));
     }
+    if body.key.is_none() && body.base_url.is_none() {
+        let has_harness = body
+            .harness
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_model = body
+            .model
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        let has_profile = body
+            .profile
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !has_harness && !has_model && !has_profile {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "model is required"));
+        }
+        return spawn_store(move || {
+            let out = create::configure_agent_runtime(
+                &state.store,
+                state.store.data_dir(),
+                &actor,
+                &agent.name,
+                body.harness.as_deref(),
+                body.model.as_deref(),
+                body.profile.as_deref(),
+            )
+            .map_err(ApiError::from_store)?;
+            Ok(Json(out))
+        })
+        .await;
+    }
+    let model_str = body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "model is required"))?;
+    let key = body.key.as_deref().unwrap_or("").trim();
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "a nonempty single-line key is required",
+        ));
+    }
+    let base_url = body
+        .base_url
+        .as_deref()
+        .ok_or_else(|| ApiError::new(StatusCode::BAD_REQUEST, "base URL is required"))?;
+    crate::gateway::store_key(state.store.data_dir(), &agent, base_url, model_str, key)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "could not bind provider key"))?;
     Ok(Json(
-        serde_json::json!({"agent": agent.name, "model": body.model}),
+        serde_json::json!({"agent": agent.name, "model": model_str}),
     ))
+}
+
+#[derive(Deserialize)]
+struct RenameAgentRequest {
+    #[serde(alias = "new_name", alias = "to")]
+    name: String,
+}
+
+async fn rename_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RenameAgentRequest>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let old = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        require_admin_or_operator(&state.store, &principal, "agents.rename", &old.name)?;
+        let updated = state
+            .store
+            .rename_agent(&old.id, &body.name)
+            .map_err(ApiError::from_store)?;
+        let data_dir = state.store.data_dir();
+        if old.name != updated.name {
+            let browsers_dir = data_dir.join("browsers");
+            let old_browser = browsers_dir.join(&old.name);
+            let new_browser = browsers_dir.join(&updated.name);
+            if old_browser.is_dir() && !new_browser.exists() {
+                if std::fs::rename(&old_browser, &new_browser).is_ok() {
+                    #[cfg(unix)]
+                    {
+                        let _ = std::os::unix::fs::symlink(&updated.name, &old_browser);
+                    }
+                }
+            }
+        }
+        let cfg = anyagents_core::agent_config_dir(data_dir, &updated.id);
+        let work_dir = updated
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
+        let _ = create::reconcile_agent_runtime_config(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+        );
+        crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
+        Ok(Json(agent_view(&state.store, &state.health, &updated)?))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct RoleAgentRequest {
+    #[serde(default)]
+    role: Option<String>,
+    #[serde(default)]
+    clear: Option<bool>,
+}
+
+async fn role_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<RoleAgentRequest>,
+) -> Result<Json<AgentView>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        require_admin_or_operator(&state.store, &principal, "agents.role", &found.name)?;
+        let new_role = if body.clear.unwrap_or(false) {
+            None
+        } else {
+            body.role.as_deref()
+        };
+        let updated = state
+            .store
+            .set_agent_role(&found.id, new_role)
+            .map_err(ApiError::from_store)?;
+        let data_dir = state.store.data_dir();
+        let cfg = anyagents_core::agent_config_dir(data_dir, &updated.id);
+        let work_dir = updated
+            .workdir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(data_dir, &updated.id));
+        let _ = create::reconcile_agent_runtime_config(
+            &state.store,
+            data_dir,
+            &updated,
+            &cfg,
+            &work_dir,
+        );
+        crate::telegram::sync_agent_telegram_bot_name(&state.store, data_dir, &updated);
+        Ok(Json(agent_view(&state.store, &state.health, &updated)?))
+    })
+    .await
+}
+
+#[derive(Deserialize, Default)]
+struct ProfileModelsQuery {
+    #[serde(default)]
+    profile: Option<String>,
+}
+
+async fn profile_models_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    Query(query): Query<ProfileModelsQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    require_admin_or_operator(&state.store, &principal, "profiles.models", "profiles")?;
+    let data = state.store.data_dir().to_path_buf();
+    let prof = query.profile;
+    spawn_store(move || {
+        Ok(Json(create::probe_profile_models_catalog(
+            &data,
+            prof.as_deref(),
+        )))
+    })
+    .await
 }
 
 async fn profiles_route(
@@ -746,8 +1991,10 @@ async fn set_subagent_defaults_route(
 
 #[derive(Deserialize, Default)]
 struct DescriptionRequest {
-    #[serde(default, alias = "instructions", alias = "role")]
+    #[serde(default, alias = "instructions")]
     description: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
     #[serde(default)]
     clear: Option<bool>,
 }
@@ -762,11 +2009,16 @@ async fn get_description_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         let system_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
+            "role": rec.role,
+            "harness": rec.harness,
+            "model": rec.model,
+            "aliases": aliases,
             "description": rec.instructions,
             "system_prompt": system_prompt,
         })))
@@ -783,6 +2035,7 @@ async fn set_description_route(
     spawn_store(move || {
         if name.eq_ignore_ascii_case("all")
             && body.description.is_none()
+            && body.role.is_none()
             && !body.clear.unwrap_or(false)
         {
             require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
@@ -824,6 +2077,18 @@ async fn set_description_route(
             )?;
         }
         let mut rec = target;
+        if let Some(ref role_str) = body.role {
+            require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+            rec = state
+                .store
+                .set_agent_role(&rec.id, Some(role_str.as_str()))
+                .map_err(ApiError::from_store)?;
+            crate::telegram::sync_agent_telegram_bot_name(
+                &state.store,
+                state.store.data_dir(),
+                &rec,
+            );
+        }
         if body.clear.unwrap_or(false) {
             rec = state
                 .store
@@ -843,21 +2108,14 @@ async fn set_description_route(
                 )
                 .map_err(ApiError::from_store)?;
         }
-        let parent_name = rec
-            .parent_id
-            .as_ref()
-            .and_then(|pid| state.store.agent(pid).ok())
-            .map(|p| p.name);
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        create::write_agent_instructions(&cfg, &rec, parent_name.as_deref());
-        if let Some((_, _, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&rec.name, parent_name.as_deref())
-        {
-            crate::sandbox::share_config_with_seat(&cfg, gid);
-        }
+        create::sync_agent_description_files(&state.store, &rec, &cfg);
+        let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
+            "role": rec.role,
+            "aliases": aliases,
             "description": rec.instructions,
             "system_prompt_synced": true,
         })))
@@ -1160,35 +2418,161 @@ fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> 
     }))
 }
 
+pub(crate) fn compute_block_reason(
+    quota_reset_at_ms: Option<i64>,
+    last_error: Option<&str>,
+    now_ms: i64,
+) -> Option<String> {
+    if quota_reset_at_ms.is_some_and(|ms| ms > now_ms) {
+        return Some("quota_exhausted".to_string());
+    }
+    if let Some(err) = last_error.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = err.to_ascii_lowercase();
+        if lower.contains("quota")
+            || lower.contains("resource_exhausted")
+            || lower.contains("rate_limit")
+        {
+            return Some("quota_exhausted".to_string());
+        }
+        if lower.contains("sign in")
+            || lower.contains("not logged in")
+            || lower.contains("unauthorized")
+        {
+            return Some("sign_in_required".to_string());
+        }
+        return Some("delivery_error".to_string());
+    }
+    None
+}
+
 fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<AgentView, ApiError> {
-    let lag = store
-        .lag(&agent.id, now_ms())
-        .map_err(ApiError::from_store)?;
+    let now = now_ms();
+    let lag = store.lag(&agent.id, now).map_err(ApiError::from_store)?;
     let has_open_turn = store.has_open_turn(&agent.id).unwrap_or(false);
-    let (process, turn_state, mode, steer, quota) = match health.get(&agent.id) {
+    let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let (session_quota, mut session_error) = if agent.state == "archived" {
+        (None, None)
+    } else if agent.harness == "claude-code" {
+        let (_, persisted_err) =
+            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
+        (
+            anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
+            persisted_err,
+        )
+    } else {
+        anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+    };
+    if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
+        session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
+    }
+    let (
+        process,
+        mut turn_state,
+        mode,
+        steer,
+        mut quota,
+        live_harness,
+        live_model,
+        process_started_at_ms,
+        pending_switch,
+        mut last_error,
+    ) = match health.get(&agent.id) {
         Some(live) => {
+            let effective_quota = live.quota_reset_at_ms.or(session_quota);
+            let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
-                && live.quota_reset_at_ms.is_none()
+                && effective_quota.is_none()
+                && effective_err.is_none()
                 && (live.turn_state == anyagents_harness::TurnState::InTurn || has_open_turn);
+            let switch_pending = live.process_alive
+                && (live
+                    .live_harness
+                    .as_deref()
+                    .is_some_and(|h| h != agent.harness)
+                    || live.live_model != agent.model
+                    || live.process_started_at_ms.is_some_and(|s| rotated_ms > s));
             (
                 if live.process_alive { "alive" } else { "down" },
                 if working { "working" } else { "idle" },
                 mode_name(live.delivery_mode),
                 steer_name(live.steer_support),
-                live.quota_reset_at_ms,
+                effective_quota,
+                live.live_harness.clone(),
+                live.live_model.clone(),
+                live.process_started_at_ms,
+                switch_pending,
+                effective_err,
             )
         }
         None => {
             let (mode, steer) = declared(&agent.harness);
-            ("down", "idle", mode_name(mode), steer_name(steer), None)
+            (
+                "down",
+                "idle",
+                mode_name(mode),
+                steer_name(steer),
+                session_quota,
+                None,
+                None,
+                None,
+                false,
+                session_error,
+            )
         }
     };
+    if quota.is_some_and(|ms| ms > now)
+        && create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some()
+    {
+        quota = None;
+        last_error = None;
+    }
+    if agent.state == "running" && quota.is_none_or(|ms| ms <= now) {
+        if let Some(ref err_msg) = last_error {
+            turn_state = "errored";
+            create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
+        } else {
+            let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+        }
+    }
+    let block_reason = compute_block_reason(quota, last_error.as_deref(), now);
+    let oldest_undelivered_age_ms = match lag.oldest_undelivered_age_ms {
+        Some(age) => Some(age),
+        None if has_open_turn
+            && (quota.is_some() || last_error.is_some() || turn_state != "working") =>
+        {
+            store.open_turn(&agent.id).ok().flatten().map(|open| {
+                open.messages
+                    .first()
+                    .map(|m| now.saturating_sub(m.received_at_ms))
+                    .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
+            })
+        }
+        None => None,
+    };
+    let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
+    let seat_info = create::resolved_agent_seat_info(store, agent);
+    let schedules = store
+        .list_schedules(Some(&agent.id), true)
+        .unwrap_or_default()
+        .into_iter()
+        .map(crate::api::ScheduleView::from)
+        .collect();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name.clone(),
+        role: agent.role.clone(),
+        aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
         harness: agent.harness.clone(),
         model: agent.model.clone(),
+        live_harness,
+        live_model,
+        process_started_at_ms,
+        pending_switch,
         workdir: agent.workdir.clone(),
         state: agent.state.clone(),
         process: process.to_string(),
@@ -1196,9 +2580,15 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         delivery_mode: mode.to_string(),
         steer_support: steer.to_string(),
         quota_reset_at_ms: quota,
-        oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
+        block_reason,
+        last_error,
+        oldest_undelivered_age_ms,
         install: install_state(store, agent),
         description: agent.instructions.clone(),
+        seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
+        seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
+        seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
+        schedules,
     })
 }
 
@@ -1262,9 +2652,13 @@ async fn create_agent_route(
             state.store.data_dir(),
             CreateRequest {
                 name: body.name,
+                role: body.role,
                 harness,
                 model,
                 profile,
+                repo: body.repo,
+                branch: body.branch,
+                base: body.base,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
                 instructions: body.instructions,
@@ -1278,12 +2672,14 @@ async fn create_agent_route(
         {
             operator::mint(&state.store, &agent.id).map_err(ApiError::from_store)?;
         }
+        let mut has_prompt = false;
         if let Some(prompt) = body
             .prompt
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            has_prompt = true;
             let sender = caller_agent
                 .as_ref()
                 .map(|(_, name)| format!("agent:{name}"))
@@ -1313,6 +2709,11 @@ async fn create_agent_route(
                 );
             }
         }
+        if has_prompt {
+            create::poke_agent_wake_socket_mail(state.store.data_dir(), &agent.id);
+        } else {
+            create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
+        }
         let view = agent_view(&state.store, &state.health, &agent)?;
         Ok((StatusCode::CREATED, Json(view)))
     })
@@ -1325,12 +2726,21 @@ async fn archive_agent_route(
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AgentView>, ApiError> {
     spawn_store(move || {
-        let found = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
+        let clean_name = name.trim().strip_prefix("agent:").unwrap_or(name.trim());
+        let found = if clean_name.eq_ignore_ascii_case("self")
+            && let Principal::Agent { ref agent_id, .. } = principal
+        {
+            state.store.agent(agent_id).map_err(ApiError::from_store)?
+        } else {
+            state
+                .store
+                .agent_by_name(clean_name)
+                .map_err(ApiError::from_store)?
+        };
+        let is_self =
+            matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
         if found.parent_id.is_none() {
-            if matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id) {
+            if is_self {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     "a root agent cannot archive itself; pass a target agent name or id in `agent`",
@@ -1353,16 +2763,18 @@ async fn archive_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while std::time::Instant::now() < deadline {
-            if state
-                .health
-                .get(&found.id)
-                .is_none_or(|live| !live.process_alive)
-            {
-                break;
+        if !is_self {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if state
+                    .health
+                    .get(&found.id)
+                    .is_none_or(|live| !live.process_alive)
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
         }
         if found.parent_id.is_some() {
             reap_subagent_ephemeral_dirs(state.store.data_dir(), &found.id);
@@ -1375,24 +2787,116 @@ async fn archive_agent_route(
 pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
+    crate::sylphx::release_persisted_sandbox_lease(&config_dir);
     let seat_ids = detect_seat_ids(&config_dir);
-    for rel in [
-        "cache-home",
-        "state-home",
-        "tmp",
-        ".rustup",
-        ".cargo",
-        "data-home/opencode",
-        "opencode-session-id",
-        "claude-session-id",
-        ".claude/projects",
-        ".codex/sessions",
-    ] {
+    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
+    let marker_path = config_dir.join(".anyagents-managed-worktree.json");
+    let marker_val = std::fs::read_to_string(&marker_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+    let initial_head = marker_val
+        .as_ref()
+        .and_then(|v| v.get("initial_head"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let recorded_wt = marker_val
+        .as_ref()
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from);
+
     let work_dir = agent_root.join("work");
-    remove_path_with_seat(&work_dir, seat_ids);
+    if let Some(ref wt_path) = recorded_wt
+        && wt_path != &work_dir
+        && wt_path.join(".git").exists()
+        && is_git_worktree_safe_to_reap(wt_path, initial_head.as_deref())
+    {
+        reap_git_worktree_cleanly(wt_path, seat_ids);
+    }
+    if work_dir.join(".git").exists() {
+        if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
+            reap_git_worktree_cleanly(&work_dir, seat_ids);
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    } else {
+        remove_path_with_seat(&work_dir, seat_ids);
+        if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
+            let _ = std::fs::remove_file(&marker_path);
+        }
+    }
+}
+
+pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, initial_head: Option<&str>) -> bool {
+    let Ok(status_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["status", "--porcelain"])
+        .output()
+    else {
+        return false;
+    };
+    if !status_out.status.success() || !status_out.stdout.is_empty() {
+        return false;
+    }
+    let Ok(head_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+    else {
+        return false;
+    };
+    if !head_out.status.success() {
+        return false;
+    }
+    let current_head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
+    if current_head.is_empty() {
+        return false;
+    }
+    if initial_head.map(str::trim) == Some(current_head.as_str()) {
+        return true;
+    }
+    let Ok(remote_out) = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["branch", "-r", "--contains", &current_head])
+        .output()
+    else {
+        return false;
+    };
+    remote_out.status.success()
+        && !String::from_utf8_lossy(&remote_out.stdout)
+            .trim()
+            .is_empty()
+}
+
+fn reap_git_worktree_cleanly(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) {
+    let git_dir = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
+    let _ = std::process::Command::new("git")
+        .arg("-C")
+        .arg(wt_path)
+        .args(["worktree", "remove", "--force"])
+        .arg(wt_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+    remove_path_with_seat(wt_path, seat_ids);
+    if let Some(gd) = git_dir
+        && gd.components().any(|c| c.as_os_str() == "worktrees")
+        && gd.exists()
+    {
+        remove_path_with_seat(&gd, seat_ids);
+    }
 }
 
 #[cfg(unix)]
@@ -1580,8 +3084,10 @@ async fn delete_agent_route(
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
         reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
         remove_path_with_seat(&agent_dir.join("config"), seat_ids);
-        remove_path_with_seat(&agent_dir, seat_ids);
-        let _ = std::fs::remove_dir_all(&agent_dir);
+        if !agent_dir.join("work").exists() {
+            remove_path_with_seat(&agent_dir, seat_ids);
+            let _ = std::fs::remove_dir_all(&agent_dir);
+        }
         Ok(Json(serde_json::json!({
             "id": deleted.id.as_str(),
             "name": deleted.name,
@@ -1601,10 +3107,35 @@ async fn wake_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
+        let work_dir = found
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &found.id));
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        {
+            create::reconcile_agent_runtime_config(
+                &state.store,
+                state.store.data_dir(),
+                &found,
+                &cfg,
+                &work_dir,
+            )
+            .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()))?;
+        }
+        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
+        let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+        let _ = std::fs::write(
+            cfg.join(".anyagents-profile-rotated-ms"),
+            format!("{}\n", now_ms()),
+        );
         let agent = state
             .store
             .set_agent_state(&found.id, "running")
             .map_err(ApiError::from_store)?;
+        create::poke_agent_wake_socket(state.store.data_dir(), &agent.id);
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
@@ -1617,6 +3148,7 @@ fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::Grou
             out.push(crate::api::GroupMemberView {
                 id: agent.id.to_string(),
                 name: agent.name,
+                role: agent.role,
                 harness: agent.harness,
                 model: agent.model,
                 state: agent.state,
@@ -1764,7 +3296,13 @@ async fn inbox(
             agent_id,
             name: own_name,
         } => {
-            if name != agent_id.as_str() && name != own_name.as_str() {
+            let matches_self = name == agent_id.as_str()
+                || name == own_name.as_str()
+                || state
+                    .store
+                    .agent_by_name(&name)
+                    .is_ok_and(|a| a.id == *agent_id);
+            if !matches_self {
                 return Err(ApiError::forbidden(
                     "a session reads its own inbox, not another agent's; use conversation to read another agent's conversation",
                 ));
@@ -1905,10 +3443,19 @@ async fn send(
     };
     let actor = match (&principal, route_named) {
         (_, Some(named)) => named,
-        (Principal::Agent { name, .. }, None) => {
+        (Principal::Agent { agent_id, name }, None) => {
             if let Some(named) = body.sender.as_deref() {
                 Actor::parse(named).and_then(|named| {
-                    if named.as_address() == Actor::Agent(name.clone()).as_address() {
+                    let matches_self = named.as_address()
+                        == Actor::Agent(name.clone()).as_address()
+                        || match &named {
+                            Actor::Agent(n) => state
+                                .store
+                                .agent_by_name(n)
+                                .is_ok_and(|a| a.id == *agent_id),
+                            _ => false,
+                        };
+                    if matches_self {
                         Ok(())
                     } else {
                         Err(ApiError::forbidden(
@@ -2324,12 +3871,19 @@ fn plan_send(
     body: &SendRequest,
 ) -> Result<SendPlan, ApiError> {
     let mut plan = SendPlan::parse(store, actor, body)?;
-    let reply = crate::reply::resolve(
+    let has_telegram_target = plan
+        .targets
+        .iter()
+        .any(|t| matches!(t, Target::Telegram { .. }));
+    let reply = match crate::reply::resolve(
         principal,
         |id| own_message(store, principal, actor, id),
         body.reply_to.as_deref(),
-    )
-    .map_err(|why| ApiError::new(StatusCode::BAD_REQUEST, why))?;
+    ) {
+        Ok(dest) => dest,
+        Err(_why) if !plan.targets.is_empty() && !has_telegram_target => None,
+        Err(why) => return Err(ApiError::new(StatusCode::BAD_REQUEST, why)),
+    };
     if let Some(destination) = reply {
         if plan.targets.is_empty() {
             plan.targets = vec![target_of(&destination)];
@@ -2629,6 +4183,7 @@ fn send_sync(
     };
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     let mut deliveries = Vec::with_capacity(plan.targets.len());
+    let mut skipped = Vec::new();
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
@@ -2643,6 +4198,7 @@ fn send_sync(
             }
             Target::Room(room) => {
                 let mut all = deliver_room(store, &body, room, key.as_deref())?;
+                let mut room_skip = room_skipped(store, &body, room);
                 if let Some(ref sid) = sender_agent_id
                     && all.iter().any(|d| !d.duplicate)
                 {
@@ -2655,6 +4211,14 @@ fn send_sync(
                         store.record_outbound(sid, &dest, body.reply_to.as_deref(), &composed_body);
                 }
                 deliveries.append(&mut all);
+                for s in room_skip.drain(..) {
+                    if !skipped
+                        .iter()
+                        .any(|existing: &crate::api::SkippedDelivery| existing.to == s.to)
+                    {
+                        skipped.push(s);
+                    }
+                }
             }
             Target::Telegram {
                 address,
@@ -2679,7 +4243,10 @@ fn send_sync(
             }
         }
     }
-    let response = SendResponse { deliveries };
+    let response = SendResponse {
+        deliveries,
+        skipped,
+    };
     if let Some(key) = key.as_deref() {
         let text = serde_json::to_string(&response)
             .map_err(|err| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -2773,12 +4340,50 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter(|agent| agent.state != "archived" && agent.state != "paused")
+        .filter(|agent| agent.state == "running")
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
         .filter(|agent| {
             members
                 .as_ref()
                 .is_none_or(|members| members.iter().any(|name| name == &agent.name))
+        })
+        .collect()
+}
+
+/// Non-running agents in a room that a broadcast or group send skipped, with their state reason.
+fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api::SkippedDelivery> {
+    let sender = body
+        .sender
+        .as_deref()
+        .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+    let name = room.strip_prefix("group:").unwrap_or(room);
+    if name == "all" {
+        return store
+            .list_agents()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+            .filter(|agent| agent.state != "running" && agent.state != "archived")
+            .map(|agent| crate::api::SkippedDelivery {
+                to: format!("agent:{}", agent.name),
+                reason: agent.state,
+            })
+            .collect();
+    }
+    let members = match store.room_members(room) {
+        Ok(Some(members)) => members,
+        _ => return Vec::new(),
+    };
+    store
+        .list_agents()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+        .filter(|agent| members.iter().any(|m| m == &agent.name))
+        .filter(|agent| agent.state != "running")
+        .map(|agent| crate::api::SkippedDelivery {
+            to: format!("agent:{}", agent.name),
+            reason: agent.state,
         })
         .collect()
 }
@@ -2829,6 +4434,15 @@ fn deliver_agent(
     key: Option<&str>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
+    if agent.state == "archived" {
+        let is_auto_subagent_completed = body
+            .text
+            .trim_start()
+            .starts_with("[Sub-Agent Completed]");
+        if !(agent.parent_id.is_none() && is_auto_subagent_completed) {
+            let _ = store.set_agent_state(&agent.id, "running");
+        }
+    }
     let outcome = store
         .receive(
             &agent.id,

@@ -759,44 +759,78 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
         .unwrap();
     let due = 1_700_000_000_000;
     let mut stepped = 0;
-    while other.agent(&sub.id).unwrap().state != "archived" {
-        assert!(
-            stepped < 40,
-            "sub-agent did not auto-archive after turn completion"
-        );
+    while !log_contains(&log, "subagent-task-1") {
+        assert!(stepped < 40, "sub-agent did not process task 1");
         stepped += 1;
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
+    // Completing the turn automatically scales the sub-agent to `idle` and releases its process.
     assert!(wait_until(|| {
-        supervisor
-            .live(&sub.id)
-            .is_some_and(|live| !live.process_alive && live.pid.is_none())
+        other.agent(&sub.id).unwrap().state == "idle"
+            && supervisor
+                .live(&sub.id)
+                .is_some_and(|live| !live.process_alive && live.pid.is_none())
     }));
 
-    // Sending a follow-up message wakes the sub-agent back up automatically,
-    // runs the second turn, and scales it back to zero when done.
+    // Sending a follow-up message wakes the `idle` sub-agent back up automatically.
     other
         .receive(&sub.id, Incoming::new("subagent-task-2"))
         .unwrap();
     let mut stepped2 = 0;
-    while !log_contains(&log, "subagent-task-2")
-        || other.agent(&sub.id).unwrap().state != "archived"
-    {
-        assert!(
-            stepped2 < 40,
-            "sub-agent did not wake, process task 2, and re-archive"
-        );
+    while !log_contains(&log, "subagent-task-2") {
+        assert!(stepped2 < 40, "sub-agent did not wake and process task 2");
         stepped2 += 1;
         clock.set_ms(due + 100_000 + i64::from(stepped2) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert_eq!(other.agent(&sub.id).unwrap().state, "archived");
     assert!(wait_until(|| {
-        supervisor
-            .live(&sub.id)
-            .is_some_and(|live| !live.process_alive && live.pid.is_none())
+        other.agent(&sub.id).unwrap().state == "idle"
+    }));
+    drop(supervisor);
+}
+
+#[test]
+fn a_model_or_harness_change_automatically_switches_running_process_at_next_idle_point() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut new_agent = NewAgent::new("alpha", "claude-code");
+    new_agent.model = Some("sonnet".to_string());
+    let agent = store.create_agent(new_agent).unwrap();
+    let work = dir.path().join("work-switch");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_699_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock) as Arc<dyn Clock>,
+        scripted("idle", log),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor.live(&agent.id).is_some_and(|live| {
+            live.pid.is_some()
+                && live.process_alive
+                && live.live_harness.as_deref() == Some("claude-code")
+                && live.live_model.as_deref() == Some("sonnet")
+        })
+    }));
+    let first_pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+
+    // Update the agent's model in the store while it is idle: the supervisor
+    // automatically replaces the running process and records the new live model.
+    store.set_agent_model(&agent.id, "opus").unwrap();
+    assert!(wait_until(|| {
+        supervisor.live(&agent.id).is_some_and(|live| {
+            live.process_alive
+                && live.pid.is_some()
+                && live.pid != Some(first_pid)
+                && live.live_model.as_deref() == Some("opus")
+        })
     }));
     drop(supervisor);
 }

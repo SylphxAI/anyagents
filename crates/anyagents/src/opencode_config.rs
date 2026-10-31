@@ -45,6 +45,18 @@ pub fn write(
         root["provider"] = donor;
     }
     let has_sylphx_provider = root.get("provider").and_then(|p| p.get("sylphx")).is_some();
+    if let Some(sylphx_opts) = root
+        .get_mut("provider")
+        .and_then(|p| p.get_mut("sylphx"))
+        .and_then(|s| s.get_mut("options"))
+        && let Some(url) = sylphx_opts
+            .get("baseURL")
+            .and_then(serde_json::Value::as_str)
+        && (url.contains("models.sylphx.ai") || url.contains("api.sylphx.ai"))
+    {
+        sylphx_opts["baseURL"] =
+            serde_json::Value::String("https://api.sylphx.com/v1".to_string());
+    }
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         let normalized = normalize_model(raw_model, has_sylphx_provider);
         let (base_model, variant) = match normalized.split_once('#') {
@@ -92,28 +104,50 @@ pub fn write(
         }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
-    std::fs::write(dir.join("opencode.json"), &bytes)?;
+    write_atomic(&dir.join("opencode.json"), &bytes)?;
     let xdg_opencode_dir = dir.join("opencode");
     std::fs::create_dir_all(&xdg_opencode_dir)?;
-    std::fs::write(xdg_opencode_dir.join("opencode.json"), &bytes)?;
+    write_atomic(&xdg_opencode_dir.join("opencode.json"), &bytes)?;
     let home_opencode_dir = dir.join(".config").join("opencode");
     std::fs::create_dir_all(&home_opencode_dir)?;
-    std::fs::write(home_opencode_dir.join("opencode.json"), &bytes)?;
+    write_atomic(&home_opencode_dir.join("opencode.json"), &bytes)?;
+    Ok(())
+}
+
+static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let tmp = path.with_file_name(format!(
+        ".{}.{pid}.{seq}.anyagents-new",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("opencode.json")
+    ));
+    std::fs::write(&tmp, bytes)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
+    }
+    std::fs::rename(&tmp, path)?;
     Ok(())
 }
 
 fn donor_provider_block(dir: &Path) -> Option<serde_json::Value> {
     let mut candidates = Vec::new();
     if let Some(data_dir) = dir.parent().and_then(Path::parent) {
-        candidates.push(data_dir.join("opencode-provider.json"));
-    }
-    if let Some(host_home) = crate::sandbox::host_home_dir() {
         candidates.push(
-            host_home
+            data_dir
+                .join("profiles")
+                .join("sylphx")
+                .join("default")
                 .join(".config")
                 .join("opencode")
                 .join("opencode.json"),
         );
+        candidates.push(data_dir.join("opencode-provider.json"));
     }
     for path in candidates {
         let Ok(bytes) = std::fs::read(&path) else {

@@ -200,7 +200,12 @@ pub fn pinned_uid(agent_name: &str) -> Option<u32> {
 
 /// The seat user name a host provisions for one agent: `seat-<name>`.
 fn seat_user(agent_name: &str) -> String {
-    format!("seat-{}", agent_name.to_ascii_lowercase())
+    let lower = agent_name.to_ascii_lowercase();
+    if lower.starts_with("seat-") {
+        lower
+    } else {
+        format!("seat-{lower}")
+    }
 }
 
 fn lookup_user(name: &str) -> Option<(u32, u32)> {
@@ -323,14 +328,14 @@ fn fallback_seat(agent_name: &str, parent_name: Option<&str>) -> Option<(String,
             return Some((candidate, (uid, gid)));
         }
     }
-    let seats = host_seat_users();
-    if seats.is_empty() {
+    let all_seats = host_seat_users();
+    if all_seats.is_empty() {
         return None;
     }
     let hash = agent_name.bytes().fold(0usize, |acc, b| {
         acc.wrapping_mul(31).wrapping_add(b as usize)
     });
-    seats.get(hash % seats.len()).cloned()
+    all_seats.get(hash % all_seats.len()).cloned()
 }
 
 fn host_seat_users() -> Vec<(String, (u32, u32))> {
@@ -476,6 +481,79 @@ pub fn seat_launch_spec_with_hint(
     ))
 }
 
+/// If `config_dir` already exists on disk and its group belongs to a provisioned
+/// host `seat-*` account, return that seat's `(user, uid, gid, seat_launch_spec)`
+/// so `describe()`, `rename`, and runtime reconciliation never flip a running
+/// agent's config directory to a different seat group.
+pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Option<String>)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if is_isolated_test_env() {
+            return None;
+        }
+        let meta = std::fs::metadata(config_dir).ok()?;
+        let dir_gid = meta.gid();
+        if dir_gid == 0 || dir_gid == server_gid() {
+            return None;
+        }
+        let candidates: Vec<(String, (u32, u32))> = host_seat_users()
+            .into_iter()
+            .filter(|(_, (_, gid))| *gid == dir_gid)
+            .collect();
+        if candidates.is_empty() {
+            return None;
+        }
+        let chosen = if candidates.len() == 1 {
+            candidates.into_iter().next()
+        } else {
+            let marker = std::fs::read_to_string(config_dir.join(".anyagents-seat"))
+                .ok()
+                .map(|s| seat_user(s.trim()));
+            let by_marker = marker.and_then(|m| {
+                candidates
+                    .iter()
+                    .find(|(u, _)| u == &m)
+                    .cloned()
+            });
+            by_marker
+                .or_else(|| {
+                    for key_file in ["state_5.sqlite", "installation_id", "logs_2.sqlite"] {
+                        if let Ok(m) = std::fs::metadata(config_dir.join(key_file)) {
+                            let f_uid = m.uid();
+                            if let Some(found) =
+                                candidates.iter().find(|(_, (uid, _))| *uid == f_uid)
+                            {
+                                return Some(found.clone());
+                            }
+                        }
+                    }
+                    let mut uid_counts = std::collections::HashMap::<u32, usize>::new();
+                    if let Ok(entries) = std::fs::read_dir(config_dir) {
+                        for entry in entries.flatten() {
+                            if let Ok(em) = entry.metadata() {
+                                *uid_counts.entry(em.uid()).or_insert(0) += 1;
+                            }
+                        }
+                    }
+                    candidates
+                        .iter()
+                        .filter(|(_, (uid, _))| uid_counts.contains_key(uid))
+                        .max_by_key(|(_, (uid, _))| uid_counts.get(uid).copied().unwrap_or(0))
+                        .cloned()
+                })
+                .or_else(|| candidates.into_iter().next())
+        };
+        if let Some((user, (uid, gid))) = chosen {
+            let spec = sock_gid_for().filter(|_| launcher().is_file()).map(|sock_gid| {
+                format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
+            });
+            return Some((user, uid, gid, spec));
+        }
+    }
+    None
+}
+
 /// Give a minted capability to its seat's group: 0640, owned by the server's
 /// user, readable by that one seat. The mode and group are read back; a file
 /// any other seat could read is a refusal.
@@ -507,13 +585,122 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
 
 /// Give one agent's config directory and the work directory beside it to its
 /// seat group, so the seat reads and writes its own files and no peer's.
+#[allow(dead_code)]
 pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
-    for dir in [config_dir.to_path_buf(), config_dir.with_file_name("work")] {
-        if dir.is_dir()
-            && let Err(err) = give_tree(&dir, gid)
+    let uid = host_seat_users()
+        .into_iter()
+        .find_map(|(_, (u, g))| (g == gid).then_some(u))
+        .unwrap_or(gid);
+    share_config_with_seat_uid(config_dir, uid, gid);
+}
+
+pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
+    let (eff_uid, eff_gid) = match existing_config_seat(config_dir) {
+        Some((_, existing_uid, existing_gid, _)) => (existing_uid, existing_gid),
+        None => (uid, gid),
+    };
+    if config_dir.is_dir() {
+        if let Some((user, _)) = host_seat_users()
+            .into_iter()
+            .find(|(_, (u, g))| *u == eff_uid && *g == eff_gid)
         {
-            eprintln!("seat: cannot share {}: {err}", dir.display());
+            let _ = std::fs::write(config_dir.join(".anyagents-seat"), format!("{user}\n"));
         }
+        if let Err(err) = give_tree(config_dir, eff_uid, eff_gid) {
+            eprintln!("seat: cannot share {}: {err}", config_dir.display());
+        }
+    }
+    let work_dir = config_dir.with_file_name("work");
+    if work_dir.is_dir() {
+        if work_dir.join(".git").exists() {
+            share_worktree_with_seat(&work_dir, eff_gid);
+        } else if let Err(err) = give_tree(&work_dir, eff_uid, eff_gid) {
+            eprintln!("seat: cannot share {}: {err}", work_dir.display());
+        }
+    }
+}
+
+/// Share a worktree or explicit working directory (and its git metadata dir when
+/// present) with the target seat group (`gid`), falling back to `anyagents-sock`
+/// (`sock_gid_for()`) so both the server user and every `seat-*` user can write
+/// and commit inside the worktree without `EPERM`.
+pub fn share_worktree_with_seat(path: &Path, gid: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if is_isolated_test_env() {
+            return;
+        }
+        let _ = chown_to_seat_group(path, gid);
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2775));
+        let apply_recursive = |target: &Path| {
+            let mut chgrp_ok = false;
+            if server_user_in_group_db(gid) && launcher().is_file() {
+                let me = current_uid().to_string();
+                let my_gid = server_gid().to_string();
+                let target_gid = gid.to_string();
+                if let Ok(st) = std::process::Command::new(launcher())
+                    .args([
+                        "--reuid",
+                        &me,
+                        "--regid",
+                        &my_gid,
+                        "--groups",
+                        &target_gid,
+                        "--no-new-privs",
+                        "--",
+                        "chgrp",
+                        "-R",
+                        &target_gid,
+                    ])
+                    .arg(target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                {
+                    chgrp_ok = st.success();
+                }
+            }
+            if !chgrp_ok {
+                let fallback_gid = sock_gid_for().unwrap_or(gid).to_string();
+                let _ = std::process::Command::new("chgrp")
+                    .args(["-R", &fallback_gid])
+                    .arg(target)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
+            let _ = std::process::Command::new("chmod")
+                .args(["-R", "g+rwX"])
+                .arg(target)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::process::Command::new("find")
+                .arg(target)
+                .args(["-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        };
+        apply_recursive(path);
+        if path.join(".git").exists()
+            && let Ok(gd_out) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(["rev-parse", "--path-format=absolute", "--git-dir"])
+                .output()
+            && gd_out.status.success()
+        {
+            let gd = PathBuf::from(String::from_utf8_lossy(&gd_out.stdout).trim());
+            if gd.is_dir() {
+                apply_recursive(&gd);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, gid);
     }
 }
 
@@ -539,14 +726,103 @@ pub fn share_socket_with_seats(path: &Path) {
     }
 }
 
-fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
+fn migrate_file_to_seat_uid(path: &Path, uid: u32, gid: u32) {
+    if is_isolated_test_env() || !launcher().is_file() {
+        return;
+    }
+    let Some(sock_gid) = sock_gid_for() else {
+        return;
+    };
+    let t_uid = uid.to_string();
+    let t_gid = gid.to_string();
+    let groups = format!("{gid},{sock_gid}");
+    let tmp = path.with_extension("seat_mig_tmp");
+    let status = std::process::Command::new(launcher())
+        .args([
+            "--reuid",
+            &t_uid,
+            "--regid",
+            &t_gid,
+            "--groups",
+            &groups,
+            "--no-new-privs",
+            "--",
+            "cp",
+            "-f",
+        ])
+        .arg(path)
+        .arg(&tmp)
+        .status();
+    if status.is_ok_and(|s| s.success()) {
+        let _ = std::process::Command::new(launcher())
+            .args([
+                "--reuid",
+                &t_uid,
+                "--regid",
+                &t_gid,
+                "--groups",
+                &groups,
+                "--no-new-privs",
+                "--",
+                "chmod",
+                "0660",
+            ])
+            .arg(&tmp)
+            .status();
+        let _ = std::process::Command::new(launcher())
+            .args([
+                "--reuid",
+                &t_uid,
+                "--regid",
+                &t_gid,
+                "--groups",
+                &groups,
+                "--no-new-privs",
+                "--",
+                "mv",
+                "-f",
+            ])
+            .arg(&tmp)
+            .arg(path)
+            .status();
+    }
+}
+
+fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+    if dir.ends_with(".config/op") || dir.ends_with(".ssh") || dir.ends_with(".gnupg") {
+        return Ok(());
+    }
     let me = current_uid();
-    if let Ok(meta) = std::fs::metadata(dir)
-        && meta.uid() == me
-    {
-        let _ = chown_to_seat_group(dir, gid);
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
+    if let Ok(meta) = std::fs::metadata(dir) {
+        if meta.uid() == me {
+            let _ = chown_to_seat_group(dir, gid);
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
+        } else if (meta.gid() != gid || meta.uid() != uid)
+            && !is_isolated_test_env()
+            && let Some(sock_gid) = sock_gid_for()
+            && launcher().is_file()
+        {
+            let f_uid = meta.uid().to_string();
+            let f_gid = meta.gid().to_string();
+            let groups = format!("{},{sock_gid}", meta.gid());
+            let _ = std::process::Command::new(launcher())
+                .args([
+                    "--reuid",
+                    &f_uid,
+                    "--regid",
+                    &f_gid,
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "chmod",
+                    "-R",
+                    "0777",
+                ])
+                .arg(dir)
+                .status();
+        }
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Ok(());
@@ -564,13 +840,19 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if kind.is_dir() {
-            let _ = give_tree(&path, gid);
+            if (name == "op" && dir.ends_with(".config")) || name == ".ssh" || name == ".gnupg" {
+                continue;
+            }
+            let _ = give_tree(&path, uid, gid);
             continue;
         }
         let Ok(meta) = entry.metadata() else {
             continue;
         };
         if meta.uid() != me {
+            if meta.gid() != gid || meta.uid() != uid {
+                migrate_file_to_seat_uid(&path, uid, gid);
+            }
             continue;
         }
         let _ = chown_to_seat_group(&path, gid);
@@ -580,6 +862,10 @@ fn give_tree(dir: &Path, gid: u32) -> std::io::Result<()> {
             let exec = meta.permissions().mode() & 0o100 != 0;
             let mode = if exec { 0o770 } else { 0o660 };
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
+            if (name.starts_with("opencode.db") || name == "serve-exit.jsonl") && meta.uid() != uid
+            {
+                migrate_file_to_seat_uid(&path, uid, gid);
+            }
         }
     }
     Ok(())

@@ -172,8 +172,32 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let (status, bytes) = request_naming(
-            &self.socket,
+        let body_clone = body.clone();
+        let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
+        let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
+            && ((method == "POST" && path == "/v1/agents")
+                || path.ends_with("/harness")
+                || path.ends_with("/model")
+                || path.ends_with("/rename")
+                || path.ends_with("/role")
+                || path.ends_with("/description")
+                || path.ends_with("/wake")
+                || path.ends_with("/pause")
+                || path.ends_with("/archive")
+                || path.starts_with("/v1/subagent-defaults")
+                || path.starts_with("/v1/profiles")
+                || path.starts_with("/v1/schedules")
+                || path.starts_with("/v1/browser")
+                || path.starts_with("/v1/send")
+                || path.contains("/schedules")
+                || path.contains("/conversation"));
+        let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
+            (Some(adm), true) => (adm.as_path(), Some(self.socket.as_path())),
+            (Some(adm), false) if adm.exists() => (self.socket.as_path(), Some(adm.as_path())),
+            _ => (self.socket.as_path(), None),
+        };
+        let primary_res = request_naming(
+            primary_sock,
             method,
             path,
             body,
@@ -181,11 +205,120 @@ impl Client {
             None,
             named.as_deref(),
         )
-        .await?;
+        .await;
+        let (mut status, mut bytes) = match primary_res {
+            Ok(ans) => ans,
+            Err(primary_err) => {
+                if let Some(sec_sock) = secondary_sock {
+                    request_naming(
+                        sec_sock,
+                        method,
+                        path,
+                        body_clone.clone(),
+                        Some(&cap),
+                        None,
+                        named.as_deref(),
+                    )
+                    .await?
+                } else {
+                    return Err(primary_err);
+                }
+            }
+        };
+        if !status.is_success()
+            && let Some(sec_sock) = secondary_sock
+            && let Ok(fallback) = request_naming(
+                sec_sock,
+                method,
+                path,
+                body_clone,
+                Some(&cap),
+                None,
+                named.as_deref(),
+            )
+            .await
+            && fallback.0.is_success()
+        {
+            (status, bytes) = fallback;
+        }
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
         serde_json::from_slice(&bytes).map_err(|err| err.to_string())
+    }
+
+    async fn get_agents(&self) -> Result<AgentsResponse, String> {
+        let mut resp: AgentsResponse = self.get("/v1/agents", None).await?;
+        if let Some(parent_dir) = self.socket.parent() {
+            let admin_socket = parent_dir.join("admin.sock");
+            if admin_socket.exists() {
+                let named = crate::client::agent_identity().map(|id| id.to_string());
+                let cap = self.current_capability();
+                if let Ok((st, bytes)) = request_naming(
+                    &admin_socket,
+                    "GET",
+                    "/v1/agents",
+                    None,
+                    Some(&cap),
+                    None,
+                    named.as_deref(),
+                )
+                .await
+                    && st.is_success()
+                    && let Ok(admin_resp) = serde_json::from_slice::<AgentsResponse>(&bytes)
+                {
+                    let by_id: std::collections::HashMap<String, AgentView> = admin_resp
+                        .agents
+                        .into_iter()
+                        .map(|a| (a.id.clone(), a))
+                        .collect();
+                    for view in &mut resp.agents {
+                        if let Some(adm) = by_id.get(&view.id) {
+                            view.name = adm.name.clone();
+                            view.harness = adm.harness.clone();
+                            if adm.model.is_some() {
+                                view.model = adm.model.clone();
+                            }
+                            view.install = adm.install.clone();
+                            view.delivery_mode = adm.delivery_mode.clone();
+                            view.steer_support = adm.steer_support.clone();
+                            if adm.role.is_some() {
+                                view.role = adm.role.clone();
+                            }
+                            if !adm.aliases.is_empty() {
+                                view.aliases = adm.aliases.clone();
+                            }
+                            if view.quota_reset_at_ms.is_none() {
+                                view.quota_reset_at_ms = adm.quota_reset_at_ms;
+                            }
+                            if view.block_reason.is_none() {
+                                view.block_reason = adm.block_reason.clone();
+                            }
+                            if view.last_error.is_none() {
+                                view.last_error = adm.last_error.clone();
+                            }
+                            if adm.turn_state == "errored"
+                                || (view.state == "running"
+                                    && view.last_error.is_some()
+                                    && view.quota_reset_at_ms.is_none())
+                            {
+                                view.turn_state = "errored".to_string();
+                            }
+                            if view.oldest_undelivered_age_ms.is_none() {
+                                view.oldest_undelivered_age_ms = adm.oldest_undelivered_age_ms;
+                            }
+                            if adm.seat_user.is_some() {
+                                view.seat_user = adm.seat_user.clone();
+                                view.seat_uid = adm.seat_uid;
+                                view.seat_gid = adm.seat_gid;
+                            }
+                            view.schedules = adm.schedules.clone();
+                        }
+                    }
+                }
+            }
+        }
+        Ok(resp)
     }
 }
 
@@ -201,15 +334,16 @@ struct SendArgs {
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
     /// `telegram:user:<user_id>[:<message_id>]`). Sending to an archived agent's
     /// name or `agt_...` ID automatically wakes and resumes its session. May be
-    /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`).
+    /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`)
+    /// or when performing a message interaction (`action`: `"react"` | `"vote"` | `"edit"` | `"delete"` | `"pin"` | `"unpin"` | `"stop_poll"`).
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
     to: Vec<String>,
     /// Message text or caption (Markdown is automatically rendered as rich HTML on Telegram).
-    /// May be omitted when sending `media`, `location`, or `poll`.
+    /// Also used as new message text when `action = "edit"` or optional comment when `action = "vote"`.
     #[serde(default)]
     text: String,
-    /// Optional reply target: `anyagents:reply:<msg_id>` from the message header
-    /// (answers in the same chat/topic/agent), or a plain destination address.
+    /// Optional reply or interaction target: `anyagents:reply:<msg_id>` from the message header
+    /// (answers or reacts in the same chat/topic/agent), or a plain destination address.
     #[serde(default)]
     reply_to: Option<String>,
     /// Optional quoted substring or message text to attach as a quote.
@@ -231,6 +365,21 @@ struct SendArgs {
     /// Optional rich Instant View article (`title`, `content` or `url`, optional `author_name`).
     #[serde(default)]
     article: Option<SendArticle>,
+    /// Optional message interaction action (`"send"` default, or `"react"`, `"vote"`, `"check"`, `"uncheck"`,
+    /// `"edit"`, `"delete"`, `"pin"`, `"unpin"`, `"stop_poll"` on an existing message identified by `target` or `reply_to`).
+    #[serde(default)]
+    action: Option<String>,
+    /// Target message for interactions (`anyagents:reply:msg_...`, `msg_...`, or `telegram:chat:<chat_id>:<message_id>`).
+    /// Falls back to `reply_to` if omitted.
+    #[serde(default)]
+    target: Option<String>,
+    /// Emoji reaction when `action = "react"` (e.g. `"👍"`, `"🔥"`, `"❤️"`, `"🎉"`, or `""` to clear).
+    #[serde(default)]
+    emoji: Option<String>,
+    /// Selected poll option(s) when `action = "vote"` (1-based option numbers `"1"`, `"2"` or option text)
+    /// or checklist item numbers when `action = "check" | "uncheck"`.
+    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    options: Vec<String>,
     /// Names this send. Send it again with the same value only when an earlier
     /// attempt got no answer.
     #[serde(default)]
@@ -266,21 +415,96 @@ struct ConversationArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct AgentsArgs {
-    /// Optional state filter: `"running"`, `"archived"`, or `"all"` (default `"all"`).
+    /// Action to perform:
+    /// - `"list"` (default: list agents and sub-agents with optional `state` and `parent` filters)
+    /// - `"inspect"` / `"status"` (inspect an agent or sub-agent's live status, schedules, and recent conversation turns)
+    /// - `"spawn"` (spawn a new sub-agent under this agent, with optional `repo` / `branch` / `base` / `workdir` for an isolated Git worktree)
+    /// - `"create"` (admin-only: create a standalone root agent with no parent)
+    /// - `"describe"` (read or update an agent's role & responsibility `description` / `instructions` and short `role` label; defaults `name` to `"self"`)
+    /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
+    /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
+    /// - `"pause"` (pause an agent)
+    /// - `"archive"` (archive an agent or yourself to scale to zero; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
+    /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
+    /// - `"rename"` (admin-only: rename an agent in place while keeping its `agt_...` ID and old name as an alias)
+    /// - `"role"` (set or clear an agent's short role label)
+    /// - `"harness"` (declaratively update an agent's harness/model/profile)
+    /// - `"models"` (list upstream provider profile model catalogs)
+    #[serde(default)]
+    action: Option<String>,
+    /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     state: Option<String>,
-    /// Optional parent filter: agent name, `agt_...` ID, `"self"` (children of this agent),
-    /// or `"root"` (persistent root agents with no parent).
+    /// Optional parent filter for `list`: `"self"` / `"children"` (direct sub-agents of this agent),
+    /// `"subagents"` (all sub-agents across all parents), `"root"` (root agents with no parent), or an agent name/`agt_...` ID.
     #[serde(default)]
     parent: Option<String>,
+    /// Target agent name or `agt_...` ID (`"self"`, `"all"`, or a peer/sub-agent name; optional on `spawn` where a `<caller>-sub-<id>` name is auto-generated if omitted).
+    #[serde(
+        default,
+        alias = "agent",
+        alias = "id",
+        alias = "agent_id",
+        alias = "target"
+    )]
+    name: Option<String>,
+    /// New agent name when `action = "rename"`.
+    #[serde(default, alias = "to")]
+    new_name: Option<String>,
+    /// Short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...)
+    /// when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
+    #[serde(default)]
+    role: Option<String>,
+    /// Set `true` to clear the description or role label when `action` is `"describe"` or `"role"`.
+    #[serde(default)]
+    clear: Option<bool>,
+    /// Harness catalog ID when `action` is `"spawn"`, `"create"`, or `"harness"` (`sylphx`, `opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `"inherit"`).
+    #[serde(default)]
+    harness: Option<String>,
+    /// Optional model override when `action` is `"spawn"`, `"create"`, or `"harness"`.
+    #[serde(default)]
+    model: Option<String>,
+    /// Optional upstream provider account profile when `action` is `"spawn"`, `"create"`, or `"harness"`.
+    #[serde(default)]
+    profile: Option<String>,
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) when `action` is `"spawn"` or `"create"` to automatically provision an isolated, lifecycle-managed Git worktree at `<data>/agents/<id>/work`.
+    #[serde(default)]
+    repo: Option<String>,
+    /// Optional Git branch name for the managed worktree when `repo` is provided (defaults to `agent/<name>`).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional starting Git ref/branch when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional working directory or workspace mode when `action` is `"spawn"` or `"create"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default for sub-agents when `repo` is omitted: shares parent's `workdir`).
+    #[serde(default)]
+    workdir: Option<String>,
+    /// Role/responsibility description or standing instructions when `action` is `"spawn"`, `"create"`, or `"describe"`.
+    #[serde(default, alias = "description")]
+    instructions: Option<String>,
+    /// Task prompt or follow-up message when `action` is `"spawn"`, `"create"`, `"steer"`, `"send"`, or `"wake"`.
+    #[serde(default, alias = "text", alias = "message")]
+    prompt: Option<String>,
+    /// Number of recent conversation turns to include when `action = "inspect"` (default 10).
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct SpawnArgs {
     /// Optional short agent name (`[a-z0-9][a-z0-9_-]*`). If omitted, a unique
     /// `<caller>-sub-<id>` name is generated automatically.
-    #[serde(default)]
+    #[serde(
+        default,
+        alias = "agent",
+        alias = "id",
+        alias = "agent_id",
+        alias = "target"
+    )]
     name: Option<String>,
+    /// Optional short role label for the spawned agent.
+    #[serde(default)]
+    role: Option<String>,
     /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     /// Defaults to the caller's own harness (or `claude-code` when the caller runs on `agy`).
     #[serde(default)]
@@ -291,11 +515,20 @@ struct SpawnArgs {
     /// Optional upstream provider account profile (e.g. `acct-a`, `openai/default`, `sylphx/default`).
     #[serde(default)]
     profile: Option<String>,
-    /// Optional working directory path.
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"` to branch from the parent's repo) to automatically provision an isolated, lifecycle-managed Git worktree as the sub-agent's `workdir`.
+    #[serde(default)]
+    repo: Option<String>,
+    /// Optional Git branch name to create in the managed worktree when `repo` is provided (defaults to `agent/<name>`).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional starting Git ref/branch for the managed worktree when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional working directory or workspace mode: an explicit path, `"worktree"` / `"branch"` (provisions an isolated Git worktree branched from the parent's repo at `<data>/agents/<id>/work`), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default when `repo` is omitted: inherits the parent agent's `workdir`).
     #[serde(default)]
     workdir: Option<String>,
     /// Optional system/role description or standing instructions for the spawned agent.
-    #[serde(default, alias = "description", alias = "role")]
+    #[serde(default, alias = "description")]
     instructions: Option<String>,
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
@@ -309,8 +542,11 @@ struct DescribeArgs {
     agent: Option<String>,
     /// New role/responsibility description to set (syncs into the agent's private system prompt and group roster).
     /// Omit to read the current description.
-    #[serde(default, alias = "instructions", alias = "role", alias = "text")]
+    #[serde(default, alias = "instructions", alias = "text")]
     description: Option<String>,
+    /// Optional short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...).
+    #[serde(default)]
+    role: Option<String>,
     /// Set `true` to clear the agent's custom description.
     #[serde(default)]
     clear: Option<bool>,
@@ -351,7 +587,16 @@ struct SubagentsArgs {
     /// Optional account profile when `action = "spawn"`.
     #[serde(default)]
     profile: Option<String>,
-    /// Optional working directory when `action = "spawn"`.
+    /// Optional repository (`"<org>/<repo>"`, local repo path, or `"inherit"`) when `action = "spawn"` to automatically provision an isolated, lifecycle-managed Git worktree.
+    #[serde(default)]
+    repo: Option<String>,
+    /// Optional Git branch name for the managed worktree when `action = "spawn"` and `repo` is set (defaults to `agent/<name>`).
+    #[serde(default)]
+    branch: Option<String>,
+    /// Optional starting Git ref/branch when `action = "spawn"` and `repo` is set (defaults to `origin/HEAD` or parent `HEAD`).
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional working directory or workspace mode when `action = "spawn"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory), or `"inherit"` (default when `repo` is omitted: shares parent's `workdir`).
     #[serde(default)]
     workdir: Option<String>,
     /// Optional system/role instructions when `action = "spawn"`.
@@ -425,6 +670,39 @@ struct InteractArgs {
     text: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, JsonSchema)]
+struct ScheduleArgs {
+    /// Action: `"set"` (create a one-off `at`, recurring `every`, or event `watch` wake),
+    /// `"list"` (list active schedules), or `"cancel"` (cancel a schedule by `id` or `"all"`).
+    /// Inferred automatically when `at`, `every`, `watch`, or `id` is provided.
+    #[serde(default)]
+    action: Option<String>,
+    /// One-off wake time: relative duration (`"1m"`, `"30s"`, `"2h"`) or ISO-8601 / Unix timestamp (`"2026-10-29T16:30:00Z"`).
+    #[serde(default)]
+    at: Option<String>,
+    /// Recurring wake interval (`"1m"`, `"5m"`, `"15m"`, `"30m"`, `"1h"`). Fires only when idle and not quota-blocked; a missed wake never double-fires.
+    #[serde(default)]
+    every: Option<String>,
+    /// Event watch specification:
+    /// - `"github:pr:<owner>/<repo>#<num>"` (GitHub PR reaching a terminal state: merged/closed or checks terminal)
+    /// - `"github:check:<owner>/<repo>@<ref>"` (GitHub check runs reaching a terminal state)
+    /// - `"spiron:promise:<id>"` (Spiron promise state change pulled from the public API)
+    /// - `"agent:idle:<name_or_id>"` (AnyAgents agent transitioning to idle)
+    /// - `"pid:<pid>"` / `"process:<pid>"` (local background process PID exiting)
+    /// - `"file:<path>"` / `"path:<path>"` (local file/directory created or modified)
+    #[serde(default)]
+    watch: Option<String>,
+    /// Prompt delivered to the agent when the schedule or event watch fires.
+    #[serde(default, alias = "text", alias = "message")]
+    prompt: Option<String>,
+    /// Schedule ID (`sch_...`) or `"all"` when `action = "cancel"`.
+    #[serde(default, alias = "schedule_id")]
+    id: Option<String>,
+    /// Optional target agent name or `agt_...` ID (defaults to this agent; owners/parents can also inspect or manage a peer/child's schedules).
+    #[serde(default, alias = "name", alias = "target")]
+    agent: Option<String>,
+}
+
 fn generate_subagent_name(parent_name: &str) -> String {
     let raw = AgentId::generate().to_string();
     let short = raw
@@ -437,15 +715,58 @@ fn generate_subagent_name(parent_name: &str) -> String {
     format!("{parent_name}-sub-{short}")
 }
 
-#[tool_router(server_handler)]
+#[tool_router]
 impl AgentMcp {
     #[tool(
-        description = "Send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`)."
+        description = "Unified outbound communication and message interaction tool: send a message, media file (`photo`, `video`, `audio`, `music`, `voice`, `document`, `animation`), GPS `location`/venue, interactive `poll`, `checklist`, or Instant View `article` to one or multiple agents (`sage`, `agt_...`, `parent`, `children`), internal groups (`group:<name>`, `group:all`, `all`), or external channel targets (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>`); OR perform a message interaction (`action`: `\"react\"` | `\"vote\"` | `\"check\"` | `\"uncheck\"` | `\"edit\"` | `\"delete\"` | `\"pin\"` | `\"unpin\"` | `\"stop_poll\"`) on a target message (`target` or `reply_to`: `anyagents:reply:msg_...` or `telegram:chat:<chat_id>:<message_id>`)."
     )]
     async fn send(
         &self,
         Parameters(args): Parameters<SendArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<SendResponse>, String> {
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let inferred_interact = args
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("send"))
+            .map(str::to_ascii_lowercase)
+            .or_else(|| {
+                if args.emoji.is_some() && args.to.is_empty() && args.text.trim().is_empty() {
+                    Some("react".to_string())
+                } else {
+                    None
+                }
+            });
+        if let Some(interact_action) = inferred_interact {
+            let target = args
+                .target
+                .or(args.reply_to)
+                .or_else(|| args.to.into_iter().next())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    format!("`send` with `action = \"{interact_action}\"` requires `target` or `reply_to`")
+                })?;
+            let text_opt = if args.text.trim().is_empty() {
+                None
+            } else {
+                Some(args.text)
+            };
+            let res = self
+                .interact(Parameters(InteractArgs {
+                    action: interact_action,
+                    target,
+                    emoji: args.emoji,
+                    options: args.options,
+                    text: text_opt,
+                }))
+                .await?
+                .0;
+            return Ok(rmcp::handler::server::wrapper::Json(
+                serde_json::to_value(res).map_err(|e| e.to_string())?,
+            ));
+        }
+
         let quote =
             args.quote
                 .as_deref()
@@ -469,14 +790,16 @@ impl AgentMcp {
             article: args.article,
             idempotency_key: args.idempotency_key,
         };
-        let response = self
+        let response: SendResponse = self
             .client
             .get(
                 "/v1/send",
                 Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
             )
             .await?;
-        Ok(rmcp::handler::server::wrapper::Json(response))
+        Ok(rmcp::handler::server::wrapper::Json(
+            serde_json::to_value(response).map_err(|e| e.to_string())?,
+        ))
     }
 
     #[tool(
@@ -541,60 +864,421 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "List agents (persistent and sub-agents, running or archived) with their permanent `agt_...` ID, name, parent, harness, state, and lag. Supports optional `state` (`running` | `archived` | `all`) and `parent` (`self` | `root` | `<name/id>`) filters."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
         Parameters(args): Parameters<AgentsArgs>,
-    ) -> Result<rmcp::handler::server::wrapper::Json<AgentsResponse>, String> {
-        let mut response: AgentsResponse = self.client.get("/v1/agents", None).await?;
-        if let Some(state_filter) = args
-            .state
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
-        {
-            response
-                .agents
-                .retain(|a| a.state.eq_ignore_ascii_case(state_filter));
-        }
-        if let Some(parent_filter) = args
-            .parent
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let action = args
+            .action
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-        {
-            let cleaned = parent_filter
-                .strip_prefix("agent:")
-                .unwrap_or(parent_filter);
-            if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none") {
-                response.agents.retain(|a| a.parent.is_none());
-            } else {
-                let wanted_id = if cleaned.eq_ignore_ascii_case("self")
-                    || cleaned.eq_ignore_ascii_case(&self.agent.name)
-                    || cleaned == self.agent.id.as_str()
+            .map(str::to_ascii_lowercase)
+            .unwrap_or_else(|| {
+                if args.new_name.is_some() {
+                    "rename".to_string()
+                } else if args.instructions.is_some()
+                    && args.prompt.is_none()
+                    && args.harness.is_none()
+                    && args.repo.is_none()
                 {
-                    Some(self.agent.id.to_string())
+                    "describe".to_string()
+                } else if args.prompt.is_some()
+                    && (args.repo.is_some() || args.workdir.is_some() || args.branch.is_some())
+                {
+                    "spawn".to_string()
                 } else {
-                    response
-                        .agents
-                        .iter()
-                        .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
-                        .map(|a| a.id.clone())
-                        .or_else(|| Some(cleaned.to_string()))
-                };
-                if let Some(wid) = wanted_id {
-                    response
-                        .agents
-                        .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                    "list".to_string()
                 }
+            });
+        match action.as_str() {
+            "list" | "ls" => {
+                let mut response: AgentsResponse = self.client.get_agents().await?;
+                if let Some(state_filter) = args
+                    .state
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+                {
+                    response.agents.retain(|a| {
+                        a.state.eq_ignore_ascii_case(state_filter)
+                            || a.turn_state.eq_ignore_ascii_case(state_filter)
+                    });
+                }
+                if let Some(parent_filter) = args
+                    .parent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    let cleaned = parent_filter
+                        .strip_prefix("agent:")
+                        .unwrap_or(parent_filter);
+                    if cleaned.eq_ignore_ascii_case("root") || cleaned.eq_ignore_ascii_case("none")
+                    {
+                        response.agents.retain(|a| a.parent.is_none());
+                    } else if cleaned.eq_ignore_ascii_case("subagents")
+                        || cleaned.eq_ignore_ascii_case("all_subagents")
+                    {
+                        response.agents.retain(|a| a.parent.is_some());
+                    } else if !cleaned.eq_ignore_ascii_case("all") {
+                        let wanted_id = if cleaned.eq_ignore_ascii_case("self")
+                            || cleaned.eq_ignore_ascii_case("children")
+                            || cleaned.eq_ignore_ascii_case(&self.agent.name)
+                            || cleaned == self.agent.id.as_str()
+                        {
+                            Some(self.agent.id.to_string())
+                        } else {
+                            response
+                                .agents
+                                .iter()
+                                .find(|a| {
+                                    a.name.eq_ignore_ascii_case(cleaned)
+                                        || a.id == cleaned
+                                        || a.aliases
+                                            .iter()
+                                            .any(|al| al.eq_ignore_ascii_case(cleaned))
+                                })
+                                .map(|a| a.id.clone())
+                                .or_else(|| Some(cleaned.to_string()))
+                        };
+                        if let Some(wid) = wanted_id {
+                            response
+                                .agents
+                                .retain(|a| a.parent.as_deref() == Some(wid.as_str()));
+                        }
+                    }
+                }
+                let running = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running")
+                    .count();
+                let working = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "working")
+                    .count();
+                let errored = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "errored")
+                    .count();
+                let paused = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "paused")
+                    .count();
+                let archived = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "archived")
+                    .count();
+                let mut val = serde_json::to_value(&response).map_err(|e| e.to_string())?;
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert(
+                        "summary".to_string(),
+                        serde_json::json!({
+                            "total": response.agents.len(),
+                            "running": running,
+                            "working": working,
+                            "errored": errored,
+                            "idle": running.saturating_sub(working).saturating_sub(errored),
+                            "paused": paused,
+                            "archived": archived,
+                        }),
+                    );
+                }
+                Ok(rmcp::handler::server::wrapper::Json(val))
             }
+            "spawn" => {
+                let spawned = self
+                    .spawn(Parameters(SpawnArgs {
+                        name: args.name,
+                        role: args.role,
+                        harness: args.harness,
+                        model: args.model,
+                        profile: args.profile,
+                        repo: args.repo,
+                        branch: args.branch,
+                        base: args.base,
+                        workdir: args.workdir,
+                        instructions: args.instructions,
+                        prompt: args.prompt,
+                    }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(spawned).map_err(|e| e.to_string())?,
+                ))
+            }
+            "create" => {
+                let name = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents create` requires `name`".to_string())?
+                    .to_string();
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("codex")
+                    .to_string();
+                let parent_val = match args.parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    Some(p) if p.eq_ignore_ascii_case("self") => Some(self.agent.id.to_string()),
+                    Some(p) => Some(p.to_string()),
+                    None => Some("root".to_string()),
+                };
+                let body = CreateAgentRequest {
+                    name,
+                    role: args.role,
+                    harness,
+                    model: args.model,
+                    profile: args.profile,
+                    repo: args.repo,
+                    branch: args.branch,
+                    base: args.base,
+                    workdir: args.workdir,
+                    instructions: args.instructions,
+                    parent: parent_val,
+                    prompt: args.prompt,
+                };
+                let created: AgentView = self
+                    .client
+                    .get(
+                        "/v1/agents",
+                        Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(created).map_err(|e| e.to_string())?,
+                ))
+            }
+            "describe" => {
+                self.describe(Parameters(DescribeArgs {
+                    agent: args.name,
+                    description: args.instructions,
+                    role: args.role,
+                    clear: args.clear,
+                }))
+                .await
+            }
+            "steer" | "send" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents steer` requires `name` (or `agent`)".to_string())?;
+                let text = args
+                    .prompt
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents steer` requires `prompt`".to_string())?;
+                self.send(Parameters(SendArgs {
+                    to: vec![target.to_string()],
+                    text: text.to_string(),
+                    ..SendArgs::default()
+                }))
+                .await
+            }
+            "wake" | "resume" => {
+                let target = args
+                    .name
+                    .ok_or_else(|| "`agents wake` requires `name` (or `agent`)".to_string())?;
+                let woke = self
+                    .wake(Parameters(WakeArgs {
+                        agent: target,
+                        prompt: args.prompt,
+                    }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(woke).map_err(|e| e.to_string())?,
+                ))
+            }
+            "pause" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents pause` requires `name` (or `agent`)".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let view: AgentView = self
+                    .client
+                    .get(&format!("/v1/agents/{clean}/pause"), Some(b"{}".to_vec()))
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(view).map_err(|e| e.to_string())?,
+                ))
+            }
+            "archive" => {
+                let view = self
+                    .archive(Parameters(ArchiveArgs { agent: args.name }))
+                    .await?
+                    .0;
+                Ok(rmcp::handler::server::wrapper::Json(
+                    serde_json::to_value(view).map_err(|e| e.to_string())?,
+                ))
+            }
+            "delete" | "kill" | "remove" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents delete` requires `name` (or `agent`)".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let deleted: serde_json::Value = self
+                    .client
+                    .request_method("DELETE", &format!("/v1/agents/{clean}"), None)
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(deleted))
+            }
+            "rename" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents rename` requires `name`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let new_name = args
+                    .new_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents rename` requires `new_name`".to_string())?;
+                let clean_new = new_name.strip_prefix("agent:").unwrap_or(new_name);
+                let body = serde_json::json!({
+                    "name": clean_new,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/rename"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
+            "role" | "set_role" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents role` requires `name`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let body = serde_json::json!({
+                    "role": args.role,
+                    "clear": args.clear.unwrap_or(false),
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/role"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
+            "harness" | "set_harness" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents harness` requires `name`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents harness` requires `harness`".to_string())?;
+                let body = serde_json::json!({
+                    "harness": harness,
+                    "model": args.model,
+                    "profile": args.profile,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/harness"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
+            "inspect" | "status" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("self");
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let resp: AgentsResponse = self.client.get_agents().await?;
+                let view = resp
+                    .agents
+                    .into_iter()
+                    .find(|a| {
+                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
+                            || a.name.eq_ignore_ascii_case(clean)
+                            || a.id == clean
+                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
+                    })
+                    .ok_or_else(|| format!("agent `{clean}` not found"))?;
+                let limit = args.limit.unwrap_or(10);
+                let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
+                let conv: ConversationResponse =
+                    self.client
+                        .get(&conv_path, None)
+                        .await
+                        .unwrap_or(ConversationResponse {
+                            agent_id: view.id.clone(),
+                            agent: view.name.clone(),
+                            turns: Vec::new(),
+                        });
+                let schedules = view.schedules.clone();
+                Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
+                    "agent": view,
+                    "subagent": view,
+                    "schedules": schedules,
+                    "recent_turns": conv.turns,
+                })))
+            }
+            "models" | "catalog" | "profiles" => {
+                let filter = args
+                    .profile
+                    .as_deref()
+                    .or(args.harness.as_deref())
+                    .or(args.name.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let path = match filter {
+                    Some(f) => format!("/v1/profiles/models?filter={}", urlencoding_simple(f)),
+                    None => "/v1/profiles/models".to_string(),
+                };
+                let catalogs: serde_json::Value = self.client.get(&path, None).await?;
+                Ok(rmcp::handler::server::wrapper::Json(catalogs))
+            }
+            other => Err(format!(
+                "unknown agents action `{other}`; expected `list`, `inspect`, `spawn`, `create`, `describe`, `steer`, `wake`, `pause`, `archive`, `delete`, `rename`, `role`, `harness`, or `models`"
+            )),
         }
-        Ok(rmcp::handler::server::wrapper::Json(response))
     }
 
     #[tool(
-        description = "Spawn a new sub-agent with this agent as its `parent`. Returns its permanent `agt_...` ID and name. The sub-agent automatically scales to zero (`state = archived`) once its turn finishes and its mailbox is drained, and automatically wakes/resumes whenever a new message is sent to its ID/name."
+        description = "Spawn a new sub-agent with this agent as its `parent` (supports multi-level sub-agent trees). Pass `repo` (e.g. `\"SylphxAI/spiron\"` or `\"inherit\"` to branch from your current repo, with optional `branch` and `base`) to automatically provision an isolated, lifecycle-managed Git worktree as its `workdir` (cleanly reaped on `archive` when pushed, or preserved if dirty). If both `repo` and `workdir` are omitted, inherits your `workdir`. Every sub-agent automatically receives the shared `AGENTS.md` and top-level `skills` in its config home."
     )]
     async fn spawn(
         &self,
@@ -616,9 +1300,13 @@ impl AgentMcp {
             .to_string();
         let body = CreateAgentRequest {
             name,
+            role: args.role,
             harness,
             model: args.model,
             profile: args.profile,
+            repo: args.repo,
+            branch: args.branch,
+            base: args.base,
             workdir: args.workdir,
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
@@ -635,7 +1323,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view a sub-agent's live status AND its recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workdir; use `steer` to send follow-up instructions; use `pause`, `archive`, `wake`, or `delete` to control its lifecycle."
+        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git worktree at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or default `\"inherit\"`); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
     )]
     async fn subagents(
         &self,
@@ -656,7 +1344,7 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .unwrap_or("self");
-                let mut resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                let mut resp: AgentsResponse = self.client.get_agents().await?;
                 if parent_arg.eq_ignore_ascii_case("all") {
                     resp.agents.retain(|a| a.parent.is_some());
                 } else {
@@ -669,7 +1357,11 @@ impl AgentMcp {
                     } else {
                         resp.agents
                             .iter()
-                            .find(|a| a.name.eq_ignore_ascii_case(cleaned) || a.id == cleaned)
+                            .find(|a| {
+                                a.name.eq_ignore_ascii_case(cleaned)
+                                    || a.id == cleaned
+                                    || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(cleaned))
+                            })
                             .map(|a| a.id.clone())
                             .unwrap_or_else(|| cleaned.to_string())
                     };
@@ -682,13 +1374,20 @@ impl AgentMcp {
                     .map(str::trim)
                     .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
                 {
-                    resp.agents.retain(|a| a.state.eq_ignore_ascii_case(st));
+                    resp.agents.retain(|a| {
+                        a.state.eq_ignore_ascii_case(st) || a.turn_state.eq_ignore_ascii_case(st)
+                    });
                 }
                 let running = resp.agents.iter().filter(|a| a.state == "running").count();
                 let working = resp
                     .agents
                     .iter()
                     .filter(|a| a.state == "running" && a.turn_state == "working")
+                    .count();
+                let errored = resp
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "errored")
                     .count();
                 let paused = resp.agents.iter().filter(|a| a.state == "paused").count();
                 let archived = resp.agents.iter().filter(|a| a.state == "archived").count();
@@ -698,7 +1397,8 @@ impl AgentMcp {
                         "total": resp.agents.len(),
                         "running": running,
                         "working": working,
-                        "idle": running.saturating_sub(working),
+                        "errored": errored,
+                        "idle": running.saturating_sub(working).saturating_sub(errored),
                         "paused": paused,
                         "archived": archived,
                     },
@@ -711,15 +1411,18 @@ impl AgentMcp {
                     .as_deref()
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .ok_or_else(|| {
-                        "`subagents inspect` requires `agent` (name or agt_... id)".to_string()
-                    })?;
+                    .unwrap_or("self");
                 let clean = target.strip_prefix("agent:").unwrap_or(target);
-                let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+                let resp: AgentsResponse = self.client.get_agents().await?;
                 let view = resp
                     .agents
                     .into_iter()
-                    .find(|a| a.name.eq_ignore_ascii_case(clean) || a.id == clean)
+                    .find(|a| {
+                        (clean.eq_ignore_ascii_case("self") && a.id == self.agent.id.as_str())
+                            || a.name.eq_ignore_ascii_case(clean)
+                            || a.id == clean
+                            || a.aliases.iter().any(|al| al.eq_ignore_ascii_case(clean))
+                    })
                     .ok_or_else(|| format!("sub-agent `{clean}` not found"))?;
                 let limit = args.limit.unwrap_or(10);
                 let conv_path = format!("/v1/agents/{}/conversation?limit={limit}", view.id);
@@ -732,8 +1435,10 @@ impl AgentMcp {
                             agent: view.name.clone(),
                             turns: Vec::new(),
                         });
+                let schedules = view.schedules.clone();
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "subagent": view,
+                    "schedules": schedules,
                     "recent_turns": conv.turns,
                 })))
             }
@@ -741,9 +1446,13 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.agent,
+                        role: None,
                         harness: args.harness,
                         model: args.model,
                         profile: args.profile,
+                        repo: args.repo,
+                        branch: args.branch,
+                        base: args.base,
                         workdir: args.workdir,
                         instructions: args.instructions,
                         prompt: args.prompt,
@@ -826,6 +1535,34 @@ impl AgentMcp {
                     serde_json::to_value(view).map_err(|e| e.to_string())?,
                 ))
             }
+            "harness" | "set_harness" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents harness` requires `agent`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let harness = args
+                    .harness
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents harness` requires `harness`".to_string())?;
+                let body = serde_json::json!({
+                    "harness": harness,
+                    "model": args.model,
+                    "profile": args.profile,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/harness"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
             "delete" | "kill" | "remove" => {
                 let target = args
                     .agent
@@ -841,13 +1578,13 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(deleted))
             }
             other => Err(format!(
-                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, or `delete`"
+                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, `harness`, or `delete`"
             )),
         }
     }
 
     #[tool(
-        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so any future message or `wake` call resumes it."
+        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so any future message or `wake` call resumes it. For sub-agents with a managed Git worktree, automatically runs `git worktree remove` if the worktree is clean and has no unpushed commits, or preserves the worktree on disk if uncommitted/unpushed work remains."
     )]
     async fn archive(
         &self,
@@ -857,8 +1594,9 @@ impl AgentMcp {
             .agent
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
             .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
+            .filter(|s| !s.eq_ignore_ascii_case("self"))
             .unwrap_or_else(|| self.agent.id.to_string());
         let response = self
             .client
@@ -991,9 +1729,10 @@ impl AgentMcp {
         };
         if resolved_target.eq_ignore_ascii_case("all")
             && args.description.is_none()
+            && args.role.is_none()
             && !args.clear.unwrap_or(false)
         {
-            let resp: AgentsResponse = self.client.get("/v1/agents", None).await?;
+            let resp: AgentsResponse = self.client.get_agents().await?;
             let roster: Vec<serde_json::Value> = resp
                 .agents
                 .into_iter()
@@ -1002,6 +1741,8 @@ impl AgentMcp {
                     serde_json::json!({
                         "id": a.id,
                         "name": a.name,
+                        "role": a.role,
+                        "aliases": a.aliases,
                         "parent": a.parent,
                         "harness": a.harness,
                         "model": a.model,
@@ -1014,9 +1755,10 @@ impl AgentMcp {
                 "agents": roster,
             })));
         }
-        if args.description.is_some() || args.clear.unwrap_or(false) {
+        if args.description.is_some() || args.role.is_some() || args.clear.unwrap_or(false) {
             let body = serde_json::json!({
                 "description": args.description,
+                "role": args.role,
                 "clear": args.clear.unwrap_or(false),
             });
             let updated: serde_json::Value = self
@@ -1036,7 +1778,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Native SOTA anti-detect browser with persistent login profiles and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `eval` | `screenshot` | `cookies` | `tabs` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
+        description = "Native SOTA anti-detect browser with persistent login profiles and scale-to-zero lifecycle (`action`: `open` | `snapshot` | `click` | `fill` | `press` | `hold` | `key_down` | `key_up` | `eval` | `screenshot` | `cookies` | `tabs` | `status` | `profiles` | `close`). Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile WebGL/Client-Hints/Canvas stealth fingerprinting and persistent `--user-data-dir` login state. Pass `action: \"open\"` with `url` to navigate and receive interactive `@e1`, `@e2` refs; pass `action: \"click\"` or `\"fill\"` with `selector: \"@e1\"`; pass `action: \"press\"` or `\"hold\"` with `key` (or `keys`: `[\"w\", \"d\"]`) and optional `hold_ms` (e.g. `500`) to hold trusted keyboard input (`isTrusted: true`, W3C `KeyboardEvent.code`) across rendered animation frames and release cleanly on completion; pass `action: \"close\"` when finished to scale the browser process to zero while keeping the profile logged in."
     )]
     async fn browser(
         &self,
@@ -1050,6 +1792,77 @@ impl AgentMcp {
             )
             .await?;
         Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+
+    #[tool(
+        description = "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>` (PR or checks terminal), `github:check:<owner>/<repo>@<ref>` (check runs terminal), `spiron:promise:<id>` (Spiron promise state change pulled from the public API), and `agent:idle:<name_or_id>` (AnyAgents agent going idle). Wakes fire only when you are idle and not quota-blocked, and a missed wake never fires twice."
+    )]
+    async fn schedule(
+        &self,
+        Parameters(args): Parameters<ScheduleArgs>,
+    ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
+        let target_opt = args
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("self"))
+            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string());
+        let path = match target_opt.as_deref() {
+            Some(target) => format!("/v1/agents/{target}/schedules"),
+            None => "/v1/schedules".to_string(),
+        };
+        let body = serde_json::json!({
+            "action": args.action,
+            "at": args.at,
+            "every": args.every,
+            "watch": args.watch,
+            "prompt": args.prompt,
+            "id": args.id,
+            "agent": target_opt,
+        });
+        let response: serde_json::Value = self
+            .client
+            .get(
+                &path,
+                Some(serde_json::to_vec(&body).map_err(|err| err.to_string())?),
+            )
+            .await?;
+        Ok(rmcp::handler::server::wrapper::Json(response))
+    }
+}
+
+const CANONICAL_MCP_TOOLS: &[&str] = &[
+    "agents",
+    "browser",
+    "conversation",
+    "groups",
+    "schedule",
+    "send",
+];
+
+#[rmcp::tool_handler(router = Self::tool_router())]
+impl rmcp::ServerHandler for AgentMcp {
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let supports_cache_hints = context.protocol_version().is_some_and(|version| {
+            version >= rmcp::model::ProtocolVersion::V_2026_07_28
+        });
+        let tools = Self::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|t| CANONICAL_MCP_TOOLS.contains(&t.name.as_ref()))
+            .collect();
+        Ok(rmcp::model::ListToolsResult {
+            result_type: Some(rmcp::model::ResultType::COMPLETE),
+            tools,
+            meta: None,
+            next_cursor: None,
+            ttl_ms: supports_cache_hints.then_some(0),
+            cache_scope: supports_cache_hints.then_some(rmcp::model::CacheScope::Public),
+        })
     }
 }
 

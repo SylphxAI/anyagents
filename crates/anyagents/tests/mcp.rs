@@ -10,7 +10,9 @@ use rmcp::{ServiceExt, serde_json};
 use serde::Deserialize;
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    cmd.env("ANYAGENTS_TESTS", "1");
+    cmd
 }
 
 /// A `PATH` where creating an agent installs nothing: `npm` answers a version
@@ -67,6 +69,14 @@ struct GroupView {
 #[derive(Deserialize)]
 struct SendResponse {
     deliveries: Vec<Delivery>,
+    #[serde(default)]
+    skipped: Vec<SkippedDelivery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SkippedDelivery {
+    to: String,
+    reason: String,
 }
 
 #[derive(Deserialize)]
@@ -263,11 +273,18 @@ async fn mcp_tools_use_the_server_socket() {
 
     let tools = alpha.list_all_tools().await.unwrap();
     let names: Vec<_> = tools.iter().map(|tool| tool.name.to_string()).collect();
-    assert!(names.contains(&"send".to_string()), "{names:?}");
-    assert!(names.contains(&"conversation".to_string()), "{names:?}");
-    assert!(names.contains(&"search".to_string()), "{names:?}");
-    assert!(!names.contains(&"inbox".to_string()), "{names:?}");
-    assert!(names.contains(&"agents".to_string()), "{names:?}");
+    assert_eq!(
+        names,
+        vec![
+            "agents".to_string(),
+            "browser".to_string(),
+            "conversation".to_string(),
+            "groups".to_string(),
+            "schedule".to_string(),
+            "send".to_string(),
+        ],
+        "expected consolidated 6 canonical orthogonal MCP tools, got {names:?}"
+    );
 
     let listed: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
     assert_eq!(listed.agents.len(), 2);
@@ -363,6 +380,19 @@ async fn mcp_tools_use_the_server_socket() {
         in_room.turns.iter().any(|line| line.text == "room line"),
         "{:?}",
         in_room.turns.len()
+    );
+    let searched_conv: ConversationResponse = ok_json(
+        call(
+            &alpha,
+            "conversation",
+            serde_json::json!({"query": "room line", "limit": 5}),
+        )
+        .await,
+    );
+    assert!(
+        searched_conv.turns.iter().any(|line| line.text == "room line"),
+        "{:?}",
+        searched_conv.turns
     );
     let searched: ConversationResponse = ok_json(
         call(
@@ -490,6 +520,44 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(archived.state, "archived");
 
     // While archived, `group:all` skips it.
+    // Also pause `worker-1` via unified `agents` tool after joining `crew` to verify `skipped` reports paused agents with reason.
+    let paused_worker: AgentView = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "pause", "name": &spawned.id}),
+        )
+        .await,
+    );
+    assert_eq!(paused_worker.state, "paused");
+
+    let to_all_with_paused: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["all"], "text": "broadcast while worker paused"}),
+        )
+        .await,
+    );
+    assert!(
+        to_all_with_paused
+            .skipped
+            .iter()
+            .any(|s| s.to == "agent:worker-1" && s.reason == "paused"),
+        "expected paused worker in skipped receipt: {:?}",
+        to_all_with_paused.skipped
+    );
+
+    let archived: AgentView = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "archive", "name": &spawned.id}),
+        )
+        .await,
+    );
+    assert_eq!(archived.state, "archived");
+
     let to_all: SendResponse = ok_json(
         call(
             &alpha,
@@ -523,6 +591,26 @@ async fn mcp_tools_use_the_server_socket() {
         .expect("worker-1");
     assert_eq!(worker_row.state, "running");
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let alpha_cfg = dir.path().join("agents").join(&alpha_id).join("config");
+        std::fs::set_permissions(&alpha_cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
+        let before_gid = std::fs::metadata(&alpha_cfg).unwrap().gid();
+        let desc_res: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "describe",
+                serde_json::json!({"agent": "self", "description": "Standing owner role description."}),
+            )
+            .await,
+        );
+        assert_eq!(desc_res["system_prompt_synced"], true);
+        let after_meta = std::fs::metadata(&alpha_cfg).unwrap();
+        assert_eq!(after_meta.permissions().mode() & 0o7777, 0o0700);
+        assert_eq!(after_meta.gid(), before_gid);
+    }
+
     alpha.cancel().await.unwrap();
     beta.cancel().await.unwrap();
     drop(server);
@@ -538,9 +626,9 @@ async fn mcp_tools_use_the_server_socket() {
         "{}",
         String::from_utf8_lossy(&inbox.stderr)
     );
-    // Two addressed lines, the room line, and the `all` broadcast line, each readable from the CLI too.
+    // Two addressed lines, the room line, and the two `all` broadcast lines, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 4, "{listed}");
+    assert_eq!(listed.lines().count(), 5, "{listed}");
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
 }
