@@ -20,6 +20,7 @@ use anyagents_supervisor::LaunchRequest;
 
 use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
+use crate::sylphx::SylphxHarness;
 
 pub enum VendorHarness {
     Claude(Box<ClaudeHarness>, PathBuf),
@@ -30,6 +31,7 @@ pub enum VendorHarness {
     Omp(Box<OmpHarness>, PathBuf),
     Dsh(Box<DshHarness>, PathBuf),
     Grok(Box<GrokHarness>, PathBuf),
+    Sylphx(Box<SylphxHarness>, PathBuf),
     Contract(Box<ContractHarness>),
 }
 
@@ -49,6 +51,7 @@ impl VendorHarness {
             Self::Omp(harness, path) => (harness.session_id(), Some(path)),
             Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
             Self::Grok(harness, path) => (harness.session_id(), Some(path)),
+            Self::Sylphx(harness, path) => (harness.session_id(), Some(path)),
             Self::OpenCode(_) | Self::Contract(_) => (None, None),
         };
         if let (Some(id), Some(path)) = (session, path) {
@@ -806,6 +809,32 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         );
         vh.sync_session();
         Ok(vh)
+    } else if request.agent.harness == "sylphx" {
+        let session = session_from_file(&request.config_dir, "sylphx-session-id");
+        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+        let mcp_args = vec![
+            "--data".to_string(),
+            request.data_dir.display().to_string(),
+            "mcp".to_string(),
+            "--config".to_string(),
+            request.config_dir.display().to_string(),
+        ];
+        let harness = SylphxHarness::start(
+            &request.config_dir,
+            &request.work_dir,
+            request.agent.model.as_deref(),
+            session.as_deref(),
+            &pairs(&env),
+            &exe,
+            &mcp_args,
+        )
+        .map_err(|err| err.to_string())?;
+        let vh = VendorHarness::Sylphx(
+            Box::new(harness),
+            request.config_dir.join("sylphx-session-id"),
+        );
+        vh.sync_session();
+        Ok(vh)
     } else if request.agent.harness == "opencode" {
         // Each agent gets its own OpenCode data root. Without this every agent
         // shares ~/.local/share/opencode/opencode.db with the desk's own
@@ -1107,6 +1136,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.deliver(message),
             Self::Dsh(harness, _) => harness.deliver(message),
             Self::Grok(harness, _) => harness.deliver(message),
+            Self::Sylphx(harness, _) => harness.deliver(message),
             Self::Contract(harness) => harness.deliver(message),
         };
         self.sync_session();
@@ -1123,6 +1153,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.background(),
             Self::Dsh(harness, _) => harness.background(),
             Self::Grok(harness, _) => harness.background(),
+            Self::Sylphx(harness, _) => harness.background(),
             Self::Contract(harness) => harness.background(),
         }
     }
@@ -1137,6 +1168,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.resume(session),
             Self::Dsh(harness, _) => harness.resume(session),
             Self::Grok(harness, _) => harness.resume(session),
+            Self::Sylphx(harness, _) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
         };
         self.sync_session();
@@ -1153,6 +1185,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.cancel(),
             Self::Dsh(harness, _) => harness.cancel(),
             Self::Grok(harness, _) => harness.cancel(),
+            Self::Sylphx(harness, _) => harness.cancel(),
             Self::Contract(harness) => harness.cancel(),
         }
     }
@@ -1168,6 +1201,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.health(),
             Self::Dsh(harness, _) => harness.health(),
             Self::Grok(harness, _) => harness.health(),
+            Self::Sylphx(harness, _) => harness.health(),
             Self::Contract(harness) => harness.health(),
         }
     }
@@ -1182,6 +1216,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.input_ready(),
             Self::Dsh(harness, _) => harness.input_ready(),
             Self::Grok(harness, _) => harness.input_ready(),
+            Self::Sylphx(harness, _) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
         }
     }
@@ -1197,6 +1232,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.last_usage(),
             Self::Dsh(harness, _) => harness.last_usage(),
             Self::Grok(harness, _) => harness.last_usage(),
+            Self::Sylphx(harness, _) => harness.last_usage(),
             Self::Contract(harness) => harness.last_usage(),
         }
     }
@@ -1211,6 +1247,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.turns_served(),
             Self::Dsh(harness, _) => harness.turns_served(),
             Self::Grok(harness, _) => harness.turns_served(),
+            Self::Sylphx(harness, _) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
         }
     }
@@ -1225,6 +1262,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Dsh(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Grok(harness, _) => harness.quiet_for(id, quiet, patience),
+            Self::Sylphx(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
         }
     }
@@ -1239,6 +1277,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.ends_on_quiet(),
             Self::Dsh(harness, _) => harness.ends_on_quiet(),
             Self::Grok(harness, _) => harness.ends_on_quiet(),
+            Self::Sylphx(harness, _) => harness.ends_on_quiet(),
             Self::Contract(harness) => harness.ends_on_quiet(),
         }
     }
@@ -1253,6 +1292,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.clear_quota(),
             Self::Dsh(harness, _) => harness.clear_quota(),
             Self::Grok(harness, _) => harness.clear_quota(),
+            Self::Sylphx(harness, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
         }
     }
@@ -1267,6 +1307,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.process_id(),
             Self::Dsh(harness, _) => harness.process_id(),
             Self::Grok(harness, _) => harness.process_id(),
+            Self::Sylphx(harness, _) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
         }
     }
@@ -1281,6 +1322,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.watch_activity(notify),
             Self::Dsh(harness, _) => harness.watch_activity(notify),
             Self::Grok(harness, _) => harness.watch_activity(notify),
+            Self::Sylphx(harness, _) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
         }
     }

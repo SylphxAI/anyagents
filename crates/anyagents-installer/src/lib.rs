@@ -137,6 +137,17 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             vec!["grok-4.20".to_string()],
             "",
         ),
+        entry(
+            "sylphx",
+            InstallMethod::Vendored,
+            vec!["sylphx".to_string(), "login".to_string()],
+            Some("SYLPHX_API_KEY".to_string()),
+            vec![
+                "sylphx/openai/gpt-6.1-sol#xhigh".to_string(),
+                "sylphx/openai/gpt-6.1-sol#medium".to_string(),
+            ],
+            "",
+        ),
     ]
 }
 
@@ -328,8 +339,11 @@ fn launcher_name(harness: &str) -> &str {
     }
 }
 
-/// Whether the harness's launcher is already on `PATH`.
+/// Whether the harness's launcher is already on `PATH` (or built-in).
 pub fn machine_has(harness: &str) -> bool {
+    if harness == "sylphx" {
+        return true;
+    }
     let name = launcher_name(harness);
     std::env::var_os("PATH").is_some_and(|path| {
         std::env::split_paths(&path)
@@ -394,7 +408,7 @@ pub fn config_dir_variable(harness: &str) -> Option<&'static str> {
         "agy" => Some("AGY_CONFIG_DIR"),
         "muse" => Some("MUSE_CONFIG_HOME"),
         "omp" => Some("PI_CODING_AGENT_DIR"),
-        "dsh" | "grok" => Some("HOME"),
+        "dsh" | "grok" | "sylphx" => Some("HOME"),
         _ => None,
     }
 }

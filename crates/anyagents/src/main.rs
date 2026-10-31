@@ -29,6 +29,7 @@ mod sandbox;
 mod schedule;
 mod server;
 mod signin;
+mod sylphx;
 mod telegram;
 mod ui;
 mod vendor;
@@ -64,7 +65,7 @@ enum Command {
     },
     /// Sign an agent's harness or a server master profile in through the vendor's own command.
     SignIn {
-        /// Agent name or harness ID (`claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        /// Agent name or harness ID (`sylphx`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
         agent: String,
         /// Optional master profile name (e.g. `acct-1`, `acct-2`, `default`).
         #[arg(long)]
@@ -127,7 +128,7 @@ enum Command {
         /// Set sub-agent default to inherit parent's harness, model, and profile (`subagents default --inherit`).
         #[arg(long)]
         inherit: bool,
-        /// Set sub-agent default harness (`subagents default --harness opencode`).
+        /// Set sub-agent default harness (`subagents default --harness sylphx`).
         #[arg(long)]
         harness: Option<String>,
         /// Set sub-agent default model (`subagents default --model sylphx/openai/gpt-6.1-sol#xhigh`).
@@ -1824,6 +1825,10 @@ fn profiles_cmd(
 fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyagents_core::Error> {
     let mut runner = signin::ProcessRunner;
     let mut sink = signin::TerminalSink;
+    let target = match target.trim() {
+        "sylphx-agent" | "sylphx_agent" => "sylphx",
+        other => other,
+    };
     if signin::signable(target) {
         let prof = profile
             .map(str::trim)

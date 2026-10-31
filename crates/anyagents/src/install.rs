@@ -97,6 +97,9 @@ fn version_sort_key(path: &Path) -> (u64, u64, u64, String) {
 
 /// Detect the currently active version string of `harness`.
 pub fn detect_version(root: &Path, harness: &str) -> String {
+    if harness == "sylphx" {
+        return env!("CARGO_PKG_VERSION").to_string();
+    }
     let dirs = root.join("harnesses").join(harness);
     if let Ok(versions) = std::fs::read_dir(&dirs) {
         let mut installed: Vec<PathBuf> = versions
@@ -282,7 +285,8 @@ fn ensure_vendored_binary(root: &Path, harness: &str) {
 /// Whether any adapter can run this harness, and the reason when none can.
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
     match harness {
-        "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok" => Ok(()),
+        "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok"
+        | "sylphx" | "sylphx-agent" | "sylphx_agent" => Ok(()),
         other => Err(anyagents_core::Error::Message(format!(
             "unknown harness: {other}"
         ))),

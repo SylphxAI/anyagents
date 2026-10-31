@@ -35,9 +35,13 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
+    let normalized_harness = match request.harness.trim() {
+        "sylphx-agent" | "sylphx_agent" => "sylphx".to_string(),
+        other => other.to_string(),
+    };
     // A harness is installed only if an adapter can start it.
-    install::adapter(&request.harness)?;
-    let mut new = NewAgent::new(request.name, request.harness);
+    install::adapter(&normalized_harness)?;
+    let mut new = NewAgent::new(request.name, normalized_harness);
     new.role = request.role;
     new.model = request.model;
     new.instructions = request.instructions;
@@ -1125,6 +1129,14 @@ pub(crate) fn seed_harness_credentials(
             ".grok/models_cache.json",
             ".grok/settings_cache.json",
         ],
+        "sylphx" => &[
+            ".config/sylphx/credentials.json",
+            ".config/sylphx/context.json",
+            ".config/desk/sylphx-ai/key",
+            ".config/opencode/sylphx.key",
+            ".config/opencode/opencode.json",
+            "sylphx-agent.json",
+        ],
         _ => &[],
     };
     let mut rel_paths: Vec<String> = static_rel_paths.iter().map(|s| (*s).to_string()).collect();
@@ -1288,6 +1300,7 @@ pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
         "omp" => Some("omp-session-id"),
         "dsh" => Some("dsh-session-id"),
         "grok" => Some("grok-session-id"),
+        "sylphx" => Some("sylphx-session-id"),
         _ => None,
     }
 }
@@ -1387,6 +1400,7 @@ pub(crate) fn compute_live_session_continuity(
         "omp",
         "dsh",
         "grok",
+        "sylphx",
     ] {
         if candidate == agent.harness {
             continue;
@@ -1639,6 +1653,14 @@ pub(crate) fn reconcile_agent_runtime_config(
             "grok" => {
                 crate::grok::write_grok_config(config, agent.model.as_deref(), &command, &args)?;
             }
+            "sylphx" => {
+                crate::sylphx::write_sylphx_config(
+                    config,
+                    agent.model.as_deref(),
+                    &command,
+                    &args,
+                )?;
+            }
             _ => {
                 let _ = mcp_config::sanitize_claude_settings(config);
                 mcp_config::write_claude(&config.join(".claude.json"), &command, &args)?;
@@ -1826,6 +1848,17 @@ pub(crate) fn verify_harness_runtime_config(
                 ));
             }
         }
+        "sylphx" => {
+            let path = config.join("sylphx-agent.json");
+            let text = std::fs::read_to_string(&path).map_err(|_| {
+                Error::Message(format!("sylphx runtime config missing: {}", path.display()))
+            })?;
+            if !text.contains("\"anyagents\"") {
+                return Err(Error::Message(
+                    "sylphx-agent.json missing anyagents MCP server".into(),
+                ));
+            }
+        }
         _ => {
             for rel in ["mcp.json", ".claude.json"] {
                 let path = config.join(rel);
@@ -1942,6 +1975,7 @@ pub(crate) fn configure_agent_runtime(
     let previous_harness = existing.harness.clone();
     let target_harness = match harness.map(str::trim) {
         Some("") => return Err(Error::Message("harness is empty".into())),
+        Some("sylphx-agent" | "sylphx_agent") => "sylphx".to_string(),
         Some(h) => h.to_string(),
         None => existing.harness.clone(),
     };
@@ -2337,7 +2371,7 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
         "muse" => "muse".to_string(),
         "dsh" => "deepseek".to_string(),
         "grok" => "xai".to_string(),
-        "opencode" | "omp" => "sylphx".to_string(),
+        "sylphx" | "opencode" | "omp" => "sylphx".to_string(),
         other => other.to_string(),
     }
 }
@@ -2345,7 +2379,20 @@ pub(crate) fn upstream_provider_of(harness: &str, model: Option<&str>) -> String
 pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<String>) {
     let harnesses = |list: &[&str]| list.iter().map(|s| (*s).to_string()).collect();
     match provider {
-        "sylphx" | "openrouter" | "opengateway" | "google-gemini" => (
+        "sylphx" => (
+            "api-key",
+            harnesses(&[
+                "sylphx",
+                "opencode",
+                "omp",
+                "claude-code",
+                "codex",
+                "muse",
+                "grok",
+                "dsh",
+            ]),
+        ),
+        "openrouter" | "opengateway" | "google-gemini" => (
             "api-key",
             harnesses(&[
                 "opencode",
@@ -2692,6 +2739,9 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
                             compatible_harnesses = parsed;
                         }
                     }
+                }
+                if provider == "sylphx" && !compatible_harnesses.iter().any(|h| h == "sylphx") {
+                    compatible_harnesses.insert(0, "sylphx".to_string());
                 }
                 entries.push(ProviderProfileEntry {
                     provider: provider.clone(),
@@ -4207,10 +4257,7 @@ pub(crate) fn probe_one_profile_usage(
             Some(format!("active ({count} models)"))
         }
         "sylphx" => {
-            let _key = read_first_non_empty_file(
-                &prof_dir,
-                &[".config/opencode/sylphx.key", ".config/desk/sylphx-ai/key"],
-            )?;
+            let _key = crate::sylphx::read_sylphx_key_from_dir(&prof_dir)?;
             let resp = http
                 .get("https://api.models.sylphx.ai/health")
                 .call()

@@ -82,6 +82,17 @@ impl CommandRunner for ProcessRunner {
         env: &[(&str, &str)],
         on_line: &mut dyn LineSink,
     ) -> Result<(), InstallError> {
+        if program == "sylphx"
+            && args.first().map(String::as_str) == Some("login")
+            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        {
+            let target_dir = env
+                .iter()
+                .find(|(k, _)| *k == "HOME")
+                .map(|(_, v)| Path::new(*v))
+                .unwrap_or(dir);
+            return crate::sylphx::run_device_flow_login(target_dir, on_line);
+        }
         let mut command = Command::new(program);
         command
             .args(args)

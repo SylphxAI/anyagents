@@ -241,9 +241,8 @@ impl HealthBoard {
 /// have no wired, confirmed consumption acknowledgement.
 pub fn declared(harness: &str) -> (DeliveryMode, SteerSupport) {
     match harness {
-        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok" => {
-            (DeliveryMode::Steer, SteerSupport::Yes)
-        }
+        "codex" | "claude-code" | "opencode" | "muse" | "agy" | "omp" | "dsh" | "grok"
+        | "sylphx" => (DeliveryMode::Steer, SteerSupport::Yes),
         _ => (DeliveryMode::Followup, SteerSupport::Unproven),
     }
 }
@@ -1491,6 +1490,7 @@ mod tests {
             "omp",
             "dsh",
             "grok",
+            "sylphx",
         ] {
             assert_eq!(
                 super::declared(harness),
