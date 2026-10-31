@@ -1175,6 +1175,7 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
     let mut table = Table::new(&[
         ("PROVIDER", false),
         ("PROFILE", false),
+        ("ACCOUNT", false),
         ("KIND", false),
         ("USAGE / BALANCE", false),
         ("AGENTS", false),
@@ -1197,6 +1198,10 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
             dim("default")
         } else {
             cyan(&e.profile)
+        };
+        let account_cell = match e.account.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(acct) => dim(acct),
+            None => dim("-"),
         };
         let kind_badge = match e.kind.as_str() {
             "oauth" | "subscription" => green(&e.kind),
@@ -1238,6 +1243,7 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
         table.add_row(vec![
             provider_cell,
             profile_cell,
+            account_cell,
             kind_badge,
             usage_cell,
             agents_cell,

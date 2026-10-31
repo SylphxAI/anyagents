@@ -1817,9 +1817,10 @@ fn profiles_cmd(
             Ok(())
         }
         Some("signin") | Some("sign-in") | Some("login") => {
-            let prof_target = target.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-                Error::Message("usage: anyagents profiles signin <provider>/<profile>".into())
-            })?;
+            let prof_target = target
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("claude-code");
             sign_in(data, prof_target, None)
         }
         Some("list") => list_profiles_cmd(data, target),
@@ -1854,26 +1855,51 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         other => other,
     };
     if signin::signable(target) {
-        let prof = effective_profile
+        let explicit_prof = effective_profile
             .and_then(|p| p.split_once('/').map(|(_, r)| r.trim()).or(Some(p)))
-            .filter(|s| !s.is_empty())
-            .unwrap_or("default");
+            .filter(|s| !s.is_empty());
         let provider = create::upstream_provider_of(target, None);
-        let dir = data.join("profiles").join(&provider).join(prof);
-        std::fs::create_dir_all(&dir)?;
-        let outcome = anyagents_installer::sign_in_at(
+        let staging_dir = match explicit_prof {
+            Some(prof) => data.join("profiles").join(&provider).join(prof),
+            None => {
+                let stage = data
+                    .join("profiles")
+                    .join(&provider)
+                    .join(format!(".signin-staging-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&stage);
+                stage
+            }
+        };
+        std::fs::create_dir_all(&staging_dir)?;
+        let outcome = match anyagents_installer::sign_in_at(
             &anyagents_installer::builtin_catalog(),
-            &dir,
+            &staging_dir,
             target,
             &mut runner,
             &mut sink,
-        )
-        .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
-        create::finalize_profile_signin(data, &provider, prof);
+        ) {
+            Ok(o) => o,
+            Err(err) => {
+                if explicit_prof.is_none() {
+                    let _ = std::fs::remove_dir_all(&staging_dir);
+                }
+                return Err(anyagents_core::Error::Message(err.to_string()));
+            }
+        };
+        let (resolved_prof, final_dir, resolved_acct) =
+            create::resolve_and_commit_staged_signin(
+                data,
+                &provider,
+                &staging_dir,
+                explicit_prof,
+            )?;
         println!(
-            "signed in\tprofile:{provider}/{prof}\t{}\t{}",
-            dir.display(),
-            outcome.account.as_deref().unwrap_or("-")
+            "signed in\tprofile:{provider}/{resolved_prof}\t{}\t{}",
+            final_dir.display(),
+            resolved_acct
+                .as_deref()
+                .or(outcome.account.as_deref())
+                .unwrap_or("-")
         );
         return Ok(());
     }
@@ -2123,6 +2149,9 @@ fn list_profiles_cmd(data: &Path, filter: Option<&str>) -> Result<(), anyagents_
         e.provider == f_trimmed
             || e.profile == f_trimmed
             || format!("{}/{}", e.provider, e.profile) == f_trimmed
+            || e.account
+                .as_deref()
+                .is_some_and(|a| a.eq_ignore_ascii_case(f_trimmed))
             || e.compatible_harnesses.iter().any(|h| h == f_trimmed)
     };
     let filtered: Vec<create::ProviderProfileEntry> = entries

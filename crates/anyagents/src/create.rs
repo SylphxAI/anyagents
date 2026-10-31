@@ -1251,14 +1251,23 @@ pub(crate) fn seed_harness_credentials(
                             break;
                         }
                         if !profile_changed {
-                            let newer_oauth = matches!(
+                            let different_identity = matches!(
                                 (
-                                    json_oauth_expires_at(&src_bytes),
-                                    json_oauth_expires_at(&dst_bytes)
+                                    json_oauth_identity(&src_bytes),
+                                    json_oauth_identity(&dst_bytes)
                                 ),
-                                (Some(s_exp), Some(d_exp)) if s_exp > d_exp
-                            ) || (json_oauth_expires_at(&src_bytes).is_some()
-                                && json_oauth_expires_at(&dst_bytes).is_none());
+                                (Some(s_id), Some(d_id)) if s_id != d_id
+                            );
+                            let newer_oauth = different_identity
+                                || matches!(
+                                    (
+                                        json_oauth_expires_at(&src_bytes),
+                                        json_oauth_expires_at(&dst_bytes)
+                                    ),
+                                    (Some(s_exp), Some(d_exp)) if s_exp > d_exp
+                                )
+                                || (json_oauth_expires_at(&src_bytes).is_some()
+                                    && json_oauth_expires_at(&dst_bytes).is_none());
                             if !newer_oauth {
                                 break;
                             }
@@ -1288,6 +1297,8 @@ pub(crate) fn seed_harness_credentials(
 pub(crate) struct ProviderProfileEntry {
     pub provider: String,
     pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub kind: String,
     pub compatible_harnesses: Vec<String>,
     pub assigned_agents: Vec<String>,
@@ -2363,11 +2374,405 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
     }
 }
 
+pub(crate) fn update_profile_json_identity(
+    prof_dir: &Path,
+    provider: &str,
+    email: Option<&str>,
+    account_id: Option<&str>,
+) {
+    ensure_provider_profile_meta(prof_dir, provider, None);
+    let meta_path = prof_dir.join("profile.json");
+    let mut val = std::fs::read_to_string(&meta_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    let Some(obj) = val.as_object_mut() else {
+        return;
+    };
+    let mut changed = false;
+    if let Some(em) = email.map(str::trim).filter(|s| !s.is_empty())
+        && obj.get("account").and_then(serde_json::Value::as_str) != Some(em)
+    {
+        obj.insert(
+            "account".to_string(),
+            serde_json::Value::String(em.to_string()),
+        );
+        changed = true;
+    }
+    if let Some(aid) = account_id.map(str::trim).filter(|s| !s.is_empty())
+        && obj.get("account_id").and_then(serde_json::Value::as_str) != Some(aid)
+    {
+        obj.insert(
+            "account_id".to_string(),
+            serde_json::Value::String(aid.to_string()),
+        );
+        changed = true;
+    }
+    if changed
+        && let Ok(text) = serde_json::to_string_pretty(&val)
+    {
+        let _ = std::fs::write(&meta_path, text);
+    }
+}
+
+fn extract_jwt_email(jwt: &str) -> Option<String> {
+    let payload_b64 = jwt.split('.').nth(1)?;
+    let decoded = decode_b64url(payload_b64)?;
+    let val: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
+    val.get("email")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            val.pointer("/https:~1~1api.openai.com~1profile/email")
+                .and_then(serde_json::Value::as_str)
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Extracts `(email, account_id)` for a provider profile directory from its
+/// vendor credential files or `profile.json`.
+pub(crate) fn extract_profile_account_identity(
+    prof_dir: &Path,
+    provider: &str,
+) -> (Option<String>, Option<String>) {
+    let mut email: Option<String> = None;
+    let mut account_id: Option<String> = None;
+
+    match provider {
+        "anthropic" => {
+            for rel in [".credentials.json", ".claude/.credentials.json"] {
+                if let Ok(text) = std::fs::read_to_string(prof_dir.join(rel))
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    if email.is_none() {
+                        email = val
+                            .pointer("/claudeAiOauth/email")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                    if account_id.is_none() {
+                        account_id = val
+                            .pointer("/claudeAiOauth/accountUuid")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                }
+            }
+            for rel in [".claude.json", ".claude/.claude.json"] {
+                if let Ok(text) = std::fs::read_to_string(prof_dir.join(rel))
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    if email.is_none() {
+                        email = val
+                            .pointer("/oauthAccount/emailAddress")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                    if account_id.is_none() {
+                        account_id = val
+                            .pointer("/oauthAccount/accountUuid")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        "openai" => {
+            for rel in ["auth.json", ".codex/auth.json"] {
+                if let Ok(text) = std::fs::read_to_string(prof_dir.join(rel))
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    if email.is_none() {
+                        email = val
+                            .get("id_token_email")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                val.pointer("/tokens/id_token")
+                                    .and_then(serde_json::Value::as_str)
+                                    .and_then(extract_jwt_email)
+                            });
+                    }
+                    if account_id.is_none() {
+                        account_id = val
+                            .pointer("/tokens/account_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    if let Ok(raw) = std::fs::read_to_string(prof_dir.join("profile.json"))
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+    {
+        if email.is_none() {
+            email = val
+                .get("account")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+        if account_id.is_none() {
+            account_id = val
+                .get("account_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+        }
+    }
+
+    (email, account_id)
+}
+
+fn sanitize_profile_slug(raw: &str) -> String {
+    let base = raw.split('@').next().unwrap_or(raw).trim();
+    let mut slug = String::new();
+    for ch in base.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            slug.push(ch.to_ascii_lowercase());
+        } else if ch == '.' && !slug.ends_with('-') && !slug.is_empty() {
+            slug.push('-');
+        }
+    }
+    let slug = slug.trim_matches('-').trim_matches('_');
+    if slug.is_empty() || slug == "default" {
+        "acct".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn copy_dir_recursive_overwrite(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let ft = entry.file_type()?;
+        let dst_path = dst.join(entry.file_name());
+        if ft.is_dir() {
+            copy_dir_recursive_overwrite(&entry.path(), &dst_path)?;
+        } else if ft.is_file() {
+            let _ = std::fs::copy(entry.path(), &dst_path);
+        }
+    }
+    Ok(())
+}
+
+/// Resolves the target profile for an OAuth sign-in staged at `staging_dir` using
+/// the authenticated account's `email` and `account_id`:
+/// - If `explicit_profile` is `Some(prof)`, commits directly to `prof`.
+/// - Otherwise (`explicit_profile` is `None`), extracts `(email, account_id)` from
+///   `staging_dir` (probing the upstream OAuth profile endpoint if needed) and:
+///   1. If an existing profile already uniquely matches `account_id` or `email` (and is not
+///      duplicated across multiple profiles), updates that profile in-place.
+///   2. If the newly signed-in account does not match an existing profile (e.g. logging in
+///      `ritaleewoonyee@gmail.com` while `default` and `vulcan` both hold duplicate
+///      `stanleylau_ex@hotmail.com`), assigns it to an unauthenticated profile or one of
+///      the duplicated profiles (preferring `default`) so each profile holds its own
+///      distinct account and bound agents (`sage` vs `vulcan`) are immediately separated.
+///   3. If all existing profiles already hold distinct accounts, creates a profile named
+///      after the account's email handle.
+pub(crate) fn resolve_and_commit_staged_signin(
+    data: &Path,
+    provider: &str,
+    staging_dir: &Path,
+    explicit_profile: Option<&str>,
+) -> Result<(String, PathBuf, Option<String>), Error> {
+    if provider == "anthropic" {
+        let root_cred = staging_dir.join(".credentials.json");
+        let sub_cred = staging_dir.join(".claude/.credentials.json");
+        let root_mt = std::fs::metadata(&root_cred).and_then(|m| m.modified()).ok();
+        let sub_mt = std::fs::metadata(&sub_cred).and_then(|m| m.modified()).ok();
+        if sub_mt > root_mt
+            && let Ok(bytes) = std::fs::read(&sub_cred)
+        {
+            let _ = std::fs::write(&root_cred, &bytes);
+        } else if root_mt.is_some()
+            && let Ok(bytes) = std::fs::read(&root_cred)
+        {
+            let _ = std::fs::create_dir_all(staging_dir.join(".claude"));
+            let _ = std::fs::write(&sub_cred, &bytes);
+        }
+        let (claude_email, claude_uuid) = extract_profile_account_identity(staging_dir, provider);
+        if let Ok(cred_text) = std::fs::read_to_string(&root_cred)
+            && let Ok(mut cred) = serde_json::from_str::<serde_json::Value>(&cred_text)
+        {
+            if let Some(oauth) = cred
+                .get_mut("claudeAiOauth")
+                .and_then(serde_json::Value::as_object_mut)
+            {
+                if let Some(ref em) = claude_email {
+                    oauth.insert("email".to_string(), serde_json::Value::String(em.clone()));
+                }
+                if let Some(ref u) = claude_uuid {
+                    oauth.insert(
+                        "accountUuid".to_string(),
+                        serde_json::Value::String(u.clone()),
+                    );
+                }
+            }
+            if let Some(tok) = cred
+                .pointer("/claudeAiOauth/accessToken")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+            {
+                let http = ureq::Agent::config_builder()
+                    .timeout_global(Some(std::time::Duration::from_secs(6)))
+                    .build()
+                    .new_agent();
+                let _ = sync_anthropic_profile_metadata(
+                    &http,
+                    data,
+                    staging_dir,
+                    ".staging",
+                    &tok,
+                    &mut cred,
+                    true,
+                );
+            }
+            if let Ok(updated) = serde_json::to_string(&cred) {
+                let _ = std::fs::create_dir_all(staging_dir.join(".claude"));
+                let _ = std::fs::write(&root_cred, &updated);
+                let _ = std::fs::write(&sub_cred, &updated);
+            }
+        }
+    }
+
+    let (staged_email, staged_id) = extract_profile_account_identity(staging_dir, provider);
+
+    let chosen_profile = if let Some(exp) = explicit_profile.map(str::trim).filter(|s| !s.is_empty())
+    {
+        exp.to_string()
+    } else {
+        let existing = list_harness_profiles(data, provider);
+        if existing.is_empty() {
+            "default".to_string()
+        } else {
+            struct ExistingProf {
+                name: String,
+                email: Option<String>,
+                acct_id: Option<String>,
+                has_creds: bool,
+            }
+            let mut profs = Vec::new();
+            for (name, dir) in &existing {
+                let (em, aid) = extract_profile_account_identity(dir, provider);
+                let has_creds = em.is_some()
+                    || aid.is_some()
+                    || dir.join(".credentials.json").is_file()
+                    || dir.join("auth.json").is_file()
+                    || dir
+                        .join(".gemini/antigravity-cli/antigravity-oauth-token")
+                        .is_file();
+                profs.push(ExistingProf {
+                    name: name.clone(),
+                    email: em,
+                    acct_id: aid,
+                    has_creds,
+                });
+            }
+
+            let matches_staged = |p: &ExistingProf| -> bool {
+                if let (Some(s_id), Some(p_id)) = (staged_id.as_deref(), p.acct_id.as_deref())
+                    && s_id == p_id
+                {
+                    return true;
+                }
+                if let (Some(s_em), Some(p_em)) = (staged_email.as_deref(), p.email.as_deref())
+                    && s_em.eq_ignore_ascii_case(p_em)
+                {
+                    return true;
+                }
+                false
+            };
+
+            let matching: Vec<&ExistingProf> =
+                profs.iter().filter(|p| matches_staged(p)).collect();
+            if let Some(first_match) = matching.first() {
+                first_match.name.clone()
+            } else if let Some(empty) = profs
+                .iter()
+                .find(|p| !p.has_creds && p.name == "default")
+                .or_else(|| profs.iter().find(|p| !p.has_creds))
+            {
+                empty.name.clone()
+            } else {
+                // Check if two or more existing profiles currently hold a duplicated account:
+                let mut duplicate_names: Vec<String> = Vec::new();
+                for (i, a) in profs.iter().enumerate() {
+                    let is_dup = profs.iter().enumerate().any(|(j, b)| {
+                        i != j
+                            && ((a.acct_id.is_some() && a.acct_id == b.acct_id)
+                                || (a.email.is_some()
+                                    && b.email.as_deref().is_some_and(|be| {
+                                        a.email
+                                            .as_deref()
+                                            .is_some_and(|ae| ae.eq_ignore_ascii_case(be))
+                                    })))
+                    });
+                    if is_dup {
+                        duplicate_names.push(a.name.clone());
+                    }
+                }
+                if !duplicate_names.is_empty() {
+                    if duplicate_names.iter().any(|n| n == "default") {
+                        "default".to_string()
+                    } else {
+                        duplicate_names.remove(0)
+                    }
+                } else {
+                    let base_slug = staged_email
+                        .as_deref()
+                        .map(sanitize_profile_slug)
+                        .or_else(|| staged_id.as_deref().map(sanitize_profile_slug))
+                        .unwrap_or_else(|| "acct".to_string());
+                    let mut candidate = base_slug.clone();
+                    let mut seq = 2usize;
+                    while profs.iter().any(|p| p.name == candidate) {
+                        candidate = format!("{base_slug}-{seq}");
+                        seq += 1;
+                    }
+                    candidate
+                }
+            }
+        }
+    };
+
+    let final_dir = data.join("profiles").join(provider).join(&chosen_profile);
+    if staging_dir != final_dir {
+        let _ = copy_dir_recursive_overwrite(staging_dir, &final_dir);
+        let _ = std::fs::remove_dir_all(staging_dir);
+    }
+    finalize_profile_signin(data, provider, &chosen_profile);
+    let (final_email, final_id) = extract_profile_account_identity(&final_dir, provider);
+    Ok((chosen_profile, final_dir, final_email.or(final_id)))
+}
+
 pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str) {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     ensure_provider_profile_meta(&prof_dir, provider, None);
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
     let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
+    let (pre_email, pre_id) = extract_profile_account_identity(&prof_dir, provider);
+    update_profile_json_identity(&prof_dir, provider, pre_email.as_deref(), pre_id.as_deref());
     match provider {
         "anthropic" => {
             let root_cred = prof_dir.join(".credentials.json");
@@ -2383,6 +2788,49 @@ pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str
             {
                 let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
                 let _ = std::fs::write(&sub_cred, &bytes);
+            }
+            if let Ok(cred_text) = std::fs::read_to_string(&root_cred)
+                && let Ok(mut cred) = serde_json::from_str::<serde_json::Value>(&cred_text)
+            {
+                if let Some(oauth) = cred
+                    .get_mut("claudeAiOauth")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    if let Some(ref em) = pre_email {
+                        oauth.insert("email".to_string(), serde_json::Value::String(em.clone()));
+                    }
+                    if let Some(ref u) = pre_id {
+                        oauth.insert(
+                            "accountUuid".to_string(),
+                            serde_json::Value::String(u.clone()),
+                        );
+                    }
+                }
+                if let Ok(updated) = serde_json::to_string(&cred) {
+                    let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
+                    let _ = std::fs::write(&root_cred, &updated);
+                    let _ = std::fs::write(&sub_cred, &updated);
+                }
+                if let Some(tok) = cred
+                    .pointer("/claudeAiOauth/accessToken")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                {
+                    let http = ureq::Agent::config_builder()
+                        .timeout_global(Some(std::time::Duration::from_secs(6)))
+                        .build()
+                        .new_agent();
+                    let _ = sync_anthropic_profile_metadata(
+                        &http,
+                        data,
+                        &prof_dir,
+                        profile,
+                        &tok,
+                        &mut cred,
+                        true,
+                    );
+                }
             }
             propagate_profile_files_to_bound_agents(
                 data,
@@ -2613,6 +3061,7 @@ fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
     let val: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     for ptr in [
         "/claudeAiOauth/accountUuid",
+        "/claudeAiOauth/email",
         "/claudeAiOauth/refreshToken",
         "/id_token_email",
         "/tokens/account_id",
@@ -2899,9 +3348,11 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
                 if provider == "sylphx" && !compatible_harnesses.iter().any(|h| h == "sylphx") {
                     compatible_harnesses.insert(0, "sylphx".to_string());
                 }
+                let (acct_email, acct_id) = extract_profile_account_identity(&prof_path, &provider);
                 entries.push(ProviderProfileEntry {
                     provider: provider.clone(),
                     profile,
+                    account: acct_email.or(acct_id),
                     kind,
                     compatible_harnesses,
                     assigned_agents: Vec::new(),
@@ -3036,6 +3487,16 @@ pub(crate) fn enrich_profiles_usage(data: &Path, entries: &mut [ProviderProfileE
             }
         }
     });
+    for entry in entries.iter_mut() {
+        if entry.account.is_none() {
+            let prof_dir = data
+                .join("profiles")
+                .join(&entry.provider)
+                .join(&entry.profile);
+            let (em, id) = extract_profile_account_identity(&prof_dir, &entry.provider);
+            entry.account = em.or(id);
+        }
+    }
 }
 
 fn read_first_non_empty_file(base: &Path, rels: &[&str]) -> Option<String> {
@@ -3215,6 +3676,9 @@ fn sync_anthropic_profile_metadata(
     let existing_tier = cred
         .pointer("/claudeAiOauth/rateLimitTier")
         .and_then(serde_json::Value::as_str);
+    let existing_email = cred
+        .pointer("/claudeAiOauth/email")
+        .and_then(serde_json::Value::as_str);
     let now_ms = anyagents_core::now_ms();
     let meta_sync_path = prof_dir.join(".anyagents-profile-meta-sync-ms");
     let last_sync_ms = std::fs::read_to_string(&meta_sync_path)
@@ -3225,6 +3689,7 @@ fn sync_anthropic_profile_metadata(
     if (force
         || existing_sub.is_none()
         || existing_tier.is_none()
+        || existing_email.is_none()
         || now_ms.saturating_sub(last_sync_ms) >= 300_000)
         && let Ok(resp) = http
             .get("https://api.anthropic.com/api/oauth/profile")
@@ -3253,10 +3718,28 @@ fn sync_anthropic_profile_metadata(
         let acct_uuid = pval
             .pointer("/account/uuid")
             .and_then(serde_json::Value::as_str);
+        let acct_email = pval
+            .pointer("/account/email")
+            .and_then(serde_json::Value::as_str);
+        if !profile.starts_with('.') {
+            update_profile_json_identity(prof_dir, "anthropic", acct_email, acct_uuid);
+        }
         if let Some(oauth) = cred
             .get_mut("claudeAiOauth")
             .and_then(serde_json::Value::as_object_mut)
         {
+            if let Some(em) = acct_email
+                && oauth
+                    .get("email")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(em)
+            {
+                oauth.insert(
+                    "email".to_string(),
+                    serde_json::Value::String(em.to_string()),
+                );
+                changed = true;
+            }
             if let Some(au) = acct_uuid
                 && oauth
                     .get("accountUuid")
@@ -3304,12 +3787,14 @@ fn sync_anthropic_profile_metadata(
             let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
             let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
             let _ = std::fs::write(prof_dir.join(".claude/.credentials.json"), &updated);
-            propagate_profile_files_to_bound_agents(
-                data,
-                "anthropic",
-                profile,
-                &[".credentials.json", ".claude/.credentials.json"],
-            );
+            if !profile.starts_with('.') {
+                propagate_profile_files_to_bound_agents(
+                    data,
+                    "anthropic",
+                    profile,
+                    &[".credentials.json", ".claude/.credentials.json"],
+                );
+            }
         }
     }
     let sub_type = cred
@@ -3532,7 +4017,7 @@ pub(crate) fn probe_one_profile_usage(
 ) -> Option<String> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let http = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(4)))
+        .timeout_global(Some(std::time::Duration::from_secs(8)))
         .build()
         .new_agent();
 
@@ -3677,6 +4162,13 @@ pub(crate) fn probe_one_profile_usage(
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let (oa_em, oa_id) = extract_profile_account_identity(&prof_dir, "openai");
+            update_profile_json_identity(
+                &prof_dir,
+                "openai",
+                oa_em.as_deref(),
+                oa_id.as_deref().or((!acc_id.is_empty()).then_some(acc_id.as_str())),
+            );
             let fetch_wham = |tok: &str| -> Option<serde_json::Value> {
                 let mut req = http
                     .get("https://chatgpt.com/backend-api/wham/usage")
@@ -3854,6 +4346,20 @@ pub(crate) fn probe_one_profile_usage(
                 }
                 active_token = new_acc;
                 summary_val = fetch_summary(&active_token);
+            }
+            if extract_profile_account_identity(&prof_dir, "google-antigravity")
+                .0
+                .is_none()
+                && let Ok(uresp) = http
+                    .get("https://www.googleapis.com/oauth2/v2/userinfo")
+                    .header("authorization", &format!("Bearer {active_token}"))
+                    .call()
+                && let Ok(ubody) = uresp.into_body().read_to_string()
+                && let Ok(uval) = serde_json::from_str::<serde_json::Value>(&ubody)
+            {
+                let em = uval.get("email").and_then(serde_json::Value::as_str);
+                let uid = uval.get("id").and_then(serde_json::Value::as_str);
+                update_profile_json_identity(&prof_dir, "google-antigravity", em, uid);
             }
             if let Some(ref sv) = summary_val
                 && let Some(groups) = sv.get("groups").and_then(serde_json::Value::as_array)
@@ -6041,5 +6547,99 @@ mod tests {
             Some("mock-ort-vulcan-refresh"),
             "vulcan profile must never be overwritten by default profile credentials"
         );
+    }
+
+    #[test]
+    fn signin_auto_routes_by_email_and_account_id_and_repairs_duplicates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let def_dir = data.join("profiles/anthropic/default");
+        let vul_dir = data.join("profiles/anthropic/vulcan");
+        std::fs::create_dir_all(&def_dir).unwrap();
+        std::fs::create_dir_all(&vul_dir).unwrap();
+
+        let dup_cred = serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "",
+                "refreshToken": "rtok-stanley",
+                "accountUuid": "uuid-stanley",
+                "email": "stanleylau_ex@hotmail.com"
+            }
+        });
+        std::fs::write(def_dir.join(".credentials.json"), dup_cred.to_string()).unwrap();
+        std::fs::write(vul_dir.join(".credentials.json"), dup_cred.to_string()).unwrap();
+
+        // Signing in a different account (`ritaleewoonyee@gmail.com`) without `--profile`
+        // automatically replaces one of the duplicated profiles (`default`) while preserving `vulcan`.
+        let stage1 = data.join("profiles/anthropic/.signin-staging-test1");
+        std::fs::create_dir_all(&stage1).unwrap();
+        std::fs::write(
+            stage1.join(".credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "rtok-rita",
+                    "accountUuid": "uuid-rita",
+                    "email": "ritaleewoonyee@gmail.com"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (prof1, _, acct1) =
+            resolve_and_commit_staged_signin(data, "anthropic", &stage1, None).unwrap();
+        assert_eq!(prof1, "default");
+        assert_eq!(acct1.as_deref(), Some("ritaleewoonyee@gmail.com"));
+        assert_eq!(
+            extract_profile_account_identity(&def_dir, "anthropic").0.as_deref(),
+            Some("ritaleewoonyee@gmail.com")
+        );
+        assert_eq!(
+            extract_profile_account_identity(&vul_dir, "anthropic").0.as_deref(),
+            Some("stanleylau_ex@hotmail.com")
+        );
+
+        // Re-signing in `stanleylau_ex@hotmail.com` without `--profile` routes directly to `vulcan`.
+        let stage2 = data.join("profiles/anthropic/.signin-staging-test2");
+        std::fs::create_dir_all(&stage2).unwrap();
+        std::fs::write(
+            stage2.join(".credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "rtok-stanley-2",
+                    "accountUuid": "uuid-stanley",
+                    "email": "stanleylau_ex@hotmail.com"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (prof2, _, acct2) =
+            resolve_and_commit_staged_signin(data, "anthropic", &stage2, None).unwrap();
+        assert_eq!(prof2, "vulcan");
+        assert_eq!(acct2.as_deref(), Some("stanleylau_ex@hotmail.com"));
+
+        // Signing in a 3rd distinct account creates a new profile named after the email prefix.
+        let stage3 = data.join("profiles/anthropic/.signin-staging-test3");
+        std::fs::create_dir_all(&stage3).unwrap();
+        std::fs::write(
+            stage3.join(".credentials.json"),
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "",
+                    "refreshToken": "rtok-kyle",
+                    "accountUuid": "uuid-kyle",
+                    "email": "kyletse@sylphx.com"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let (prof3, _, acct3) =
+            resolve_and_commit_staged_signin(data, "anthropic", &stage3, None).unwrap();
+        assert_eq!(prof3, "kyletse");
+        assert_eq!(acct3.as_deref(), Some("kyletse@sylphx.com"));
     }
 }
