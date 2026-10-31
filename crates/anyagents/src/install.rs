@@ -51,6 +51,16 @@ impl Installer {
     }
 
     fn install(&self, harness: &str) -> Result<Install, String> {
+        if harness == "sylphx" {
+            let dir = self
+                .root
+                .join("harnesses")
+                .join("sylphx")
+                .join(env!("CARGO_PKG_VERSION"));
+            let _ = std::fs::create_dir_all(&dir);
+            let _ = std::fs::write(dir.join(".installed"), env!("CARGO_PKG_VERSION"));
+            return Ok(Install { dir });
+        }
         let dirs = self.root.join("harnesses").join(harness);
         if let Ok(versions) = std::fs::read_dir(&dirs) {
             let mut installed: Vec<PathBuf> = versions
@@ -323,6 +333,9 @@ pub fn recorded(harness: &str) -> Option<Result<(), String>> {
 /// operating system looks up. `ANYAGENTS_<ID>_BIN` wins, so tests never start a
 /// real vendor and an unusual install can be pointed at.
 pub fn program(root: &Path, harness: &str) -> PathBuf {
+    if harness == "sylphx" {
+        return std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+    }
     if let Some(named) = std::env::var_os(format!(
         "ANYAGENTS_{}_BIN",
         harness.to_uppercase().replace('-', "_")

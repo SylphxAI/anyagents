@@ -4275,7 +4275,7 @@ pub(crate) fn probe_one_profile_usage(
         "sylphx" => {
             let _key = crate::sylphx::read_sylphx_key_from_dir(&prof_dir)?;
             let resp = http
-                .get("https://api.models.sylphx.ai/health")
+                .get("https://api.sylphx.com/health")
                 .call()
                 .ok()?;
             let body = resp.into_body().read_to_string().ok()?;

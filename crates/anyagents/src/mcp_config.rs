@@ -376,7 +376,7 @@ fn upsert_named_table(text: &str, header: &str, body: &str) -> String {
 }
 
 fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<String>) {
-    let mut base_url = "https://api.models.sylphx.ai/v1".to_string();
+    let mut base_url = "https://api.sylphx.com/v1".to_string();
     let mut key_candidates = Vec::new();
     if let Some(dir) = config_dir {
         for opencode_rel in [
@@ -392,7 +392,11 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
                     .map(str::trim)
                     .filter(|u| !u.is_empty())
             {
-                base_url = url.to_string();
+                base_url = if url.contains("models.sylphx.ai") || url.contains("api.sylphx.ai") {
+                    "https://api.sylphx.com/v1".to_string()
+                } else {
+                    url.to_string()
+                };
                 break;
             }
         }
@@ -471,7 +475,7 @@ mod tests {
         );
         assert!(text.contains("[model_providers.sylphx]"), "{text}");
         assert!(
-            text.contains("base_url = \"https://api.models.sylphx.ai/v1\""),
+            text.contains("base_url = \"https://api.sylphx.com/v1\""),
             "{text}"
         );
         assert!(

@@ -45,6 +45,18 @@ pub fn write(
         root["provider"] = donor;
     }
     let has_sylphx_provider = root.get("provider").and_then(|p| p.get("sylphx")).is_some();
+    if let Some(sylphx_opts) = root
+        .get_mut("provider")
+        .and_then(|p| p.get_mut("sylphx"))
+        .and_then(|s| s.get_mut("options"))
+        && let Some(url) = sylphx_opts
+            .get("baseURL")
+            .and_then(serde_json::Value::as_str)
+        && (url.contains("models.sylphx.ai") || url.contains("api.sylphx.ai"))
+    {
+        sylphx_opts["baseURL"] =
+            serde_json::Value::String("https://api.sylphx.com/v1".to_string());
+    }
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         let normalized = normalize_model(raw_model, has_sylphx_provider);
         let (base_model, variant) = match normalized.split_once('#') {

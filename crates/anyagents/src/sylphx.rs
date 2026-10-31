@@ -11,11 +11,12 @@
 //!    - Cloud Session mode against `https://api.sylphx.com/v1/{env}/agent_sessions`
 //!      (`:send`, `:steer`, `:interrupt`, `/session_events`) when `SYLPHX_AGENT_ENV`
 //!      is set.
-//!    - Native Sylphx Agent Runtime multi-step tool loop against Sylphx AI Gateway
-//!      (`https://api.models.sylphx.ai/v1/chat/completions`) with direct execution
-//!      of all 6 AnyAgents coordination tools (`agents`, `send`, `conversation`,
-//!      `groups`, `schedule`, `browser`) and workspace tools (`bash`, `read_file`,
-//!      `write_file`, `edit_file`), plus immediate mid-turn steering between tool steps.
+//!    - Native Sylphx Agent Runtime multi-step tool loop against Sylphx AI
+//!      (`https://api.sylphx.com/v1/responses`) with direct execution
+//!      of all AnyAgents coordination tools (`agents`, `send`, `conversation`,
+//!      `groups`, `schedule`, `browser`, `describe`, `archive`) and workspace tools
+//!      (`bash`, `read_file`, `write_file`, `edit_file`), plus immediate mid-turn
+//!      steering between tool steps.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -34,7 +35,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 pub const DEFAULT_SYLPHX_API_URL: &str = "https://api.sylphx.com";
-pub const DEFAULT_SYLPHX_GATEWAY_URL: &str = "https://api.models.sylphx.ai/v1";
+pub const DEFAULT_SYLPHX_GATEWAY_URL: &str = "https://api.sylphx.com/v1";
 pub const DEFAULT_SYLPHX_MODEL: &str = "sylphx/openai/gpt-6.1-sol#medium";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -457,7 +458,7 @@ pub fn resolve_sylphx_api_key(config_dir: &Path, env: &[(String, String)]) -> Op
     None
 }
 
-/// Resolves the Sylphx AI Gateway key (`https://api.models.sylphx.ai/v1/chat/completions`),
+/// Resolves the Sylphx AI Gateway key (`https://api.sylphx.com/v1/responses`),
 /// prioritizing project-environment keys (`sk-sx-...` in `.config/desk/sylphx-ai/key` or
 /// `.config/opencode/sylphx.key`) before falling back to `.config/sylphx/credentials.json`.
 pub fn resolve_sylphx_gateway_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
@@ -1143,12 +1144,29 @@ fn run_cloud_session_turn(
     Ok(TurnUsage::default())
 }
 
-/// Runs our native multi-step Sylphx Agent Runtime loop against the Sylphx AI Gateway
-/// (`https://api.models.sylphx.ai/v1/chat/completions`), executing AnyAgents MCP tools
-/// (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`) and workspace
-/// tools (`bash`, `read_file`, `write_file`, `edit_file`) directly, and draining
-/// `steer_queue` between every step so mid-turn steering takes effect immediately on
-/// the next step.
+/// Normalizes legacy Sylphx AI hostnames (`api.models.sylphx.ai`, `models.sylphx.ai`,
+/// `ai.sylphx.com`, `api.sylphx.ai`) to the canonical `https://api.sylphx.com/v1`.
+pub fn normalize_sylphx_gateway_url(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty()
+        || trimmed.contains("models.sylphx.ai")
+        || trimmed.contains("api.sylphx.ai")
+        || trimmed.contains("://ai.sylphx.com")
+    {
+        return DEFAULT_SYLPHX_GATEWAY_URL.to_string();
+    }
+    if trimmed == "https://api.sylphx.com" {
+        return DEFAULT_SYLPHX_GATEWAY_URL.to_string();
+    }
+    trimmed.to_string()
+}
+
+/// Runs our native multi-step Sylphx Agent Runtime loop against Sylphx AI's
+/// canonical Responses API (`https://api.sylphx.com/v1/responses`), executing
+/// AnyAgents MCP tools (`agents`, `send`, `conversation`, `groups`, `schedule`,
+/// `browser`, `describe`, `archive`) and workspace tools (`bash`, `read_file`,
+/// `write_file`, `edit_file`) directly, and draining `steer_queue` between every
+/// step so mid-turn steering takes effect immediately on the next step.
 #[allow(clippy::too_many_arguments)]
 fn run_native_gateway_turn(
     state: &Arc<Mutex<SharedState>>,
@@ -1167,29 +1185,28 @@ fn run_native_gateway_turn(
     let gateway_base = env
         .iter()
         .find(|(k, _)| k == "SYLPHX_GATEWAY_URL")
-        .map(|(_, v)| v.trim().trim_end_matches('/').to_string())
+        .map(|(_, v)| normalize_sylphx_gateway_url(v))
         .or_else(|| {
             std::env::var("SYLPHX_GATEWAY_URL")
                 .ok()
-                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .map(|s| normalize_sylphx_gateway_url(&s))
         })
-        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_SYLPHX_GATEWAY_URL.to_string());
-    let chat_url = format!("{gateway_base}/chat/completions");
+    let responses_url = format!("{gateway_base}/responses");
 
     let (model_id, reasoning_effort) = parse_sylphx_model_and_effort(model);
     let system_prompt = assemble_system_prompt(config_dir, work_dir);
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
-    let mut messages = load_transcript_messages(&transcript_path, &system_prompt);
+    let mut input_items = load_transcript_input_items(&transcript_path);
     let user_msg = json!({
         "role": "user",
         "content": initial_user_message,
     });
     append_transcript_message(&transcript_path, &user_msg);
-    messages.push(user_msg);
+    input_items.push(user_msg);
 
-    let tools = build_tool_definitions();
+    let tools = build_responses_tool_definitions();
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
     let mut sent_any_reply = false;
@@ -1198,38 +1215,39 @@ fn run_native_gateway_turn(
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
-        drain_steered_messages(state, &transcript_path, &mut messages);
+        drain_steered_messages(state, &transcript_path, &mut input_items);
 
         let mut req_body = json!({
             "model": model_id,
-            "messages": messages,
+            "instructions": system_prompt,
+            "input": input_items,
             "tools": tools,
         });
         if let Some(ref effort) = reasoning_effort
             && let Some(obj) = req_body.as_object_mut()
         {
-            obj.insert("reasoning_effort".to_string(), Value::String(effort.clone()));
+            obj.insert("reasoning".to_string(), json!({ "effort": effort }));
         }
 
-        let (status, raw) = curl_post_json(&chat_url, Some(&api_key), &req_body)?;
+        let (status, raw) = curl_post_json(&responses_url, Some(&api_key), &req_body)?;
         if !(200..300).contains(&status) {
-            return Err(format!("Sylphx gateway HTTP {status}: {}", raw.trim()));
+            return Err(format!("Sylphx responses API HTTP {status}: {}", raw.trim()));
         }
         let resp: Value = serde_json::from_str(&raw)
-            .map_err(|e| format!("invalid Sylphx gateway JSON response: {e}"))?;
+            .map_err(|e| format!("invalid Sylphx responses API JSON: {e}"))?;
 
         if let Some(usage) = resp.get("usage") {
             total_in = total_in.saturating_add(
                 usage
-                    .get("prompt_tokens")
-                    .or_else(|| usage.get("input_tokens"))
+                    .get("input_tokens")
+                    .or_else(|| usage.get("prompt_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             );
             total_out = total_out.saturating_add(
                 usage
-                    .get("completion_tokens")
-                    .or_else(|| usage.get("output_tokens"))
+                    .get("output_tokens")
+                    .or_else(|| usage.get("completion_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             );
@@ -1244,38 +1262,66 @@ fn run_native_gateway_turn(
             cb();
         }
 
-        let Some(raw_choice_msg) = resp.pointer("/choices/0/message").cloned() else {
-            return Err("Sylphx gateway response missing choices[0].message".to_string());
+        let Some(output_arr) = resp.get("output").and_then(Value::as_array).cloned() else {
+            return Err("Sylphx responses API missing `output` array".to_string());
         };
-        let choice_msg = sanitize_assistant_message(&raw_choice_msg);
 
-        append_transcript_message(&transcript_path, &choice_msg);
-        messages.push(choice_msg.clone());
+        let mut function_calls = Vec::new();
+        let mut assistant_texts = Vec::new();
 
-        let tool_calls = choice_msg
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        for item in output_arr {
+            append_transcript_message(&transcript_path, &item);
+            input_items.push(item.clone());
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    function_calls.push(item);
+                }
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for p in parts {
+                            if let Some(t) = p
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                assistant_texts.push(t.to_string());
+                            }
+                        }
+                    } else if let Some(t) = item
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        assistant_texts.push(t.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
 
-        if !tool_calls.is_empty() {
+        if !function_calls.is_empty() {
             let mut self_archived = false;
-            for tc in tool_calls {
+            for fc in function_calls {
                 if cancel_flag.load(Ordering::SeqCst) {
                     break;
                 }
-                let call_id = tc
-                    .get("id")
+                let call_id = fc
+                    .get("call_id")
+                    .or_else(|| fc.get("id"))
                     .and_then(Value::as_str)
                     .unwrap_or("call_0")
                     .to_string();
-                let fn_name = tc
-                    .pointer("/function/name")
+                let fn_name = fc
+                    .get("name")
+                    .or_else(|| fc.pointer("/function/name"))
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .to_string();
-                let raw_args = tc
-                    .pointer("/function/arguments")
+                let raw_args = fc
+                    .get("arguments")
+                    .or_else(|| fc.pointer("/function/arguments"))
                     .and_then(Value::as_str)
                     .unwrap_or("{}");
                 let parsed_args: Value =
@@ -1313,13 +1359,13 @@ fn run_native_gateway_turn(
                     mcp_command,
                     mcp_args,
                 );
-                let tool_msg = json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": output,
+                let tool_out_item = json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": output,
                 });
-                append_transcript_message(&transcript_path, &tool_msg);
-                messages.push(tool_msg);
+                append_transcript_message(&transcript_path, &tool_out_item);
+                input_items.push(tool_out_item);
             }
             if self_archived {
                 break;
@@ -1327,16 +1373,13 @@ fn run_native_gateway_turn(
             continue;
         }
 
-        if drain_steered_messages(state, &transcript_path, &mut messages) {
+        if drain_steered_messages(state, &transcript_path, &mut input_items) {
             continue;
         }
 
+        let content_text = assistant_texts.join("\n\n");
         if !sent_any_reply
-            && let Some(content_text) = choice_msg
-                .get("content")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+            && !content_text.trim().is_empty()
             && let Some(reply_to) = extract_envelope_sender(initial_user_message)
         {
             let _ = call_anyagents_mcp_tool(
@@ -1346,7 +1389,7 @@ fn run_native_gateway_turn(
                 "send",
                 &json!({
                     "to": reply_to,
-                    "text": content_text,
+                    "text": content_text.trim(),
                 }),
             );
         }
@@ -1652,84 +1695,81 @@ fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     }
 }
 
-/// Strips response-only fields (`annotations`, `refusal`, `audio`, `reasoning`, etc.)
-/// from an assistant message before it is persisted or echoed back to the
-/// Sylphx AI Gateway (`https://api.models.sylphx.ai/v1/chat/completions`), which
-/// rejects unknown fields on assistant messages (`HTTP 400: Unknown parameter: annotations`).
-fn sanitize_assistant_message(msg: &Value) -> Value {
-    let mut out = serde_json::Map::new();
-    out.insert("role".to_string(), Value::String("assistant".to_string()));
-    match msg.get("content") {
-        Some(Value::String(s)) => {
-            out.insert("content".to_string(), Value::String(s.clone()));
-        }
-        _ => {
-            out.insert("content".to_string(), Value::Null);
-        }
-    }
-    if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array)
-        && !tcs.is_empty()
-    {
-        let clean_tcs: Vec<Value> = tcs
-            .iter()
-            .filter_map(|tc| {
-                let id = tc.get("id").and_then(Value::as_str)?;
-                let fn_name = tc.pointer("/function/name").and_then(Value::as_str)?;
-                let fn_args = tc
-                    .pointer("/function/arguments")
-                    .and_then(Value::as_str)
-                    .unwrap_or("{}");
-                Some(json!({
-                    "id": id,
-                    "type": "function",
-                    "function": {
-                        "name": fn_name,
-                        "arguments": fn_args,
-                    }
-                }))
-            })
-            .collect();
-        if !clean_tcs.is_empty() {
-            out.insert("tool_calls".to_string(), Value::Array(clean_tcs));
-        }
-    }
-    Value::Object(out)
-}
-
-fn load_transcript_messages(transcript_path: &Path, system_prompt: &str) -> Vec<Value> {
-    let mut out = vec![json!({
-        "role": "system",
-        "content": system_prompt,
-    })];
+/// Loads persisted transcript items for `/v1/responses` (`input`), automatically
+/// converting any legacy Chat Completions entries (`tool_calls` / `role: "tool"`)
+/// into Responses API items (`function_call` / `function_call_output`).
+fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> {
     let Ok(file) = std::fs::File::open(transcript_path) else {
-        return out;
+        return Vec::new();
     };
-    let mut history: Vec<Value> = BufReader::new(file)
-        .lines()
-        .map_while(Result::ok)
-        .filter_map(|l| serde_json::from_str::<Value>(&l).ok())
-        .map(|m| {
-            if m.get("role").and_then(Value::as_str) == Some("assistant") {
-                sanitize_assistant_message(&m)
-            } else {
-                m
+    let mut history = Vec::new();
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        let Ok(m) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if m.get("type").is_some() {
+            history.push(m);
+            continue;
+        }
+        match m.get("role").and_then(Value::as_str) {
+            Some("user") => {
+                history.push(m);
             }
-        })
-        .collect();
+            Some("assistant") => {
+                if let Some(s) = m
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    history.push(json!({
+                        "role": "assistant",
+                        "content": s,
+                    }));
+                }
+                if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
+                    for tc in tcs {
+                        if let (Some(cid), Some(fname)) = (
+                            tc.get("id").and_then(Value::as_str),
+                            tc.pointer("/function/name").and_then(Value::as_str),
+                        ) {
+                            let fargs = tc
+                                .pointer("/function/arguments")
+                                .and_then(Value::as_str)
+                                .unwrap_or("{}");
+                            history.push(json!({
+                                "type": "function_call",
+                                "call_id": cid,
+                                "name": fname,
+                                "arguments": fargs,
+                            }));
+                        }
+                    }
+                }
+            }
+            Some("tool") => {
+                if let Some(cid) = m.get("tool_call_id").and_then(Value::as_str) {
+                    let out_str = m.get("content").and_then(Value::as_str).unwrap_or("");
+                    history.push(json!({
+                        "type": "function_call_output",
+                        "call_id": cid,
+                        "output": out_str,
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
     if history.len() > 80 {
         let split = history.len() - 80;
         history.drain(0..split);
-        while history
-            .first()
-            .and_then(|m| m.get("role"))
-            .and_then(Value::as_str)
-            == Some("tool")
-        {
+        while history.first().is_some_and(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                || item.get("type").and_then(Value::as_str) == Some("reasoning")
+        }) {
             history.remove(0);
         }
     }
-    out.extend(history);
-    out
+    history
 }
 
 fn append_transcript_message(transcript_path: &Path, msg: &Value) {
@@ -1741,6 +1781,23 @@ fn append_transcript_message(transcript_path: &Path, msg: &Value) {
     {
         let _ = writeln!(f, "{line}");
     }
+}
+
+/// Converts `build_tool_definitions()` into the flat `/v1/responses` function tool schema
+/// (`{"type": "function", "name": ..., "description": ..., "parameters": ...}`).
+fn build_responses_tool_definitions() -> Vec<Value> {
+    build_tool_definitions()
+        .into_iter()
+        .filter_map(|t| {
+            let func = t.get("function")?;
+            Some(json!({
+                "type": "function",
+                "name": func.get("name")?,
+                "description": func.get("description").cloned().unwrap_or(Value::String(String::new())),
+                "parameters": func.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+            }))
+        })
+        .collect()
 }
 
 fn build_tool_definitions() -> Vec<Value> {
@@ -2405,29 +2462,20 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_assistant_message_strips_annotations_and_refusal() {
-        let raw = json!({
-            "role": "assistant",
-            "content": null,
-            "refusal": null,
-            "annotations": [],
-            "tool_calls": [
-                {
-                    "id": "call_123",
-                    "type": "function",
-                    "function": {
-                        "name": "describe",
-                        "arguments": "{\"agent\":\"self\"}"
-                    }
-                }
-            ]
-        });
-        let cleaned = sanitize_assistant_message(&raw);
-        assert!(cleaned.get("annotations").is_none());
-        assert!(cleaned.get("refusal").is_none());
-        assert_eq!(cleaned["role"], "assistant");
-        assert!(cleaned["content"].is_null());
-        assert_eq!(cleaned["tool_calls"][0]["id"], "call_123");
-        assert_eq!(cleaned["tool_calls"][0]["function"]["name"], "describe");
+    fn responses_api_tools_and_url_normalization_work() {
+        assert_eq!(
+            normalize_sylphx_gateway_url("https://api.models.sylphx.ai/v1"),
+            "https://api.sylphx.com/v1"
+        );
+        assert_eq!(
+            normalize_sylphx_gateway_url("https://api.sylphx.com/v1/"),
+            "https://api.sylphx.com/v1"
+        );
+        let tools = build_responses_tool_definitions();
+        assert!(!tools.is_empty());
+        assert_eq!(tools[0]["type"], "function");
+        assert!(tools[0]["name"].is_string());
+        assert!(tools[0]["parameters"].is_object());
+        assert!(tools[0].get("function").is_none());
     }
 }

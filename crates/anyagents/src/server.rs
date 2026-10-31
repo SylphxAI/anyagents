@@ -366,13 +366,108 @@ struct AdminReconcileState {
     initialized: bool,
     watermark_seq: std::collections::HashMap<String, i64>,
     last_backoff_reset_ms: std::collections::HashMap<String, i64>,
+    flushing_sylphx: std::collections::HashSet<String>,
+}
+
+fn spawn_admin_sylphx_delivery(
+    data: PathBuf,
+    agent: Agent,
+    health: HealthBoard,
+    reconcile: Arc<std::sync::Mutex<AdminReconcileState>>,
+) {
+    std::thread::spawn(move || {
+        let (delivery_mode, steer_support) = declared(&agent.harness);
+        let cfg = anyagents_core::agent_config_dir(&data, &agent.id);
+        let work_dir = agent
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| anyagents_core::agent_work_dir(&data, &agent.id));
+        health.publish(
+            &agent.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::InTurn,
+                delivery_mode,
+                steer_support,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: Some(std::process::id()),
+                live_harness: Some(agent.harness.clone()),
+                live_model: agent.model.clone(),
+                process_started_at_ms: Some(now_ms()),
+                last_error: None,
+            },
+        );
+        if let Ok(store) = Store::open(data.join("state.db")) {
+            let req = anyagents_supervisor::LaunchRequest {
+                agent: agent.clone(),
+                data_dir: data.clone(),
+                config_dir: cfg.clone(),
+                work_dir,
+                extra_env: Vec::new(),
+            };
+            match crate::vendor::vendor_launch(req) {
+                Ok(mut harness) => {
+                    while let Ok(Some(message)) = store.next_undelivered(&agent.id) {
+                        let outbound = anyagents_harness::OutboundMessage {
+                            id: message.id.as_str().to_string(),
+                            seq: message.seq,
+                            text: message.text.clone(),
+                            sender: message.sender.clone(),
+                            reply_to: message.reply_to.clone(),
+                            source_time_ms: message.source_time_ms,
+                            context: anyagents_harness::Context::default(),
+                        };
+                        match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
+                            Ok(_) => {
+                                let _ = store.note_delivered(&agent.id, message.seq);
+                                let _ = store.note_turn_completed(&agent.id);
+                                crate::vendor::persist_last_error(&cfg, None, None);
+                            }
+                            Err(err) => {
+                                let _ = store.note_turn_completed(&agent.id);
+                                crate::vendor::persist_last_error(&cfg, Some(&err.to_string()), None);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Err(reason) => {
+                    crate::vendor::persist_last_error(&cfg, Some(&reason), None);
+                }
+            }
+        }
+        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+        health.publish(
+            &agent.id,
+            anyagents_supervisor::LiveState {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::Idle,
+                delivery_mode,
+                steer_support,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some(agent.harness.clone()),
+                live_model: agent.model.clone(),
+                process_started_at_ms: None,
+                last_error: persisted_err,
+            },
+        );
+        let mut guard = match reconcile.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.flushing_sylphx.remove(agent.id.as_str());
+    });
 }
 
 fn reconcile_stopped_and_backed_off_agents(
     store: &Store,
     health: &HealthBoard,
     data: &Path,
-    reconcile: &std::sync::Mutex<AdminReconcileState>,
+    reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
     now_ms: i64,
 ) {
     let Ok(agents) = store.list_agents() else {
@@ -435,6 +530,63 @@ fn reconcile_stopped_and_backed_off_agents(
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
             }
         } else if agent.state == "running" {
+            if agent.harness == "sylphx" {
+                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                let persisted_err =
+                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                if !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                    let (delivery_mode, steer_support) = declared(&agent.harness);
+                    health.publish(
+                        &agent.id,
+                        anyagents_supervisor::LiveState {
+                            process_alive: true,
+                            turn_state: anyagents_harness::TurnState::Idle,
+                            delivery_mode,
+                            steer_support,
+                            quota_reset_at_ms: None,
+                            restart_at_ms: None,
+                            pid: None,
+                            live_harness: Some(agent.harness.clone()),
+                            live_model: agent.model.clone(),
+                            process_started_at_ms: None,
+                            last_error: persisted_err.clone(),
+                        },
+                    );
+                }
+                if oldest_age_ms.is_some() && !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                    let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+                    let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+                    let prev_wm = guard
+                        .watermark_seq
+                        .get(agent.id.as_str())
+                        .copied()
+                        .unwrap_or(delivered);
+                    let last_try = guard
+                        .last_backoff_reset_ms
+                        .get(agent.id.as_str())
+                        .copied()
+                        .unwrap_or(0);
+                    if persisted_err.is_none()
+                        || max_seq > prev_wm
+                        || now_ms.saturating_sub(last_try) >= 15_000
+                    {
+                        guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                        guard
+                            .last_backoff_reset_ms
+                            .insert(agent.id.to_string(), now_ms);
+                        guard.flushing_sylphx.insert(agent.id.to_string());
+                        spawn_admin_sylphx_delivery(
+                            data.to_path_buf(),
+                            agent.clone(),
+                            health.clone(),
+                            Arc::clone(reconcile),
+                        );
+                    }
+                } else if oldest_age_ms.is_none() {
+                    guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                }
+                continue;
+            }
             if oldest_age_ms.is_none() {
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
                 continue;
@@ -1021,6 +1173,45 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("codex");
             let (delivery_mode, steer_support) = declared(harness_str);
+            let raw_last_error = item
+                .get("last_error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if harness_str == "sylphx"
+                && raw_last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("unknown harness: sylphx"))
+            {
+                if health
+                    .get(&id)
+                    .is_some_and(|cur| cur.turn_state == anyagents_harness::TurnState::InTurn)
+                {
+                    continue;
+                }
+                let cfg = anyagents_core::agent_config_dir(data, &id);
+                let persisted_err =
+                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                health.publish(
+                    &id,
+                    anyagents_supervisor::LiveState {
+                        process_alive: true,
+                        turn_state: anyagents_harness::TurnState::Idle,
+                        delivery_mode,
+                        steer_support,
+                        quota_reset_at_ms: None,
+                        restart_at_ms: None,
+                        pid: None,
+                        live_harness: Some("sylphx".to_string()),
+                        live_model: item
+                            .get("model")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                        process_started_at_ms: None,
+                        last_error: persisted_err,
+                    },
+                );
+                continue;
+            }
             health.publish(
                 &id,
                 anyagents_supervisor::LiveState {
@@ -1050,10 +1241,7 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
                     process_started_at_ms: item
                         .get("process_started_at_ms")
                         .and_then(serde_json::Value::as_i64),
-                    last_error: item
-                        .get("last_error")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
+                    last_error: raw_last_error,
                 },
             );
         }

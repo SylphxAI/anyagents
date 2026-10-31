@@ -890,6 +890,20 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             }
         }
         let cfg = anyagents_core::agent_config_dir(data, &id);
+        if view.harness == "sylphx" {
+            view.install = "installed".to_string();
+            if view
+                .last_error
+                .as_deref()
+                .is_some_and(|e| e.contains("unknown harness: sylphx"))
+            {
+                view.last_error =
+                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                if view.state == "running" {
+                    view.process = "alive".to_string();
+                }
+            }
+        }
         let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
