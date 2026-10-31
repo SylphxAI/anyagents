@@ -2363,6 +2363,142 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
     }
 }
 
+pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str) {
+    let prof_dir = data.join("profiles").join(provider).join(profile);
+    ensure_provider_profile_meta(&prof_dir, provider, None);
+    let _ = std::fs::remove_file(prof_dir.join(".anyagents-oauth-refresh-attempt-ms"));
+    let _ = std::fs::remove_file(prof_dir.join(".anyagents-profile-meta-sync-ms"));
+    match provider {
+        "anthropic" => {
+            let root_cred = prof_dir.join(".credentials.json");
+            let sub_cred = prof_dir.join(".claude/.credentials.json");
+            let root_mt = std::fs::metadata(&root_cred).and_then(|m| m.modified()).ok();
+            let sub_mt = std::fs::metadata(&sub_cred).and_then(|m| m.modified()).ok();
+            if sub_mt > root_mt
+                && let Ok(bytes) = std::fs::read(&sub_cred)
+            {
+                let _ = std::fs::write(&root_cred, &bytes);
+            } else if root_mt.is_some()
+                && let Ok(bytes) = std::fs::read(&root_cred)
+            {
+                let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
+                let _ = std::fs::write(&sub_cred, &bytes);
+            }
+            propagate_profile_files_to_bound_agents(
+                data,
+                "anthropic",
+                profile,
+                &[".credentials.json", ".claude/.credentials.json"],
+            );
+        }
+        "openai" => {
+            let root_auth = prof_dir.join("auth.json");
+            let sub_auth = prof_dir.join(".codex/auth.json");
+            let root_mt = std::fs::metadata(&root_auth).and_then(|m| m.modified()).ok();
+            let sub_mt = std::fs::metadata(&sub_auth).and_then(|m| m.modified()).ok();
+            if sub_mt > root_mt
+                && let Ok(bytes) = std::fs::read(&sub_auth)
+            {
+                let _ = std::fs::write(&root_auth, &bytes);
+            } else if root_mt.is_some()
+                && let Ok(bytes) = std::fs::read(&root_auth)
+            {
+                let _ = std::fs::create_dir_all(prof_dir.join(".codex"));
+                let _ = std::fs::write(&sub_auth, &bytes);
+            }
+            propagate_profile_files_to_bound_agents(
+                data,
+                "openai",
+                profile,
+                &["auth.json", ".codex/auth.json"],
+            );
+        }
+        "google-antigravity" => {
+            propagate_profile_files_to_bound_agents(
+                data,
+                "google-antigravity",
+                profile,
+                &[
+                    ".gemini/antigravity-cli/antigravity-oauth-token",
+                    ".gemini/antigravity-cli/antigravity_state.pbtxt",
+                    ".gemini/config/config.json",
+                ],
+            );
+        }
+        "muse" => {
+            propagate_profile_files_to_bound_agents(
+                data,
+                "muse",
+                profile,
+                &["muse/auth.json", ".config/muse/auth.json"],
+            );
+        }
+        "xai" => {
+            propagate_profile_files_to_bound_agents(data, "xai", profile, &[".grok/auth.json"]);
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) {
+    let cfg = agent_config_dir(data, &agent.id);
+    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
+    let prof_name = bound_profile_name(&cfg)
+        .and_then(|b| {
+            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+            (!p.is_empty()).then_some(p)
+        })
+        .unwrap_or_else(|| "default".to_string());
+    let prof_dir = data.join("profiles").join(&provider).join(&prof_name);
+    let rels: &[&str] = match provider.as_str() {
+        "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
+        "openai" => &["auth.json", ".codex/auth.json"],
+        "google-antigravity" => &[
+            ".gemini/antigravity-cli/antigravity-oauth-token",
+            ".gemini/antigravity-cli/antigravity_state.pbtxt",
+            ".gemini/config/config.json",
+        ],
+        "muse" => &["muse/auth.json", ".config/muse/auth.json"],
+        "xai" => &[".grok/auth.json"],
+        _ => &[],
+    };
+    let mut best_src: Option<(std::time::SystemTime, Vec<u8>)> = None;
+    for rel in rels {
+        let src = cfg.join(rel);
+        if std::fs::read(&src).is_err() {
+            chmod_seat_file_readable(&src);
+        }
+        if let Ok(meta) = std::fs::metadata(&src)
+            && meta.is_file()
+            && meta.len() > 0
+            && let Ok(bytes) = std::fs::read(&src)
+        {
+            let mt = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+            if matches!(provider.as_str(), "anthropic" | "openai") {
+                if best_src.as_ref().is_none_or(|(bmt, _)| mt > *bmt) {
+                    best_src = Some((mt, bytes));
+                }
+            } else {
+                let dst = prof_dir.join(rel);
+                if let Some(p) = dst.parent() {
+                    let _ = std::fs::create_dir_all(p);
+                }
+                let _ = std::fs::write(&dst, &bytes);
+            }
+        }
+    }
+    if let Some((_, bytes)) = best_src {
+        for rel in rels {
+            let dst = prof_dir.join(rel);
+            if let Some(p) = dst.parent() {
+                let _ = std::fs::create_dir_all(p);
+            }
+            let _ = std::fs::write(&dst, &bytes);
+        }
+    }
+    finalize_profile_signin(data, &provider, &prof_name);
+}
+
 /// Resolves the upstream provider an agent draws its credential profile from.
 ///
 /// An agent's `model` prefix (`sylphx/...`, `openrouter/...`, `qwen-token-plan/...`,

@@ -64,8 +64,9 @@ enum Command {
         json: bool,
     },
     /// Sign an agent's harness or a server master profile in through the vendor's own command.
+    #[command(visible_alias = "signin", alias = "login")]
     SignIn {
-        /// Agent name or harness ID (`sylphx`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
+        /// Agent name, `<provider>/<profile>`, or harness ID (`sylphx`, `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`).
         agent: String,
         /// Optional master profile name (e.g. `acct-1`, `acct-2`, `default`).
         #[arg(long)]
@@ -1815,6 +1816,12 @@ fn profiles_cmd(
             );
             Ok(())
         }
+        Some("signin") | Some("sign-in") | Some("login") => {
+            let prof_target = target.map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+                Error::Message("usage: anyagents profiles signin <provider>/<profile>".into())
+            })?;
+            sign_in(data, prof_target, None)
+        }
         Some("list") => list_profiles_cmd(data, target),
         other => list_profiles_cmd(data, other),
     }
@@ -1826,13 +1833,29 @@ fn profiles_cmd(
 fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyagents_core::Error> {
     let mut runner = signin::ProcessRunner;
     let mut sink = signin::TerminalSink;
-    let target = match target.trim() {
+    let raw_target = target.trim();
+    let (split_target, split_prof) = match raw_target.split_once('/') {
+        Some((lhs, rhs)) if !lhs.trim().is_empty() && !rhs.trim().is_empty() => {
+            (lhs.trim(), Some(rhs.trim()))
+        }
+        _ => (raw_target, None),
+    };
+    let effective_profile = profile
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or(split_prof);
+    let target = match split_target {
         "sylphx-agent" | "sylphx_agent" => "sylphx",
+        "anthropic" => "claude-code",
+        "openai" => "codex",
+        "google-antigravity" => "agy",
+        "deepseek" => "dsh",
+        "xai" => "grok",
         other => other,
     };
     if signin::signable(target) {
-        let prof = profile
-            .map(str::trim)
+        let prof = effective_profile
+            .and_then(|p| p.split_once('/').map(|(_, r)| r.trim()).or(Some(p)))
             .filter(|s| !s.is_empty())
             .unwrap_or("default");
         let provider = create::upstream_provider_of(target, None);
@@ -1846,6 +1869,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             &mut sink,
         )
         .map_err(|err| anyagents_core::Error::Message(err.to_string()))?;
+        create::finalize_profile_signin(data, &provider, prof);
         println!(
             "signed in\tprofile:{provider}/{prof}\t{}\t{}",
             dir.display(),
@@ -1853,7 +1877,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         );
         return Ok(());
     }
-    if let Some(prof) = profile.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(prof) = effective_profile {
         let rec = agent::named(data, target)?;
         let cfg = anyagents_core::agent_config_dir(data, &rec.id);
         std::fs::create_dir_all(&cfg)?;
@@ -1875,13 +1899,15 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         }
     }
     let outcome = signin::sign_in_agent(data, target, &mut runner, &mut sink)?;
-    let harness = agent::named(data, target)?.harness;
+    let rec = agent::named(data, target)?;
+    let harness = rec.harness.clone();
     if !outcome.signed_in {
         let hint = signin::install_hint(&harness).unwrap_or_else(|| "-".to_string());
         return Err(anyagents_core::Error::Message(format!(
             "{target} is not signed in: the vendor command finished without reporting a sign-in (install: {hint})"
         )));
     }
+    create::finalize_agent_signin(data, &rec);
     println!(
         "signed in\t{target}\t{harness}\t{}",
         outcome.account.as_deref().unwrap_or("-")
