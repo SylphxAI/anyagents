@@ -1030,7 +1030,12 @@ impl AgentMcp {
                     .filter(|s| !s.is_empty())
                     .unwrap_or("codex")
                     .to_string();
-                let parent_val = match args.parent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let parent_val = match args
+                    .parent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     Some(p) if p.eq_ignore_ascii_case("self") => Some(self.agent.id.to_string()),
                     Some(p) => Some(p.to_string()),
                     None => Some("root".to_string()),
@@ -1848,9 +1853,9 @@ impl rmcp::ServerHandler for AgentMcp {
         _request: Option<rmcp::model::PaginatedRequestParams>,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
-        let supports_cache_hints = context.protocol_version().is_some_and(|version| {
-            version >= rmcp::model::ProtocolVersion::V_2026_07_28
-        });
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
         let tools = Self::tool_router()
             .list_all()
             .into_iter()

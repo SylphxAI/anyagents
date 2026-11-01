@@ -209,7 +209,8 @@ impl Harness for SylphxHarness {
                         .ok()
                         .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
                     let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
-                    let steer_url = format!("{}/v1/{sess_path}:steer", api_url.trim_end_matches('/'));
+                    let steer_url =
+                        format!("{}/v1/{sess_path}:steer", api_url.trim_end_matches('/'));
                     let _ = curl_post_json(
                         &steer_url,
                         Some(&api_key),
@@ -311,8 +312,10 @@ impl Harness for SylphxHarness {
                 match outcome {
                     Ok(usage) => {
                         g.turns_served = g.turns_served.saturating_add(1);
-                        g.served_usage.input_tokens =
-                            g.served_usage.input_tokens.saturating_add(usage.input_tokens);
+                        g.served_usage.input_tokens = g
+                            .served_usage
+                            .input_tokens
+                            .saturating_add(usage.input_tokens);
                         g.served_usage.output_tokens = g
                             .served_usage
                             .output_tokens
@@ -380,7 +383,8 @@ impl Harness for SylphxHarness {
                 .ok()
                 .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
             let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
-            let interrupt_url = format!("{}/v1/{sess_path}:interrupt", api_url.trim_end_matches('/'));
+            let interrupt_url =
+                format!("{}/v1/{sess_path}:interrupt", api_url.trim_end_matches('/'));
             let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
         }
         if let Some(cb) = notify {
@@ -476,7 +480,10 @@ fn cloud_session_resource_path(env_slug: &str, sess_id: &str) -> String {
     if trimmed.contains("/agent_sessions/") {
         trimmed.to_string()
     } else {
-        format!("{}/agent_sessions/{trimmed}", env_slug.trim().trim_matches('/'))
+        format!(
+            "{}/agent_sessions/{trimmed}",
+            env_slug.trim().trim_matches('/')
+        )
     }
 }
 
@@ -665,7 +672,8 @@ fn run_cloud_session_turn(
                         .unwrap_or("")
                         .to_string();
                     let is_client = tc.get("client").and_then(Value::as_bool).unwrap_or(true);
-                    if !call_id.is_empty() && is_client && handled_call_ids.insert(call_id.clone()) {
+                    if !call_id.is_empty() && is_client && handled_call_ids.insert(call_id.clone())
+                    {
                         let tool_name = tc
                             .get("tool")
                             .or_else(|| tc.get("name"))
@@ -872,7 +880,10 @@ fn run_native_gateway_turn(
 
         let (status, raw) = curl_post_json(&responses_url, Some(&api_key), &req_body)?;
         if !(200..300).contains(&status) {
-            return Err(format!("Sylphx responses API HTTP {status}: {}", raw.trim()));
+            return Err(format!(
+                "Sylphx responses API HTTP {status}: {}",
+                raw.trim()
+            ));
         }
         let resp: Value = serde_json::from_str(&raw)
             .map_err(|e| format!("invalid Sylphx responses API JSON: {e}"))?;
@@ -1114,9 +1125,7 @@ pub fn run_stdio_adapter(
                         .map(PathBuf::from)
                 })
         })
-        .unwrap_or_else(|| {
-            std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"))
-        });
+        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents")));
     let mcp_args: Vec<String> = config_val
         .get("mcp_args")
         .and_then(Value::as_array)
@@ -1201,13 +1210,17 @@ pub fn run_stdio_adapter(
         };
 
         if already_in_turn {
-            let mut sc = steered_in_turn.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut sc = steered_in_turn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             *sc += 1;
             continue;
         }
 
         cancel_flag.store(false, Ordering::SeqCst);
-        *steered_in_turn.lock().unwrap_or_else(PoisonError::into_inner) = 0;
+        *steered_in_turn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
 
         let state_cl = Arc::clone(&state);
         let cancel_cl = Arc::clone(&cancel_flag);
@@ -1250,8 +1263,7 @@ pub fn run_stdio_adapter(
                     &mcp_args_cl,
                     &user_text,
                 )
-            }
-            ;
+            };
 
             let extra_followups = {
                 let mut g = state_cl.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1311,10 +1323,7 @@ pub fn run_stdio_adapter(
     }
 
     for _ in 0..2400 {
-        let busy = state
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .in_turn;
+        let busy = state.lock().unwrap_or_else(PoisonError::into_inner).in_turn;
         if !busy {
             break;
         }
@@ -1907,7 +1916,8 @@ fn execute_sylphx_tool(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
             else {
-                return "error: `context_window_open` requires a non-empty `handoff` string".to_string();
+                return "error: `context_window_open` requires a non-empty `handoff` string"
+                    .to_string();
             };
             serde_json::to_string_pretty(&json!({
                 "status": "window_opened",
@@ -1935,8 +1945,9 @@ fn execute_sylphx_tool(
                         } else {
                             skill_dir.join("references").join(format!("{r}.md"))
                         };
-                        return std::fs::read_to_string(&ref_file)
-                            .unwrap_or_else(|e| format!("error reading {}: {e}", ref_file.display()));
+                        return std::fs::read_to_string(&ref_file).unwrap_or_else(|e| {
+                            format!("error reading {}: {e}", ref_file.display())
+                        });
                     }
                     let body = std::fs::read_to_string(&skill_md).unwrap_or_default();
                     let mut refs = Vec::new();
@@ -2046,7 +2057,8 @@ fn execute_sylphx_tool(
                 return "error: missing `patch`".to_string();
             };
             let patch_b64 = base64_encode(patch_str.as_bytes());
-            let script = format!("printf '%s' '{patch_b64}' | base64 -d | git apply --whitespace=nowarn -");
+            let script =
+                format!("printf '%s' '{patch_b64}' | base64 -d | git apply --whitespace=nowarn -");
             execute_sylphx_tool(
                 "bash",
                 &json!({ "command": script }),
@@ -2069,7 +2081,9 @@ fn execute_sylphx_tool(
                 .unwrap_or_default();
             let escaped_pat = pat.replace('\'', "'\\''");
             let escaped_path = path.replace('\'', "'\\''");
-            let script = format!("rg -n --max-count 100{glob_arg} -- '{escaped_pat}' '{escaped_path}' | head -n 200");
+            let script = format!(
+                "rg -n --max-count 100{glob_arg} -- '{escaped_pat}' '{escaped_path}' | head -n 200"
+            );
             execute_sylphx_tool(
                 "bash",
                 &json!({ "command": script }),
@@ -2149,9 +2163,11 @@ fn execute_sylphx_tool(
                         explicit_base,
                     ) {
                         Ok((lease_name, uid)) => {
-                            let lease_meta = std::fs::read_to_string(config_dir.join("sylphx-sandbox-lease.json"))
-                                .ok()
-                                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+                            let lease_meta = std::fs::read_to_string(
+                                config_dir.join("sylphx-sandbox-lease.json"),
+                            )
+                            .ok()
+                            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
                             serde_json::to_string_pretty(&json!({
                                 "status": "ready",
                                 "lease": lease_name,
@@ -2171,7 +2187,12 @@ fn execute_sylphx_tool(
                     let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
                         return "error: missing `command`".to_string();
                     };
-                    match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str) {
+                    match exec_in_cloud_sandbox_with_work_dir(
+                        config_dir,
+                        Some(work_dir),
+                        env,
+                        cmd_str,
+                    ) {
                         Ok(out) => out,
                         Err(e) => format!("error executing in cloud sandbox: {e}"),
                     }
@@ -2180,7 +2201,12 @@ fn execute_sylphx_tool(
                     let Some(rel) = args.get("path").and_then(Value::as_str) else {
                         return "error: missing `path`".to_string();
                     };
-                    match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel) {
+                    match read_file_in_cloud_sandbox_with_work_dir(
+                        config_dir,
+                        Some(work_dir),
+                        env,
+                        rel,
+                    ) {
                         Ok(s) => s,
                         Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
                     }
@@ -2192,7 +2218,13 @@ fn execute_sylphx_tool(
                     let Some(content) = args.get("content").and_then(Value::as_str) else {
                         return "error: missing `content`".to_string();
                     };
-                    match write_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel, content) {
+                    match write_file_in_cloud_sandbox_with_work_dir(
+                        config_dir,
+                        Some(work_dir),
+                        env,
+                        rel,
+                        content,
+                    ) {
                         Ok(s) => s,
                         Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
                     }
@@ -2212,7 +2244,12 @@ fn execute_sylphx_tool(
                 return "error: missing `command`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str) {
+                return match exec_in_cloud_sandbox_with_work_dir(
+                    config_dir,
+                    Some(work_dir),
+                    env,
+                    cmd_str,
+                ) {
                     Ok(out) => out,
                     Err(e) => format!("error executing in cloud sandbox: {e}"),
                 };
@@ -2260,7 +2297,12 @@ fn execute_sylphx_tool(
                 return "error: missing `path`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel) {
+                return match read_file_in_cloud_sandbox_with_work_dir(
+                    config_dir,
+                    Some(work_dir),
+                    env,
+                    rel,
+                ) {
                     Ok(content) => {
                         let start = args
                             .get("start_line")
@@ -2317,7 +2359,13 @@ fn execute_sylphx_tool(
                 return "error: missing `content`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match write_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel, content) {
+                return match write_file_in_cloud_sandbox_with_work_dir(
+                    config_dir,
+                    Some(work_dir),
+                    env,
+                    rel,
+                    content,
+                ) {
                     Ok(msg) => msg,
                     Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
                 };
@@ -2345,13 +2393,24 @@ fn execute_sylphx_tool(
                 return "error: missing `replacement`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel) {
+                return match read_file_in_cloud_sandbox_with_work_dir(
+                    config_dir,
+                    Some(work_dir),
+                    env,
+                    rel,
+                ) {
                     Ok(existing) => {
                         if !existing.contains(old_str) {
                             return format!("error: target string not found in `{rel}`");
                         }
                         let updated = existing.replace(old_str, new_str);
-                        match write_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel, &updated) {
+                        match write_file_in_cloud_sandbox_with_work_dir(
+                            config_dir,
+                            Some(work_dir),
+                            env,
+                            rel,
+                            &updated,
+                        ) {
                             Ok(_) => format!("edited `{rel}` in cloud sandbox"),
                             Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
                         }
@@ -2476,10 +2535,9 @@ mod tests {
         )
         .unwrap();
 
-        let agent_json: Value = serde_json::from_str(
-            &std::fs::read_to_string(cfg.join("sylphx-agent.json")).unwrap(),
-        )
-        .unwrap();
+        let agent_json: Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join("sylphx-agent.json")).unwrap())
+                .unwrap();
         assert_eq!(agent_json["harness"], "sylphx");
         assert_eq!(agent_json["model"], "sylphx/openai/gpt-6.1-sol#xhigh");
         assert_eq!(
@@ -2732,7 +2790,10 @@ mod tests {
                 .unwrap()
                 .contains("context.window_opened")
         );
-        assert_eq!(active[1]["content"].as_str(), Some("Now check production health"));
+        assert_eq!(
+            active[1]["content"].as_str(),
+            Some("Now check production health")
+        );
 
         // `memory_recall` still recalls pre-compaction items with contiguous episode context!
         let recall_raw = execute_memory_recall(
@@ -2771,7 +2832,10 @@ mod tests {
             );
         }
         let w1 = load_transcript_input_items(&transcript);
-        append_transcript_message(&transcript, &json!({ "role": "user", "content": "msg_165" }));
+        append_transcript_message(
+            &transcript,
+            &json!({ "role": "user", "content": "msg_165" }),
+        );
         let w2 = load_transcript_input_items(&transcript);
         // Item 0 must stay identical across consecutive turns between block strides!
         assert_eq!(w1[0], w2[0]);
@@ -2821,10 +2885,9 @@ mod tests {
         )
         .unwrap();
 
-        let agent_json: Value = serde_json::from_str(
-            &std::fs::read_to_string(cfg.join("sylphx-agent.json")).unwrap(),
-        )
-        .unwrap();
+        let agent_json: Value =
+            serde_json::from_str(&std::fs::read_to_string(cfg.join("sylphx-agent.json")).unwrap())
+                .unwrap();
         assert_eq!(agent_json["sandbox"], "cloud");
         assert_eq!(agent_json["branch"], "agent/cloud-worker");
         assert_eq!(resolve_sandbox_mode(cfg, &[]), "cloud");

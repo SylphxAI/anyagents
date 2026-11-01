@@ -374,13 +374,8 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         gamma_archived_row["state"], "archived",
         "{gamma_archived_row}"
     );
-    let woke_explicit = support::call_raw(
-        &socket,
-        "POST",
-        "/v1/agents/gamma/wake",
-        "{}",
-        &alpha_auth,
-    );
+    let woke_explicit =
+        support::call_raw(&socket, "POST", "/v1/agents/gamma/wake", "{}", &alpha_auth);
     assert!(woke_explicit.starts_with("HTTP/1.1 200"), "{woke_explicit}");
     let agents = support::call_raw(&socket, "GET", "/v1/agents", "", &support::header());
     let agents_json: Value =

@@ -211,7 +211,10 @@ pub fn run_device_flow_login(
                         )
                     })?
                     .to_string();
-                let kn = v.get("key_name").and_then(Value::as_str).map(str::to_string);
+                let kn = v
+                    .get("key_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
                 let oid = v.get("org_id").and_then(Value::as_str).map(str::to_string);
                 let oslug = v
                     .get("org_slug")
@@ -361,9 +364,10 @@ pub fn write_sylphx_config(
     let existing_agent_json = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    let worktree_marker = std::fs::read_to_string(config_dir.join(".anyagents-managed-worktree.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let worktree_marker =
+        std::fs::read_to_string(config_dir.join(".anyagents-managed-worktree.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
 
     let mut doc = json!({
         "schema_version": 1,
@@ -556,15 +560,12 @@ pub fn read_sylphx_key_from_dir(base: &Path) -> Option<String> {
             {
                 return Some(k.to_string());
             }
-            if let Some(k) = orgs
-                .iter()
-                .find_map(|o| {
-                    o.get("api_key")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                })
-            {
+            if let Some(k) = orgs.iter().find_map(|o| {
+                o.get("api_key")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            }) {
                 return Some(k.to_string());
             }
         }

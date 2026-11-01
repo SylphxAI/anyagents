@@ -513,8 +513,13 @@ fn compute_subtree_stats<'a>(
                 .block_reason
                 .as_deref()
                 .is_some_and(|r| !r.trim().is_empty());
-            let has_lag = kid.oldest_undelivered_age_ms.is_some_and(|ms| ms >= 120_000);
-            if kid.state != "archived" && kid.state != "paused" && (on_quota || is_blocked || has_lag) {
+            let has_lag = kid
+                .oldest_undelivered_age_ms
+                .is_some_and(|ms| ms >= 120_000);
+            if kid.state != "archived"
+                && kid.state != "paused"
+                && (on_quota || is_blocked || has_lag)
+            {
                 stats.lagging += 1;
             }
             stats.working += child_stats.working;
@@ -595,10 +600,16 @@ fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
         && let Some(ms) = agent.oldest_undelivered_age_ms
     {
         if ms >= 120_000 {
-            return format!("{base} {}", red(&format!("! lag {}", format_duration_ms(ms))));
+            return format!(
+                "{base} {}",
+                red(&format!("! lag {}", format_duration_ms(ms)))
+            );
         }
         if ms >= 5_000 {
-            return format!("{base} {}", yellow(&format!("~ {}", format_duration_ms(ms))));
+            return format!(
+                "{base} {}",
+                yellow(&format!("~ {}", format_duration_ms(ms)))
+            );
         }
     }
     base
@@ -751,8 +762,11 @@ pub fn print_agents_table_with_options(
             .cmp(&b_archived)
             .then_with(|| a_has_role.cmp(&b_has_role))
             .then_with(|| {
-                state_rank(&a.state, &a.process, &a.turn_state)
-                    .cmp(&state_rank(&b.state, &b.process, &b.turn_state))
+                state_rank(&a.state, &a.process, &a.turn_state).cmp(&state_rank(
+                    &b.state,
+                    &b.process,
+                    &b.turn_state,
+                ))
             })
             .then_with(|| a.name.cmp(&b.name))
     });
@@ -815,7 +829,9 @@ pub fn print_agents_table_with_options(
         let view_hint = match options.max_depth {
             Some(0) => "use --tree (-t) or --depth <N> (-d) to expand sub-agents".to_string(),
             Some(d) if d < global_max_depth => {
-                format!("showing depth ≤ {d} of {global_max_depth} · use --tree (-t) or -d {global_max_depth} for all")
+                format!(
+                    "showing depth ≤ {d} of {global_max_depth} · use --tree (-t) or -d {global_max_depth} for all"
+                )
             }
             _ => format!("showing full tree ({global_max_depth} levels deep)"),
         };
@@ -1006,9 +1022,9 @@ pub fn print_agents_table_with_options(
         {
             short_model = stripped;
         }
-        let same_as_parent = node.parent_runtime.is_some_and(|(ph, pm)| {
-            ph == agent.harness.as_str() && pm == agent.model.as_deref()
-        });
+        let same_as_parent = node
+            .parent_runtime
+            .is_some_and(|(ph, pm)| ph == agent.harness.as_str() && pm == agent.model.as_deref());
         let runtime = if is_dim || (node.depth > 0 && same_as_parent) {
             dim(&format!("{} · {short_model}", agent.harness))
         } else {
@@ -1124,7 +1140,11 @@ pub fn format_profile_usage(usage: Option<&str>) -> String {
 /// Pretty-print upstream provider profiles (`anyagents profiles`).
 pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEntry]) {
     if entries.is_empty() {
-        println!("\n  {} {}\n", bold_cyan("Provider Profiles"), dim("none configured"));
+        println!(
+            "\n  {} {}\n",
+            bold_cyan("Provider Profiles"),
+            dim("none configured")
+        );
         return;
     }
     let total = entries.len();
@@ -1199,7 +1219,12 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
         } else {
             cyan(&e.profile)
         };
-        let account_cell = match e.account.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let account_cell = match e
+            .account
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(acct) => dim(acct),
             None => dim("-"),
         };
@@ -1215,7 +1240,12 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
         } else {
             let mut parts = Vec::new();
             if !e.assigned_agents.is_empty() {
-                let shown: Vec<&str> = e.assigned_agents.iter().take(3).map(String::as_str).collect();
+                let shown: Vec<&str> = e
+                    .assigned_agents
+                    .iter()
+                    .take(3)
+                    .map(String::as_str)
+                    .collect();
                 let base = bold(&shown.join(", "));
                 if e.assigned_agents.len() > 3 {
                     parts.push(format!(
@@ -1330,7 +1360,10 @@ mod tests {
         assert_eq!(visible_width("helios"), 6);
         assert_eq!(visible_width("實作"), 4);
         assert_eq!(visible_width("helios · 實作 · Building"), 24);
-        assert_eq!(visible_width("\x1b[1mhelios\x1b[0m \x1b[2m· 實作\x1b[0m"), 13);
+        assert_eq!(
+            visible_width("\x1b[1mhelios\x1b[0m \x1b[2m· 實作\x1b[0m"),
+            13
+        );
     }
 
     #[test]

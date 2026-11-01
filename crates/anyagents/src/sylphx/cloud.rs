@@ -470,7 +470,10 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
 
     if let Ok(raw) = std::fs::read_to_string(&lease_file)
         && let Ok(mut persisted) = serde_json::from_str::<Value>(&raw)
-        && let Some(name) = persisted.get("name").and_then(Value::as_str).map(str::to_string)
+        && let Some(name) = persisted
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_string)
     {
         let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{name}");
         if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
@@ -503,12 +506,7 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
                     || (wt_spec.repo_slug.is_some() && wt_spec.repo_slug != prev_repo)
                     || (wt_spec.branch.is_some() && wt_spec.branch != prev_branch);
                 if needs_bootstrap {
-                    bootstrap_cloud_sandbox_worktree(
-                        &access_key,
-                        &name,
-                        &wt_spec,
-                        env,
-                    )?;
+                    bootstrap_cloud_sandbox_worktree(&access_key, &name, &wt_spec, env)?;
                     if let Some(obj) = persisted.as_object_mut() {
                         obj.insert("workspace_bootstrapped".to_string(), json!(true));
                         obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
@@ -573,7 +571,9 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
     let mut ready = lease_val
         .pointer("/status/state")
         .and_then(Value::as_str)
-        .is_some_and(|s| s.eq_ignore_ascii_case("ready") || s.eq_ignore_ascii_case("lease_state_ready"));
+        .is_some_and(|s| {
+            s.eq_ignore_ascii_case("ready") || s.eq_ignore_ascii_case("lease_state_ready")
+        });
     if !ready {
         let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}");
         for _ in 0..45 {
@@ -592,7 +592,9 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
                     break;
                 }
                 if st == "refused" || st == "ended" || st == "failed" {
-                    return Err(format!("Cloud Sandbox Lease `{lease_name}` entered state `{st}`"));
+                    return Err(format!(
+                        "Cloud Sandbox Lease `{lease_name}` entered state `{st}`"
+                    ));
                 }
             }
         }
@@ -753,9 +755,7 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
     let exec_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:exec");
     let mut exec_env = serde_json::Map::new();
     let needs_git_auth = cmd_str.contains("git") || cmd_str.contains("gh");
-    if needs_git_auth
-        && let Some(tok) = resolve_github_token(env)
-    {
+    if needs_git_auth && let Some(tok) = resolve_github_token(env) {
         exec_env.insert("GH_TOKEN".to_string(), json!(tok));
         exec_env.insert("GITHUB_TOKEN".to_string(), json!(tok));
     }

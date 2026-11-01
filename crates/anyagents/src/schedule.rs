@@ -343,10 +343,7 @@ pub fn parse_watch_spec(raw: &str) -> Result<WatchTarget, String> {
 
     // Local file / path change forms:
     // "file:<path>", "path:<path>"
-    if let Some(path_str) = s
-        .strip_prefix("file:")
-        .or_else(|| s.strip_prefix("path:"))
-    {
+    if let Some(path_str) = s.strip_prefix("file:").or_else(|| s.strip_prefix("path:")) {
         let clean = path_str.trim();
         if clean.is_empty() {
             return Err("`file:<path>` requires a non-empty path".to_string());

@@ -390,7 +390,10 @@ async fn mcp_tools_use_the_server_socket() {
         .await,
     );
     assert!(
-        searched_conv.turns.iter().any(|line| line.text == "room line"),
+        searched_conv
+            .turns
+            .iter()
+            .any(|line| line.text == "room line"),
         "{:?}",
         searched_conv.turns
     );

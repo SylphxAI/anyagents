@@ -510,12 +510,7 @@ pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Opti
             let marker = std::fs::read_to_string(config_dir.join(".anyagents-seat"))
                 .ok()
                 .map(|s| seat_user(s.trim()));
-            let by_marker = marker.and_then(|m| {
-                candidates
-                    .iter()
-                    .find(|(u, _)| u == &m)
-                    .cloned()
-            });
+            let by_marker = marker.and_then(|m| candidates.iter().find(|(u, _)| u == &m).cloned());
             by_marker
                 .or_else(|| {
                     for key_file in ["state_5.sqlite", "installation_id", "logs_2.sqlite"] {
@@ -545,9 +540,11 @@ pub fn existing_config_seat(config_dir: &Path) -> Option<(String, u32, u32, Opti
                 .or_else(|| candidates.into_iter().next())
         };
         if let Some((user, (uid, gid))) = chosen {
-            let spec = sock_gid_for().filter(|_| launcher().is_file()).map(|sock_gid| {
-                format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
-            });
+            let spec = sock_gid_for()
+                .filter(|_| launcher().is_file())
+                .map(|sock_gid| {
+                    format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display())
+                });
             return Some((user, uid, gid, spec));
         }
     }

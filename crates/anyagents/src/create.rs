@@ -122,10 +122,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             wd_lower.as_str(),
             "private" | "sandbox" | "self" | "cloud" | "cloud-sandbox"
         );
-        let wd_is_inherit_keyword = matches!(
-            wd_lower.as_str(),
-            "inherit" | "parent"
-        );
+        let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
         let effective_repo = request
             .repo
             .as_deref()
@@ -241,13 +238,11 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         pre_running.workdir = Some(cwd.display().to_string());
         reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd)?;
         let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
-        let should_share_cwd = (workdir_created
-            || cwd == managed_abs
-            || explicit_workdir.is_some())
-            && cwd != Path::new("/scratch/wt/owners-main")
-            && cwd != Path::new("/scratch/wt");
-        if should_share_cwd
-            && let Some((_, _, gid, _)) = resolved_agent_seat_info(store, &running)
+        let should_share_cwd =
+            (workdir_created || cwd == managed_abs || explicit_workdir.is_some())
+                && cwd != Path::new("/scratch/wt/owners-main")
+                && cwd != Path::new("/scratch/wt");
+        if should_share_cwd && let Some((_, _, gid, _)) = resolved_agent_seat_info(store, &running)
         {
             crate::sandbox::share_worktree_with_seat(&cwd, gid);
         }
@@ -320,8 +315,8 @@ pub(crate) fn provision_managed_worktree(
         let desk_hub_bin = std::env::var_os("ANYAGENTS_GIT_HUB_BIN")
             .map(PathBuf::from)
             .or_else(|| crate::sandbox::host_home_dir().map(|h| h.join(".local/bin/desk-git-hub")));
-        let hub_fallback = Path::new("/workspace-data/desk-git-hubs")
-            .join(repo_raw.replacen('/', "-", 1));
+        let hub_fallback =
+            Path::new("/workspace-data/desk-git-hubs").join(repo_raw.replacen('/', "-", 1));
         let data_hub_fallback = data.join("git-hubs").join(repo_raw);
         let data_repos_hub = data.join("repos").join(
             repo_raw
@@ -398,7 +393,9 @@ pub(crate) fn provision_managed_worktree(
                 .arg(&data_repos_hub)
                 .output()?;
             if !clone_out.status.success() {
-                let stderr = String::from_utf8_lossy(&clone_out.stderr).trim().to_string();
+                let stderr = String::from_utf8_lossy(&clone_out.stderr)
+                    .trim()
+                    .to_string();
                 return Err(Error::Message(format!(
                     "git clone for `{repo_raw}` failed: {stderr}"
                 )));
@@ -832,10 +829,8 @@ pub(crate) fn sync_agent_description_files(store: &Store, agent: &Agent, config:
     if agent.harness == "codex" {
         let codex_toml = config.join("config.toml");
         if codex_toml.is_file() {
-            let _ = mcp_config::sync_codex_developer_instructions(
-                &codex_toml,
-                continuity.as_deref(),
-            );
+            let _ =
+                mcp_config::sync_codex_developer_instructions(&codex_toml, continuity.as_deref());
         }
     }
     #[cfg(unix)]
@@ -1911,10 +1906,7 @@ pub(crate) fn verify_harness_runtime_config(
         "codex" => {
             let path = config.join("config.toml");
             let text = std::fs::read_to_string(&path).map_err(|_| {
-                Error::Message(format!(
-                    "codex runtime config missing: {}",
-                    path.display()
-                ))
+                Error::Message(format!("codex runtime config missing: {}", path.display()))
             })?;
             if !text.contains("[mcp_servers.anyagents]") || !text.contains("command =") {
                 return Err(Error::Message(
@@ -1951,10 +1943,16 @@ pub(crate) fn verify_harness_runtime_config(
             for rel in ["opencode/opencode.json", ".config/opencode/opencode.json"] {
                 let path = config.join(rel);
                 let bytes = std::fs::read(&path).map_err(|_| {
-                    Error::Message(format!("opencode runtime config missing: {}", path.display()))
+                    Error::Message(format!(
+                        "opencode runtime config missing: {}",
+                        path.display()
+                    ))
                 })?;
                 let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-                    Error::Message(format!("opencode runtime config invalid JSON: {}", path.display()))
+                    Error::Message(format!(
+                        "opencode runtime config invalid JSON: {}",
+                        path.display()
+                    ))
                 })?;
                 if val.pointer("/mcp/anyagents/command").is_none() {
                     return Err(Error::Message(format!(
@@ -1976,13 +1974,20 @@ pub(crate) fn verify_harness_runtime_config(
             }
         }
         "muse" => {
-            for rel in ["settings.json", "muse/settings.json", ".config/muse/settings.json"] {
+            for rel in [
+                "settings.json",
+                "muse/settings.json",
+                ".config/muse/settings.json",
+            ] {
                 let path = config.join(rel);
                 let bytes = std::fs::read(&path).map_err(|_| {
                     Error::Message(format!("muse runtime config missing: {}", path.display()))
                 })?;
                 let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-                    Error::Message(format!("muse runtime config invalid JSON: {}", path.display()))
+                    Error::Message(format!(
+                        "muse runtime config invalid JSON: {}",
+                        path.display()
+                    ))
                 })?;
                 if val.get("schema_version").is_none()
                     || val.pointer("/mcpServers/anyagents/command").is_none()
@@ -2000,7 +2005,10 @@ pub(crate) fn verify_harness_runtime_config(
                 Error::Message(format!("agy runtime config missing: {}", path.display()))
             })?;
             let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| {
-                Error::Message(format!("agy runtime config invalid JSON: {}", path.display()))
+                Error::Message(format!(
+                    "agy runtime config invalid JSON: {}",
+                    path.display()
+                ))
             })?;
             if val.pointer("/mcpServers/anyagents/command").is_none() {
                 return Err(Error::Message(
@@ -2023,9 +2031,7 @@ pub(crate) fn verify_harness_runtime_config(
                 Error::Message(format!("dsh runtime config missing: {}", path.display()))
             })?;
             if !text.contains("anyagents") {
-                return Err(Error::Message(
-                    "dsh-mcp-patch.yml missing anyagents".into(),
-                ));
+                return Err(Error::Message("dsh-mcp-patch.yml missing anyagents".into()));
             }
         }
         "grok" => {
@@ -2099,7 +2105,10 @@ pub(crate) fn maybe_notify_parent_on_error(
         .and_then(|s| s.trim().parse::<i64>().ok())
         .unwrap_or(0);
     let marker_path = config.join(".anyagents-notified-parent-error.json");
-    let source_key = format!("subagent-error:{}:{rotated_ms}:{trimmed}", agent.id.as_str());
+    let source_key = format!(
+        "subagent-error:{}:{rotated_ms}:{trimmed}",
+        agent.id.as_str()
+    );
     if let Ok(existing) = std::fs::read_to_string(&marker_path)
         && let Ok(val) = serde_json::from_str::<serde_json::Value>(&existing)
         && val.get("source_key").and_then(|v| v.as_str()) == Some(source_key.as_str())
@@ -2577,9 +2586,7 @@ pub(crate) fn update_profile_json_identity(
         );
         changed = true;
     }
-    if changed
-        && let Ok(text) = serde_json::to_string_pretty(&val)
-    {
+    if changed && let Ok(text) = serde_json::to_string_pretty(&val) {
         let _ = std::fs::write(&meta_path, text);
     }
 }
@@ -2877,12 +2884,11 @@ fn extract_profile_dedup_key(prof_dir: &Path, provider: &str) -> Option<String> 
         "openrouter" => read_first_non_empty_file(prof_dir, &[".config/opencode/openrouter.key"])
             .or_else(|| read_dsh_yaml_ref(prof_dir, "OPENROUTER_API_KEY"))
             .map(|k| format!("key:{k}")),
-        "google-gemini" => read_first_non_empty_file(
-            prof_dir,
-            &["gemini-api-key", ".config/opencode/gemini.key"],
-        )
-        .or_else(|| read_dsh_yaml_ref(prof_dir, "GEMINI_API_KEY"))
-        .map(|k| format!("key:{k}")),
+        "google-gemini" => {
+            read_first_non_empty_file(prof_dir, &["gemini-api-key", ".config/opencode/gemini.key"])
+                .or_else(|| read_dsh_yaml_ref(prof_dir, "GEMINI_API_KEY"))
+                .map(|k| format!("key:{k}"))
+        }
         _ => None,
     }
 }
@@ -3049,7 +3055,9 @@ pub(crate) fn resolve_and_commit_staged_signin(
     if provider == "anthropic" {
         let root_cred = staging_dir.join(".credentials.json");
         let sub_cred = staging_dir.join(".claude/.credentials.json");
-        let root_mt = std::fs::metadata(&root_cred).and_then(|m| m.modified()).ok();
+        let root_mt = std::fs::metadata(&root_cred)
+            .and_then(|m| m.modified())
+            .ok();
         let sub_mt = std::fs::metadata(&sub_cred).and_then(|m| m.modified()).ok();
         if sub_mt > root_mt
             && let Ok(bytes) = std::fs::read(&sub_cred)
@@ -3199,7 +3207,9 @@ pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str
         "anthropic" => {
             let root_cred = prof_dir.join(".credentials.json");
             let sub_cred = prof_dir.join(".claude/.credentials.json");
-            let root_mt = std::fs::metadata(&root_cred).and_then(|m| m.modified()).ok();
+            let root_mt = std::fs::metadata(&root_cred)
+                .and_then(|m| m.modified())
+                .ok();
             let sub_mt = std::fs::metadata(&sub_cred).and_then(|m| m.modified()).ok();
             if sub_mt > root_mt
                 && let Ok(bytes) = std::fs::read(&sub_cred)
@@ -3244,13 +3254,7 @@ pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str
                         .build()
                         .new_agent();
                     let _ = sync_anthropic_profile_metadata(
-                        &http,
-                        data,
-                        &prof_dir,
-                        profile,
-                        &tok,
-                        &mut cred,
-                        true,
+                        &http, data, &prof_dir, profile, &tok, &mut cred, true,
                     );
                 }
             }
@@ -3264,7 +3268,9 @@ pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str
         "openai" => {
             let root_auth = prof_dir.join("auth.json");
             let sub_auth = prof_dir.join(".codex/auth.json");
-            let root_mt = std::fs::metadata(&root_auth).and_then(|m| m.modified()).ok();
+            let root_mt = std::fs::metadata(&root_auth)
+                .and_then(|m| m.modified())
+                .ok();
             let sub_mt = std::fs::metadata(&sub_auth).and_then(|m| m.modified()).ok();
             if sub_mt > root_mt
                 && let Ok(bytes) = std::fs::read(&sub_auth)
@@ -3802,8 +3808,7 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
 
     // Bind active agents to their resolved `<provider>/<profile>` without cross-profile
     // fallback or cross-profile rotation (strict 1-account-per-profile isolation).
-    let mut ordered_agents: Vec<&Agent> =
-        agents.iter().filter(|a| a.state != "archived").collect();
+    let mut ordered_agents: Vec<&Agent> = agents.iter().filter(|a| a.state != "archived").collect();
     ordered_agents.sort_by_key(|a| a.parent_id.is_some());
     for agent in ordered_agents {
         let is_root = agent.parent_id.is_none();
@@ -4000,14 +4005,14 @@ fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
         .into_iter()
         .map(|r| prof_dir.join(r))
         .find(|p| p.is_file())?;
-    if let Ok(conn) = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    ) && let Ok(data_str) = conn.query_row(
-        "SELECT data FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
-        [],
-        |row| row.get::<_, String>(0),
-    ) && let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str)
+    if let Ok(conn) =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        && let Ok(data_str) = conn.query_row(
+            "SELECT data FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str)
         && let Some(access) = val
             .get("access")
             .and_then(serde_json::Value::as_str)
@@ -4184,10 +4189,7 @@ fn sync_anthropic_profile_metadata(
             .and_then(serde_json::Value::as_object_mut)
         {
             if let Some(em) = acct_email
-                && oauth
-                    .get("email")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(em)
+                && oauth.get("email").and_then(serde_json::Value::as_str) != Some(em)
             {
                 oauth.insert(
                     "email".to_string(),
@@ -4196,10 +4198,7 @@ fn sync_anthropic_profile_metadata(
                 changed = true;
             }
             if let Some(au) = acct_uuid
-                && oauth
-                    .get("accountUuid")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(au)
+                && oauth.get("accountUuid").and_then(serde_json::Value::as_str) != Some(au)
             {
                 oauth.insert(
                     "accountUuid".to_string(),
@@ -4265,7 +4264,11 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
-    let m_adj = if m > 2 { (m - 3) as u64 } else { (m + 9) as u64 };
+    let m_adj = if m > 2 {
+        (m - 3) as u64
+    } else {
+        (m + 9) as u64
+    };
     let doy = (153 * m_adj + 2) / 5 + (d as u64) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + (doe as i64) - 719_468
@@ -4454,7 +4457,11 @@ fn format_anthropic_usage_summary(
             .pointer("/extra_usage/decimal_places")
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(2) as i32;
-        let scale = if limit > 1000.0 && exp == 2 { 100.0 } else { 1.0 };
+        let scale = if limit > 1000.0 && exp == 2 {
+            100.0
+        } else {
+            1.0
+        };
         let rem_d = ((limit - used) / scale).max(0.0);
         parts.push(format!("extra: ${rem_d:.2} left"));
     }
@@ -4623,7 +4630,8 @@ pub(crate) fn probe_one_profile_usage(
                             }
                             if let Ok(updated) = serde_json::to_string(&cred) {
                                 let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
-                                let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
+                                let _ =
+                                    std::fs::write(prof_dir.join(".credentials.json"), &updated);
                                 let _ = std::fs::write(
                                     prof_dir.join(".claude/.credentials.json"),
                                     &updated,
@@ -4677,7 +4685,9 @@ pub(crate) fn probe_one_profile_usage(
                 &prof_dir,
                 "openai",
                 oa_em.as_deref(),
-                oa_id.as_deref().or((!acc_id.is_empty()).then_some(acc_id.as_str())),
+                oa_id
+                    .as_deref()
+                    .or((!acc_id.is_empty()).then_some(acc_id.as_str())),
             );
             let fetch_wham = |tok: &str| -> Option<serde_json::Value> {
                 let mut req = http
@@ -5449,10 +5459,7 @@ pub(crate) fn probe_one_profile_usage(
         }
         "sylphx" => {
             let _key = crate::sylphx::read_sylphx_key_from_dir(&prof_dir)?;
-            let resp = http
-                .get("https://api.sylphx.com/health")
-                .call()
-                .ok()?;
+            let resp = http.get("https://api.sylphx.com/health").call().ok()?;
             let body = resp.into_body().read_to_string().ok()?;
             let val: serde_json::Value = serde_json::from_str(&body).ok()?;
             if val.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
@@ -5680,9 +5687,7 @@ pub(crate) fn force_refresh_provider_profiles(data: &Path, target: Option<&str>)
                         let _ = sync_anthropic_profile_metadata(
                             &http, data, &prof_dir, &profile, &tok, &mut cred, true,
                         );
-                        if refreshed_token
-                            && let Ok(updated) = serde_json::to_string(&cred)
-                        {
+                        if refreshed_token && let Ok(updated) = serde_json::to_string(&cred) {
                             let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
                             let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
                             let _ = std::fs::write(
@@ -6021,11 +6026,7 @@ pub(crate) fn try_rotate_exhausted_profile(
     let cur_pct =
         probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
     if has_active_quota_hold && cur_pct.is_some_and(|p| p > 5) {
-        write_profile_marker(
-            &cfg,
-            ".anyagents-quota-cleared-ms",
-            &format!("{now_ms}\n"),
-        );
+        write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &format!("{now_ms}\n"));
         if agent.harness == "agy" {
             clear_stale_agy_quota_error_steps(&cfg);
         }
@@ -6552,13 +6553,10 @@ mod tests {
 
         let empty_cfg = data.join("empty-codex-cfg");
         std::fs::create_dir_all(&empty_cfg).unwrap();
-        let err = verify_harness_runtime_config(
-            &empty_cfg,
-            "codex",
-            Some("sylphx/openai/gpt-5.4#xhigh"),
-        )
-        .unwrap_err()
-        .to_string();
+        let err =
+            verify_harness_runtime_config(&empty_cfg, "codex", Some("sylphx/openai/gpt-5.4#xhigh"))
+                .unwrap_err()
+                .to_string();
         assert!(
             err.contains("codex runtime config missing") && err.contains("config.toml"),
             "unexpected err: {err}"
@@ -6566,13 +6564,10 @@ mod tests {
 
         // Write a partial config missing [mcp_servers.anyagents]
         std::fs::write(empty_cfg.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
-        let err2 = verify_harness_runtime_config(
-            &empty_cfg,
-            "codex",
-            Some("sylphx/openai/gpt-5.4#xhigh"),
-        )
-        .unwrap_err()
-        .to_string();
+        let err2 =
+            verify_harness_runtime_config(&empty_cfg, "codex", Some("sylphx/openai/gpt-5.4#xhigh"))
+                .unwrap_err()
+                .to_string();
         assert!(
             err2.contains("[mcp_servers.anyagents]"),
             "unexpected err: {err2}"
@@ -6598,7 +6593,10 @@ mod tests {
             },
         );
         let _ = std::fs::remove_file(data.join(".anyagents-suppress-config-write"));
-        assert!(res.is_err(), "expected spawn to fail when config write suppressed");
+        assert!(
+            res.is_err(),
+            "expected spawn to fail when config write suppressed"
+        );
         assert!(
             store.agent_by_name("broken-spawn-child").is_err(),
             "refused spawn must not leave a running agent row behind"
@@ -6714,7 +6712,11 @@ mod tests {
             .unwrap()
             .expect("parent notified once");
         assert!(first_msg.text.contains("[Sub-Agent Error]"));
-        assert!(first_msg.text.contains("workspace routing discovery unauthorized (401)"));
+        assert!(
+            first_msg
+                .text
+                .contains("workspace routing discovery unauthorized (401)")
+        );
         store.note_delivered(&parent.id, first_msg.seq).unwrap();
 
         // Second check must not re-notify parent for the same error.
@@ -6849,7 +6851,10 @@ mod tests {
         .unwrap();
         let l2_wt = PathBuf::from(l2.workdir.as_deref().unwrap());
         assert_ne!(l2_wt, l1_wt);
-        assert!(l2_wt.join(".git").exists(), "L2 should have its own isolated git worktree");
+        assert!(
+            l2_wt.join(".git").exists(),
+            "L2 should have its own isolated git worktree"
+        );
         assert!(l2_wt.join("README.md").is_file());
 
         // 6. Verify L0, L1, and L2 all receive the shared AGENTS.md in their config/AGENTS.md
@@ -6947,7 +6952,10 @@ mod tests {
         let formatted = format_anthropic_usage_summary(&payload, Some("max 5x")).unwrap();
         assert!(formatted.contains("5h: 90% left ↻"), "got: {formatted}");
         assert!(formatted.contains(" · 7d: 60% left ↻"), "got: {formatted}");
-        assert!(formatted.contains(" · $42.50 left (max 5x)"), "got: {formatted}");
+        assert!(
+            formatted.contains(" · $42.50 left (max 5x)"),
+            "got: {formatted}"
+        );
     }
 
     #[test]
@@ -7052,11 +7060,15 @@ mod tests {
         assert_eq!(prof1, "ritaleewoonyee");
         assert_eq!(acct1.as_deref(), Some("ritaleewoonyee@gmail.com"));
         assert_eq!(
-            extract_profile_account_identity(&def_dir, "anthropic").0.as_deref(),
+            extract_profile_account_identity(&def_dir, "anthropic")
+                .0
+                .as_deref(),
             Some("stanleylau_ex@hotmail.com")
         );
         assert_eq!(
-            extract_profile_account_identity(&rita_dir, "anthropic").0.as_deref(),
+            extract_profile_account_identity(&rita_dir, "anthropic")
+                .0
+                .as_deref(),
             Some("ritaleewoonyee@gmail.com")
         );
 

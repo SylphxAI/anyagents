@@ -461,7 +461,11 @@ fn spawn_admin_sylphx_delivery(
                             }
                             Err(err) => {
                                 let _ = store.note_turn_completed(&agent.id);
-                                crate::vendor::persist_last_error(&cfg, Some(&err.to_string()), None);
+                                crate::vendor::persist_last_error(
+                                    &cfg,
+                                    Some(&err.to_string()),
+                                    None,
+                                );
                                 break;
                             }
                         }

@@ -160,7 +160,11 @@ fn read_all_raw_transcript_items(transcript_path: &Path) -> Vec<(usize, Value, S
         return Vec::new();
     };
     let mut out = Vec::new();
-    for (idx, line) in BufReader::new(file).lines().map_while(Result::ok).enumerate() {
+    for (idx, line) in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
         let Ok(val) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -398,7 +402,8 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
     let q_tokens = tokenize_hybrid_raw_rag(query);
     let q_lower = query.to_ascii_lowercase();
     let n_docs = windows.len().max(1) as f64;
-    let avg_dl = (windows.iter().map(|(_, _, _, t)| t.len()).sum::<usize>() as f64 / n_docs).max(1.0);
+    let avg_dl =
+        (windows.iter().map(|(_, _, _, t)| t.len()).sum::<usize>() as f64 / n_docs).max(1.0);
 
     let mut df: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for q in &q_tokens {
@@ -474,7 +479,10 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
                     while !text.is_char_boundary(end_b) {
                         end_b -= 1;
                     }
-                    format!("{}...[use range=\"transcript:{idx}-{idx}\" for full item]", &text[..end_b])
+                    format!(
+                        "{}...[use range=\"transcript:{idx}-{idx}\" for full item]",
+                        &text[..end_b]
+                    )
                 } else {
                     text.clone()
                 };

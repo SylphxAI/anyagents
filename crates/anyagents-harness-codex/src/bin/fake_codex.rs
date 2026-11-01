@@ -92,9 +92,17 @@ fn main() {
                 if mode == "finish" {
                     emit_usage_and_complete(&mut stdout, &tid);
                 } else if mode == "401" {
-                    emit_turn_error(&mut stdout, &tid, "workspace routing discovery unauthorized (401)");
+                    emit_turn_error(
+                        &mut stdout,
+                        &tid,
+                        "workspace routing discovery unauthorized (401)",
+                    );
                 } else if mode == "turn-error" {
-                    emit_turn_error(&mut stdout, &tid, "upstream model stream closed unexpectedly");
+                    emit_turn_error(
+                        &mut stdout,
+                        &tid,
+                        "upstream model stream closed unexpectedly",
+                    );
                 }
             }
             "turn/steer" => {
@@ -109,9 +117,17 @@ fn main() {
                 if mode == "steer" || mode == "finish" {
                     emit_usage_and_complete(&mut stdout, &tid);
                 } else if mode == "401" {
-                    emit_turn_error(&mut stdout, &tid, "workspace routing discovery unauthorized (401)");
+                    emit_turn_error(
+                        &mut stdout,
+                        &tid,
+                        "workspace routing discovery unauthorized (401)",
+                    );
                 } else if mode == "turn-error" {
-                    emit_turn_error(&mut stdout, &tid, "upstream model stream closed unexpectedly");
+                    emit_turn_error(
+                        &mut stdout,
+                        &tid,
+                        "upstream model stream closed unexpectedly",
+                    );
                 }
             }
             "turn/interrupt" => {

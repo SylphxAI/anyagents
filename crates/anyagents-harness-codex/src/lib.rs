@@ -581,8 +581,7 @@ impl Harness for CodexHarness {
         match rpc {
             Ok(result) => {
                 if effective_steering.is_none() {
-                    state.last_turn_input =
-                        Some((thread_id, input, message.id.clone()));
+                    state.last_turn_input = Some((thread_id, input, message.id.clone()));
                 }
                 commit_delivery(
                     &mut state,
@@ -1039,10 +1038,7 @@ fn on_notification(state: &mut State, method: &str, params: &Value) {
             } else {
                 state.consecutive_turn_errors = state.consecutive_turn_errors.saturating_add(1);
                 let msg = turn_err.unwrap_or_else(|| {
-                    format!(
-                        "turn {}",
-                        if status.is_empty() { "failed" } else { status }
-                    )
+                    format!("turn {}", if status.is_empty() { "failed" } else { status })
                 });
                 if is_auth_or_provider_401(&msg) || state.consecutive_turn_errors >= 3 {
                     state.fault_error = Some(msg.clone());

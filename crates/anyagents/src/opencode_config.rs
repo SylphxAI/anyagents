@@ -54,8 +54,7 @@ pub fn write(
             .and_then(serde_json::Value::as_str)
         && (url.contains("models.sylphx.ai") || url.contains("api.sylphx.ai"))
     {
-        sylphx_opts["baseURL"] =
-            serde_json::Value::String("https://api.sylphx.com/v1".to_string());
+        sylphx_opts["baseURL"] = serde_json::Value::String("https://api.sylphx.com/v1".to_string());
     }
     if let Some(raw_model) = model.map(str::trim).filter(|m| !m.is_empty()) {
         let normalized = normalize_model(raw_model, has_sylphx_provider);

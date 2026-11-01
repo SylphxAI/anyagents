@@ -1879,12 +1879,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             }
         };
         let (resolved_prof, final_dir, resolved_acct) =
-            create::resolve_and_commit_staged_signin(
-                data,
-                &provider,
-                &staging_dir,
-                explicit_prof,
-            )?;
+            create::resolve_and_commit_staged_signin(data, &provider, &staging_dir, explicit_prof)?;
         println!(
             "signed in\tprofile:{provider}/{resolved_prof}\t{}\t{}",
             final_dir.display(),
