@@ -1403,13 +1403,12 @@ fn resolve_agy_http_port_from_proc(pid: u32, csrf_token: &str) -> Option<u16> {
         } else {
             false
         };
-        if matched {
-            if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
-                && ip_hex == "0100007F"
-                && let Ok(port) = u16::from_str_radix(port_hex, 16)
-            {
-                candidate_ports.push(port);
-            }
+        if matched
+            && let Some((ip_hex, port_hex)) = parts[1].split_once(':')
+            && ip_hex == "0100007F"
+            && let Ok(port) = u16::from_str_radix(port_hex, 16)
+        {
+            candidate_ports.push(port);
         }
     }
     for port in candidate_ports {
@@ -1727,7 +1726,7 @@ pub fn detect_agy_session_quota_and_error(
             }
         }
     }
-    logs.sort_by(|a, b| b.0.cmp(&a.0));
+    logs.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (mtime_ms, path) in logs.into_iter().take(3) {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;

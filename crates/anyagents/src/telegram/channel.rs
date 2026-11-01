@@ -152,6 +152,13 @@ pub fn delete_webhook(
     Ok(())
 }
 
+fn is_agent_explicitly_archived(data_dir: &std::path::Path, agent: &anyagents_core::Agent) -> bool {
+    anyagents_core::agent_config_dir(data_dir, &agent.id)
+        .join(".anyagents-archived")
+        .exists()
+        || (agent.state == "archived" && agent.parent_id.is_none())
+}
+
 /// Detach an archived agent from all Telegram group chat links (`chat_id < 0`)
 /// and unregister its live Telegram webhook so group posts or membership events
 /// never route to or wake a retired agent.
@@ -165,7 +172,6 @@ pub(crate) fn detach_archived_agent_from_telegram_groups(
         return;
     };
     let is_live = std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-        && !crate::sandbox::is_isolated_test_env()
         && std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
     for channel in channels {
         if channel.kind != "telegram" {
@@ -443,7 +449,7 @@ fn ingest_updates(
     if let Ok(owner_agent) = store.agent(agent_id)
         && (owner_agent.state == "archived"
             || owner_agent.state == "paused"
-            || crate::server::is_explicitly_archived(store.data_dir(), &owner_agent))
+            || is_agent_explicitly_archived(store.data_dir(), &owner_agent))
     {
         if poll.offset != before {
             memory.offset = poll.offset.max(memory.offset);
@@ -491,18 +497,11 @@ fn ingest_updates(
             let old_title = memory.title_of(inbound.chat_id).map(str::to_string);
             let is_group = inbound.chat_type == "group" || inbound.chat_type == "supergroup";
             let is_live = std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
-            if known || !is_group || !is_live {
-                memory.attach_typed_titled(
-                    agent_id.as_str(),
-                    inbound.chat_id,
-                    Some(&inbound.chat_type),
-                    inbound.chat_title.as_deref(),
-                );
-            } else if cached_probe_members(
-                token,
-                inbound.chat_id,
-                memory.bot.as_deref().unwrap_or(""),
-            ) {
+            if known
+                || !is_group
+                || !is_live
+                || cached_probe_members(token, inbound.chat_id, memory.bot.as_deref().unwrap_or(""))
+            {
                 memory.attach_typed_titled(
                     agent_id.as_str(),
                     inbound.chat_id,
@@ -881,7 +880,7 @@ fn discover_peer_bots_in_chat(
         let already_attached = other_mem.chats.iter().any(|l| l.chat_id == chat_id);
         if other_agent.state == "archived"
             || other_agent.state == "paused"
-            || crate::server::is_explicitly_archived(store.data_dir(), &other_agent)
+            || is_agent_explicitly_archived(store.data_dir(), &other_agent)
         {
             if already_attached && chat_id < 0 {
                 other_mem.chats.retain(|l| l.chat_id != chat_id);
@@ -1002,7 +1001,7 @@ fn attached_agents(store: &Store) -> Result<Vec<(String, i64)>, anyagents_core::
                     .filter(|agent| {
                         agent.state != "archived"
                             && agent.state != "paused"
-                            && !crate::server::is_explicitly_archived(store.data_dir(), agent)
+                            && !is_agent_explicitly_archived(store.data_dir(), agent)
                     })
                     .map(|agent| (agent.name, agent.id.to_string()))
             })

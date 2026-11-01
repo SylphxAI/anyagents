@@ -255,6 +255,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
     finish
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn provision_managed_worktree(
     store: &Store,
     data: &Path,
@@ -2179,7 +2180,7 @@ pub(crate) fn configure_agent_runtime(
         Some(h) => h.to_string(),
         None => existing.harness.clone(),
     };
-    let _adapter = crate::install::adapter(&target_harness)?;
+    crate::install::adapter(&target_harness)?;
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         crate::install::record(data, &target_harness).map_err(Error::Message)?;
@@ -2714,15 +2715,14 @@ pub(crate) fn extract_profile_account_identity(
             for rel in ["muse/auth.json", ".config/muse/auth.json"] {
                 if let Ok(text) = std::fs::read_to_string(prof_dir.join(rel))
                     && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                    && email.is_none()
                 {
-                    if email.is_none() {
-                        email = val
-                            .pointer("/providers/meta/user_email")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_string);
-                    }
+                    email = val
+                        .pointer("/providers/meta/user_email")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
                 }
             }
         }
@@ -4236,19 +4236,19 @@ fn sync_anthropic_profile_metadata(
             }
         }
     }
-    if changed || !prof_dir.join(".claude/.credentials.json").is_file() {
-        if let Ok(updated) = serde_json::to_string(cred) {
-            let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
-            let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
-            let _ = std::fs::write(prof_dir.join(".claude/.credentials.json"), &updated);
-            if !profile.starts_with('.') {
-                propagate_profile_files_to_bound_agents(
-                    data,
-                    "anthropic",
-                    profile,
-                    &[".credentials.json", ".claude/.credentials.json"],
-                );
-            }
+    if (changed || !prof_dir.join(".claude/.credentials.json").is_file())
+        && let Ok(updated) = serde_json::to_string(cred)
+    {
+        let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
+        let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
+        let _ = std::fs::write(prof_dir.join(".claude/.credentials.json"), &updated);
+        if !profile.starts_with('.') {
+            propagate_profile_files_to_bound_agents(
+                data,
+                "anthropic",
+                profile,
+                &[".credentials.json", ".claude/.credentials.json"],
+            );
         }
     }
     let sub_type = cred

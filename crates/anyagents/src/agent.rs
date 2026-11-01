@@ -182,12 +182,13 @@ pub fn rename_cmd(data: &Path, agent: &str, new_name: &str) -> Result<(), Error>
         let browsers_dir = data.join("browsers");
         let old_browser = browsers_dir.join(&old.name);
         let new_browser = browsers_dir.join(&updated.name);
-        if old_browser.is_dir() && !new_browser.exists() {
-            if std::fs::rename(&old_browser, &new_browser).is_ok() {
-                #[cfg(unix)]
-                {
-                    let _ = std::os::unix::fs::symlink(&updated.name, &old_browser);
-                }
+        if old_browser.is_dir()
+            && !new_browser.exists()
+            && std::fs::rename(&old_browser, &new_browser).is_ok()
+        {
+            #[cfg(unix)]
+            {
+                let _ = std::os::unix::fs::symlink(&updated.name, &old_browser);
             }
         }
     }

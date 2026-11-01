@@ -836,8 +836,7 @@ pub fn print_agents_table_with_options(
             _ => format!("showing full tree ({global_max_depth} levels deep)"),
         };
         println!(
-            "  {}      {}",
-            "  ",
+            "          {}",
             dim(&format!(
                 "{} roots · {} sub-agents (up to {} deep) · {}",
                 roots.len(),
@@ -861,6 +860,7 @@ pub fn print_agents_table_with_options(
         parent_runtime: Option<(&'a str, Option<&'a str>)>,
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_tree<'a>(
         node: &'a AgentView,
         depth: usize,
@@ -1106,27 +1106,27 @@ pub fn format_profile_usage(usage: Option<&str>) -> String {
     };
     let mut styled_segments = Vec::new();
     for seg in u.split(" · ") {
-        if let Some((before_left, after_left)) = seg.split_once("% left") {
-            if let Some((label, pct_str)) = before_left.split_once(':') {
-                let label = label.trim();
-                let pct = pct_str.trim().parse::<i64>().unwrap_or(100);
-                let styled_label = if label == "gemini" || label == "opus" {
-                    bold(&format!("{label}:"))
-                } else {
-                    dim(&format!("{label}:"))
-                };
-                let pct_badge = format!("{pct}% left");
-                let styled_pct = if pct <= 0 {
-                    red(&bold(&pct_badge))
-                } else if pct <= 25 {
-                    yellow(&pct_badge)
-                } else {
-                    green(&pct_badge)
-                };
-                let styled_after = style_usage_suffix(after_left, pct <= 0);
-                styled_segments.push(format!("{styled_label} {styled_pct}{styled_after}"));
-                continue;
-            }
+        if let Some((before_left, after_left)) = seg.split_once("% left")
+            && let Some((label, pct_str)) = before_left.split_once(':')
+        {
+            let label = label.trim();
+            let pct = pct_str.trim().parse::<i64>().unwrap_or(100);
+            let styled_label = if label == "gemini" || label == "opus" {
+                bold(&format!("{label}:"))
+            } else {
+                dim(&format!("{label}:"))
+            };
+            let pct_badge = format!("{pct}% left");
+            let styled_pct = if pct <= 0 {
+                red(&bold(&pct_badge))
+            } else if pct <= 25 {
+                yellow(&pct_badge)
+            } else {
+                green(&pct_badge)
+            };
+            let styled_after = style_usage_suffix(after_left, pct <= 0);
+            styled_segments.push(format!("{styled_label} {styled_pct}{styled_after}"));
+            continue;
         }
         if let Some((head, tail)) = seg.split_once(" (") {
             styled_segments.push(format!("{} {}", green(head), dim(&format!("({tail}"))));

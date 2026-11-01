@@ -563,36 +563,34 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
         let mut found_port: Option<u16> = None;
         for line in tcp_text.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 9 && parts[3] == "0A" && parts[7] == uid_str {
-                if let Some((ip_hex, port_hex)) = parts[1].split_once(':')
-                    && ip_hex == "0100007F"
-                    && let Ok(port) = u16::from_str_radix(port_hex, 16)
+            if parts.len() > 9
+                && parts[3] == "0A"
+                && parts[7] == uid_str
+                && let Some((ip_hex, port_hex)) = parts[1].split_once(':')
+                && ip_hex == "0100007F"
+                && let Ok(port) = u16::from_str_radix(port_hex, 16)
+            {
+                let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+                if let Ok(mut stream) =
+                    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
                 {
-                    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-                    if let Ok(mut stream) =
-                        TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
+                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
+                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
+                    let req = format!(
+                        "POST /exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories HTTP/1.0\r\n\
+                         Host: 127.0.0.1:{port}\r\n\
+                         Content-Type: application/json\r\n\
+                         x-codeium-csrf-token: {csrf}\r\n\
+                         Content-Length: 2\r\n\
+                         Connection: close\r\n\r\n{{}}"
+                    );
+                    let mut resp = String::new();
+                    if stream.write_all(req.as_bytes()).is_ok()
+                        && stream.read_to_string(&mut resp).is_ok()
+                        && (resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200"))
                     {
-                        let _ =
-                            stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                        let _ =
-                            stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
-                        let req = format!(
-                            "POST /exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories HTTP/1.0\r\n\
-                             Host: 127.0.0.1:{port}\r\n\
-                             Content-Type: application/json\r\n\
-                             x-codeium-csrf-token: {csrf}\r\n\
-                             Content-Length: 2\r\n\
-                             Connection: close\r\n\r\n{{}}"
-                        );
-                        let mut resp = String::new();
-                        if stream.write_all(req.as_bytes()).is_ok()
-                            && stream.read_to_string(&mut resp).is_ok()
-                            && (resp.starts_with("HTTP/1.1 200")
-                                || resp.starts_with("HTTP/1.0 200"))
-                        {
-                            found_port = Some(port);
-                            break;
-                        }
+                        found_port = Some(port);
+                        break;
                     }
                 }
             }
@@ -1864,12 +1862,13 @@ async fn rename_agent_route(
             let browsers_dir = data_dir.join("browsers");
             let old_browser = browsers_dir.join(&old.name);
             let new_browser = browsers_dir.join(&updated.name);
-            if old_browser.is_dir() && !new_browser.exists() {
-                if std::fs::rename(&old_browser, &new_browser).is_ok() {
-                    #[cfg(unix)]
-                    {
-                        let _ = std::os::unix::fs::symlink(&updated.name, &old_browser);
-                    }
+            if old_browser.is_dir()
+                && !new_browser.exists()
+                && std::fs::rename(&old_browser, &new_browser).is_ok()
+            {
+                #[cfg(unix)]
+                {
+                    let _ = std::os::unix::fs::symlink(&updated.name, &old_browser);
                 }
             }
         }

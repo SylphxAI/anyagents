@@ -69,8 +69,7 @@ pub fn parse_duration_ms(raw: &str) -> Result<i64, String> {
     let mut total_ms: i64 = 0;
     let mut num_buf = String::new();
     let mut unit_buf = String::new();
-    let mut chars = cleaned.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in cleaned.chars() {
         if c.is_whitespace() {
             continue;
         }
@@ -1100,6 +1099,7 @@ pub fn probe_spiron_state(id: &str, kind: &str) -> Option<String> {
     None
 }
 
+#[allow(clippy::type_complexity)]
 static GH_PROBE_CACHE: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, (i64, Option<(bool, String)>)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));

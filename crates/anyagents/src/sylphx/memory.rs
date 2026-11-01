@@ -204,10 +204,7 @@ fn render_transcript_item_text(val: &Value) -> String {
         }
     }
     let role = val.get("role").and_then(Value::as_str).unwrap_or("item");
-    let content = val
-        .get("content")
-        .and_then(Value::as_str)
-        .unwrap_or_else(|| "");
+    let content = val.get("content").and_then(Value::as_str).unwrap_or("");
     if !content.is_empty() {
         format!("[{role}] {content}")
     } else {
