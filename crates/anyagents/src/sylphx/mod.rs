@@ -320,6 +320,14 @@ impl Harness for SylphxHarness {
                             .served_usage
                             .output_tokens
                             .saturating_add(usage.output_tokens);
+                        g.served_usage.cache_read_tokens = g
+                            .served_usage
+                            .cache_read_tokens
+                            .saturating_add(usage.cache_read_tokens);
+                        g.served_usage.cache_write_tokens = g
+                            .served_usage
+                            .cache_write_tokens
+                            .saturating_add(usage.cache_write_tokens);
                         let _ = std::fs::remove_file(config_dir.join(".anyagents-last-error.json"));
                     }
                     Err(err_msg) => {
@@ -792,9 +800,22 @@ fn run_cloud_session_turn(
                     .or_else(|| val.pointer("/usage/output_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
+                let cache_read_tok = val
+                    .get("total_cache_read_tokens")
+                    .or_else(|| val.pointer("/usage/input_tokens_details/cached_tokens"))
+                    .or_else(|| val.pointer("/usage/cache_read_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                let cache_write_tok = val
+                    .get("total_cache_write_tokens")
+                    .or_else(|| val.pointer("/usage/cache_write_tokens"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 return Ok(TurnUsage {
                     input_tokens: in_tok,
                     output_tokens: out_tok,
+                    cache_read_tokens: cache_read_tok,
+                    cache_write_tokens: cache_write_tok,
                     ..TurnUsage::default()
                 });
             }
@@ -856,11 +877,20 @@ fn run_native_gateway_turn(
     input_items.push(user_msg);
 
     let tools = build_responses_tool_definitions();
+    let session_cache_key = state
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .session_id
+        .clone()
+        .unwrap_or_else(|| "sylphx_default_session".to_string());
+    let usage_log_path = config_dir.join("sylphx-usage.jsonl");
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
+    let mut total_cache_read: u64 = 0;
+    let mut total_cache_write: u64 = 0;
     let mut sent_any_reply = false;
 
-    for _step in 0..48 {
+    for step in 0..48 {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
@@ -871,6 +901,7 @@ fn run_native_gateway_turn(
             "instructions": system_prompt,
             "input": input_items,
             "tools": tools,
+            "prompt_cache_key": session_cache_key,
         });
         if let Some(ref effort) = reasoning_effort
             && let Some(obj) = req_body.as_object_mut()
@@ -878,7 +909,9 @@ fn run_native_gateway_turn(
             obj.insert("reasoning".to_string(), json!({ "effort": effort }));
         }
 
+        let step_t0 = Instant::now();
         let (status, raw) = curl_post_json(&responses_url, Some(&api_key), &req_body)?;
+        let step_elapsed_ms = step_t0.elapsed().as_millis() as u64;
         if !(200..300).contains(&status) {
             return Err(format!(
                 "Sylphx responses API HTTP {status}: {}",
@@ -889,20 +922,47 @@ fn run_native_gateway_turn(
             .map_err(|e| format!("invalid Sylphx responses API JSON: {e}"))?;
 
         if let Some(usage) = resp.get("usage") {
-            total_in = total_in.saturating_add(
-                usage
-                    .get("input_tokens")
-                    .or_else(|| usage.get("prompt_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-            total_out = total_out.saturating_add(
-                usage
-                    .get("output_tokens")
-                    .or_else(|| usage.get("completion_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
+            let step_in = usage
+                .get("input_tokens")
+                .or_else(|| usage.get("prompt_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let step_out = usage
+                .get("output_tokens")
+                .or_else(|| usage.get("completion_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let step_cache_read = usage
+                .pointer("/input_tokens_details/cached_tokens")
+                .or_else(|| usage.pointer("/prompt_tokens_details/cached_tokens"))
+                .or_else(|| usage.get("cache_read_tokens"))
+                .or_else(|| usage.get("cached_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let step_cache_write = usage
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .or_else(|| usage.get("cache_write_tokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            total_in = total_in.saturating_add(step_in);
+            total_out = total_out.saturating_add(step_out);
+            total_cache_read = total_cache_read.saturating_add(step_cache_read);
+            total_cache_write = total_cache_write.saturating_add(step_cache_write);
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&usage_log_path)
+            {
+                let rec = json!({
+                    "step": step,
+                    "input_tokens": step_in,
+                    "output_tokens": step_out,
+                    "cache_read_tokens": step_cache_read,
+                    "cache_write_tokens": step_cache_write,
+                    "elapsed_ms": step_elapsed_ms,
+                });
+                let _ = writeln!(f, "{rec}");
+            }
         }
 
         if let Some(cb) = state
@@ -1084,6 +1144,8 @@ fn run_native_gateway_turn(
     Ok(TurnUsage {
         input_tokens: total_in,
         output_tokens: total_out,
+        cache_read_tokens: total_cache_read,
+        cache_write_tokens: total_cache_write,
         ..TurnUsage::default()
     })
 }
@@ -1285,6 +1347,8 @@ pub fn run_stdio_adapter(
                         "usage": {
                             "input_tokens": usage.input_tokens,
                             "output_tokens": usage.output_tokens,
+                            "cache_read_tokens": usage.cache_read_tokens,
+                            "cache_write_tokens": usage.cache_write_tokens,
                         }
                     });
                     let _ = writeln!(out, "{done_evt}");
@@ -1295,6 +1359,8 @@ pub fn run_stdio_adapter(
                             "usage": {
                                 "input_tokens": 0,
                                 "output_tokens": 0,
+                                "cache_read_tokens": 0,
+                                "cache_write_tokens": 0,
                             }
                         });
                         let _ = writeln!(out, "{followup_done}");
@@ -1468,7 +1534,9 @@ fn discover_skills_index(work_dir: &Path, config_dir: &Path) -> String {
         "<skills>\nAvailable skills (call `activate_skill` with `name` to load full `SKILL.md` instructions and `references/*.md`):\n",
     );
     for (name, desc) in seen {
-        out.push_str(&format!("- {name}: {desc}\n"));
+        let short = desc.split(". ").next().unwrap_or(&desc);
+        let compact: String = short.chars().take(160).collect();
+        out.push_str(&format!("- {name}: {compact}\n"));
     }
     out.push_str("</skills>");
     out
