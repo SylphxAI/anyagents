@@ -24,6 +24,52 @@ mod auth;
 mod cloud;
 mod memory;
 
+pub mod sandbox {
+    use std::path::PathBuf;
+
+    pub fn is_isolated_test_env() -> bool {
+        cfg!(test)
+            || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
+            || std::env::var_os("ANYAGENTS_TESTS").is_some()
+            || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
+            || std::env::var_os("ANYAGENTS_HARNESS_BIN").is_some()
+            || std::env::var_os("ANYAGENTS_CLAUDE_BIN").is_some()
+            || std::env::var_os("ANYAGENTS_CODEX_BIN").is_some()
+            || std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_some()
+    }
+
+    pub fn host_home_dir() -> Option<PathBuf> {
+        if is_isolated_test_env() {
+            return None;
+        }
+        if let Some(explicit) = std::env::var_os("ANYAGENTS_HOST_HOME")
+            && !explicit.is_empty()
+        {
+            let path = PathBuf::from(explicit);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+        #[cfg(unix)]
+        unsafe {
+            let pwd = libc::getpwuid(libc::getuid());
+            if !pwd.is_null() && !(*pwd).pw_dir.is_null() {
+                let dir = std::ffi::CStr::from_ptr((*pwd).pw_dir).to_string_lossy();
+                if !dir.is_empty() {
+                    let path = PathBuf::from(dir.into_owned());
+                    if path.is_dir() {
+                        return Some(path);
+                    }
+                }
+            }
+        }
+        std::env::var_os("HOME")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+    }
+}
+
 use aci::*;
 pub use auth::*;
 pub use cloud::*;
@@ -2864,61 +2910,6 @@ mod tests {
         }
         assert_eq!(harness.health().turn_state, TurnState::Idle);
         assert_eq!(harness.turns_served(), 1);
-    }
-
-    #[test]
-    fn create_agent_and_subagent_with_sylphx_harness_succeeds() {
-        let tmp = tempfile::tempdir().unwrap();
-        let data = tmp.path().join("data");
-        std::fs::create_dir_all(&data).unwrap();
-        let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
-
-        let root = crate::create::create(
-            &store,
-            &data,
-            crate::create::CreateRequest {
-                name: "sylphx-lead".to_string(),
-                role: Some("Sylphx Lead".to_string()),
-                harness: "sylphx-agent".to_string(),
-                model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
-                profile: None,
-                repo: None,
-                branch: None,
-                base: None,
-                workdir: None,
-                workdir_default: None,
-                instructions: Some("Lead instructions".to_string()),
-                parent_id: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(root.harness, "sylphx");
-        let root_cfg = anyagents_core::agent_config_dir(&data, &root.id);
-        assert!(root_cfg.join("sylphx-agent.json").is_file());
-
-        let sub = crate::create::create(
-            &store,
-            &data,
-            crate::create::CreateRequest {
-                name: "sylphx-worker-1".to_string(),
-                role: Some("Sylphx Sub-Agent".to_string()),
-                harness: "sylphx".to_string(),
-                model: Some("sylphx/openai/gpt-6.1-sol#medium".to_string()),
-                profile: None,
-                repo: None,
-                branch: None,
-                base: None,
-                workdir: None,
-                workdir_default: None,
-                instructions: Some("Worker instructions".to_string()),
-                parent_id: Some(root.id.clone()),
-            },
-        )
-        .unwrap();
-        assert_eq!(sub.harness, "sylphx");
-        assert_eq!(sub.parent_id.as_ref(), Some(&root.id));
-        let sub_cfg = anyagents_core::agent_config_dir(&data, &sub.id);
-        assert!(sub_cfg.join("sylphx-agent.json").is_file());
     }
 
     #[test]

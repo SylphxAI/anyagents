@@ -82,6 +82,7 @@ dependencies = [
  "anyagents-harness-omp",
  "anyagents-harness-opencode",
  "anyagents-harness-stream",
+ "anyagents-harness-sylphx",
  "anyagents-installer",
  "anyagents-supervisor",
  "axum",
@@ -227,6 +228,20 @@ dependencies = [
  "anyagents-harness",
  "libc",
  "serde_json",
+]
+
+[[package]]
+name = "anyagents-harness-sylphx"
+version = "0.1.0"
+dependencies = [
+ "anyagents-core",
+ "anyagents-harness",
+ "anyagents-installer",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "ureq",
 ]
 
 [[package]]
