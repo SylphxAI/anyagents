@@ -317,7 +317,9 @@ pub(crate) fn provision_managed_worktree(
     } else if Path::new(repo_raw).is_dir() && is_git_repo_dir(Path::new(repo_raw)) {
         add_git_worktree_from_local_repo(Path::new(repo_raw), target_wt, &branch, base)?;
     } else if repo_raw.contains('/') && !repo_raw.contains("..") {
-        let desk_hub_bin = Path::new("/home/kyle/.local/bin/desk-git-hub");
+        let desk_hub_bin = std::env::var_os("ANYAGENTS_GIT_HUB_BIN")
+            .map(PathBuf::from)
+            .or_else(|| crate::sandbox::host_home_dir().map(|h| h.join(".local/bin/desk-git-hub")));
         let hub_fallback = Path::new("/workspace-data/desk-git-hubs")
             .join(repo_raw.replacen('/', "-", 1));
         let data_hub_fallback = data.join("git-hubs").join(repo_raw);
@@ -326,7 +328,8 @@ pub(crate) fn provision_managed_worktree(
                 .trim_start_matches("https://github.com/")
                 .trim_end_matches(".git"),
         );
-        if desk_hub_bin.is_file()
+        if let Some(ref desk_hub_bin) = desk_hub_bin
+            && desk_hub_bin.is_file()
             && !crate::sandbox::is_isolated_test_env()
             && !repo_raw.starts_with("http://")
             && !repo_raw.starts_with("https://")
@@ -1234,14 +1237,14 @@ pub(crate) fn seed_harness_credentials(
             ".codex/auth.json",
             "models_cache.json",
             "model-catalog-direct.json",
-            ".config/desk/sylphx-ai/key",
+            ".config/sylphx/key",
             ".config/opencode/sylphx.key",
             ".config/opencode/opencode.json",
         ],
         "codex" => &[
             "models_cache.json",
             "model-catalog-direct.json",
-            ".config/desk/sylphx-ai/key",
+            ".config/sylphx/key",
             ".config/opencode/sylphx.key",
             ".config/opencode/opencode.json",
         ],
@@ -1291,7 +1294,7 @@ pub(crate) fn seed_harness_credentials(
         "sylphx" => &[
             ".config/sylphx/credentials.json",
             ".config/sylphx/context.json",
-            ".config/desk/sylphx-ai/key",
+            ".config/sylphx/key",
             ".config/opencode/sylphx.key",
             ".config/opencode/opencode.json",
             "sylphx-agent.json",
@@ -3956,14 +3959,15 @@ fn read_dsh_yaml_ref(base: &Path, key_name: &str) -> Option<String> {
 }
 
 fn extract_agy_oauth_clients() -> Vec<(String, String)> {
-    let Some(agy_bin) = ["/home/kyle/.local/bin/agy", "/usr/local/bin/agy"]
-        .into_iter()
-        .map(Path::new)
-        .find(|p| p.is_file())
-    else {
+    let mut candidates = Vec::new();
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        candidates.push(home.join(".local/bin/agy"));
+    }
+    candidates.push(PathBuf::from("/usr/local/bin/agy"));
+    let Some(agy_bin) = candidates.into_iter().find(|p| p.is_file()) else {
         return Vec::new();
     };
-    let Ok(bytes) = std::fs::read(agy_bin) else {
+    let Ok(bytes) = std::fs::read(&agy_bin) else {
         return Vec::new();
     };
     let cid_needle = b"1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com";
@@ -5845,12 +5849,11 @@ pub(crate) fn probe_profile_models_catalog(data: &Path, target: Option<&str>) ->
         .new_agent();
 
     let mut agy_cli_models = Vec::new();
-    let agy_bin = if Path::new("/home/kyle/.local/bin/agy").is_file() {
-        "/home/kyle/.local/bin/agy"
-    } else {
-        "agy"
-    };
-    if let Ok(out) = std::process::Command::new(agy_bin).arg("models").output()
+    let agy_bin = crate::sandbox::host_home_dir()
+        .map(|h| h.join(".local/bin/agy"))
+        .filter(|p| p.is_file())
+        .unwrap_or_else(|| PathBuf::from("agy"));
+    if let Ok(out) = std::process::Command::new(&agy_bin).arg("models").output()
         && out.status.success()
     {
         let stdout = String::from_utf8_lossy(&out.stdout);

@@ -410,10 +410,10 @@ fn resolve_sylphx_codex_provider(config_dir: Option<&Path>) -> (String, Option<S
                 .unwrap_or_else(|| "default".to_string());
             let prof_dir = data_dir.join("profiles").join("sylphx").join(&prof_name);
             key_candidates.push(prof_dir.join(".config/opencode/sylphx.key"));
-            key_candidates.push(prof_dir.join(".config/desk/sylphx-ai/key"));
+            key_candidates.push(prof_dir.join(".config/sylphx/key"));
         }
         key_candidates.push(dir.join(".config/opencode/sylphx.key"));
-        key_candidates.push(dir.join(".config/desk/sylphx-ai/key"));
+        key_candidates.push(dir.join(".config/sylphx/key"));
     }
     let mut resolved_keys: Vec<String> = key_candidates
         .into_iter()
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn codex_config_writes_native_sylphx_provider_and_reasoning_effort() {
         let dir = tempfile::tempdir().unwrap();
-        let key_dir = dir.path().join(".config").join("desk").join("sylphx-ai");
+        let key_dir = dir.path().join(".config").join("sylphx");
         std::fs::create_dir_all(&key_dir).unwrap();
         std::fs::write(key_dir.join("key"), "test-sylphx-key\n").unwrap();
         let cfg_path = dir.path().join("config.toml");

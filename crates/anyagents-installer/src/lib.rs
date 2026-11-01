@@ -48,6 +48,17 @@ pub struct CatalogEntry {
 pub fn builtin_catalog() -> Vec<CatalogEntry> {
     vec![
         entry(
+            "sylphx",
+            InstallMethod::Vendored,
+            vec!["sylphx".to_string(), "login".to_string()],
+            Some("SYLPHX_API_KEY".to_string()),
+            vec![
+                "sylphx/openai/gpt-6.1-sol#xhigh".to_string(),
+                "sylphx/openai/gpt-6.1-sol#medium".to_string(),
+            ],
+            "",
+        ),
+        entry(
             "claude-code",
             InstallMethod::Npm {
                 package: "@anthropic-ai/claude-code".to_string(),
@@ -135,17 +146,6 @@ pub fn builtin_catalog() -> Vec<CatalogEntry> {
             vec!["grok".to_string(), "login".to_string()],
             Some("XAI_API_KEY".to_string()),
             vec!["grok-4.20".to_string()],
-            "",
-        ),
-        entry(
-            "sylphx",
-            InstallMethod::Vendored,
-            vec!["sylphx".to_string(), "login".to_string()],
-            Some("SYLPHX_API_KEY".to_string()),
-            vec![
-                "sylphx/openai/gpt-6.1-sol#xhigh".to_string(),
-                "sylphx/openai/gpt-6.1-sol#medium".to_string(),
-            ],
             "",
         ),
     ]
