@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, SteerSupport, TurnUsage,
 };
+pub use anyagents_harness_stream::detect_agy_session_quota_and_error;
 use anyagents_harness_stream::{
     AgyRpcConfig, Launch, StreamHarness, StreamSpec, cancel_line, message_line,
 };

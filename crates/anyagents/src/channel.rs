@@ -482,14 +482,13 @@ pub(crate) fn resolve_embedding_endpoint_and_key(data: &Path) -> Option<(String,
             ));
         }
     }
-    // Check `<data>/profiles/openrouter/default/` or host `.dsh/.credentials.yaml`
-    let mut candidates = vec![
+    // Check `<data>/profiles/openrouter/default/` or `<data>/profiles/deepseek/`
+    let candidates = [
         data.join("profiles/openrouter/default/api-key"),
         data.join("profiles/openrouter/default/.dsh/.credentials.yaml"),
+        data.join("profiles/deepseek/api/.dsh/.credentials.yaml"),
+        data.join("profiles/deepseek/web/.dsh/.credentials.yaml"),
     ];
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        candidates.push(home.join(".dsh/.credentials.yaml"));
-    }
     for path in candidates {
         let Ok(raw) = std::fs::read_to_string(&path) else {
             continue;
@@ -669,7 +668,7 @@ pub(crate) fn record(
 }
 
 pub fn list_channels(data: &Path) -> Result<(), Error> {
-    if client::can_call_server(data) {
+    if !crate::ui::is_pretty() && client::can_call_server(data) {
         match client::call::<serde_json::Value>(
             data,
             "GET",
@@ -702,8 +701,9 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
         );
         let mut table = crate::ui::Table::new(&[
             ("KIND", false),
+            ("BOT", false),
             ("AGENTS", false),
-            ("CREDENTIAL REF", false),
+            ("GROUPS / CHATS", false),
             ("ID", false),
         ]);
         for channel in channels {
@@ -717,10 +717,23 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
             } else {
                 crate::ui::bold(&names.join(", "))
             };
+            let bot_cell = match channel.identity.as_deref() {
+                Some(id) if !id.is_empty() => {
+                    let uname = id.split_once(':').map(|(_, u)| u).unwrap_or(id);
+                    if uname.starts_with('@') {
+                        crate::ui::cyan(uname)
+                    } else {
+                        crate::ui::cyan(&format!("@{uname}"))
+                    }
+                }
+                _ => crate::ui::dim("-"),
+            };
+            let chats_cell = summarize_channel_chats(&channel.state);
             table.add_row(vec![
                 crate::ui::cyan(&channel.kind),
+                bot_cell,
                 agents_cell,
-                crate::ui::dim(channel.credential_ref.as_deref().unwrap_or("-")),
+                chats_cell,
                 crate::ui::dim(channel.id.as_ref()),
             ]);
         }
@@ -743,4 +756,45 @@ pub fn list_channels(data: &Path) -> Result<(), Error> {
         );
     }
     Ok(())
+}
+
+fn summarize_channel_chats(state_json: &str) -> String {
+    let Ok(val) = serde_json::from_str::<serde_json::Value>(state_json) else {
+        return crate::ui::dim("-");
+    };
+    let Some(chats) = val.get("chats").and_then(|c| c.as_array()) else {
+        return crate::ui::dim("-");
+    };
+    let mut groups: Vec<String> = Vec::new();
+    let mut dms = 0usize;
+    for entry in chats {
+        let chat_id = entry.get("chat_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        if chat_id < 0 {
+            let title = entry
+                .get("title")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| chat_id.to_string());
+            if !groups.contains(&title) {
+                groups.push(title);
+            }
+        } else if chat_id > 0 {
+            dms += 1;
+        }
+    }
+    if groups.is_empty() && dms == 0 {
+        return crate::ui::dim("-");
+    }
+    let mut parts = Vec::new();
+    if !groups.is_empty() {
+        parts.push(groups.join(", "));
+    }
+    if dms > 0 {
+        parts.push(crate::ui::dim(&format!(
+            "{dms} DM{}",
+            if dms == 1 { "" } else { "s" }
+        )));
+    }
+    parts.join(" · ")
 }

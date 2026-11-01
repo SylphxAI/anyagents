@@ -340,7 +340,8 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         "{root_archive_refused}"
     );
 
-    // Archiving gamma sets state = archived, and sending to gamma wakes it back to running.
+    // Archiving gamma sets state = archived; ordinary sends do NOT wake an explicitly archived
+    // agent, and only an explicit `/wake` transitions it back to running.
     let archived = support::call_raw(
         &socket,
         "POST",
@@ -349,14 +350,33 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &alpha_auth,
     );
     assert!(archived.contains("\"state\":\"archived\""), "{archived}");
-    let woke_send = support::call_raw(
+    let send_while_archived = support::call_raw(
         &socket,
         "POST",
         "/v1/send",
-        &json!({"to": ["gamma"], "text": "resume now"}).to_string(),
+        &json!({"to": ["gamma"], "text": "message while archived"}).to_string(),
         &alpha_auth,
     );
-    assert!(woke_send.starts_with("HTTP/1.1 200"), "{woke_send}");
+    assert!(
+        send_while_archived.starts_with("HTTP/1.1 200"),
+        "{send_while_archived}"
+    );
+    let agents_archived = support::call_raw(&socket, "GET", "/v1/agents", "", &support::header());
+    let agents_archived_json: Value =
+        serde_json::from_str(agents_archived.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    let gamma_archived_row = agents_archived_json["agents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["name"] == "gamma")
+        .unwrap();
+    assert_eq!(
+        gamma_archived_row["state"], "archived",
+        "{gamma_archived_row}"
+    );
+    let woke_explicit =
+        support::call_raw(&socket, "POST", "/v1/agents/gamma/wake", "{}", &alpha_auth);
+    assert!(woke_explicit.starts_with("HTTP/1.1 200"), "{woke_explicit}");
     let agents = support::call_raw(&socket, "GET", "/v1/agents", "", &support::header());
     let agents_json: Value =
         serde_json::from_str(agents.split("\r\n\r\n").nth(1).unwrap()).unwrap();

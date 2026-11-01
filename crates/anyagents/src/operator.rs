@@ -105,24 +105,17 @@ fn share_capability_if_needed(
     // The capability belongs to this agent's own seat group, 0640, and is read
     // back: no other seat can read it. A seat group that is the server's own
     // group adds nothing, so that file stays 0600.
-    if let Ok(agent) = store.agent(agent_id) {
-        let parent_name = agent
-            .parent_id
-            .as_ref()
-            .and_then(|pid| store.agent(pid).ok())
-            .map(|p| p.name);
-        if let Some((_, seat_uid, gid, _)) =
-            crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name.as_deref())
-            && seat_uid != crate::sandbox::server_uid()
-            && gid != crate::sandbox::server_gid()
-        {
-            crate::sandbox::share_capability_with_seat(path, gid).map_err(|err| {
-                anyagents_core::Error::Message(format!(
-                    "the capability for {} is not shared with its seat: {err}",
-                    agent.name
-                ))
-            })?;
-        }
+    if let Ok(agent) = store.agent(agent_id)
+        && let Some((_, seat_uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent)
+        && seat_uid != crate::sandbox::server_uid()
+        && gid != crate::sandbox::server_gid()
+    {
+        crate::sandbox::share_capability_with_seat(path, gid).map_err(|err| {
+            anyagents_core::Error::Message(format!(
+                "the capability for {} is not shared with its seat: {err}",
+                agent.name
+            ))
+        })?;
     }
     Ok(())
 }

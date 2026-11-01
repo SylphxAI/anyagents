@@ -162,6 +162,8 @@ struct TgMessage {
     #[serde(default)]
     caption: Option<String>,
     #[serde(default)]
+    rich_message: Option<serde_json::Value>,
+    #[serde(default)]
     message_thread_id: Option<i64>,
     #[serde(default)]
     is_topic_message: Option<bool>,
@@ -367,12 +369,21 @@ struct TgEntity {
 }
 
 impl TgMessage {
-    /// The text of a typed message, else the caption of a media message.
-    fn body(&self) -> Option<&str> {
-        self.text
+    /// The text of a typed message, else the caption of a media message, else
+    /// the flattened text of a `RichMessage` (`sendRichMessage` / Bot API 10.1+).
+    fn body(&self) -> Option<String> {
+        if let Some(t) = self
+            .text
             .as_deref()
             .or(self.caption.as_deref())
             .filter(|text| !text.is_empty())
+        {
+            return Some(t.to_string());
+        }
+        self.rich_message
+            .as_ref()
+            .and_then(extract_rich_message_text)
+            .filter(|t| !t.is_empty())
     }
 
     /// Collect all media attachments on this message (picking the largest resolution for `photo`).
@@ -575,7 +586,7 @@ impl TgMessage {
         if let Some(body) = self.body() {
             return match rich {
                 Some(summary) => Some(format!("{body}\n{summary}")),
-                None => Some(body.to_string()),
+                None => Some(body),
             };
         }
         if let Some(summary) = rich {
@@ -603,7 +614,6 @@ impl TgMessage {
             .unwrap_or_else(|| "unknown".to_string());
         let snippet = pinned
             .body()
-            .map(str::to_string)
             .or_else(|| pinned.rich_payload_summary())
             .unwrap_or_else(|| "(non-text message)".to_string());
         Some(format!(
@@ -612,7 +622,7 @@ impl TgMessage {
         ))
     }
 
-    /// Extract `@username` and `text_mention` handles from `entities` and `caption_entities`.
+    /// Extract `@username` and `text_mention` handles from `entities`, `caption_entities`, and `rich_message`.
     fn entity_mentions(&self) -> Vec<String> {
         let raw_text = self.body().unwrap_or_default();
         let utf16: Vec<u16> = raw_text.encode_utf16().collect();
@@ -637,6 +647,9 @@ impl TgMessage {
             {
                 out.push(handle);
             }
+        }
+        if let Some(rm) = &self.rich_message {
+            extract_rich_message_mentions(rm, &mut out);
         }
         out
     }
@@ -674,9 +687,9 @@ impl TgMessage {
             .as_ref()
             .map(|q| q.text.as_str())
             .filter(|t| !t.is_empty())
+            .map(str::to_string)
             .or_else(|| quoted.body())
-            .unwrap_or_default()
-            .to_string();
+            .unwrap_or_default();
         let quote = Quote {
             reference: Some(QuoteRef {
                 chat_id: quoted.chat.id,
@@ -1125,7 +1138,8 @@ pub struct BotCall {
     pub body: serde_json::Value,
 }
 
-/// `sendMessage` for one chat, rendered as rich Telegram HTML from Markdown.
+/// `sendRichMessage` (Telegram Bot API 10.1+) for one chat using native
+/// Rich Markdown (`rich_message.markdown`).
 /// `reply_to` is a Telegram message id, when the agent was answering one.
 /// `thread` keeps the post in its forum topic.
 pub fn send_message(
@@ -1134,20 +1148,21 @@ pub fn send_message(
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> BotCall {
-    let html = markdown_to_telegram_html(text);
     let mut body = serde_json::json!({
         "chat_id": chat_id,
-        "text": html,
-        "parse_mode": "HTML",
+        "rich_message": {
+            "markdown": text,
+        },
     });
     if let Some(id) = reply_to {
+        body["reply_parameters"] = serde_json::json!({ "message_id": id });
         body["reply_to_message_id"] = serde_json::json!(id);
     }
     if let Some(id) = thread {
         body["message_thread_id"] = serde_json::json!(id);
     }
     BotCall {
-        method: "sendMessage".to_string(),
+        method: "sendRichMessage".to_string(),
         body,
     }
 }
@@ -1272,17 +1287,141 @@ pub fn set_message_reaction(
     }
 }
 
-/// `editMessageText` to update the text of an existing message.
+/// `editMessageText` to update the rich Markdown content of an existing message.
 pub fn edit_message_text(chat_id: i64, message_id: i64, text: &str) -> BotCall {
-    let html = markdown_to_telegram_html(text);
     BotCall {
         method: "editMessageText".to_string(),
         body: serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id,
-            "text": html,
-            "parse_mode": "HTML",
+            "rich_message": {
+                "markdown": text,
+            },
         }),
+    }
+}
+
+fn extract_rich_message_text(rm: &serde_json::Value) -> Option<String> {
+    let mut lines = Vec::new();
+    if let Some(blocks) = rm.get("blocks").and_then(serde_json::Value::as_array) {
+        for block in blocks {
+            let mut block_text = String::new();
+            collect_rich_text(block, &mut block_text);
+            let trimmed = block_text.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_string());
+            }
+        }
+    } else {
+        let mut text = String::new();
+        collect_rich_text(rm, &mut text);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            lines.push(trimmed.to_string());
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+fn collect_rich_text(val: &serde_json::Value, out: &mut String) {
+    match val {
+        serde_json::Value::String(s) => out.push_str(s),
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                collect_rich_text(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let kind = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if kind == "table"
+                && let Some(rows) = map.get("cells").and_then(serde_json::Value::as_array)
+            {
+                for (r_idx, row) in rows.iter().enumerate() {
+                    if r_idx > 0 {
+                        out.push('\n');
+                    }
+                    if let Some(cells) = row.as_array() {
+                        for (c_idx, cell) in cells.iter().enumerate() {
+                            if c_idx > 0 {
+                                out.push_str(" | ");
+                            }
+                            if let Some(t) = cell.get("text") {
+                                collect_rich_text(t, out);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+            if let Some(t) = map.get("text") {
+                collect_rich_text(t, out);
+            }
+            if let Some(items) = map.get("items").and_then(serde_json::Value::as_array) {
+                for (idx, item) in items.iter().enumerate() {
+                    if idx > 0 || !out.is_empty() {
+                        out.push('\n');
+                    }
+                    collect_rich_text(item, out);
+                }
+            }
+            if let Some(blocks) = map.get("blocks").and_then(serde_json::Value::as_array) {
+                for (idx, b) in blocks.iter().enumerate() {
+                    if idx > 0 || !out.is_empty() {
+                        out.push('\n');
+                    }
+                    collect_rich_text(b, out);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn extract_rich_message_mentions(val: &serde_json::Value, out: &mut Vec<String>) {
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                extract_rich_message_mentions(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            let kind = map
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if kind == "mention" {
+                let mut text = String::new();
+                if let Some(t) = map.get("text") {
+                    collect_rich_text(t, &mut text);
+                }
+                let trimmed = text.trim();
+                let handle = if trimmed.starts_with('@') {
+                    trimmed.to_string()
+                } else if !trimmed.is_empty() {
+                    format!("@{trimmed}")
+                } else {
+                    String::new()
+                };
+                if !handle.is_empty() && !out.contains(&handle) {
+                    out.push(handle);
+                }
+            } else if kind == "text_mention"
+                && let Some(user_val) = map.get("user")
+                && let Ok(user) = serde_json::from_value::<TgUser>(user_val.clone())
+            {
+                let handle = user.handle();
+                if !handle.is_empty() && !out.contains(&handle) {
+                    out.push(handle);
+                }
+            }
+            for v in map.values() {
+                extract_rich_message_mentions(v, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -2456,9 +2595,10 @@ mod tests {
     #[test]
     fn send_message_names_the_chat_and_keeps_the_token_out() {
         let call = send_message(100, "hello", Some(5), None);
-        assert_eq!(call.method, "sendMessage");
+        assert_eq!(call.method, "sendRichMessage");
         assert_eq!(call.body["chat_id"], 100);
-        assert_eq!(call.body["text"], "hello");
+        assert_eq!(call.body["rich_message"]["markdown"], "hello");
+        assert_eq!(call.body["reply_parameters"]["message_id"], 5);
         assert_eq!(call.body["reply_to_message_id"], 5);
         assert!(call.body.get("message_thread_id").is_none());
         let id = sent_message_id(r#"{"ok":true,"result":{"message_id":9}}"#).unwrap();
@@ -2572,20 +2712,13 @@ mod membership_tests {
     }
 
     #[test]
-    fn send_message_formats_markdown_as_rich_telegram_html() {
-        let input = "## Status\n**Bold <ok>** and *italic* with `code & <tag>` and [docs](https://webhooks.example.com/a?x=1&y=2)\n```rust\nfn main() { assert!(1 < 2 && 3 > 1); }\n```\n> Quote **line**";
+    fn send_message_sends_native_telegram_rich_message_markdown() {
+        let input = "## Status\n| # | Owner | Model |\n|---|---|---|\n| **1** | **Cloud** | `Claude Opus 5.5` |\n";
         let call = send_message(-100200300400, input, Some(42), None);
-        assert_eq!(call.method, "sendMessage");
-        assert_eq!(call.body["parse_mode"], "HTML");
+        assert_eq!(call.method, "sendRichMessage");
+        assert_eq!(call.body["rich_message"]["markdown"], input);
+        assert_eq!(call.body["reply_parameters"]["message_id"], 42);
         assert_eq!(call.body["reply_to_message_id"], 42);
-        let html = call.body["text"].as_str().unwrap();
-        assert!(html.contains("<b>Status</b>"));
-        assert!(html.contains("<b>Bold &lt;ok&gt;</b>"));
-        assert!(html.contains("<i>italic</i>"));
-        assert!(html.contains("<code>code &amp; &lt;tag&gt;</code>"));
-        assert!(html.contains("<a href=\"https://webhooks.example.com/a?x=1&amp;y=2\">docs</a>"));
-        assert!(html.contains("<pre><code class=\"language-rust\">fn main() { assert!(1 &lt; 2 &amp;&amp; 3 &gt; 1); }</code></pre>"));
-        assert!(html.contains("<blockquote>Quote <b>line</b></blockquote>"));
     }
 
     #[test]

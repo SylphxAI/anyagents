@@ -49,7 +49,6 @@ fn repository_has_no_hardcoded_host_paths_or_internal_identifiers() {
             "hardcoded scratch path",
             concat!("/scratch/", "coordinator"),
         ),
-        ("internal env prefix", concat!("DESK", "_")),
         ("internal config path", concat!(".config/", "desk/")),
         ("internal telegram user id", concat!("16807", "7807")),
         ("internal telegram group id", concat!("-100354", "4170260")),

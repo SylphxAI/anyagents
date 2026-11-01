@@ -235,7 +235,7 @@ fn offline_provider_errors() {
         assert_eq!(request["chat_id"], -1007);
         assert!(err.contains(class), "expected {class}: {err}");
         assert!(err.contains(&format!("\"status\":{status}")), "{err}");
-        assert!(err.contains("\"method\":\"sendMessage\""), "{err}");
+        assert!(err.contains("\"method\":\"sendRichMessage\""), "{err}");
         assert!(err.contains(&format!("\"error_code\":{code}")), "{err}");
         if status == 429 {
             assert!(err.contains("\"retry_after\":8"), "{err}");
@@ -366,7 +366,7 @@ fn offline_lost_or_invalid_acknowledgement_is_uncertain_and_never_retried() {
         let err = telegram::post_text(&store, dir.path(), "ada", -1007,
             "private outbound text", Some(55), Some(3)).unwrap_err().to_string();
         let request = task.join().unwrap();
-        assert_eq!(request["text"], "private outbound text");
+        assert_eq!(request["rich_message"]["markdown"], "private outbound text");
         let details: Value = serde_json::from_str(err.strip_prefix("telegram ").unwrap()).unwrap();
         // A complete request followed by EOF is an HTTP protocol/transport
         // failure; it cannot establish whether Telegram committed the send.

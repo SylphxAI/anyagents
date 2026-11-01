@@ -7,6 +7,18 @@
 
 use std::path::PathBuf;
 
+/// Returns `std::env::current_exe()` with the Linux `" (deleted)"` suffix
+/// stripped when the running binary was replaced on disk via `install`/`cp`.
+pub(crate) fn current_exe_clean() -> std::io::Result<PathBuf> {
+    let exe = std::env::current_exe()?;
+    if let Some(s) = exe.to_str()
+        && let Some(clean) = s.strip_suffix(" (deleted)")
+    {
+        return Ok(PathBuf::from(clean));
+    }
+    Ok(exe)
+}
+
 /// The data directory this process belongs to, when its deployment named one
 /// via `ANYAGENTS_DATA` or a `<exe_dir>/anyagents-data.path` pointer file.
 pub fn data_dir() -> Option<PathBuf> {
@@ -16,7 +28,7 @@ pub fn data_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(value));
     }
     if !crate::sandbox::is_isolated_test_env()
-        && let Ok(exe) = std::env::current_exe()
+        && let Ok(exe) = current_exe_clean()
         && let Some(dir) = exe.parent()
     {
         let pointer = dir.join("anyagents-data.path");

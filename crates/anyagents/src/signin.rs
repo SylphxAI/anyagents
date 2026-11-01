@@ -3,7 +3,7 @@
 //! store the agent's harness is started with. The credential itself stays in the
 //! vendor's store: this module never reads it, prints it or copies it.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
@@ -82,12 +82,30 @@ impl CommandRunner for ProcessRunner {
         env: &[(&str, &str)],
         on_line: &mut dyn LineSink,
     ) -> Result<(), InstallError> {
+        if program == "sylphx"
+            && args.first().map(String::as_str) == Some("login")
+            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        {
+            let target_dir = env
+                .iter()
+                .find(|(k, _)| *k == "HOME")
+                .map(|(_, v)| Path::new(*v))
+                .unwrap_or(dir);
+            return crate::sylphx::run_device_flow_login(target_dir, on_line);
+        }
         let mut command = Command::new(program);
         command
             .args(args)
             .current_dir(dir)
+            .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        if std::env::var_os("DISPLAY").is_none()
+            && std::env::var_os("WAYLAND_DISPLAY").is_none()
+            && std::env::var_os("BROWSER").is_none()
+        {
+            command.env("BROWSER", "/bin/true");
+        }
         for (key, value) in env {
             command.env(key, value);
         }
@@ -98,10 +116,65 @@ impl CommandRunner for ProcessRunner {
                 InstallError::Failed(err.to_string())
             }
         })?;
-        if let Some(stdout) = child.stdout.take() {
-            for line in BufReader::new(stdout).lines() {
-                let line = line.map_err(|err| InstallError::Failed(err.to_string()))?;
-                on_line.line(&line);
+        if let Some(mut stdout) = child.stdout.take() {
+            let pass_through = std::io::IsTerminal::is_terminal(&std::io::stdout())
+                && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
+            let mut buf = [0u8; 4096];
+            let mut pending = Vec::new();
+            loop {
+                let n = stdout
+                    .read(&mut buf)
+                    .map_err(|err| InstallError::Failed(err.to_string()))?;
+                if n == 0 {
+                    if !pending.is_empty() {
+                        let line = String::from_utf8_lossy(&pending).to_string();
+                        let trimmed = line.trim_end_matches(['\r', '\n']);
+                        if !pass_through
+                            || trimmed.starts_with("LINK ")
+                            || trimmed.starts_with("DEVICE ")
+                            || trimmed.starts_with("PROMPT ")
+                            || trimmed.starts_with("SIGNED_IN ")
+                        {
+                            on_line.line(trimmed);
+                        } else {
+                            let mut out = std::io::stdout().lock();
+                            let _ = out.write_all(&pending);
+                            let _ = out.flush();
+                        }
+                    }
+                    break;
+                }
+                pending.extend_from_slice(&buf[..n]);
+                while let Some(pos) = pending.iter().position(|&b| b == b'\n') {
+                    let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&line_bytes);
+                    let trimmed = line.trim_end_matches(['\r', '\n']);
+                    if !pass_through
+                        || trimmed.starts_with("LINK ")
+                        || trimmed.starts_with("DEVICE ")
+                        || trimmed.starts_with("PROMPT ")
+                        || trimmed.starts_with("SIGNED_IN ")
+                    {
+                        on_line.line(trimmed);
+                    } else {
+                        let mut out = std::io::stdout().lock();
+                        let _ = out.write_all(&line_bytes);
+                        let _ = out.flush();
+                    }
+                }
+                if pass_through && !pending.is_empty() {
+                    let partial = String::from_utf8_lossy(&pending);
+                    if !partial.starts_with("LINK")
+                        && !partial.starts_with("DEVICE")
+                        && !partial.starts_with("PROMPT")
+                        && !partial.starts_with("SIGNED_IN")
+                    {
+                        let mut out = std::io::stdout().lock();
+                        let _ = out.write_all(&pending);
+                        let _ = out.flush();
+                        pending.clear();
+                    }
+                }
             }
         }
         let status = child
