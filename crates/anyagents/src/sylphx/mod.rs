@@ -1071,6 +1071,23 @@ fn run_native_gateway_turn(
                             .is_none_or(|s| s.trim().is_empty() || s.eq_ignore_ascii_case("self")))
                 {
                     self_archived = true;
+                    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    g.served_usage.input_tokens =
+                        g.served_usage.input_tokens.saturating_add(total_in);
+                    g.served_usage.output_tokens =
+                        g.served_usage.output_tokens.saturating_add(total_out);
+                    g.served_usage.cache_read_tokens = g
+                        .served_usage
+                        .cache_read_tokens
+                        .saturating_add(total_cache_read);
+                    g.served_usage.cache_write_tokens = g
+                        .served_usage
+                        .cache_write_tokens
+                        .saturating_add(total_cache_write);
+                    total_in = 0;
+                    total_out = 0;
+                    total_cache_read = 0;
+                    total_cache_write = 0;
                 }
 
                 let output = execute_sylphx_tool(
@@ -2132,8 +2149,13 @@ fn execute_sylphx_tool(
                 return "error: missing `patch`".to_string();
             };
             let patch_b64 = base64_encode(patch_str.as_bytes());
-            let script =
-                format!("printf '%s' '{patch_b64}' | base64 -d | git apply --whitespace=nowarn -");
+            let script = format!(
+                "tmp_patch=$(mktemp /tmp/sylphx-patch.XXXXXX) && printf '%s' '{patch_b64}' | base64 -d > \"$tmp_patch\" && \
+                 (git apply --recount -C1 --whitespace=nowarn \"$tmp_patch\" 2>/dev/null || \
+                  patch -p1 --fuzz=3 --no-backup-if-mismatch < \"$tmp_patch\" 2>/dev/null || \
+                  git apply --recount --whitespace=nowarn \"$tmp_patch\"); \
+                 rc=$?; rm -f \"$tmp_patch\"; exit $rc"
+            );
             execute_sylphx_tool(
                 "bash",
                 &json!({ "command": script }),

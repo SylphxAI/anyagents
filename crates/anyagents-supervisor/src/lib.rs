@@ -695,6 +695,7 @@ impl<H: Harness + 'static> Session<H> {
     fn run(&mut self) -> bool {
         loop {
             if self.stop.load(Ordering::SeqCst) {
+                self.record_usage();
                 self.delivery = None;
                 self.publish();
                 return false;
@@ -734,6 +735,7 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             if !self.process_alive() {
+                self.record_usage();
                 if !self.wait_backoff() {
                     self.delivery = None;
                     self.restart_at = None;
