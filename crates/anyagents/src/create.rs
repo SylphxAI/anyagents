@@ -4342,17 +4342,47 @@ pub(crate) fn probe_one_profile_usage(
             if token.is_empty() {
                 return None;
             }
-            let fetch_usage = |tok: &str| -> Option<serde_json::Value> {
-                let resp = http
+            let fetch_usage = |tok: &str| -> Result<serde_json::Value, u16> {
+                match http
                     .get("https://api.anthropic.com/api/oauth/usage")
                     .header("authorization", &format!("Bearer {tok}"))
                     .header("anthropic-beta", "oauth-2025-04-20")
                     .header("cache-control", "no-cache")
                     .header("user-agent", "claude-code/2.1.310")
                     .call()
-                    .ok()?;
-                let body = resp.into_body().read_to_string().ok()?;
-                serde_json::from_str(&body).ok()
+                {
+                    Ok(resp) => {
+                        let body = resp.into_body().read_to_string().map_err(|_| 0u16)?;
+                        serde_json::from_str(&body).map_err(|_| 0u16)
+                    }
+                    Err(ureq::Error::StatusCode(code)) => Err(code),
+                    Err(_) => Err(0),
+                }
+            };
+            let last_usage_path = prof_dir.join(".anyagents-last-usage.txt");
+            let fallback_cached_usage = |cred_val: &serde_json::Value| -> Option<String> {
+                if let Ok(cached) = std::fs::read_to_string(&last_usage_path) {
+                    let trimmed = cached.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+                let tier = cred_val
+                    .pointer("/claudeAiOauth/rateLimitTier")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let sub = cred_val
+                    .pointer("/claudeAiOauth/subscriptionType")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                let badge = if tier.contains("20x") {
+                    "max 20x"
+                } else if tier.contains("5x") {
+                    "max 5x"
+                } else {
+                    sub
+                };
+                (!badge.is_empty()).then(|| format!("({badge})"))
             };
             let now_ms = anyagents_core::now_ms();
             let expires_at = cred
@@ -4361,94 +4391,119 @@ pub(crate) fn probe_one_profile_usage(
                 .unwrap_or(i64::MAX);
             let expiring_soon = now_ms.saturating_add(30 * 60 * 1000) >= expires_at;
             let initial_usage = if expiring_soon {
-                None
+                Err(401)
             } else {
                 fetch_usage(&token)
             };
             let val = match initial_usage {
-                Some(v) => v,
-                None => {
+                Ok(v) => v,
+                Err(code) if code != 401 => {
+                    return fallback_cached_usage(&cred);
+                }
+                Err(_) => {
                     let attempt_path = prof_dir.join(".anyagents-oauth-refresh-attempt-ms");
                     let last_attempt_ms = std::fs::read_to_string(&attempt_path)
                         .ok()
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
-                        fetch_usage(&token)?
+                        match fetch_usage(&token) {
+                            Ok(v) => v,
+                            Err(_) => return fallback_cached_usage(&cred),
+                        }
                     } else {
-                    let rtok = cred
-                        .pointer("/claudeAiOauth/refreshToken")
-                        .and_then(serde_json::Value::as_str)?
-                        .trim()
+                        let rtok = cred
+                            .pointer("/claudeAiOauth/refreshToken")
+                            .and_then(serde_json::Value::as_str)?
+                            .trim()
+                            .to_string();
+                        if rtok.is_empty() {
+                            return fallback_cached_usage(&cred);
+                        }
+                        let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
+                        let req_body = serde_json::json!({
+                            "grant_type": "refresh_token",
+                            "refresh_token": rtok,
+                            "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+                        })
                         .to_string();
-                    if rtok.is_empty() {
-                        return None;
-                    }
-                    let _ = std::fs::write(&attempt_path, format!("{now_ms}\n"));
-                    let req_body = serde_json::json!({
-                        "grant_type": "refresh_token",
-                        "refresh_token": rtok,
-                        "client_id": "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-                    })
-                    .to_string();
-                    let rresp = http
-                        .post("https://platform.claude.com/v1/oauth/token")
-                        .header("content-type", "application/json")
-                        .header("user-agent", "claude-code/2.1.310")
-                        .send(req_body.as_bytes())
-                        .ok()?;
-                    let rbody = rresp.into_body().read_to_string().ok()?;
-                    let rval: serde_json::Value = serde_json::from_str(&rbody).ok()?;
-                    let new_acc = rval.get("access_token")?.as_str()?.trim().to_string();
-                    if let Some(oauth) = cred
-                        .get_mut("claudeAiOauth")
-                        .and_then(serde_json::Value::as_object_mut)
-                    {
-                        oauth.insert(
-                            "accessToken".to_string(),
-                            serde_json::Value::String(new_acc.clone()),
-                        );
-                        if let Some(new_ref) = rval
-                            .get("refresh_token")
-                            .and_then(serde_json::Value::as_str)
+                        let Ok(rresp) = http
+                            .post("https://platform.claude.com/v1/oauth/token")
+                            .header("content-type", "application/json")
+                            .header("user-agent", "claude-code/2.1.310")
+                            .send(req_body.as_bytes())
+                        else {
+                            return fallback_cached_usage(&cred);
+                        };
+                        let Ok(rbody) = rresp.into_body().read_to_string() else {
+                            return fallback_cached_usage(&cred);
+                        };
+                        let Ok(rval) = serde_json::from_str::<serde_json::Value>(&rbody) else {
+                            return fallback_cached_usage(&cred);
+                        };
+                        let Some(new_acc) = rval
+                            .get("access_token")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string())
+                        else {
+                            return fallback_cached_usage(&cred);
+                        };
+                        if let Some(oauth) = cred
+                            .get_mut("claudeAiOauth")
+                            .and_then(serde_json::Value::as_object_mut)
                         {
                             oauth.insert(
-                                "refreshToken".to_string(),
-                                serde_json::Value::String(new_ref.to_string()),
+                                "accessToken".to_string(),
+                                serde_json::Value::String(new_acc.clone()),
                             );
+                            if let Some(new_ref) = rval
+                                .get("refresh_token")
+                                .and_then(serde_json::Value::as_str)
+                            {
+                                oauth.insert(
+                                    "refreshToken".to_string(),
+                                    serde_json::Value::String(new_ref.to_string()),
+                                );
+                            }
+                            if let Some(exp_in) =
+                                rval.get("expires_in").and_then(serde_json::Value::as_i64)
+                            {
+                                oauth.insert(
+                                    "expiresAt".to_string(),
+                                    serde_json::Value::Number((now_ms + exp_in * 1000).into()),
+                                );
+                            }
+                            if let Ok(updated) = serde_json::to_string(&cred) {
+                                let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
+                                let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
+                                let _ = std::fs::write(
+                                    prof_dir.join(".claude/.credentials.json"),
+                                    &updated,
+                                );
+                                propagate_profile_files_to_bound_agents(
+                                    data,
+                                    provider,
+                                    profile,
+                                    &[".credentials.json", ".claude/.credentials.json"],
+                                );
+                            }
                         }
-                        if let Some(exp_in) =
-                            rval.get("expires_in").and_then(serde_json::Value::as_i64)
-                        {
-                            oauth.insert(
-                                "expiresAt".to_string(),
-                                serde_json::Value::Number((now_ms + exp_in * 1000).into()),
-                            );
-                        }
-                        if let Ok(updated) = serde_json::to_string(&cred) {
-                            let _ = std::fs::create_dir_all(prof_dir.join(".claude"));
-                            let _ = std::fs::write(prof_dir.join(".credentials.json"), &updated);
-                            let _ = std::fs::write(
-                                prof_dir.join(".claude/.credentials.json"),
-                                &updated,
-                            );
-                            propagate_profile_files_to_bound_agents(
-                                data,
-                                provider,
-                                profile,
-                                &[".credentials.json", ".claude/.credentials.json"],
-                            );
-                        }
-                    }
                         token = new_acc;
-                        fetch_usage(&token)?
+                        match fetch_usage(&token) {
+                            Ok(v) => v,
+                            Err(_) => return fallback_cached_usage(&cred),
+                        }
                     }
                 }
             };
             let tier_badge = sync_anthropic_profile_metadata(
                 &http, data, &prof_dir, profile, &token, &mut cred, false,
             );
-            format_anthropic_usage_summary(&val, tier_badge)
+            let formatted = format_anthropic_usage_summary(&val, tier_badge);
+            if let Some(ref s) = formatted {
+                let _ = std::fs::write(&last_usage_path, format!("{s}\n"));
+            }
+            formatted
         }
         "openai" => {
             let auth_text = std::fs::read_to_string(prof_dir.join("auth.json"))
