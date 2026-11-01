@@ -1654,12 +1654,18 @@ fn spawn_cloudflared_quick_tunnel(local_port: u16, token: &str) -> (Option<Strin
             return (Some(format!("{trimmed}/takeover/{token}")), None);
         }
     }
-    let candidates = [
-        "/home/kyle/.local/bin/cloudflared",
-        "/usr/local/bin/cloudflared",
-        "/usr/bin/cloudflared",
-        "cloudflared",
-    ];
+    let mut candidates = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!(
+            "{}/.local/bin/cloudflared",
+            home.trim_end_matches('/')
+        ));
+    }
+    candidates.extend([
+        "/usr/local/bin/cloudflared".to_string(),
+        "/usr/bin/cloudflared".to_string(),
+        "cloudflared".to_string(),
+    ]);
     let Some(bin) = candidates.into_iter().find(|p| {
         if p.starts_with('/') {
             Path::new(p).is_file()
