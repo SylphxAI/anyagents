@@ -1539,6 +1539,17 @@ impl Store {
     /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
     /// mail arrived, a turn is still open, or a child sub-agent is still running.
     pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+        let err_file =
+            crate::agent_config_dir(self.data_dir(), id).join(".anyagents-last-error.json");
+        if let Ok(raw) = std::fs::read_to_string(&err_file)
+            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            && val
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            return Ok(false);
+        }
         let (transitioned, parent_to_wake, silent_completion) = {
             let mut conn = self.conn();
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;

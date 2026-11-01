@@ -114,10 +114,23 @@ impl StreamSpec {
             .get("type")
             .or_else(|| value.get("event"))
             .and_then(Value::as_str);
+        let has_error_payload = matches!(kind, Some("done") | Some("result"))
+            && value
+                .pointer("/result/error")
+                .or_else(|| value.get("error"))
+                .and_then(|v| {
+                    v.as_str().or_else(|| {
+                        v.get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| v.get("code").and_then(Value::as_str))
+                    })
+                })
+                .is_some_and(|s| !s.trim().is_empty());
         let is_error = value
             .pointer("/result/status")
             .and_then(Value::as_str)
-            .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"));
+            .is_some_and(|status| status.eq_ignore_ascii_case("ERROR"))
+            || has_error_payload;
         let quota_reset_at_ms = quota_of(value);
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
@@ -253,6 +266,7 @@ struct State {
     finished: HashSet<String>,
     turns_started: usize,
     quota_reset_at_ms: Option<i64>,
+    sign_in_fault: Option<String>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
     /// The text lines of the open turn so far, and the id they were read under.
@@ -520,12 +534,14 @@ impl StreamHarness {
             delivery_mode: self.mode,
             steer_support: self.steer,
             quota_reset_at_ms: state.quota_reset_at_ms,
-            sign_in_fault: None,
+            sign_in_fault: state.sign_in_fault.clone(),
         }
     }
 
     pub fn clear_quota(&self) {
-        lock(&self.shared).quota_reset_at_ms = None;
+        let mut state = lock(&self.shared);
+        state.quota_reset_at_ms = None;
+        state.sign_in_fault = None;
     }
 
     pub fn process_id(&self) -> Option<u32> {
@@ -605,6 +621,7 @@ impl StreamHarness {
                         state.open.push(message.id.clone());
                         state.turn_user_inputs = 0;
                         state.idle_since = None;
+                        state.sign_in_fault = None;
                     } else if self.mode == DeliveryMode::Steer {
                         if !state.open.contains(&message.id) {
                             state.open.push(message.id.clone());
@@ -867,6 +884,7 @@ impl StreamHarness {
             state.finished_quiet.clear();
             state.usages.clear();
             state.quota_reset_at_ms = None;
+            state.sign_in_fault = None;
             state.child = Some(child);
             state.alive = true;
             state.open.clear();
@@ -1005,6 +1023,7 @@ impl State {
             finished: HashSet::new(),
             turns_started: 0,
             quota_reset_at_ms: None,
+            sign_in_fault: None,
             session_id: session_id.map(str::to_string),
             usages: Vec::new(),
             text: None,
@@ -1131,8 +1150,27 @@ fn read_stdout(
                 }
             }
             if effect.finishes_turn {
+                state.sign_in_fault = None;
                 let usage = effect.usage.unwrap_or_default();
                 finish_open(&mut state, usage);
+            } else if effect.quota_reset_at_ms.is_none()
+                && matches!(kind, Some("done") | Some("result"))
+                && let Some(err_str) = value
+                    .pointer("/result/error")
+                    .or_else(|| value.get("error"))
+                    .and_then(|v| {
+                        v.as_str().or_else(|| {
+                            v.get("message")
+                                .and_then(Value::as_str)
+                                .or_else(|| v.get("code").and_then(Value::as_str))
+                        })
+                    })
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                state.sign_in_fault = Some(err_str.to_string());
+                state.open.clear();
+                state.followups.clear();
             }
             state.epoch = state.epoch.wrapping_add(1);
         }

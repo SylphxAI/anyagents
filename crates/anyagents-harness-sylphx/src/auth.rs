@@ -477,11 +477,13 @@ pub fn resolve_sylphx_api_key(config_dir: &Path, env: &[(String, String)]) -> Op
 /// `.config/opencode/sylphx.key`) before falling back to `.config/sylphx/credentials.json`.
 pub fn resolve_sylphx_gateway_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
     for (k, v) in env {
-        if (k == "SYLPHX_AI_KEY" || k == "SYLPHX_API_KEY") && !v.trim().is_empty() {
+        if (k == "SYLPHX_AI_KEY" || k == "SYLPHX_API_KEY" || k == "SYLPHX_GATEWAY_KEY")
+            && !v.trim().is_empty()
+        {
             return Some(v.trim().to_string());
         }
     }
-    for k in ["SYLPHX_AI_KEY", "SYLPHX_API_KEY"] {
+    for k in ["SYLPHX_AI_KEY", "SYLPHX_API_KEY", "SYLPHX_GATEWAY_KEY"] {
         if let Ok(v) = std::env::var(k)
             && !v.trim().is_empty()
         {
@@ -629,12 +631,45 @@ fn shared_http_agent() -> &'static ureq::Agent {
     })
 }
 
-pub(super) fn curl_post_json(
+pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
+    if matches!(status, 408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=529) {
+        return true;
+    }
+    let lower = body.to_ascii_lowercase();
+    if status == 429 {
+        return !lower.contains("insufficient_quota")
+            && !lower.contains("credit balance is too low")
+            && !lower.contains("out of credits")
+            && !lower.contains("quota exceeded");
+    }
+    if !(200..300).contains(&status) {
+        return lower.contains("model_unavailable")
+            || lower.contains("temporarily unavailable")
+            || lower.contains("overloaded")
+            || lower.contains("bad gateway")
+            || lower.contains("service unavailable")
+            || lower.contains("gateway timeout");
+    }
+    false
+}
+
+fn gateway_retry_policy() -> (u32, u64) {
+    let max_retries = std::env::var("SYLPHX_MAX_RETRIES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(3);
+    let base_backoff_ms = std::env::var("SYLPHX_RETRY_BACKOFF_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(300);
+    (max_retries, base_backoff_ms)
+}
+
+fn curl_post_json_once(
     url: &str,
     bearer_token: Option<&str>,
-    body: &Value,
+    payload: &str,
 ) -> Result<(u16, String), String> {
-    let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
     let mut req = shared_http_agent()
         .post(url)
         .header("content-type", "application/json");
@@ -664,7 +699,7 @@ pub(super) fn curl_post_json(
         cmd.arg("-H").arg(format!("Authorization: Bearer {tok}"));
     }
     cmd.arg("-d")
-        .arg(&payload)
+        .arg(payload)
         .arg(url)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -674,6 +709,38 @@ pub(super) fn curl_post_json(
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     parse_curl_status_and_body(&String::from_utf8_lossy(&out.stdout))
+}
+
+pub(super) fn curl_post_json(
+    url: &str,
+    bearer_token: Option<&str>,
+    body: &Value,
+) -> Result<(u16, String), String> {
+    let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let (max_retries, base_backoff_ms) = gateway_retry_policy();
+    let mut attempt = 0u32;
+    loop {
+        match curl_post_json_once(url, bearer_token, &payload) {
+            Ok((code, text)) => {
+                if attempt < max_retries && is_transient_gateway_failure(code, &text) {
+                    let delay_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(4));
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    attempt += 1;
+                    continue;
+                }
+                return Ok((code, text));
+            }
+            Err(err) => {
+                if attempt < max_retries {
+                    let delay_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(4));
+                    std::thread::sleep(Duration::from_millis(delay_ms));
+                    attempt += 1;
+                    continue;
+                }
+                return Err(err);
+            }
+        }
+    }
 }
 
 pub(super) fn curl_get(url: &str, bearer_token: Option<&str>) -> Result<(u16, String), String> {
