@@ -2515,6 +2515,100 @@ pub(crate) fn extract_profile_account_identity(
                 }
             }
         }
+        "google-antigravity" => {
+            let tok_path = prof_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            if let Ok(text) = std::fs::read_to_string(tok_path)
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+            {
+                email = val
+                    .get("email")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                account_id = val
+                    .get("account_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+            }
+        }
+        "muse" => {
+            for rel in ["muse/auth.json", ".config/muse/auth.json"] {
+                if let Ok(text) = std::fs::read_to_string(prof_dir.join(rel))
+                    && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                {
+                    if email.is_none() {
+                        email = val
+                            .pointer("/providers/meta/user_email")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        "xai" => {
+            if let Ok(text) = std::fs::read_to_string(prof_dir.join(".grok/auth.json"))
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(obj) = val.as_object()
+            {
+                for entry in obj.values() {
+                    if email.is_none() {
+                        email = entry
+                            .get("email")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                    if account_id.is_none() {
+                        account_id = entry
+                            .get("user_id")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string);
+                    }
+                }
+            }
+        }
+        "cursor" => {
+            for rel in ["agent.db", ".omp/agent/agent.db"] {
+                let db_path = prof_dir.join(rel);
+                if db_path.is_file()
+                    && let Ok(conn) = rusqlite::Connection::open_with_flags(
+                        &db_path,
+                        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                    )
+                    && let Ok(id_key) = conn.query_row(
+                        "SELECT identity_key FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
+                        [],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    && let Some(raw_id) = id_key
+                {
+                    let cleaned = raw_id
+                        .strip_prefix("account:")
+                        .unwrap_or(&raw_id)
+                        .split('|')
+                        .next_back()
+                        .unwrap_or(&raw_id)
+                        .trim()
+                        .to_string();
+                    if !cleaned.is_empty() {
+                        if cleaned.contains('@') {
+                            email = Some(cleaned);
+                        } else {
+                            account_id = Some(cleaned);
+                        }
+                        break;
+                    }
+                }
+            }
+        }
         _ => {}
     }
 
@@ -2575,26 +2669,214 @@ fn copy_dir_recursive_overwrite(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Resolves the target profile for an OAuth sign-in staged at `staging_dir` using
-/// the authenticated account's `email` and `account_id`:
-/// - If `explicit_profile` is `Some(prof)`, commits directly to `prof`.
-/// - Otherwise (`explicit_profile` is `None`), extracts `(email, account_id)` from
-///   `staging_dir` (probing the upstream OAuth profile endpoint if needed) and:
-///   1. If an existing profile already uniquely matches `account_id` or `email` (and is not
-///      duplicated across multiple profiles), updates that profile in-place.
-///   2. If the newly signed-in account does not match an existing profile (e.g. logging in
-///      `ritaleewoonyee@gmail.com` while `default` and `vulcan` both hold duplicate
-///      `stanleylau_ex@hotmail.com`), assigns it to an unauthenticated profile or one of
-///      the duplicated profiles (preferring `default`) so each profile holds its own
-///      distinct account and bound agents (`sage` vs `vulcan`) are immediately separated.
-///   3. If all existing profiles already hold distinct accounts, creates a profile named
-///      after the account's email handle.
+fn extract_profile_dedup_key(prof_dir: &Path, provider: &str) -> Option<String> {
+    let (email, account_id) = extract_profile_account_identity(prof_dir, provider);
+    if let Some(em) = email {
+        return Some(format!("email:{}", em.to_ascii_lowercase()));
+    }
+    if let Some(id) = account_id {
+        return Some(format!("id:{id}"));
+    }
+    match provider {
+        "deepseek" => read_first_non_empty_file(prof_dir, &[".config/opencode/deepseek.key"])
+            .or_else(|| read_dsh_yaml_ref(prof_dir, "DEEPSEEK_API_KEY"))
+            .map(|k| format!("key:{k}")),
+        "kimi-code-plan" => read_first_non_empty_file(
+            prof_dir,
+            &[
+                ".config/opencode/kimi-code-plan.key",
+                ".config/opencode/kimi.key",
+            ],
+        )
+        .map(|k| format!("key:{k}")),
+        "glm-code-plan" => read_first_non_empty_file(
+            prof_dir,
+            &[
+                ".config/opencode/glm-code-plan.key",
+                ".config/opencode/glm.key",
+            ],
+        )
+        .map(|k| format!("key:{k}")),
+        "minimax-code-plan" => read_first_non_empty_file(
+            prof_dir,
+            &[
+                ".config/opencode/minimax-code-plan.key",
+                ".config/opencode/minimax.key",
+            ],
+        )
+        .map(|k| format!("key:{k}")),
+        "openrouter" => read_first_non_empty_file(prof_dir, &[".config/opencode/openrouter.key"])
+            .or_else(|| read_dsh_yaml_ref(prof_dir, "OPENROUTER_API_KEY"))
+            .map(|k| format!("key:{k}")),
+        "google-gemini" => read_first_non_empty_file(
+            prof_dir,
+            &["gemini-api-key", ".config/opencode/gemini.key"],
+        )
+        .or_else(|| read_dsh_yaml_ref(prof_dir, "GEMINI_API_KEY"))
+        .map(|k| format!("key:{k}")),
+        _ => None,
+    }
+}
+
+/// Enforces the `1 Email / Account = 1 Profile` invariant across all providers under
+/// `<data>/profiles/<provider>`. If two or more profiles under the same provider share
+/// the exact same email, account ID, or API key, merges them into a single canonical
+/// profile (preferring `default` when present), updates any bound agents' `.anyagents-profile`
+/// and `.anyagents-seeded-profile` markers, and removes the duplicate profile directory.
+pub(crate) fn deduplicate_same_account_profiles(data: &Path) {
+    let profiles_root = data.join("profiles");
+    let Ok(providers) = std::fs::read_dir(&profiles_root) else {
+        return;
+    };
+    for prov_entry in providers.flatten() {
+        let prov_path = prov_entry.path();
+        if !prov_path.is_dir() {
+            continue;
+        }
+        let provider = prov_entry.file_name().to_string_lossy().into_owned();
+        if provider.starts_with('.') {
+            continue;
+        }
+        let Ok(prof_dirs) = std::fs::read_dir(&prov_path) else {
+            continue;
+        };
+        let mut profs: Vec<(String, PathBuf)> = prof_dirs
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if !p.is_dir() {
+                    return None;
+                }
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with('.') {
+                    return None;
+                }
+                Some((name, p))
+            })
+            .collect();
+        if profs.len() <= 1 {
+            continue;
+        }
+        profs.sort_by(|a, b| {
+            (a.0 != "default")
+                .cmp(&(b.0 != "default"))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let mut canonical_by_key: std::collections::BTreeMap<String, (String, PathBuf)> =
+            std::collections::BTreeMap::new();
+        let mut merged_into: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+
+        for (prof_name, prof_path) in profs {
+            let (em, aid) = extract_profile_account_identity(&prof_path, &provider);
+            let dedup_key = extract_profile_dedup_key(&prof_path, &provider);
+            let mut matched_canon: Option<(String, PathBuf)> = None;
+            if let Some(ref e) = em {
+                let k = format!("email:{}", e.to_ascii_lowercase());
+                if let Some(c) = canonical_by_key.get(&k) {
+                    matched_canon = Some(c.clone());
+                }
+            }
+            if matched_canon.is_none()
+                && let Some(ref id) = aid
+            {
+                let k = format!("id:{id}");
+                if let Some(c) = canonical_by_key.get(&k) {
+                    matched_canon = Some(c.clone());
+                }
+            }
+            if matched_canon.is_none()
+                && let Some(ref dk) = dedup_key
+                && let Some(c) = canonical_by_key.get(dk)
+            {
+                matched_canon = Some(c.clone());
+            }
+
+            if let Some((canon_name, canon_path)) = matched_canon {
+                let rels: &[&str] = match provider.as_str() {
+                    "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
+                    "openai" => &["auth.json", ".codex/auth.json"],
+                    "google-antigravity" => &[
+                        ".gemini/antigravity-cli/antigravity-oauth-token",
+                        ".gemini/antigravity-cli/antigravity_state.pbtxt",
+                        ".gemini/config/config.json",
+                    ],
+                    "muse" => &["muse/auth.json", ".config/muse/auth.json"],
+                    "xai" => &[".grok/auth.json"],
+                    _ => &[],
+                };
+                for rel in rels {
+                    let src = prof_path.join(rel);
+                    if src.is_file() {
+                        let _ = copy_seat_file_if_newer(&src, &canon_path.join(rel));
+                    }
+                }
+                let _ = std::fs::remove_dir_all(&prof_path);
+                merged_into.insert(prof_name, canon_name);
+            } else {
+                if let Some(e) = em {
+                    canonical_by_key.insert(
+                        format!("email:{}", e.to_ascii_lowercase()),
+                        (prof_name.clone(), prof_path.clone()),
+                    );
+                }
+                if let Some(id) = aid {
+                    canonical_by_key
+                        .insert(format!("id:{id}"), (prof_name.clone(), prof_path.clone()));
+                }
+                if let Some(dk) = dedup_key {
+                    canonical_by_key.insert(dk, (prof_name, prof_path));
+                }
+            }
+        }
+
+        if !merged_into.is_empty()
+            && let Ok(agents_dir) = std::fs::read_dir(data.join("agents"))
+        {
+            for entry in agents_dir.flatten() {
+                let cfg = entry.path().join("config");
+                if !cfg.is_dir() {
+                    continue;
+                }
+                for marker in [".anyagents-profile", ".anyagents-seeded-profile"] {
+                    if let Ok(raw) = std::fs::read_to_string(cfg.join(marker)) {
+                        let trimmed = raw.trim();
+                        let (m_prov, m_prof) = trimmed
+                            .split_once('/')
+                            .unwrap_or((provider.as_str(), trimmed));
+                        if m_prov == provider
+                            && let Some(canon_prof) = merged_into.get(m_prof)
+                        {
+                            write_profile_marker(
+                                &cfg,
+                                marker,
+                                &format!("{provider}/{canon_prof}\n"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Resolves the target profile for an OAuth sign-in staged at `staging_dir` under
+/// strict `1 Email / Account = 1 Profile` and `1 Agent = 1 Assigned Profile` rules:
+/// 1. If an existing profile under `provider` already holds the same `account_id` or
+///    `email`, updates that single profile in-place (never creating a duplicate profile
+///    for the same account).
+/// 2. If the signed-in account is new to `provider`:
+///    - Uses `explicit_profile` if specified and not already occupied by a different account;
+///    - Otherwise uses `default` if `default` does not yet hold a different account;
+///    - Otherwise creates a new profile named after the account's email handle.
 pub(crate) fn resolve_and_commit_staged_signin(
     data: &Path,
     provider: &str,
     staging_dir: &Path,
     explicit_profile: Option<&str>,
 ) -> Result<(String, PathBuf, Option<String>), Error> {
+    deduplicate_same_account_profiles(data);
     if provider == "anthropic" {
         let root_cred = staging_dir.join(".credentials.json");
         let sub_cred = staging_dir.join(".claude/.credentials.json");
@@ -2657,103 +2939,73 @@ pub(crate) fn resolve_and_commit_staged_signin(
     }
 
     let (staged_email, staged_id) = extract_profile_account_identity(staging_dir, provider);
+    let existing = list_harness_profiles(data, provider);
+    struct ExistingProf {
+        name: String,
+        email: Option<String>,
+        acct_id: Option<String>,
+        has_creds: bool,
+    }
+    let mut profs = Vec::new();
+    for (name, dir) in &existing {
+        let (em, aid) = extract_profile_account_identity(dir, provider);
+        let has_creds = em.is_some()
+            || aid.is_some()
+            || dir.join(".credentials.json").is_file()
+            || dir.join("auth.json").is_file()
+            || dir
+                .join(".gemini/antigravity-cli/antigravity-oauth-token")
+                .is_file();
+        profs.push(ExistingProf {
+            name: name.clone(),
+            email: em,
+            acct_id: aid,
+            has_creds,
+        });
+    }
 
-    let chosen_profile = if let Some(exp) = explicit_profile.map(str::trim).filter(|s| !s.is_empty())
-    {
-        exp.to_string()
-    } else {
-        let existing = list_harness_profiles(data, provider);
-        if existing.is_empty() {
-            "default".to_string()
-        } else {
-            struct ExistingProf {
-                name: String,
-                email: Option<String>,
-                acct_id: Option<String>,
-                has_creds: bool,
-            }
-            let mut profs = Vec::new();
-            for (name, dir) in &existing {
-                let (em, aid) = extract_profile_account_identity(dir, provider);
-                let has_creds = em.is_some()
-                    || aid.is_some()
-                    || dir.join(".credentials.json").is_file()
-                    || dir.join("auth.json").is_file()
-                    || dir
-                        .join(".gemini/antigravity-cli/antigravity-oauth-token")
-                        .is_file();
-                profs.push(ExistingProf {
-                    name: name.clone(),
-                    email: em,
-                    acct_id: aid,
-                    has_creds,
-                });
-            }
-
-            let matches_staged = |p: &ExistingProf| -> bool {
-                if let (Some(s_id), Some(p_id)) = (staged_id.as_deref(), p.acct_id.as_deref())
-                    && s_id == p_id
-                {
-                    return true;
-                }
-                if let (Some(s_em), Some(p_em)) = (staged_email.as_deref(), p.email.as_deref())
-                    && s_em.eq_ignore_ascii_case(p_em)
-                {
-                    return true;
-                }
-                false
-            };
-
-            let matching: Vec<&ExistingProf> =
-                profs.iter().filter(|p| matches_staged(p)).collect();
-            if let Some(first_match) = matching.first() {
-                first_match.name.clone()
-            } else if let Some(empty) = profs
-                .iter()
-                .find(|p| !p.has_creds && p.name == "default")
-                .or_else(|| profs.iter().find(|p| !p.has_creds))
-            {
-                empty.name.clone()
-            } else {
-                // Check if two or more existing profiles currently hold a duplicated account:
-                let mut duplicate_names: Vec<String> = Vec::new();
-                for (i, a) in profs.iter().enumerate() {
-                    let is_dup = profs.iter().enumerate().any(|(j, b)| {
-                        i != j
-                            && ((a.acct_id.is_some() && a.acct_id == b.acct_id)
-                                || (a.email.is_some()
-                                    && b.email.as_deref().is_some_and(|be| {
-                                        a.email
-                                            .as_deref()
-                                            .is_some_and(|ae| ae.eq_ignore_ascii_case(be))
-                                    })))
-                    });
-                    if is_dup {
-                        duplicate_names.push(a.name.clone());
-                    }
-                }
-                if !duplicate_names.is_empty() {
-                    if duplicate_names.iter().any(|n| n == "default") {
-                        "default".to_string()
-                    } else {
-                        duplicate_names.remove(0)
-                    }
-                } else {
-                    let base_slug = staged_email
-                        .as_deref()
-                        .map(sanitize_profile_slug)
-                        .or_else(|| staged_id.as_deref().map(sanitize_profile_slug))
-                        .unwrap_or_else(|| "acct".to_string());
-                    let mut candidate = base_slug.clone();
-                    let mut seq = 2usize;
-                    while profs.iter().any(|p| p.name == candidate) {
-                        candidate = format!("{base_slug}-{seq}");
-                        seq += 1;
-                    }
-                    candidate
-                }
-            }
+    let matches_staged = |p: &ExistingProf| -> bool {
+        if let (Some(s_id), Some(p_id)) = (staged_id.as_deref(), p.acct_id.as_deref())
+            && s_id == p_id
+        {
+            return true;
         }
+        if let (Some(s_em), Some(p_em)) = (staged_email.as_deref(), p.email.as_deref())
+            && s_em.eq_ignore_ascii_case(p_em)
+        {
+            return true;
+        }
+        false
+    };
+
+    let chosen_profile = if let Some(existing_match) = profs.iter().find(|p| matches_staged(p)) {
+        // 1 Email / Account = 1 Profile: if this account already exists under `provider`,
+        // always update its existing profile rather than creating a second profile with the same email.
+        existing_match.name.clone()
+    } else if let Some(exp) = explicit_profile.map(str::trim).filter(|s| !s.is_empty()) {
+        exp.to_string()
+    } else if profs.is_empty()
+        || profs
+            .iter()
+            .find(|p| p.name == "default")
+            .is_none_or(|p| !p.has_creds)
+    {
+        "default".to_string()
+    } else if let Some(empty) = profs.iter().find(|p| !p.has_creds) {
+        empty.name.clone()
+    } else {
+        let base_slug = staged_email
+            .as_deref()
+            .map(sanitize_profile_slug)
+            .or_else(|| staged_id.as_deref().map(sanitize_profile_slug))
+            .unwrap_or_else(|| "acct".to_string());
+        let mut candidate = base_slug.clone();
+        let mut seq = 2usize;
+        while profs.iter().any(|p| p.name == candidate) {
+            candidate = format!("{base_slug}-{seq}");
+            seq += 1;
+        }
+        candidate
     };
 
     let final_dir = data.join("profiles").join(provider).join(&chosen_profile);
@@ -2762,6 +3014,7 @@ pub(crate) fn resolve_and_commit_staged_signin(
         let _ = std::fs::remove_dir_all(staging_dir);
     }
     finalize_profile_signin(data, provider, &chosen_profile);
+    deduplicate_same_account_profiles(data);
     let (final_email, final_id) = extract_profile_account_identity(&final_dir, provider);
     Ok((chosen_profile, final_dir, final_email.or(final_id)))
 }
@@ -2891,13 +3144,12 @@ pub(crate) fn finalize_profile_signin(data: &Path, provider: &str, profile: &str
 pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) {
     let cfg = agent_config_dir(data, &agent.id);
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
-    let prof_name = bound_profile_name(&cfg)
-        .and_then(|b| {
-            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
-            (!p.is_empty()).then_some(p)
-        })
-        .unwrap_or_else(|| "default".to_string());
-    let prof_dir = data.join("profiles").join(&provider).join(&prof_name);
+    let stage = data
+        .join("profiles")
+        .join(&provider)
+        .join(format!(".signin-staging-agent-{}", agent.id.as_str()));
+    let _ = std::fs::remove_dir_all(&stage);
+    let _ = std::fs::create_dir_all(&stage);
     let rels: &[&str] = match provider.as_str() {
         "anthropic" => &[".credentials.json", ".claude/.credentials.json"],
         "openai" => &["auth.json", ".codex/auth.json"],
@@ -2927,7 +3179,7 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) {
                     best_src = Some((mt, bytes));
                 }
             } else {
-                let dst = prof_dir.join(rel);
+                let dst = stage.join(rel);
                 if let Some(p) = dst.parent() {
                     let _ = std::fs::create_dir_all(p);
                 }
@@ -2937,14 +3189,23 @@ pub(crate) fn finalize_agent_signin(data: &Path, agent: &Agent) {
     }
     if let Some((_, bytes)) = best_src {
         for rel in rels {
-            let dst = prof_dir.join(rel);
+            let dst = stage.join(rel);
             if let Some(p) = dst.parent() {
                 let _ = std::fs::create_dir_all(p);
             }
             let _ = std::fs::write(&dst, &bytes);
         }
     }
-    finalize_profile_signin(data, &provider, &prof_name);
+    if let Ok((resolved_prof, _, _)) =
+        resolve_and_commit_staged_signin(data, &provider, &stage, None)
+    {
+        let normalized = format!("{provider}/{resolved_prof}\n");
+        write_profile_marker(&cfg, ".anyagents-profile", &normalized);
+        write_profile_marker(&cfg, ".anyagents-seeded-profile", &normalized);
+        finalize_profile_signin(data, &provider, &resolved_prof);
+    } else {
+        let _ = std::fs::remove_dir_all(&stage);
+    }
 }
 
 /// Resolves the upstream provider an agent draws its credential profile from.
@@ -3300,6 +3561,8 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
         }
     }
 
+    deduplicate_same_account_profiles(data);
+
     let mut entries: Vec<ProviderProfileEntry> = Vec::new();
     if let Ok(providers) = std::fs::read_dir(&profiles_root) {
         for prov_entry in providers.flatten() {
@@ -3567,6 +3830,28 @@ fn extract_cursor_oauth_from_db(prof_dir: &Path) -> Option<(String, String)> {
         .into_iter()
         .map(|r| prof_dir.join(r))
         .find(|p| p.is_file())?;
+    if let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) && let Ok(data_str) = conn.query_row(
+        "SELECT data FROM auth_credentials WHERE provider = 'cursor' ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    ) && let Ok(val) = serde_json::from_str::<serde_json::Value>(&data_str)
+        && let Some(access) = val
+            .get("access")
+            .and_then(serde_json::Value::as_str)
+            .map(|s| s.trim().to_string())
+        && !access.is_empty()
+    {
+        let refresh = val
+            .get("refresh")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return Some((access, refresh));
+    }
     let bytes = std::fs::read(db_path).ok()?;
     for needle in [
         &b"{\"access\":\"eyJ"[..],
@@ -4646,11 +4931,8 @@ pub(crate) fn probe_one_profile_usage(
             Some(format!("5h: {r5}% left{e5} · 7d: {r7}% left{e7}"))
         }
         "deepseek" => {
-            let api_dir = data.join("profiles/deepseek/api");
             let key = read_first_non_empty_file(&prof_dir, &[".config/opencode/deepseek.key"])
-                .or_else(|| read_dsh_yaml_ref(&prof_dir, "DEEPSEEK_API_KEY"))
-                .or_else(|| read_first_non_empty_file(&api_dir, &[".config/opencode/deepseek.key"]))
-                .or_else(|| read_dsh_yaml_ref(&api_dir, "DEEPSEEK_API_KEY"))?;
+                .or_else(|| read_dsh_yaml_ref(&prof_dir, "DEEPSEEK_API_KEY"))?;
             let resp = http
                 .get("https://api.deepseek.com/user/balance")
                 .header("authorization", &format!("Bearer {key}"))
@@ -5577,102 +5859,41 @@ pub(crate) fn bound_profile_name(config_dir: &Path) -> Option<String> {
 }
 
 /// Selects (or reuses the already-bound) Upstream Provider Profile for `agent`
-/// from `<data>/profiles/<provider>/<profile>` using quota-aware least-loaded
-/// assignment across agents sharing that upstream provider, and persists
-/// `.anyagents-profile` (`<provider>/<profile>`) in `target_config`.
+/// from `<data>/profiles/<provider>/<profile>` with zero automatic load-balancing
+/// ("分流"): an agent uses its explicitly assigned `.anyagents-profile` (defaulting
+/// deterministically to `<provider>/default`).
 fn select_or_bind_profile(
     data: &Path,
-    all_agents: &[Agent],
+    _all_agents: &[Agent],
     agent: &Agent,
     target_config: &Path,
 ) -> Vec<PathBuf> {
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let available = list_harness_profiles(data, &provider);
-    let mut roots = Vec::new();
     if let Some(existing) = bound_profile_name(target_config) {
         let prof_name = existing
             .split_once('/')
             .map(|(_, p)| p)
             .unwrap_or(existing.as_str());
         if let Some((_, dir)) = available.iter().find(|(n, _)| n == prof_name) {
-            roots.push(dir.clone());
-        } else {
-            roots.push(data.join("profiles").join(&provider).join(prof_name));
+            return vec![dir.clone()];
         }
-        if prof_name != "default" {
-            return roots;
+        let exact_dir = data.join("profiles").join(&provider).join(prof_name);
+        if exact_dir.is_dir() {
+            return vec![exact_dir];
         }
-    } else if !available.is_empty() {
-        let mut counts: std::collections::BTreeMap<String, usize> = available
-            .iter()
-            .map(|(name, _)| (name.clone(), 0usize))
-            .collect();
-        for other in all_agents {
-            if other.id != agent.id
-                && other.state != "archived"
-                && upstream_provider_of(&other.harness, other.model.as_deref()) == provider
-            {
-                let other_cfg = agent_config_dir(data, &other.id);
-                if let Some(p) = bound_profile_name(&other_cfg) {
-                    let prof_name = p.split_once('/').map(|(_, n)| n).unwrap_or(p.as_str());
-                    if let Some(c) = counts.get_mut(prof_name) {
-                        *c += 1;
-                    }
-                }
-            }
-        }
-        let probe_enabled = !crate::sandbox::is_isolated_test_env() && available.len() > 1;
-        let scored: Vec<(&(String, PathBuf), bool, bool, usize, i64)> = available
-            .iter()
-            .map(|item| {
-                let pct = if probe_enabled {
-                    probe_profile_remaining_pct(data, &provider, &item.0, agent.model.as_deref())
-                        .unwrap_or(100)
-                } else {
-                    100
-                };
-                let assigned = counts.get(&item.0).copied().unwrap_or(0);
-                (item, pct > 0, pct >= 20, assigned, pct)
-            })
-            .collect();
-        let best_tier = scored
-            .iter()
-            .map(|(_, has_quota, healthy, assigned, _)| {
-                (*has_quota, *healthy, std::cmp::Reverse(*assigned))
-            })
-            .max()
-            .unwrap_or((true, true, std::cmp::Reverse(0)));
-        let candidates: Vec<&(String, PathBuf)> = scored
-            .iter()
-            .filter(|(_, has_quota, healthy, assigned, _)| {
-                (*has_quota, *healthy, std::cmp::Reverse(*assigned)) == best_tier
-            })
-            .map(|(item, _, _, _, _)| *item)
-            .collect();
-        let hash = agent.name.bytes().fold(0usize, |acc, b| {
-            acc.wrapping_mul(31).wrapping_add(b as usize)
-        });
-        let chosen = candidates[hash % candidates.len()];
-        write_profile_marker(
-            target_config,
-            ".anyagents-profile",
-            &format!("{provider}/{}\n", chosen.0),
-        );
-        roots.push(chosen.1.clone());
-        if chosen.0 != "default" {
-            return roots;
-        }
-    } else {
-        write_profile_marker(
-            target_config,
-            ".anyagents-profile",
-            &format!("{provider}/default\n"),
-        );
     }
-    roots.push(data.join("profiles").join(&provider).join("default"));
-    roots.push(data.join("profiles").join(&agent.harness).join("default"));
-    roots.push(data.join("config").join(&provider).join("default"));
-    roots
+    let chosen_name = if available.iter().any(|(n, _)| n == "default") || available.is_empty() {
+        "default".to_string()
+    } else {
+        available[0].0.clone()
+    };
+    write_profile_marker(
+        target_config,
+        ".anyagents-profile",
+        &format!("{provider}/{chosen_name}\n"),
+    );
+    vec![data.join("profiles").join(&provider).join(chosen_name)]
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -6550,13 +6771,16 @@ mod tests {
     }
 
     #[test]
-    fn signin_auto_routes_by_email_and_account_id_and_repairs_duplicates() {
+    fn signin_deduplicates_same_email_and_enforces_one_email_one_profile() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
         let def_dir = data.join("profiles/anthropic/default");
         let vul_dir = data.join("profiles/anthropic/vulcan");
+        let agent_cfg = data.join("agents/vulcan-id/config");
         std::fs::create_dir_all(&def_dir).unwrap();
         std::fs::create_dir_all(&vul_dir).unwrap();
+        std::fs::create_dir_all(&agent_cfg).unwrap();
+        std::fs::write(agent_cfg.join(".anyagents-profile"), "anthropic/vulcan\n").unwrap();
 
         let dup_cred = serde_json::json!({
             "claudeAiOauth": {
@@ -6569,8 +6793,20 @@ mod tests {
         std::fs::write(def_dir.join(".credentials.json"), dup_cred.to_string()).unwrap();
         std::fs::write(vul_dir.join(".credentials.json"), dup_cred.to_string()).unwrap();
 
-        // Signing in a different account (`ritaleewoonyee@gmail.com`) without `--profile`
-        // automatically replaces one of the duplicated profiles (`default`) while preserving `vulcan`.
+        // Deduplicating same-email profiles merges `vulcan` into `default` and updates bound agents.
+        deduplicate_same_account_profiles(data);
+        assert!(def_dir.is_dir());
+        assert!(
+            !vul_dir.exists(),
+            "duplicate profile for the same email must be removed"
+        );
+        assert_eq!(
+            bound_profile_name(&agent_cfg).as_deref(),
+            Some("anthropic/default")
+        );
+
+        // Signing in a new account (`ritaleewoonyee@gmail.com`) without `--profile`
+        // creates its own distinct profile (`ritaleewoonyee`) without touching `default`.
         let stage1 = data.join("profiles/anthropic/.signin-staging-test1");
         std::fs::create_dir_all(&stage1).unwrap();
         std::fs::write(
@@ -6587,20 +6823,21 @@ mod tests {
         )
         .unwrap();
 
-        let (prof1, _, acct1) =
+        let (prof1, rita_dir, acct1) =
             resolve_and_commit_staged_signin(data, "anthropic", &stage1, None).unwrap();
-        assert_eq!(prof1, "default");
+        assert_eq!(prof1, "ritaleewoonyee");
         assert_eq!(acct1.as_deref(), Some("ritaleewoonyee@gmail.com"));
         assert_eq!(
             extract_profile_account_identity(&def_dir, "anthropic").0.as_deref(),
-            Some("ritaleewoonyee@gmail.com")
-        );
-        assert_eq!(
-            extract_profile_account_identity(&vul_dir, "anthropic").0.as_deref(),
             Some("stanleylau_ex@hotmail.com")
         );
+        assert_eq!(
+            extract_profile_account_identity(&rita_dir, "anthropic").0.as_deref(),
+            Some("ritaleewoonyee@gmail.com")
+        );
 
-        // Re-signing in `stanleylau_ex@hotmail.com` without `--profile` routes directly to `vulcan`.
+        // Re-signing in `stanleylau_ex@hotmail.com` (even with an explicit `--profile extra`)
+        // updates its existing `default` profile rather than creating a duplicate email profile.
         let stage2 = data.join("profiles/anthropic/.signin-staging-test2");
         std::fs::create_dir_all(&stage2).unwrap();
         std::fs::write(
@@ -6617,29 +6854,9 @@ mod tests {
         )
         .unwrap();
         let (prof2, _, acct2) =
-            resolve_and_commit_staged_signin(data, "anthropic", &stage2, None).unwrap();
-        assert_eq!(prof2, "vulcan");
+            resolve_and_commit_staged_signin(data, "anthropic", &stage2, Some("extra")).unwrap();
+        assert_eq!(prof2, "default");
         assert_eq!(acct2.as_deref(), Some("stanleylau_ex@hotmail.com"));
-
-        // Signing in a 3rd distinct account creates a new profile named after the email prefix.
-        let stage3 = data.join("profiles/anthropic/.signin-staging-test3");
-        std::fs::create_dir_all(&stage3).unwrap();
-        std::fs::write(
-            stage3.join(".credentials.json"),
-            serde_json::json!({
-                "claudeAiOauth": {
-                    "accessToken": "",
-                    "refreshToken": "rtok-kyle",
-                    "accountUuid": "uuid-kyle",
-                    "email": "kyletse@sylphx.com"
-                }
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let (prof3, _, acct3) =
-            resolve_and_commit_staged_signin(data, "anthropic", &stage3, None).unwrap();
-        assert_eq!(prof3, "kyletse");
-        assert_eq!(acct3.as_deref(), Some("kyletse@sylphx.com"));
+        assert!(!data.join("profiles/anthropic/extra").exists());
     }
 }

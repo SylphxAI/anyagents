@@ -1859,17 +1859,11 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
             .and_then(|p| p.split_once('/').map(|(_, r)| r.trim()).or(Some(p)))
             .filter(|s| !s.is_empty());
         let provider = create::upstream_provider_of(target, None);
-        let staging_dir = match explicit_prof {
-            Some(prof) => data.join("profiles").join(&provider).join(prof),
-            None => {
-                let stage = data
-                    .join("profiles")
-                    .join(&provider)
-                    .join(format!(".signin-staging-{}", std::process::id()));
-                let _ = std::fs::remove_dir_all(&stage);
-                stage
-            }
-        };
+        let staging_dir = data
+            .join("profiles")
+            .join(&provider)
+            .join(format!(".signin-staging-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&staging_dir);
         std::fs::create_dir_all(&staging_dir)?;
         let outcome = match anyagents_installer::sign_in_at(
             &anyagents_installer::builtin_catalog(),
@@ -1880,9 +1874,7 @@ fn sign_in(data: &Path, target: &str, profile: Option<&str>) -> Result<(), anyag
         ) {
             Ok(o) => o,
             Err(err) => {
-                if explicit_prof.is_none() {
-                    let _ = std::fs::remove_dir_all(&staging_dir);
-                }
+                let _ = std::fs::remove_dir_all(&staging_dir);
                 return Err(anyagents_core::Error::Message(err.to_string()));
             }
         };
