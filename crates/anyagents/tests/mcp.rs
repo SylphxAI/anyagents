@@ -576,8 +576,9 @@ async fn mcp_tools_use_the_server_socket() {
         "{all_recipients:?}"
     );
 
-    // Sending directly to the archived sub-agent's `agt_...` ID wakes and resumes it automatically!
-    let resumed_send: SendResponse = ok_json(
+    // Sending directly to an explicitly archived sub-agent queues the message without auto-waking it;
+    // only an explicit `wake` action resumes it to `running`.
+    let queued_send: SendResponse = ok_json(
         call(
             &alpha,
             "send",
@@ -585,14 +586,31 @@ async fn mcp_tools_use_the_server_socket() {
         )
         .await,
     );
-    assert_eq!(resumed_send.deliveries[0].to, "agent:worker-1");
-    let after_wake: AgentsResponse = ok_json(call(&alpha, "agents", serde_json::json!({})).await);
-    let worker_row = after_wake
+    assert_eq!(queued_send.deliveries[0].to, "agent:worker-1");
+    let after_send: AgentsResponse = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "list", "state": "all"}),
+        )
+        .await,
+    );
+    let worker_row = after_send
         .agents
         .iter()
         .find(|a| a.id == spawned.id)
         .expect("worker-1");
-    assert_eq!(worker_row.state, "running");
+    assert_eq!(worker_row.state, "archived");
+
+    let woken: AgentView = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "wake", "name": &spawned.id}),
+        )
+        .await,
+    );
+    assert_eq!(woken.state, "running");
 
     #[cfg(unix)]
     {
