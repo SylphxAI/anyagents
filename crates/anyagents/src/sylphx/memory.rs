@@ -155,10 +155,22 @@ pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) {
     }
 }
 
-fn read_all_raw_transcript_items(transcript_path: &Path) -> Vec<(usize, Value, String)> {
+#[derive(Clone, Debug)]
+struct RawTranscriptItem {
+    index: usize,
+    raw: Value,
+    rendered: String,
+    is_tool: bool,
+    tool_name: String,
+    role: String,
+}
+
+fn read_all_raw_transcript_items(transcript_path: &Path) -> Vec<RawTranscriptItem> {
     let Ok(file) = std::fs::File::open(transcript_path) else {
         return Vec::new();
     };
+    let mut call_id_to_tool: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut out = Vec::new();
     for (idx, line) in BufReader::new(file)
         .lines()
@@ -168,13 +180,92 @@ fn read_all_raw_transcript_items(transcript_path: &Path) -> Vec<(usize, Value, S
         let Ok(val) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let rendered = render_transcript_item_text(&val);
-        out.push((idx, val, rendered));
+        let mut is_tool = false;
+        let mut tool_name = String::new();
+        let mut role = val
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("item")
+            .to_ascii_lowercase();
+
+        if let Some(t) = val.get("type").and_then(Value::as_str) {
+            match t {
+                "function_call" => {
+                    is_tool = true;
+                    role = "tool".to_string();
+                    tool_name = val
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if let Some(cid) = val.get("call_id").and_then(Value::as_str)
+                        && !tool_name.is_empty()
+                    {
+                        call_id_to_tool.insert(cid.to_string(), tool_name.clone());
+                    }
+                }
+                "function_call_output" => {
+                    is_tool = true;
+                    role = "tool".to_string();
+                    if let Some(cid) = val.get("call_id").and_then(Value::as_str)
+                        && let Some(tname) = call_id_to_tool.get(cid)
+                    {
+                        tool_name = tname.clone();
+                    }
+                }
+                "message" => {
+                    role = "assistant".to_string();
+                }
+                "context_window_open" => {
+                    role = "system".to_string();
+                }
+                _ => {}
+            }
+        } else if role == "tool" {
+            is_tool = true;
+            if let Some(cid) = val.get("tool_call_id").and_then(Value::as_str)
+                && let Some(tname) = call_id_to_tool.get(cid)
+            {
+                tool_name = tname.clone();
+            }
+        } else if role == "assistant"
+            && let Some(tcs) = val.get("tool_calls").and_then(Value::as_array)
+        {
+            for tc in tcs {
+                if let (Some(cid), Some(fname)) = (
+                    tc.get("id").and_then(Value::as_str),
+                    tc.pointer("/function/name").and_then(Value::as_str),
+                ) {
+                    let lower = fname.to_ascii_lowercase();
+                    call_id_to_tool.insert(cid.to_string(), lower.clone());
+                    if tool_name.is_empty() {
+                        tool_name = lower;
+                    }
+                }
+            }
+            if val
+                .get("content")
+                .and_then(Value::as_str)
+                .is_none_or(|s| s.trim().is_empty())
+            {
+                is_tool = true;
+            }
+        }
+
+        let rendered = render_transcript_item_text(&val, &tool_name);
+        out.push(RawTranscriptItem {
+            index: idx,
+            raw: val,
+            rendered,
+            is_tool,
+            tool_name,
+            role,
+        });
     }
     out
 }
 
-fn render_transcript_item_text(val: &Value) -> String {
+fn render_transcript_item_text(val: &Value, linked_tool_name: &str) -> String {
     if let Some(t) = val.get("type").and_then(Value::as_str) {
         match t {
             "context_window_open" => {
@@ -189,6 +280,9 @@ fn render_transcript_item_text(val: &Value) -> String {
             "function_call_output" => {
                 let cid = val.get("call_id").and_then(Value::as_str).unwrap_or("");
                 let output = val.get("output").and_then(Value::as_str).unwrap_or("");
+                if !linked_tool_name.is_empty() {
+                    return format!("[tool_output:{linked_tool_name}:{cid}] {output}");
+                }
                 return format!("[tool_output:{cid}] {output}");
             }
             "message" => {
@@ -226,16 +320,26 @@ fn is_cjk_char(c: char) -> bool {
 }
 
 /// Hybrid ASCII + CJK tokenizer: emits lowercased alphanumeric/identifier tokens
-/// (`len >= 2`) plus individual CJK characters and CJK bigrams so English, code,
-/// and Cantonese/Chinese queries all achieve high BM25 recall without external embeddings.
+/// (`len >= 2`, plus sub-tokens split on `_` and `-`) and individual CJK characters +
+/// CJK bigrams so English, code, and Cantonese/Chinese queries achieve high BM25 recall
+/// without external embeddings.
 fn tokenize_hybrid_raw_rag(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut ascii_buf = String::new();
     let mut cjk_run: Vec<char> = Vec::new();
 
     let flush_ascii = |buf: &mut String, out: &mut Vec<String>| {
-        if buf.len() >= 2 {
-            out.push(buf.to_ascii_lowercase());
+        let trimmed = buf.trim_matches(['-', '_']);
+        if trimmed.len() >= 2 {
+            let lower = trimmed.to_ascii_lowercase();
+            out.push(lower.clone());
+            if lower.contains('_') || lower.contains('-') {
+                for part in lower.split(['_', '-']) {
+                    if part.len() >= 2 {
+                        out.push(part.to_string());
+                    }
+                }
+            }
         }
         buf.clear();
     };
@@ -279,7 +383,7 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
     let handoff_due = used_percent >= CONTEXT_WATERMARK_PERCENT || active_items.len() >= 120;
     let windows_opened = raw_items
         .iter()
-        .filter(|(_, v, _)| v.get("type").and_then(Value::as_str) == Some("context_window_open"))
+        .filter(|item| item.raw.get("type").and_then(Value::as_str) == Some("context_window_open"))
         .count();
 
     serde_json::to_string_pretty(&json!({
@@ -297,14 +401,13 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
     .unwrap_or_default()
 }
 
-/// Lossless `Raw-RAG` recall over the full append-only `sylphx-transcript.jsonl`
-/// (`arXiv:2610.30755` + `arXiv:2310.10971`):
-/// - Zero lossy ingestion transformation (`ADD`-only raw log).
-/// - Groups raw transcript items into overlapping episode windows so causal
-///   `(Trigger -> FunctionCall -> FunctionOutput -> Outcome)` chains (`P(path | result)`)
-///   are never severed across chunk boundaries.
-/// - Scores windows with BM25 (`k1 = 1.2`, `b = 0.75`) + query term-coverage + exact
-///   substring boost, and expands each top hit by `radius` neighbor items.
+/// Lossless `Raw-RAG` lexical + structured recall over the full append-only
+/// `sylphx-transcript.jsonl` (`arXiv:2610.30755` + `arXiv:2310.10971`):
+/// - Zero lossy ingestion transformation (`ADD`-only raw log, zero vector embeddings).
+/// - Supports multi-query (`query` + `queries`), negative terms (`exclude`), tool history
+///   toggles (`include_tools`, `only_tools`, `tool_name`), `role` filter, ordering (`sort`:
+///   `"relevance"`, `"newest"`, `"oldest"`), exact range coordinates (`range`), and
+///   contiguous episode expansion (`radius`).
 pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> String {
     let all_items = read_all_raw_transcript_items(transcript_path);
     if all_items.is_empty() {
@@ -315,6 +418,72 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         }))
         .unwrap_or_default();
     }
+
+    let tool_filter = args
+        .get("tool_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase);
+    let only_tools = args
+        .get("only_tools")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || tool_filter.is_some();
+    let include_tools = args
+        .get("include_tools")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+        || only_tools;
+    let role_filter = args
+        .get("role")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+        .map(str::to_ascii_lowercase);
+    let exclude_lower: Vec<String> = args
+        .get("exclude")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let sort_mode = args
+        .get("sort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "relevance".to_string());
+
+    let item_passes_filters = |item: &RawTranscriptItem| -> bool {
+        if only_tools && !item.is_tool {
+            return false;
+        }
+        if !include_tools && item.is_tool {
+            return false;
+        }
+        if let Some(ref wanted_tool) = tool_filter
+            && item.tool_name != *wanted_tool
+        {
+            return false;
+        }
+        if let Some(ref wanted_role) = role_filter
+            && item.role != *wanted_role
+        {
+            return false;
+        }
+        if !exclude_lower.is_empty() {
+            let text_l = item.rendered.to_lowercase();
+            if exclude_lower.iter().any(|ex| text_l.contains(ex)) {
+                return false;
+            }
+        }
+        true
+    };
 
     if let Some(range_raw) = args
         .get("range")
@@ -339,10 +508,13 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         let start_clamped = from_idx.min(end_clamped);
         let slice: Vec<Value> = all_items[start_clamped..=end_clamped]
             .iter()
-            .map(|(idx, _, text)| {
+            .filter(|item| item_passes_filters(item))
+            .map(|item| {
                 json!({
-                    "index": idx,
-                    "content": text,
+                    "index": item.index,
+                    "role": item.role,
+                    "tool_name": if item.tool_name.is_empty() { Value::Null } else { Value::String(item.tool_name.clone()) },
+                    "content": item.rendered,
                 })
             })
             .collect();
@@ -355,49 +527,118 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         .unwrap_or_default();
     }
 
-    let query = args
+    let mut all_queries: Vec<String> = Vec::new();
+    if let Some(q) = args
         .get("query")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if query.is_empty() {
-        return "error: `memory_recall` requires either `query` or `range` (`transcript:<from>-<to>`)".to_string();
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        all_queries.push(q.to_string());
+    }
+    if let Some(q_arr) = args.get("queries").and_then(Value::as_array) {
+        for qv in q_arr.iter().filter_map(Value::as_str) {
+            let trimmed = qv.trim();
+            if !trimmed.is_empty() && !all_queries.iter().any(|existing| existing == trimmed) {
+                all_queries.push(trimmed.to_string());
+            }
+        }
     }
 
     let limit = args
         .get("limit")
         .and_then(Value::as_u64)
         .unwrap_or(5)
-        .clamp(1, 20) as usize;
+        .clamp(1, 50) as usize;
     let radius = args
         .get("radius")
         .and_then(Value::as_u64)
         .unwrap_or(2)
         .clamp(0, 10) as usize;
 
-    // Build overlapping episode windows of up to 3 items with stride 2 (1-item overlap)
-    // so `function_call -> function_call_output` causal pairs are never split.
+    let filtered_items: Vec<&RawTranscriptItem> = all_items
+        .iter()
+        .filter(|item| item_passes_filters(item))
+        .collect();
+
+    if all_queries.is_empty() {
+        if !only_tools
+            && include_tools
+            && role_filter.is_none()
+            && exclude_lower.is_empty()
+            && args.get("sort").is_none()
+        {
+            return "error: `memory_recall` requires `query`, `queries`, `range` (`transcript:<from>-<to>`), or a structured filter (`only_tools`, `tool_name`, `include_tools: false`, `role`)".to_string();
+        }
+        let mut iter_items: Vec<&RawTranscriptItem> = filtered_items;
+        if sort_mode != "oldest" && sort_mode != "asc" {
+            iter_items.reverse();
+        }
+        let items_json: Vec<Value> = iter_items
+            .into_iter()
+            .take(limit)
+            .map(|item| {
+                json!({
+                    "index": item.index,
+                    "role": item.role,
+                    "tool_name": if item.tool_name.is_empty() { Value::Null } else { Value::String(item.tool_name.clone()) },
+                    "content": item.rendered,
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({
+            "mode": "filter",
+            "total_raw_items": all_items.len(),
+            "hits": items_json,
+        }))
+        .unwrap_or_default();
+    }
+
+    if filtered_items.is_empty() {
+        return serde_json::to_string_pretty(&json!({
+            "mode": "query",
+            "query": all_queries.join(" | "),
+            "total_raw_items": all_items.len(),
+            "hits": [],
+        }))
+        .unwrap_or_default();
+    }
+
+    // Build overlapping episode windows over `filtered_items` so tool call/output pairs stay together.
     let mut windows: Vec<(usize, usize, String, Vec<String>)> = Vec::new();
-    let window_size = 3usize;
-    let stride = 2usize;
+    let window_size = if only_tools || !include_tools {
+        2usize
+    } else {
+        3usize
+    };
+    let stride = if window_size > 1 { 2usize } else { 1usize };
     let mut start = 0usize;
-    while start < all_items.len() {
-        let end = (start + window_size - 1).min(all_items.len() - 1);
-        let combined = all_items[start..=end]
+    while start < filtered_items.len() {
+        let end = (start + window_size - 1).min(filtered_items.len() - 1);
+        let raw_start_idx = filtered_items[start].index;
+        let raw_end_idx = filtered_items[end].index;
+        let combined = filtered_items[start..=end]
             .iter()
-            .map(|(i, _, t)| format!("#{i}: {t}"))
+            .map(|item| format!("#{}: {}", item.index, item.rendered))
             .collect::<Vec<_>>()
             .join("\n");
         let toks = tokenize_hybrid_raw_rag(&combined);
-        windows.push((start, end, combined, toks));
-        if end + 1 >= all_items.len() {
+        windows.push((raw_start_idx, raw_end_idx, combined, toks));
+        if end + 1 >= filtered_items.len() {
             break;
         }
         start += stride;
     }
 
-    let q_tokens = tokenize_hybrid_raw_rag(query);
-    let q_lower = query.to_ascii_lowercase();
+    let mut q_tokens: Vec<String> = Vec::new();
+    for q in &all_queries {
+        for tok in tokenize_hybrid_raw_rag(q) {
+            if !q_tokens.contains(&tok) {
+                q_tokens.push(tok);
+            }
+        }
+    }
+    let queries_lower: Vec<String> = all_queries.iter().map(|q| q.to_lowercase()).collect();
     let n_docs = windows.len().max(1) as f64;
     let avg_dl =
         (windows.iter().map(|(_, _, _, t)| t.len()).sum::<usize>() as f64 / n_docs).max(1.0);
@@ -428,12 +669,12 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
                 bm25 += idf * norm_tf;
             }
         }
-        let exact_boost = if !q_lower.is_empty() && combined.to_ascii_lowercase().contains(&q_lower)
-        {
-            3.0
-        } else {
-            0.0
-        };
+        let combined_lower = combined.to_lowercase();
+        let exact_matches = queries_lower
+            .iter()
+            .filter(|ql| !ql.is_empty() && combined_lower.contains(ql.as_str()))
+            .count();
+        let exact_boost = (exact_matches as f64) * 3.0;
         let coverage = if !q_tokens.is_empty() {
             matched_unique as f64 / q_tokens.len() as f64
         } else {
@@ -445,11 +686,27 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         }
     }
 
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.2.cmp(&a.2))
-    });
+    match sort_mode.as_str() {
+        "newest" | "desc" | "recent" => {
+            scored.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
+            });
+        }
+        "oldest" | "asc" | "chronological" => {
+            scored.sort_by(|a, b| {
+                a.1.cmp(&b.1)
+                    .then_with(|| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal))
+            });
+        }
+        _ => {
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.2.cmp(&a.2))
+            });
+        }
+    }
 
     let mut hits = Vec::new();
     let mut covered_ranges: Vec<(usize, usize)> = Vec::new();
@@ -470,7 +727,10 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         covered_ranges.push((exp_start, exp_end));
         let episode_items: Vec<Value> = all_items[exp_start..=exp_end]
             .iter()
-            .map(|(idx, _, text)| {
+            .filter(|item| item_passes_filters(item))
+            .map(|item| {
+                let idx = item.index;
+                let text = &item.rendered;
                 let clipped = if text.len() > 2400 {
                     let mut end_b = 2400;
                     while !text.is_char_boundary(end_b) {
@@ -485,6 +745,8 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
                 };
                 json!({
                     "index": idx,
+                    "role": item.role,
+                    "tool_name": if item.tool_name.is_empty() { Value::Null } else { Value::String(item.tool_name.clone()) },
                     "content": clipped,
                 })
             })
@@ -499,7 +761,7 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
 
     serde_json::to_string_pretty(&json!({
         "mode": "query",
-        "query": query,
+        "query": all_queries.join(" | "),
         "total_raw_items": all_items.len(),
         "hits": hits,
     }))

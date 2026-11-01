@@ -389,26 +389,68 @@ struct SendArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ConversationArgs {
-    /// Optional semantic + keyword search query (Hybrid RAG: dense vector embedding
-    /// `voyageai/voyage-4-large` + SQLite FTS5 trigram BM25 with Reciprocal Rank Fusion).
+    /// Optional lexical + structured search query (`Raw-RAG`: SQLite FTS5 BM25 with hybrid
+    /// ASCII identifier + CJK bigram tokenization, exact phrase boost, and substring fallback).
     /// When set, searches across all historical and live turns without loading the
-    /// full history. Omit `query` to read recent chronological turns.
+    /// full history. Omit `query` to read recent chronological turns or filter by tool/range.
     #[serde(default, alias = "q", alias = "search")]
     query: Option<String>,
-    /// Agent name (`sage`, `argon`, `prism`, `"all"`) or `agt_...` ID whose complete
+    /// Optional array (or comma-separated list) of additional search queries / synonyms
+    /// OR-combined with `query` in a single turn.
+    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    queries: Vec<String>,
+    /// Optional negative terms — any turn containing any of these substrings is excluded.
+    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    exclude: Vec<String>,
+    /// Agent name (`sage`, `volt`, `xenon`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
-    /// `query` is provided (searching across all agents), or this agent when reading
-    /// recent chronological turns.
+    /// searching, or this agent when reading recent chronological turns.
     #[serde(default)]
     agent: Option<String>,
     /// Optional peer filter (e.g. `alice`, `telegram:user:42`, `telegram:chat:-1001234567890`,
     /// `group:owners`, or `agent:beta`).
     #[serde(default)]
     with: Option<String>,
-    /// Optional exclusive timestamp cursor in milliseconds (`timestamp_ms > since_ms`).
+    /// Optional direction filter (`"in"`, `"out"`, or `"all"`).
+    #[serde(default)]
+    direction: Option<String>,
+    /// Optional sender substring filter.
+    #[serde(default)]
+    sender: Option<String>,
+    /// Whether to include tool/system history (`true` by default). Set `false` to search
+    /// only human/agent conversation messages without tool/schedule/sub-agent events.
+    #[serde(default)]
+    include_tools: Option<bool>,
+    /// When `true`, searches ONLY tool/system history (`kind = "tool"`).
+    #[serde(default)]
+    only_tools: Option<bool>,
+    /// Optional tool name filter (e.g. `"browser"`, `"agents"`, `"schedule"`, `"send"`).
+    #[serde(default)]
+    tool_name: Option<String>,
+    /// Optional lower timestamp bound in milliseconds (`timestamp_ms > since_ms`).
     #[serde(default)]
     since_ms: Option<i64>,
-    /// Optional maximum number of turns to return (defaults to 20 when `query` is set,
+    /// Optional upper timestamp bound in milliseconds (`timestamp_ms <= until_ms`).
+    #[serde(default)]
+    until_ms: Option<i64>,
+    /// Optional sequence range lower bound (`seq >= from_seq`).
+    #[serde(default)]
+    from_seq: Option<i64>,
+    /// Optional sequence range upper bound (`seq <= to_seq`).
+    #[serde(default)]
+    to_seq: Option<i64>,
+    /// Optional sequence range shorthand (`"10-25"` or `"seq:10-25"`).
+    #[serde(default)]
+    range: Option<String>,
+    /// Result ordering: `"relevance"` (default for search), `"newest"` (`timestamp_ms DESC`),
+    /// or `"oldest"` (`timestamp_ms ASC`).
+    #[serde(default)]
+    sort: Option<String>,
+    /// Contiguous neighbor turns (`0..=10`) to include around each matched hit so causal
+    /// `(Trigger -> Action -> Outcome)` chains stay intact.
+    #[serde(default)]
+    radius: Option<usize>,
+    /// Optional maximum number of turns to return (defaults to 20 when searching,
     /// or 50 for chronological history).
     #[serde(default)]
     limit: Option<usize>,
@@ -804,7 +846,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified two-way (`in` + `out`) conversation reader and Hybrid RAG semantic search (`query`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` to run Hybrid RAG search (dense vector embedding + BM25 keyword search) across all agents' historical memory (`agent` defaults to `\"all\"`), or omit `query` to read recent chronological two-way turns of yourself or any peer (`agent`, `with`, `since_ms`, `limit`)."
+        description = "Unified two-way (`in` + `out`) conversation reader and Zero-Embedding Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search across all agents' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns."
     )]
     async fn conversation(
         &self,
@@ -815,7 +857,30 @@ impl AgentMcp {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
-        let default_agent = if clean_q.is_some() {
+        let (range_from, range_to) = if let Some(r) = args
+            .range
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let stripped = r.strip_prefix("seq:").unwrap_or(r).trim();
+            if let Some((a, b)) = stripped.split_once('-') {
+                (a.trim().parse::<i64>().ok(), b.trim().parse::<i64>().ok())
+            } else {
+                let single = stripped.parse::<i64>().ok();
+                (single, single)
+            }
+        } else {
+            (None, None)
+        };
+        let from_seq = args.from_seq.or(range_from);
+        let to_seq = args.to_seq.or(range_to);
+        let is_search_mode = clean_q.is_some()
+            || !args.queries.is_empty()
+            || !args.exclude.is_empty()
+            || args.only_tools == Some(true)
+            || args.tool_name.is_some();
+        let default_agent = if is_search_mode {
             "all".to_string()
         } else {
             match crate::client::agent_identity() {
@@ -834,6 +899,18 @@ impl AgentMcp {
         if let Some(q) = clean_q {
             query.push(format!("query={}", urlencoding_simple(q)));
         }
+        if !args.queries.is_empty() {
+            query.push(format!(
+                "queries={}",
+                urlencoding_simple(&args.queries.join("|"))
+            ));
+        }
+        if !args.exclude.is_empty() {
+            query.push(format!(
+                "exclude={}",
+                urlencoding_simple(&args.exclude.join("|"))
+            ));
+        }
         if let Some(with_peer) = args
             .with
             .as_deref()
@@ -842,12 +919,60 @@ impl AgentMcp {
         {
             query.push(format!("with={}", urlencoding_simple(with_peer)));
         }
+        if let Some(dir) = args
+            .direction
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("direction={}", urlencoding_simple(dir)));
+        }
+        if let Some(sender) = args
+            .sender
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("sender={}", urlencoding_simple(sender)));
+        }
+        if let Some(inc) = args.include_tools {
+            query.push(format!("include_tools={inc}"));
+        }
+        if let Some(only) = args.only_tools {
+            query.push(format!("only_tools={only}"));
+        }
+        if let Some(tname) = args
+            .tool_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("tool_name={}", urlencoding_simple(tname)));
+        }
         if let Some(since_ms) = args.since_ms {
             query.push(format!("since_ms={since_ms}"));
         }
-        let limit = args
-            .limit
-            .unwrap_or(if clean_q.is_some() { 20 } else { 50 });
+        if let Some(until_ms) = args.until_ms {
+            query.push(format!("until_ms={until_ms}"));
+        }
+        if let Some(fs) = from_seq {
+            query.push(format!("from_seq={fs}"));
+        }
+        if let Some(ts) = to_seq {
+            query.push(format!("to_seq={ts}"));
+        }
+        if let Some(sort) = args
+            .sort
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            query.push(format!("sort={}", urlencoding_simple(sort)));
+        }
+        if let Some(rad) = args.radius {
+            query.push(format!("radius={rad}"));
+        }
+        let limit = args.limit.unwrap_or(if is_search_mode { 20 } else { 50 });
         query.push(format!("limit={limit}"));
         let path = format!("/v1/agents/{target}/conversation?{}", query.join("&"));
         let response = self.client.get(&path, None).await?;
@@ -855,7 +980,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Hybrid RAG semantic + keyword search across all agents' historical and live conversations (`query`, optional `agent`, `with`, `since_ms`, `limit`). Uses locked `voyageai/voyage-4-large` dense embeddings fused with SQLite FTS5 trigram BM25."
+        description = "Zero-Embedding Lossless Lexical + Structured History Search across all agents' conversations and tool history (`query`, `queries`, `exclude`, `agent`, `with`, `direction`, `sender`, `include_tools`, `only_tools`, `tool_name`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Combines SQLite FTS5 BM25 (ASCII identifiers + CJK bigrams), exact phrase boost, and contiguous episode context expansion."
     )]
     async fn search(
         &self,

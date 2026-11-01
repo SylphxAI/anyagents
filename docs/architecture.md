@@ -215,6 +215,12 @@ A message from Telegram keeps the message it quotes: the quoted author, as Teleg
 
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
+- `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
+  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation.
+  - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
+  - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
+  - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
+  - **Range reads & contiguous episode windows:** Read verbatim transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 
 ## Usage and cost
