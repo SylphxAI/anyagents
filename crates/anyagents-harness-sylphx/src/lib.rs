@@ -278,6 +278,7 @@ impl Harness for SylphxHarness {
                 });
             }
             guard.in_turn = true;
+            guard.sign_in_fault = None;
             guard.last_activity = Some(Instant::now());
         }
 
@@ -359,6 +360,7 @@ impl Harness for SylphxHarness {
                 g.last_activity = Some(Instant::now());
                 match outcome {
                     Ok(usage) => {
+                        g.sign_in_fault = None;
                         g.turns_served = g.turns_served.saturating_add(1);
                         g.served_usage.input_tokens = g
                             .served_usage
@@ -386,10 +388,7 @@ impl Harness for SylphxHarness {
                             || lower.contains("out of credits")
                         {
                             g.quota_reset_at_ms = Some(anyagents_core::now_ms() + 300_000);
-                        } else if lower.contains("missing sylphx api key")
-                            || lower.contains("unauthorized")
-                            || lower.contains("invalid api key")
-                        {
+                        } else {
                             g.sign_in_fault = Some(err_msg.clone());
                         }
                         persist_turn_error(&config_dir, &err_msg);
@@ -1490,6 +1489,10 @@ pub fn run_stdio_adapter(
                         "type": "done",
                         "session_id": sess_cl,
                         "error": err_msg,
+                        "result": {
+                            "status": "ERROR",
+                            "error": err_msg,
+                        },
                         "usage": {
                             "input_tokens": 0,
                             "output_tokens": 0,
@@ -1544,16 +1547,61 @@ fn extract_envelope_sender(text: &str) -> Option<String> {
     (!sender.is_empty()).then(|| sender.to_string())
 }
 
-fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
-    let mut parts = Vec::new();
+fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
+    for dir in work_dir.ancestors() {
+        let candidate = dir.join("AGENTS.md");
+        if let Ok(text) = std::fs::read_to_string(&candidate)
+            && !text.trim().is_empty()
+        {
+            return Some(text);
+        }
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    None
+}
+
+fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
+    let mut candidates = vec![config_dir.join("AGENTS.md")];
+    if let Some(data_dir) = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        candidates.push(data_dir.join("AGENTS.md"));
+    }
+    if let Some(parent) = config_dir.parent() {
+        candidates.push(parent.join("AGENTS.md"));
+    }
+    for cand in candidates {
+        if let Ok(text) = std::fs::read_to_string(&cand)
+            && !text.trim().is_empty()
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
+pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
+    let mut parts: Vec<String> = Vec::new();
     if let Ok(sys) = std::fs::read_to_string(config_dir.join("SYSTEM_PROMPT.md"))
         && !sys.trim().is_empty()
     {
         parts.push(sys);
-    } else if let Ok(agents_md) = std::fs::read_to_string(work_dir.join("AGENTS.md"))
-        && !agents_md.trim().is_empty()
-    {
-        parts.push(agents_md);
+    }
+    if let Some(shared_agents) = read_shared_agents_md_for_config(config_dir) {
+        let trimmed = shared_agents.trim();
+        if !trimmed.is_empty() && !parts.iter().any(|p| p.contains(trimmed)) {
+            parts.push(shared_agents);
+        }
+    }
+    if let Some(work_agents) = read_workspace_agents_md(work_dir) {
+        let trimmed = work_agents.trim();
+        if !trimmed.is_empty() && !parts.iter().any(|p| p.contains(trimmed)) {
+            parts.push(work_agents);
+        }
     }
     if parts.is_empty() {
         parts.push(
@@ -3412,5 +3460,166 @@ mod tests {
             cm_out.contains("CODE_MODE_OK z_updated=True hits=1"),
             "unexpected: {cm_out}"
         );
+    }
+
+    #[test]
+    fn assemble_system_prompt_layers_shared_and_workspace_agents_md_when_system_prompt_exists() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cfg = data_dir.join("agents/agt_test/config");
+        let work = tmp.path().join("repo");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        std::fs::write(
+            data_dir.join("AGENTS.md"),
+            "## Two limits and operating defaults\nNo unauthorized spending and no user-data loss.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            cfg.join("SYSTEM_PROMPT.md"),
+            "# Agent Identity\nYou are a default Sylphx worker.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("AGENTS.md"),
+            "# SylphxAI/owner\nWorkspace repository instructions.\n",
+        )
+        .unwrap();
+
+        let prompt = assemble_system_prompt(&cfg, &work);
+        assert!(prompt.contains("# Agent Identity"));
+        assert!(prompt.contains("Two limits and operating defaults"));
+        assert!(prompt.contains("# SylphxAI/owner"));
+        assert_eq!(
+            prompt.matches("Two limits and operating defaults").count(),
+            1
+        );
+    }
+
+    #[test]
+    fn transient_503_model_unavailable_retries_and_persistent_503_surfaces_fault() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicUsize;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cl = Arc::clone(&hits);
+
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 8192];
+                let _ = stream.read(&mut buf);
+                let n = hits_cl.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // 1st attempt: transient 503 model_unavailable
+                    let body = r#"{"error":{"message":"The selected model is temporarily unavailable.","type":"server_error","code":"model_unavailable"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else if n == 1 {
+                    // 2nd attempt (retry of turn 1): 200 OK
+                    let body = r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Recovered after retry"}]}],"usage":{"input_tokens":12,"output_tokens":6}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                } else {
+                    // Subsequent attempts (turn 2): persistent 503
+                    let body = r#"{"error":{"message":"The selected model is temporarily unavailable.","type":"server_error","code":"model_unavailable"}}"#;
+                    let resp = format!(
+                        "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(resp.as_bytes());
+                }
+            }
+        });
+
+        // SAFETY: test-local retry tuning
+        unsafe {
+            std::env::set_var("SYLPHX_RETRY_BACKOFF_MS", "5");
+            std::env::set_var("SYLPHX_MAX_RETRIES", "2");
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let gw_url = format!("http://{addr}/v1");
+
+        let mut harness = SylphxHarness::start(
+            &cfg,
+            &work,
+            Some("sylphx/openai/gpt-6.1-sol#medium"),
+            None,
+            &[
+                ("SYLPHX_GATEWAY_KEY", "sk-sx-test"),
+                ("SYLPHX_GATEWAY_URL", &gw_url),
+            ],
+            Path::new("anyagents"),
+            &[],
+        )
+        .unwrap();
+
+        // Turn 1: first request gets 503, retries automatically, and succeeds on 2nd request!
+        let msg1 = OutboundMessage {
+            id: "msg_retry_ok".to_string(),
+            seq: 1,
+            text: "hello retry".to_string(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: Context::default(),
+        };
+        harness.deliver(&msg1).unwrap();
+        for _ in 0..80 {
+            if harness.health().turn_state == TurnState::Idle {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(harness.turns_served(), 1);
+        assert!(harness.health().sign_in_fault.is_none());
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+
+        // Turn 2: persistent 503 across all retry attempts -> surfaces `sign_in_fault` and `.anyagents-last-error.json` without advancing `turns_served`!
+        let msg2 = OutboundMessage {
+            id: "msg_fail".to_string(),
+            seq: 2,
+            text: "hello persistent 503".to_string(),
+            sender: None,
+            reply_to: None,
+            source_time_ms: None,
+            context: Context::default(),
+        };
+        harness.deliver(&msg2).unwrap();
+        for _ in 0..80 {
+            if harness.health().turn_state == TurnState::Idle {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(harness.turns_served(), 1);
+        let fault = harness
+            .health()
+            .sign_in_fault
+            .expect("expected sign_in_fault on persistent 503");
+        assert!(fault.contains("503"), "unexpected fault: {fault}");
+        assert!(
+            fault.contains("model_unavailable"),
+            "unexpected fault: {fault}"
+        );
+        assert!(cfg.join(".anyagents-last-error.json").exists());
     }
 }

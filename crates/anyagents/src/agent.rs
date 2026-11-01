@@ -983,7 +983,9 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         } else if view.turn_state.is_empty() {
             view.turn_state = "idle".to_string();
         }
-        if view.state == "running" && view.quota_reset_at_ms.is_none_or(|ms| ms <= now) {
+        if (view.state == "running" || view.state == "idle")
+            && view.quota_reset_at_ms.is_none_or(|ms| ms <= now)
+        {
             if let Some(ref err_msg) = view.last_error {
                 view.turn_state = "errored".to_string();
                 if let Ok(agent_rec) = store.agent(&id) {

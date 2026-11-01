@@ -1138,6 +1138,75 @@ pub struct BotCall {
     pub body: serde_json::Value,
 }
 
+/// Escapes unescaped `$` characters outside inline code spans (`` `...` ``) and
+/// fenced code blocks (` ```...``` `) so Telegram Bot API 10.1+ `sendRichMessage`
+/// (`rich_message.markdown`) never misinterprets currency pairs (e.g. `S$766.87 同 US$170`
+/// or `HK$100 and HK$200`) as a `RichTextMathematicalExpression`.
+pub fn escape_rich_markdown_dollars(text: &str) -> String {
+    if !text.contains('$') {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut in_fence = false;
+    for (line_idx, line) in text.split('\n').enumerate() {
+        if line_idx > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            in_fence = !in_fence;
+            out.push_str(line);
+            continue;
+        }
+        if in_fence {
+            out.push_str(line);
+            continue;
+        }
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = 0;
+        let mut inline_ticks: usize = 0;
+        while i < chars.len() {
+            let c = chars[i];
+            if c == '`' {
+                let mut count = 0;
+                while i + count < chars.len() && chars[i + count] == '`' {
+                    count += 1;
+                }
+                for _ in 0..count {
+                    out.push('`');
+                }
+                if inline_ticks == 0 {
+                    inline_ticks = count;
+                } else if count == inline_ticks {
+                    inline_ticks = 0;
+                }
+                i += count;
+                continue;
+            }
+            if inline_ticks > 0 {
+                out.push(c);
+                i += 1;
+                continue;
+            }
+            if c == '\\' && i + 1 < chars.len() {
+                out.push('\\');
+                out.push(chars[i + 1]);
+                i += 2;
+                continue;
+            }
+            if c == '$' {
+                out.push('\\');
+                out.push('$');
+                i += 1;
+                continue;
+            }
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
+}
+
 /// `sendRichMessage` (Telegram Bot API 10.1+) for one chat using native
 /// Rich Markdown (`rich_message.markdown`).
 /// `reply_to` is a Telegram message id, when the agent was answering one.
@@ -1148,10 +1217,11 @@ pub fn send_message(
     reply_to: Option<i64>,
     thread: Option<i64>,
 ) -> BotCall {
+    let markdown = escape_rich_markdown_dollars(text);
     let mut body = serde_json::json!({
         "chat_id": chat_id,
         "rich_message": {
-            "markdown": text,
+            "markdown": markdown,
         },
     });
     if let Some(id) = reply_to {
@@ -1289,13 +1359,14 @@ pub fn set_message_reaction(
 
 /// `editMessageText` to update the rich Markdown content of an existing message.
 pub fn edit_message_text(chat_id: i64, message_id: i64, text: &str) -> BotCall {
+    let markdown = escape_rich_markdown_dollars(text);
     BotCall {
         method: "editMessageText".to_string(),
         body: serde_json::json!({
             "chat_id": chat_id,
             "message_id": message_id,
             "rich_message": {
-                "markdown": text,
+                "markdown": markdown,
             },
         }),
     }
@@ -1358,6 +1429,16 @@ fn collect_rich_text(val: &serde_json::Value, out: &mut String) {
             }
             if let Some(t) = map.get("text") {
                 collect_rich_text(t, out);
+            } else if let Some(expr) = map
+                .get("expression")
+                .or_else(|| map.get("formula"))
+                .or_else(|| map.get("latex"))
+                .or_else(|| map.get("math"))
+                .and_then(serde_json::Value::as_str)
+            {
+                out.push('$');
+                out.push_str(expr);
+                out.push('$');
             }
             if let Some(items) = map.get("items").and_then(serde_json::Value::as_array) {
                 for (idx, item) in items.iter().enumerate() {
@@ -2844,6 +2925,43 @@ mod membership_tests {
         assert!(
             html.contains("• <b>Reason</b>: Rank <b>#1</b></blockquote>"),
             "{html}"
+        );
+    }
+
+    #[test]
+    fn send_message_and_edit_escape_currency_dollar_signs_outside_code_spans() {
+        let input = "今日 S$766.87 同 US$170 已經入帳，HK$100 and HK$200 with `$PATH` and `$HOME`";
+        let call = send_message(100, input, None, None);
+        let md = call.body["rich_message"]["markdown"].as_str().unwrap();
+        assert_eq!(
+            md,
+            "今日 S\\$766.87 同 US\\$170 已經入帳，HK\\$100 and HK\\$200 with `$PATH` and `$HOME`"
+        );
+        assert!(md.contains("766.87 同 US"));
+        assert!(md.contains("100 and HK"));
+
+        let edit_call = edit_message_text(100, 42, "Updated: HK$100 and HK$200");
+        assert_eq!(
+            edit_call.body["rich_message"]["markdown"].as_str().unwrap(),
+            "Updated: HK\\$100 and HK\\$200"
+        );
+
+        // Historical inbound rich_message with mathematical_expression preserves expression text
+        let rm = serde_json::json!({
+            "blocks": [
+                {
+                    "type": "paragraph",
+                    "text": [
+                        { "type": "plain", "text": "今日 S" },
+                        { "type": "mathematical_expression", "expression": "766.87 同 US" },
+                        { "type": "plain", "text": "170 已經入帳" }
+                    ]
+                }
+            ]
+        });
+        assert_eq!(
+            extract_rich_message_text(&rm).as_deref(),
+            Some("今日 S$766.87 同 US$170 已經入帳")
         );
     }
 }

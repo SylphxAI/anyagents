@@ -299,7 +299,7 @@ impl Client {
                                 view.last_error = adm.last_error.clone();
                             }
                             if adm.turn_state == "errored"
-                                || (view.state == "running"
+                                || ((view.state == "running" || view.state == "idle")
                                     && view.last_error.is_some()
                                     && view.quota_reset_at_ms.is_none())
                             {
@@ -1090,7 +1090,7 @@ impl AgentMcp {
                 let errored = response
                     .agents
                     .iter()
-                    .filter(|a| a.state == "running" && a.turn_state == "errored")
+                    .filter(|a| a.turn_state == "errored")
                     .count();
                 let paused = response
                     .agents
@@ -1518,7 +1518,7 @@ impl AgentMcp {
                 let errored = resp
                     .agents
                     .iter()
-                    .filter(|a| a.state == "running" && a.turn_state == "errored")
+                    .filter(|a| a.turn_state == "errored")
                     .count();
                 let paused = resp.agents.iter().filter(|a| a.state == "paused").count();
                 let archived = resp.agents.iter().filter(|a| a.state == "archived").count();

@@ -452,11 +452,23 @@ fn spawn_admin_sylphx_delivery(
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
+                                let turn_err = anyagents_harness::Harness::health(&harness)
+                                    .sign_in_fault
+                                    .or_else(|| {
+                                        crate::vendor::read_persisted_last_error(&cfg)
+                                            .and_then(|(e, _)| e)
+                                    });
+                                if let Some(err_msg) = turn_err {
+                                    had_err = true;
+                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
+                                    create::maybe_notify_parent_on_error(
+                                        &store, &agent, &cfg, &err_msg,
+                                    );
+                                    break;
+                                }
                                 let _ = store.note_turn_completed(&agent.id);
                                 completed_any = true;
-                                if crate::vendor::read_persisted_last_error(&cfg).is_none() {
-                                    crate::vendor::persist_last_error(&cfg, None, None);
-                                }
+                                crate::vendor::persist_last_error(&cfg, None, None);
                             }
                             Ok(_) => {
                                 let _ = store.note_turn_completed(&agent.id);
@@ -464,11 +476,10 @@ fn spawn_admin_sylphx_delivery(
                             }
                             Err(err) => {
                                 had_err = true;
-                                let _ = store.note_turn_completed(&agent.id);
-                                crate::vendor::persist_last_error(
-                                    &cfg,
-                                    Some(&err.to_string()),
-                                    None,
+                                let err_msg = err.to_string();
+                                crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
+                                create::maybe_notify_parent_on_error(
+                                    &store, &agent, &cfg, &err_msg,
                                 );
                                 break;
                             }
@@ -484,6 +495,7 @@ fn spawn_admin_sylphx_delivery(
                 }
                 Err(reason) => {
                     crate::vendor::persist_last_error(&cfg, Some(&reason), None);
+                    create::maybe_notify_parent_on_error(&store, &agent, &cfg, &reason);
                 }
             }
         }
@@ -2629,7 +2641,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         quota = None;
         last_error = None;
     }
-    if agent.state == "running" && quota.is_none_or(|ms| ms <= now) {
+    if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
         if let Some(ref err_msg) = last_error {
             turn_state = "errored";
             create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
