@@ -1082,11 +1082,19 @@ pub(crate) fn seed_harness_credentials(
     let Ok(all_agents) = store.list_agents() else {
         return;
     };
+    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let static_rel_paths: &[&str] = match agent.harness.as_str() {
         "claude-code" => &[".credentials.json", ".claude/.credentials.json"],
-        "codex" => &[
+        "codex" if provider == "openai" => &[
             "auth.json",
             ".codex/auth.json",
+            "models_cache.json",
+            "model-catalog-direct.json",
+            ".config/desk/sylphx-ai/key",
+            ".config/opencode/sylphx.key",
+            ".config/opencode/opencode.json",
+        ],
+        "codex" => &[
             "models_cache.json",
             "model-catalog-direct.json",
             ".config/desk/sylphx-ai/key",
@@ -1159,6 +1167,15 @@ pub(crate) fn seed_harness_credentials(
         && (current_bound != last_seeded
             || (last_seeded.is_none() && explicit_non_default_profile));
 
+    if agent.harness == "codex" && provider != "openai" {
+        for stale_rel in ["auth.json", ".codex/auth.json"] {
+            let stale_path = target_config.join(stale_rel);
+            if stale_path.exists() {
+                let _ = std::fs::remove_file(&stale_path);
+            }
+        }
+    }
+
     if let (Some(bound), Some(primary_profile_root)) =
         (current_bound.as_deref(), profile_roots.first())
     {
@@ -1177,6 +1194,11 @@ pub(crate) fn seed_harness_credentials(
                     "model-catalog-direct.json",
                     ".gemini/antigravity-cli/antigravity-oauth-token",
                 ] {
+                    if matches!(rel, "auth.json" | ".codex/auth.json")
+                        && !bound.starts_with("openai/")
+                    {
+                        continue;
+                    }
                     let other_src = other_cfg.join(rel);
                     if other_src.is_file() {
                         let _ =

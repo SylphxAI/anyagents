@@ -612,11 +612,7 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
     }
     let work_dir = config_dir.with_file_name("work");
     if work_dir.is_dir() {
-        if work_dir.join(".git").exists() {
-            share_worktree_with_seat(&work_dir, eff_gid);
-        } else if let Err(err) = give_tree(&work_dir, eff_uid, eff_gid) {
-            eprintln!("seat: cannot share {}: {err}", work_dir.display());
-        }
+        share_worktree_with_seat(&work_dir, eff_gid);
     }
 }
 
@@ -798,7 +794,7 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         if meta.uid() == me {
             let _ = chown_to_seat_group(dir, gid);
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
-        } else if (meta.gid() != gid || meta.uid() != uid)
+        } else if meta.uid() != uid
             && !is_isolated_test_env()
             && let Some(sock_gid) = sock_gid_for()
             && launcher().is_file()
@@ -840,7 +836,23 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
             .and_then(|name| name.to_str())
             .unwrap_or("");
         if kind.is_dir() {
-            if (name == "op" && dir.ends_with(".config")) || name == ".ssh" || name == ".gnupg" {
+            if (name == "op" && dir.ends_with(".config"))
+                || matches!(
+                    name,
+                    ".ssh"
+                        | ".gnupg"
+                        | "node_modules"
+                        | ".bun"
+                        | ".turbo"
+                        | ".next"
+                        | "target"
+                        | ".git"
+                        | "cache-home"
+                        | "tmp"
+                        | ".cargo"
+                        | ".rustup"
+                )
+            {
                 continue;
             }
             let _ = give_tree(&path, uid, gid);
@@ -850,7 +862,7 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
             continue;
         };
         if meta.uid() != me {
-            if meta.gid() != gid || meta.uid() != uid {
+            if meta.uid() != uid {
                 migrate_file_to_seat_uid(&path, uid, gid);
             }
             continue;
@@ -862,7 +874,10 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
             let exec = meta.permissions().mode() & 0o100 != 0;
             let mode = if exec { 0o770 } else { 0o660 };
             let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
-            if (name.starts_with("opencode.db") || name == "serve-exit.jsonl") && meta.uid() != uid
+            if (name.starts_with("opencode.db")
+                || name == "serve-exit.jsonl"
+                || name.contains(".sqlite"))
+                && meta.uid() != uid
             {
                 migrate_file_to_seat_uid(&path, uid, gid);
             }

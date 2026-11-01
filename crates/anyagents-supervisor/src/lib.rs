@@ -535,13 +535,21 @@ fn ensure<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: AgentId) {
             }
             let thread = slot.thread.take();
             workers.remove(&id);
-            thread
+            thread.map(|t| (t, finished))
         } else {
             None
         }
     };
-    if let Some(thread) = stopping_thread {
-        let _ = thread.join();
+    if let Some((thread, finished)) = stopping_thread {
+        if finished {
+            let _ = thread.join();
+        } else {
+            let _ = thread::Builder::new()
+                .name("anyagents-reap".into())
+                .spawn(move || {
+                    let _ = thread.join();
+                });
+        }
     }
     let mut workers = lock(&inner.workers);
     if workers.contains_key(&id) {
@@ -1058,7 +1066,7 @@ impl<H: Harness + 'static> Session<H> {
                 delivery.harness().process_id(),
             )
         };
-        if !is_idle || harness_has_inflight_processes(pid) {
+        if !is_idle {
             return false;
         }
         let Ok(fresh) = self.inner.store.agent(&self.id) else {
@@ -1072,7 +1080,7 @@ impl<H: Harness + 'static> Session<H> {
         let config_changed = fresh.harness != self.agent.harness
             || fresh.model != self.agent.model
             || current_rotated_ms > self.process_profile_rotated_ms;
-        if !config_changed {
+        if !config_changed || harness_has_inflight_processes(pid) {
             return false;
         }
         self.replace_process();

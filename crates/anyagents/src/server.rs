@@ -768,10 +768,6 @@ fn reconcile_stopped_and_backed_off_agents(
                             cfg.join(".anyagents-profile-rotated-ms"),
                             now_ms.to_string(),
                         );
-                        let _ = store.set_agent_state(&agent.id, "paused");
-                        create::poke_agent_wake_socket(data, &agent.id);
-                        std::thread::sleep(std::time::Duration::from_millis(250));
-                        let _ = store.set_agent_state(&agent.id, "running");
                         create::poke_agent_wake_socket(data, &agent.id);
                         create::poke_agent_wake_socket_mail(data, &agent.id);
                         continue;
@@ -816,10 +812,6 @@ fn reconcile_stopped_and_backed_off_agents(
                         cfg.join(".anyagents-profile-rotated-ms"),
                         now_ms.to_string(),
                     );
-                    let _ = store.set_agent_state(&agent.id, "paused");
-                    create::poke_agent_wake_socket(data, &agent.id);
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                    let _ = store.set_agent_state(&agent.id, "running");
                     create::poke_agent_wake_socket(data, &agent.id);
                     create::poke_agent_wake_socket_mail(data, &agent.id);
                 }
