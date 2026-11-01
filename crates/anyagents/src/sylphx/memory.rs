@@ -11,17 +11,169 @@ pub const CONTEXT_WATERMARK_PERCENT: usize = 75;
 pub const WINDOW_MAX_ITEMS: usize = 160;
 pub const WINDOW_STRIDE_ITEMS: usize = 80;
 
-/// Loads persisted transcript items for `/v1/responses` (`input`), starting from
-/// the most recent `context_window_open` anchor (so autonomous compaction starts a
-/// clean KV-cacheable window while keeping 100% of raw history on disk for `memory_recall`),
-/// and using block-aligned stride windowing (`WINDOW_STRIDE_ITEMS = 80`) instead of a
-/// 1-by-1 sliding window so item 0 stays cache-pinned across 80 items at a time.
-pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> {
+fn parse_range_spec_set(spec_val: &Value) -> std::collections::HashSet<usize> {
+    fn push_str(set: &mut std::collections::HashSet<usize>, raw: &str) {
+        for part in raw.split(',') {
+            let clean = part
+                .trim()
+                .strip_prefix("transcript:")
+                .unwrap_or(part.trim())
+                .trim_start_matches('#');
+            if clean.is_empty() {
+                continue;
+            }
+            if let Some((a, b)) = clean.split_once('-') {
+                let start = a.trim().trim_start_matches('#').parse::<usize>().ok();
+                let end = b.trim().trim_start_matches('#').parse::<usize>().ok();
+                if let (Some(s), Some(e)) = (start, end) {
+                    for idx in s.min(e)..=s.max(e) {
+                        set.insert(idx);
+                    }
+                }
+            } else if let Ok(single) = clean.parse::<usize>() {
+                set.insert(single);
+            }
+        }
+    }
+    let mut set = std::collections::HashSet::new();
+    match spec_val {
+        Value::String(s) => push_str(&mut set, s),
+        Value::Number(n) => {
+            if let Some(u) = n.as_u64() {
+                set.insert(u as usize);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    push_str(&mut set, s);
+                } else if let Some(u) = item.as_u64() {
+                    set.insert(u as usize);
+                }
+            }
+        }
+        _ => {}
+    }
+    set
+}
+
+fn apply_context_edit_to_history(history: &mut Vec<(usize, Value)>, edit_event: &Value) {
+    // 1. In-place `replace` / `mask`: compress verbose tool outputs or messages into 1-line notes
+    if let Some(replacements) = edit_event
+        .get("replace")
+        .or_else(|| edit_event.get("mask"))
+        .and_then(Value::as_array)
+    {
+        for rep in replacements {
+            let target_spec = rep
+                .get("range")
+                .or_else(|| rep.get("index"))
+                .or_else(|| rep.get("indices"))
+                .unwrap_or(&Value::Null);
+            let target_indices = parse_range_spec_set(target_spec);
+            let with_note = rep
+                .get("with")
+                .or_else(|| rep.get("summary"))
+                .or_else(|| rep.get("note"))
+                .and_then(Value::as_str)
+                .unwrap_or("pruned")
+                .trim();
+            if target_indices.is_empty() {
+                continue;
+            }
+            for (raw_idx, item) in history.iter_mut() {
+                if !target_indices.contains(raw_idx) {
+                    continue;
+                }
+                let replacement_text = format!(
+                    "[context_edit (#{raw_idx}): {with_note} | raw preserved at transcript:{raw_idx}-{raw_idx}]"
+                );
+                if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("output".to_string(), json!(replacement_text));
+                    }
+                } else if item.get("type").and_then(Value::as_str) == Some("message")
+                    || item.get("role").is_some()
+                {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.remove("content");
+                        obj.insert("content".to_string(), json!(replacement_text));
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Surgical `drop` or `keep_only`: remove obsolete turns while enforcing `/v1/responses`
+    //    `call_id` pair integrity (never leaving an orphaned `function_call` or `function_call_output`).
+    let drop_set = edit_event
+        .get("drop")
+        .map(parse_range_spec_set)
+        .unwrap_or_default();
+    let keep_only_set = edit_event
+        .get("keep_only")
+        .map(parse_range_spec_set)
+        .unwrap_or_default();
+    if drop_set.is_empty() && keep_only_set.is_empty() {
+        return;
+    }
+
+    let should_drop_idx = |raw_idx: usize| -> bool {
+        if !keep_only_set.is_empty() && !keep_only_set.contains(&raw_idx) {
+            return true;
+        }
+        drop_set.contains(&raw_idx)
+    };
+
+    let mut protected_call_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut dropped_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (raw_idx, item) in history.iter() {
+        if item.get("type").and_then(Value::as_str) == Some("function_call")
+            && matches!(
+                item.get("name").and_then(Value::as_str),
+                Some("context_edit" | "context_prune")
+            )
+            && let Some(cid) = item.get("call_id").and_then(Value::as_str)
+        {
+            protected_call_ids.insert(cid.to_string());
+        }
+        if should_drop_idx(*raw_idx)
+            && let Some(cid) = item.get("call_id").and_then(Value::as_str)
+        {
+            dropped_call_ids.insert(cid.to_string());
+        }
+    }
+
+    history.retain(|(raw_idx, item)| {
+        if let Some(cid) = item.get("call_id").and_then(Value::as_str)
+            && protected_call_ids.contains(cid)
+        {
+            return true;
+        }
+        if should_drop_idx(*raw_idx) {
+            return false;
+        }
+        if let Some(cid) = item.get("call_id").and_then(Value::as_str)
+            && dropped_call_ids.contains(cid)
+        {
+            return false;
+        }
+        true
+    });
+}
+
+/// Loads persisted transcript items along with their raw transcript line indices `(raw_idx, item)`.
+pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usize, Value)> {
     let Ok(file) = std::fs::File::open(transcript_path) else {
         return Vec::new();
     };
-    let mut history = Vec::new();
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
+    let mut history: Vec<(usize, Value)> = Vec::new();
+    for (raw_idx, line) in BufReader::new(file)
+        .lines()
+        .map_while(Result::ok)
+        .enumerate()
+    {
         let Ok(m) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -32,21 +184,28 @@ pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> 
                 .unwrap_or("")
                 .trim();
             history.clear();
-            history.push(json!({
-                "role": "user",
-                "content": format!(
-                    "<context-event kind=\"context.window_opened\">\n<handoff>\n{handoff}\n</handoff>\nPrior raw transcript entries remain indexed in full; call `memory_recall` with `query` or `range` (`transcript:<from>-<to>`) to inspect exact prior turns.\n</context-event>"
-                ),
-            }));
+            history.push((
+                raw_idx,
+                json!({
+                    "role": "user",
+                    "content": format!(
+                        "<context-event kind=\"context.window_opened\">\n<handoff>\n{handoff}\n</handoff>\nPrior raw transcript entries remain indexed in full; call `memory_recall` with `query` or `range` (`transcript:<from>-<to>`) to inspect exact prior turns.\n</context-event>"
+                    ),
+                }),
+            ));
+            continue;
+        }
+        if m.get("type").and_then(Value::as_str) == Some("context_edit") {
+            apply_context_edit_to_history(&mut history, &m);
             continue;
         }
         if m.get("type").is_some() {
-            history.push(m);
+            history.push((raw_idx, m));
             continue;
         }
         match m.get("role").and_then(Value::as_str) {
             Some("user") => {
-                history.push(m);
+                history.push((raw_idx, m));
             }
             Some("assistant") => {
                 if let Some(s) = m
@@ -54,10 +213,13 @@ pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> 
                     .and_then(Value::as_str)
                     .filter(|s| !s.is_empty())
                 {
-                    history.push(json!({
-                        "role": "assistant",
-                        "content": s,
-                    }));
+                    history.push((
+                        raw_idx,
+                        json!({
+                            "role": "assistant",
+                            "content": s,
+                        }),
+                    ));
                 }
                 if let Some(tcs) = m.get("tool_calls").and_then(Value::as_array) {
                     for tc in tcs {
@@ -69,12 +231,15 @@ pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> 
                                 .pointer("/function/arguments")
                                 .and_then(Value::as_str)
                                 .unwrap_or("{}");
-                            history.push(json!({
-                                "type": "function_call",
-                                "call_id": cid,
-                                "name": fname,
-                                "arguments": fargs,
-                            }));
+                            history.push((
+                                raw_idx,
+                                json!({
+                                    "type": "function_call",
+                                    "call_id": cid,
+                                    "name": fname,
+                                    "arguments": fargs,
+                                }),
+                            ));
                         }
                     }
                 }
@@ -82,11 +247,14 @@ pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> 
             Some("tool") => {
                 if let Some(cid) = m.get("tool_call_id").and_then(Value::as_str) {
                     let out_str = m.get("content").and_then(Value::as_str).unwrap_or("");
-                    history.push(json!({
-                        "type": "function_call_output",
-                        "call_id": cid,
-                        "output": out_str,
-                    }));
+                    history.push((
+                        raw_idx,
+                        json!({
+                            "type": "function_call_output",
+                            "call_id": cid,
+                            "output": out_str,
+                        }),
+                    ));
                 }
             }
             _ => {}
@@ -96,14 +264,42 @@ pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> 
         let excess = history.len() - WINDOW_STRIDE_ITEMS;
         let block_start = (excess / WINDOW_STRIDE_ITEMS) * WINDOW_STRIDE_ITEMS;
         history.drain(0..block_start);
-        while history.first().is_some_and(|item| {
+        while history.first().is_some_and(|(_, item)| {
             item.get("type").and_then(Value::as_str) == Some("function_call_output")
                 || item.get("type").and_then(Value::as_str) == Some("reasoning")
         }) {
             history.remove(0);
         }
+        let mask_bound = (WINDOW_STRIDE_ITEMS / 2).min(history.len());
+        for (_, item) in &mut history[..mask_bound] {
+            if item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && let Some(out_str) = item.get("output").and_then(Value::as_str)
+                && out_str.len() > 4_000
+            {
+                let masked = super::auth::truncate_tool_output_middle_utf8(
+                    out_str.to_string(),
+                    2_000,
+                    900,
+                    900,
+                );
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("output".to_string(), json!(masked));
+                }
+            }
+        }
     }
     history
+}
+
+/// Loads persisted transcript items for `/v1/responses` (`input`), starting from
+/// the most recent `context_window_open` anchor, applying any surgical `context_edit`
+/// pruning/masking events (`Context Language Models`, `arXiv:2609.37725`), and using
+/// block-aligned stride windowing (`WINDOW_STRIDE_ITEMS = 80`) so item 0 stays cache-pinned.
+pub(super) fn load_transcript_input_items(transcript_path: &Path) -> Vec<Value> {
+    load_transcript_indexed_items(transcript_path)
+        .into_iter()
+        .map(|(_, v)| v)
+        .collect()
 }
 
 pub(super) fn estimate_items_tokens(items: &[Value]) -> usize {
@@ -136,7 +332,7 @@ pub(super) fn maybe_emit_context_watermark_event(
         let evt = json!({
             "role": "user",
             "content": format!(
-                "<context-event kind=\"context.watermark\" used_percent=\"{used_percent}\" active_items=\"{item_count}\">\nContext window watermark reached ({used_tokens} / {DEFAULT_CONTEXT_WINDOW_TOKENS} est. tokens, {item_count} active items). At your next coherent milestone, call `context_window_open` with a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) to open a fresh KV-cached window while keeping 100% of prior raw turns searchable via `memory_recall`.\n</context-event>"
+                "<context-event kind=\"context.watermark\" used_percent=\"{used_percent}\" active_items=\"{item_count}\">\nContext window watermark reached ({used_tokens} / {DEFAULT_CONTEXT_WINDOW_TOKENS} est. tokens, {item_count} active items). At your next coherent milestone, you can either:\n1. Call `context_edit` (`drop: [\"from-to\"]` or `replace: [{{\"range\": \"from-to\", \"with\": \"1-line note\"}}]`) to surgically prune obsolete turns or compress verbose tool outputs without writing a full summary (`Context Language Models`), OR\n2. Call `context_window_open` with a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) to open a fresh window.\n100% of raw turns remain searchable via `memory_recall`.\n</context-event>"
             ),
         });
         append_transcript_message(transcript_path, &evt);
@@ -375,7 +571,8 @@ fn tokenize_hybrid_raw_rag(text: &str) -> Vec<String> {
 
 pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
     let raw_items = read_all_raw_transcript_items(transcript_path);
-    let active_items = load_transcript_input_items(transcript_path);
+    let active_indexed = load_transcript_indexed_items(transcript_path);
+    let active_items: Vec<Value> = active_indexed.iter().map(|(_, v)| v.clone()).collect();
     let used_tokens = estimate_items_tokens(&active_items);
     let remaining_tokens = DEFAULT_CONTEXT_WINDOW_TOKENS.saturating_sub(used_tokens);
     let used_percent = (used_tokens * 100) / DEFAULT_CONTEXT_WINDOW_TOKENS.max(1);
@@ -384,6 +581,10 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
     let windows_opened = raw_items
         .iter()
         .filter(|item| item.raw.get("type").and_then(Value::as_str) == Some("context_window_open"))
+        .count();
+    let edits_applied = raw_items
+        .iter()
+        .filter(|item| item.raw.get("type").and_then(Value::as_str) == Some("context_edit"))
         .count();
 
     serde_json::to_string_pretty(&json!({
@@ -397,6 +598,116 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
         "active_window_items": active_items.len(),
         "total_raw_transcript_items": raw_items.len(),
         "windows_opened": windows_opened,
+        "context_edits_applied": edits_applied,
+    }))
+    .unwrap_or_default()
+}
+
+/// Agent-controlled surgical context editing (`Context Language Models`, Meta FAIR / UW / MIT,
+/// `arXiv:2609.37725`): lets the agent inspect active context items by index/token weight,
+/// drop obsolete turns (`drop` / `keep_only`), or replace verbose tool outputs in-place with
+/// 1-line notes (`replace` / `mask`) without writing a full summary, while keeping 100% of
+/// raw history intact in `sylphx-transcript.jsonl` for `memory_recall`.
+pub(super) fn execute_context_edit(transcript_path: &Path, args: &Value) -> String {
+    let before_indexed = load_transcript_indexed_items(transcript_path);
+    let before_items: Vec<Value> = before_indexed.iter().map(|(_, v)| v.clone()).collect();
+    let tokens_before = estimate_items_tokens(&before_items);
+
+    let has_drop = args
+        .get("drop")
+        .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+    let has_keep = args
+        .get("keep_only")
+        .is_some_and(|v| !v.is_null() && v.as_array().is_none_or(|a| !a.is_empty()));
+    let has_replace = args
+        .get("replace")
+        .or_else(|| args.get("mask"))
+        .is_some_and(|v| v.as_array().is_some_and(|a| !a.is_empty()));
+    let action = args
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or(if has_drop || has_keep || has_replace {
+            "edit"
+        } else {
+            "inspect"
+        })
+        .trim()
+        .to_ascii_lowercase();
+
+    if action == "inspect" || (!has_drop && !has_keep && !has_replace) {
+        let mut item_summaries = Vec::with_capacity(before_indexed.len());
+        let mut hogs: Vec<(usize, usize, String, String)> = Vec::new();
+        for (raw_idx, item) in &before_indexed {
+            let serialized = serde_json::to_string(item).unwrap_or_default();
+            let est_tok = serialized.len() / 4;
+            let kind = item
+                .get("type")
+                .and_then(Value::as_str)
+                .or_else(|| item.get("role").and_then(Value::as_str))
+                .unwrap_or("item")
+                .to_string();
+            let text_preview = render_transcript_item_text(item, "");
+            let mut cut = 120.min(text_preview.len());
+            while cut > 0 && !text_preview.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let preview = if cut < text_preview.len() {
+                format!("{}...", &text_preview[..cut])
+            } else {
+                text_preview
+            };
+            item_summaries.push(json!({
+                "index": raw_idx,
+                "kind": kind,
+                "est_tokens": est_tok,
+                "preview": preview,
+            }));
+            hogs.push((est_tok, *raw_idx, kind, preview));
+        }
+        hogs.sort_by(|a, b| b.0.cmp(&a.0));
+        let top_hogs: Vec<Value> = hogs
+            .into_iter()
+            .take(10)
+            .map(|(tok, idx, kind, prev)| {
+                json!({
+                    "index": idx,
+                    "kind": kind,
+                    "est_tokens": tok,
+                    "preview": prev,
+                })
+            })
+            .collect();
+        return serde_json::to_string_pretty(&json!({
+            "mode": "inspect",
+            "active_items": before_indexed.len(),
+            "used_tokens": tokens_before,
+            "top_token_hogs": top_hogs,
+            "items": item_summaries,
+        }))
+        .unwrap_or_default();
+    }
+
+    let edit_event = json!({
+        "type": "context_edit",
+        "drop": args.get("drop").cloned().unwrap_or(Value::Null),
+        "keep_only": args.get("keep_only").cloned().unwrap_or(Value::Null),
+        "replace": args.get("replace").or_else(|| args.get("mask")).cloned().unwrap_or(Value::Null),
+        "timestamp_ms": anyagents_core::now_ms(),
+    });
+    append_transcript_message(transcript_path, &edit_event);
+
+    let after_items = load_transcript_input_items(transcript_path);
+    let tokens_after = estimate_items_tokens(&after_items);
+    let tokens_freed = tokens_before.saturating_sub(tokens_after);
+
+    serde_json::to_string_pretty(&json!({
+        "status": "edited",
+        "active_items_before": before_items.len(),
+        "active_items_after": after_items.len(),
+        "tokens_before": tokens_before,
+        "tokens_after": tokens_after,
+        "tokens_freed": tokens_freed,
+        "raw_recall_preserved": true,
     }))
     .unwrap_or_default()
 }

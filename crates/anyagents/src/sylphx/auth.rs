@@ -619,12 +619,36 @@ pub fn normalize_sylphx_gateway_url(raw: &str) -> String {
     trimmed.to_string()
 }
 
+fn shared_http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(|| {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .timeout_global(Some(Duration::from_secs(180)))
+            .build()
+            .new_agent()
+    })
+}
+
 pub(super) fn curl_post_json(
     url: &str,
     bearer_token: Option<&str>,
     body: &Value,
 ) -> Result<(u16, String), String> {
     let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let mut req = shared_http_agent()
+        .post(url)
+        .header("content-type", "application/json");
+    if let Some(tok) = bearer_token {
+        req = req.header("authorization", &format!("Bearer {tok}"));
+    }
+    if let Ok(resp) = req.send(payload.as_bytes()) {
+        let code = resp.status().as_u16();
+        if let Ok(text) = resp.into_body().read_to_string() {
+            return Ok((code, text));
+        }
+    }
+
     let mut cmd = Command::new("curl");
     cmd.args([
         "-sS",
@@ -654,6 +678,17 @@ pub(super) fn curl_post_json(
 }
 
 pub(super) fn curl_get(url: &str, bearer_token: Option<&str>) -> Result<(u16, String), String> {
+    let mut req = shared_http_agent().get(url);
+    if let Some(tok) = bearer_token {
+        req = req.header("authorization", &format!("Bearer {tok}"));
+    }
+    if let Ok(resp) = req.call() {
+        let code = resp.status().as_u16();
+        if let Ok(text) = resp.into_body().read_to_string() {
+            return Ok((code, text));
+        }
+    }
+
     let mut cmd = Command::new("curl");
     cmd.args(["-sS", "--max-time", "30", "-w", "\n%{http_code}"]);
     if let Some(tok) = bearer_token {
@@ -668,6 +703,53 @@ pub(super) fn curl_get(url: &str, bearer_token: Option<&str>) -> Result<(u16, St
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     parse_curl_status_and_body(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// UTF-8-safe Head + Tail middle-out observation truncation (`arXiv:2508.21433`,
+/// NeurIPS DL4Code 2025): preserves both the command/header at the top AND the
+/// compiler/test failure trace and exit summary at the bottom while eliding
+/// repetitive middle build/log lines.
+pub(super) fn truncate_tool_output_middle_utf8(
+    text: String,
+    max_bytes: usize,
+    head_bytes: usize,
+    tail_bytes: usize,
+) -> String {
+    if text.len() <= max_bytes || head_bytes + tail_bytes >= text.len() {
+        return text;
+    }
+    let mut head_end = head_bytes.min(text.len());
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    if let Some(nl) = text[..head_end].rfind('\n')
+        && head_end.saturating_sub(nl) <= 512
+    {
+        head_end = nl;
+    }
+
+    let mut tail_start = text.len().saturating_sub(tail_bytes);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if let Some(nl) = text[tail_start..].find('\n')
+        && nl <= 512
+        && tail_start + nl + 1 < text.len()
+    {
+        tail_start += nl + 1;
+    }
+
+    if head_end >= tail_start {
+        return text;
+    }
+    let elided = &text[head_end..tail_start];
+    let elided_lines = elided.lines().count();
+    let elided_bytes = elided.len();
+    format!(
+        "{}\n\n... [elided {elided_lines} lines ({elided_bytes} bytes) from middle of output; head and tail preserved] ...\n\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
 }
 
 fn parse_curl_status_and_body(raw: &str) -> Result<(u16, String), String> {
