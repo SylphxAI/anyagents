@@ -19,10 +19,12 @@
 //!      autonomous `context_window_open` compaction, and lossless `Raw-RAG` hybrid
 //!      BM25 + episode recall (`memory` submodule).
 
+mod aci;
 mod auth;
 mod cloud;
 mod memory;
 
+use aci::*;
 pub use auth::*;
 pub use cloud::*;
 pub use memory::*;
@@ -1016,10 +1018,10 @@ fn run_native_gateway_turn(
         if !function_calls.is_empty() {
             let mut self_archived = false;
             let mut pending_window_handoff: Option<String> = None;
+            let mut did_context_edit = false;
+            let mut parsed_calls: Vec<(String, String, Value)> =
+                Vec::with_capacity(function_calls.len());
             for fc in function_calls {
-                if cancel_flag.load(Ordering::SeqCst) {
-                    break;
-                }
                 let call_id = fc
                     .get("call_id")
                     .or_else(|| fc.get("id"))
@@ -1039,73 +1041,123 @@ fn run_native_gateway_turn(
                     .unwrap_or("{}");
                 let parsed_args: Value =
                     serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
-
                 let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
                 if norm_fn == "send" {
                     sent_any_reply = true;
                 }
-                if norm_fn == "context_window_open"
-                    && let Some(h) = parsed_args
-                        .get("handoff")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                {
-                    pending_window_handoff = Some(h.to_string());
+                if matches!(norm_fn, "context_edit" | "context_prune") {
+                    did_context_edit = true;
                 }
-                if (norm_fn == "archive"
-                    && parsed_args
-                        .get("agent")
-                        .or_else(|| parsed_args.get("name"))
-                        .and_then(Value::as_str)
-                        .is_none_or(|s| s.trim().is_empty() || s.eq_ignore_ascii_case("self")))
-                    || ((norm_fn == "agents" || norm_fn == "subagents")
-                        && parsed_args
-                            .get("action")
+                parsed_calls.push((call_id, fn_name, parsed_args));
+            }
+
+            if !cancel_flag.load(Ordering::SeqCst) && can_parallelize_tool_batch(&parsed_calls) {
+                let outputs: Vec<String> = std::thread::scope(|s| {
+                    let handles: Vec<_> = parsed_calls
+                        .iter()
+                        .map(|(_, fn_name, parsed_args)| {
+                            s.spawn(move || {
+                                execute_sylphx_tool(
+                                    fn_name,
+                                    parsed_args,
+                                    config_dir,
+                                    work_dir,
+                                    env,
+                                    mcp_command,
+                                    mcp_args,
+                                )
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| {
+                            h.join().unwrap_or_else(|_| {
+                                "error: tool worker thread panicked".to_string()
+                            })
+                        })
+                        .collect()
+                });
+                for ((call_id, _, _), output) in parsed_calls.into_iter().zip(outputs) {
+                    let tool_out_item = json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    });
+                    append_transcript_message(&transcript_path, &tool_out_item);
+                    input_items.push(tool_out_item);
+                }
+            } else {
+                for (call_id, fn_name, parsed_args) in parsed_calls {
+                    if cancel_flag.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
+                    if norm_fn == "context_window_open"
+                        && let Some(h) = parsed_args
+                            .get("handoff")
                             .and_then(Value::as_str)
-                            .is_some_and(|a| a.eq_ignore_ascii_case("archive"))
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    {
+                        pending_window_handoff = Some(h.to_string());
+                    }
+                    if (norm_fn == "archive"
                         && parsed_args
-                            .get("name")
-                            .or_else(|| parsed_args.get("agent"))
+                            .get("agent")
+                            .or_else(|| parsed_args.get("name"))
                             .and_then(Value::as_str)
                             .is_none_or(|s| s.trim().is_empty() || s.eq_ignore_ascii_case("self")))
-                {
-                    self_archived = true;
-                    let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
-                    g.served_usage.input_tokens =
-                        g.served_usage.input_tokens.saturating_add(total_in);
-                    g.served_usage.output_tokens =
-                        g.served_usage.output_tokens.saturating_add(total_out);
-                    g.served_usage.cache_read_tokens = g
-                        .served_usage
-                        .cache_read_tokens
-                        .saturating_add(total_cache_read);
-                    g.served_usage.cache_write_tokens = g
-                        .served_usage
-                        .cache_write_tokens
-                        .saturating_add(total_cache_write);
-                    total_in = 0;
-                    total_out = 0;
-                    total_cache_read = 0;
-                    total_cache_write = 0;
-                }
+                        || ((norm_fn == "agents" || norm_fn == "subagents")
+                            && parsed_args
+                                .get("action")
+                                .and_then(Value::as_str)
+                                .is_some_and(|a| a.eq_ignore_ascii_case("archive"))
+                            && parsed_args
+                                .get("name")
+                                .or_else(|| parsed_args.get("agent"))
+                                .and_then(Value::as_str)
+                                .is_none_or(|s| {
+                                    s.trim().is_empty() || s.eq_ignore_ascii_case("self")
+                                }))
+                    {
+                        self_archived = true;
+                        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.served_usage.input_tokens =
+                            g.served_usage.input_tokens.saturating_add(total_in);
+                        g.served_usage.output_tokens =
+                            g.served_usage.output_tokens.saturating_add(total_out);
+                        g.served_usage.cache_read_tokens = g
+                            .served_usage
+                            .cache_read_tokens
+                            .saturating_add(total_cache_read);
+                        g.served_usage.cache_write_tokens = g
+                            .served_usage
+                            .cache_write_tokens
+                            .saturating_add(total_cache_write);
+                        total_in = 0;
+                        total_out = 0;
+                        total_cache_read = 0;
+                        total_cache_write = 0;
+                    }
 
-                let output = execute_sylphx_tool(
-                    &fn_name,
-                    &parsed_args,
-                    config_dir,
-                    work_dir,
-                    env,
-                    mcp_command,
-                    mcp_args,
-                );
-                let tool_out_item = json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": output,
-                });
-                append_transcript_message(&transcript_path, &tool_out_item);
-                input_items.push(tool_out_item);
+                    let output = execute_sylphx_tool(
+                        &fn_name,
+                        &parsed_args,
+                        config_dir,
+                        work_dir,
+                        env,
+                        mcp_command,
+                        mcp_args,
+                    );
+                    let tool_out_item = json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": output,
+                    });
+                    append_transcript_message(&transcript_path, &tool_out_item);
+                    input_items.push(tool_out_item);
+                }
             }
             if let Some(handoff) = pending_window_handoff {
                 let anchor = json!({
@@ -1114,6 +1166,8 @@ fn run_native_gateway_turn(
                     "timestamp_ms": anyagents_core::now_ms(),
                 });
                 append_transcript_message(&transcript_path, &anchor);
+                input_items = load_transcript_input_items(&transcript_path);
+            } else if did_context_edit {
                 input_items = load_transcript_input_items(&transcript_path);
             } else {
                 maybe_emit_context_watermark_event(&transcript_path, &mut input_items);
@@ -1776,6 +1830,21 @@ fn build_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "code_mode",
+                "description": "Programmatic Tool Calling (PTC / Code Mode, `arXiv:2605.18747`): execute a multi-step Python script with a pre-injected zero-import SDK (`read(path, start_line=None, end_line=None)`, `write(path, content)`, `edit(path, target, replacement, replace_all=False)`, `files(pattern='**/*', path='.')`, `grep(pattern, path='.', glob=None)`, `sh(cmd, timeout=120)`, `mcp(tool_name, **kwargs)`, `agents(**kwargs)`, `send(target, message)`, `conversation(**kwargs)`, `schedule(**kwargs)`, `recall(query=None, limit=10)`). Intermediate data stays in script RAM; only `print(...)` output enters the LLM context window.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string", "description": "Python code using pre-injected SDK functions (`read`, `write`, `edit`, `files`, `grep`, `sh`, `mcp`, `agents`, `send`, `conversation`, `schedule`, `recall`). Use `print(...)` to return concise results." },
+                        "timeout_ms": { "type": "integer", "description": "Optional timeout in ms (default 120000)." }
+                    },
+                    "required": ["code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "bash",
                 "description": "Execute a bash command in the agent's working directory (or inside the isolated Cloud Kata microVM Sandbox pod when a cloud sandbox lease is active).",
                 "parameters": {
@@ -1792,7 +1861,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a UTF-8 file from the workspace.",
+                "description": "Read a UTF-8 file from the workspace with 1-based line numbers (`[file: <path> (lines S..E of N)]`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1823,15 +1892,28 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Replace an exact target string in a file with a replacement string.",
+                "description": "Edit a file by replacing `target` with `replacement` (or applying multiple `edits: [{target, replacement}, ...]`), with automatic whitespace/indentation tolerance.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "target": { "type": "string" },
-                        "replacement": { "type": "string" }
+                        "target": { "type": "string", "description": "Target block to replace." },
+                        "replacement": { "type": "string", "description": "Replacement text." },
+                        "replace_all": { "type": "boolean", "description": "Replace every occurrence if target appears multiple times (default false)." },
+                        "edits": {
+                            "type": "array",
+                            "description": "Optional list of `{target, replacement}` edits to apply sequentially in one atomic write.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "target": { "type": "string" },
+                                    "replacement": { "type": "string" }
+                                },
+                                "required": ["target", "replacement"]
+                            }
+                        }
                     },
-                    "required": ["path", "target", "replacement"]
+                    "required": ["path"]
                 }
             }
         }),
@@ -1839,11 +1921,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "apply_patch",
-                "description": "Apply a unified diff patch (`git apply` / unified diff format) to the workspace.",
+                "description": "Apply a patch to the workspace. Supports both OpenAI V4A patches (`*** Begin Patch` / `*** Update File:` / `*** Add File:` / `*** Delete File:`) and unified diffs (`--- a/... +++ b/...`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "patch": { "type": "string", "description": "Unified diff patch text." }
+                        "patch": { "type": "string", "description": "V4A (`*** Begin Patch`) or unified diff (`--- a/... +++ b/...`) patch text." }
                     },
                     "required": ["patch"]
                 }
@@ -1962,6 +2044,45 @@ fn build_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "context_edit",
+                "description": "Surgically inspect, prune, or compress the active context window without writing a full summary (`Context Language Models`, `arXiv:2609.37725`). Call with `action: \"inspect\"` to see active item indices and top token hogs; pass `drop: [\"4-12\", \"19\"]` (or `keep_only: [\"0-3\", \"20-35\"]`) to drop obsolete turns while automatically preserving tool `call_id` pair integrity; or pass `replace: [{\"range\": \"14-15\", \"with\": \"1-line note\"}]` to compress verbose tool outputs in-place. 100% of raw items remain untouched on disk for `memory_recall`.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["inspect", "edit"],
+                            "description": "`inspect` lists active items and top token hogs; `edit` applies `drop`, `keep_only`, or `replace`."
+                        },
+                        "drop": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Transcript index ranges or indices to remove from the active context window (e.g. `[\"4-12\", \"18\"]`). Paired tool calls/outputs are dropped together automatically."
+                        },
+                        "keep_only": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Keep only these transcript index ranges in the active context window and drop all others."
+                        },
+                        "replace": {
+                            "type": "array",
+                            "description": "Replace verbose tool outputs or messages in-place with a concise 1-line note.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "range": { "type": "string", "description": "Target index or range (e.g. `\"14\"` or `\"14-15\"`)." },
+                                    "with": { "type": "string", "description": "Concise 1-line replacement summary/note." }
+                                },
+                                "required": ["range", "with"]
+                            }
+                        }
+                    }
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "context_window_open",
                 "description": "Autonomously compact the active context window at a coherent task milestone by writing a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) and opening a fresh KV-cached window. 100% of prior raw transcript turns remain on disk and searchable via `memory_recall`.",
                 "parameters": {
@@ -2000,6 +2121,9 @@ fn execute_sylphx_tool(
         }
         "context_budget_read" => {
             execute_context_budget_read(&config_dir.join("sylphx-transcript.jsonl"))
+        }
+        "context_edit" | "context_prune" => {
+            execute_context_edit(&config_dir.join("sylphx-transcript.jsonl"), args)
         }
         "context_window_open" => {
             let Some(handoff) = args
@@ -2145,13 +2269,23 @@ fn execute_sylphx_tool(
             serde_json::to_string_pretty(&current).unwrap_or_default()
         }
         "apply_patch" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
             let Some(patch_str) = args.get("patch").and_then(Value::as_str) else {
                 return "error: missing `patch`".to_string();
             };
+            if sandbox_mode != "cloud" {
+                return match apply_patch_universal(work_dir, patch_str) {
+                    Ok(msg) => msg,
+                    Err(e) => format!("error applying patch: {e}"),
+                };
+            }
             let patch_b64 = base64_encode(patch_str.as_bytes());
             let script = format!(
                 "tmp_patch=$(mktemp /tmp/sylphx-patch.XXXXXX) && printf '%s' '{patch_b64}' | base64 -d > \"$tmp_patch\" && \
                  (git apply --recount -C1 --whitespace=nowarn \"$tmp_patch\" 2>/dev/null || \
+                  git apply --recount -p0 -C1 --whitespace=nowarn \"$tmp_patch\" 2>/dev/null || \
                   patch -p1 --fuzz=3 --no-backup-if-mismatch < \"$tmp_patch\" 2>/dev/null || \
                   git apply --recount --whitespace=nowarn \"$tmp_patch\"); \
                  rc=$?; rm -f \"$tmp_patch\"; exit $rc"
@@ -2210,7 +2344,13 @@ fn execute_sylphx_tool(
             )
         }
         "list_dir" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
+            if sandbox_mode != "cloud" {
+                return list_dir_native(work_dir, path);
+            }
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("ls -la '{escaped_path}' | head -n 200");
             execute_sylphx_tool(
@@ -2333,6 +2473,28 @@ fn execute_sylphx_tool(
                 other => format!("error: unknown sandbox action `{other}`"),
             }
         }
+        "code_mode" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
+            let Some(code_str) = args.get("code").and_then(Value::as_str) else {
+                return "error: missing `code`".to_string();
+            };
+            let timeout_ms = args
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(120_000);
+            let wrapped = build_code_mode_command(code_str, config_dir, mcp_command, mcp_args);
+            execute_sylphx_tool(
+                "bash",
+                &json!({ "command": wrapped, "timeout_ms": timeout_ms }),
+                config_dir,
+                work_dir,
+                env,
+                mcp_command,
+                mcp_args,
+            )
+        }
         "bash" | "shell" => {
             if sandbox_mode == "none" {
                 return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
@@ -2351,40 +2513,11 @@ fn execute_sylphx_tool(
                     Err(e) => format!("error executing in cloud sandbox: {e}"),
                 };
             }
-            let mut cmd = Command::new("bash");
-            cmd.arg("-c")
-                .arg(cmd_str)
-                .current_dir(work_dir)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
-            for (k, v) in env {
-                cmd.env(k, v);
-            }
-            match cmd.output() {
-                Ok(out) => {
-                    let stdout = String::from_utf8_lossy(&out.stdout);
-                    let stderr = String::from_utf8_lossy(&out.stderr);
-                    let code = out.status.code().unwrap_or(-1);
-                    let mut combined = format!("exit_code: {code}\n");
-                    if !stdout.is_empty() {
-                        combined.push_str(&stdout);
-                    }
-                    if !stderr.is_empty() {
-                        if !combined.ends_with('\n') {
-                            combined.push('\n');
-                        }
-                        combined.push_str("stderr:\n");
-                        combined.push_str(&stderr);
-                    }
-                    if combined.len() > 32_000 {
-                        combined.truncate(32_000);
-                        combined.push_str("\n...[truncated]");
-                    }
-                    combined
-                }
-                Err(e) => format!("error executing bash: {e}"),
-            }
+            let timeout_ms = args
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(120_000);
+            execute_bash_with_timeout(cmd_str, work_dir, env, timeout_ms)
         }
         "read_file" => {
             if sandbox_mode == "none" {
@@ -2393,6 +2526,8 @@ fn execute_sylphx_tool(
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
+            let start_line = args.get("start_line").and_then(Value::as_u64);
+            let end_line = args.get("end_line").and_then(Value::as_u64);
             if sandbox_mode == "cloud" {
                 return match read_file_in_cloud_sandbox_with_work_dir(
                     config_dir,
@@ -2400,48 +2535,13 @@ fn execute_sylphx_tool(
                     env,
                     rel,
                 ) {
-                    Ok(content) => {
-                        let start = args
-                            .get("start_line")
-                            .and_then(Value::as_u64)
-                            .unwrap_or(1)
-                            .max(1) as usize;
-                        let lines: Vec<&str> = content.lines().collect();
-                        let end = args
-                            .get("end_line")
-                            .and_then(Value::as_u64)
-                            .map(|n| n as usize)
-                            .unwrap_or(lines.len())
-                            .min(lines.len());
-                        if start > lines.len() {
-                            String::new()
-                        } else {
-                            lines[start - 1..end].join("\n")
-                        }
-                    }
+                    Ok(content) => format_read_file_output(rel, &content, start_line, end_line),
                     Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
                 };
             }
             let target = resolve_workspace_path(work_dir, rel);
             match std::fs::read_to_string(&target) {
-                Ok(content) => {
-                    let start = args
-                        .get("start_line")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(1)
-                        .max(1) as usize;
-                    let lines: Vec<&str> = content.lines().collect();
-                    let end = args
-                        .get("end_line")
-                        .and_then(Value::as_u64)
-                        .map(|n| n as usize)
-                        .unwrap_or(lines.len())
-                        .min(lines.len());
-                    if start > lines.len() {
-                        return String::new();
-                    }
-                    lines[start - 1..end].join("\n")
-                }
+                Ok(content) => format_read_file_output(rel, &content, start_line, end_line),
                 Err(e) => format!("error reading {}: {e}", target.display()),
             }
         }
@@ -2483,12 +2583,31 @@ fn execute_sylphx_tool(
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
-            let Some(old_str) = args.get("target").and_then(Value::as_str) else {
-                return "error: missing `target`".to_string();
-            };
-            let Some(new_str) = args.get("replacement").and_then(Value::as_str) else {
-                return "error: missing `replacement`".to_string();
-            };
+            let replace_all = args
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let mut edits_vec: Vec<(String, String)> = Vec::new();
+            if let Some(arr) = args.get("edits").and_then(Value::as_array) {
+                for item in arr {
+                    let Some(t) = item.get("target").and_then(Value::as_str) else {
+                        return "error: each entry in `edits` requires `target`".to_string();
+                    };
+                    let Some(r) = item.get("replacement").and_then(Value::as_str) else {
+                        return "error: each entry in `edits` requires `replacement`".to_string();
+                    };
+                    edits_vec.push((t.to_string(), r.to_string()));
+                }
+            }
+            if edits_vec.is_empty() {
+                let Some(old_str) = args.get("target").and_then(Value::as_str) else {
+                    return "error: missing `target` (or `edits` array)".to_string();
+                };
+                let Some(new_str) = args.get("replacement").and_then(Value::as_str) else {
+                    return "error: missing `replacement`".to_string();
+                };
+                edits_vec.push((old_str.to_string(), new_str.to_string()));
+            }
             if sandbox_mode == "cloud" {
                 return match read_file_in_cloud_sandbox_with_work_dir(
                     config_dir,
@@ -2497,19 +2616,31 @@ fn execute_sylphx_tool(
                     rel,
                 ) {
                     Ok(existing) => {
-                        if !existing.contains(old_str) {
-                            return format!("error: target string not found in `{rel}`");
-                        }
-                        let updated = existing.replace(old_str, new_str);
-                        match write_file_in_cloud_sandbox_with_work_dir(
-                            config_dir,
-                            Some(work_dir),
-                            env,
-                            rel,
-                            &updated,
-                        ) {
-                            Ok(_) => format!("edited `{rel}` in cloud sandbox"),
-                            Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
+                        match apply_edits_to_content(&existing, &edits_vec, replace_all) {
+                            Ok((updated, ranges)) => {
+                                match write_file_in_cloud_sandbox_with_work_dir(
+                                    config_dir,
+                                    Some(work_dir),
+                                    env,
+                                    rel,
+                                    &updated,
+                                ) {
+                                    Ok(_) => {
+                                        let range_desc: Vec<String> = ranges
+                                            .iter()
+                                            .map(|(s, e)| format!("L{s}..L{e}"))
+                                            .collect();
+                                        format!(
+                                            "edited `{rel}` in cloud sandbox ({})",
+                                            range_desc.join(", ")
+                                        )
+                                    }
+                                    Err(e) => {
+                                        format!("error writing `{rel}` in cloud sandbox: {e}")
+                                    }
+                                }
+                            }
+                            Err(e) => format!("error editing `{rel}`: {e}"),
                         }
                     }
                     Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
@@ -2517,16 +2648,17 @@ fn execute_sylphx_tool(
             }
             let target = resolve_workspace_path(work_dir, rel);
             match std::fs::read_to_string(&target) {
-                Ok(existing) => {
-                    if !existing.contains(old_str) {
-                        return format!("error: target string not found in {}", target.display());
-                    }
-                    let updated = existing.replace(old_str, new_str);
-                    match std::fs::write(&target, updated) {
-                        Ok(()) => format!("edited {}", target.display()),
+                Ok(existing) => match apply_edits_to_content(&existing, &edits_vec, replace_all) {
+                    Ok((updated, ranges)) => match std::fs::write(&target, updated) {
+                        Ok(()) => {
+                            let range_desc: Vec<String> =
+                                ranges.iter().map(|(s, e)| format!("L{s}..L{e}")).collect();
+                            format!("edited {} ({})", target.display(), range_desc.join(", "))
+                        }
                         Err(e) => format!("error writing {}: {e}", target.display()),
-                    }
-                }
+                    },
+                    Err(e) => format!("error editing {}: {e}", target.display()),
+                },
                 Err(e) => format!("error reading {}: {e}", target.display()),
             }
         }
@@ -3027,5 +3159,267 @@ mod tests {
             "https://github.com/SylphxAI/anyagents.git"
         );
         assert_eq!(env_spec["repo"]["revision"], "agent/cloud-worker");
+    }
+
+    #[test]
+    fn sota_aci_middle_truncation_fuzzy_edit_v4a_patch_and_parallel_batch_work() {
+        // 1. UTF-8-safe Head + Tail middle truncation preserves both top header and bottom error summary
+        let mut noisy = String::from("HEADER_START: cargo test\n");
+        for i in 0..500 {
+            noisy.push_str(&format!("compiling crate_{i} 測試多字節UTF8邊界安全...\n"));
+        }
+        noisy.push_str("FOOTER_FAILURE: test_critical_invariant FAILED at src/lib.rs:42\n");
+        let truncated = truncate_tool_output_middle_utf8(noisy, 2_000, 700, 700);
+        assert!(truncated.contains("HEADER_START: cargo test"));
+        assert!(truncated.contains("FOOTER_FAILURE: test_critical_invariant FAILED"));
+        assert!(truncated.contains("elided"));
+
+        // 2. Line-numbered `read_file`, multi-edit + fuzzy indentation/line-number stripping in `edit_file`
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let sample_rs = work.join("sample.rs");
+        std::fs::write(
+            &sample_rs,
+            "fn alpha() {\n    let x = 1;   \n    let y = 2;\n}\n\nfn beta() {\n    let z = 10;\n}\n",
+        )
+        .unwrap();
+
+        let read_out = execute_sylphx_tool(
+            "read_file",
+            &json!({ "path": "sample.rs" }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(read_out.contains("[file: sample.rs (lines 1..8 of 8)]"));
+        assert!(read_out.contains("   1: fn alpha() {"));
+
+        // Multi-edit: edit #1 has accidental copied line numbers (`2: ...`), edit #2 has different indentation
+        let edit_out = execute_sylphx_tool(
+            "edit_file",
+            &json!({
+                "path": "sample.rs",
+                "edits": [
+                    {
+                        "target": "   2:     let x = 1;\n   3:     let y = 2;",
+                        "replacement": "   2:     let x = 100;\n   3:     let y = 200;"
+                    },
+                    {
+                        "target": "fn beta() {\n  let z = 10;\n}",
+                        "replacement": "fn beta() {\n  let z = 999;\n}"
+                    }
+                ]
+            }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(edit_out.starts_with("edited "), "unexpected: {edit_out}");
+        let updated_rs = std::fs::read_to_string(&sample_rs).unwrap();
+        assert!(updated_rs.contains("let x = 100;"));
+        assert!(updated_rs.contains("let z = 999;"));
+
+        // 3. Universal `apply_patch`: OpenAI V4A format (`*** Begin Patch`)
+        let v4a_patch = "*** Begin Patch\n*** Update File: sample.rs\n@@ fn alpha @@\n fn alpha() {\n-    let x = 100;\n+    let x = 777;\n     let y = 200;\n*** Add File: added.txt\n+hello v4a\n*** End Patch";
+        let patch_out = execute_sylphx_tool(
+            "apply_patch",
+            &json!({ "patch": v4a_patch }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(
+            patch_out.contains("exit_code: 0"),
+            "unexpected: {patch_out}"
+        );
+        assert!(
+            std::fs::read_to_string(&sample_rs)
+                .unwrap()
+                .contains("let x = 777;")
+        );
+        assert_eq!(
+            std::fs::read_to_string(work.join("added.txt")).unwrap(),
+            "hello v4a\n"
+        );
+
+        // 4. Universal `apply_patch`: Unified diff with broken hunk header counts (`@@ -99,99 +99,99 @@`)
+        let broken_unified = "--- a/sample.rs\n+++ b/sample.rs\n@@ -99,99 +99,99 @@\n fn beta() {\n-    let z = 999;\n+    let z = 42;\n }\n";
+        let u_out = execute_sylphx_tool(
+            "apply_patch",
+            &json!({ "patch": broken_unified }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(u_out.contains("exit_code: 0"), "unexpected: {u_out}");
+        assert!(
+            std::fs::read_to_string(&sample_rs)
+                .unwrap()
+                .contains("let z = 42;")
+        );
+
+        // 5. Enforced `timeout_ms` on `bash`
+        let t0 = Instant::now();
+        let timeout_out = execute_sylphx_tool(
+            "bash",
+            &json!({ "command": "sleep 10", "timeout_ms": 500 }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(t0.elapsed() < Duration::from_secs(4));
+        assert!(timeout_out.contains("timed out after 500ms"));
+
+        // 6. Parallel tool batch classifier
+        assert!(can_parallelize_tool_batch(&[
+            (
+                "c1".to_string(),
+                "read_file".to_string(),
+                json!({"path": "a.rs"})
+            ),
+            (
+                "c2".to_string(),
+                "read_file".to_string(),
+                json!({"path": "b.rs"})
+            ),
+            (
+                "c3".to_string(),
+                "grep".to_string(),
+                json!({"pattern": "fn"})
+            ),
+        ]));
+        assert!(!can_parallelize_tool_batch(&[
+            (
+                "c1".to_string(),
+                "edit_file".to_string(),
+                json!({"path": "a.rs"})
+            ),
+            (
+                "c2".to_string(),
+                "edit_file".to_string(),
+                json!({"path": "a.rs"})
+            ),
+        ]));
+
+        // 7. Meta CLM `context_edit` (`arXiv:2609.37725`): inspect, in-place replace, and surgical drop
+        //    with automatic `call_id` pair integrity while preserving 100% raw recall via `memory_recall`.
+        let transcript = cfg.join("sylphx-transcript.jsonl");
+        append_transcript_message(
+            &transcript,
+            &json!({ "role": "user", "content": "Initial task prompt" }),
+        );
+        append_transcript_message(
+            &transcript,
+            &json!({
+                "type": "function_call",
+                "call_id": "call_deadend",
+                "name": "grep",
+                "arguments": "{\"pattern\":\"obsolete_symbol_xyz\"}"
+            }),
+        );
+        append_transcript_message(
+            &transcript,
+            &json!({
+                "type": "function_call_output",
+                "call_id": "call_deadend",
+                "output": "exit_code: 1\nno matches for obsolete_symbol_xyz"
+            }),
+        );
+        append_transcript_message(
+            &transcript,
+            &json!({
+                "type": "function_call",
+                "call_id": "call_biglog",
+                "name": "bash",
+                "arguments": "{\"command\":\"cargo test\"}"
+            }),
+        );
+        append_transcript_message(
+            &transcript,
+            &json!({
+                "type": "function_call_output",
+                "call_id": "call_biglog",
+                "output": "exit_code: 0\n".to_string() + &"test line pass SECRET_BUILD_MARKER_777\n".repeat(100)
+            }),
+        );
+
+        let inspect_raw = execute_sylphx_tool(
+            "context_edit",
+            &json!({ "action": "inspect" }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        let inspect_val: Value = serde_json::from_str(&inspect_raw).unwrap();
+        assert_eq!(inspect_val["mode"], "inspect");
+        assert_eq!(inspect_val["active_items"], 5);
+
+        // Drop only index 1 (`call_deadend` function_call) -> index 2 (`call_deadend` output) is automatically paired and dropped too!
+        // And replace index 4 (`call_biglog` huge output) with a 1-line note!
+        let edit_ctx_raw = execute_sylphx_tool(
+            "context_edit",
+            &json!({
+                "drop": ["1"],
+                "replace": [{ "range": "4", "with": "cargo test 100/100 passed" }]
+            }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        let edit_ctx_val: Value = serde_json::from_str(&edit_ctx_raw).unwrap();
+        assert_eq!(edit_ctx_val["status"], "edited");
+        assert_eq!(edit_ctx_val["active_items_before"], 5);
+        assert_eq!(edit_ctx_val["active_items_after"], 3);
+        assert!(edit_ctx_val["tokens_freed"].as_u64().unwrap() > 500);
+
+        let active_after = load_transcript_input_items(&transcript);
+        assert_eq!(active_after.len(), 3);
+        let active_str = serde_json::to_string(&active_after).unwrap();
+        assert!(!active_str.contains("call_deadend"));
+        assert!(active_str.contains("cargo test 100/100 passed"));
+        assert!(!active_str.contains("SECRET_BUILD_MARKER_777"));
+
+        // Yet `memory_recall` still finds both `obsolete_symbol_xyz` and `SECRET_BUILD_MARKER_777` in the lossless raw transcript!
+        let recall_dropped = execute_memory_recall(
+            &transcript,
+            &json!({ "query": "obsolete_symbol_xyz SECRET_BUILD_MARKER_777", "limit": 5 }),
+        );
+        assert!(recall_dropped.contains("obsolete_symbol_xyz"));
+        assert!(recall_dropped.contains("SECRET_BUILD_MARKER_777"));
+
+        // 8. `code_mode` (Programmatic Tool Calling / PTC) executes multi-step SDK operations in one call
+        let cm_out = execute_sylphx_tool(
+            "code_mode",
+            &json!({
+                "code": "src = read('sample.rs')\nedit('sample.rs', 'let z = 42;', 'let z = 888;')\nhits = recall('SECRET_BUILD_MARKER_777')\nprint(f'CODE_MODE_OK z_updated={\"888\" in read(\"sample.rs\")} hits={len(hits)}')"
+            }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(
+            cm_out.contains("CODE_MODE_OK z_updated=True hits=1"),
+            "unexpected: {cm_out}"
+        );
     }
 }

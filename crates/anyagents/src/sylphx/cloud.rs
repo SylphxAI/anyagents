@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use super::auth::{
     DEFAULT_SYLPHX_API_URL, base64_decode, base64_encode, curl_get, curl_post_json,
-    resolve_sylphx_api_key,
+    resolve_sylphx_api_key, truncate_tool_output_middle_utf8,
 };
 
 const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
@@ -793,11 +793,9 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
         combined.push_str("stderr:\n");
         combined.push_str(&stderr);
     }
-    if combined.len() > 32_000 {
-        combined.truncate(32_000);
-        combined.push_str("\n...[truncated]");
-    }
-    Ok(combined)
+    Ok(truncate_tool_output_middle_utf8(
+        combined, 30_000, 14_000, 14_000,
+    ))
 }
 
 #[allow(dead_code)]
