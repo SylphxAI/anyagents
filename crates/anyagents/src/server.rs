@@ -3343,9 +3343,23 @@ struct Since {
 struct ConversationQuery {
     with: Option<String>,
     since_ms: Option<i64>,
+    until_ms: Option<i64>,
+    from_seq: Option<i64>,
+    to_seq: Option<i64>,
+    direction: Option<String>,
+    sender: Option<String>,
+    include_tools: Option<bool>,
+    only_tools: Option<bool>,
+    tool_name: Option<String>,
+    sort: Option<String>,
+    radius: Option<usize>,
     limit: Option<usize>,
     #[serde(default, alias = "q", alias = "search")]
     query: Option<String>,
+    #[serde(default)]
+    queries: Option<String>,
+    #[serde(default)]
+    exclude: Option<String>,
 }
 
 async fn inbox(
@@ -3398,20 +3412,63 @@ async fn conversation_route(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty());
+        let extra_queries: Vec<String> = query
+            .queries
+            .as_deref()
+            .unwrap_or("")
+            .split('|')
+            .flat_map(|s| s.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let exclude_terms: Vec<String> = query
+            .exclude
+            .as_deref()
+            .unwrap_or("")
+            .split('|')
+            .flat_map(|s| s.split(','))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let has_structured_search = clean_q.is_some()
+            || !extra_queries.is_empty()
+            || !exclude_terms.is_empty()
+            || query.until_ms.is_some()
+            || query.from_seq.is_some()
+            || query.to_seq.is_some()
+            || query.direction.is_some()
+            || query.sender.is_some()
+            || query.include_tools == Some(false)
+            || query.only_tools == Some(true)
+            || query.tool_name.is_some()
+            || query.sort.is_some()
+            || query.radius.is_some_and(|r| r > 0);
         let is_all = name.eq_ignore_ascii_case("all") || name == "*";
-        let (agent_name, agent_id_str, raw_turns) = if let Some(q) = clean_q {
-            let qvec =
-                crate::channel::embed_query_for_store(&state.store, state.store.data_dir(), q);
+        let (agent_name, agent_id_str, raw_turns) = if has_structured_search {
+            let search_req = anyagents_core::HistorySearchQuery {
+                query: clean_q.map(str::to_string),
+                queries: extra_queries,
+                exclude: exclude_terms,
+                agent: Some(name.clone()),
+                with_peer: query.with.clone(),
+                direction: query.direction.clone(),
+                sender: query.sender.clone(),
+                include_tools: query.include_tools.unwrap_or(true),
+                only_tools: query.only_tools.unwrap_or(false),
+                tool_name: query.tool_name.clone(),
+                since_ms: query.since_ms,
+                until_ms: query.until_ms,
+                from_seq: query.from_seq,
+                to_seq: query.to_seq,
+                sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
+                radius: query.radius.unwrap_or(0),
+                limit: query.limit.unwrap_or(20),
+            };
             let turns = state
                 .store
-                .search_conversation(
-                    Some(&name),
-                    query.with.as_deref(),
-                    query.since_ms,
-                    query.limit,
-                    q,
-                    qvec.as_deref(),
-                )
+                .search_history(&search_req)
                 .map_err(ApiError::from_store)?;
             let (aname, aid) = if is_all {
                 ("all".to_string(), "all".to_string())

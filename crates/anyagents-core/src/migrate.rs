@@ -34,6 +34,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/018_agent_aliases_and_role.sql"),
     ),
     (18, include_str!("../migrations/019_agent_schedules.sql")),
+    (
+        19,
+        include_str!("../migrations/020_lexical_history_search.sql"),
+    ),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
@@ -57,7 +61,7 @@ pub fn migrate(conn: &mut Connection) -> Result<(), Error> {
         if *version <= current {
             continue;
         }
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute_batch(sql)?;
         tx.execute(
             "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (?1, ?2)",

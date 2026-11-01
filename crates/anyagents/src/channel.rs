@@ -366,8 +366,7 @@ pub fn conversation(
     };
     if let Ok(store) = open(data) {
         let turns_res = if let Some(q) = clean_query {
-            let qvec = embed_query_for_store(&store, data, q);
-            store.search_conversation(Some(&target), with, since_ms, limit, q, qvec.as_deref())
+            store.search_conversation(Some(&target), with, since_ms, limit, q)
         } else if target.eq_ignore_ascii_case("all") || target == "*" {
             store.conversation_all(with, since_ms, limit)
         } else {
@@ -426,8 +425,7 @@ pub fn conversation(
     }
     let store = open(data)?;
     let turns = if let Some(q) = clean_query {
-        let qvec = embed_query_for_store(&store, data, q);
-        store.search_conversation(Some(&target), with, since_ms, limit, q, qvec.as_deref())?
+        store.search_conversation(Some(&target), with, since_ms, limit, q)?
     } else if target.eq_ignore_ascii_case("all") || target == "*" {
         store.conversation_all(with, since_ms, limit)?
     } else {
@@ -460,114 +458,6 @@ fn urlencoding_simple(s: &str) -> String {
         }
     }
     out
-}
-
-pub(crate) fn resolve_embedding_endpoint_and_key(data: &Path) -> Option<(String, String)> {
-    if let (Ok(url), Ok(key)) = (
-        std::env::var("ANYAGENTS_EMBEDDING_URL"),
-        std::env::var("ANYAGENTS_EMBEDDING_KEY"),
-    ) {
-        let u = url.trim();
-        let k = key.trim();
-        if !u.is_empty() && !k.is_empty() {
-            return Some((u.to_string(), k.to_string()));
-        }
-    }
-    if let Ok(key) = std::env::var("OPENROUTER_API_KEY") {
-        let k = key.trim();
-        if !k.is_empty() {
-            return Some((
-                "https://openrouter.ai/api/v1/embeddings".to_string(),
-                k.to_string(),
-            ));
-        }
-    }
-    // Check `<data>/profiles/openrouter/default/` or `<data>/profiles/deepseek/`
-    let candidates = [
-        data.join("profiles/openrouter/default/api-key"),
-        data.join("profiles/openrouter/default/.dsh/.credentials.yaml"),
-        data.join("profiles/deepseek/api/.dsh/.credentials.yaml"),
-        data.join("profiles/deepseek/web/.dsh/.credentials.yaml"),
-    ];
-    for path in candidates {
-        let Ok(raw) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        if path.file_name().is_some_and(|n| n == "api-key") {
-            let k = raw.trim();
-            if !k.is_empty() {
-                return Some((
-                    "https://openrouter.ai/api/v1/embeddings".to_string(),
-                    k.to_string(),
-                ));
-            }
-        }
-        for line in raw.lines() {
-            let trimmed = line.trim();
-            if let Some(rest) = trimmed.strip_prefix("OPENROUTER_API_KEY:") {
-                let k = rest.trim().trim_matches(['"', '\'']);
-                if !k.is_empty() {
-                    return Some((
-                        "https://openrouter.ai/api/v1/embeddings".to_string(),
-                        k.to_string(),
-                    ));
-                }
-            }
-        }
-    }
-    None
-}
-
-pub(crate) fn embed_query_for_store(
-    store: &anyagents_core::Store,
-    data: &Path,
-    query: &str,
-) -> Option<Vec<i8>> {
-    let cleaned = anyagents_core::clean_rag_text(query);
-    if cleaned.chars().count() < 2 {
-        return None;
-    }
-    let chash = anyagents_core::rag_content_hash(&cleaned);
-    if let Ok(Some(cached)) = store.get_embedding_i8(&chash) {
-        return Some(cached);
-    }
-    let (model, dim) = store.locked_embedding_spec().ok()?;
-    let (endpoint, api_key) = resolve_embedding_endpoint_and_key(data)?;
-    let payload = serde_json::json!({
-        "model": model,
-        "input": [cleaned],
-        "dimensions": dim,
-    });
-    let agent = ureq::Agent::config_builder()
-        .timeout_global(Some(std::time::Duration::from_secs(6)))
-        .build()
-        .new_agent();
-    let resp = agent
-        .post(&endpoint)
-        .header("authorization", &format!("Bearer {api_key}"))
-        .header("content-type", "application/json")
-        .send(payload.to_string().as_bytes())
-        .ok()?;
-    let body = resp.into_body().read_to_string().ok()?;
-    let val: serde_json::Value = serde_json::from_str(&body).ok()?;
-    let arr = val.pointer("/data/0/embedding")?.as_array()?;
-    if arr.len() != dim {
-        return None;
-    }
-    let mut floats = Vec::with_capacity(dim);
-    let mut norm_sq = 0.0_f64;
-    for v in arr {
-        let f = v.as_f64().unwrap_or(0.0);
-        norm_sq += f * f;
-        floats.push(f);
-    }
-    let norm = norm_sq.sqrt().max(1e-12);
-    let vec_i8: Vec<i8> = floats
-        .into_iter()
-        .map(|f| ((f / norm) * 127.0).clamp(-127.0, 127.0).round() as i8)
-        .collect();
-    let _ = store.store_embedding_i8(&chash, &model, dim, &vec_i8);
-    Some(vec_i8)
 }
 
 fn print_messages(target: &str, read: InboxResponse) {

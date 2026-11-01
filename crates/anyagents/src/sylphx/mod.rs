@@ -1844,13 +1844,20 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_recall",
-                "description": "Lossless Raw-RAG recall over the full append-only session transcript (including all turns prior to any `context_window_open` compaction boundary). Pass `query` for hybrid BM25 + contiguous episode window recall (`[idx - radius ..= idx + radius]`), or `range` (`transcript:<from>-<to>`) to read exact verbatim transcript items.",
+                "description": "Zero-Embedding Lossless `Raw-RAG` lexical + structured recall over the full append-only session transcript (including all turns prior to any `context_window_open` compaction boundary). Supports single/multi-query BM25 (`query`, `queries`), negative terms (`exclude`), tool history toggles (`include_tools`, `only_tools`, `tool_name`), `role` filter, ordering (`sort`: `\"relevance\"` | `\"newest\"` | `\"oldest\"`), exact range coordinates (`range`: `transcript:<from>-<to>`), and contiguous episode window expansion (`radius`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Search query (supports English, code identifiers, and CJK / Cantonese terms)." },
+                        "query": { "type": "string", "description": "Primary search query (supports English, code identifiers, and CJK / Cantonese terms)." },
+                        "queries": { "type": "array", "items": { "type": "string" }, "description": "Optional additional search queries / synonyms OR-combined with `query`." },
+                        "exclude": { "type": "array", "items": { "type": "string" }, "description": "Optional negative substrings — items containing any of these terms are excluded." },
+                        "include_tools": { "type": "boolean", "description": "Whether to include tool call/output history (`true` by default). Set `false` to search only user/assistant messages." },
+                        "only_tools": { "type": "boolean", "description": "When `true`, searches ONLY tool call and tool output items." },
+                        "tool_name": { "type": "string", "description": "Optional tool name filter (e.g. `\"bash\"`, `\"edit_file\"`, `\"send\"`). Matches both the tool call and its output." },
+                        "role": { "type": "string", "description": "Optional role filter (`\"user\"`, `\"assistant\"`, `\"tool\"`)." },
+                        "sort": { "type": "string", "enum": ["relevance", "newest", "oldest"], "description": "Result ordering (`\"relevance\"` default, `\"newest\"`, or `\"oldest\"`)." },
                         "range": { "type": "string", "description": "Exact item range coordinate (`transcript:<from>-<to>` or `<from>-<to>`) returned by a previous `memory_recall` hit." },
-                        "limit": { "type": "integer", "description": "Maximum episode windows to return (default 5, max 20)." },
+                        "limit": { "type": "integer", "description": "Maximum episode windows or filtered items to return (default 5, max 50)." },
                         "radius": { "type": "integer", "description": "Contiguous neighbor items to include around each matched window to preserve intact `(Event -> Action -> Receipt)` causal chains (default 2, max 10)." }
                     }
                 }
@@ -2819,6 +2826,27 @@ mod tests {
         let range_val: Value = serde_json::from_str(&range_raw).unwrap();
         assert_eq!(range_val["mode"], "range");
         assert_eq!(range_val["items"].as_array().unwrap().len(), 3);
+
+        // Tool history filtering (`only_tools: true`, `tool_name: "bash"`) returns both the tool call and its linked output.
+        let tools_raw = execute_memory_recall(
+            &transcript,
+            &json!({ "only_tools": true, "tool_name": "bash", "sort": "oldest" }),
+        );
+        let tools_val: Value = serde_json::from_str(&tools_raw).unwrap();
+        let tool_hits = tools_val["hits"].as_array().unwrap();
+        assert_eq!(tool_hits.len(), 2);
+        assert_eq!(tool_hits[0]["tool_name"], "bash");
+        assert_eq!(tool_hits[1]["tool_name"], "bash");
+
+        // Excluding tool history (`include_tools: false`) searches only user/assistant messages.
+        let msg_only_raw = execute_memory_recall(
+            &transcript,
+            &json!({ "queries": ["v2.4.1", "production"], "include_tools": false, "radius": 0 }),
+        );
+        let msg_only_val: Value = serde_json::from_str(&msg_only_raw).unwrap();
+        let msg_only_str = serde_json::to_string(&msg_only_val["hits"]).unwrap();
+        assert!(msg_only_str.contains("ALPHA_99182_KEY"));
+        assert!(!msg_only_str.contains("[tool_call:bash]"));
     }
 
     #[test]

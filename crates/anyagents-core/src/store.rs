@@ -248,6 +248,89 @@ pub struct ConversationTurn {
     pub timestamp_ms: i64,
 }
 
+/// Ordering for [`HistorySearchQuery`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HistorySort {
+    #[default]
+    Relevance,
+    Newest,
+    Oldest,
+}
+
+impl HistorySort {
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("newest" | "desc" | "time_desc" | "recent" | "latest") => Self::Newest,
+            Some("oldest" | "asc" | "time_asc" | "chronological") => Self::Oldest,
+            _ => Self::Relevance,
+        }
+    }
+}
+
+/// Structured + lexical search request over agent conversations and tool history (`Raw-RAG`).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HistorySearchQuery {
+    /// Primary search query string (optional when browsing/filtering by range, tool, peer, or time).
+    pub query: Option<String>,
+    /// Additional search queries (OR-combined with `query` for multi-keyword / synonym recall).
+    pub queries: Vec<String>,
+    /// Negative terms — any turn containing any of these substrings (case-insensitive) is excluded.
+    pub exclude: Vec<String>,
+    /// Agent name (`"sage"`, `"all"`) or `agt_...` ID.
+    pub agent: Option<String>,
+    /// Optional peer filter (user, channel chat, internal group, or other agent).
+    pub with_peer: Option<String>,
+    /// Direction filter: `"in"`, `"out"`, or `None` / `"all"`.
+    pub direction: Option<String>,
+    /// Optional sender substring/exact filter.
+    pub sender: Option<String>,
+    /// Whether to include tool/system history (`true` by default). Set `false` to search only messages.
+    pub include_tools: bool,
+    /// When `true`, searches ONLY tool/system history (`kind = 'tool'`).
+    pub only_tools: bool,
+    /// Optional tool name filter (e.g. `"browser"`, `"agents"`, `"schedule"`, `"send"`, `"bash"`).
+    pub tool_name: Option<String>,
+    /// Lower timestamp bound (`timestamp_ms > since_ms`).
+    pub since_ms: Option<i64>,
+    /// Upper timestamp bound (`timestamp_ms <= until_ms`).
+    pub until_ms: Option<i64>,
+    /// Optional sequence range lower bound (`seq >= from_seq`).
+    pub from_seq: Option<i64>,
+    /// Optional sequence range upper bound (`seq <= to_seq`).
+    pub to_seq: Option<i64>,
+    /// Result ordering (`Relevance`, `Newest`, `Oldest`).
+    pub sort: HistorySort,
+    /// Contiguous neighbor turns (`0..=10`) to include around each matched hit.
+    pub radius: usize,
+    /// Maximum turns to return (`1..=200`).
+    pub limit: usize,
+}
+
+impl Default for HistorySearchQuery {
+    fn default() -> Self {
+        Self {
+            query: None,
+            queries: Vec::new(),
+            exclude: Vec::new(),
+            agent: None,
+            with_peer: None,
+            direction: None,
+            sender: None,
+            include_tools: true,
+            only_tools: false,
+            tool_name: None,
+            since_ms: None,
+            until_ms: None,
+            from_seq: None,
+            to_seq: None,
+            sort: HistorySort::Relevance,
+            radius: 0,
+            limit: 20,
+        }
+    }
+}
+
 /// Age of the oldest message the harness has not taken. `None` means the agent
 /// has caught up.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -397,10 +480,20 @@ impl Store {
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
-        let _ = conn.execute(
-            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
-            [],
-        );
+        let has_legacy_state: bool = conn
+            .query_row(
+                "SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived') LIMIT 1",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if has_legacy_state {
+            let _ = conn.execute(
+                "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
+                [],
+            );
+        }
+        let _ = ensure_lexical_fts_backfilled(&mut conn);
         Ok(Self {
             conn: Mutex::new(conn),
             data_dir: data_dir_for(path),
@@ -440,7 +533,7 @@ impl Store {
         {
             let mut conn = self.conn();
             agent_by_id(&conn, agent_id)?;
-            let tx = conn.transaction()?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             // A new instance replaces the old one: the generation moves, and
             // every capability minted before it stops authenticating.
             let generation: i64 = tx.query_row(
@@ -769,6 +862,10 @@ impl Store {
             let _ = tx.execute(
                 "UPDATE rag_chunks SET agent_name = ?2 WHERE agent_id = ?1",
                 params![agent_id.as_str(), clean],
+            );
+            let _ = tx.execute(
+                "UPDATE rag_chunks_fts SET agent_name = ?2 WHERE agent_name = ?1",
+                params![current.name, clean],
             );
             let updated = agent_by_id(&tx, agent_id)?;
             tx.commit()?;
@@ -1320,6 +1417,9 @@ impl Store {
                     .unwrap_or(&format!("agent:{}", agent.name)),
                 message.received_at_ms,
                 &message.text,
+                None,
+                None,
+                message.seq,
             );
         }
         tx.commit()?;
@@ -1538,6 +1638,7 @@ impl Store {
                 "turn_recovery",
                 "messages",
                 "outbound_messages",
+                "rag_chunks",
                 "group_agents",
                 "channel_agents",
             ] {
@@ -1546,6 +1647,10 @@ impl Store {
                     [id.as_str()],
                 )?;
             }
+            let _ = tx.execute(
+                "DELETE FROM rag_chunks_fts WHERE agent_name = ?1",
+                [agent.name.as_str()],
+            );
             tx.execute("DELETE FROM agents WHERE id = ?1", [id.as_str()])?;
             tx.commit()?;
             agent
@@ -1592,6 +1697,13 @@ impl Store {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, agent_id.as_str(), destination, reply_to, body, ts_ms,],
         )?;
+        let cur_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
+                [agent_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
         let _ = index_rag_chunk(
             &conn,
             &id,
@@ -1602,7 +1714,53 @@ impl Store {
             destination,
             ts_ms,
             body,
+            None,
+            None,
+            cur_seq,
         );
+        Ok(id)
+    }
+
+    /// Record a tool invocation or tool output in the history search index (`kind = 'tool'`)
+    /// so agents can search with `include_tools` (`true` / `false`), `only_tools` (`true`),
+    /// or `tool_name` (`"browser"`, `"agents"`, `"schedule"`, `"send"`, `"bash"`, etc.).
+    pub fn record_tool_event(
+        &self,
+        agent_id: &AgentId,
+        tool_name: &str,
+        summary: &str,
+    ) -> Result<String, Error> {
+        let conn = self.conn();
+        let agent = agent_by_id(&conn, agent_id)?;
+        let id = format!("tool_{}", MessageId::generate());
+        let ts_ms = now_ms();
+        let clean_tool = tool_name.trim().to_ascii_lowercase();
+        let text = if summary.trim().starts_with("[tool") {
+            summary.trim().to_string()
+        } else {
+            format!("[tool:{clean_tool}] {}", summary.trim())
+        };
+        let cur_seq: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE agent_id = ?1",
+                [agent_id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        index_rag_chunk(
+            &conn,
+            &id,
+            agent_id.as_str(),
+            &agent.name,
+            "out",
+            &format!("agent:{}", agent.name),
+            &format!("tool:{clean_tool}"),
+            ts_ms,
+            &text,
+            Some("tool"),
+            Some(&clean_tool),
+            cur_seq,
+        )?;
         Ok(id)
     }
 
@@ -1791,282 +1949,359 @@ impl Store {
         Ok(turns)
     }
 
-    /// Return the locked canonical embedding model and dimensionality for this store.
-    pub fn locked_embedding_spec(&self) -> Result<(String, usize), Error> {
-        let conn = self.conn();
-        Self::locked_embedding_spec_conn(&conn)
-    }
-
-    fn locked_embedding_spec_conn(conn: &Connection) -> Result<(String, usize), Error> {
-        let model: String = conn
-            .query_row(
-                "SELECT value FROM rag_meta WHERE key = 'embedding_model'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| "voyageai/voyage-4-large".to_string());
-        let dim_str: String = conn
-            .query_row(
-                "SELECT value FROM rag_meta WHERE key = 'embedding_dimensions'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap_or_else(|_| "1024".to_string());
-        let dim = dim_str.parse::<usize>().unwrap_or(1024);
-        Ok((model, dim))
-    }
-
-    /// Look up a cached `i8` quantized embedding by `content_hash` for the currently locked model.
-    pub fn get_embedding_i8(&self, content_hash: &str) -> Result<Option<Vec<i8>>, Error> {
-        let conn = self.conn();
-        let (locked_model, locked_dim) = Self::locked_embedding_spec_conn(&conn)?;
-        let raw: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT vector_i8 FROM rag_embeddings
-                 WHERE content_hash = ?1 AND model = ?2 AND dimensions = ?3",
-                params![
-                    content_hash,
-                    locked_model,
-                    i64::try_from(locked_dim).unwrap_or(1024)
-                ],
-                |r| r.get(0),
-            )
-            .optional()?;
-        Ok(raw.map(|bytes| bytes.into_iter().map(|b| b as i8).collect()))
-    }
-
-    /// Store a quantized `i8` embedding for `content_hash`.
-    pub fn store_embedding_i8(
-        &self,
-        content_hash: &str,
-        model: &str,
-        dimensions: usize,
-        vec_i8: &[i8],
-    ) -> Result<(), Error> {
-        let conn = self.conn();
-        let bytes: Vec<u8> = vec_i8.iter().map(|&x| x as u8).collect();
-        conn.execute(
-            "INSERT OR REPLACE INTO rag_embeddings (content_hash, model, dimensions, vector_i8, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![content_hash, model, i64::try_from(dimensions).unwrap_or(1024), bytes, now_ms()],
-        )?;
-        Ok(())
-    }
-
-    /// Hybrid RAG Semantic + BM25 Keyword Search with Reciprocal Rank Fusion (RRF).
+    /// Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`).
     ///
-    /// Searches `rag_chunks` across `agent_filter` (`None` or `"all"` searches all agents)
-    /// combining Dense Vector Cosine Similarity (`rag_embeddings`) and SQLite FTS5 BM25
-    /// (`rag_chunks_fts`), plus live message fallback so unindexed turns are also matched.
-    pub fn search_conversation(
-        &self,
-        agent_filter: Option<&str>,
-        with_peer: Option<&str>,
-        since_ms: Option<i64>,
-        limit: Option<usize>,
-        query_text: &str,
-        query_vec_i8: Option<&[i8]>,
-    ) -> Result<Vec<ConversationTurn>, Error> {
+    /// Searches `rag_chunks` and `rag_chunks_fts` across `req.agent` (`None` or `"all"` searches all agents)
+    /// combining SQLite FTS5 BM25 (hybrid ASCII + CJK bigrams/unigrams), exact phrase/substring boost,
+    /// multi-query coverage (`query` + `queries`), negative term filtering (`exclude`), tool history
+    /// toggles (`include_tools`, `only_tools`, `tool_name`), range bounds (`since_ms`, `until_ms`,
+    /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
+    /// context expansion (`radius`).
+    pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
         let conn = self.conn();
-        let limit = limit.unwrap_or(20).clamp(1, 200);
-        let since = since_ms.unwrap_or(0);
-        let agent_name_filter = agent_filter
+        let limit = req.limit.clamp(1, 200);
+        let radius = req.radius.min(10);
+        let since = req.since_ms.unwrap_or(0);
+        let until = req.until_ms.unwrap_or(i64::MAX);
+
+        let agent_name_filter = req
+            .agent
+            .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all") && *s != "*")
-            .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_lowercase());
-        let peer_filter = with_peer.map(str::trim).filter(|s| !s.is_empty());
+            .map(|s| {
+                let stripped = s.strip_prefix("agent:").unwrap_or(s);
+                if let Ok(aid) = AgentId::parse(stripped)
+                    && let Ok(found) = agent_by_id(&conn, &aid)
+                {
+                    return found.name.to_lowercase();
+                }
+                stripped.to_lowercase()
+            });
+        let peer_filter = req
+            .with_peer
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let dir_filter = req
+            .direction
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
+            .map(str::to_ascii_lowercase);
+        let sender_filter = req
+            .sender
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let tool_filter = req
+            .tool_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_lowercase);
+        let only_tools = req.only_tools || tool_filter.is_some();
+        let include_tools = req.include_tools || only_tools;
 
-        let mut rrf_scores: std::collections::HashMap<String, f64> =
-            std::collections::HashMap::new();
-        let mut chunk_meta: std::collections::HashMap<String, ConversationTurn> =
-            std::collections::HashMap::new();
-
-        // 1. Dense Vector Leg (Cosine Similarity over int8-quantized L2-normalized vectors, strictly scoped to locked_embedding_spec).
-        if let Some(qvec) = query_vec_i8
-            && !qvec.is_empty()
+        let mut all_queries: Vec<String> = Vec::new();
+        if let Some(q) = req
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
         {
-            let (locked_model, locked_dim) = Self::locked_embedding_spec_conn(&conn)?;
-            let q_norm_sq: i32 = qvec.iter().map(|&x| (x as i32) * (x as i32)).sum();
-            let q_norm = (q_norm_sq as f64).sqrt().max(1.0);
-            let mut scored_hashes: Vec<(String, f64)> = Vec::new();
-            let mut emb_stmt = conn.prepare(
-                "SELECT content_hash, vector_i8 FROM rag_embeddings
-                 WHERE model = ?1 AND dimensions = ?2",
-            )?;
-            let mut emb_rows = emb_stmt.query(params![
-                locked_model,
-                i64::try_from(locked_dim).unwrap_or(1024)
-            ])?;
-            while let Some(row) = emb_rows.next()? {
-                let hash: String = row.get(0)?;
-                let blob: Vec<u8> = row.get(1)?;
-                if blob.len() != qvec.len() {
-                    continue;
-                }
-                let mut dot: i32 = 0;
-                let mut v_norm_sq: i32 = 0;
-                for (&qb, &vb_u8) in qvec.iter().zip(blob.iter()) {
-                    let q = qb as i32;
-                    let v = (vb_u8 as i8) as i32;
-                    dot += q * v;
-                    v_norm_sq += v * v;
-                }
-                let denom = q_norm * (v_norm_sq as f64).sqrt().max(1.0);
-                let cos = (dot as f64) / denom;
-                if cos > 0.15 {
-                    scored_hashes.push((hash, cos));
-                }
-            }
-            let candidate_pool = (limit * 8).max(120);
-            scored_hashes
-                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            scored_hashes.truncate(candidate_pool);
-
-            for (rank, (hash, cos)) in scored_hashes.into_iter().enumerate() {
-                let sql = if agent_name_filter.is_some() {
-                    "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, agent_name
-                     FROM rag_chunks
-                     WHERE content_hash = ?1 AND timestamp_ms > ?2 AND LOWER(agent_name) = ?3
-                     ORDER BY timestamp_ms DESC LIMIT 2"
-                } else {
-                    "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, agent_name
-                     FROM rag_chunks
-                     WHERE content_hash = ?1 AND timestamp_ms > ?2
-                     ORDER BY timestamp_ms DESC LIMIT 2"
-                };
-                let mut cstmt = conn.prepare(sql)?;
-                let mut crows = if let Some(ref aname) = agent_name_filter {
-                    cstmt.query(params![hash, since, aname])?
-                } else {
-                    cstmt.query(params![hash, since])?
-                };
-                while let Some(crow) = crows.next()? {
-                    let cid: String = crow.get(0)?;
-                    let turn = ConversationTurn {
-                        id: cid.clone(),
-                        direction: crow.get(1)?,
-                        from: crow.get(2)?,
-                        to: crow.get(3)?,
-                        reply_to: Some(format!(
-                            "rag:cos={cos:.3}:agent={}",
-                            crow.get::<_, String>(6)?
-                        )),
-                        text: crow.get(4)?,
-                        timestamp_ms: crow.get(5)?,
-                    };
-                    if let Some(peer) = peer_filter
-                        && !matches_conversation_peer(&turn, peer)
-                    {
-                        continue;
-                    }
-                    *rrf_scores.entry(cid.clone()).or_insert(0.0) +=
-                        1.35 / (50.0 + (rank as f64) + 1.0) + (cos * 0.01);
-                    chunk_meta.entry(cid).or_insert(turn);
-                }
+            all_queries.push(q.to_string());
+        }
+        for q in &req.queries {
+            let trimmed = q.trim();
+            if !trimmed.is_empty() && !all_queries.iter().any(|existing| existing == trimmed) {
+                all_queries.push(trimmed.to_string());
             }
         }
+        let queries_lower: Vec<String> = all_queries.iter().map(|q| q.to_lowercase()).collect();
+        let query_tokens: Vec<String> = {
+            let mut toks = Vec::new();
+            for q in &all_queries {
+                for t in tokenize_hybrid_search_tokens(q) {
+                    if !toks.contains(&t) {
+                        toks.push(t);
+                    }
+                }
+            }
+            toks
+        };
+        let exclude_lower: Vec<String> = req
+            .exclude
+            .iter()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-        // 2. Lexical FTS5 BM25 Leg (`rag_chunks_fts`) — rank inside FTS5 first, then join top hits.
-        let fts_query = build_fts5_query(query_text);
-        if !fts_query.is_empty()
-            && let Ok(mut fstmt) = conn.prepare(
-                "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms, c.agent_name
-                 FROM (
-                     SELECT chunk_id, bm25(rag_chunks_fts) as score
-                     FROM rag_chunks_fts
-                     WHERE rag_chunks_fts MATCH ?1
-                     ORDER BY score ASC
-                     LIMIT ?3
-                 ) f
-                 JOIN rag_chunks c ON c.chunk_id = f.chunk_id
-                 WHERE c.timestamp_ms > ?2
-                 ORDER BY f.score ASC",
-            )
-            && let Ok(mut frows) = fstmt.query(params![fts_query, since, i64::try_from((limit * 8).max(120)).unwrap_or(120)])
-        {
-            let mut rank = 0usize;
-            while let Ok(Some(row)) = frows.next() {
-                let cid: String = row.get(0)?;
-                let aname: String = row.get(6)?;
-                if let Some(ref wanted) = agent_name_filter
-                    && !aname.eq_ignore_ascii_case(wanted)
+        let passes_filters =
+            |turn: &ConversationTurn, aname: &str, kind: &str, tool_name: &str, seq: i64| -> bool {
+                if let Some(ref wanted_agent) = agent_name_filter
+                    && !aname.eq_ignore_ascii_case(wanted_agent)
                 {
+                    return false;
+                }
+                if only_tools && kind != "tool" {
+                    return false;
+                }
+                if !include_tools && kind == "tool" {
+                    return false;
+                }
+                if let Some(ref wanted_tool) = tool_filter
+                    && !tool_name.eq_ignore_ascii_case(wanted_tool)
+                    && !turn
+                        .text
+                        .to_lowercase()
+                        .contains(&format!("[tool:{wanted_tool}]"))
+                    && !turn
+                        .text
+                        .to_lowercase()
+                        .contains(&format!("[tool_call:{wanted_tool}]"))
+                {
+                    return false;
+                }
+                if let Some(ref wanted_dir) = dir_filter
+                    && !turn.direction.eq_ignore_ascii_case(wanted_dir)
+                {
+                    return false;
+                }
+                if let Some(ref wanted_sender) = sender_filter
+                    && !turn.from.to_lowercase().contains(wanted_sender)
+                {
+                    return false;
+                }
+                if let Some(from_s) = req.from_seq
+                    && seq < from_s
+                {
+                    return false;
+                }
+                if let Some(to_s) = req.to_seq
+                    && seq > to_s
+                {
+                    return false;
+                }
+                if let Some(peer) = peer_filter
+                    && !matches_conversation_peer(turn, peer)
+                {
+                    return false;
+                }
+                if !exclude_lower.is_empty() {
+                    let text_l = turn.text.to_lowercase();
+                    if exclude_lower.iter().any(|ex| text_l.contains(ex)) {
+                        return false;
+                    }
+                }
+                true
+            };
+
+        let mut scores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+        let mut chunk_meta: std::collections::HashMap<String, (ConversationTurn, String, i64)> =
+            std::collections::HashMap::new();
+
+        if !all_queries.is_empty() {
+            // 1. Lexical FTS5 BM25 Leg (`rag_chunks_fts` over `text` + hybrid ASCII/CJK `search_tokens`).
+            let fts_query = build_fts5_query_multi(&all_queries);
+            if !fts_query.is_empty()
+                && let Ok(mut fstmt) = conn.prepare(
+                    "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms,
+                            c.agent_name, c.kind, c.tool_name, c.seq, f.score
+                     FROM (
+                         SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
+                         FROM rag_chunks_fts
+                         WHERE rag_chunks_fts MATCH ?1
+                         ORDER BY score ASC
+                         LIMIT ?4
+                     ) f
+                     JOIN rag_chunks c ON c.chunk_id = f.chunk_id
+                     WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
+                     ORDER BY f.score ASC",
+                )
+                && let Ok(mut frows) = fstmt.query(params![
+                    fts_query,
+                    since,
+                    until,
+                    i64::try_from((limit * 10).max(160)).unwrap_or(160)
+                ])
+            {
+                let mut rank = 0usize;
+                while let Ok(Some(row)) = frows.next() {
+                    let cid: String = row.get(0)?;
+                    let aname: String = row.get(6)?;
+                    let kind: String = row.get(7)?;
+                    let tool_name: String = row.get(8)?;
+                    let seq: i64 = row.get(9)?;
+                    let bm25_raw: f64 = row.get(10).unwrap_or(0.0);
+                    let turn = ConversationTurn {
+                        id: cid.clone(),
+                        direction: row.get(1)?,
+                        from: row.get(2)?,
+                        to: row.get(3)?,
+                        reply_to: Some(format!(
+                            "bm25_rank={}:agent={aname}:kind={kind}:seq={seq}",
+                            rank + 1
+                        )),
+                        text: row.get(4)?,
+                        timestamp_ms: row.get(5)?,
+                    };
+                    if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
+                        continue;
+                    }
+                    let text_lower = turn.text.to_lowercase();
+                    let exact_matches = queries_lower
+                        .iter()
+                        .filter(|ql| !ql.is_empty() && text_lower.contains(ql.as_str()))
+                        .count();
+                    let exact_boost = (exact_matches as f64) * 1.5;
+                    let token_hits = if !query_tokens.is_empty() {
+                        let doc_tokens = tokenize_hybrid_search_tokens(&turn.text);
+                        query_tokens
+                            .iter()
+                            .filter(|qt| doc_tokens.contains(qt))
+                            .count() as f64
+                            / (query_tokens.len() as f64)
+                    } else {
+                        0.0
+                    };
+                    let rrf = 2.0 / (30.0 + (rank as f64) + 1.0)
+                        + (-bm25_raw).clamp(0.0, 25.0) * 0.06
+                        + exact_boost
+                        + token_hits * 0.8;
+                    *scores.entry(cid.clone()).or_insert(0.0) += rrf;
+                    chunk_meta.entry(cid).or_insert((turn, aname, seq));
+                    rank += 1;
+                }
+            }
+
+            // 2. Direct substring scan over `rag_chunks` (catches exact punctuation, CLI flags, paths, or CJK substrings).
+            for q_raw in &all_queries {
+                let q_trim = q_raw.trim();
+                if q_trim.is_empty() {
                     continue;
                 }
+                let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
+                let mut lstmt = conn.prepare(
+                    "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
+                            agent_name, kind, tool_name, seq
+                     FROM rag_chunks
+                     WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
+                       AND text LIKE ?3 ESCAPE '\\'
+                     ORDER BY timestamp_ms DESC
+                     LIMIT ?4",
+                )?;
+                let mut lrows = lstmt.query(params![
+                    since,
+                    until,
+                    like_pat,
+                    i64::try_from((limit * 4).max(80)).unwrap_or(80)
+                ])?;
+                let mut rank = 0usize;
+                while let Some(row) = lrows.next()? {
+                    let cid: String = row.get(0)?;
+                    let aname: String = row.get(6)?;
+                    let kind: String = row.get(7)?;
+                    let tool_name: String = row.get(8)?;
+                    let seq: i64 = row.get(9)?;
+                    let turn = ConversationTurn {
+                        id: cid.clone(),
+                        direction: row.get(1)?,
+                        from: row.get(2)?,
+                        to: row.get(3)?,
+                        reply_to: Some(format!("exact:agent={aname}:kind={kind}:seq={seq}")),
+                        text: row.get(4)?,
+                        timestamp_ms: row.get(5)?,
+                    };
+                    if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
+                        continue;
+                    }
+                    *scores.entry(cid.clone()).or_insert(0.0) += 1.6 / (30.0 + (rank as f64) + 1.0);
+                    chunk_meta.entry(cid).or_insert((turn, aname, seq));
+                    rank += 1;
+                }
+            }
+        } else {
+            // Structured Filter / Range / Tool History Browse Mode (no keyword query required).
+            let order_sql = if req.sort == HistorySort::Oldest {
+                "ORDER BY timestamp_ms ASC, seq ASC, chunk_id ASC"
+            } else {
+                "ORDER BY timestamp_ms DESC, seq DESC, chunk_id DESC"
+            };
+            let sql = format!(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
+                        agent_name, kind, tool_name, seq
+                 FROM rag_chunks
+                 WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
+                 {order_sql}
+                 LIMIT ?3"
+            );
+            let mut bstmt = conn.prepare(&sql)?;
+            let mut brows = bstmt.query(params![
+                since,
+                until,
+                i64::try_from((limit * 8).max(200)).unwrap_or(200)
+            ])?;
+            let mut rank = 0usize;
+            while let Some(row) = brows.next()? {
+                let cid: String = row.get(0)?;
+                let aname: String = row.get(6)?;
+                let kind: String = row.get(7)?;
+                let tool_name: String = row.get(8)?;
+                let seq: i64 = row.get(9)?;
                 let turn = ConversationTurn {
                     id: cid.clone(),
                     direction: row.get(1)?,
                     from: row.get(2)?,
                     to: row.get(3)?,
-                    reply_to: Some(format!("rag:bm25_rank={}:agent={aname}", rank + 1)),
+                    reply_to: Some(format!("filter:agent={aname}:kind={kind}:seq={seq}")),
                     text: row.get(4)?,
                     timestamp_ms: row.get(5)?,
                 };
-                if let Some(peer) = peer_filter
-                    && !matches_conversation_peer(&turn, peer)
-                {
+                if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
                     continue;
                 }
-                *rrf_scores.entry(cid.clone()).or_insert(0.0) +=
-                    1.85 / (50.0 + (rank as f64) + 1.0);
-                chunk_meta.entry(cid).or_insert(turn);
+                scores.insert(cid.clone(), 1.0 / (1.0 + rank as f64));
+                chunk_meta.insert(cid, (turn, aname, seq));
                 rank += 1;
             }
         }
 
-        // 3. Direct substring fallback (covers CJK substrings or fresh turns in `messages` / `outbound_messages`).
-        let q_trim = query_text.trim();
-        if !q_trim.is_empty() && rrf_scores.len() < limit {
-            let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
-            let mut lstmt = conn.prepare(
-                "SELECT m.id, a.name, COALESCE(m.sender, 'unknown'), COALESCE(m.reply_to, 'agent:' || a.name), m.body, m.received_at_ms
-                 FROM messages m
-                 JOIN agents a ON a.id = m.agent_id
-                 WHERE m.received_at_ms > ?1 AND m.body LIKE ?2 ESCAPE '\\'
-                 ORDER BY m.received_at_ms DESC LIMIT ?3",
-            )?;
-            let mut lrows = lstmt.query(params![
-                since,
-                like_pat,
-                i64::try_from(limit * 2).unwrap_or(40)
-            ])?;
-            let mut rank = 0usize;
-            while let Some(row) = lrows.next()? {
-                let cid: String = row.get(0)?;
-                let aname: String = row.get(1)?;
-                if let Some(ref wanted) = agent_name_filter
-                    && !aname.eq_ignore_ascii_case(wanted)
-                {
-                    continue;
-                }
-                let turn = ConversationTurn {
-                    id: cid.clone(),
-                    direction: "in".to_string(),
-                    from: row.get(2)?,
-                    to: row.get(3)?,
-                    reply_to: Some(format!("rag:substring:agent={aname}")),
-                    text: row.get(4)?,
-                    timestamp_ms: row.get(5)?,
-                };
-                if let Some(peer) = peer_filter
-                    && !matches_conversation_peer(&turn, peer)
-                {
-                    continue;
-                }
-                *rrf_scores.entry(cid.clone()).or_insert(0.0) += 0.8 / (60.0 + (rank as f64) + 1.0);
-                chunk_meta.entry(cid).or_insert(turn);
-                rank += 1;
+        let mut ranked: Vec<(String, f64)> = scores.into_iter().collect();
+        match req.sort {
+            HistorySort::Relevance => {
+                ranked.sort_by(|a, b| {
+                    b.1.partial_cmp(&a.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| {
+                            let ts_a = chunk_meta.get(&a.0).map(|m| m.0.timestamp_ms).unwrap_or(0);
+                            let ts_b = chunk_meta.get(&b.0).map(|m| m.0.timestamp_ms).unwrap_or(0);
+                            ts_b.cmp(&ts_a)
+                        })
+                });
+            }
+            HistorySort::Newest => {
+                ranked.sort_by(|a, b| {
+                    let ts_a = chunk_meta.get(&a.0).map(|m| m.0.timestamp_ms).unwrap_or(0);
+                    let ts_b = chunk_meta.get(&b.0).map(|m| m.0.timestamp_ms).unwrap_or(0);
+                    ts_b.cmp(&ts_a).then_with(|| b.0.cmp(&a.0))
+                });
+            }
+            HistorySort::Oldest => {
+                ranked.sort_by(|a, b| {
+                    let ts_a = chunk_meta.get(&a.0).map(|m| m.0.timestamp_ms).unwrap_or(0);
+                    let ts_b = chunk_meta.get(&b.0).map(|m| m.0.timestamp_ms).unwrap_or(0);
+                    ts_a.cmp(&ts_b).then_with(|| a.0.cmp(&b.0))
+                });
             }
         }
-
-        let mut ranked: Vec<(String, f64)> = rrf_scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Deduplicate identical message text across multiple recipient agents in room broadcasts.
         let mut seen_text_sig: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut out = Vec::new();
+        let mut matched_hits: Vec<(ConversationTurn, String, i64)> = Vec::new();
         for (cid, score) in ranked {
-            if let Some(mut turn) = chunk_meta.remove(&cid) {
+            if let Some((mut turn, aname, seq)) = chunk_meta.remove(&cid) {
                 let sig: String = turn.text.chars().take(180).collect();
                 if !seen_text_sig.insert(sig) {
                     continue;
@@ -2075,13 +2310,131 @@ impl Store {
                     "score={score:.4} ({})",
                     turn.reply_to.unwrap_or_default()
                 ));
-                out.push(turn);
-                if out.len() >= limit {
+                matched_hits.push((turn, aname, seq));
+                if matched_hits.len() >= limit {
                     break;
                 }
             }
         }
+
+        if radius == 0 || matched_hits.is_empty() {
+            return Ok(matched_hits.into_iter().map(|(t, _, _)| t).collect());
+        }
+
+        // Contiguous episode context expansion (`radius > 0`): attach up to `radius` preceding
+        // and `radius` following turns of the same agent around each matched turn.
+        let mut out: Vec<ConversationTurn> = Vec::new();
+        let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let rad_i64 = i64::try_from(radius).unwrap_or(2);
+        for (hit_turn, aname, hit_seq) in matched_hits {
+            let hit_ts = hit_turn.timestamp_ms;
+            let mut before: Vec<ConversationTurn> = Vec::new();
+            if let Ok(mut bstmt) = conn.prepare(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq
+                 FROM rag_chunks
+                 WHERE LOWER(agent_name) = LOWER(?1)
+                   AND (timestamp_ms < ?2 OR (timestamp_ms = ?2 AND chunk_id != ?3))
+                 ORDER BY timestamp_ms DESC, seq DESC
+                 LIMIT ?4",
+            ) && let Ok(mut brows) =
+                bstmt.query(params![aname, hit_ts, hit_turn.id, rad_i64 * 2])
+            {
+                while let Ok(Some(r)) = brows.next() {
+                    let kind: String = r.get(6)?;
+                    if only_tools && kind != "tool" {
+                        continue;
+                    }
+                    if !include_tools && kind == "tool" {
+                        continue;
+                    }
+                    let seq: i64 = r.get(7)?;
+                    before.push(ConversationTurn {
+                        id: r.get(0)?,
+                        direction: r.get(1)?,
+                        from: r.get(2)?,
+                        to: r.get(3)?,
+                        reply_to: Some(format!(
+                            "context:before={}:agent={aname}:seq={seq}",
+                            hit_turn.id
+                        )),
+                        text: r.get(4)?,
+                        timestamp_ms: r.get(5)?,
+                    });
+                    if before.len() >= radius {
+                        break;
+                    }
+                }
+            }
+            before.reverse();
+            for b in before {
+                if seen_ids.insert(b.id.clone()) {
+                    out.push(b);
+                }
+            }
+            let hit_id = hit_turn.id.clone();
+            if seen_ids.insert(hit_id.clone()) {
+                out.push(hit_turn);
+            }
+            if let Ok(mut astmt) = conn.prepare(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq
+                 FROM rag_chunks
+                 WHERE LOWER(agent_name) = LOWER(?1)
+                   AND timestamp_ms >= ?2
+                   AND chunk_id != ?3
+                 ORDER BY timestamp_ms ASC, seq ASC
+                 LIMIT ?4",
+            ) && let Ok(mut arows) = astmt.query(params![aname, hit_ts, hit_id, rad_i64 * 2])
+            {
+                let mut added_after = 0usize;
+                while let Ok(Some(r)) = arows.next() {
+                    let kind: String = r.get(6)?;
+                    if only_tools && kind != "tool" {
+                        continue;
+                    }
+                    if !include_tools && kind == "tool" {
+                        continue;
+                    }
+                    let seq: i64 = r.get(7)?;
+                    let _ = hit_seq;
+                    let turn = ConversationTurn {
+                        id: r.get(0)?,
+                        direction: r.get(1)?,
+                        from: r.get(2)?,
+                        to: r.get(3)?,
+                        reply_to: Some(format!("context:after={hit_id}:agent={aname}:seq={seq}")),
+                        text: r.get(4)?,
+                        timestamp_ms: r.get(5)?,
+                    };
+                    if seen_ids.insert(turn.id.clone()) {
+                        out.push(turn);
+                        added_after += 1;
+                        if added_after >= radius {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         Ok(out)
+    }
+
+    /// Lexical + structured search over `rag_chunks` across `agent_filter` (`None` or `"all"` searches all agents).
+    pub fn search_conversation(
+        &self,
+        agent_filter: Option<&str>,
+        with_peer: Option<&str>,
+        since_ms: Option<i64>,
+        limit: Option<usize>,
+        query_text: &str,
+    ) -> Result<Vec<ConversationTurn>, Error> {
+        self.search_history(&HistorySearchQuery {
+            query: Some(query_text.to_string()),
+            agent: agent_filter.map(str::to_string),
+            with_peer: with_peer.map(str::to_string),
+            since_ms,
+            limit: limit.unwrap_or(20),
+            ..HistorySearchQuery::default()
+        })
     }
 
     /// The next message the harness has not taken, or `None` when delivery has
@@ -3109,6 +3462,174 @@ pub fn rag_content_hash(text: &str) -> String {
     format!("{h1:016x}{h2:016x}")
 }
 
+fn is_cjk_char(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xF900..=0xFAFF
+            | 0x20000..=0x2A6DF
+            | 0x2A700..=0x2B73F
+            | 0x2B740..=0x2B81F
+            | 0x2B820..=0x2CEAF
+    )
+}
+
+/// Hybrid ASCII + CJK tokenizer: emits lowercased alphanumeric/identifier tokens
+/// (`len >= 2`, plus sub-tokens split on `_` and `-`) together with individual CJK
+/// characters and CJK bigrams so English, code identifiers, and Chinese/Cantonese
+/// queries achieve high BM25 recall without dense vector embeddings.
+pub fn tokenize_hybrid_search_tokens(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut ascii_buf = String::new();
+    let mut cjk_run: Vec<char> = Vec::new();
+
+    let flush_ascii = |buf: &mut String, out: &mut Vec<String>| {
+        let trimmed = buf.trim_matches(['-', '_']);
+        if trimmed.len() >= 2 {
+            let lower = trimmed.to_ascii_lowercase();
+            out.push(lower.clone());
+            if lower.contains('_') || lower.contains('-') {
+                for part in lower.split(['_', '-']) {
+                    if part.len() >= 2 {
+                        out.push(part.to_string());
+                    }
+                }
+            }
+        }
+        buf.clear();
+    };
+    let flush_cjk = |run: &mut Vec<char>, out: &mut Vec<String>| {
+        for &ch in run.iter() {
+            out.push(ch.to_string());
+        }
+        for pair in run.windows(2) {
+            let mut s = String::with_capacity(6);
+            s.push(pair[0]);
+            s.push(pair[1]);
+            out.push(s);
+        }
+        run.clear();
+    };
+
+    for ch in text.chars() {
+        if is_cjk_char(ch) {
+            flush_ascii(&mut ascii_buf, &mut tokens);
+            cjk_run.push(ch);
+        } else if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            flush_cjk(&mut cjk_run, &mut tokens);
+            ascii_buf.push(ch);
+        } else {
+            flush_ascii(&mut ascii_buf, &mut tokens);
+            flush_cjk(&mut cjk_run, &mut tokens);
+        }
+    }
+    flush_ascii(&mut ascii_buf, &mut tokens);
+    flush_cjk(&mut cjk_run, &mut tokens);
+    tokens
+}
+
+fn classify_chunk_kind_and_tool(
+    kind_override: Option<&str>,
+    tool_override: Option<&str>,
+    sender: &str,
+    destination: &str,
+    text: &str,
+) -> (String, String) {
+    if let Some(k) = kind_override.map(str::trim).filter(|s| !s.is_empty()) {
+        let t = tool_override
+            .map(str::trim)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        return (k.to_ascii_lowercase(), t);
+    }
+    let trimmed = text.trim();
+    if let Some(rest) = trimmed
+        .strip_prefix("[tool:")
+        .or_else(|| trimmed.strip_prefix("[tool_call:"))
+        .or_else(|| trimmed.strip_prefix("[tool_output:"))
+        .or_else(|| trimmed.strip_prefix("[Tool:"))
+    {
+        let tool = rest
+            .split([']', ':', ' '])
+            .next()
+            .unwrap_or("tool")
+            .trim()
+            .to_ascii_lowercase();
+        return ("tool".to_string(), tool);
+    }
+    if trimmed.starts_with("[Sub-Agent Completed]") {
+        return ("tool".to_string(), "subagents".to_string());
+    }
+    if trimmed.starts_with("[Schedule") || trimmed.starts_with("[Watch") {
+        return ("tool".to_string(), "schedule".to_string());
+    }
+    if let Some(tool) = sender
+        .strip_prefix("tool:")
+        .or_else(|| destination.strip_prefix("tool:"))
+    {
+        return ("tool".to_string(), tool.trim().to_ascii_lowercase());
+    }
+    ("message".to_string(), String::new())
+}
+
+fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
+    let chunk_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rag_chunks", [], |r| r.get(0))
+        .unwrap_or(0);
+    if chunk_count == 0 {
+        return Ok(());
+    }
+    let fts_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM rag_chunks_fts", [], |r| r.get(0))
+        .unwrap_or(0);
+    if fts_count >= chunk_count {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    {
+        tx.execute("DELETE FROM rag_chunks_fts", [])?;
+        let mut sel = tx.prepare(
+            "SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text
+             FROM rag_chunks",
+        )?;
+        let rows: Vec<(String, String, String, String, String, String, String)> = sel
+            .query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        let mut ins = tx.prepare(
+            "INSERT INTO rag_chunks_fts (
+                chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        for (cid, aname, sender, dest, kind, tool_name, text) in rows {
+            let search_tokens = tokenize_hybrid_search_tokens(&text).join(" ");
+            let _ = ins.execute(params![
+                cid,
+                aname,
+                sender,
+                dest,
+                kind,
+                tool_name,
+                text,
+                search_tokens
+            ]);
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn index_rag_chunk(
     conn: &Connection,
@@ -3120,16 +3641,23 @@ fn index_rag_chunk(
     destination: &str,
     timestamp_ms: i64,
     text: &str,
+    kind_override: Option<&str>,
+    tool_override: Option<&str>,
+    seq: i64,
 ) -> Result<(), Error> {
     let cleaned = clean_rag_text(text);
-    if cleaned.chars().count() < 4 {
+    if cleaned.chars().count() < 2 {
         return Ok(());
     }
     let chash = rag_content_hash(&cleaned);
+    let (kind, tool_name) =
+        classify_chunk_kind_and_tool(kind_override, tool_override, sender, destination, &cleaned);
+    let search_tokens = tokenize_hybrid_search_tokens(&cleaned).join(" ");
     conn.execute(
         "INSERT OR REPLACE INTO rag_chunks (
-            chunk_id, agent_id, agent_name, direction, sender, destination, timestamp_ms, content_hash, text
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            chunk_id, agent_id, agent_name, direction, sender, destination,
+            timestamp_ms, content_hash, text, kind, tool_name, seq
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             chunk_id,
             agent_id,
@@ -3139,38 +3667,46 @@ fn index_rag_chunk(
             destination,
             timestamp_ms,
             chash,
-            cleaned
+            cleaned,
+            kind,
+            tool_name,
+            seq,
         ],
     )?;
+    let _ = conn.execute(
+        "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
+        params![format!("\"{}\"", chunk_id.replace('"', ""))],
+    );
     conn.execute(
-        "INSERT INTO rag_chunks_fts (chunk_id, agent_name, sender, destination, text)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![chunk_id, agent_name, sender, destination, cleaned],
+        "INSERT INTO rag_chunks_fts (
+            chunk_id, agent_name, sender, destination, kind, tool_name, text, search_tokens
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            chunk_id,
+            agent_name,
+            sender,
+            destination,
+            kind,
+            tool_name,
+            cleaned,
+            search_tokens
+        ],
     )?;
     Ok(())
 }
 
-fn build_fts5_query(raw: &str) -> String {
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for ch in raw.chars() {
-        if ch.is_alphanumeric() || ch == '_' || ch == '-' {
-            current.push(ch);
-        } else if !current.is_empty() {
-            let trimmed = current.trim_matches(['-', '_']);
-            if !trimmed.is_empty() {
-                tokens.push(format!("\"{}\"", trimmed.replace('"', "")));
+fn build_fts5_query_multi(queries: &[String]) -> String {
+    let mut terms = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in queries {
+        for tok in tokenize_hybrid_search_tokens(raw) {
+            let clean = tok.replace('"', "");
+            if !clean.is_empty() && seen.insert(clean.clone()) {
+                terms.push(format!("\"{clean}\""));
             }
-            current.clear();
         }
     }
-    if !current.is_empty() {
-        let trimmed = current.trim_matches(['-', '_']);
-        if !trimmed.is_empty() {
-            tokens.push(format!("\"{}\"", trimmed.replace('"', "")));
-        }
-    }
-    tokens.join(" OR ")
+    terms.join(" OR ")
 }
 
 fn message_by_source(
@@ -4239,14 +4775,15 @@ mod tests {
     }
 
     #[test]
-    fn search_conversation_with_dense_query_vector_ranks_without_reentrant_lock() {
+    fn search_history_supports_lexical_cjk_multi_query_exclude_tools_range_ordering_and_radius() {
         let (_dir, store) = setup();
         let alice = agent(&store, "alice");
-        let outcome = store
+        store
             .receive(
                 &alice.id,
                 Incoming {
-                    text: "durable turn recovery checkpoint design".to_string(),
+                    text: "Step 1: durable turn_recovery checkpoint design and 記憶檢索"
+                        .to_string(),
                     sender: Some("agent:bob".to_string()),
                     source_time_ms: None,
                     source_key: None,
@@ -4257,29 +4794,118 @@ mod tests {
                 },
             )
             .unwrap();
-        let ReceiveOutcome::New(msg) = outcome else {
-            panic!("expected New");
-        };
-        let hash = rag_content_hash(&msg.text);
-        let (model, dim) = store.locked_embedding_spec().unwrap();
-        let mut vec_i8 = vec![0i8; dim];
-        vec_i8[0] = 100;
         store
-            .store_embedding_i8(&hash, &model, dim, &vec_i8)
-            .unwrap();
-
-        let hits = store
-            .search_conversation(
-                Some("alice"),
-                None,
-                None,
-                Some(10),
-                "durable recovery",
-                Some(&vec_i8),
+            .record_tool_event(
+                &alice.id,
+                "browser",
+                "opened https://openrouter.ai/rankings and took snapshot",
             )
             .unwrap();
+        store
+            .receive(
+                &alice.id,
+                Incoming {
+                    text: "Step 2: noisy heartbeat ping to ignore".to_string(),
+                    sender: Some("agent:bob".to_string()),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: Some(2_000),
+                },
+            )
+            .unwrap();
+        store
+            .receive(
+                &alice.id,
+                Incoming {
+                    text: "Step 3: 生產環境部署完成 verified green".to_string(),
+                    sender: Some("agent:carol".to_string()),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: Some(3_000),
+                },
+            )
+            .unwrap();
+
+        // 1. Sub-token (`recovery` from `turn_recovery`) + CJK 2-char bigram (`記憶`).
+        let hits = store
+            .search_conversation(Some("alice"), None, None, Some(10), "recovery")
+            .unwrap();
         assert_eq!(hits.len(), 1);
-        assert!(hits[0].text.contains("durable turn recovery"));
+        assert!(hits[0].text.contains("turn_recovery"));
+
+        let cjk_hits = store
+            .search_conversation(Some("alice"), None, None, Some(10), "記憶")
+            .unwrap();
+        assert_eq!(cjk_hits.len(), 1);
+        assert!(cjk_hits[0].text.contains("記憶檢索"));
+
+        // 2. Multi-query (`queries`) + negative filter (`exclude`) + ordering (`Oldest` vs `Newest`).
+        let multi = store
+            .search_history(&HistorySearchQuery {
+                queries: vec![
+                    "checkpoint".to_string(),
+                    "生產環境".to_string(),
+                    "Step".to_string(),
+                ],
+                exclude: vec!["heartbeat".to_string()],
+                agent: Some("alice".to_string()),
+                include_tools: false,
+                sort: HistorySort::Oldest,
+                limit: 10,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(multi.len(), 2);
+        assert!(multi[0].text.contains("Step 1"));
+        assert!(multi[1].text.contains("Step 3"));
+
+        // 3. Tool history filtering (`only_tools: true` and `tool_name: Some("browser")`).
+        let tools_only = store
+            .search_history(&HistorySearchQuery {
+                agent: Some("alice".to_string()),
+                only_tools: true,
+                tool_name: Some("browser".to_string()),
+                limit: 10,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(tools_only.len(), 1);
+        assert!(tools_only[0].text.contains("[tool:browser]"));
+
+        // 4. Sequence range (`from_seq` / `to_seq`) and `radius` expansion.
+        let ranged = store
+            .search_history(&HistorySearchQuery {
+                agent: Some("alice".to_string()),
+                include_tools: false,
+                from_seq: Some(3),
+                to_seq: Some(3),
+                limit: 10,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ranged.len(), 1);
+        assert!(ranged[0].text.contains("Step 3"));
+
+        let with_radius = store
+            .search_history(&HistorySearchQuery {
+                query: Some("heartbeat".to_string()),
+                agent: Some("alice".to_string()),
+                include_tools: false,
+                radius: 1,
+                limit: 1,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(with_radius.len(), 3);
+        assert!(with_radius[0].text.contains("Step 1"));
+        assert!(with_radius[1].text.contains("Step 2"));
+        assert!(with_radius[2].text.contains("Step 3"));
     }
 
     #[test]

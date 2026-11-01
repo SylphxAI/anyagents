@@ -351,9 +351,9 @@ enum Command {
     },
     /// Read or search (`--query`) any agent's full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
     Conversation {
-        /// Agent name (`sage`, `argon`, `prism`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
+        /// Agent name (`sage`, `volt`, `xenon`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
         agent: Option<String>,
-        /// Optional Hybrid RAG semantic + BM25 search query.
+        /// Optional lexical + structured search query (SQLite FTS5 BM25 + CJK bigram + exact phrase boost).
         #[arg(short = 'q', long)]
         query: Option<String>,
         /// Optional peer filter (e.g. `alice`, `agent:beta`, `group:crew`, `telegram:chat:-1001234567890`).
@@ -366,11 +366,11 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Hybrid RAG semantic + BM25 search across historical and live conversations.
+    /// Zero-Embedding Lexical + Structured search across historical and live conversations.
     Search {
-        /// Search query (matched via locked `voyageai/voyage-4-large` vector embedding + FTS5 trigram BM25).
+        /// Search query (matched via SQLite FTS5 BM25 with hybrid ASCII + CJK bigrams and exact substring boost).
         query: String,
-        /// Optional agent filter (`sage`, `argon`, `prism`, or `all`; defaults to `all`).
+        /// Optional agent filter (`sage`, `volt`, `xenon`, or `all`; defaults to `all`).
         #[arg(long)]
         agent: Option<String>,
         /// Optional peer filter.
