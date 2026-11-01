@@ -1830,6 +1830,21 @@ fn build_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
+                "name": "code_mode",
+                "description": "Programmatic Tool Calling (PTC / Code Mode, `arXiv:2605.18747`): execute a multi-step Python script with a pre-injected zero-import SDK (`read(path, start_line=None, end_line=None)`, `write(path, content)`, `edit(path, target, replacement, replace_all=False)`, `files(pattern='**/*', path='.')`, `grep(pattern, path='.', glob=None)`, `sh(cmd, timeout=120)`, `mcp(tool_name, **kwargs)`, `agents(**kwargs)`, `send(target, message)`, `conversation(**kwargs)`, `schedule(**kwargs)`, `recall(query=None, limit=10)`). Intermediate data stays in script RAM; only `print(...)` output enters the LLM context window.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": { "type": "string", "description": "Python code using pre-injected SDK functions (`read`, `write`, `edit`, `files`, `grep`, `sh`, `mcp`, `agents`, `send`, `conversation`, `schedule`, `recall`). Use `print(...)` to return concise results." },
+                        "timeout_ms": { "type": "integer", "description": "Optional timeout in ms (default 120000)." }
+                    },
+                    "required": ["code"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
                 "name": "bash",
                 "description": "Execute a bash command in the agent's working directory (or inside the isolated Cloud Kata microVM Sandbox pod when a cloud sandbox lease is active).",
                 "parameters": {
@@ -2457,6 +2472,28 @@ fn execute_sylphx_tool(
                 }
                 other => format!("error: unknown sandbox action `{other}`"),
             }
+        }
+        "code_mode" => {
+            if sandbox_mode == "none" {
+                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
+            }
+            let Some(code_str) = args.get("code").and_then(Value::as_str) else {
+                return "error: missing `code`".to_string();
+            };
+            let timeout_ms = args
+                .get("timeout_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(120_000);
+            let wrapped = build_code_mode_command(code_str, config_dir, mcp_command, mcp_args);
+            execute_sylphx_tool(
+                "bash",
+                &json!({ "command": wrapped, "timeout_ms": timeout_ms }),
+                config_dir,
+                work_dir,
+                env,
+                mcp_command,
+                mcp_args,
+            )
         }
         "bash" | "shell" => {
             if sandbox_mode == "none" {
@@ -3367,5 +3404,22 @@ mod tests {
         );
         assert!(recall_dropped.contains("obsolete_symbol_xyz"));
         assert!(recall_dropped.contains("SECRET_BUILD_MARKER_777"));
+
+        // 8. `code_mode` (Programmatic Tool Calling / PTC) executes multi-step SDK operations in one call
+        let cm_out = execute_sylphx_tool(
+            "code_mode",
+            &json!({
+                "code": "src = read('sample.rs')\nedit('sample.rs', 'let z = 42;', 'let z = 888;')\nhits = recall('SECRET_BUILD_MARKER_777')\nprint(f'CODE_MODE_OK z_updated={\"888\" in read(\"sample.rs\")} hits={len(hits)}')"
+            }),
+            &cfg,
+            &work,
+            &[],
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(
+            cm_out.contains("CODE_MODE_OK z_updated=True hits=1"),
+            "unexpected: {cm_out}"
+        );
     }
 }

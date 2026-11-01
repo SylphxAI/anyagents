@@ -92,13 +92,12 @@ fn apply_context_edit_to_history(history: &mut Vec<(usize, Value)>, edit_event: 
                     if let Some(obj) = item.as_object_mut() {
                         obj.insert("output".to_string(), json!(replacement_text));
                     }
-                } else if item.get("type").and_then(Value::as_str) == Some("message")
-                    || item.get("role").is_some()
+                } else if (item.get("type").and_then(Value::as_str) == Some("message")
+                    || item.get("role").is_some())
+                    && let Some(obj) = item.as_object_mut()
                 {
-                    if let Some(obj) = item.as_object_mut() {
-                        obj.remove("content");
-                        obj.insert("content".to_string(), json!(replacement_text));
-                    }
+                    obj.remove("content");
+                    obj.insert("content".to_string(), json!(replacement_text));
                 }
             }
         }
@@ -664,7 +663,7 @@ pub(super) fn execute_context_edit(transcript_path: &Path, args: &Value) -> Stri
             }));
             hogs.push((est_tok, *raw_idx, kind, preview));
         }
-        hogs.sort_by(|a, b| b.0.cmp(&a.0));
+        hogs.sort_by_key(|a| std::cmp::Reverse(a.0));
         let top_hogs: Vec<Value> = hogs
             .into_iter()
             .take(10)

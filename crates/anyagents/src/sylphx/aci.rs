@@ -248,7 +248,7 @@ pub(super) fn list_dir_native(work_dir: &Path, raw_path: &str) -> String {
     files.sort();
     let total = dirs.len() + files.len();
     let mut out = format!("[dir: {raw_path} ({total} entries)]\n");
-    for d in dirs.into_iter().chain(files.into_iter()).take(200) {
+    for d in dirs.into_iter().chain(files).take(200) {
         out.push_str(&d);
         out.push('\n');
     }
@@ -305,6 +305,7 @@ fn byte_offset_to_line(text: &str, byte_offset: usize) -> usize {
 /// 2. CRLF-normalized exact match.
 /// 3. Line-by-line `trim_end()` match (ignoring trailing spaces/tabs).
 /// 4. Line-by-line `trim()` indentation-tolerant block match (for multi-line targets).
+///
 /// Also automatically retries after stripping accidental `12: ` line-number prefixes.
 pub(super) fn apply_edits_to_content(
     existing: &str,
@@ -932,4 +933,142 @@ fn find_subslice_lines(doc: &[String], needle: &[&str], cursor: usize) -> Option
         }
     }
     None
+}
+
+/// Builds a self-contained `python3` shell command for `code_mode` (Programmatic Tool
+/// Calling / PTC, Cloudflare Code Mode + Anthropic CE-MCP + `arXiv:2605.18747`),
+/// injecting a zero-import SDK (`read`, `write`, `edit`, `files`, `grep`, `sh`, `mcp`,
+/// `agents`, `send`, `conversation`, `schedule`, `recall`) so intermediate data stays
+/// in Python RAM and only printed output enters the LLM context window.
+pub(super) fn build_code_mode_command(
+    user_code: &str,
+    config_dir: &Path,
+    mcp_command: &Path,
+    mcp_args: &[String],
+) -> String {
+    let mut mcp_cmd_vec = vec![mcp_command.display().to_string()];
+    mcp_cmd_vec.extend(mcp_args.iter().cloned());
+    let mcp_cmd_json = serde_json::to_string(&mcp_cmd_vec).unwrap_or_else(|_| "[]".to_string());
+    let transcript_path = config_dir.join("sylphx-transcript.jsonl");
+    let transcript_json =
+        serde_json::to_string(&transcript_path.display().to_string()).unwrap_or_default();
+
+    let prelude = format!(
+        r#"import json, os, pathlib, re, subprocess, sys
+
+_MCP_CMD = {mcp_cmd_json}
+_TRANSCRIPT_PATH = {transcript_json}
+
+def read(path, start_line=None, end_line=None):
+    p = pathlib.Path(path)
+    text = p.read_text(encoding="utf-8")
+    if start_line is None and end_line is None:
+        return text
+    lines = text.splitlines()
+    s = max(1, int(start_line or 1))
+    e = min(len(lines), int(end_line or len(lines)))
+    return "\n".join(lines[s - 1:e])
+
+read_file = read
+
+def write(path, content):
+    p = pathlib.Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(content), encoding="utf-8")
+    return f"wrote {{p}} ({{len(str(content))}} bytes)"
+
+write_file = write
+
+def edit(path, target, replacement, replace_all=False):
+    p = pathlib.Path(path)
+    src = p.read_text(encoding="utf-8")
+    if target not in src:
+        raise ValueError(f"target not found in {{path}}")
+    updated = src.replace(target, replacement) if replace_all else src.replace(target, replacement, 1)
+    p.write_text(updated, encoding="utf-8")
+    return f"edited {{p}}"
+
+edit_file = edit
+
+def files(pattern="**/*", path="."):
+    proc = subprocess.run(["rg", "--files", "-g", pattern, path], capture_output=True, text=True)
+    if proc.returncode == 0 or proc.stdout:
+        return [l for l in proc.stdout.splitlines() if l.strip()]
+    base = pathlib.Path(path)
+    return [str(p) for p in base.glob(pattern) if p.is_file()]
+
+glob = files
+
+def grep(pattern, path=".", glob=None):
+    cmd = ["rg", "-n", "--no-heading", "--color=never"]
+    if glob:
+        cmd.extend(["-g", glob])
+    cmd.extend(["--", pattern, path])
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    hits = []
+    for line in proc.stdout.splitlines():
+        parts = line.split(":", 2)
+        if len(parts) == 3 and parts[1].isdigit():
+            hits.append({{"path": parts[0], "line": int(parts[1]), "text": parts[2]}})
+        elif len(parts) >= 2 and parts[0].isdigit():
+            hits.append({{"path": path, "line": int(parts[0]), "text": ":".join(parts[1:])}})
+    return hits
+
+def sh(command, timeout=120):
+    proc = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=timeout)
+    return {{"code": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr}}
+
+def mcp(tool_name, **kwargs):
+    if not _MCP_CMD:
+        raise RuntimeError("MCP command not configured")
+    reqs = [
+        {{"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {{"protocolVersion": "2024-11-05", "capabilities": {{}}, "clientInfo": {{"name": "sylphx-code-mode", "version": "0.1.0"}}}}}},
+        {{"jsonrpc": "2.0", "method": "notifications/initialized"}},
+        {{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {{"name": tool_name, "arguments": kwargs}}}},
+    ]
+    payload = "\n".join(json.dumps(r) for r in reqs) + "\n"
+    proc = subprocess.run(_MCP_CMD, input=payload, capture_output=True, text=True)
+    for line in reversed(proc.stdout.splitlines()):
+        try:
+            msg = json.loads(line)
+        except Exception:
+            continue
+        if msg.get("id") == 1:
+            if "error" in msg:
+                raise RuntimeError(msg["error"].get("message", str(msg["error"])))
+            text = (((msg.get("result") or {{}}).get("content") or [{{}}])[0]).get("text", "")
+            try:
+                return json.loads(text)
+            except Exception:
+                return text
+    return proc.stdout.strip()
+
+def agents(**kwargs):
+    return mcp("agents", **kwargs)
+
+def send(target, message, **kwargs):
+    return mcp("send", target=target, message=message, **kwargs)
+
+def conversation(**kwargs):
+    return mcp("conversation", **kwargs)
+
+def schedule(**kwargs):
+    return mcp("schedule", **kwargs)
+
+def recall(query=None, limit=10):
+    p = pathlib.Path(_TRANSCRIPT_PATH)
+    if not p.is_file():
+        return []
+    q = (query or "").lower()
+    out = []
+    for idx, line in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines()):
+        if not q or q in line.lower():
+            out.append({{"index": idx, "raw": line}})
+    return out[-limit:]
+"#
+    );
+
+    let full_script = format!("{prelude}\n{user_code}\n");
+    let b64 = super::auth::base64_encode(full_script.as_bytes());
+    format!("python3 -c \"import base64; exec(base64.b64decode('{b64}').decode('utf-8'))\"")
 }
