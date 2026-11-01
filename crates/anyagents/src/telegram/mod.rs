@@ -6,7 +6,7 @@
 mod channel;
 pub mod poller;
 
-pub(crate) use channel::outbound_call;
+pub(crate) use channel::{detach_archived_agent_from_telegram_groups, outbound_call};
 pub use channel::{
     WebhookError, chat_member_is_in, close_poll, delete_chat_message, edit_message, pin_message,
     post_article, post_checklist, post_location, post_media, post_poll, post_text, react_message,

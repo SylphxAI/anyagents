@@ -653,11 +653,17 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             format!("{}\n", anyagents_core::now_ms()),
         );
     }
+    if state == "running" {
+        server::clear_explicitly_archived(data, &found.id);
+    }
     let agent = store.set_agent_state(&found.id, state)?;
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
-    } else if state == "archived" && found.parent_id.is_some() {
-        server::reap_subagent_ephemeral_dirs(data, &found.id);
+    } else if state == "archived" {
+        server::mark_explicitly_archived(&store, data, &agent);
+        if found.parent_id.is_some() {
+            server::reap_subagent_ephemeral_dirs(data, &found.id);
+        }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
     let (mode, steer) = declared(&agent.harness);

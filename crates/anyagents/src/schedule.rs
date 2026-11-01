@@ -559,6 +559,9 @@ pub fn agent_wake_block_reason(
     if agent.state == "paused" {
         return Some("paused");
     }
+    if agent.state == "archived" || crate::server::is_explicitly_archived(store.data_dir(), agent) {
+        return Some("archived");
+    }
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let (session_quota, session_error) = if agent.harness == "claude-code" {
         let (_, persisted_err) =
@@ -773,7 +776,13 @@ fn deliver_scheduled_wake(
     source_key: &str,
     now: i64,
 ) {
-    if agent.state != "running" && agent.state != "paused" {
+    if agent.state == "paused"
+        || agent.state == "archived"
+        || crate::server::is_explicitly_archived(store.data_dir(), agent)
+    {
+        return;
+    }
+    if agent.state != "running" {
         let _ = store.set_agent_state(&agent.id, "running");
     }
     let _ = store.receive(

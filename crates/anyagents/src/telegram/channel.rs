@@ -152,6 +152,51 @@ pub fn delete_webhook(
     Ok(())
 }
 
+/// Detach an archived agent from all Telegram group chat links (`chat_id < 0`)
+/// and unregister its live Telegram webhook so group posts or membership events
+/// never route to or wake a retired agent.
+pub(crate) fn detach_archived_agent_from_telegram_groups(
+    store: &Store,
+    data_dir: &std::path::Path,
+    agent: &anyagents_core::Agent,
+    drop_live_webhook: bool,
+) {
+    let Ok(channels) = store.list_channels() else {
+        return;
+    };
+    let is_live = std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && !crate::sandbox::is_isolated_test_env()
+        && std::env::var_os("ANYAGENTS_TELEGRAM_API").is_none();
+    for channel in channels {
+        if channel.kind != "telegram" {
+            continue;
+        }
+        let owns_channel = channel.agents.contains(&agent.id);
+        let mut mem = Memory::from_state(&channel.state);
+        let before = mem.chats.len();
+        mem.chats.retain(|link| {
+            if link.chat_id >= 0 {
+                return true;
+            }
+            if owns_channel {
+                return false;
+            }
+            link.agent != agent.id.as_str() && link.agent != agent.name
+        });
+        if mem.chats.len() != before {
+            let _ = store.set_channel_state(&channel.id, &mem.to_state());
+        }
+        if drop_live_webhook && is_live && owns_channel {
+            let dir = data_dir.to_path_buf();
+            let ch = channel.clone();
+            std::thread::spawn(move || {
+                let secrets = FileCredentialStore::new(&dir);
+                let _ = delete_webhook(&secrets, &ch);
+            });
+        }
+    }
+}
+
 /// Receive one webhook update (or array of updates) pushed by Telegram for
 /// `channel_id`, verify `X-Telegram-Bot-Api-Secret-Token`, and route into the
 /// durable mailbox.
@@ -395,6 +440,17 @@ fn ingest_updates(
             None,
         )
     })?;
+    if let Ok(owner_agent) = store.agent(agent_id)
+        && (owner_agent.state == "archived"
+            || owner_agent.state == "paused"
+            || crate::server::is_explicitly_archived(store.data_dir(), &owner_agent))
+    {
+        if poll.offset != before {
+            memory.offset = poll.offset.max(memory.offset);
+            store.set_channel_state(&channel.id, &memory.to_state())?;
+        }
+        return Ok(());
+    }
     let attached = attached_agents(store)?;
     let own_bots = known_bot_identities(store, memory.bot.as_deref());
     let mut grew = false;
@@ -818,8 +874,21 @@ fn discover_peer_bots_in_chat(
         let Some(other_agent_id) = other.agents.first() else {
             continue;
         };
+        let Ok(other_agent) = store.agent(other_agent_id) else {
+            continue;
+        };
         let mut other_mem = Memory::from_state(&other.state);
         let already_attached = other_mem.chats.iter().any(|l| l.chat_id == chat_id);
+        if other_agent.state == "archived"
+            || other_agent.state == "paused"
+            || crate::server::is_explicitly_archived(store.data_dir(), &other_agent)
+        {
+            if already_attached && chat_id < 0 {
+                other_mem.chats.retain(|l| l.chat_id != chat_id);
+                let _ = store.set_channel_state(&other.id, &other_mem.to_state());
+            }
+            continue;
+        }
         if !is_live && already_attached {
             continue;
         }
@@ -930,6 +999,11 @@ fn attached_agents(store: &Store) -> Result<Vec<(String, i64)>, anyagents_core::
                 store
                     .agent(id)
                     .ok()
+                    .filter(|agent| {
+                        agent.state != "archived"
+                            && agent.state != "paused"
+                            && !crate::server::is_explicitly_archived(store.data_dir(), agent)
+                    })
                     .map(|agent| (agent.name, agent.id.to_string()))
             })
             .collect();

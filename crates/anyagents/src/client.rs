@@ -102,6 +102,7 @@ pub(crate) fn call<T: serde::de::DeserializeOwned>(
             || path.starts_with("/v1/schedules")
             || path.starts_with("/v1/browser")
             || path.starts_with("/v1/send")
+            || path.starts_with("/v1/interact")
             || path.contains("/schedules")
             || path.contains("/conversation"));
     let (primary_sock, secondary_sock) = if prefer_admin {

@@ -227,6 +227,13 @@ fn run_channel(
         let Some(channel) = channel else {
             return;
         };
+        if !channel_has_running_agent(&store, &channel) {
+            if webhook_registered_for.take().is_some() {
+                let _ = delete_webhook(&secrets, &channel);
+            }
+            sleep_for(&stop, &global_stop, Duration::from_secs(5));
+            continue;
+        }
         if let Some(base) = configured_webhook_base()
             && webhook_origin_ready(&base)
         {
@@ -245,10 +252,6 @@ fn run_channel(
             continue;
         }
         webhook_registered_for = None;
-        if !channel_has_running_agent(&store, &channel) {
-            sleep_for(&stop, &global_stop, Duration::from_secs(5));
-            continue;
-        }
         // The timeout is capped so a shutdown never waits out a full long poll:
         // Telegram answers at once when the timeout is short.
         let timeout = if stop.load(Ordering::SeqCst) || global_stop.load(Ordering::SeqCst) {
@@ -268,6 +271,15 @@ fn run_channel(
         if !matches!(outcome, Ok(Ok(()))) {
             sleep_a_moment(&stop, &global_stop);
         }
+    }
+    if webhook_registered_for.is_some()
+        && let Some(channel) = store
+            .list_channels()
+            .unwrap_or_default()
+            .into_iter()
+            .find(|channel| channel.id.to_string() == id)
+    {
+        let _ = delete_webhook(&secrets, &channel);
     }
 }
 

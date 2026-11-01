@@ -650,6 +650,37 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
     }
 }
 
+pub(crate) fn has_explicit_archive_marker(
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
+    anyagents_core::agent_config_dir(data_dir, agent_id)
+        .join(".anyagents-archived")
+        .exists()
+}
+
+pub(crate) fn is_explicitly_archived(data_dir: &Path, agent: &Agent) -> bool {
+    has_explicit_archive_marker(data_dir, &agent.id)
+        || (agent.state == "archived" && agent.parent_id.is_none())
+}
+
+pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
+    let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
+    let _ = std::fs::create_dir_all(&cfg);
+    let _ = std::fs::write(cfg.join(".anyagents-archived"), format!("{}\n", now_ms()));
+    if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
+        for sched in schedules {
+            let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
+        }
+    }
+    crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
+}
+
+pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
+    let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
+    let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
+}
+
 fn reconcile_stopped_and_backed_off_agents(
     store: &Store,
     health: &HealthBoard,
@@ -685,6 +716,15 @@ fn reconcile_stopped_and_backed_off_agents(
 
     for agent in &agents {
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
+        if is_explicitly_archived(data, agent) {
+            if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
+                let _ = store.set_agent_state(&agent.id, "archived");
+            }
+            let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
+            let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
+            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+            continue;
+        }
         let oldest_age_ms = store
             .lag(&agent.id, now_ms)
             .ok()
@@ -700,8 +740,10 @@ fn reconcile_stopped_and_backed_off_agents(
                     .unwrap_or(delivered);
                 if max_seq > delivered && max_seq > prev_wm {
                     let should_wake = undelivered.iter().filter(|m| m.seq > prev_wm).any(|m| {
+                        let trimmed = m.text.trim_start();
                         !(agent.parent_id.is_none()
-                            && m.text.trim_start().starts_with("[Sub-Agent Completed]"))
+                            && (trimmed.starts_with("[Sub-Agent Completed]")
+                                || trimmed.starts_with("[Sub-Agent Error]")))
                     });
                     if should_wake {
                         if store.set_agent_state(&agent.id, "running").is_ok() {
@@ -2789,6 +2831,7 @@ async fn archive_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
+        mark_explicitly_archived(&state.store, state.store.data_dir(), &agent);
         if !is_self {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -3157,6 +3200,7 @@ async fn wake_agent_route(
             cfg.join(".anyagents-profile-rotated-ms"),
             format!("{}\n", now_ms()),
         );
+        clear_explicitly_archived(state.store.data_dir(), &found.id);
         let agent = state
             .store
             .set_agent_state(&found.id, "running")
@@ -3626,6 +3670,9 @@ fn interact_sync(
                 if let Some(ref sender) = msg.sender
                     && let Some(peer_name) = sender.strip_prefix("agent:")
                     && let Ok(peer) = store.agent_by_name(peer_name)
+                    && peer.state != "archived"
+                    && peer.state != "paused"
+                    && !is_explicitly_archived(store.data_dir(), &peer)
                 {
                     let mut incoming = Incoming::new(summary.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
@@ -3696,6 +3743,9 @@ fn interact_sync(
                 if let Some(ref sender) = msg.sender
                     && let Some(peer_name) = sender.strip_prefix("agent:")
                     && let Ok(peer) = store.agent_by_name(peer_name)
+                    && peer.state != "archived"
+                    && peer.state != "paused"
+                    && !is_explicitly_archived(store.data_dir(), &peer)
                 {
                     let mut incoming = Incoming::new(ballot.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
@@ -4460,12 +4510,13 @@ fn deliver_agent(
     key: Option<&str>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
-    if agent.state == "archived" {
-        let is_auto_subagent_completed = body
-            .text
-            .trim_start()
-            .starts_with("[Sub-Agent Completed]");
-        if !(agent.parent_id.is_none() && is_auto_subagent_completed) {
+    if (agent.state == "idle" || agent.state == "archived")
+        && !is_explicitly_archived(store.data_dir(), &agent)
+    {
+        let trimmed = body.text.trim_start();
+        let is_auto_subagent_lifecycle = trimmed.starts_with("[Sub-Agent Completed]")
+            || trimmed.starts_with("[Sub-Agent Error]");
+        if !(agent.parent_id.is_none() && is_auto_subagent_lifecycle) {
             let _ = store.set_agent_state(&agent.id, "running");
         }
     }
