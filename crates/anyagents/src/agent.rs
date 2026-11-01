@@ -878,6 +878,8 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         if view.state == "archived" {
             if view.harness == "sylphx" {
                 view.install = "installed".to_string();
+                view.delivery_mode = "steer".to_string();
+                view.steer_support = "yes".to_string();
                 if view
                     .last_error
                     .as_deref()
@@ -912,6 +914,8 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         let cfg = anyagents_core::agent_config_dir(data, &id);
         if view.harness == "sylphx" {
             view.install = "installed".to_string();
+            view.delivery_mode = "steer".to_string();
+            view.steer_support = "yes".to_string();
             if view
                 .last_error
                 .as_deref()
