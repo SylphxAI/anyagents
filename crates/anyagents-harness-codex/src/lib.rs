@@ -500,6 +500,10 @@ impl Drop for CodexHarness {
 
 impl Harness for CodexHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
+        let input = json!([{
+            "type": "text",
+            "text": compose_message(&message.id, &message.context, &message.text)
+        }]);
         let (thread_id, steering) = {
             let mut state = lock(&self.shared);
             if !state.alive {
@@ -524,13 +528,13 @@ impl Harness for CodexHarness {
             let steering = state.turn_id.clone();
             state.fault_error = None;
             state.consecutive_turn_errors = 0;
+            if steering.is_none() {
+                state.last_turn_input =
+                    Some((thread_id.clone(), input.clone(), message.id.clone()));
+            }
             state.open.push(message.id.clone());
             (thread_id, steering)
         };
-        let input = json!([{
-            "type": "text",
-            "text": compose_message(&message.id, &message.context, &message.text)
-        }]);
         let (method, params) = if let Some(turn_id) = &steering {
             (
                 "turn/steer",
@@ -559,6 +563,8 @@ impl Harness for CodexHarness {
                     if state.turn_id == effective_steering {
                         state.turn_id = None;
                     }
+                    state.last_turn_input =
+                        Some((thread_id.clone(), input.clone(), message.id.clone()));
                 }
                 effective_steering = None;
                 self.call(
@@ -580,9 +586,6 @@ impl Harness for CodexHarness {
         let mut state = lock(&self.shared);
         match rpc {
             Ok(result) => {
-                if effective_steering.is_none() {
-                    state.last_turn_input = Some((thread_id, input, message.id.clone()));
-                }
                 commit_delivery(
                     &mut state,
                     &message.id,
@@ -595,15 +598,24 @@ impl Harness for CodexHarness {
                 })
             }
             Err(CallFail::Dead) => {
+                if effective_steering.is_none() {
+                    state.last_turn_input = None;
+                }
                 unstage(&mut state, &message.id);
                 Err(HarnessError::Dead)
             }
             Err(CallFail::Quota(reset_at_ms)) => {
+                if effective_steering.is_none() {
+                    state.last_turn_input = None;
+                }
                 unstage(&mut state, &message.id);
                 state.quota_reset_at_ms = Some(reset_at_ms);
                 Ok(DeliverOutcome::Quota { reset_at_ms })
             }
             Err(CallFail::Failed(reason)) => {
+                if effective_steering.is_none() {
+                    state.last_turn_input = None;
+                }
                 unstage(&mut state, &message.id);
                 state.consecutive_turn_errors = state.consecutive_turn_errors.saturating_add(1);
                 if is_auth_or_provider_401(&reason) || state.consecutive_turn_errors >= 3 {
@@ -736,7 +748,10 @@ fn commit_delivery(state: &mut State, id: &str, started_turn: bool, method: &str
             state.turns_started += 1;
         }
     }
-    if state.finished.contains(id) {
+    if state.finished.contains(id)
+        || state.consecutive_turn_errors > 0
+        || state.fault_error.is_some()
+    {
         return;
     }
     let turn_id = if method == "turn/steer" {
