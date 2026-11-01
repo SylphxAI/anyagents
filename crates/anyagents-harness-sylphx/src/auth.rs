@@ -435,7 +435,6 @@ pub fn write_sylphx_config(
         let _ = std::fs::write(config_dir.join("adapter.json"), format!("{adapter_text}\n"));
     }
 
-    let _ = crate::opencode_config::write(config_dir, Some(resolved_model), mcp_command, mcp_args);
     Ok(())
 }
 

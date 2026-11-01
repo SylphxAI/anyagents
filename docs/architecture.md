@@ -114,7 +114,7 @@ Every harness is admitted. The delivery mode is whatever that tool does best, de
 
 | Harness | Mode | How a line reaches it |
 | --- | --- | --- |
-| `sylphx` | `steer` | Built-in native Sylphx harness (`crates/anyagents/src/sylphx/`). Drains `steer_queue` between every tool step in native Sylphx AI Responses mode (`/v1/responses`) or forwards `POST /v1/{env}/agent_sessions/{id}:steer` in `Sylphx Agents` BaaS mode (`SYLPHX_AGENT_ENV`). |
+| `sylphx` | `steer` | Built-in native Sylphx harness (`crates/anyagents-harness-sylphx`). Drains `steer_queue` between every tool step in native Sylphx AI Responses mode (`/v1/responses`) or forwards `POST /v1/{env}/agent_sessions/{id}:steer` in `Sylphx Agents` BaaS mode (`SYLPHX_AGENT_ENV`). |
 | `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
 | `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
