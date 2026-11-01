@@ -474,10 +474,12 @@ fn spawn_admin_sylphx_delivery(
                             }
                         }
                     }
-                    if completed_any && !had_err && agent.parent_id.is_some() {
-                        if store.complete_idle_subagent(&agent.id).unwrap_or(false) {
-                            reap_subagent_ephemeral_dirs(&data, &agent.id);
-                        }
+                    if completed_any
+                        && !had_err
+                        && agent.parent_id.is_some()
+                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                    {
+                        reap_subagent_ephemeral_dirs(&data, &agent.id);
                     }
                 }
                 Err(reason) => {
