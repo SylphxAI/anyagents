@@ -1416,8 +1416,16 @@ fn browser_cmd(
         tab_action: None,
         target_id: None,
         cookies: None,
+        reason: None,
+        ttl_ms: None,
+        tunnel: None,
     };
     match act.as_str() {
+        "takeover" | "human_takeover" | "user_takeover" => {
+            if req.reason.is_none() {
+                req.reason = target.or(value);
+            }
+        }
         "open" | "goto" | "navigate" => {
             if req.url.is_none() {
                 req.url = target;

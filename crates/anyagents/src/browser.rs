@@ -128,6 +128,9 @@ pub struct BrowserRequest {
     /// `"screenshot"` (save PNG screenshot to `path` or profile screenshots dir),
     /// `"cookies"` (list cookies, or set cookies when `cookies` JSON array is provided),
     /// `"tabs"` (list tabs, or open/switch/close via `tab_action` and `target_id`),
+    /// `"takeover"` / `"human_takeover"` (open an interactive live remote browser takeover session so the user can solve a CAPTCHA or 2FA challenge directly in this persistent profile),
+    /// `"takeover_status"` / `"wait_for_user"` (inspect or wait for an active human takeover session to complete),
+    /// `"release_takeover"` (reclaim control from a human takeover session and shut down its ephemeral takeover endpoint),
     /// `"status"` (inspect profile status and anti-detect fingerprint),
     /// `"profiles"` / `"list"` (list all persistent browser profiles),
     /// or `"close"` / `"stop"` (shut down the browser process to scale to zero while keeping profile login state on disk).
@@ -207,6 +210,15 @@ pub struct BrowserRequest {
     /// Optional cookies array to set when `action = "cookies"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cookies: Option<Vec<serde_json::Value>>,
+    /// Optional reason / instructions displayed to the user in the takeover UI banner when `action = "takeover"` (e.g. `"Solve Cloudflare Turnstile CAPTCHA"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Optional time-to-live in milliseconds for a human takeover session (default `600_000` = 10 minutes).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+    /// Whether `action = "takeover"` should open a temporary public HTTPS tunnel (`cloudflared`) when available so the user can open `takeover_url` from a phone or remote browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<bool>,
 }
 
 fn sanitize_profile_name(raw: Option<&str>, fallback: &str) -> String {
@@ -670,6 +682,7 @@ pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Err
         stop_process_group(rt.pid);
     }
     clear_held_keys(data, profile);
+    cleanup_takeover_session(data, profile);
     let _ = std::fs::remove_file(&rt_path);
     cleanup_singleton_locks(&dir.join("user-data"));
     Ok(serde_json::json!({
@@ -701,6 +714,10 @@ pub fn reap_idle_browsers(data: &Path) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        reap_expired_takeover(data, name, now);
+        if is_human_takeover_active(data, name, now) {
+            continue;
+        }
         if let Some(rt) = load_runtime(data, name)
             && now.saturating_sub(rt.last_used_at_ms) > idle_ms
         {
@@ -1351,6 +1368,1362 @@ fn snapshot_js_with_offset(start_idx: usize) -> String {
     )
 }
 
+const DEFAULT_TAKEOVER_TTL_MS: u64 = 10 * 60 * 1000;
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CaptchaDetection {
+    pub detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct BrowserTakeoverState {
+    pub profile: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent: Option<String>,
+    pub token: String,
+    pub port: u16,
+    pub local_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_url: Option<String>,
+    pub takeover_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// `"human"` while the user holds control; `"agent"` once completed or released.
+    pub holder: String,
+    pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_note: Option<String>,
+    pub started_at_ms: i64,
+    pub expires_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel_pid: Option<u32>,
+    #[serde(default)]
+    pub initial_captcha_detected: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_captcha_kind: Option<String>,
+}
+
+fn takeover_path(data: &Path, profile: &str) -> PathBuf {
+    profile_dir(data, profile).join("takeover.json")
+}
+
+fn load_takeover_state(data: &Path, profile: &str) -> Option<BrowserTakeoverState> {
+    let bytes = std::fs::read(takeover_path(data, profile)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
+    let dir = profile_dir(data, &state.profile);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
+        let _ = std::fs::write(dir.join("takeover.json"), bytes);
+    }
+}
+
+fn is_human_takeover_active(data: &Path, profile: &str, now: i64) -> bool {
+    load_takeover_state(data, profile).is_some_and(|st| {
+        st.holder == "human" && !st.completed && now < st.expires_at_ms && cdp_port_alive(st.port)
+    })
+}
+
+fn reap_expired_takeover(data: &Path, profile: &str, now: i64) {
+    if let Some(mut st) = load_takeover_state(data, profile)
+        && st.holder == "human"
+        && !st.completed
+        && (now >= st.expires_at_ms || !cdp_port_alive(st.port))
+    {
+        if let Some(tpid) = st.tunnel_pid.take() {
+            stop_process_group(tpid);
+        }
+        st.holder = "agent".to_string();
+        st.completed = true;
+        st.completed_at_ms = Some(now);
+        st.completion_note = Some("takeover session expired".to_string());
+        save_takeover_state(data, &st);
+    }
+}
+
+fn cleanup_takeover_session(data: &Path, profile: &str) {
+    if let Some(st) = load_takeover_state(data, profile)
+        && let Some(tpid) = st.tunnel_pid
+    {
+        stop_process_group(tpid);
+    }
+    let _ = std::fs::remove_file(takeover_path(data, profile));
+}
+
+fn generate_takeover_token() -> String {
+    let mut bytes = [0u8; 16];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(&mut bytes);
+    } else {
+        let seed = deterministic_profile_seed(&format!("takeover-{}", now_ms()));
+        bytes[..8].copy_from_slice(&seed.to_le_bytes());
+        bytes[8..].copy_from_slice(&seed.rotate_left(19).to_le_bytes());
+    }
+    let mut out = String::with_capacity(36);
+    out.push_str("tok_");
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
+}
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+const DETECT_CAPTCHA_JS: &str = r#"(() => {
+  const title = (document.title || '').toLowerCase();
+  const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+  const iframes = Array.from(document.querySelectorAll('iframe')).map(f => (f.src || f.getAttribute('src') || '').toLowerCase());
+  const hasSel = (s) => {
+    try { return Boolean(document.querySelector(s)); } catch (_) { return false; }
+  };
+  if (
+    hasSel('#cf-chl-widget') ||
+    hasSel('.cf-turnstile') ||
+    hasSel('[data-sitekey].cf-turnstile') ||
+    hasSel('#challenge-running') ||
+    hasSel('#challenge-stage') ||
+    hasSel('input[name="cf-turnstile-response"]') ||
+    iframes.some(u => u.includes('challenges.cloudflare.com') || u.includes('turnstile')) ||
+    (title.includes('just a moment') && (bodyText.includes('verify you are human') || bodyText.includes('cloudflare'))) ||
+    title.includes('attention required! | cloudflare')
+  ) {
+    return { detected: true, kind: 'cloudflare_turnstile', summary: 'Cloudflare Turnstile / human verification challenge' };
+  }
+  if (
+    hasSel('.g-recaptcha') ||
+    hasSel('#g-recaptcha') ||
+    hasSel('textarea[name="g-recaptcha-response"]') ||
+    iframes.some(u => u.includes('google.com/recaptcha') || u.includes('recaptcha/api2') || u.includes('recaptcha/enterprise'))
+  ) {
+    return { detected: true, kind: 'recaptcha', summary: 'Google reCAPTCHA verification challenge' };
+  }
+  if (
+    hasSel('.h-captcha') ||
+    hasSel('textarea[name="h-captcha-response"]') ||
+    iframes.some(u => u.includes('hcaptcha.com'))
+  ) {
+    return { detected: true, kind: 'hcaptcha', summary: 'hCaptcha verification challenge' };
+  }
+  if (
+    hasSel('#arkose') ||
+    hasSel('[data-arkose]') ||
+    iframes.some(u => u.includes('arkoselabs.com') || u.includes('funcaptcha.com'))
+  ) {
+    return { detected: true, kind: 'arkose_funcaptcha', summary: 'Arkose Labs / FunCaptcha challenge' };
+  }
+  if (
+    hasSel('.geetest_panel') ||
+    hasSel('.geetest_holder') ||
+    hasSel('.nc_scale') ||
+    hasSel('#nc_1_n1z')
+  ) {
+    return { detected: true, kind: 'slider_captcha', summary: 'Slider / Geetest verification challenge' };
+  }
+  if (
+    hasSel('[data-captcha]') ||
+    hasSel('#captcha-box') ||
+    title === 'robot check' ||
+    title === 'security check' ||
+    (bodyText.includes('verify you are human') && bodyText.length < 1500)
+  ) {
+    return { detected: true, kind: 'generic_captcha', summary: 'Human verification / CAPTCHA challenge' };
+  }
+  return { detected: false };
+})()"#;
+
+fn detect_captcha(cdp: &mut CdpSession) -> CaptchaDetection {
+    if let Ok(val) = eval_js(cdp, DETECT_CAPTCHA_JS)
+        && val.get("detected").and_then(|v| v.as_bool()) == Some(true)
+    {
+        return CaptchaDetection {
+            detected: true,
+            kind: val.get("kind").and_then(|v| v.as_str()).map(str::to_string),
+            summary: val
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+        };
+    }
+    for cf in discover_child_frames(cdp) {
+        let lower_url = cf.url.to_ascii_lowercase();
+        if lower_url.contains("challenges.cloudflare.com") || lower_url.contains("turnstile") {
+            return CaptchaDetection {
+                detected: true,
+                kind: Some("cloudflare_turnstile".to_string()),
+                summary: Some("Cloudflare Turnstile iframe challenge".to_string()),
+            };
+        }
+        if lower_url.contains("google.com/recaptcha") || lower_url.contains("recaptcha/api2") {
+            return CaptchaDetection {
+                detected: true,
+                kind: Some("recaptcha".to_string()),
+                summary: Some("Google reCAPTCHA iframe challenge".to_string()),
+            };
+        }
+        if lower_url.contains("hcaptcha.com") {
+            return CaptchaDetection {
+                detected: true,
+                kind: Some("hcaptcha".to_string()),
+                summary: Some("hCaptcha iframe challenge".to_string()),
+            };
+        }
+        if lower_url.contains("arkoselabs.com") || lower_url.contains("funcaptcha.com") {
+            return CaptchaDetection {
+                detected: true,
+                kind: Some("arkose_funcaptcha".to_string()),
+                summary: Some("Arkose / FunCaptcha iframe challenge".to_string()),
+            };
+        }
+    }
+    CaptchaDetection::default()
+}
+
+fn notify_agent_takeover_completed(
+    data: &Path,
+    owner_agent: Option<&str>,
+    profile: &str,
+    url: &str,
+    note: Option<&str>,
+) {
+    let Some(agent_name) = owner_agent
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "default" && *s != "operator")
+    else {
+        return;
+    };
+    let db_path = data.join("state.db");
+    if !db_path.exists() {
+        return;
+    }
+    let Ok(store) = anyagents_core::Store::open(db_path) else {
+        return;
+    };
+    let Ok(agent) = store.agent_by_name(agent_name) else {
+        return;
+    };
+    let now = now_ms();
+    let msg_id = format!("msg_takeover_{profile}_{now}");
+    let note_suffix = note
+        .filter(|s| !s.trim().is_empty())
+        .map(|n| format!(" ({n})"))
+        .unwrap_or_default();
+    let text = format!(
+        "[Browser Takeover Completed] User finished browser takeover on profile `{profile}`{note_suffix} (current url: {url}). Control is now back with you; call `browser({{ \"action\": \"snapshot\", \"profile\": \"{profile}\" }})` to inspect the updated page and continue."
+    );
+    let _ = store.receive(
+        &agent.id,
+        anyagents_core::Incoming {
+            source_key: Some(msg_id),
+            text,
+            sender: Some("system:browser-takeover".to_string()),
+            reply_to: None,
+            quote: None,
+            source_time_ms: Some(now),
+            received_at_ms: Some(now),
+            origin: None,
+        },
+    );
+    if agent.state == "idle" || agent.state == "archived" {
+        let _ = store.set_agent_state(&agent.id, "running");
+    }
+    crate::create::poke_agent_wake_socket(data, &agent.id);
+    crate::create::poke_agent_wake_socket_mail(data, &agent.id);
+}
+
+fn spawn_cloudflared_quick_tunnel(local_port: u16, token: &str) -> (Option<String>, Option<u32>) {
+    if let Ok(explicit_base) = std::env::var("ANYAGENTS_TAKEOVER_URL") {
+        let trimmed = explicit_base.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return (Some(format!("{trimmed}/takeover/{token}")), None);
+        }
+    }
+    let candidates = [
+        "/home/kyle/.local/bin/cloudflared",
+        "/usr/local/bin/cloudflared",
+        "/usr/bin/cloudflared",
+        "cloudflared",
+    ];
+    let Some(bin) = candidates.into_iter().find(|p| {
+        if p.starts_with('/') {
+            Path::new(p).is_file()
+        } else {
+            Command::new("which")
+                .arg(p)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+    }) else {
+        return (None, None);
+    };
+
+    let mut cmd = Command::new(bin);
+    cmd.args([
+        "tunnel",
+        "--no-autoupdate",
+        "--url",
+        &format!("http://127.0.0.1:{local_port}"),
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    let Ok(mut child) = cmd.spawn() else {
+        return (None, None);
+    };
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+
+    if let Some(stderr) = child.stderr.take() {
+        let tx_err = tx.clone();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                if let Some(url) = extract_trycloudflare_url(&line) {
+                    let _ = tx_err.send(url);
+                }
+            }
+        });
+    }
+    if let Some(stdout) = child.stdout.take() {
+        std::thread::spawn(move || {
+            use std::io::{BufRead, BufReader};
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if let Some(url) = extract_trycloudflare_url(&line) {
+                    let _ = tx.send(url);
+                }
+            }
+        });
+    }
+
+    if let Ok(base_url) = rx.recv_timeout(Duration::from_secs(7)) {
+        let clean = base_url.trim_end_matches('/');
+        (Some(format!("{clean}/takeover/{token}")), Some(pid))
+    } else {
+        stop_process_group(pid);
+        (None, None)
+    }
+}
+
+fn extract_trycloudflare_url(line: &str) -> Option<String> {
+    let idx = line.find("https://")?;
+    let rest = &line[idx..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || c == '|' || c == '"' || c == '\'')
+        .unwrap_or(rest.len());
+    let candidate = &rest[..end];
+    if candidate.contains(".trycloudflare.com") {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+fn render_takeover_html(profile: &str, token: &str, reason: Option<&str>) -> String {
+    let reason_banner = reason
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Solve the CAPTCHA / verification challenge below, then click Done.");
+    let reason_escaped = reason_banner
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;");
+    let profile_escaped = profile
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>AnyAgents Browser Takeover ({profile_escaped})</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: #0b0f17;
+      color: #f3f4f6;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }}
+    .topbar {{
+      background: #111827;
+      border-bottom: 1px solid #1f2937;
+      padding: 10px 14px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+      justify-content: space-between;
+    }}
+    .badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 600;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #1e293b;
+      color: #38bdf8;
+    }}
+    .badge.warn {{ background: #422006; color: #fbbf24; }}
+    .badge.ok {{ background: #064e3b; color: #34d399; }}
+    .reason {{
+      font-size: 13px;
+      color: #d1d5db;
+      flex: 1 1 240px;
+    }}
+    .controls {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      align-items: center;
+    }}
+    input.text-box {{
+      background: #0f172a;
+      color: #f9fafb;
+      border: 1px solid #334155;
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+      min-width: 170px;
+    }}
+    button {{
+      border: 1px solid #334155;
+      background: #1e293b;
+      color: #f9fafb;
+      border-radius: 6px;
+      padding: 6px 11px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+    }}
+    button:hover {{ background: #334155; }}
+    button.done-btn {{
+      background: #059669;
+      border-color: #10b981;
+      color: #ffffff;
+      font-weight: 600;
+      padding: 7px 14px;
+    }}
+    button.done-btn:hover {{ background: #047857; }}
+    .urlbar {{
+      background: #0f172a;
+      border-bottom: 1px solid #1e293b;
+      padding: 6px 14px;
+      font-size: 12px;
+      color: #94a3b8;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    .stage {{
+      flex: 1;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 8px;
+      overflow: auto;
+    }}
+    canvas {{
+      background: #000;
+      max-width: 100%;
+      height: auto;
+      border: 1px solid #1f2937;
+      border-radius: 6px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+      touch-action: none;
+      cursor: pointer;
+    }}
+    .done-overlay {{
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(11, 15, 23, 0.92);
+      align-items: center;
+      justify-content: center;
+      flex-direction: column;
+      gap: 12px;
+      z-index: 50;
+      text-align: center;
+      padding: 24px;
+    }}
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <span class="badge" id="status-badge">🟢 Live Profile: {profile_escaped}</span>
+    <span class="badge warn" id="captcha-badge" style="display:none;">⚠️ Challenge Active</span>
+    <div class="reason">{reason_escaped}</div>
+    <div class="controls">
+      <input id="type-input" class="text-box" type="text" placeholder="Type/paste text or 2FA..." />
+      <button type="button" id="send-text-btn">Type</button>
+      <button type="button" id="enter-btn">Enter ↵</button>
+      <button type="button" id="bksp-btn">⌫</button>
+      <button type="button" id="reload-btn">↻</button>
+      <button type="button" class="done-btn" id="done-btn">✅ Done — Hand Back to Agent</button>
+    </div>
+  </div>
+  <div class="urlbar">
+    <span>URL:</span>
+    <span id="page-url">connecting...</span>
+  </div>
+  <div class="stage">
+    <canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
+  </div>
+  <div class="done-overlay" id="done-overlay">
+    <h2>✅ Control Handed Back to Agent</h2>
+    <p>Your session cookies and verification state are saved in profile <b>{profile_escaped}</b>. You can close this tab now.</p>
+  </div>
+  <script>
+    const TOKEN = {token_json};
+    const BASE = "/takeover/" + encodeURIComponent(TOKEN);
+    const canvas = document.getElementById("screen");
+    const ctx = canvas.getContext("2d");
+    const urlEl = document.getElementById("page-url");
+    const captchaBadge = document.getElementById("captcha-badge");
+    const doneOverlay = document.getElementById("done-overlay");
+    let completed = false;
+    let isPointerDown = false;
+
+    async function sendInput(payload) {{
+      if (completed) return;
+      try {{
+        await fetch(BASE + "/input", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify(payload),
+        }});
+      }} catch (_) {{}}
+    }}
+
+    function canvasCoords(clientX, clientY) {{
+      const rect = canvas.getBoundingClientRect();
+      const x = Math.round(((clientX - rect.left) / Math.max(rect.width, 1)) * canvas.width);
+      const y = Math.round(((clientY - rect.top) / Math.max(rect.height, 1)) * canvas.height);
+      return {{ x: Math.max(0, Math.min(canvas.width, x)), y: Math.max(0, Math.min(canvas.height, y)) }};
+    }}
+
+    canvas.addEventListener("pointerdown", (e) => {{
+      e.preventDefault();
+      canvas.focus();
+      isPointerDown = true;
+      const pt = canvasCoords(e.clientX, e.clientY);
+      sendInput({{ type: "mouse", event_type: "mousePressed", x: pt.x, y: pt.y, button: "left", buttons: 1 }});
+    }});
+
+    canvas.addEventListener("pointermove", (e) => {{
+      if (!isPointerDown) return;
+      e.preventDefault();
+      const pt = canvasCoords(e.clientX, e.clientY);
+      sendInput({{ type: "mouse", event_type: "mouseMoved", x: pt.x, y: pt.y, button: "left", buttons: 1 }});
+    }});
+
+    window.addEventListener("pointerup", (e) => {{
+      if (!isPointerDown) return;
+      isPointerDown = false;
+      const pt = canvasCoords(e.clientX, e.clientY);
+      sendInput({{ type: "mouse", event_type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0 }});
+    }});
+
+    canvas.addEventListener("wheel", (e) => {{
+      e.preventDefault();
+      const pt = canvasCoords(e.clientX, e.clientY);
+      sendInput({{ type: "wheel", x: pt.x, y: pt.y, delta_x: e.deltaX, delta_y: e.deltaY }});
+    }}, {{ passive: false }});
+
+    canvas.addEventListener("keydown", (e) => {{
+      if (e.target !== canvas) return;
+      e.preventDefault();
+      sendInput({{ type: "key", key: e.key }});
+    }});
+
+    document.getElementById("send-text-btn").addEventListener("click", () => {{
+      const inp = document.getElementById("type-input");
+      if (inp.value) {{
+        sendInput({{ type: "text", text: inp.value, submit: false }});
+        inp.value = "";
+      }}
+    }});
+    document.getElementById("type-input").addEventListener("keydown", (e) => {{
+      if (e.key === "Enter") {{
+        e.preventDefault();
+        const inp = e.target;
+        if (inp.value) {{
+          sendInput({{ type: "text", text: inp.value, submit: true }});
+          inp.value = "";
+        }} else {{
+          sendInput({{ type: "key", key: "Enter" }});
+        }}
+      }}
+    }});
+    document.getElementById("enter-btn").addEventListener("click", () => sendInput({{ type: "key", key: "Enter" }}));
+    document.getElementById("bksp-btn").addEventListener("click", () => sendInput({{ type: "key", key: "Backspace" }}));
+    document.getElementById("reload-btn").addEventListener("click", () => sendInput({{ type: "reload" }}));
+
+    document.getElementById("done-btn").addEventListener("click", async () => {{
+      try {{
+        await fetch(BASE + "/complete", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ note: "completed by user in takeover UI" }}),
+        }});
+      }} catch (_) {{}}
+      completed = true;
+      doneOverlay.style.display = "flex";
+    }});
+
+    async function pollFrame() {{
+      if (completed) return;
+      try {{
+        const img = new Image();
+        const loaded = new Promise((resolve, reject) => {{
+          img.onload = resolve;
+          img.onerror = reject;
+        }});
+        img.src = BASE + "/frame.jpg?t=" + Date.now();
+        await loaded;
+        if (img.naturalWidth > 0 && img.naturalHeight > 0) {{
+          if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {{
+            canvas.width = img.naturalWidth;
+            canvas.height = img.naturalHeight;
+          }}
+          ctx.drawImage(img, 0, 0);
+        }}
+      }} catch (_) {{}}
+      setTimeout(pollFrame, 160);
+    }}
+
+    async function pollState() {{
+      if (completed) return;
+      try {{
+        const res = await fetch(BASE + "/state");
+        if (res.ok) {{
+          const st = await res.json();
+          if (st.url) urlEl.textContent = st.url + (st.title ? " — " + st.title : "");
+          if (st.captcha_detected) {{
+            captchaBadge.style.display = "inline-flex";
+            captchaBadge.className = "badge warn";
+            captchaBadge.textContent = "⚠️ " + (st.captcha_kind || "Challenge Active");
+          }} else {{
+            captchaBadge.style.display = "inline-flex";
+            captchaBadge.className = "badge ok";
+            captchaBadge.textContent = "✅ No Challenge Detected";
+          }}
+          if (st.completed) {{
+            completed = true;
+            doneOverlay.style.display = "flex";
+            return;
+          }}
+        }}
+      }} catch (_) {{}}
+      setTimeout(pollState, 800);
+    }}
+
+    pollFrame();
+    pollState();
+  </script>
+</body>
+</html>"#,
+        token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into()),
+    )
+}
+
+fn dispatch_takeover_input(
+    data: &Path,
+    profile: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let mut rt = load_runtime(data, profile)
+        .ok_or_else(|| Error::Message(format!("browser profile `{profile}` is not running")))?;
+    touch_runtime(data, &mut rt);
+    let target = select_page_target(data, &mut rt, None)?;
+    let ws_url = target
+        .ws_url
+        .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
+    let mut cdp = CdpSession::connect(rt.cdp_port, &ws_url)?;
+
+    let kind = payload
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("click");
+    match kind {
+        "click" => {
+            let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            dispatch_trusted_click(&mut cdp, x, y)?;
+            Ok(serde_json::json!({ "ok": true, "type": "click", "x": x, "y": y }))
+        }
+        "mouse" => {
+            let event_type = payload
+                .get("event_type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("mouseMoved");
+            let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let button = payload
+                .get("button")
+                .and_then(|v| v.as_str())
+                .unwrap_or("left");
+            let buttons = payload
+                .get("buttons")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(if event_type == "mouseReleased" { 0 } else { 1 });
+            cdp.call(
+                "Input.dispatchMouseEvent",
+                serde_json::json!({
+                    "type": event_type,
+                    "x": x,
+                    "y": y,
+                    "button": button,
+                    "buttons": buttons,
+                    "clickCount": 1,
+                }),
+            )?;
+            Ok(serde_json::json!({ "ok": true, "type": "mouse", "event_type": event_type }))
+        }
+        "wheel" => {
+            let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(400.0);
+            let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(300.0);
+            let delta_x = payload
+                .get("delta_x")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            let delta_y = payload
+                .get("delta_y")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(120.0);
+            cdp.call(
+                "Input.dispatchMouseEvent",
+                serde_json::json!({
+                    "type": "mouseWheel",
+                    "x": x,
+                    "y": y,
+                    "deltaX": delta_x,
+                    "deltaY": delta_y,
+                }),
+            )?;
+            Ok(serde_json::json!({ "ok": true, "type": "wheel" }))
+        }
+        "key" => {
+            let raw_key = payload
+                .get("key")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Enter");
+            let spec = resolve_key_spec(raw_key);
+            if spec.key.chars().count() == 1 && spec.vk != 13 && spec.vk != 9 && spec.vk != 8 {
+                let s = spec.key.clone();
+                let _ = cdp.call(
+                    "Input.dispatchKeyEvent",
+                    serde_json::json!({
+                        "type": "keyDown",
+                        "key": s,
+                        "code": spec.code,
+                        "text": s,
+                        "unmodifiedText": s,
+                        "windowsVirtualKeyCode": spec.vk,
+                        "nativeVirtualKeyCode": spec.vk,
+                    }),
+                );
+                let _ = cdp.call(
+                    "Input.dispatchKeyEvent",
+                    serde_json::json!({
+                        "type": "keyUp",
+                        "key": spec.key,
+                        "code": spec.code,
+                        "windowsVirtualKeyCode": spec.vk,
+                        "nativeVirtualKeyCode": spec.vk,
+                    }),
+                );
+            } else {
+                dispatch_cdp_key_down(&mut cdp, &spec, false, None)?;
+                dispatch_cdp_key_up(&mut cdp, &spec, None)?;
+            }
+            Ok(serde_json::json!({ "ok": true, "type": "key", "key": spec.key }))
+        }
+        "text" => {
+            let text_val = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
+            let submit = payload
+                .get("submit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if text_val.chars().count() <= 128 && !text_val.contains('\n') {
+                for ch in text_val.chars() {
+                    let s = ch.to_string();
+                    let _ = cdp.call(
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({
+                            "type": "keyDown",
+                            "key": s,
+                            "text": s,
+                            "unmodifiedText": s,
+                        }),
+                    );
+                    let _ = cdp.call(
+                        "Input.dispatchKeyEvent",
+                        serde_json::json!({
+                            "type": "keyUp",
+                            "key": s,
+                        }),
+                    );
+                }
+            } else if !text_val.is_empty() {
+                let _ = cdp.call("Input.insertText", serde_json::json!({ "text": text_val }));
+            }
+            if submit {
+                let enter = resolve_key_spec("Enter");
+                let _ = dispatch_cdp_key_down(&mut cdp, &enter, false, None);
+                let _ = dispatch_cdp_key_up(&mut cdp, &enter, None);
+            }
+            Ok(serde_json::json!({ "ok": true, "type": "text", "submitted": submit }))
+        }
+        "navigate" => {
+            if let Some(u) = payload
+                .get("url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                let _ = cdp.call("Page.navigate", serde_json::json!({ "url": u }));
+            }
+            Ok(serde_json::json!({ "ok": true, "type": "navigate" }))
+        }
+        "reload" => {
+            let _ = cdp.call("Page.reload", serde_json::json!({}));
+            Ok(serde_json::json!({ "ok": true, "type": "reload" }))
+        }
+        other => Err(Error::Message(format!(
+            "unsupported takeover input type `{other}`"
+        ))),
+    }
+}
+
+fn write_http_response(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(body)?;
+    stream.flush()
+}
+
+fn handle_takeover_http_client(
+    mut stream: TcpStream,
+    data: &Path,
+    profile: &str,
+    expected_token: &str,
+) -> bool {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+    let mut buf = Vec::with_capacity(2048);
+    let mut chunk = [0u8; 1024];
+    let header_end = loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if buf.len() > 65536 {
+                    return false;
+                }
+            }
+        }
+    };
+    let header_str = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let first_line = header_str.lines().next().unwrap_or("");
+    let mut parts = first_line.split_whitespace();
+    let method = parts.next().unwrap_or("GET");
+    let raw_path = parts.next().unwrap_or("/");
+    let path_only = raw_path.split('?').next().unwrap_or("/");
+
+    let content_len: usize = header_str
+        .lines()
+        .find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                v.trim().parse::<usize>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(0);
+    while buf.len() < header_end + content_len && buf.len() < 131_072 {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+    let body_bytes = if buf.len() >= header_end {
+        &buf[header_end..buf.len().min(header_end + content_len)]
+    } else {
+        &[][..]
+    };
+
+    if path_only == "/healthz" {
+        let _ = write_http_response(&mut stream, "200 OK", "application/json", b"{\"ok\":true}");
+        return false;
+    }
+
+    let prefix = format!("/takeover/{expected_token}");
+    let subpath = match path_only.strip_prefix(&prefix) {
+        Some(s) => s,
+        None => {
+            let matched = path_only
+                .strip_prefix("/takeover/")
+                .map(|rest| rest.split('/').next().unwrap_or(""))
+                .is_some_and(|tok| constant_time_eq(tok, expected_token));
+            if !matched {
+                let _ = write_http_response(
+                    &mut stream,
+                    "403 Forbidden",
+                    "application/json",
+                    b"{\"error\":\"invalid takeover token\"}",
+                );
+                return false;
+            }
+            ""
+        }
+    };
+
+    match (method, subpath) {
+        ("GET", "" | "/") => {
+            let reason = load_takeover_state(data, profile).and_then(|s| s.reason);
+            let html = render_takeover_html(profile, expected_token, reason.as_deref());
+            let _ = write_http_response(
+                &mut stream,
+                "200 OK",
+                "text/html; charset=utf-8",
+                html.as_bytes(),
+            );
+            false
+        }
+        ("GET", "/frame.jpg") => {
+            let Some(mut rt) = load_runtime(data, profile) else {
+                let _ = write_http_response(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "application/json",
+                    b"{\"error\":\"browser not running\"}",
+                );
+                return false;
+            };
+            let Ok(target) = select_page_target(data, &mut rt, None) else {
+                let _ = write_http_response(
+                    &mut stream,
+                    "503 Service Unavailable",
+                    "application/json",
+                    b"{\"error\":\"no page target\"}",
+                );
+                return false;
+            };
+            let Some(ws_url) = target.ws_url else {
+                return false;
+            };
+            let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url) else {
+                return false;
+            };
+            if let Ok(shot) = cdp.call(
+                "Page.captureScreenshot",
+                serde_json::json!({
+                    "format": "jpeg",
+                    "quality": 75,
+                }),
+            ) && let Some(b64) = shot.get("data").and_then(|v| v.as_str())
+                && let Ok(jpeg_bytes) = decode_base64(b64)
+            {
+                let _ = write_http_response(&mut stream, "200 OK", "image/jpeg", &jpeg_bytes);
+            } else {
+                let _ = write_http_response(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    "application/json",
+                    b"{\"error\":\"capture failed\"}",
+                );
+            }
+            false
+        }
+        ("GET", "/state") => {
+            let mut url = String::new();
+            let mut title = String::new();
+            let mut cap = CaptchaDetection::default();
+            if let Some(mut rt) = load_runtime(data, profile)
+                && let Ok(target) = select_page_target(data, &mut rt, None)
+            {
+                url = target.url.clone();
+                title = target.title.clone();
+                if let Some(ws_url) = target.ws_url
+                    && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
+                {
+                    cap = detect_captcha(&mut cdp);
+                    if let Ok(u) = eval_js(&mut cdp, "location.href")
+                        && let Some(s) = u.as_str()
+                    {
+                        url = s.to_string();
+                    }
+                    if let Ok(t) = eval_js(&mut cdp, "document.title || ''")
+                        && let Some(s) = t.as_str()
+                    {
+                        title = s.to_string();
+                    }
+                }
+            }
+            let st = load_takeover_state(data, profile);
+            let body = serde_json::json!({
+                "profile": profile,
+                "url": url,
+                "title": title,
+                "captcha_detected": cap.detected,
+                "captcha_kind": cap.kind,
+                "captcha_summary": cap.summary,
+                "holder": st.as_ref().map(|s| s.holder.as_str()).unwrap_or("agent"),
+                "completed": st.as_ref().is_none_or(|s| s.completed),
+                "expires_at_ms": st.as_ref().map(|s| s.expires_at_ms),
+            });
+            let bytes = serde_json::to_vec(&body).unwrap_or_default();
+            let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+            false
+        }
+        ("POST", "/input") => {
+            let payload: serde_json::Value =
+                serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+            match dispatch_takeover_input(data, profile, &payload) {
+                Ok(res) => {
+                    let bytes = serde_json::to_vec(&res).unwrap_or_default();
+                    let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+                }
+                Err(err) => {
+                    let bytes = serde_json::to_vec(&serde_json::json!({
+                        "ok": false,
+                        "error": err.to_string(),
+                    }))
+                    .unwrap_or_default();
+                    let _ = write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        &bytes,
+                    );
+                }
+            }
+            false
+        }
+        ("POST", "/complete") => {
+            let payload: serde_json::Value =
+                serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
+            let note = payload
+                .get("note")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let done = complete_takeover_session(data, profile, note.as_deref());
+            let bytes = serde_json::to_vec(&done).unwrap_or_default();
+            let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+            true
+        }
+        _ => {
+            let _ = write_http_response(
+                &mut stream,
+                "404 Not Found",
+                "application/json",
+                b"{\"error\":\"not found\"}",
+            );
+            false
+        }
+    }
+}
+
+fn complete_takeover_session(data: &Path, profile: &str, note: Option<&str>) -> serde_json::Value {
+    let now = now_ms();
+    let mut current_url = String::new();
+    if let Some(mut rt) = load_runtime(data, profile)
+        && let Ok(target) = select_page_target(data, &mut rt, None)
+    {
+        current_url = target.url.clone();
+        if let Some(ws_url) = target.ws_url
+            && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
+            && let Ok(u) = eval_js(&mut cdp, "location.href")
+            && let Some(s) = u.as_str()
+        {
+            current_url = s.to_string();
+        }
+    }
+    if let Some(mut st) = load_takeover_state(data, profile) {
+        let was_completed = st.completed;
+        if let Some(tpid) = st.tunnel_pid.take() {
+            stop_process_group(tpid);
+        }
+        st.holder = "agent".to_string();
+        st.completed = true;
+        st.completed_at_ms = Some(now);
+        st.completion_note = note
+            .map(str::to_string)
+            .or_else(|| Some("completed by user".to_string()));
+        save_takeover_state(data, &st);
+        if !was_completed {
+            notify_agent_takeover_completed(
+                data,
+                st.owner_agent.as_deref(),
+                profile,
+                &current_url,
+                st.completion_note.as_deref(),
+            );
+        }
+        serde_json::json!({
+            "ok": true,
+            "profile": profile,
+            "holder": "agent",
+            "completed": true,
+            "completed_at_ms": now,
+            "url": current_url,
+        })
+    } else {
+        serde_json::json!({
+            "ok": true,
+            "profile": profile,
+            "holder": "agent",
+            "completed": true,
+            "url": current_url,
+        })
+    }
+}
+
+fn start_or_reuse_takeover_session(
+    data: &Path,
+    profile: &str,
+    owner_agent: Option<&str>,
+    reason: Option<&str>,
+    ttl_ms: Option<u64>,
+    want_tunnel: Option<bool>,
+    initial_captcha: &CaptchaDetection,
+) -> Result<BrowserTakeoverState, Error> {
+    let now = now_ms();
+    let duration_ms = ttl_ms
+        .unwrap_or(DEFAULT_TAKEOVER_TTL_MS)
+        .clamp(5_000, 3_600_000) as i64;
+    if let Some(mut existing) = load_takeover_state(data, profile)
+        && existing.holder == "human"
+        && !existing.completed
+        && now < existing.expires_at_ms
+        && cdp_port_alive(existing.port)
+    {
+        existing.expires_at_ms = now + duration_ms;
+        if let Some(r) = reason.filter(|s| !s.trim().is_empty()) {
+            existing.reason = Some(r.to_string());
+        }
+        save_takeover_state(data, &existing);
+        return Ok(existing);
+    }
+
+    cleanup_takeover_session(data, profile);
+
+    let listener = TcpListener::bind("0.0.0.0:0").or_else(|_| TcpListener::bind("127.0.0.1:0"))?;
+    let port = listener.local_addr()?.port();
+    let _ = listener.set_nonblocking(true);
+    let token = generate_takeover_token();
+    let local_url = format!("http://127.0.0.1:{port}/takeover/{token}");
+
+    let allow_tunnel = want_tunnel.unwrap_or_else(|| {
+        std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
+    });
+    let (public_url, tunnel_pid) = if allow_tunnel {
+        spawn_cloudflared_quick_tunnel(port, &token)
+    } else {
+        (None, None)
+    };
+    let takeover_url = public_url.clone().unwrap_or_else(|| local_url.clone());
+
+    let state = BrowserTakeoverState {
+        profile: profile.to_string(),
+        owner_agent: owner_agent.map(str::to_string),
+        token: token.clone(),
+        port,
+        local_url,
+        public_url,
+        takeover_url,
+        reason: reason.map(str::to_string),
+        holder: "human".to_string(),
+        completed: false,
+        completed_at_ms: None,
+        completion_note: None,
+        started_at_ms: now,
+        expires_at_ms: now + duration_ms,
+        tunnel_pid,
+        initial_captcha_detected: initial_captcha.detected,
+        initial_captcha_kind: initial_captcha.kind.clone(),
+    };
+    save_takeover_state(data, &state);
+
+    let data_dir = data.to_path_buf();
+    let prof = profile.to_string();
+    let tok = token;
+    std::thread::Builder::new()
+        .name(format!("anyagents-takeover-{prof}"))
+        .spawn(move || {
+            loop {
+                let now = now_ms();
+                let Some(cur) = load_takeover_state(&data_dir, &prof) else {
+                    break;
+                };
+                if cur.token != tok || cur.completed || now >= cur.expires_at_ms {
+                    if cur.token == tok && !cur.completed && now >= cur.expires_at_ms {
+                        reap_expired_takeover(&data_dir, &prof, now);
+                    }
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = stream.set_nonblocking(false);
+                        let finished = handle_takeover_http_client(stream, &data_dir, &prof, &tok);
+                        if finished {
+                            std::thread::sleep(Duration::from_millis(150));
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(40));
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .map_err(|e| Error::Message(format!("failed to spawn takeover server thread: {e}")))?;
+
+    Ok(state)
+}
+
+fn wait_for_takeover_completion(
+    data: &Path,
+    profile: &str,
+    wait_ms: u64,
+) -> (Option<BrowserTakeoverState>, CaptchaDetection) {
+    let deadline = std::time::Instant::now() + Duration::from_millis(wait_ms.clamp(100, 600_000));
+    let mut consecutive_cleared = 0u32;
+    loop {
+        let now = now_ms();
+        reap_expired_takeover(data, profile, now);
+        let st = load_takeover_state(data, profile);
+        let mut cap = CaptchaDetection::default();
+        if let Some(mut rt) = load_runtime(data, profile)
+            && let Ok(target) = select_page_target(data, &mut rt, None)
+            && let Some(ws_url) = target.ws_url
+            && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
+        {
+            cap = detect_captcha(&mut cdp);
+        }
+        let Some(ref cur) = st else {
+            return (None, cap);
+        };
+        if cur.completed || cur.holder != "human" {
+            return (st, cap);
+        }
+        if cur.initial_captcha_detected {
+            if !cap.detected {
+                consecutive_cleared += 1;
+                if consecutive_cleared >= 2 {
+                    let _ = complete_takeover_session(
+                        data,
+                        profile,
+                        Some("CAPTCHA challenge automatically detected as solved"),
+                    );
+                    return (load_takeover_state(data, profile), cap);
+                }
+            } else {
+                consecutive_cleared = 0;
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return (st, cap);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+fn check_human_takeover_fence(data: &Path, profile: &str, action: &str) -> Result<(), Error> {
+    let is_mutating = matches!(
+        action,
+        "open"
+            | "goto"
+            | "navigate"
+            | "click"
+            | "fill"
+            | "type"
+            | "input"
+            | "press"
+            | "key"
+            | "hold"
+            | "key_down"
+            | "keydown"
+            | "key_up"
+            | "keyup"
+            | "release"
+            | "release_keys"
+            | "eval"
+            | "evaluate"
+            | "js"
+    );
+    if !is_mutating {
+        return Ok(());
+    }
+    let now = now_ms();
+    reap_expired_takeover(data, profile, now);
+    if let Some(st) = load_takeover_state(data, profile)
+        && st.holder == "human"
+        && !st.completed
+        && now < st.expires_at_ms
+        && cdp_port_alive(st.port)
+    {
+        return Err(Error::Message(format!(
+            "CONTROL_HELD_BY_HUMAN: browser profile `{profile}` is currently held by a human takeover session ({}). Wait for the user to finish, call `browser({{ \"action\": \"wait_for_user\", \"profile\": \"{profile}\" }})`, or call `browser({{ \"action\": \"release_takeover\", \"profile\": \"{profile}\" }})` to reclaim control.",
+            st.takeover_url
+        )));
+    }
+    Ok(())
+}
+
 fn capture_snapshot(
     data: &Path,
     profile: &str,
@@ -1406,8 +2779,21 @@ fn capture_snapshot(
         }
     }
 
+    let captcha = detect_captcha(cdp);
     val["text"] = serde_json::Value::String(combined_text);
     val["elements"] = serde_json::to_value(&all_elements).unwrap_or_default();
+    val["captcha_detected"] = serde_json::Value::Bool(captcha.detected);
+    if let Some(kind) = captcha.kind {
+        val["captcha_kind"] = serde_json::Value::String(kind);
+    }
+    if let Some(summary) = captcha.summary {
+        val["captcha_summary"] = serde_json::Value::String(summary);
+    }
+    if captcha.detected {
+        val["takeover_hint"] = serde_json::Value::String(format!(
+            "Human verification / CAPTCHA detected on profile `{profile}`. Call `browser({{ \"action\": \"takeover\", \"profile\": \"{profile}\", \"reason\": \"solve CAPTCHA\" }})` and send `takeover_url` (and `screenshot_path`) to the user."
+        ));
+    }
 
     let stored = StoredRefs {
         url: val
@@ -2064,6 +3450,7 @@ pub fn execute(
                 .into_iter()
                 .map(|k| k.key)
                 .collect();
+            let takeover = load_takeover_state(data, &profile);
             if let Some(rt) = load_runtime(data, &profile) {
                 let pages = list_page_targets(rt.cdp_port).unwrap_or_default();
                 return Ok(serde_json::json!({
@@ -2073,6 +3460,7 @@ pub fn execute(
                     "fingerprint": fp,
                     "tabs": pages,
                     "held_keys": held,
+                    "takeover": takeover,
                 }));
             }
             return Ok(serde_json::json!({
@@ -2080,10 +3468,13 @@ pub fn execute(
                 "status": "stopped",
                 "fingerprint": fp,
                 "held_keys": held,
+                "takeover": takeover,
             }));
         }
         _ => {}
     }
+
+    check_human_takeover_fence(data, &profile, &action)?;
 
     let (mut rt, fp) = ensure_browser_running(data, &profile, req.headless)?;
 
@@ -2200,7 +3591,7 @@ pub fn execute(
             }
             apply_stealth(&mut cdp, &fp)?;
             let snap = capture_snapshot(data, &profile, &mut cdp)?;
-            Ok(serde_json::json!({
+            let mut out = serde_json::json!({
                 "profile": profile,
                 "status": "running",
                 "display_mode": rt.display_mode,
@@ -2208,17 +3599,36 @@ pub fn execute(
                 "title": snap.get("title").cloned().unwrap_or_default(),
                 "text_preview": snap.get("text").and_then(|v| v.as_str()).map(|s| s.chars().take(1500).collect::<String>()).unwrap_or_default(),
                 "interactive_elements": snap.get("elements").cloned().unwrap_or_default(),
-            }))
+                "captcha_detected": snap.get("captcha_detected").and_then(|v| v.as_bool()).unwrap_or(false),
+            });
+            if let Some(kind) = snap.get("captcha_kind").cloned() {
+                out["captcha_kind"] = kind;
+            }
+            if let Some(hint) = snap.get("takeover_hint").cloned() {
+                out["takeover_hint"] = hint;
+            }
+            Ok(out)
         }
         "snapshot" | "read" | "dom" => {
             let snap = capture_snapshot(data, &profile, &mut cdp)?;
-            Ok(serde_json::json!({
+            let mut out = serde_json::json!({
                 "profile": profile,
                 "url": snap.get("url").cloned().unwrap_or_default(),
                 "title": snap.get("title").cloned().unwrap_or_default(),
                 "text": snap.get("text").cloned().unwrap_or_default(),
                 "elements": snap.get("elements").cloned().unwrap_or_default(),
-            }))
+                "captcha_detected": snap.get("captcha_detected").and_then(|v| v.as_bool()).unwrap_or(false),
+            });
+            if let Some(kind) = snap.get("captcha_kind").cloned() {
+                out["captcha_kind"] = kind;
+            }
+            if let Some(hint) = snap.get("takeover_hint").cloned() {
+                out["takeover_hint"] = hint;
+            }
+            if let Some(st) = load_takeover_state(data, &profile) {
+                out["takeover"] = serde_json::to_value(st).unwrap_or_default();
+            }
+            Ok(out)
         }
         "click" => {
             let raw_sel = req
@@ -2816,8 +4226,163 @@ pub fn execute(
                 "cookies": list,
             }))
         }
+        "takeover" | "human_takeover" | "user_takeover" => {
+            if let Some(raw_url) = req.url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                let url = if raw_url.contains("://") || raw_url.starts_with("about:") {
+                    raw_url.to_string()
+                } else {
+                    format!("https://{raw_url}")
+                };
+                let _ = cdp.call("Page.navigate", serde_json::json!({ "url": url }));
+                std::thread::sleep(Duration::from_millis(800));
+            }
+            let cap = detect_captcha(&mut cdp);
+            let reason = req
+                .reason
+                .as_deref()
+                .or(req.text.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| cap.summary.clone());
+
+            let shots_dir = profile_dir(data, &profile).join("screenshots");
+            let _ = std::fs::create_dir_all(&shots_dir);
+            let shot_path = shots_dir.join(format!("takeover-{}.png", now_ms()));
+            let screenshot_path = if let Ok(shot) = cdp.call(
+                "Page.captureScreenshot",
+                serde_json::json!({
+                    "format": "png",
+                    "captureBeyondViewport": false,
+                }),
+            ) && let Some(b64) = shot.get("data").and_then(|v| v.as_str())
+                && let Ok(bytes) = decode_base64(b64)
+                && std::fs::write(&shot_path, &bytes).is_ok()
+            {
+                Some(shot_path.display().to_string())
+            } else {
+                None
+            };
+
+            let state = start_or_reuse_takeover_session(
+                data,
+                &profile,
+                Some(default_profile),
+                reason.as_deref(),
+                req.ttl_ms,
+                req.tunnel,
+                &cap,
+            )?;
+
+            if let Some(wait_ms) = req.wait_ms
+                && wait_ms > 0
+            {
+                let (after_st, after_cap) = wait_for_takeover_completion(data, &profile, wait_ms);
+                let completed = after_st.as_ref().is_some_and(|s| s.completed);
+                let snap = capture_snapshot(data, &profile, &mut cdp)?;
+                return Ok(serde_json::json!({
+                    "profile": profile,
+                    "status": if completed { "takeover_completed" } else { "takeover_active" },
+                    "holder": after_st.as_ref().map(|s| s.holder.as_str()).unwrap_or("agent"),
+                    "completed": completed,
+                    "takeover_url": state.takeover_url,
+                    "local_url": state.local_url,
+                    "public_url": state.public_url,
+                    "token": state.token,
+                    "screenshot_path": screenshot_path,
+                    "url": snap.get("url").cloned().unwrap_or_default(),
+                    "title": snap.get("title").cloned().unwrap_or_default(),
+                    "text_preview": snap.get("text").and_then(|v| v.as_str()).map(|s| s.chars().take(1500).collect::<String>()).unwrap_or_default(),
+                    "interactive_elements": snap.get("elements").cloned().unwrap_or_default(),
+                    "captcha_detected": after_cap.detected,
+                    "captcha_kind": after_cap.kind,
+                    "expires_at_ms": state.expires_at_ms,
+                }));
+            }
+
+            let cur_url = eval_js(&mut cdp, "location.href")
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let cur_title = eval_js(&mut cdp, "document.title || ''")
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+
+            Ok(serde_json::json!({
+                "profile": profile,
+                "status": "takeover_active",
+                "holder": state.holder,
+                "completed": state.completed,
+                "takeover_url": state.takeover_url,
+                "local_url": state.local_url,
+                "public_url": state.public_url,
+                "token": state.token,
+                "port": state.port,
+                "reason": state.reason,
+                "screenshot_path": screenshot_path,
+                "url": cur_url,
+                "title": cur_title,
+                "captcha_detected": cap.detected,
+                "captcha_kind": cap.kind,
+                "expires_at_ms": state.expires_at_ms,
+                "instructions": "Send `takeover_url` (and `screenshot_path` via `send` media) to the user so they can solve the CAPTCHA or verification challenge in the live browser session. When the user clicks 'Done — Hand Back to Agent', you will automatically receive `[Browser Takeover Completed]` (or call `browser({ \"action\": \"wait_for_user\", \"profile\": \"...\", \"wait_ms\": 120000 })`).",
+            }))
+        }
+        "takeover_status" | "wait_for_user" | "wait_takeover" => {
+            let should_wait = matches!(action.as_str(), "wait_for_user" | "wait_takeover")
+                || req.wait_ms.is_some_and(|w| w > 0);
+            let (st, cap) = if should_wait {
+                let wait_ms = req.wait_ms.unwrap_or(60_000);
+                wait_for_takeover_completion(data, &profile, wait_ms)
+            } else {
+                reap_expired_takeover(data, &profile, now_ms());
+                (
+                    load_takeover_state(data, &profile),
+                    detect_captcha(&mut cdp),
+                )
+            };
+            let snap = capture_snapshot(data, &profile, &mut cdp)?;
+            let active = st
+                .as_ref()
+                .is_some_and(|s| s.holder == "human" && !s.completed);
+            Ok(serde_json::json!({
+                "profile": profile,
+                "status": if active { "takeover_active" } else { "agent_control" },
+                "holder": st.as_ref().map(|s| s.holder.as_str()).unwrap_or("agent"),
+                "completed": st.as_ref().is_none_or(|s| s.completed),
+                "takeover": st,
+                "url": snap.get("url").cloned().unwrap_or_default(),
+                "title": snap.get("title").cloned().unwrap_or_default(),
+                "text_preview": snap.get("text").and_then(|v| v.as_str()).map(|s| s.chars().take(1500).collect::<String>()).unwrap_or_default(),
+                "interactive_elements": snap.get("elements").cloned().unwrap_or_default(),
+                "captcha_detected": cap.detected,
+                "captcha_kind": cap.kind,
+            }))
+        }
+        "release_takeover" | "end_takeover" | "resume_agent" => {
+            let note = req
+                .reason
+                .as_deref()
+                .or(req.text.as_deref())
+                .unwrap_or("released by agent");
+            let _ = complete_takeover_session(data, &profile, Some(note));
+            cleanup_takeover_session(data, &profile);
+            let snap = capture_snapshot(data, &profile, &mut cdp)?;
+            Ok(serde_json::json!({
+                "profile": profile,
+                "status": "agent_control",
+                "holder": "agent",
+                "released_takeover": true,
+                "url": snap.get("url").cloned().unwrap_or_default(),
+                "title": snap.get("title").cloned().unwrap_or_default(),
+                "text_preview": snap.get("text").and_then(|v| v.as_str()).map(|s| s.chars().take(1500).collect::<String>()).unwrap_or_default(),
+                "interactive_elements": snap.get("elements").cloned().unwrap_or_default(),
+                "captcha_detected": snap.get("captcha_detected").and_then(|v| v.as_bool()).unwrap_or(false),
+            }))
+        }
         other => Err(Error::Message(format!(
-            "unknown browser action `{other}`; expected `open`, `snapshot`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, `eval`, `screenshot`, `cookies`, `tabs`, `status`, `profiles`, or `close`"
+            "unknown browser action `{other}`; expected `open`, `snapshot`, `click`, `fill`, `press`, `hold`, `key_down`, `key_up`, `eval`, `screenshot`, `cookies`, `tabs`, `takeover`, `takeover_status`, `wait_for_user`, `release_takeover`, `status`, `profiles`, or `close`"
         ))),
     }
 }
@@ -3261,6 +4826,260 @@ mod tests {
             BrowserRequest {
                 action: "close".into(),
                 profile: Some("profile-b".into()),
+                ..Default::default()
+            },
+        );
+    }
+
+    fn raw_http_call(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16, Vec<u8>) {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect takeover server");
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let body_bytes = body.unwrap_or("").as_bytes();
+        let req = if body.is_some() {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body_bytes.len(),
+                body.unwrap_or("")
+            )
+        } else {
+            format!(
+                "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        stream.write_all(req.as_bytes()).expect("write request");
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+        let sep = resp
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("http header separator");
+        let header = String::from_utf8_lossy(&resp[..sep]);
+        let code = header
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(500);
+        (code, resp[sep + 4..].to_vec())
+    }
+
+    #[test]
+    fn human_takeover_captcha_detection_fencing_and_remote_solve() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let html = r#"<!doctype html>
+<html>
+<head><title>Just a moment...</title></head>
+<body style="margin:0;padding:40px;background:#111;color:#fff;">
+  <div id="cf-chl-widget" class="cf-turnstile" style="width:300px;height:80px;background:#2563eb;display:flex;align-items:center;justify-content:center;cursor:pointer;">
+    Verify you are human (Click to solve)
+  </div>
+  <input id="post_captcha_input" type="text" value="" style="margin-top:20px;" />
+  <button id="continue_btn" type="button">Continue</button>
+  <script>
+    window.__captchaSolved = false;
+    window.__trustedSolveClick = false;
+    const widget = document.getElementById('cf-chl-widget');
+    widget.addEventListener('click', (e) => {
+      window.__captchaSolved = true;
+      window.__trustedSolveClick = Boolean(e.isTrusted);
+      document.title = 'Dashboard Unlocked';
+      widget.remove();
+      document.getElementById('post_captcha_input').focus();
+    });
+  </script>
+</body>
+</html>"#
+        .to_string();
+
+        let port = spawn_html_server("127.0.0.1", html);
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let open_res = match execute(
+            dir.path(),
+            "captcha-prof",
+            BrowserRequest {
+                action: "open".into(),
+                profile: Some("captcha-prof".into()),
+                url: Some(format!("http://127.0.0.1:{port}/")),
+                headless: Some(true),
+                wait_ms: Some(300),
+                ..Default::default()
+            },
+        ) {
+            Ok(v) => v,
+            Err(err) => {
+                let msg = format!("{err:?}");
+                if msg.contains("did not open CDP port")
+                    || msg.contains("Operation not permitted")
+                    || msg.contains("Permission denied")
+                {
+                    return;
+                }
+                panic!("open captcha page: {err:?}");
+            }
+        };
+
+        assert_eq!(open_res["captcha_detected"], true);
+        assert_eq!(open_res["captcha_kind"], "cloudflare_turnstile");
+        assert!(
+            open_res["takeover_hint"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("takeover")
+        );
+
+        let takeover_res = execute(
+            dir.path(),
+            "captcha-prof",
+            BrowserRequest {
+                action: "takeover".into(),
+                profile: Some("captcha-prof".into()),
+                reason: Some("Solve Cloudflare Turnstile".into()),
+                tunnel: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("start takeover session");
+
+        assert_eq!(takeover_res["status"], "takeover_active");
+        assert_eq!(takeover_res["holder"], "human");
+        assert_eq!(takeover_res["captcha_detected"], true);
+        let token = takeover_res["token"]
+            .as_str()
+            .expect("takeover token")
+            .to_string();
+        let takeover_port = takeover_res["port"].as_u64().expect("takeover port") as u16;
+        let shot_path = takeover_res["screenshot_path"]
+            .as_str()
+            .expect("screenshot_path");
+        assert!(Path::new(shot_path).is_file());
+
+        // 1. Mutating agent actions must be fenced while human holds control.
+        let fenced_err = execute(
+            dir.path(),
+            "captcha-prof",
+            BrowserRequest {
+                action: "click".into(),
+                profile: Some("captcha-prof".into()),
+                selector: Some("#continue_btn".into()),
+                ..Default::default()
+            },
+        )
+        .expect_err("expected CONTROL_HELD_BY_HUMAN fence");
+        assert!(
+            fenced_err.to_string().contains("CONTROL_HELD_BY_HUMAN"),
+            "unexpected error: {fenced_err}"
+        );
+
+        // 2. Wrong takeover token must be rejected with 403 Forbidden.
+        let (bad_code, _) = raw_http_call(takeover_port, "GET", "/takeover/tok_wrong/state", None);
+        assert_eq!(bad_code, 403);
+
+        // 3. Valid token serves the HTML UI, JPEG frame, and live state.
+        let (html_code, html_bytes) =
+            raw_http_call(takeover_port, "GET", &format!("/takeover/{token}"), None);
+        assert_eq!(html_code, 200);
+        assert!(
+            String::from_utf8_lossy(&html_bytes).contains("Done — Hand Back to Agent"),
+            "expected takeover UI HTML"
+        );
+
+        let (jpg_code, jpg_bytes) = raw_http_call(
+            takeover_port,
+            "GET",
+            &format!("/takeover/{token}/frame.jpg"),
+            None,
+        );
+        assert_eq!(jpg_code, 200);
+        assert!(
+            jpg_bytes.len() > 100 && jpg_bytes.starts_with(&[0xff, 0xd8, 0xff]),
+            "expected valid JPEG screenshot frame"
+        );
+
+        let (state_code, state_bytes) = raw_http_call(
+            takeover_port,
+            "GET",
+            &format!("/takeover/{token}/state"),
+            None,
+        );
+        assert_eq!(state_code, 200);
+        let state_json: serde_json::Value =
+            serde_json::from_slice(&state_bytes).expect("parse state json");
+        assert_eq!(state_json["captcha_detected"], true);
+        assert_eq!(state_json["holder"], "human");
+
+        // 4. User clicks the Turnstile widget (centered around x=150, y=80) and types into the input via the remote takeover API.
+        let (click_code, _) = raw_http_call(
+            takeover_port,
+            "POST",
+            &format!("/takeover/{token}/input"),
+            Some(r#"{"type":"click","x":150,"y":80}"#),
+        );
+        assert_eq!(click_code, 200);
+        std::thread::sleep(Duration::from_millis(150));
+
+        let (text_code, _) = raw_http_call(
+            takeover_port,
+            "POST",
+            &format!("/takeover/{token}/input"),
+            Some(r#"{"type":"text","text":"SOLVED-BY-USER","submit":false}"#),
+        );
+        assert_eq!(text_code, 200);
+
+        // 5. User clicks "Done — Hand Back to Agent".
+        let (done_code, done_bytes) = raw_http_call(
+            takeover_port,
+            "POST",
+            &format!("/takeover/{token}/complete"),
+            Some(r#"{"note":"CAPTCHA solved by user"}"#),
+        );
+        assert_eq!(done_code, 200);
+        let done_json: serde_json::Value =
+            serde_json::from_slice(&done_bytes).expect("parse complete json");
+        assert_eq!(done_json["completed"], true);
+        assert_eq!(done_json["holder"], "agent");
+
+        // 6. Agent now re-inspects and can perform mutating actions again!
+        let snap_after = execute(
+            dir.path(),
+            "captcha-prof",
+            BrowserRequest {
+                action: "snapshot".into(),
+                profile: Some("captcha-prof".into()),
+                ..Default::default()
+            },
+        )
+        .expect("snapshot after takeover");
+        assert_eq!(snap_after["captcha_detected"], false);
+        assert_eq!(snap_after["title"], "Dashboard Unlocked");
+
+        let solved_eval = execute(
+            dir.path(),
+            "captcha-prof",
+            BrowserRequest {
+                action: "eval".into(),
+                profile: Some("captcha-prof".into()),
+                script: Some(
+                    "({ solved: window.__captchaSolved, trusted: window.__trustedSolveClick, val: document.getElementById('post_captcha_input').value })"
+                        .into(),
+                ),
+                ..Default::default()
+            },
+        )
+        .expect("eval solved state")["result"]
+            .clone();
+        assert_eq!(solved_eval["solved"], true);
+        assert_eq!(solved_eval["trusted"], true);
+        assert_eq!(solved_eval["val"], "SOLVED-BY-USER");
+
+        let _ = execute(
+            dir.path(),
+            "captcha-prof",
+            BrowserRequest {
+                action: "close".into(),
+                profile: Some("captcha-prof".into()),
                 ..Default::default()
             },
         );
