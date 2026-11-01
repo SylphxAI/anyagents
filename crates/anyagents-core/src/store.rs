@@ -449,9 +449,25 @@ pub enum Wake {
 /// Open database. Methods take a shared reference; writes serialize on the mutex.
 pub struct Store {
     conn: Mutex<Connection>,
+    db_path: PathBuf,
     data_dir: PathBuf,
     wakes: Mutex<Vec<Sender<Wake>>>,
     capabilities: Mutex<Option<String>>,
+}
+
+enum ReadConn<'a> {
+    Owned(Connection),
+    Guard(MutexGuard<'a, Connection>),
+}
+
+impl std::ops::Deref for ReadConn<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        match self {
+            Self::Owned(c) => c,
+            Self::Guard(g) => g,
+        }
+    }
 }
 
 /// A capability is 32 random bytes, written in hex.
@@ -496,6 +512,7 @@ impl Store {
         let _ = ensure_lexical_fts_backfilled(&mut conn);
         Ok(Self {
             conn: Mutex::new(conn),
+            db_path: path.to_path_buf(),
             data_dir: data_dir_for(path),
             wakes: Mutex::new(Vec::new()),
             capabilities: Mutex::new(None),
@@ -1958,7 +1975,7 @@ impl Store {
     /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let limit = req.limit.clamp(1, 200);
         let radius = req.radius.min(10);
         let since = req.since_ms.unwrap_or(0);
@@ -2003,6 +2020,13 @@ impl Store {
             .map(str::to_lowercase);
         let only_tools = req.only_tools || tool_filter.is_some();
         let include_tools = req.include_tools || only_tools;
+        let kind_sql_filter: Option<&str> = if only_tools {
+            Some("tool")
+        } else if !include_tools {
+            Some("message")
+        } else {
+            None
+        };
 
         let mut all_queries: Vec<String> = Vec::new();
         if let Some(q) = req
@@ -2103,8 +2127,13 @@ impl Store {
             std::collections::HashMap::new();
 
         if !all_queries.is_empty() {
-            // 1. Lexical FTS5 BM25 Leg (`rag_chunks_fts` over `text` + hybrid ASCII/CJK `search_tokens`).
-            let fts_query = build_fts5_query_multi(&all_queries);
+            // 1. Lexical FTS5 BM25 Leg with inverted-index filter pushdown (`agent_name`, `kind`, `tool_name`).
+            let fts_query = build_fts5_query_with_filters(
+                &all_queries,
+                agent_name_filter.as_deref(),
+                kind_sql_filter,
+                tool_filter.as_deref(),
+            );
             if !fts_query.is_empty()
                 && let Ok(mut fstmt) = conn.prepare(
                     "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms,
@@ -2124,7 +2153,7 @@ impl Store {
                     fts_query,
                     since,
                     until,
-                    i64::try_from((limit * 10).max(160)).unwrap_or(160)
+                    i64::try_from((limit * 8).max(120)).unwrap_or(120)
                 ])
             {
                 let mut rank = 0usize;
@@ -2176,54 +2205,73 @@ impl Store {
                 }
             }
 
-            // 2. Direct substring scan over `rag_chunks` (catches exact punctuation, CLI flags, paths, or CJK substrings).
-            for q_raw in &all_queries {
-                let q_trim = q_raw.trim();
-                if q_trim.is_empty() {
-                    continue;
-                }
-                let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
-                let mut lstmt = conn.prepare(
-                    "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
-                            agent_name, kind, tool_name, seq
-                     FROM rag_chunks
-                     WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
-                       AND text LIKE ?3 ESCAPE '\\'
-                     ORDER BY timestamp_ms DESC
-                     LIMIT ?4",
-                )?;
-                let mut lrows = lstmt.query(params![
-                    since,
-                    until,
-                    like_pat,
-                    i64::try_from((limit * 4).max(80)).unwrap_or(80)
-                ])?;
-                let mut rank = 0usize;
-                while let Some(row) = lrows.next()? {
-                    let cid: String = row.get(0)?;
-                    let aname: String = row.get(6)?;
-                    let kind: String = row.get(7)?;
-                    let tool_name: String = row.get(8)?;
-                    let seq: i64 = row.get(9)?;
-                    let turn = ConversationTurn {
-                        id: cid.clone(),
-                        direction: row.get(1)?,
-                        from: row.get(2)?,
-                        to: row.get(3)?,
-                        reply_to: Some(format!("exact:agent={aname}:kind={kind}:seq={seq}")),
-                        text: row.get(4)?,
-                        timestamp_ms: row.get(5)?,
-                    };
-                    if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
+            // 2. Bounded index-pushed substring fallback (only when FTS5 returned fewer than `limit` hits
+            //    or for symbol/punctuation queries that produce no FTS tokens).
+            if scores.len() < limit {
+                for q_raw in &all_queries {
+                    let q_trim = q_raw.trim();
+                    if q_trim.is_empty() {
                         continue;
                     }
-                    *scores.entry(cid.clone()).or_insert(0.0) += 1.6 / (30.0 + (rank as f64) + 1.0);
-                    chunk_meta.entry(cid).or_insert((turn, aname, seq));
-                    rank += 1;
+                    let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
+                    let mut lstmt = conn.prepare(
+                        "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
+                                agent_name, kind, tool_name, seq
+                         FROM (
+                             SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
+                                    agent_name, kind, tool_name, seq
+                             FROM rag_chunks
+                             WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
+                               AND (?5 IS NULL OR LOWER(agent_name) = ?5)
+                               AND (?6 IS NULL OR kind = ?6)
+                               AND (?7 IS NULL OR seq >= ?7)
+                               AND (?8 IS NULL OR seq <= ?8)
+                             ORDER BY timestamp_ms DESC
+                             LIMIT 2000
+                         )
+                         WHERE text LIKE ?3 ESCAPE '\\'
+                         ORDER BY timestamp_ms DESC
+                         LIMIT ?4",
+                    )?;
+                    let mut lrows = lstmt.query(params![
+                        since,
+                        until,
+                        like_pat,
+                        i64::try_from((limit * 4).max(80)).unwrap_or(80),
+                        agent_name_filter.as_deref(),
+                        kind_sql_filter,
+                        req.from_seq,
+                        req.to_seq,
+                    ])?;
+                    let mut rank = 0usize;
+                    while let Some(row) = lrows.next()? {
+                        let cid: String = row.get(0)?;
+                        let aname: String = row.get(6)?;
+                        let kind: String = row.get(7)?;
+                        let tool_name: String = row.get(8)?;
+                        let seq: i64 = row.get(9)?;
+                        let turn = ConversationTurn {
+                            id: cid.clone(),
+                            direction: row.get(1)?,
+                            from: row.get(2)?,
+                            to: row.get(3)?,
+                            reply_to: Some(format!("exact:agent={aname}:kind={kind}:seq={seq}")),
+                            text: row.get(4)?,
+                            timestamp_ms: row.get(5)?,
+                        };
+                        if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
+                            continue;
+                        }
+                        *scores.entry(cid.clone()).or_insert(0.0) +=
+                            1.6 / (30.0 + (rank as f64) + 1.0);
+                        chunk_meta.entry(cid).or_insert((turn, aname, seq));
+                        rank += 1;
+                    }
                 }
             }
         } else {
-            // Structured Filter / Range / Tool History Browse Mode (no keyword query required).
+            // Structured Filter / Range / Tool History Browse Mode (no keyword query required)
+            // with full B-tree index pushdown on `agent_name`, `kind`, `tool_name`, `direction`, and `seq`.
             let order_sql = if req.sort == HistorySort::Oldest {
                 "ORDER BY timestamp_ms ASC, seq ASC, chunk_id ASC"
             } else {
@@ -2234,6 +2282,11 @@ impl Store {
                         agent_name, kind, tool_name, seq
                  FROM rag_chunks
                  WHERE timestamp_ms > ?1 AND timestamp_ms <= ?2
+                   AND (?4 IS NULL OR LOWER(agent_name) = ?4)
+                   AND (?5 IS NULL OR kind = ?5)
+                   AND (?6 IS NULL OR LOWER(direction) = ?6)
+                   AND (?7 IS NULL OR seq >= ?7)
+                   AND (?8 IS NULL OR seq <= ?8)
                  {order_sql}
                  LIMIT ?3"
             );
@@ -2241,7 +2294,12 @@ impl Store {
             let mut brows = bstmt.query(params![
                 since,
                 until,
-                i64::try_from((limit * 8).max(200)).unwrap_or(200)
+                i64::try_from((limit * 8).max(200)).unwrap_or(200),
+                agent_name_filter.as_deref(),
+                kind_sql_filter,
+                dir_filter.as_deref(),
+                req.from_seq,
+                req.to_seq,
             ])?;
             let mut rank = 0usize;
             while let Some(row) = brows.next()? {
@@ -2763,6 +2821,21 @@ impl Store {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn read_conn(&self) -> ReadConn<'_> {
+        if !self.db_path.as_os_str().is_empty()
+            && let Ok(c) = Connection::open_with_flags(
+                &self.db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+        {
+            let _ = c.busy_timeout(Duration::from_secs(5));
+            let _ = c.pragma_update(None, "query_only", "ON");
+            return ReadConn::Owned(c);
+        }
+        ReadConn::Guard(self.conn())
     }
 
     pub fn create_schedule(&self, input: NewSchedule) -> Result<AgentSchedule, Error> {
@@ -3574,16 +3647,22 @@ fn classify_chunk_kind_and_tool(
 }
 
 fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
-    let chunk_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM rag_chunks", [], |r| r.get(0))
+    let has_chunks: i64 = conn
+        .query_row("SELECT EXISTS(SELECT 1 FROM rag_chunks LIMIT 1)", [], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
-    if chunk_count == 0 {
+    if has_chunks == 0 {
         return Ok(());
     }
-    let fts_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM rag_chunks_fts", [], |r| r.get(0))
+    let has_fts: i64 = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM rag_chunks_fts_docsize LIMIT 1)",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
-    if fts_count >= chunk_count {
+    if has_fts != 0 {
         return Ok(());
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -3673,6 +3752,12 @@ fn index_rag_chunk(
             seq,
         ],
     )?;
+    if seq <= 0 {
+        let _ = conn.execute(
+            "UPDATE rag_chunks SET seq = rowid WHERE chunk_id = ?1 AND seq <= 0",
+            params![chunk_id],
+        );
+    }
     let _ = conn.execute(
         "DELETE FROM rag_chunks_fts WHERE chunk_id MATCH ?1",
         params![format!("\"{}\"", chunk_id.replace('"', ""))],
@@ -3695,7 +3780,12 @@ fn index_rag_chunk(
     Ok(())
 }
 
-fn build_fts5_query_multi(queries: &[String]) -> String {
+fn build_fts5_query_with_filters(
+    queries: &[String],
+    agent_name: Option<&str>,
+    kind: Option<&str>,
+    tool_name: Option<&str>,
+) -> String {
     let mut terms = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for raw in queries {
@@ -3706,7 +3796,34 @@ fn build_fts5_query_multi(queries: &[String]) -> String {
             }
         }
     }
-    terms.join(" OR ")
+    if terms.is_empty() {
+        return String::new();
+    }
+    let text_expr = if terms.len() == 1 {
+        terms.remove(0)
+    } else {
+        format!("({})", terms.join(" OR "))
+    };
+    let mut clauses = vec![text_expr];
+    if let Some(a) = agent_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean = a.replace('"', "");
+        if !clean.is_empty() {
+            clauses.push(format!("agent_name : \"{clean}\""));
+        }
+    }
+    if let Some(k) = kind.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean = k.replace('"', "");
+        if !clean.is_empty() {
+            clauses.push(format!("kind : \"{clean}\""));
+        }
+    }
+    if let Some(t) = tool_name.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean = t.replace('"', "").to_ascii_lowercase();
+        if !clean.is_empty() {
+            clauses.push(format!("tool_name : \"{clean}\""));
+        }
+    }
+    clauses.join(" AND ")
 }
 
 fn message_by_source(
@@ -4906,6 +5023,26 @@ mod tests {
         assert!(with_radius[0].text.contains("Step 1"));
         assert!(with_radius[1].text.contains("Step 2"));
         assert!(with_radius[2].text.contains("Step 3"));
+
+        // 5. FTS5 filter pushdown: even when another agent has 250 matching rows,
+        // filtering by `agent = "alice"` with `limit = 1` finds Alice's row via inverted-index intersection.
+        let bob = agent(&store, "bob");
+        for i in 0..250 {
+            store
+                .receive(&bob.id, Incoming::new(format!("heartbeat noise {i}")))
+                .unwrap();
+        }
+        let pushed_down = store
+            .search_history(&HistorySearchQuery {
+                query: Some("heartbeat".to_string()),
+                agent: Some("alice".to_string()),
+                limit: 1,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(pushed_down.len(), 1);
+        assert!(pushed_down[0].to.contains("alice") || pushed_down[0].from.contains("alice"));
+        assert!(pushed_down[0].text.contains("Step 2"));
     }
 
     #[test]
