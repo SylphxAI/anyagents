@@ -715,7 +715,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - Built-in harness sub-agent tools (`Task`/`Agent`/`task`/`invoke_subagent`) are **disabled by default** so sub-agents are never trapped inside a single vendor CLI. Always use `agents` for all peer, role, and sub-agent operations:\n\
              - **List Peers or Sub-Agents**: `agents({ \"action\": \"list\" })` (all agents), `agents({ \"action\": \"list\", \"parent\": \"self\" })` (your sub-agents + summary counts), `agents({ \"action\": \"list\", \"parent\": \"root\" })` (root agents), with optional `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`.\n\
              - **Inspect Status & Recent Turns**: `agents({ \"action\": \"inspect\", \"name\": \"<name-or-id>\", \"limit\": 10 })` (live status, schedules, and recent conversation turns in one call).\n\
-             - **Spawn a Sub-Agent**: `agents({ \"action\": \"spawn\", \"name\": \"<optional-name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"base\": \"<optional-base>\", \"workdir\": \"<optional-path-or-mode>\", \"description\": \"...\", \"prompt\": \"...\" })`. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`opencode` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
+             - **Spawn a Sub-Agent**: `agents({ \"action\": \"spawn\", \"name\": \"<optional-name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"base\": \"<optional-base>\", \"workdir\": \"<optional-path-or-mode>\", \"description\": \"...\", \"prompt\": \"...\" })`. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`sylphx` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
              - **Read or Update Role Description (`describe`)**: `agents({ \"action\": \"describe\", \"name\": \"self\" })` (read your own role), `agents({ \"action\": \"describe\", \"name\": \"self\", \"description\": \"...\" })` (update your own role/mission description; syncs your private system prompt and group roster), `agents({ \"action\": \"describe\", \"name\": \"all\" })` (read every peer's role & responsibilities).\n\
              - **Steer & Lifecycle Control**: `agents({ \"action\": \"steer\", \"name\": \"<name-or-id>\", \"prompt\": \"...\" })`, `agents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"name\": \"<name-or-id>\" })` (omit `name` on `\"archive\"` to archive yourself).\n\
              - **Admin / Configuration**: `agents({ \"action\": \"create\" | \"rename\" | \"role\" | \"harness\" | \"models\", ... })`.\n\
@@ -6217,7 +6217,7 @@ pub(crate) fn resolve_subagent_defaults(
 
     let inherit_harness = || {
         if parent_agent.harness == "agy" {
-            "claude-code".to_string()
+            "sylphx".to_string()
         } else {
             parent_agent.harness.clone()
         }
