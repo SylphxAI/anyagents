@@ -94,6 +94,9 @@ pub fn is_isolated_test_env() -> bool {
         || std::env::var_os("ANYAGENTS_TESTS").is_some()
         || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
         || std::env::var_os("ANYAGENTS_HARNESS_BIN").is_some()
+        || std::env::var_os("ANYAGENTS_CLAUDE_BIN").is_some()
+        || std::env::var_os("ANYAGENTS_CODEX_BIN").is_some()
+        || std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_some()
 }
 
 /// The server user's home directory on the host, resolved from
@@ -183,9 +186,16 @@ pub fn launch_boundary(agents: &[String]) -> bool {
     })
 }
 
-/// The socket group: the configured one, else the host's `anyagents-sock`.
+/// The socket group: the configured one, else the host's `anyagents-sock`
+/// when running outside isolated tests.
 fn sock_gid_for() -> Option<u32> {
-    number("ANYAGENTS_SOCKET_GID").or_else(|| lookup_group("anyagents-sock"))
+    number("ANYAGENTS_SOCKET_GID").or_else(|| {
+        if is_isolated_test_env() {
+            None
+        } else {
+            lookup_group("anyagents-sock")
+        }
+    })
 }
 
 /// The uid the deployment's own line gives one agent: `<agent>=<uid>` entries

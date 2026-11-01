@@ -398,7 +398,7 @@ impl Store {
             return Err(Error::Message("migrations did not apply".into()));
         }
         let _ = conn.execute(
-            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('running', 'paused', 'archived')",
+            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
             [],
         );
         Ok(Self {
@@ -909,7 +909,7 @@ impl Store {
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
-            if agent.state != "running" {
+            if agent.state == "archived" || agent.state == "paused" {
                 continue;
             }
             if author.as_deref() == Some(agent.name.as_str())
@@ -967,7 +967,7 @@ impl Store {
             let names = self
                 .list_agents()?
                 .into_iter()
-                .filter(|agent| agent.state == "running")
+                .filter(|agent| agent.state != "archived" && agent.state != "paused")
                 .map(|agent| agent.name)
                 .collect();
             return Ok(Some(names));

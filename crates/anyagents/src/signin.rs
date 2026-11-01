@@ -117,6 +117,8 @@ impl CommandRunner for ProcessRunner {
             }
         })?;
         if let Some(mut stdout) = child.stdout.take() {
+            let pass_through = std::io::IsTerminal::is_terminal(&std::io::stdout())
+                && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
             let mut buf = [0u8; 4096];
             let mut pending = Vec::new();
             loop {
@@ -127,7 +129,8 @@ impl CommandRunner for ProcessRunner {
                     if !pending.is_empty() {
                         let line = String::from_utf8_lossy(&pending).to_string();
                         let trimmed = line.trim_end_matches(['\r', '\n']);
-                        if trimmed.starts_with("LINK ")
+                        if !pass_through
+                            || trimmed.starts_with("LINK ")
                             || trimmed.starts_with("DEVICE ")
                             || trimmed.starts_with("PROMPT ")
                             || trimmed.starts_with("SIGNED_IN ")
@@ -146,7 +149,8 @@ impl CommandRunner for ProcessRunner {
                     let line_bytes: Vec<u8> = pending.drain(..=pos).collect();
                     let line = String::from_utf8_lossy(&line_bytes);
                     let trimmed = line.trim_end_matches(['\r', '\n']);
-                    if trimmed.starts_with("LINK ")
+                    if !pass_through
+                        || trimmed.starts_with("LINK ")
                         || trimmed.starts_with("DEVICE ")
                         || trimmed.starts_with("PROMPT ")
                         || trimmed.starts_with("SIGNED_IN ")
@@ -158,7 +162,7 @@ impl CommandRunner for ProcessRunner {
                         let _ = out.flush();
                     }
                 }
-                if !pending.is_empty() {
+                if pass_through && !pending.is_empty() {
                     let partial = String::from_utf8_lossy(&pending);
                     if !partial.starts_with("LINK")
                         && !partial.starts_with("DEVICE")
