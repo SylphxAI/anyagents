@@ -99,16 +99,31 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             .and_then(|p| p.to_str())
             .map(str::trim)
             .unwrap_or("");
+        let wd_lower = wd_str.to_ascii_lowercase();
+        let wd_is_cloud_keyword = matches!(
+            wd_lower.as_str(),
+            "cloud" | "cloud-worktree" | "cloud-sandbox"
+        ) || (agent.harness == "sylphx" && wd_lower == "sandbox");
+        let is_cloud_sandbox_mode = wd_is_cloud_keyword
+            || pairs
+                .iter()
+                .any(|(k, v)| k == "SYLPHX_SANDBOX" && v.eq_ignore_ascii_case("cloud"))
+            || std::env::var("SYLPHX_SANDBOX")
+                .ok()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cloud"));
+        if is_cloud_sandbox_mode && !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
+            pairs.push(("SYLPHX_SANDBOX".to_string(), "cloud".to_string()));
+        }
         let wd_is_worktree_keyword = matches!(
-            wd_str.to_ascii_lowercase().as_str(),
-            "worktree" | "branch" | "isolated"
+            wd_lower.as_str(),
+            "worktree" | "branch" | "isolated" | "cloud-worktree"
         );
         let wd_is_private_keyword = matches!(
-            wd_str.to_ascii_lowercase().as_str(),
-            "private" | "sandbox" | "self"
+            wd_lower.as_str(),
+            "private" | "sandbox" | "self" | "cloud" | "cloud-sandbox"
         );
         let wd_is_inherit_keyword = matches!(
-            wd_str.to_ascii_lowercase().as_str(),
+            wd_lower.as_str(),
             "inherit" | "parent"
         );
         let effective_repo = request
@@ -134,23 +149,45 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
         let cwd = if let Some(repo_raw) = effective_repo {
-            let target_wt = match &explicit_workdir {
-                Some(path) => std::path::absolute(path)?,
-                None => managed_abs.clone(),
-            };
-            provision_managed_worktree(
-                store,
-                &data,
-                &agent,
-                &config,
-                repo_raw,
-                request.branch.as_deref(),
-                request.base.as_deref(),
-                &target_wt,
-                parent_name.as_deref(),
-            )?;
-            target_wt
+            if agent.harness == "sylphx" && is_cloud_sandbox_mode && explicit_workdir.is_none() {
+                provision_cloud_sandbox_worktree_marker(
+                    store,
+                    &agent,
+                    &config,
+                    repo_raw,
+                    request.branch.as_deref(),
+                    request.base.as_deref(),
+                )?;
+                managed_abs.clone()
+            } else {
+                let target_wt = match &explicit_workdir {
+                    Some(path) => std::path::absolute(path)?,
+                    None => managed_abs.clone(),
+                };
+                provision_managed_worktree(
+                    store,
+                    &data,
+                    &agent,
+                    &config,
+                    repo_raw,
+                    request.branch.as_deref(),
+                    request.base.as_deref(),
+                    &target_wt,
+                    parent_name.as_deref(),
+                )?;
+                target_wt
+            }
         } else if wd_is_private_keyword {
+            if agent.harness == "sylphx" && is_cloud_sandbox_mode {
+                let _ = provision_cloud_sandbox_worktree_marker(
+                    store,
+                    &agent,
+                    &config,
+                    "inherit",
+                    request.branch.as_deref(),
+                    request.base.as_deref(),
+                );
+            }
             managed_abs.clone()
         } else if wd_is_inherit_keyword {
             let inherited_parent_wd = agent
@@ -448,6 +485,95 @@ fn add_git_worktree_from_local_repo(
     )))
 }
 
+fn provision_cloud_sandbox_worktree_marker(
+    store: &Store,
+    agent: &Agent,
+    config: &Path,
+    repo_raw: &str,
+    branch_opt: Option<&str>,
+    base_opt: Option<&str>,
+) -> Result<(), Error> {
+    let branch = branch_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("agent/{}", agent.name));
+    let mut resolved_repo = repo_raw.trim().to_string();
+    let mut initial_head = base_opt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_default();
+
+    if matches!(
+        resolved_repo.to_ascii_lowercase().as_str(),
+        "inherit" | "parent" | "worktree" | "branch" | "isolated"
+    ) {
+        if let Some(parent_wd) = agent
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok())
+            .and_then(|p| p.workdir)
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+        {
+            if let Ok(out) = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&parent_wd)
+                .args(["config", "--get", "remote.origin.url"])
+                .output()
+                && out.status.success()
+            {
+                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if !url.is_empty() {
+                    resolved_repo = url;
+                }
+            }
+            if initial_head.is_empty()
+                && let Ok(out) = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&parent_wd)
+                    .args(["rev-parse", "HEAD"])
+                    .output()
+                && out.status.success()
+            {
+                initial_head = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            }
+        }
+    } else if Path::new(&resolved_repo).is_dir() {
+        let local_repo = Path::new(&resolved_repo);
+        if let Ok(out) = std::process::Command::new("git")
+            .arg("-C")
+            .arg(local_repo)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            && out.status.success()
+        {
+            let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !url.is_empty() {
+                resolved_repo = url;
+            }
+        }
+    }
+
+    let payload = serde_json::json!({
+        "path": crate::sylphx::CLOUD_WORKSPACE_DIR,
+        "cloud_sandbox": true,
+        "repo": resolved_repo,
+        "branch": branch,
+        "base": initial_head,
+        "initial_head": initial_head,
+    });
+    if let Ok(bytes) = serde_json::to_vec_pretty(&payload) {
+        let _ = write_seat_shared_file(
+            &config.join(".anyagents-managed-worktree.json"),
+            &bytes,
+            0o664,
+        );
+    }
+    Ok(())
+}
+
 fn record_managed_worktree_marker(
     config: &Path,
     target_wt: &Path,
@@ -463,9 +589,27 @@ fn record_managed_worktree_marker(
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
+    let effective_repo = if matches!(
+        repo_raw.trim().to_ascii_lowercase().as_str(),
+        "inherit" | "parent" | "worktree" | "branch" | "isolated" | "explicit-worktree"
+    ) || Path::new(repo_raw).is_dir()
+    {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(target_wt)
+            .args(["config", "--get", "remote.origin.url"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| repo_raw.to_string())
+    } else {
+        repo_raw.to_string()
+    };
     let payload = serde_json::json!({
         "path": target_wt.display().to_string(),
-        "repo": repo_raw,
+        "repo": effective_repo,
         "branch": branch.unwrap_or(""),
         "initial_head": initial_head,
     });

@@ -384,7 +384,14 @@ pub fn write_sylphx_config(
     let mut command_vec = vec![mcp_command.display().to_string()];
     command_vec.extend(mcp_args.iter().cloned());
 
-    let doc = json!({
+    let existing_agent_json = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let worktree_marker = std::fs::read_to_string(config_dir.join(".anyagents-managed-worktree.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    let mut doc = json!({
         "schema_version": 1,
         "harness": "sylphx",
         "model": resolved_model,
@@ -404,6 +411,36 @@ pub fn write_sylphx_config(
             }
         }
     });
+
+    if let Some(obj) = doc.as_object_mut() {
+        for key in ["sandbox", "repo", "branch", "base"] {
+            if let Some(val) = worktree_marker
+                .as_ref()
+                .and_then(|m| m.get(key))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    existing_agent_json
+                        .as_ref()
+                        .and_then(|e| e.get(key))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                })
+            {
+                obj.insert(key.to_string(), json!(val));
+            }
+        }
+        if worktree_marker
+            .as_ref()
+            .and_then(|m| m.get("cloud_sandbox"))
+            .and_then(Value::as_bool)
+            == Some(true)
+        {
+            obj.insert("sandbox".to_string(), json!("cloud"));
+        }
+    }
     let text = serde_json::to_string_pretty(&doc)
         .map_err(|e| anyagents_core::Error::Message(e.to_string()))?;
     std::fs::write(config_dir.join("sylphx-agent.json"), format!("{text}\n"))?;
@@ -757,16 +794,17 @@ impl Harness for SylphxHarness {
                     let api_url = std::env::var("SYLPHX_API_URL")
                         .ok()
                         .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
-                    let steer_url = format!(
-                        "{}/v1/{}/agent_sessions/{}:steer",
-                        api_url.trim_end_matches('/'),
-                        env_slug,
-                        sess_id
-                    );
+                    let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
+                    let steer_url = format!("{}/v1/{sess_path}:steer", api_url.trim_end_matches('/'));
                     let _ = curl_post_json(
                         &steer_url,
                         Some(&api_key),
-                        &json!({ "content": marked }),
+                        &json!({
+                            "content": marked,
+                            "message": {
+                                "parts": [{ "text": marked }]
+                            }
+                        }),
                     );
                 }
                 if let Some(cb) = notify {
@@ -927,12 +965,8 @@ impl Harness for SylphxHarness {
             let api_url = std::env::var("SYLPHX_API_URL")
                 .ok()
                 .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
-            let interrupt_url = format!(
-                "{}/v1/{}/agent_sessions/{}:interrupt",
-                api_url.trim_end_matches('/'),
-                env_slug,
-                sess_id
-            );
+            let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
+            let interrupt_url = format!("{}/v1/{sess_path}:interrupt", api_url.trim_end_matches('/'));
             let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
         }
         if let Some(cb) = notify {
@@ -1023,7 +1057,33 @@ fn persist_turn_error(config_dir: &Path, err_msg: &str) {
     let _ = std::fs::write(&err_path, format!("{doc}\n"));
 }
 
-/// Runs a turn against the remote Sylphx Cloud Agents service (`/v1/{env}/agent_sessions`).
+fn cloud_session_resource_path(env_slug: &str, sess_id: &str) -> String {
+    let trimmed = sess_id.trim().trim_start_matches('/');
+    if trimmed.contains("/agent_sessions/") {
+        trimmed.to_string()
+    } else {
+        format!("{}/agent_sessions/{trimmed}", env_slug.trim().trim_matches('/'))
+    }
+}
+
+fn build_cloud_agent_client_tools() -> Vec<Value> {
+    build_tool_definitions()
+        .into_iter()
+        .filter_map(|t| {
+            let func = t.get("function")?;
+            Some(json!({
+                "name": func.get("name")?,
+                "description": func.get("description").cloned().unwrap_or(Value::String(String::new())),
+                "input_schema": func.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+                "client": {},
+            }))
+        })
+        .collect()
+}
+
+/// Runs a turn against the remote Sylphx Cloud Agents service (`/v1/{env}/agent_sessions`),
+/// executing any client tool calls (`send`, `agents`, `conversation`, `groups`, `schedule`,
+/// `browser`, `describe`, `archive`, and Cloud Sandbox worktree tools) via `:submitToolResult`.
 #[allow(clippy::too_many_arguments)]
 fn run_cloud_session_turn(
     state: &Arc<Mutex<SharedState>>,
@@ -1055,25 +1115,33 @@ fn run_cloud_session_turn(
 
     if agent_id.is_none() {
         let create_agent_url = format!("{base}/v1/{env_slug}/agents");
-        let body = json!({
-            "name": config_dir
-                .parent()
-                .and_then(|p| p.file_name())
-                .and_then(|s| s.to_str())
-                .unwrap_or("anyagents-sylphx"),
+        let agent_short_name = config_dir
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .unwrap_or("anyagents-sylphx");
+        let spec_body = json!({
+            "spec": {
+                "model": model_id,
+                "instructions": system_prompt,
+                "tools": build_cloud_agent_client_tools(),
+            },
+            "name": agent_short_name,
             "model": model_id,
             "system_prompt": system_prompt,
             "tools": build_tool_definitions(),
         });
-        let (st, raw) = curl_post_json(&create_agent_url, Some(&api_key), &body)?;
+        let (st, raw) = curl_post_json(&create_agent_url, Some(&api_key), &spec_body)?;
         if !(200..300).contains(&st) {
             return Err(format!("cloud create_agent HTTP {st}: {}", raw.trim()));
         }
         let val: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let id = val
-            .get("id")
+            .get("name")
+            .or_else(|| val.get("id"))
+            .or_else(|| val.get("uid"))
             .and_then(Value::as_str)
-            .ok_or_else(|| "cloud create_agent missing id".to_string())?
+            .ok_or_else(|| "cloud create_agent missing name/id".to_string())?
             .to_string();
         agent_id = Some(id.clone());
         state
@@ -1084,8 +1152,10 @@ fn run_cloud_session_turn(
 
     if session_id.is_none() {
         let create_sess_url = format!("{base}/v1/{env_slug}/agent_sessions");
+        let agent_ref = agent_id.as_deref().unwrap_or_default();
         let body = json!({
-            "agent_id": agent_id.as_deref().unwrap_or_default(),
+            "agent": agent_ref,
+            "agent_id": agent_ref,
             "title": "AnyAgents Session",
         });
         let (st, raw) = curl_post_json(&create_sess_url, Some(&api_key), &body)?;
@@ -1094,9 +1164,11 @@ fn run_cloud_session_turn(
         }
         let val: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
         let sid = val
-            .get("id")
+            .get("name")
+            .or_else(|| val.get("id"))
+            .or_else(|| val.get("uid"))
             .and_then(Value::as_str)
-            .ok_or_else(|| "cloud create_session missing id".to_string())?
+            .ok_or_else(|| "cloud create_session missing name/id".to_string())?
             .to_string();
         session_id = Some(sid.clone());
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1106,27 +1178,191 @@ fn run_cloud_session_turn(
     }
 
     let sid = session_id.unwrap_or_default();
-    let send_url = format!("{base}/v1/{env_slug}/agent_sessions/{sid}:send");
-    let (st, raw) = curl_post_json(&send_url, Some(&api_key), &json!({ "content": user_message }))?;
+    let sess_path = cloud_session_resource_path(env_slug, &sid);
+    let send_url = format!("{base}/v1/{sess_path}:send");
+    let send_body = json!({
+        "content": user_message,
+        "message": {
+            "parts": [{ "text": user_message }]
+        }
+    });
+    let (st, raw) = curl_post_json(&send_url, Some(&api_key), &send_body)?;
     if !(200..300).contains(&st) {
         return Err(format!("cloud session send HTTP {st}: {}", raw.trim()));
     }
 
-    let sess_url = format!("{base}/v1/{env_slug}/agent_sessions/{sid}");
+    let sess_url = format!("{base}/v1/{sess_path}");
+    let events_url = format!("{base}/v1/{sess_path}/session_events");
+    let submit_tool_url = format!("{base}/v1/{sess_path}:submitToolResult");
+    let mut handled_call_ids = std::collections::HashSet::new();
+    let mut last_seq: i64 = 0;
+    let mut sent_any_reply = false;
+    let mut self_archived = false;
+    let mut assistant_texts: Vec<String> = Vec::new();
+
     while !cancel_flag.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(250));
+
+        // Poll session_events for client tool calls and assistant messages
+        let poll_events_url = if last_seq > 0 {
+            format!("{events_url}?filter=sequence%20%3E%20{last_seq}")
+        } else {
+            events_url.clone()
+        };
+        if let Ok((200..=299, raw_events)) = curl_get(&poll_events_url, Some(&api_key))
+            && let Ok(ev_doc) = serde_json::from_str::<Value>(&raw_events)
+            && let Some(events) = ev_doc
+                .get("session_events")
+                .or_else(|| ev_doc.get("sessionEvents"))
+                .or_else(|| ev_doc.get("events"))
+                .and_then(Value::as_array)
+        {
+            for ev in events {
+                let seq = ev
+                    .get("sequence")
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    })
+                    .unwrap_or(0);
+                if seq > 0 && seq <= last_seq {
+                    continue;
+                }
+                if seq > last_seq {
+                    last_seq = seq;
+                }
+
+                let ev_type = ev
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+
+                if let Some(tc) = ev.get("tool_call").or_else(|| ev.get("toolCall")) {
+                    let call_id = tc
+                        .get("id")
+                        .or_else(|| tc.get("call_id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let is_client = tc.get("client").and_then(Value::as_bool).unwrap_or(true);
+                    if !call_id.is_empty() && is_client && handled_call_ids.insert(call_id.clone()) {
+                        let tool_name = tc
+                            .get("tool")
+                            .or_else(|| tc.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let input_val = tc
+                            .get("input")
+                            .or_else(|| tc.get("arguments"))
+                            .cloned()
+                            .unwrap_or_else(|| json!({}));
+                        let parsed_args = if let Some(s) = input_val.as_str() {
+                            serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
+                        } else {
+                            input_val
+                        };
+                        let norm_fn = tool_name
+                            .strip_prefix("mcp__anyagents__")
+                            .unwrap_or(tool_name);
+                        if norm_fn == "send" {
+                            sent_any_reply = true;
+                        }
+                        if norm_fn == "archive"
+                            && parsed_args
+                                .get("agent")
+                                .or_else(|| parsed_args.get("name"))
+                                .and_then(Value::as_str)
+                                .is_none_or(|s| {
+                                    s.trim().is_empty() || s.eq_ignore_ascii_case("self")
+                                })
+                        {
+                            self_archived = true;
+                        }
+                        let output = execute_sylphx_tool(
+                            tool_name,
+                            &parsed_args,
+                            config_dir,
+                            work_dir,
+                            env,
+                            mcp_command,
+                            mcp_args,
+                        );
+                        let is_err = output.starts_with("error:");
+                        let _ = curl_post_json(
+                            &submit_tool_url,
+                            Some(&api_key),
+                            &json!({
+                                "call_id": call_id,
+                                "output": output,
+                                "error": is_err,
+                            }),
+                        );
+                    }
+                } else if ev_type.contains("AGENT_MESSAGE") || ev_type.contains("RESPONSE") {
+                    if let Some(parts) = ev.pointer("/message/parts").and_then(Value::as_array) {
+                        for p in parts {
+                            if let Some(t) = p
+                                .get("text")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                            {
+                                assistant_texts.push(t.to_string());
+                            }
+                        }
+                    } else if let Some(t) = ev
+                        .pointer("/response/text")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        assistant_texts.push(t.to_string());
+                    }
+                }
+            }
+        }
+
+        if self_archived {
+            release_persisted_sandbox_lease(config_dir);
+            break;
+        }
+
         let (st_poll, raw_poll) = curl_get(&sess_url, Some(&api_key))?;
         if (200..300).contains(&st_poll)
             && let Ok(val) = serde_json::from_str::<Value>(&raw_poll)
         {
-            let status = val.get("status").and_then(Value::as_str).unwrap_or("");
-            if status == "idle" || status == "completed" {
+            let status = val
+                .get("state")
+                .or_else(|| val.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if status == "idle" || status == "session_state_idle" || status == "completed" {
+                let content_text = assistant_texts.join("\n\n");
+                if !sent_any_reply
+                    && !content_text.trim().is_empty()
+                    && let Some(reply_to) = extract_envelope_sender(user_message)
+                {
+                    let _ = call_anyagents_mcp_tool(
+                        mcp_command,
+                        mcp_args,
+                        env,
+                        "send",
+                        &json!({
+                            "to": reply_to,
+                            "text": content_text.trim(),
+                        }),
+                    );
+                }
                 let in_tok = val
                     .get("total_input_tokens")
+                    .or_else(|| val.pointer("/usage/input_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 let out_tok = val
                     .get("total_output_tokens")
+                    .or_else(|| val.pointer("/usage/output_tokens"))
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
                 return Ok(TurnUsage {
@@ -1135,11 +1371,14 @@ fn run_cloud_session_turn(
                     ..TurnUsage::default()
                 });
             }
-            if status == "failed" || status == "terminated" || status == "errored" {
+            if status == "failed"
+                || status == "session_state_failed"
+                || status == "terminated"
+                || status == "errored"
+            {
                 return Err(format!("cloud session ended with status `{status}`"));
             }
         }
-        let _ = (mcp_command, mcp_args);
     }
     Ok(TurnUsage::default())
 }
@@ -2159,13 +2398,16 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "sandbox",
-                "description": "Manage or execute inside this agent's isolated Cloud Kata microVM Sandbox pod (`https://api.sylphx.com/v1/{parent}/leases`, `template:agent`). Actions: `status`, `ensure`, `exec`, `read_file`, `write_file`, `release`. Once `ensure` is called (or when `SYLPHX_SANDBOX=cloud`), `bash`, `read_file`, `write_file`, and `edit_file` automatically run inside the isolated cloud pod.",
+                "description": "Manage or execute inside this agent's isolated Cloud Kata microVM Sandbox pod (`https://api.sylphx.com/v1/{parent}/leases`, `template:agent`, worktree at `/home/user/workspace`). Actions: `status`, `ensure`, `exec`, `read_file`, `write_file`, `release`. When `ensure` is called (or when `SYLPHX_SANDBOX=cloud`), the agent's Git repository and branch are automatically cloned and checked out inside `/home/user/workspace` with `GH_TOKEN` and Git author (`Kyle Tse <hi@kylet.se>`) configured, and `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `grep`, `glob`, and `list_dir` run inside the cloud sandbox.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "action": { "type": "string", "description": "`status`, `ensure`, `exec`, `read_file`, `write_file`, or `release`." },
+                        "repo": { "type": "string", "description": "Optional GitHub repository (`<org>/<repo>` or HTTPS URL) to clone into `/home/user/workspace` when `action` is `ensure`." },
+                        "branch": { "type": "string", "description": "Optional Git branch to checkout or create inside `/home/user/workspace` when `action` is `ensure`." },
+                        "base": { "type": "string", "description": "Optional starting Git ref/SHA when creating `branch`." },
                         "command": { "type": "string", "description": "Shell command for `exec`." },
-                        "path": { "type": "string", "description": "File path inside the sandbox for `read_file` or `write_file`." },
+                        "path": { "type": "string", "description": "File path inside the sandbox for `read_file` or `write_file` (relative paths resolve against `/home/user/workspace`)." },
                         "content": { "type": "string", "description": "File content for `write_file`." }
                     },
                     "required": ["action"]
@@ -2629,22 +2871,42 @@ fn execute_sylphx_tool(
                     }))
                     .unwrap_or_default()
                 }
-                "ensure" | "create" => match ensure_cloud_sandbox_lease(config_dir, env) {
-                    Ok((lease_name, uid)) => serde_json::to_string_pretty(&json!({
-                        "status": "ready",
-                        "lease": lease_name,
-                        "uid": uid,
-                        "image": "template:agent",
-                        "shape": "sandbox_shapes/linux-xs",
-                    }))
-                    .unwrap_or_default(),
-                    Err(e) => format!("error ensuring cloud sandbox lease: {e}"),
-                },
+                "ensure" | "create" => {
+                    let explicit_repo = args.get("repo").and_then(Value::as_str);
+                    let explicit_branch = args.get("branch").and_then(Value::as_str);
+                    let explicit_base = args.get("base").and_then(Value::as_str);
+                    match ensure_cloud_sandbox_lease_with_worktree(
+                        config_dir,
+                        Some(work_dir),
+                        env,
+                        explicit_repo,
+                        explicit_branch,
+                        explicit_base,
+                    ) {
+                        Ok((lease_name, uid)) => {
+                            let lease_meta = std::fs::read_to_string(config_dir.join("sylphx-sandbox-lease.json"))
+                                .ok()
+                                .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+                            serde_json::to_string_pretty(&json!({
+                                "status": "ready",
+                                "lease": lease_name,
+                                "uid": uid,
+                                "image": "template:agent",
+                                "shape": "linux-xs",
+                                "workspace_dir": CLOUD_WORKSPACE_DIR,
+                                "repo": lease_meta.as_ref().and_then(|v| v.get("repo")).cloned().unwrap_or(Value::Null),
+                                "branch": lease_meta.as_ref().and_then(|v| v.get("branch")).cloned().unwrap_or(Value::Null),
+                            }))
+                            .unwrap_or_default()
+                        }
+                        Err(e) => format!("error ensuring cloud sandbox lease: {e}"),
+                    }
+                }
                 "exec" => {
                     let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
                         return "error: missing `command`".to_string();
                     };
-                    match exec_in_cloud_sandbox(config_dir, env, cmd_str) {
+                    match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str) {
                         Ok(out) => out,
                         Err(e) => format!("error executing in cloud sandbox: {e}"),
                     }
@@ -2653,7 +2915,7 @@ fn execute_sylphx_tool(
                     let Some(rel) = args.get("path").and_then(Value::as_str) else {
                         return "error: missing `path`".to_string();
                     };
-                    match read_file_in_cloud_sandbox(config_dir, env, rel) {
+                    match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel) {
                         Ok(s) => s,
                         Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
                     }
@@ -2665,7 +2927,7 @@ fn execute_sylphx_tool(
                     let Some(content) = args.get("content").and_then(Value::as_str) else {
                         return "error: missing `content`".to_string();
                     };
-                    match write_file_in_cloud_sandbox(config_dir, env, rel, content) {
+                    match write_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel, content) {
                         Ok(s) => s,
                         Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
                     }
@@ -2685,7 +2947,7 @@ fn execute_sylphx_tool(
                 return "error: missing `command`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match exec_in_cloud_sandbox(config_dir, env, cmd_str) {
+                return match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str) {
                     Ok(out) => out,
                     Err(e) => format!("error executing in cloud sandbox: {e}"),
                 };
@@ -2733,7 +2995,7 @@ fn execute_sylphx_tool(
                 return "error: missing `path`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match read_file_in_cloud_sandbox(config_dir, env, rel) {
+                return match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel) {
                     Ok(content) => {
                         let start = args
                             .get("start_line")
@@ -2790,7 +3052,7 @@ fn execute_sylphx_tool(
                 return "error: missing `content`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match write_file_in_cloud_sandbox(config_dir, env, rel, content) {
+                return match write_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel, content) {
                     Ok(msg) => msg,
                     Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
                 };
@@ -2818,13 +3080,13 @@ fn execute_sylphx_tool(
                 return "error: missing `replacement`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match read_file_in_cloud_sandbox(config_dir, env, rel) {
+                return match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel) {
                     Ok(existing) => {
                         if !existing.contains(old_str) {
                             return format!("error: target string not found in `{rel}`");
                         }
                         let updated = existing.replace(old_str, new_str);
-                        match write_file_in_cloud_sandbox(config_dir, env, rel, &updated) {
+                        match write_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel, &updated) {
                             Ok(_) => format!("edited `{rel}` in cloud sandbox"),
                             Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
                         }
@@ -2852,6 +3114,313 @@ fn execute_sylphx_tool(
 }
 
 const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
+pub const CLOUD_WORKSPACE_DIR: &str = "/home/user/workspace";
+
+#[derive(Debug, Clone, Default)]
+pub struct CloudWorktreeSpec {
+    pub repo_url: Option<String>,
+    pub repo_slug: Option<String>,
+    pub branch: Option<String>,
+    pub base: Option<String>,
+}
+
+fn normalize_github_repo_url_and_slug(raw: &str) -> Option<(String, String)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "inherit" | "parent" | "worktree" | "branch" | "isolated" | "explicit-worktree"
+        )
+    {
+        return None;
+    }
+    if let Some(rest) = trimmed.strip_prefix("git@github.com:") {
+        let slug = rest.trim_end_matches(".git").trim_matches('/');
+        if slug.contains('/') {
+            return Some((format!("https://github.com/{slug}.git"), slug.to_string()));
+        }
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("https://github.com/")
+        .or_else(|| trimmed.strip_prefix("http://github.com/"))
+    {
+        let slug = rest.trim_end_matches(".git").trim_matches('/');
+        if slug.contains('/') {
+            return Some((format!("https://github.com/{slug}.git"), slug.to_string()));
+        }
+    }
+    if trimmed.starts_with("https://") || trimmed.starts_with("http://") {
+        return Some((trimmed.to_string(), trimmed.to_string()));
+    }
+    let p = Path::new(trimmed);
+    if p.is_dir()
+        && let Some(origin) = git_origin_url(p)
+    {
+        return normalize_github_repo_url_and_slug(&origin);
+    }
+    let parts: Vec<&str> = trimmed.trim_matches('/').split('/').collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() && !trimmed.contains("..") {
+        let slug = format!("{}/{}", parts[0], parts[1].trim_end_matches(".git"));
+        return Some((format!("https://github.com/{slug}.git"), slug));
+    }
+    None
+}
+
+fn git_origin_url(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["config", "--get", "remote.origin.url"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+fn git_current_branch(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty() && s != "HEAD").then_some(s)
+}
+
+fn git_current_head_sha(dir: &Path) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "HEAD"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
+pub fn resolve_agent_git_worktree_spec(
+    config_dir: &Path,
+    work_dir: Option<&Path>,
+    env: &[(String, String)],
+    explicit_repo: Option<&str>,
+    explicit_branch: Option<&str>,
+    explicit_base: Option<&str>,
+) -> CloudWorktreeSpec {
+    let marker = std::fs::read_to_string(config_dir.join(".anyagents-managed-worktree.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let agent_json = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+
+    let env_lookup = |key: &str| -> Option<String> {
+        env.iter()
+            .find(|(k, v)| k == key && !v.trim().is_empty())
+            .map(|(_, v)| v.trim().to_string())
+            .or_else(|| {
+                std::env::var(key)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+    };
+
+    let raw_repo = explicit_repo
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| env_lookup("ANYAGENTS_REPO"))
+        .or_else(|| {
+            marker
+                .as_ref()
+                .and_then(|m| m.get("repo"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            agent_json
+                .as_ref()
+                .and_then(|m| m.get("repo"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        });
+
+    let mut candidate_git_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(wd) = work_dir {
+        candidate_git_dirs.push(wd.to_path_buf());
+    }
+    if let Some(p) = marker
+        .as_ref()
+        .and_then(|m| m.get("path"))
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+    {
+        candidate_git_dirs.push(p);
+    }
+    if let Some(parent) = config_dir.parent() {
+        candidate_git_dirs.push(parent.join("work"));
+    }
+
+    let (repo_url, repo_slug) = raw_repo
+        .as_deref()
+        .and_then(normalize_github_repo_url_and_slug)
+        .or_else(|| {
+            for dir in &candidate_git_dirs {
+                if dir.is_dir()
+                    && let Some(origin) = git_origin_url(dir)
+                    && let Some(pair) = normalize_github_repo_url_and_slug(&origin)
+                {
+                    return Some(pair);
+                }
+            }
+            None
+        })
+        .map(|(u, s)| (Some(u), Some(s)))
+        .unwrap_or((None, None));
+
+    let branch = explicit_branch
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| env_lookup("ANYAGENTS_BRANCH"))
+        .or_else(|| {
+            marker
+                .as_ref()
+                .and_then(|m| m.get("branch"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            agent_json
+                .as_ref()
+                .and_then(|m| m.get("branch"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            for dir in &candidate_git_dirs {
+                if dir.is_dir()
+                    && let Some(b) = git_current_branch(dir)
+                {
+                    return Some(b);
+                }
+            }
+            None
+        });
+
+    let base = explicit_base
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| env_lookup("ANYAGENTS_BASE"))
+        .or_else(|| {
+            marker
+                .as_ref()
+                .and_then(|m| m.get("base").or_else(|| m.get("initial_head")))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            agent_json
+                .as_ref()
+                .and_then(|m| m.get("base"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            for dir in &candidate_git_dirs {
+                if dir.is_dir()
+                    && let Some(sha) = git_current_head_sha(dir)
+                {
+                    return Some(sha);
+                }
+            }
+            None
+        });
+
+    CloudWorktreeSpec {
+        repo_url,
+        repo_slug,
+        branch,
+        base,
+    }
+}
+
+fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
+    for (k, v) in env {
+        if (k == "GH_TOKEN" || k == "GITHUB_TOKEN") && !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    for k in ["GH_TOKEN", "GITHUB_TOKEN"] {
+        if let Ok(v) = std::env::var(k)
+            && !v.trim().is_empty()
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    if !crate::sandbox::is_isolated_test_env()
+        && let Ok(out) = Command::new("gh")
+            .args(["auth", "token"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        && out.status.success()
+    {
+        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !tok.is_empty() {
+            return Some(tok);
+        }
+    }
+    None
+}
+
+pub fn resolve_cloud_sandbox_path(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed == "." || trimmed == "./" || trimmed == "/workspace" {
+        return CLOUD_WORKSPACE_DIR.to_string();
+    }
+    if let Some(rest) = trimmed.strip_prefix("/workspace/") {
+        return format!("{CLOUD_WORKSPACE_DIR}/{}", rest.trim_start_matches('/'));
+    }
+    if trimmed.starts_with('/') {
+        return trimmed.to_string();
+    }
+    let clean = trimmed.strip_prefix("./").unwrap_or(trimmed);
+    format!("{CLOUD_WORKSPACE_DIR}/{clean}")
+}
 
 fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) -> String {
     let raw = env
@@ -2873,10 +3442,19 @@ fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) -> String {
                         .and_then(Value::as_str)
                         .map(|s| s.trim().to_ascii_lowercase())
                 })
+        })
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join(".anyagents-managed-worktree.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| {
+                    (v.get("cloud_sandbox").and_then(Value::as_bool) == Some(true))
+                        .then(|| "cloud".to_string())
+                })
         });
     match raw.as_deref() {
         Some("none" | "stateless" | "off" | "false" | "0") => "none".to_string(),
-        Some("cloud" | "pod" | "kata" | "microvm") => "cloud".to_string(),
+        Some("cloud" | "pod" | "kata" | "microvm" | "sandbox") => "cloud".to_string(),
         Some("local" | "host") => "local".to_string(),
         _ => {
             if config_dir.join("sylphx-sandbox-lease.json").is_file() {
@@ -2916,29 +3494,92 @@ fn resolve_sylphx_cloud_access_key(config_dir: &Path, env: &[(String, String)]) 
     resolve_sylphx_api_key(config_dir, env)
 }
 
+#[allow(dead_code)]
 pub fn ensure_cloud_sandbox_lease(
     config_dir: &Path,
     env: &[(String, String)],
 ) -> Result<(String, String), String> {
+    ensure_cloud_sandbox_lease_with_worktree(config_dir, None, env, None, None, None)
+}
+
+pub fn ensure_cloud_sandbox_lease_with_worktree(
+    config_dir: &Path,
+    work_dir: Option<&Path>,
+    env: &[(String, String)],
+    explicit_repo: Option<&str>,
+    explicit_branch: Option<&str>,
+    explicit_base: Option<&str>,
+) -> Result<(String, String), String> {
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx Cloud access key; run `anyagents sign-in sylphx` first".to_string()
     })?;
+    let wt_spec = resolve_agent_git_worktree_spec(
+        config_dir,
+        work_dir,
+        env,
+        explicit_repo,
+        explicit_branch,
+        explicit_base,
+    );
     let lease_file = config_dir.join("sylphx-sandbox-lease.json");
+
     if let Ok(raw) = std::fs::read_to_string(&lease_file)
-        && let Ok(val) = serde_json::from_str::<Value>(&raw)
-        && let Some(name) = val.get("name").and_then(Value::as_str)
+        && let Ok(mut persisted) = serde_json::from_str::<Value>(&raw)
+        && let Some(name) = persisted.get("name").and_then(Value::as_str).map(str::to_string)
     {
         let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{name}");
         if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
             && let Ok(live) = serde_json::from_str::<Value>(&body)
-            && live.pointer("/status/state").and_then(Value::as_str) == Some("ready")
         {
-            let uid = live
-                .get("uid")
+            let state = live
+                .pointer("/status/state")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .to_string();
-            return Ok((name.to_string(), uid));
+                .to_ascii_lowercase();
+            if state == "ready" || state == "lease_state_ready" {
+                let uid = live
+                    .get("uid")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                let prev_repo = persisted
+                    .get("repo")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let prev_branch = persisted
+                    .get("branch")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let already_bootstrapped = persisted
+                    .get("workspace_bootstrapped")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let needs_bootstrap = !already_bootstrapped
+                    || (wt_spec.repo_slug.is_some() && wt_spec.repo_slug != prev_repo)
+                    || (wt_spec.branch.is_some() && wt_spec.branch != prev_branch);
+                if needs_bootstrap {
+                    bootstrap_cloud_sandbox_worktree(
+                        &access_key,
+                        &name,
+                        &wt_spec,
+                        env,
+                    )?;
+                    if let Some(obj) = persisted.as_object_mut() {
+                        obj.insert("workspace_bootstrapped".to_string(), json!(true));
+                        obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
+                        if let Some(ref slug) = wt_spec.repo_slug {
+                            obj.insert("repo".to_string(), json!(slug));
+                        }
+                        if let Some(ref br) = wt_spec.branch {
+                            obj.insert("branch".to_string(), json!(br));
+                        }
+                    }
+                    if let Ok(pretty) = serde_json::to_string_pretty(&persisted) {
+                        let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
+                    }
+                }
+                return Ok((name, uid));
+            }
         }
     }
 
@@ -2956,8 +3597,12 @@ pub fn ensure_cloud_sandbox_lease(
     let create_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{parent}/leases");
     let req_body = json!({
         "spec": {
-            "shape": "sandbox_shapes/linux-xs",
+            "shape": "linux-xs",
+            "kind": "general",
             "image": "template:agent",
+            "network": {
+                "egress": "allow"
+            },
             "ttl": "1800s",
         }
     });
@@ -2965,7 +3610,7 @@ pub fn ensure_cloud_sandbox_lease(
     if !(200..300).contains(&status) {
         return Err(format!("CreateLease HTTP {status}: {}", raw.trim()));
     }
-    let lease_val: Value =
+    let mut lease_val: Value =
         serde_json::from_str(&raw).map_err(|e| format!("invalid Lease JSON: {e}"))?;
     let lease_name = lease_val
         .get("name")
@@ -2978,10 +3623,151 @@ pub fn ensure_cloud_sandbox_lease(
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+
+    // Poll until status.state == "ready" if not immediately ready
+    let mut ready = lease_val
+        .pointer("/status/state")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.eq_ignore_ascii_case("ready") || s.eq_ignore_ascii_case("lease_state_ready"));
+    if !ready {
+        let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}");
+        for _ in 0..45 {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
+                && let Ok(live) = serde_json::from_str::<Value>(&body)
+            {
+                let st = live
+                    .pointer("/status/state")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                lease_val = live;
+                if st == "ready" || st == "lease_state_ready" {
+                    ready = true;
+                    break;
+                }
+                if st == "refused" || st == "ended" || st == "failed" {
+                    return Err(format!("Cloud Sandbox Lease `{lease_name}` entered state `{st}`"));
+                }
+            }
+        }
+    }
+    if !ready {
+        return Err(format!(
+            "Cloud Sandbox Lease `{lease_name}` did not become ready within 45s"
+        ));
+    }
+
+    bootstrap_cloud_sandbox_worktree(&access_key, &lease_name, &wt_spec, env)?;
+
+    if let Some(obj) = lease_val.as_object_mut() {
+        obj.insert("workspace_bootstrapped".to_string(), json!(true));
+        obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
+        if let Some(ref slug) = wt_spec.repo_slug {
+            obj.insert("repo".to_string(), json!(slug));
+        }
+        if let Some(ref br) = wt_spec.branch {
+            obj.insert("branch".to_string(), json!(br));
+        }
+    }
     if let Ok(pretty) = serde_json::to_string_pretty(&lease_val) {
         let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
     }
     Ok((lease_name, uid))
+}
+
+fn bootstrap_cloud_sandbox_worktree(
+    access_key: &str,
+    lease_name: &str,
+    wt_spec: &CloudWorktreeSpec,
+    env: &[(String, String)],
+) -> Result<(), String> {
+    let exec_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:exec");
+    let mut exec_env = serde_json::Map::new();
+    exec_env.insert(
+        "ANYAGENTS_WORKSPACE".to_string(),
+        json!(CLOUD_WORKSPACE_DIR),
+    );
+    if let Some(tok) = resolve_github_token(env) {
+        exec_env.insert("GH_TOKEN".to_string(), json!(tok));
+        exec_env.insert("GITHUB_TOKEN".to_string(), json!(tok));
+    }
+    if let Some(ref url) = wt_spec.repo_url {
+        exec_env.insert("ANYAGENTS_CLONE_URL".to_string(), json!(url));
+    }
+    if let Some(ref slug) = wt_spec.repo_slug {
+        exec_env.insert("ANYAGENTS_REPO_SLUG".to_string(), json!(slug));
+    }
+    if let Some(ref br) = wt_spec.branch {
+        exec_env.insert("ANYAGENTS_BRANCH".to_string(), json!(br));
+    }
+    if let Some(ref base) = wt_spec.base {
+        exec_env.insert("ANYAGENTS_BASE_REF".to_string(), json!(base));
+    }
+
+    let bootstrap_script = r#"set -e
+mkdir -p "$ANYAGENTS_WORKSPACE" "$HOME/.local/bin"
+git config --global user.name "Kyle Tse"
+git config --global user.email "hi@kylet.se"
+git config --global init.defaultBranch main
+git config --global --add safe.directory "$ANYAGENTS_WORKSPACE"
+if [ -n "$GH_TOKEN" ]; then
+  (
+    umask 077
+    printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > "$HOME/.git-credentials"
+    printf 'export GH_TOKEN="%s"\nexport GITHUB_TOKEN="%s"\nexport PATH="$HOME/.local/bin:$PATH"\n' "$GH_TOKEN" "$GH_TOKEN" > "$HOME/.anyagents_cloud_env"
+  )
+  git config --global credential.helper store
+fi
+if [ -n "$ANYAGENTS_CLONE_URL" ] && [ ! -d "$ANYAGENTS_WORKSPACE/.git" ]; then
+  git clone --filter=blob:none "$ANYAGENTS_CLONE_URL" "$ANYAGENTS_WORKSPACE"
+fi
+if [ -d "$ANYAGENTS_WORKSPACE/.git" ]; then
+  cd "$ANYAGENTS_WORKSPACE"
+  git config --local user.name "Kyle Tse"
+  git config --local user.email "hi@kylet.se"
+  if [ -n "$ANYAGENTS_BASE_REF" ]; then
+    git fetch origin "$ANYAGENTS_BASE_REF" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$ANYAGENTS_BRANCH" ] && [ "$ANYAGENTS_BRANCH" != "HEAD" ]; then
+    git fetch origin "$ANYAGENTS_BRANCH" >/dev/null 2>&1 || true
+    if git show-ref --verify --quiet "refs/heads/$ANYAGENTS_BRANCH"; then
+      git checkout "$ANYAGENTS_BRANCH"
+    elif git show-ref --verify --quiet "refs/remotes/origin/$ANYAGENTS_BRANCH"; then
+      git checkout -B "$ANYAGENTS_BRANCH" "refs/remotes/origin/$ANYAGENTS_BRANCH"
+    elif [ -n "$ANYAGENTS_BASE_REF" ] && git rev-parse --verify --quiet "$ANYAGENTS_BASE_REF^{commit}" >/dev/null; then
+      git checkout -B "$ANYAGENTS_BRANCH" "$ANYAGENTS_BASE_REF"
+    else
+      git checkout -b "$ANYAGENTS_BRANCH"
+    fi
+  fi
+fi
+"#;
+
+    let (status, raw) = curl_post_json(
+        &exec_url,
+        Some(access_key),
+        &json!({
+            "command": ["bash", "-lc", bootstrap_script],
+            "env": exec_env,
+            "timeout": "180s",
+        }),
+    )?;
+    if !(200..300).contains(&status) {
+        return Err(format!("Bootstrap ExecLease HTTP {status}: {}", raw.trim()));
+    }
+    let val: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("invalid ExecLease JSON: {e}"))?;
+    let code = val.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    if code != 0 {
+        let stderr_b64 = val.get("stderr").and_then(Value::as_str).unwrap_or("");
+        let stderr = String::from_utf8_lossy(&base64_decode(stderr_b64)).into_owned();
+        return Err(format!(
+            "cloud sandbox worktree bootstrap exited with {code}: {}",
+            stderr.trim()
+        ));
+    }
+    Ok(())
 }
 
 pub fn release_persisted_sandbox_lease(config_dir: &Path) {
@@ -3003,20 +3789,35 @@ pub fn release_persisted_sandbox_lease(config_dir: &Path) {
     let _ = curl_post_json(&release_url, Some(&access_key), &json!({}));
 }
 
+#[allow(dead_code)]
 fn exec_in_cloud_sandbox(
     config_dir: &Path,
     env: &[(String, String)],
     cmd_str: &str,
 ) -> Result<String, String> {
-    let (lease_name, _) = ensure_cloud_sandbox_lease(config_dir, env)?;
+    exec_in_cloud_sandbox_with_work_dir(config_dir, None, env, cmd_str)
+}
+
+fn exec_in_cloud_sandbox_with_work_dir(
+    config_dir: &Path,
+    work_dir: Option<&Path>,
+    env: &[(String, String)],
+    cmd_str: &str,
+) -> Result<String, String> {
+    let (lease_name, _) =
+        ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
         .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
     let exec_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:exec");
+    let wrapped_cmd = format!(
+        "[ -f \"$HOME/.anyagents_cloud_env\" ] && . \"$HOME/.anyagents_cloud_env\"; mkdir -p \"{CLOUD_WORKSPACE_DIR}\" && cd \"{CLOUD_WORKSPACE_DIR}\" && {cmd_str}"
+    );
     let (status, raw) = curl_post_json(
         &exec_url,
         Some(&access_key),
         &json!({
-            "command": ["bash", "-lc", cmd_str],
+            "command": ["bash", "-lc", wrapped_cmd],
+            "working_directory": CLOUD_WORKSPACE_DIR,
             "timeout": "120s",
         }),
     )?;
@@ -3048,16 +3849,28 @@ fn exec_in_cloud_sandbox(
     Ok(combined)
 }
 
+#[allow(dead_code)]
 fn read_file_in_cloud_sandbox(
     config_dir: &Path,
     env: &[(String, String)],
     path: &str,
 ) -> Result<String, String> {
-    let (lease_name, _) = ensure_cloud_sandbox_lease(config_dir, env)?;
+    read_file_in_cloud_sandbox_with_work_dir(config_dir, None, env, path)
+}
+
+fn read_file_in_cloud_sandbox_with_work_dir(
+    config_dir: &Path,
+    work_dir: Option<&Path>,
+    env: &[(String, String)],
+    path: &str,
+) -> Result<String, String> {
+    let (lease_name, _) =
+        ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
         .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let guest_path = resolve_cloud_sandbox_path(path);
     let url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:readFile");
-    let (status, raw) = curl_post_json(&url, Some(&access_key), &json!({ "path": path }))?;
+    let (status, raw) = curl_post_json(&url, Some(&access_key), &json!({ "path": guest_path }))?;
     if !(200..300).contains(&status) {
         return Err(format!("ReadFile HTTP {status}: {}", raw.trim()));
     }
@@ -3067,21 +3880,34 @@ fn read_file_in_cloud_sandbox(
     Ok(String::from_utf8_lossy(&base64_decode(content_b64)).into_owned())
 }
 
+#[allow(dead_code)]
 fn write_file_in_cloud_sandbox(
     config_dir: &Path,
     env: &[(String, String)],
     path: &str,
     content: &str,
 ) -> Result<String, String> {
-    let (lease_name, _) = ensure_cloud_sandbox_lease(config_dir, env)?;
+    write_file_in_cloud_sandbox_with_work_dir(config_dir, None, env, path, content)
+}
+
+fn write_file_in_cloud_sandbox_with_work_dir(
+    config_dir: &Path,
+    work_dir: Option<&Path>,
+    env: &[(String, String)],
+    path: &str,
+    content: &str,
+) -> Result<String, String> {
+    let (lease_name, _) =
+        ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
         .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let guest_path = resolve_cloud_sandbox_path(path);
     let url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:writeFile");
     let (status, raw) = curl_post_json(
         &url,
         Some(&access_key),
         &json!({
-            "path": path,
+            "path": guest_path,
             "content": base64_encode(content.as_bytes()),
         }),
     )?;
@@ -3089,7 +3915,7 @@ fn write_file_in_cloud_sandbox(
         return Err(format!("WriteFile HTTP {status}: {}", raw.trim()));
     }
     Ok(format!(
-        "wrote `{path}` ({} bytes) in cloud sandbox `{lease_name}`",
+        "wrote `{guest_path}` ({} bytes) in cloud sandbox `{lease_name}`",
         content.len()
     ))
 }
@@ -3957,5 +4783,66 @@ mod tests {
         // Item 0 must stay identical across consecutive turns between block strides!
         assert_eq!(w1[0], w2[0]);
         assert_eq!(w1[0]["content"], "msg_80");
+    }
+
+    #[test]
+    fn cloud_sandbox_path_and_worktree_spec_resolution_work() {
+        assert_eq!(resolve_cloud_sandbox_path("."), "/home/user/workspace");
+        assert_eq!(
+            resolve_cloud_sandbox_path("crates/anyagents/src/lib.rs"),
+            "/home/user/workspace/crates/anyagents/src/lib.rs"
+        );
+        assert_eq!(
+            resolve_cloud_sandbox_path("./README.md"),
+            "/home/user/workspace/README.md"
+        );
+        assert_eq!(
+            resolve_cloud_sandbox_path("/workspace/src/main.rs"),
+            "/home/user/workspace/src/main.rs"
+        );
+        assert_eq!(
+            resolve_cloud_sandbox_path("/tmp/custom.txt"),
+            "/tmp/custom.txt"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::write(
+            cfg.join(".anyagents-managed-worktree.json"),
+            serde_json::to_string_pretty(&json!({
+                "path": "/home/user/workspace",
+                "cloud_sandbox": true,
+                "repo": "git@github.com:SylphxAI/anyagents.git",
+                "branch": "agent/cloud-worker",
+                "base": "main",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        write_sylphx_config(
+            cfg,
+            Some("sylphx/openai/gpt-6.1-sol#medium"),
+            Path::new("anyagents"),
+            &[],
+        )
+        .unwrap();
+
+        let agent_json: Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.join("sylphx-agent.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(agent_json["sandbox"], "cloud");
+        assert_eq!(agent_json["branch"], "agent/cloud-worker");
+        assert_eq!(resolve_sandbox_mode(cfg, &[]), "cloud");
+
+        let spec = resolve_agent_git_worktree_spec(cfg, None, &[], None, None, None);
+        assert_eq!(
+            spec.repo_url.as_deref(),
+            Some("https://github.com/SylphxAI/anyagents.git")
+        );
+        assert_eq!(spec.repo_slug.as_deref(), Some("SylphxAI/anyagents"));
+        assert_eq!(spec.branch.as_deref(), Some("agent/cloud-worker"));
+        assert_eq!(spec.base.as_deref(), Some("main"));
     }
 }

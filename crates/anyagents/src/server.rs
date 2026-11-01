@@ -420,10 +420,44 @@ fn spawn_admin_sylphx_delivery(
                             context: anyagents_harness::Context::default(),
                         };
                         match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
-                            Ok(_) => {
+                            Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
                                 let _ = store.note_delivered(&agent.id, message.seq);
+                                if !turn_finished {
+                                    while anyagents_harness::Harness::health(&harness).turn_state
+                                        == anyagents_harness::TurnState::InTurn
+                                    {
+                                        if let Ok(Some(steered)) = store.next_undelivered(&agent.id)
+                                        {
+                                            let steered_out = anyagents_harness::OutboundMessage {
+                                                id: steered.id.as_str().to_string(),
+                                                seq: steered.seq,
+                                                text: steered.text.clone(),
+                                                sender: steered.sender.clone(),
+                                                reply_to: steered.reply_to.clone(),
+                                                source_time_ms: steered.source_time_ms,
+                                                context: anyagents_harness::Context::default(),
+                                            };
+                                            if anyagents_harness::Harness::deliver(
+                                                &mut harness,
+                                                &steered_out,
+                                            )
+                                            .is_ok()
+                                            {
+                                                let _ =
+                                                    store.note_delivered(&agent.id, steered.seq);
+                                            }
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                    }
+                                }
                                 let _ = store.note_turn_completed(&agent.id);
-                                crate::vendor::persist_last_error(&cfg, None, None);
+                                if crate::vendor::read_persisted_last_error(&cfg).is_none() {
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                }
+                            }
+                            Ok(_) => {
+                                let _ = store.note_turn_completed(&agent.id);
+                                break;
                             }
                             Err(err) => {
                                 let _ = store.note_turn_completed(&agent.id);
