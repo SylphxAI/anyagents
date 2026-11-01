@@ -409,6 +409,8 @@ fn spawn_admin_sylphx_delivery(
             };
             match crate::vendor::vendor_launch(req) {
                 Ok(mut harness) => {
+                    let mut had_err = false;
+                    let mut completed_any = false;
                     while let Ok(Some(message)) = store.next_undelivered(&agent.id) {
                         let outbound = anyagents_harness::OutboundMessage {
                             id: message.id.as_str().to_string(),
@@ -451,6 +453,7 @@ fn spawn_admin_sylphx_delivery(
                                     }
                                 }
                                 let _ = store.note_turn_completed(&agent.id);
+                                completed_any = true;
                                 if crate::vendor::read_persisted_last_error(&cfg).is_none() {
                                     crate::vendor::persist_last_error(&cfg, None, None);
                                 }
@@ -460,6 +463,7 @@ fn spawn_admin_sylphx_delivery(
                                 break;
                             }
                             Err(err) => {
+                                had_err = true;
                                 let _ = store.note_turn_completed(&agent.id);
                                 crate::vendor::persist_last_error(
                                     &cfg,
@@ -468,6 +472,11 @@ fn spawn_admin_sylphx_delivery(
                                 );
                                 break;
                             }
+                        }
+                    }
+                    if completed_any && !had_err && agent.parent_id.is_some() {
+                        if store.complete_idle_subagent(&agent.id).unwrap_or(false) {
+                            reap_subagent_ephemeral_dirs(&data, &agent.id);
                         }
                     }
                 }
@@ -750,8 +759,25 @@ fn reconcile_stopped_and_backed_off_agents(
                     if should_wake {
                         if store.set_agent_state(&agent.id, "running").is_ok() {
                             guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                            create::poke_agent_wake_socket(data, &agent.id);
-                            create::poke_agent_wake_socket_mail(data, &agent.id);
+                            if agent.harness == "sylphx"
+                                && !guard.flushing_sylphx.contains(agent.id.as_str())
+                            {
+                                let mut running_agent = agent.clone();
+                                running_agent.state = "running".to_string();
+                                guard
+                                    .last_backoff_reset_ms
+                                    .insert(agent.id.to_string(), now_ms);
+                                guard.flushing_sylphx.insert(agent.id.to_string());
+                                spawn_admin_sylphx_delivery(
+                                    data.to_path_buf(),
+                                    running_agent,
+                                    health.clone(),
+                                    Arc::clone(reconcile),
+                                );
+                            } else {
+                                create::poke_agent_wake_socket(data, &agent.id);
+                                create::poke_agent_wake_socket_mail(data, &agent.id);
+                            }
                         }
                     } else {
                         guard.watermark_seq.insert(agent.id.to_string(), max_seq);
