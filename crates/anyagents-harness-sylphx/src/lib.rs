@@ -1742,7 +1742,7 @@ pub fn run_stdio_adapter(
                 .find(|(k, v)| k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty())
                 .map(|(_, v)| v.trim().to_string());
             let outcome = if let Some(env_slug) = cloud_env {
-                run_cloud_session_turn(
+                match run_cloud_session_turn(
                     &state_cl,
                     &cancel_cl,
                     &cfg_cl,
@@ -1753,7 +1753,23 @@ pub fn run_stdio_adapter(
                     &mcp_args_cl,
                     &env_slug,
                     &user_text,
-                )
+                ) {
+                    Ok(usage) => Ok(usage),
+                    Err(cloud_err) => {
+                        record_cloud_sandbox_fallback(&cfg_cl, &cloud_err);
+                        run_native_gateway_turn(
+                            &state_cl,
+                            &cancel_cl,
+                            &cfg_cl,
+                            &work_cl,
+                            model_cl.as_deref(),
+                            &env_cl,
+                            &mcp_cmd_cl,
+                            &mcp_args_cl,
+                            &user_text,
+                        )
+                    }
+                }
             } else {
                 run_native_gateway_turn(
                     &state_cl,
