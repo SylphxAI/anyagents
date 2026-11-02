@@ -106,6 +106,15 @@ impl CommandRunner for ProcessRunner {
         {
             command.env("BROWSER", "/bin/true");
         }
+        let is_real_agy = program == "agy"
+            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
+        let agy_token_path = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        let initial_agy_token = if is_real_agy {
+            std::fs::read(&agy_token_path).ok()
+        } else {
+            None
+        };
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
         {
@@ -132,6 +141,38 @@ impl CommandRunner for ProcessRunner {
                 InstallError::Failed(err.to_string())
             }
         })?;
+        let child_pid = child.id();
+        let agy_token_written = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher_handle = if is_real_agy {
+            let tok_path = agy_token_path;
+            let init_tok = initial_agy_token;
+            let written_flag = std::sync::Arc::clone(&agy_token_written);
+            let stop_flag = std::sync::Arc::clone(&watcher_stop);
+            Some(std::thread::spawn(move || {
+                while !stop_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(150));
+                    if let Ok(bytes) = std::fs::read(&tok_path)
+                        && init_tok.as_ref() != Some(&bytes)
+                        && let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                        && val
+                            .pointer("/token/access_token")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|s| !s.trim().is_empty())
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        written_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        #[cfg(unix)]
+                        unsafe {
+                            libc::kill(child_pid as i32, libc::SIGTERM);
+                        }
+                        break;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
         if let Some(mut stdout) = child.stdout.take() {
             let pass_through = std::io::IsTerminal::is_terminal(&std::io::stdout())
                 && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none();
@@ -196,7 +237,11 @@ impl CommandRunner for ProcessRunner {
         let status = child
             .wait()
             .map_err(|err| InstallError::Failed(err.to_string()))?;
-        if status.success() {
+        watcher_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = watcher_handle {
+            let _ = h.join();
+        }
+        if status.success() || agy_token_written.load(std::sync::atomic::Ordering::SeqCst) {
             Ok(())
         } else {
             Err(InstallError::Failed(format!(
