@@ -500,10 +500,14 @@ fn spawn_admin_sylphx_delivery(
             }
         }
         let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+        let still_running = Store::open(data.join("state.db"))
+            .ok()
+            .and_then(|s| s.agent(&agent.id).ok())
+            .is_some_and(|a| a.state == "running");
         health.publish(
             &agent.id,
             anyagents_supervisor::LiveState {
-                process_alive: true,
+                process_alive: still_running,
                 turn_state: anyagents_harness::TurnState::Idle,
                 delivery_mode,
                 steer_support,
@@ -685,8 +689,7 @@ pub(crate) fn has_explicit_archive_marker(
 }
 
 pub(crate) fn is_explicitly_archived(data_dir: &Path, agent: &Agent) -> bool {
-    has_explicit_archive_marker(data_dir, &agent.id)
-        || (agent.state == "archived" && agent.parent_id.is_none())
+    agent.state == "archived" || has_explicit_archive_marker(data_dir, &agent.id)
 }
 
 pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
@@ -699,6 +702,30 @@ pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &A
         }
     }
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
+    if let Ok(all_agents) = store.list_agents() {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(agent.id.clone());
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(agent.id.clone());
+        while let Some(pid) = queue.pop_front() {
+            for child in all_agents
+                .iter()
+                .filter(|a| a.parent_id.as_ref() == Some(&pid))
+            {
+                if seen.insert(child.id.clone()) {
+                    queue.push_back(child.id.clone());
+                    if child.state != "archived" {
+                        let _ = store.set_agent_state(&child.id, "archived");
+                    }
+                    let c_cfg = anyagents_core::agent_config_dir(data_dir, &child.id);
+                    let _ = std::fs::create_dir_all(&c_cfg);
+                    let _ =
+                        std::fs::write(c_cfg.join(".anyagents-archived"), format!("{}\n", now_ms()));
+                    reap_subagent_ephemeral_dirs(data_dir, &child.id);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
@@ -745,6 +772,28 @@ fn reconcile_stopped_and_backed_off_agents(
             if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
                 let _ = store.set_agent_state(&agent.id, "archived");
             }
+            if agent.harness == "sylphx"
+                && !guard.flushing_sylphx.contains(agent.id.as_str())
+                && health.get(&agent.id).is_some_and(|l| l.process_alive)
+            {
+                let (delivery_mode, steer_support) = declared(&agent.harness);
+                health.publish(
+                    &agent.id,
+                    anyagents_supervisor::LiveState {
+                        process_alive: false,
+                        turn_state: anyagents_harness::TurnState::Idle,
+                        delivery_mode,
+                        steer_support,
+                        quota_reset_at_ms: None,
+                        restart_at_ms: None,
+                        pid: None,
+                        live_harness: Some(agent.harness.clone()),
+                        live_model: agent.model.clone(),
+                        process_started_at_ms: None,
+                        last_error: None,
+                    },
+                );
+            }
             let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
             let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
             guard.watermark_seq.insert(agent.id.to_string(), max_seq);
@@ -754,7 +803,7 @@ fn reconcile_stopped_and_backed_off_agents(
             .lag(&agent.id, now_ms)
             .ok()
             .and_then(|l| l.oldest_undelivered_age_ms);
-        if agent.state == "archived" || agent.state == "idle" {
+        if agent.state == "idle" {
             if oldest_age_ms.is_some() {
                 let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                 let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
@@ -806,6 +855,32 @@ fn reconcile_stopped_and_backed_off_agents(
                 let persisted_err =
                     crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                    if oldest_age_ms.is_none()
+                        && persisted_err.is_none()
+                        && agent.parent_id.is_some()
+                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                    {
+                        reap_subagent_ephemeral_dirs(data, &agent.id);
+                        let (delivery_mode, steer_support) = declared(&agent.harness);
+                        health.publish(
+                            &agent.id,
+                            anyagents_supervisor::LiveState {
+                                process_alive: false,
+                                turn_state: anyagents_harness::TurnState::Idle,
+                                delivery_mode,
+                                steer_support,
+                                quota_reset_at_ms: None,
+                                restart_at_ms: None,
+                                pid: None,
+                                live_harness: Some(agent.harness.clone()),
+                                live_model: agent.model.clone(),
+                                process_started_at_ms: None,
+                                last_error: None,
+                            },
+                        );
+                        guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                        continue;
+                    }
                     let (delivery_mode, steer_support) = declared(&agent.harness);
                     health.publish(
                         &agent.id,
@@ -4611,9 +4686,7 @@ fn deliver_agent(
     key: Option<&str>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
-    if (agent.state == "idle" || agent.state == "archived")
-        && !is_explicitly_archived(store.data_dir(), &agent)
-    {
+    if agent.state == "idle" && !is_explicitly_archived(store.data_dir(), &agent) {
         let trimmed = body.text.trim_start();
         let is_auto_subagent_lifecycle = trimmed.starts_with("[Sub-Agent Completed]")
             || trimmed.starts_with("[Sub-Agent Error]");
