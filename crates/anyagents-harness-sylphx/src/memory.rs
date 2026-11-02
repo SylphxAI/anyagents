@@ -11,6 +11,71 @@ pub const CONTEXT_WATERMARK_PERCENT: usize = 75;
 pub const WINDOW_MAX_ITEMS: usize = 160;
 pub const WINDOW_STRIDE_ITEMS: usize = 80;
 
+/// Move a suffix boundary back over every completed call/output pair it splits.
+/// Parallel calls can interleave, so inspecting only the first retained item is
+/// insufficient. Extending the suffix preserves actual results, never invents a
+/// result or executes a call, and keeps the prefix stable between stride changes.
+fn paired_suffix_start(history: &[(usize, Value)], mut start: usize) -> usize {
+    let mut open_calls = std::collections::HashMap::new();
+    let mut pairs = Vec::new();
+    for (index, (_, item)) in history.iter().enumerate() {
+        let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+            continue;
+        };
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                open_calls.insert(call_id, index);
+            }
+            Some("function_call_output") => {
+                if let Some(call) = open_calls.remove(call_id) {
+                    pairs.push((call, index));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Descending output order also closes pairs exposed by an earlier extension.
+    for (call, output) in pairs.into_iter().rev() {
+        if call < start && output >= start {
+            start = call;
+        }
+    }
+    start
+}
+
+/// Last boundary before serialization: malformed raw history must not become a
+/// malformed model request. Open calls are allowed (e.g. an interrupted batch),
+/// but outputs must consume a preceding open call exactly once. No raw content
+/// or call arguments are included in the diagnostic.
+pub(super) fn validate_responses_input(items: &[Value]) -> Result<(), String> {
+    let mut open_calls = std::collections::HashSet::new();
+    for (index, item) in items.iter().enumerate() {
+        let kind = item.get("type").and_then(Value::as_str);
+        if !matches!(kind, Some("function_call" | "function_call_output")) {
+            continue;
+        }
+        let call_id = item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| format!("invalid Responses input[{index}].call_id: missing call ID"))?;
+        match kind {
+            Some("function_call") if !open_calls.insert(call_id) => {
+                return Err(format!(
+                    "invalid Responses input[{index}].call_id: duplicate open call"
+                ));
+            }
+            Some("function_call_output") if !open_calls.remove(call_id) => {
+                return Err(format!(
+                    "invalid Responses input[{index}].call_id: output has no preceding open call; raw transcript preserved"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 fn parse_range_spec_set(spec_val: &Value) -> std::collections::HashSet<usize> {
     fn push_str(set: &mut std::collections::HashSet<usize>, raw: &str) {
         for part in raw.split(',') {
@@ -57,7 +122,10 @@ fn parse_range_spec_set(spec_val: &Value) -> std::collections::HashSet<usize> {
     set
 }
 
-fn apply_context_edit_to_history(history: &mut Vec<(usize, Value)>, edit_event: &Value) {
+fn apply_context_edit_to_history(
+    history: &mut Vec<(usize, Value)>,
+    edit_event: &Value,
+) -> std::collections::HashSet<String> {
     // 1. In-place `replace` / `mask`: compress verbose tool outputs or messages into 1-line notes
     if let Some(replacements) = edit_event
         .get("replace")
@@ -114,7 +182,7 @@ fn apply_context_edit_to_history(history: &mut Vec<(usize, Value)>, edit_event: 
         .map(parse_range_spec_set)
         .unwrap_or_default();
     if drop_set.is_empty() && keep_only_set.is_empty() {
-        return;
+        return std::collections::HashSet::new();
     }
 
     let should_drop_idx = |raw_idx: usize| -> bool {
@@ -127,10 +195,24 @@ fn apply_context_edit_to_history(history: &mut Vec<(usize, Value)>, edit_event: 
     let mut protected_call_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut dropped_call_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut open_call_ids = std::collections::HashSet::new();
     for (raw_idx, item) in history.iter() {
+        if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call") => {
+                    open_call_ids.insert(cid.to_string());
+                }
+                Some("function_call_output") => {
+                    open_call_ids.remove(cid);
+                }
+                _ => {}
+            }
+        }
         if item.get("type").and_then(Value::as_str) == Some("function_call")
             && matches!(
-                item.get("name").and_then(Value::as_str),
+                item.get("name")
+                    .and_then(Value::as_str)
+                    .map(|name| name.strip_prefix("mcp__anyagents__").unwrap_or(name)),
                 Some("context_edit" | "context_prune")
             )
             && let Some(cid) = item.get("call_id").and_then(Value::as_str)
@@ -160,6 +242,25 @@ fn apply_context_edit_to_history(history: &mut Vec<(usize, Value)>, edit_event: 
         }
         true
     });
+    open_call_ids.retain(|cid| dropped_call_ids.contains(cid) && !protected_call_ids.contains(cid));
+    open_call_ids
+}
+
+fn include_after_context_edit(
+    item: &Value,
+    pruned_open_calls: &mut std::collections::HashSet<String>,
+) -> bool {
+    let Some(cid) = item.get("call_id").and_then(Value::as_str) else {
+        return true;
+    };
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call_output") => !pruned_open_calls.remove(cid),
+        Some("function_call") => {
+            pruned_open_calls.remove(cid);
+            true
+        }
+        _ => true,
+    }
 }
 
 /// Loads persisted transcript items along with their raw transcript line indices `(raw_idx, item)`.
@@ -168,6 +269,7 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
         return Vec::new();
     };
     let mut history: Vec<(usize, Value)> = Vec::new();
+    let mut pruned_open_calls = std::collections::HashSet::new();
     for (raw_idx, line) in BufReader::new(file)
         .lines()
         .map_while(Result::ok)
@@ -183,6 +285,7 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
                 .unwrap_or("")
                 .trim();
             history.clear();
+            pruned_open_calls.clear();
             history.push((
                 raw_idx,
                 json!({
@@ -195,11 +298,16 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             continue;
         }
         if m.get("type").and_then(Value::as_str) == Some("context_edit") {
-            apply_context_edit_to_history(&mut history, &m);
+            // An edit can run inside a batch, before another already-issued
+            // call's result is appended. Carry pairing through those later
+            // results, without applying keep_only to future unrelated messages.
+            pruned_open_calls.extend(apply_context_edit_to_history(&mut history, &m));
             continue;
         }
         if m.get("type").is_some() {
-            history.push((raw_idx, m));
+            if include_after_context_edit(&m, &mut pruned_open_calls) {
+                history.push((raw_idx, m));
+            }
             continue;
         }
         match m.get("role").and_then(Value::as_str) {
@@ -226,6 +334,7 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
                             tc.get("id").and_then(Value::as_str),
                             tc.pointer("/function/name").and_then(Value::as_str),
                         ) {
+                            pruned_open_calls.remove(cid);
                             let fargs = tc
                                 .pointer("/function/arguments")
                                 .and_then(Value::as_str)
@@ -245,6 +354,9 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             }
             Some("tool") => {
                 if let Some(cid) = m.get("tool_call_id").and_then(Value::as_str) {
+                    if pruned_open_calls.remove(cid) {
+                        continue;
+                    }
                     let out_str = m.get("content").and_then(Value::as_str).unwrap_or("");
                     history.push((
                         raw_idx,
@@ -261,12 +373,15 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
     }
     if history.len() > WINDOW_MAX_ITEMS {
         let excess = history.len() - WINDOW_STRIDE_ITEMS;
-        let block_start = (excess / WINDOW_STRIDE_ITEMS) * WINDOW_STRIDE_ITEMS;
+        let block_start = paired_suffix_start(
+            &history,
+            (excess / WINDOW_STRIDE_ITEMS) * WINDOW_STRIDE_ITEMS,
+        );
         history.drain(0..block_start);
-        while history.first().is_some_and(|(_, item)| {
-            item.get("type").and_then(Value::as_str) == Some("function_call_output")
-                || item.get("type").and_then(Value::as_str) == Some("reasoning")
-        }) {
+        while history
+            .first()
+            .is_some_and(|(_, item)| item.get("type").and_then(Value::as_str) == Some("reasoning"))
+        {
             history.remove(0);
         }
         let mask_bound = (WINDOW_STRIDE_ITEMS / 2).min(history.len());
@@ -287,34 +402,7 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             }
         }
     }
-    sanitize_responses_call_pairs(&mut history);
     history
-}
-
-/// Ensures every `function_call_output` in `history` has a preceding matching
-/// `function_call`, preventing `/v1/responses` HTTP 400
-/// (`function output has no preceding open call`) when stride windowing
-/// (`0..block_start`) slices through the middle of a multi-call tool batch.
-fn sanitize_responses_call_pairs(history: &mut Vec<(usize, Value)>) {
-    let mut seen_calls = std::collections::HashSet::new();
-    history.retain(|(_, item)| match item.get("type").and_then(Value::as_str) {
-        Some("function_call") => {
-            if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
-                seen_calls.insert(cid.to_string());
-            }
-            true
-        }
-        Some("function_call_output") => item
-            .get("call_id")
-            .and_then(Value::as_str)
-            .is_some_and(|cid| seen_calls.contains(cid)),
-        _ => true,
-    });
-    while history.first().is_some_and(|(_, item)| {
-        item.get("type").and_then(Value::as_str) == Some("reasoning")
-    }) {
-        history.remove(0);
-    }
 }
 
 /// Loads persisted transcript items for `/v1/responses` (`input`), starting from
@@ -1106,43 +1194,194 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
 }
 
 #[cfg(test)]
-mod tests {
+mod projection_tests {
     use super::*;
 
+    fn call(id: usize) -> Value {
+        json!({"type": "function_call", "call_id": format!("call_{id}"),
+            "name": "read_file", "arguments": "{\"path\":\"README.md\"}"})
+    }
+
+    fn output(id: usize) -> Value {
+        json!({"type": "function_call_output", "call_id": format!("call_{id}"),
+            "output": format!("already completed read {id}")})
+    }
+
+    fn values(history: &[(usize, Value)]) -> Vec<Value> {
+        history.iter().map(|(_, item)| item.clone()).collect()
+    }
+
     #[test]
-    fn sanitize_responses_call_pairs_drops_orphaned_call_or_output() {
-        let mut history = vec![
-            (
-                79,
-                json!({
-                    "type": "function_call",
-                    "call_id": "call_b",
-                    "name": "bash",
-                    "arguments": "{}"
-                }),
-            ),
-            (
-                80,
-                json!({
-                    "type": "function_call_output",
-                    "call_id": "call_a",
-                    "output": "orphaned output from drained call_a"
-                }),
-            ),
-            (
-                81,
-                json!({
-                    "type": "function_call_output",
-                    "call_id": "call_b",
-                    "output": "paired output for call_b"
-                }),
-            ),
-        ];
-        sanitize_responses_call_pairs(&mut history);
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].1["type"], "function_call");
-        assert_eq!(history[0].1["call_id"], "call_b");
-        assert_eq!(history[1].1["type"], "function_call_output");
-        assert_eq!(history[1].1["call_id"], "call_b");
+    fn saved_parallel_call_shape_survives_real_request_builder_without_history_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("transcript.jsonl");
+        // Saved post-anchor/edit population: 512 items; the old stride dropped
+        // 400, leaving calls at 400/401 and a non-leading orphan at input[2].
+        let mut raw: Vec<Value> = (0..399)
+            .map(|i| json!({"role": "user", "content": format!("message {i}")}))
+            .collect();
+        raw.extend([call(0), call(1), call(2), output(0), output(1), output(2)]);
+        raw.extend((405..512).map(|i| json!({"role": "user", "content": format!("message {i}")})));
+        assert_eq!(raw.len(), 512);
+        assert!(validate_responses_input(&raw[400..]).is_err());
+        for item in raw {
+            append_transcript_message(&path, &item);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let projected = load_transcript_input_items(&path);
+        assert_eq!(projected.len(), 113);
+        assert_eq!(projected[0], call(0));
+        let request = crate::build_native_responses_request(
+            "unchanged-model",
+            "instructions",
+            &projected,
+            &[],
+            "same-session",
+            Some("high"),
+        )
+        .unwrap();
+        assert_eq!(request["input"], json!(projected));
+        assert_eq!(request["prompt_cache_key"], "same-session");
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn every_cut_preserves_transitively_overlapping_pairs_and_open_calls() {
+        // A closes before B but B starts earlier: extending over A exposes B.
+        let history: Vec<_> = [call(1), call(0), output(0), output(1), call(2)]
+            .into_iter()
+            .enumerate()
+            .collect();
+        assert_eq!(paired_suffix_start(&history, 3), 0);
+        for cut in 0..=history.len() {
+            let start = paired_suffix_start(&history, cut);
+            let projected = values(&history[start..]);
+            validate_responses_input(&projected).unwrap();
+            if cut < history.len() {
+                assert_eq!(projected.last(), history.last().map(|(_, item)| item));
+            }
+        }
+    }
+
+    #[test]
+    fn generated_windows_and_context_edits_preserve_pairing_and_exact_retained_results() {
+        // Deterministic exhaustive property check over batch width, interleaved
+        // messages, every cut, many max/stride sizes, drop/keep_only/mask edits.
+        for width in 1..=8 {
+            let mut history = Vec::new();
+            for batch in 0..4 {
+                for offset in 0..width {
+                    history.push(call(batch * width + offset));
+                }
+                history.push(json!({"role": "user", "content": "interleaved steering"}));
+                for offset in (0..width).rev() {
+                    history.push(output(batch * width + offset));
+                }
+            }
+            let history: Vec<_> = history.into_iter().enumerate().collect();
+            for selected in 0..history.len() {
+                for edit in [
+                    json!({"drop": [selected]}),
+                    json!({"keep_only": [selected]}),
+                    json!({"replace": [{"range": selected, "with": "compressed actual result"}]}),
+                ] {
+                    let mut edited = history.clone();
+                    apply_context_edit_to_history(&mut edited, &edit);
+                    validate_responses_input(&values(&edited)).unwrap();
+                    for cut in 0..=edited.len() {
+                        let start = paired_suffix_start(&edited, cut);
+                        let projected = values(&edited[start..]);
+                        crate::build_native_responses_request("m", "s", &projected, &[], "k", None)
+                            .unwrap();
+                        // Suffix extension must not discard or alter an actual
+                        // completed result retained by the requested boundary.
+                        assert_eq!(&projected[cut - start..], &values(&edited[cut..]));
+                    }
+                    for max in 1..=12 {
+                        for stride in 1..=max {
+                            if edited.len() > max {
+                                let cut = ((edited.len() - stride) / stride) * stride;
+                                let start = paired_suffix_start(&edited, cut);
+                                validate_responses_input(&values(&edited[start..])).unwrap();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn edits_inside_a_batch_pair_later_outputs_but_keep_future_messages() {
+        for edit in [json!({"drop": [1]}), json!({"keep_only": [0]})] {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("batch.jsonl");
+            let mut edit_call = call(0);
+            edit_call["name"] = json!("mcp__anyagents__context_edit");
+            for item in [
+                edit_call.clone(),
+                call(1),
+                json!({"type": "context_edit", "drop": edit.get("drop"), "keep_only": edit.get("keep_only")}),
+                output(0),
+                output(1),
+                json!({"role": "user", "content": "future message must remain"}),
+            ] {
+                append_transcript_message(&path, &item);
+            }
+            let before = std::fs::read(&path).unwrap();
+            let projected = load_transcript_input_items(&path);
+            assert_eq!(
+                projected,
+                vec![
+                    edit_call,
+                    output(0),
+                    json!({"role": "user", "content": "future message must remain"})
+                ]
+            );
+            validate_responses_input(&projected).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn final_request_boundary_rejects_orphans_and_duplicate_results_without_repairing_raw() {
+        for invalid in [
+            vec![call(1), output(0), output(1)],
+            vec![call(0), output(0), output(0)],
+            vec![output(0), call(0)],
+            vec![call(0), call(0)],
+            vec![json!({"type": "function_call_output", "output": "private contents"})],
+        ] {
+            let before = invalid.clone();
+            let error = crate::build_native_responses_request("m", "s", &invalid, &[], "k", None)
+                .unwrap_err();
+            assert!(error.contains("call_id"));
+            assert!(!error.contains("private contents"));
+            assert_eq!(invalid, before);
+        }
+        validate_responses_input(&[call(0)]).unwrap(); // Legitimately open, no replay.
+    }
+
+    #[test]
+    fn legacy_parallel_tool_calls_share_a_raw_index_but_remain_paired() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("legacy.jsonl");
+        for _ in 0..159 {
+            append_transcript_message(&path, &json!({"role": "user", "content": "old"}));
+        }
+        append_transcript_message(
+            &path,
+            &json!({"role": "assistant", "tool_calls": [
+                {"id": "a", "function": {"name": "read_file", "arguments": "{}"}},
+                {"id": "b", "function": {"name": "read_file", "arguments": "{}"}}
+            ]}),
+        );
+        for id in ["b", "a"] {
+            append_transcript_message(
+                &path,
+                &json!({"role": "tool", "tool_call_id": id, "content": "done"}),
+            );
+        }
+        validate_responses_input(&load_transcript_input_items(&path)).unwrap();
     }
 }

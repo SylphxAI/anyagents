@@ -108,6 +108,8 @@ pub struct SessionTeleportReceipt {
     pub env_slug: Option<String>,
     pub synced_events: usize,
     pub transcript_items: usize,
+    /// Session transfer is not persistent workspace routing configuration.
+    pub placement_changed: bool,
 }
 
 /// Teleports a local `SylphxSdkSession` (`sylphx-transcript.jsonl` + git workspace state)
@@ -234,12 +236,14 @@ pub fn teleport_session_to_cloud(
         env_slug: Some(canonical_env),
         synced_events: transcript_items,
         transcript_items,
+        placement_changed: false,
     })
 }
 
 /// Pulls any unsynced `session_events` from the active Sylphx Cloud `AgentSession`
 /// into local `sylphx-transcript.jsonl`, interrupts any in-flight cloud turn, and
-/// transitions the session cleanly to local execution.
+/// clears the retained cloud-session metadata. This does not select persistent
+/// workspace placement; that independent routing record remains unchanged.
 pub fn pull_session_from_cloud(
     config_dir: &Path,
     env: &[(String, String)],
@@ -324,12 +328,13 @@ pub fn pull_session_from_cloud(
     let transcript_items = load_transcript_input_items(&transcript_path).len();
     Ok(SessionTeleportReceipt {
         direction: "cloud_to_local".to_string(),
-        mode: "local".to_string(),
+        mode: "unchanged".to_string(),
         agent_id: prev_agent_id,
         session_id: prev_session_id,
         env_slug: prev_env_slug,
         synced_events,
         transcript_items,
+        placement_changed: false,
     })
 }
 

@@ -210,6 +210,38 @@ AnyAgents separates **session identity** (`mcp-capability`) from the **runtime e
 2. **Container (`docker`) and cluster (`k8s`):** Each agent runs as the single user inside its own container or Pod, connects to the switchboard with its `mcp-capability`, and receives external credentials, volumes and GPU devices through standard Docker (`--env-file`, `-v`, `--gpus`) or Kubernetes (`Secret`, `ServiceAccount`, Workload Identity) primitives.
 3. **Multi-seat host (`seat`, opt-in):** When `ANYAGENTS_AGENTS`, `ANYAGENTS_AGENT_UID` or `ANYAGENTS_SOCKET_GID` is configured, every harness starts inside a distinct managed OS seat (`setpriv --reuid <uid> --regid <gid> --groups <gid>,<socket group> --no-new-privs --`). `anyagents agent-run --config <dir> -- <command>` asserts the process's effective UID/GID, `NoNewPrivs = 1`, denial of the server's database/secrets/operator token and peers' config directories, and writability of its own config directory before executing the command.
 
+### Native Sylphx workspace placement
+
+The native Sylphx harness exposes `sandbox(action="placement")` to read its own
+workspace routing, or `sandbox(action="placement", placement="local" | "cloud")`
+to persist a choice for the next workspace tool. Readback names the effective
+surface and worktree. This changes only the session's
+`sylphx-workspace-placement.json` routing record: it does not change the agent,
+Session, model, profile, credentials, pending operations, or a retained lease.
+Without a selection the existing sandbox configuration remains authoritative.
+
+The embedding runtime can restrict the supported surfaces with launch setting
+`SYLPHX_WORKSPACE_PLACEMENTS=local,cloud` (an empty value grants neither).
+Selections cannot override a disabled workspace. Invalid or ungranted choices
+leave the saved record unchanged; every workspace tool revalidates it, including
+revoked grants and malformed saved state. Explicit cloud placement fails closed
+on a cloud error instead of silently running on the host. Lease release and
+session pull do not select a placement; their receipts say so.
+
+Local workspace commands and file operations use the existing server-supplied
+`ANYAGENTS_SEAT_LAUNCH` / shared harness launcher boundary when configured.
+File reads, writes, edits, directory listing, code mode and every patch backend
+run under that delegated principal, not the in-process server's UID. A malformed,
+unavailable or refusing configured launcher never falls back to server-side file
+IO. Tool arguments cannot choose a principal. Without a configured seat, local
+commands inherit the ordinary UID and native file operations retain their usual
+behavior. Routing does not grant a new OS identity or external credential.
+
+Source publication is not running-server activation. Activation must separately
+identify the installed source and preserve existing workers and accepted or
+unknown operations; actual same-agent tool/worktree/principal acceptance remains
+a runtime check, not an implication of the placement receipt or CLI version.
+
 ## Replies and quotes
 
 Each stored message carries the context the server authenticated for it: the author, the channel, the chat and forum topic, the mailbox reference a bare answer names, the destination that answer goes to, and the message it quotes. Every harness shows its model that context before the body, composed in one place (`anyagents_harness::compose_message`); the body's own text is never read as part of it.
