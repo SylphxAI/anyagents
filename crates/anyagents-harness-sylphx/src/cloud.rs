@@ -939,7 +939,14 @@ git config --global init.defaultBranch main
 git config --global --add safe.directory "$ANYAGENTS_WORKSPACE"
 git config --global credential.helper '!f() { [ "$1" = get ] && [ -n "$GH_TOKEN" ] && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
 if [ -n "$ANYAGENTS_CLONE_URL" ] && [ ! -d "$ANYAGENTS_WORKSPACE/.git" ]; then
-  git clone --filter=blob:none "$ANYAGENTS_CLONE_URL" "$ANYAGENTS_WORKSPACE"
+  for _try in 1 2 3; do
+    if git clone --depth 50 --no-single-branch --filter=blob:none "$ANYAGENTS_CLONE_URL" "$ANYAGENTS_WORKSPACE"; then
+      break
+    fi
+    rm -rf "$ANYAGENTS_WORKSPACE"
+    mkdir -p "$ANYAGENTS_WORKSPACE"
+    sleep 2
+  done
 fi
 if [ -d "$ANYAGENTS_WORKSPACE/.git" ]; then
   cd "$ANYAGENTS_WORKSPACE"
