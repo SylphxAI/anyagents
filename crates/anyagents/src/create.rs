@@ -2890,6 +2890,7 @@ pub(crate) fn extract_profile_account_identity(
             {
                 email = val
                     .get("email")
+                    .or_else(|| val.get("id_token_email"))
                     .and_then(serde_json::Value::as_str)
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
@@ -3302,6 +3303,76 @@ pub(crate) fn resolve_and_commit_staged_signin(
                 let _ = std::fs::create_dir_all(staging_dir.join(".claude"));
                 let _ = std::fs::write(&root_cred, &updated);
                 let _ = std::fs::write(&sub_cred, &updated);
+            }
+        }
+    } else if provider == "google-antigravity"
+        && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+    {
+        let tok_path = staging_dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        if !tok_path.is_file() {
+            let _ = std::fs::remove_dir_all(staging_dir);
+            return Err(Error::Message(
+                "agy sign-in did not complete: no OAuth token was written".into(),
+            ));
+        }
+        if let Ok(text) = std::fs::read_to_string(&tok_path)
+            && let Ok(mut val) = serde_json::from_str::<serde_json::Value>(&text)
+        {
+            let has_email = val
+                .get("email")
+                .or_else(|| val.get("id_token_email"))
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_email
+                && let Some(access_tok) = val
+                    .pointer("/token/access_token")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                let http = ureq::Agent::config_builder()
+                    .timeout_global(Some(std::time::Duration::from_secs(6)))
+                    .build()
+                    .new_agent();
+                if let Ok(mut resp) = http
+                    .get("https://www.googleapis.com/oauth2/v2/userinfo")
+                    .header("Authorization", &format!("Bearer {access_tok}"))
+                    .call()
+                    && let Ok(body) = resp.body_mut().read_to_string()
+                    && let Ok(info) = serde_json::from_str::<serde_json::Value>(&body)
+                    && let Some(obj) = val.as_object_mut()
+                {
+                    if let Some(em) = info
+                        .get("email")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        obj.insert(
+                            "id_token_email".to_string(),
+                            serde_json::Value::String(em.to_string()),
+                        );
+                        obj.insert(
+                            "email".to_string(),
+                            serde_json::Value::String(em.to_string()),
+                        );
+                    }
+                    if let Some(id) = info
+                        .get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                    {
+                        obj.insert(
+                            "account_id".to_string(),
+                            serde_json::Value::String(id.to_string()),
+                        );
+                    }
+                    if let Ok(updated) = serde_json::to_string(&val) {
+                        let _ = std::fs::write(&tok_path, updated);
+                    }
+                }
             }
         }
     }

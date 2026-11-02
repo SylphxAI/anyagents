@@ -106,6 +106,22 @@ impl CommandRunner for ProcessRunner {
         {
             command.env("BROWSER", "/bin/true");
         }
+        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+        {
+            command.env("HOME", dir);
+            if program == "agy" {
+                let agy_dir = dir.join(".gemini/antigravity-cli");
+                let _ = std::fs::create_dir_all(&agy_dir);
+                let onboarding_pbtxt = "post_onboarding: {\n  completed_steps: POST_ONBOARDING_STEP_TYPE_MANAGER_WELCOME\n  completed_steps: POST_ONBOARDING_STEP_TYPE_USAGE_MODE\n  completed_steps: POST_ONBOARDING_STEP_TYPE_AGENT_CONFIGURATION\n  completed_steps: POST_ONBOARDING_STEP_TYPE_ADD_WORKSPACE\n}\nagent_onboarding_completed: true\nmigrations: { key: 3 value: MIGRATION_STATUS_COMPLETED }\nmigrations: { key: 4 value: MIGRATION_STATUS_COMPLETED }\nmigrations: { key: 5 value: MIGRATION_STATUS_COMPLETED }\n";
+                for name in ["jetski_state.pbtxt", "antigravity_state.pbtxt"] {
+                    let p = agy_dir.join(name);
+                    if !p.exists() {
+                        let _ = std::fs::write(&p, onboarding_pbtxt);
+                    }
+                }
+            }
+        }
         for (key, value) in env {
             command.env(key, value);
         }
