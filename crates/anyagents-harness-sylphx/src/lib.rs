@@ -397,6 +397,7 @@ impl Harness for SylphxHarness {
                         let _ = std::fs::remove_file(config_dir.join(".anyagents-last-error.json"));
                     }
                     Err(err_msg) => {
+                        let consecutive = persist_turn_error(&config_dir, &err_msg);
                         let lower = err_msg.to_ascii_lowercase();
                         if lower.contains("insufficient_quota")
                             || lower.contains("quota exceeded")
@@ -413,9 +414,12 @@ impl Harness for SylphxHarness {
                             g.sign_in_fault = Some(err_msg.clone());
                         } else {
                             g.sign_in_fault = Some(err_msg.clone());
-                            g.dead_reason = Some(err_msg.clone());
+                            let non_retryable = lower.contains("\"retryable\":false")
+                                || lower.contains("\"retryable\": false");
+                            if !non_retryable && consecutive <= 3 {
+                                g.dead_reason = Some(err_msg.clone());
+                            }
                         }
-                        persist_turn_error(&config_dir, &err_msg);
                     }
                 }
                 g.notify.clone()
@@ -539,19 +543,21 @@ impl Harness for SylphxHarness {
     }
 }
 
-fn persist_turn_error(config_dir: &Path, err_msg: &str) {
+fn persist_turn_error(config_dir: &Path, err_msg: &str) -> u64 {
     let err_path = config_dir.join(".anyagents-last-error.json");
     let prev_count = std::fs::read_to_string(&err_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .and_then(|v| v.get("consecutive_turn_errors").and_then(Value::as_u64))
         .unwrap_or(0);
+    let next_count = prev_count + 1;
     let doc = json!({
         "error": err_msg,
         "timestamp_ms": anyagents_core::now_ms(),
-        "consecutive_turn_errors": prev_count + 1,
+        "consecutive_turn_errors": next_count,
     });
     let _ = std::fs::write(&err_path, format!("{doc}\n"));
+    next_count
 }
 
 fn cloud_session_resource_path(env_slug: &str, sess_id: &str) -> String {
@@ -1295,8 +1301,15 @@ pub(crate) fn run_native_gateway_turn(
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
     let mut input_items = load_transcript_input_items(&transcript_path);
-    let is_recovery_on_unanswered_tail = initial_user_message
-        .contains("[Recovery] Your previous turn was interrupted")
+    let stripped_body = match initial_user_message.strip_prefix("[anyagents") {
+        Some(rest) => rest
+            .find("]\n")
+            .map(|idx| rest[idx + 2..].trim_start())
+            .unwrap_or(initial_user_message),
+        None => initial_user_message.trim_start(),
+    };
+    let is_recovery_on_unanswered_tail = stripped_body
+        .starts_with("[Recovery] Your previous turn was interrupted")
         && input_items.last().is_some_and(|last| {
             last.get("role").and_then(Value::as_str) == Some("user")
                 || last.get("type").and_then(Value::as_str) == Some("function_call_output")
@@ -3064,7 +3077,9 @@ fn execute_sylphx_tool(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
                         }
-                        record_cloud_sandbox_fallback(config_dir, &e);
+                        if !e.starts_with("ReadFile HTTP 404:") {
+                            record_cloud_sandbox_fallback(config_dir, &e);
+                        }
                     }
                 }
             }
@@ -3095,7 +3110,9 @@ fn execute_sylphx_tool(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
                         }
-                        record_cloud_sandbox_fallback(config_dir, &e);
+                        if !e.starts_with("ReadFile HTTP 404:") {
+                            record_cloud_sandbox_fallback(config_dir, &e);
+                        }
                     }
                 }
             }
@@ -3130,7 +3147,9 @@ fn execute_sylphx_tool(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
                         }
-                        record_cloud_sandbox_fallback(config_dir, &e);
+                        if !e.starts_with("ReadFile HTTP 404:") {
+                            record_cloud_sandbox_fallback(config_dir, &e);
+                        }
                     }
                 }
             }
@@ -3219,7 +3238,9 @@ fn execute_sylphx_tool(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
                         }
-                        record_cloud_sandbox_fallback(config_dir, &e);
+                        if !e.starts_with("ReadFile HTTP 404:") {
+                            record_cloud_sandbox_fallback(config_dir, &e);
+                        }
                     }
                 }
             }
@@ -4895,5 +4916,49 @@ exec "$@"
         assert_eq!(receipt.mode, "unchanged");
         assert!(!receipt.placement_changed);
         assert_eq!(receipt.transcript_items, 3);
+    }
+
+    #[test]
+    fn cloud_sandbox_exec_sentinel_and_fallback_backoff_preserve_lease_and_retry_after() {
+        let wrapped_ok = crate::cloud::wrap_cloud_exec_command_for_zero_exit("true");
+        let out_ok = std::process::Command::new("bash")
+            .args(["-lc", &wrapped_ok])
+            .status()
+            .unwrap();
+        assert_eq!(
+            crate::cloud::normalize_cloud_exec_exit_code(out_ok.code().unwrap_or(-1) as i64),
+            0
+        );
+
+        let wrapped_err = crate::cloud::wrap_cloud_exec_command_for_zero_exit("exit 7");
+        let out_err = std::process::Command::new("bash")
+            .args(["-lc", &wrapped_err])
+            .status()
+            .unwrap();
+        assert_eq!(
+            crate::cloud::normalize_cloud_exec_exit_code(out_err.code().unwrap_or(-1) as i64),
+            7
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        record_cloud_sandbox_fallback(
+            cfg,
+            "CreateLease HTTP 503: {\"code\":\"NO_CAPACITY\",\"retry_after_ms\":180000}",
+        );
+        let fb1: Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.join("sylphx-sandbox-fallback.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fb1["consecutive_failures"].as_u64(), Some(1));
+        assert!(fb1["cooldown_ms"].as_i64().unwrap_or(0) >= 180_000);
+
+        record_cloud_sandbox_fallback(cfg, "CreateLease HTTP 503: {\"code\":\"NO_CAPACITY\"}");
+        let fb2: Value = serde_json::from_str(
+            &std::fs::read_to_string(cfg.join("sylphx-sandbox-fallback.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fb2["consecutive_failures"].as_u64(), Some(2));
+        assert!(fb2["cooldown_ms"].as_i64().unwrap_or(0) >= 120_000);
     }
 }

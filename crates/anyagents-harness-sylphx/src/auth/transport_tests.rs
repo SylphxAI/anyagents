@@ -36,6 +36,7 @@ fn assert_large_post(status: u16, response_body: &str) {
                 Err(error) => return Err(error),
             }
         };
+        stream.set_nonblocking(false)?;
         stream.set_read_timeout(Some(Duration::from_secs(3)))?;
         stream.set_write_timeout(Some(Duration::from_secs(3)))?;
         let mut request = Vec::new();
@@ -67,6 +68,7 @@ fn assert_large_post(status: u16, response_body: &str) {
             "HTTP/1.1 {status} Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
             response_body.len()
         )?;
+        stream.flush()?;
         Ok((headers, request[header_end..].to_vec()))
     });
 

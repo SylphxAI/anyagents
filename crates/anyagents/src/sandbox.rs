@@ -871,6 +871,29 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         if meta.uid() != me {
             if meta.uid() != uid {
                 migrate_file_to_seat_uid(&path, uid, gid);
+            } else if (meta.permissions().mode() & 0o060) != 0o060
+                && !is_isolated_test_env()
+                && launcher().is_file()
+                && let Some(sock_gid) = sock_gid_for()
+            {
+                let t_uid = uid.to_string();
+                let t_gid = gid.to_string();
+                let groups = format!("{gid},{sock_gid}");
+                let _ = std::process::Command::new(launcher())
+                    .args([
+                        "--reuid",
+                        &t_uid,
+                        "--regid",
+                        &t_gid,
+                        "--groups",
+                        &groups,
+                        "--no-new-privs",
+                        "--",
+                        "chmod",
+                        "g+rw",
+                    ])
+                    .arg(&path)
+                    .status();
             }
             continue;
         }
