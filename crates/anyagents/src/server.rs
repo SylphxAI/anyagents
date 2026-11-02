@@ -247,6 +247,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                 let st = Arc::clone(&sched_store);
                 let hb = sched_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    let dd = st.data_dir();
+                    if dd.join("admin.sock").exists() || dd.join("admin.lock").exists() {
+                        return;
+                    }
                     crate::schedule::tick_schedules_once(&st, &hb, now_ms());
                 })
                 .await;
@@ -414,6 +418,28 @@ fn spawn_admin_sylphx_delivery(
     reconcile: Arc<std::sync::Mutex<AdminReconcileState>>,
 ) {
     std::thread::spawn(move || {
+        let store = match Store::open(data.join("state.db")) {
+            Ok(s) => s,
+            Err(_) => {
+                let mut guard = match reconcile.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.flushing_sylphx.remove(agent.id.as_str());
+                return;
+            }
+        };
+        let _agent_lock = match store.try_lock_agent(&agent.id) {
+            Ok(lock) => lock,
+            Err(_) => {
+                let mut guard = match reconcile.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.flushing_sylphx.remove(agent.id.as_str());
+                return;
+            }
+        };
         let (delivery_mode, steer_support) = declared(&agent.harness);
         let cfg = anyagents_core::agent_config_dir(&data, &agent.id);
         let work_dir = agent
@@ -437,7 +463,12 @@ fn spawn_admin_sylphx_delivery(
                 last_error: None,
             },
         );
-        if let Ok(store) = Store::open(data.join("state.db")) {
+        {
+            create::ensure_seat_environment(&cfg);
+            let _ = std::fs::create_dir_all(&work_dir);
+            if let Some((_, gid, _)) = detect_seat_ids(&cfg) {
+                crate::sandbox::share_worktree_with_seat(&work_dir, gid);
+            }
             let req = anyagents_supervisor::LaunchRequest {
                 agent: agent.clone(),
                 data_dir: data.clone(),
@@ -620,12 +651,8 @@ fn spawn_admin_sylphx_delivery(
                             }
                         }
                     }
-                    if completed_any
-                        && !had_err
-                        && agent.parent_id.is_some()
-                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
-                    {
-                        reap_subagent_ephemeral_dirs(&data, &agent.id);
+                    if completed_any && !had_err && agent.parent_id.is_some() {
+                        let _ = store.complete_idle_subagent(&agent.id);
                     }
                 }
                 Err(reason) => {
@@ -1028,7 +1055,6 @@ fn reconcile_stopped_and_backed_off_agents(
                         && agent.parent_id.is_some()
                         && store.complete_idle_subagent(&agent.id).unwrap_or(false)
                     {
-                        reap_subagent_ephemeral_dirs(data, &agent.id);
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
                             &agent.id,
@@ -1230,6 +1256,13 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         if auth.is_confined() {
             crate::sandbox::share_socket_with_seats(&path);
         }
+        if let Ok(agents) = store.list_agents() {
+            for agent in agents {
+                if agent.harness == "sylphx" {
+                    create::poke_agent_wake_socket(data, &agent.id);
+                }
+            }
+        }
         let health = HealthBoard::default();
         sync_health_from_primary_socket(data, &health);
         let sched_store = Arc::clone(&store);
@@ -1353,7 +1386,6 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         if let Some(h) = reaper_handle {
             h.abort();
         }
-        let _ = std::fs::remove_file(&path);
         result.map_err(Error::from)
     });
     runtime.shutdown_timeout(std::time::Duration::from_millis(100));
@@ -2863,14 +2895,37 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         }
         None => {
             let (mode, steer) = declared(&agent.harness);
+            let lock_busy = agent.harness == "sylphx"
+                && matches!(
+                    store.try_lock_agent(&agent.id),
+                    Err(anyagents_core::Error::AgentBusy)
+                );
+            let admin_alive = agent.harness == "sylphx"
+                && agent.state == "running"
+                && (store.data_dir().join("admin.sock").exists()
+                    || store.data_dir().join("admin.lock").exists());
+            let proc_str = if lock_busy || admin_alive {
+                "alive"
+            } else {
+                "down"
+            };
+            let turn_str = if lock_busy { "working" } else { "idle" };
             (
-                "down",
-                "idle",
+                proc_str,
+                turn_str,
                 mode_name(mode),
                 steer_name(steer),
                 session_quota,
-                None,
-                None,
+                if proc_str == "alive" {
+                    Some(agent.harness.clone())
+                } else {
+                    None
+                },
+                if proc_str == "alive" {
+                    agent.model.clone()
+                } else {
+                    None
+                },
                 None,
                 false,
                 session_error,
@@ -3144,16 +3199,29 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     let config_dir = agent_root.join("config");
     crate::sylphx::release_persisted_sandbox_lease(&config_dir);
     let seat_ids = detect_seat_ids(&config_dir);
-    for rel in ["cache-home", "cache", ".tmp", "tmp", ".rustup", ".cargo"] {
+    for rel in ["cache-home", "cache", ".tmp", "tmp"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
-    if let Ok(store) = Store::open(data_dir.join("state.db"))
-        && let Ok(agent) = store.agent(agent_id)
-        && agent.parent_id.is_some()
-    {
-        let bp = data_dir.join("browser-profiles").join(&agent.name);
-        remove_path_with_seat(&bp, seat_ids);
+    create::ensure_seat_environment(&config_dir);
+    let mut shared_workdirs = std::collections::HashSet::new();
+    if let Ok(store) = Store::open(data_dir.join("state.db")) {
+        if let Ok(agent) = store.agent(agent_id)
+            && agent.parent_id.is_some()
+        {
+            let bp = data_dir.join("browser-profiles").join(&agent.name);
+            remove_path_with_seat(&bp, seat_ids);
+        }
+        if let Ok(agents) = store.list_agents() {
+            for other in agents {
+                if &other.id != agent_id
+                    && other.state != "archived"
+                    && let Some(wd) = other.workdir
+                {
+                    shared_workdirs.insert(PathBuf::from(wd));
+                }
+            }
+        }
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
     let marker_val = std::fs::read_to_string(&marker_path)
@@ -3173,21 +3241,28 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     let work_dir = agent_root.join("work");
     if let Some(ref wt_path) = recorded_wt
         && wt_path != &work_dir
+        && !shared_workdirs.contains(wt_path)
         && wt_path.join(".git").exists()
         && is_git_worktree_safe_to_reap(wt_path, initial_head.as_deref())
     {
         reap_git_worktree_cleanly(wt_path, seat_ids);
     }
-    if work_dir.join(".git").exists() {
-        if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
-            reap_git_worktree_cleanly(&work_dir, seat_ids);
-            let _ = std::fs::remove_file(&marker_path);
+    if !shared_workdirs.contains(&work_dir) {
+        if work_dir.join(".git").exists() {
+            if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
+                reap_git_worktree_cleanly(&work_dir, seat_ids);
+                let _ = std::fs::remove_file(&marker_path);
+            }
+        } else {
+            remove_path_with_seat(&work_dir, seat_ids);
+            if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
+                let _ = std::fs::remove_file(&marker_path);
+            }
         }
-    } else {
-        remove_path_with_seat(&work_dir, seat_ids);
-        if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
-            let _ = std::fs::remove_file(&marker_path);
-        }
+    }
+    let _ = std::fs::create_dir_all(&work_dir);
+    if let Some((_, gid, _)) = seat_ids {
+        crate::sandbox::share_worktree_with_seat(&work_dir, gid);
     }
 }
 

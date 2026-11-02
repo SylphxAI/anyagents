@@ -3072,6 +3072,22 @@ impl Store {
         Ok(updated == 1)
     }
 
+    pub fn restore_skipped_at_schedules(&self, min_next_fire_at_ms: i64) -> Result<usize, Error> {
+        let conn = self.conn();
+        let updated = conn.execute(
+            "UPDATE agent_schedules
+             SET state = 'active',
+                 last_observed = NULL
+             WHERE kind = 'at'
+               AND state = 'fired'
+               AND last_fired_at_ms IS NULL
+               AND last_observed LIKE 'skipped:%'
+               AND next_fire_at_ms >= ?1",
+            params![min_next_fire_at_ms],
+        )?;
+        Ok(updated)
+    }
+
     pub fn update_schedule_watch_observation(
         &self,
         id: &str,

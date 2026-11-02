@@ -176,6 +176,7 @@ impl Client {
         let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
         let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
             && ((method == "POST" && path == "/v1/agents")
+                || (method == "GET" && path == "/v1/agents")
                 || path.ends_with("/harness")
                 || path.ends_with("/model")
                 || path.ends_with("/rename")

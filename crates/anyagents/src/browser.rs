@@ -2871,7 +2871,7 @@ fn load_op_service_account_token() -> Option<String> {
     None
 }
 
-fn ensure_caller_op_config_dir() -> Option<PathBuf> {
+fn ensure_caller_op_home_and_config_dir() -> Option<(PathBuf, PathBuf)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -2882,14 +2882,18 @@ fn ensure_caller_op_config_dir() -> Option<PathBuf> {
                 && meta.uid() == uid
                 && (meta.permissions().mode() & 0o777) == 0o700
             {
-                return Some(candidate);
+                return Some((home, candidate));
             }
         }
-        let dir = std::env::temp_dir().join(format!("anyagents-op-cfg-{uid}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        if dir.is_dir() {
-            return Some(dir);
+        let home_dir = std::env::temp_dir().join(format!("anyagents-op-home-{uid}"));
+        let cfg_root = home_dir.join(".config");
+        let op_dir = cfg_root.join("op");
+        let _ = std::fs::create_dir_all(&op_dir);
+        let _ = std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&cfg_root, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&op_dir, std::fs::Permissions::from_mode(0o700));
+        if op_dir.is_dir() {
+            return Some((home_dir, op_dir));
         }
         None
     }
@@ -2902,7 +2906,12 @@ fn ensure_caller_op_config_dir() -> Option<PathBuf> {
 fn configure_op_command(cmd: &mut Command) {
     cmd.stdin(Stdio::null());
     cmd.env("DESK_SECRET_READ", "1");
-    if let Some(cfg_dir) = ensure_caller_op_config_dir() {
+    if let Some(host_home) = crate::sandbox::host_home_dir() {
+        cmd.env("DESK_OP_HOME", host_home);
+    }
+    if let Some((op_home, cfg_dir)) = ensure_caller_op_home_and_config_dir() {
+        cmd.env("HOME", &op_home);
+        cmd.env("XDG_CONFIG_HOME", op_home.join(".config"));
         cmd.env("OP_CONFIG_DIR", cfg_dir);
     }
     if let Some(token) = load_op_service_account_token() {

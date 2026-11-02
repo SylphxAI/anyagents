@@ -277,19 +277,32 @@ pub fn spawn_command(
     let mut command = match seat {
         Some(spec) => match spec.split('\t').collect::<Vec<_>>().as_slice() {
             [launcher, uid, gid, groups] => {
-                let mut command = std::process::Command::new(launcher);
-                command.args([
-                    "--reuid",
-                    uid,
-                    "--regid",
-                    gid,
-                    "--groups",
-                    groups,
-                    "--no-new-privs",
-                    "--",
-                ]);
-                command.arg(program);
-                command
+                #[cfg(unix)]
+                let already_in_seat = {
+                    unsafe extern "C" {
+                        fn geteuid() -> u32;
+                    }
+                    unsafe { geteuid() }.to_string() == *uid
+                };
+                #[cfg(not(unix))]
+                let already_in_seat = false;
+                if already_in_seat {
+                    std::process::Command::new(program)
+                } else {
+                    let mut command = std::process::Command::new(launcher);
+                    command.args([
+                        "--reuid",
+                        uid,
+                        "--regid",
+                        gid,
+                        "--groups",
+                        groups,
+                        "--no-new-privs",
+                        "--",
+                    ]);
+                    command.arg(program);
+                    command
+                }
             }
             _ => std::process::Command::new(program),
         },

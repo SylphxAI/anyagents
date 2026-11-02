@@ -923,9 +923,18 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             {
                 view.last_error =
                     crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-                if view.state == "running" {
-                    view.process = "alive".to_string();
-                }
+            }
+            let lock_busy = matches!(
+                store.try_lock_agent(&id),
+                Err(anyagents_core::Error::AgentBusy)
+            );
+            if lock_busy {
+                view.process = "alive".to_string();
+                view.turn_state = "working".to_string();
+            } else if view.state == "running"
+                && (data.join("admin.sock").exists() || data.join("admin.lock").exists())
+            {
+                view.process = "alive".to_string();
             }
         }
         let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))

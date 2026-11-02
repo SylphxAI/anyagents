@@ -599,6 +599,12 @@ pub fn agent_wake_block_reason(
 }
 
 pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
+    if matches!(
+        store.try_lock_agent(&agent.id),
+        Err(anyagents_core::Error::AgentBusy)
+    ) {
+        return true;
+    }
     if store.has_open_turn(&agent.id).unwrap_or(false) {
         return true;
     }
@@ -619,6 +625,7 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
 /// Evaluate all active schedules once at timestamp `now`.
 /// Returns the number of wakes delivered.
 pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    let _ = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000));
     let Ok(schedules) = store.list_schedules(None, true) else {
         return 0;
     };
@@ -637,17 +644,9 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if now < due {
                     continue;
                 }
-                if let Some(reason) = block {
-                    // Missed wake while busy/quota-blocked/paused: consume once, never fire twice.
-                    let _ = store.claim_schedule_tick(
-                        &sched.id,
-                        Some(due),
-                        "fired",
-                        None,
-                        None,
-                        None,
-                        Some(&format!("skipped:{reason}")),
-                    );
+                if block.is_some() {
+                    // Defer one-shot timer wakes while the owning agent is busy, paused, or
+                    // quota-blocked so the wake is delivered as soon as the agent becomes idle.
                     continue;
                 }
                 if store
