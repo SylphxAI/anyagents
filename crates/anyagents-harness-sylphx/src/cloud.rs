@@ -23,7 +23,7 @@ use super::auth::{
 
 pub const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
 pub const DEFAULT_SYLPHX_SANDBOX_SHAPE: &str = "linux-s";
-pub const DEFAULT_SYLPHX_SANDBOX_IDLE_TIMEOUT: &str = "300s";
+pub const DEFAULT_SYLPHX_SANDBOX_IDLE_TIMEOUT: &str = "1800s";
 pub const CLOUD_WORKSPACE_DIR: &str = "/home/user/workspace";
 const CLOUD_EXEC_ZERO_SENTINEL: i64 = 200;
 
@@ -147,6 +147,7 @@ pub fn build_cloud_environment_spec(
     let mut spec = json!({
         "shape": shape,
         "template": "template:agent",
+        "ttl": "1800s",
     });
     if let Some(uri) = wt.repo_url
         && let Some(obj) = spec.as_object_mut()
@@ -414,7 +415,7 @@ pub fn resolve_agent_git_worktree_spec(
     }
 }
 
-fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
+pub(super) fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
     for (k, v) in env {
         if (k == "GH_TOKEN" || k == "GITHUB_TOKEN") && !v.trim().is_empty() {
             return Some(v.trim().to_string());
@@ -427,18 +428,31 @@ fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
             return Some(v.trim().to_string());
         }
     }
-    if !crate::sandbox::is_isolated_test_env()
-        && let Ok(out) = Command::new("gh")
+    if !crate::sandbox::is_isolated_test_env() {
+        static CACHED_GH_TOKEN: OnceLock<Mutex<Option<(i64, String)>>> = OnceLock::new();
+        let cache = CACHED_GH_TOKEN.get_or_init(|| Mutex::new(None));
+        let now = anyagents_core::now_ms();
+        if let Ok(guard) = cache.lock()
+            && let Some((ts, ref tok)) = *guard
+            && now.saturating_sub(ts) < 300_000
+        {
+            return Some(tok.clone());
+        }
+        if let Ok(out) = Command::new("gh")
             .args(["auth", "token"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
-        && out.status.success()
-    {
-        let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        if !tok.is_empty() {
-            return Some(tok);
+            && out.status.success()
+        {
+            let tok = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !tok.is_empty() {
+                if let Ok(mut guard) = cache.lock() {
+                    *guard = Some((now, tok.clone()));
+                }
+                return Some(tok);
+            }
         }
     }
     None
@@ -592,6 +606,10 @@ pub(super) fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) 
                 "local".to_string()
             } else if config_dir.join("sylphx-sandbox-lease.json").is_file() {
                 "cloud".to_string()
+            } else if !crate::sandbox::is_isolated_test_env()
+                && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
+            {
+                "cloud".to_string()
             } else {
                 "local".to_string()
             }
@@ -599,7 +617,7 @@ pub(super) fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) 
     }
 }
 
-pub(super) fn resolve_sylphx_cloud_access_key(
+pub fn resolve_sylphx_cloud_access_key(
     config_dir: &Path,
     env: &[(String, String)],
 ) -> Option<String> {
@@ -952,12 +970,40 @@ fn bootstrap_cloud_sandbox_worktree(
     // `:exec` process environment only when git requests credentials.
     let bootstrap_script = r#"set -e
 mkdir -p "$ANYAGENTS_WORKSPACE" "$HOME/.local/bin"
+cat > "$HOME/.local/bin/gh" << 'EOF_GH'
+#!/usr/bin/env bash
+set -e
+if [ -x /usr/bin/gh ]; then
+  exec /usr/bin/gh "$@"
+fi
+GH_BIN="$HOME/.local/bin/gh-bin"
+if [ ! -x "$GH_BIN" ]; then
+  tmp_dir=$(mktemp -d /tmp/gh-dl.XXXXXX)
+  if curl -fsSL "https://github.com/cli/cli/releases/download/v2.67.0/gh_2.67.0_linux_amd64.tar.gz" | tar -xz -C "$tmp_dir" 2>/dev/null; then
+    mv "$tmp_dir"/gh_*_linux_amd64/bin/gh "$GH_BIN.$$"
+    chmod 755 "$GH_BIN.$$"
+    mv -f "$GH_BIN.$$" "$GH_BIN"
+  fi
+  rm -rf "$tmp_dir"
+fi
+if [ -x "$GH_BIN" ]; then
+  exec "$GH_BIN" "$@"
+fi
+echo "gh: failed to bootstrap github cli" >&2
+exit 1
+EOF_GH
+chmod 755 "$HOME/.local/bin/gh"
+exec 9>/tmp/sylphx-bootstrap.lock
+flock -w 180 9 || true
 rm -f "$HOME/.git-credentials" "$HOME/.anyagents_cloud_env"
 git config --global user.name "Kyle Tse"
 git config --global user.email "hi@kylet.se"
 git config --global init.defaultBranch main
 git config --global --add safe.directory "$ANYAGENTS_WORKSPACE"
 git config --global credential.helper '!f() { [ "$1" = get ] && [ -n "$GH_TOKEN" ] && printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
+if [ -f "$ANYAGENTS_WORKSPACE/.git/index.lock" ] && ! pgrep -x git >/dev/null 2>&1; then
+  rm -f "$ANYAGENTS_WORKSPACE/.git/index.lock"
+fi
 if [ -n "$ANYAGENTS_CLONE_URL" ] && [ ! -d "$ANYAGENTS_WORKSPACE/.git" ]; then
   for _try in 1 2 3; do
     if git clone --depth 50 --no-single-branch --filter=blob:none "$ANYAGENTS_CLONE_URL" "$ANYAGENTS_WORKSPACE"; then
@@ -970,6 +1016,7 @@ if [ -n "$ANYAGENTS_CLONE_URL" ] && [ ! -d "$ANYAGENTS_WORKSPACE/.git" ]; then
 fi
 if [ -d "$ANYAGENTS_WORKSPACE/.git" ]; then
   cd "$ANYAGENTS_WORKSPACE"
+  rm -f .git/index.lock
   git config --local user.name "Kyle Tse"
   git config --local user.email "hi@kylet.se"
   if [ -n "$ANYAGENTS_BASE_REF" ]; then
@@ -991,8 +1038,8 @@ fi
 "#;
 
     let wrapped_bootstrap = wrap_cloud_exec_command_for_zero_exit(bootstrap_script);
-    let idempotency_key = next_exec_idempotency_key("bootstrap");
-    let (status, raw) = post_exec_with_idempotency_retry(
+    let mut idempotency_key = next_exec_idempotency_key("bootstrap");
+    let (mut status, mut raw) = post_exec_with_idempotency_retry(
         &exec_url,
         access_key,
         &json!({
@@ -1002,6 +1049,20 @@ fi
             "timeout": "180s",
         }),
     )?;
+    if status == 409 && raw.contains("EXEC_OUTCOME_UNKNOWN") {
+        std::thread::sleep(Duration::from_secs(2));
+        idempotency_key = next_exec_idempotency_key("bootstrap_retry");
+        (status, raw) = post_exec_with_idempotency_retry(
+            &exec_url,
+            access_key,
+            &json!({
+                "idempotency_key": idempotency_key,
+                "command": ["bash", "-lc", wrapped_bootstrap],
+                "env": exec_env,
+                "timeout": "180s",
+            }),
+        )?;
+    }
     if !(200..300).contains(&status) {
         return Err(format!("Bootstrap ExecLease HTTP {status}: {}", raw.trim()));
     }
@@ -1076,8 +1137,7 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
     let api_url = resolve_cloud_api_url(env);
     let exec_url = format!("{api_url}/v1/{lease_name}:exec");
     let mut exec_env = serde_json::Map::new();
-    let needs_git_auth = cmd_str.contains("git") || cmd_str.contains("gh");
-    if needs_git_auth && let Some(tok) = resolve_github_token(env) {
+    if let Some(tok) = resolve_github_token(env) {
         exec_env.insert("GH_TOKEN".to_string(), json!(tok));
         exec_env.insert("GITHUB_TOKEN".to_string(), json!(tok));
     }
@@ -1094,9 +1154,15 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
             "command": ["bash", "-lc", wrapped_cmd],
             "working_directory": CLOUD_WORKSPACE_DIR,
             "env": exec_env,
-            "timeout": "120s",
+            "timeout": "180s",
         }),
     )?;
+    if status == 409 && raw.contains("EXEC_OUTCOME_UNKNOWN") {
+        return Ok(
+            "exit_code: 125\nstderr:\ncloud sandbox command stream interrupted (EXEC_OUTCOME_UNKNOWN); the command was already dispatched in /home/user/workspace — check workspace state (e.g. git status / ls) before retrying.\n"
+                .to_string(),
+        );
+    }
     if !(200..300).contains(&status) {
         return Err(format!("ExecLease HTTP {status}: {}", raw.trim()));
     }

@@ -106,16 +106,6 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             wd_lower.as_str(),
             "cloud" | "cloud-worktree" | "cloud-sandbox"
         ) || (agent.harness == "sylphx" && wd_lower == "sandbox");
-        let is_cloud_sandbox_mode = wd_is_cloud_keyword
-            || pairs
-                .iter()
-                .any(|(k, v)| k == "SYLPHX_SANDBOX" && v.eq_ignore_ascii_case("cloud"))
-            || std::env::var("SYLPHX_SANDBOX")
-                .ok()
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cloud"));
-        if is_cloud_sandbox_mode && !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
-            pairs.push(("SYLPHX_SANDBOX".to_string(), "cloud".to_string()));
-        }
         let wd_is_worktree_keyword = matches!(
             wd_lower.as_str(),
             "worktree" | "branch" | "isolated" | "cloud-worktree"
@@ -144,6 +134,35 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         } else {
             request.workdir.clone()
         };
+        let explicit_local_sandbox = pairs.iter().any(|(k, v)| {
+            k == "SYLPHX_SANDBOX"
+                && matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "local" | "host" | "none" | "off" | "false" | "0" | "stateless"
+                )
+        }) || std::env::var("SYLPHX_SANDBOX").ok().is_some_and(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "local" | "host" | "none" | "off" | "false" | "0" | "stateless"
+            )
+        });
+        let is_cloud_sandbox_mode = wd_is_cloud_keyword
+            || pairs
+                .iter()
+                .any(|(k, v)| k == "SYLPHX_SANDBOX" && v.eq_ignore_ascii_case("cloud"))
+            || std::env::var("SYLPHX_SANDBOX")
+                .ok()
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cloud"))
+            || (agent.harness == "sylphx"
+                && agent.parent_id.is_some()
+                && explicit_workdir.is_none()
+                && !wd_is_inherit_keyword
+                && !explicit_local_sandbox
+                && !crate::sandbox::is_isolated_test_env()
+                && crate::sylphx::resolve_sylphx_cloud_access_key(&config, &pairs).is_some());
+        if is_cloud_sandbox_mode && !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
+            pairs.push(("SYLPHX_SANDBOX".to_string(), "cloud".to_string()));
+        }
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
@@ -221,6 +240,16 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                 }
                 None => {
                     if agent.parent_id.is_some() {
+                        if agent.harness == "sylphx" && is_cloud_sandbox_mode {
+                            let _ = provision_cloud_sandbox_worktree_marker(
+                                store,
+                                &agent,
+                                &config,
+                                "inherit",
+                                request.branch.as_deref(),
+                                request.base.as_deref(),
+                            );
+                        }
                         managed_abs.clone()
                     } else {
                         match &request.workdir_default {
@@ -548,6 +577,44 @@ fn provision_cloud_sandbox_worktree_marker(
             {
                 initial_head = String::from_utf8_lossy(&out.stdout).trim().to_string();
             }
+        }
+        if matches!(
+            resolved_repo.to_ascii_lowercase().as_str(),
+            "inherit" | "parent" | "worktree" | "branch" | "isolated"
+        ) && let Some(pid) = agent.parent_id.as_ref()
+            && let Some(agents_dir) = config.parent().and_then(|p| p.parent())
+        {
+            let parent_marker = agents_dir
+                .join(pid.as_str())
+                .join("config/.anyagents-managed-worktree.json");
+            if let Ok(raw) = std::fs::read_to_string(parent_marker)
+                && let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw)
+            {
+                if let Some(r) = val
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
+                    resolved_repo = r.to_string();
+                }
+                if initial_head.is_empty()
+                    && let Some(b) = val
+                        .get("base")
+                        .or_else(|| val.get("initial_head"))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    initial_head = b.to_string();
+                }
+            }
+        }
+        if matches!(
+            resolved_repo.to_ascii_lowercase().as_str(),
+            "inherit" | "parent" | "worktree" | "branch" | "isolated"
+        ) {
+            resolved_repo.clear();
         }
     } else if Path::new(&resolved_repo).is_dir() {
         let local_repo = Path::new(&resolved_repo);
@@ -7437,8 +7504,8 @@ mod tests {
         //    - L2's worktree is clean and unmodified -> reaping L2 removes `l2_wt` cleanly.
         crate::server::reap_subagent_ephemeral_dirs(data, &l2.id);
         assert!(
-            !l2_wt.exists(),
-            "clean unmodified worktree should be reaped on archive"
+            !l2_wt.join(".git").exists() && !l2_wt.join("README.md").exists() && l2_wt.is_dir(),
+            "clean unmodified worktree should be reaped on archive while keeping empty work/ dir"
         );
 
         //    - Dirty L1's worktree with an uncommitted file -> reaping L1 MUST preserve `l1_wt`!

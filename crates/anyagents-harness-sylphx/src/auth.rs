@@ -444,7 +444,6 @@ pub fn write_sylphx_config(
         if marker_cloud == Some(true)
             || (!obj.contains_key("sandbox")
                 && marker_cloud != Some(false)
-                && obj.contains_key("repo")
                 && !crate::sandbox::is_isolated_test_env()
                 && crate::cloud::resolve_sylphx_cloud_access_key(config_dir, &[]).is_some())
         {
@@ -731,6 +730,16 @@ fn gateway_retry_policy() -> (u32, u64) {
 
 fn parse_retry_after_ms(body: &str) -> Option<u64> {
     let val = serde_json::from_str::<Value>(body.trim()).ok()?;
+    if let Some(ms) = val
+        .get("retry_after_ms")
+        .or_else(|| val.pointer("/error/retry_after_ms"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+    {
+        return Some(ms.min(30_000));
+    }
     let secs = val
         .get("error")
         .and_then(|e| e.get("retry_after_seconds"))
@@ -771,7 +780,7 @@ fn curl_post_json_fallback(
         "-X",
         "POST",
         "--max-time",
-        "120",
+        "210",
         "-H",
         "Content-Type: application/json",
         "-w",

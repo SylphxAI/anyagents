@@ -8,7 +8,8 @@ use std::path::Path;
 
 pub use anyagents_harness_sylphx::{
     CLOUD_WORKSPACE_DIR, DEFAULT_SYLPHX_MODEL, SylphxHarness, read_sylphx_key_from_dir,
-    release_persisted_sandbox_lease, run_device_flow_login, run_stdio_adapter,
+    release_persisted_sandbox_lease, resolve_sylphx_cloud_access_key, run_device_flow_login,
+    run_stdio_adapter,
 };
 
 pub fn write_sylphx_config(

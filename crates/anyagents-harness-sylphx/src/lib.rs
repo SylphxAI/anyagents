@@ -39,6 +39,8 @@ pub mod sandbox {
             || std::env::var_os("ANYAGENTS_CLAUDE_BIN").is_some()
             || std::env::var_os("ANYAGENTS_CODEX_BIN").is_some()
             || std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_some()
+            || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
+            || std::env::var_os("NEXTEST_RUN_ID").is_some()
     }
 
     pub fn host_home_dir() -> Option<PathBuf> {
@@ -615,25 +617,108 @@ fn build_cloud_agent_client_tools() -> Vec<Value> {
                 "name": name,
                 "description": func.get("description").cloned().unwrap_or(Value::String(String::new())),
                 "input_schema": func.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
-                "client": {},
+                "client": {
+                    "timeout": "600s"
+                },
             }))
         })
         .collect()
 }
 
 fn build_cloud_agent_tools() -> Vec<Value> {
-    let mut tools = vec![
-        json!({
-            "name": "shell",
-            "builtin": { "id": "shell" }
-        }),
-        json!({
-            "name": "files",
-            "builtin": { "id": "files" }
-        }),
-    ];
-    tools.extend(build_cloud_agent_client_tools());
-    tools
+    build_cloud_agent_client_tools()
+}
+
+fn format_rfc3339_utc_plus_secs(offset_secs: u64) -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(1_793_640_000)
+        .saturating_add(offset_secs);
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    format!("{year:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_cloud_turn_execution(
+    base: &str,
+    canonical_env: &str,
+    api_key: &str,
+    gateway_key: &str,
+    repo_token: Option<&str>,
+    sess_path: &str,
+    turn: i64,
+    has_repo: bool,
+) -> Result<Option<Value>, String> {
+    let capture_url = format!("{base}/v1/{canonical_env}/agents:capture-credential");
+    let expires_at = format_rfc3339_utc_plus_secs(10_800);
+    let capture_one =
+        |purpose: &str, allowed_tools: &[&str], credential: &str| -> Result<Option<String>, String> {
+            let body = json!({
+                "session": sess_path,
+                "turn": turn,
+                "purpose": purpose,
+                "allowed_tools": allowed_tools,
+                "credential": credential,
+                "expires_at": expires_at,
+            });
+            let (st, raw) = curl_post_json(&capture_url, Some(api_key), &body)?;
+            if st == 404 {
+                return Ok(None);
+            }
+            if !(200..300).contains(&st) {
+                return Err(format!(
+                    "cloud capture-credential ({purpose}) HTTP {st}: {}",
+                    raw.trim()
+                ));
+            }
+            let val: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+            val.get("handle")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(|s| Some(s.to_string()))
+                .ok_or_else(|| format!("cloud capture-credential ({purpose}) missing handle"))
+        };
+
+    let Some(runtime_handle) = capture_one("runtime", &["runtime_api"], api_key)? else {
+        return Ok(None);
+    };
+    let Some(inference_handle) = capture_one("execution", &["inference"], gateway_key)? else {
+        return Ok(None);
+    };
+    let mut credentials = serde_json::Map::new();
+    credentials.insert(
+        "inference".to_string(),
+        json!({ "handle": inference_handle }),
+    );
+    if has_repo
+        && let Some(tok) = repo_token.filter(|s| !s.trim().is_empty())
+        && let Some(repo_handle) = capture_one("execution", &["repository"], tok)?
+    {
+        credentials.insert(
+            "repository".to_string(),
+            json!({ "handle": repo_handle }),
+        );
+    }
+    Ok(Some(json!({
+        "turn": turn,
+        "runtime_credential_handle": runtime_handle,
+        "credentials": Value::Object(credentials),
+    })))
 }
 
 /// Runs a turn against the remote Sylphx Cloud Agents BaaS (`/v1/{env}/agent_sessions`),
@@ -739,6 +824,8 @@ pub(crate) fn run_cloud_session_turn(
     let api_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
     })?;
+    let gateway_key = resolve_sylphx_gateway_key(config_dir, env).unwrap_or_else(|| api_key.clone());
+    let repo_token = resolve_github_token(env);
     let base = resolve_cloud_api_url(env);
     let canonical_env = normalize_cloud_env_slug(env_slug);
     let (model_id, _) = parse_sylphx_model_and_effort(model);
@@ -749,6 +836,7 @@ pub(crate) fn run_cloud_session_turn(
         (g.cloud_agent_id.clone(), g.cloud_session_id.clone())
     };
     let mut initial_last_seq: i64 = 0;
+    let mut next_turn: i64 = 1;
 
     if let Some(persisted) = load_persisted_cloud_session(config_dir) {
         if persisted.model_id == model_id && persisted.env_slug == canonical_env {
@@ -787,6 +875,14 @@ pub(crate) fn run_cloud_session_turn(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_ascii_lowercase();
+                    let tc = val
+                        .get("turn_count")
+                        .and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        })
+                        .unwrap_or(0);
+                    next_turn = tc.saturating_add(1);
                     if status == "failed"
                         || status == "session_state_failed"
                         || status == "terminated"
@@ -795,9 +891,11 @@ pub(crate) fn run_cloud_session_turn(
                         clear_persisted_cloud_session(config_dir);
                         session_id = None;
                         initial_last_seq = 0;
+                        next_turn = 1;
                     } else if status.contains("running")
                         || status.contains("working")
                         || status.contains("waiting")
+                        || status.contains("awaiting")
                     {
                         let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
                         let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
@@ -809,6 +907,7 @@ pub(crate) fn run_cloud_session_turn(
                 agent_id = None;
                 session_id = None;
                 initial_last_seq = 0;
+                next_turn = 1;
             }
             _ => {}
         }
@@ -832,7 +931,22 @@ pub(crate) fn run_cloud_session_turn(
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&prior_block);
     }
-    let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
+    let mut environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
+    if let Some(obj) = environment_spec.as_object_mut() {
+        if repo_token.is_none() {
+            obj.remove("repo");
+        } else if let Some(repo_obj) = obj.get_mut("repo").and_then(Value::as_object_mut)
+            && let Some(rev) = repo_obj
+                .get("revision")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        {
+            let is_sha = rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit());
+            if !is_sha && rev != "HEAD" && !rev.starts_with("origin/") {
+                repo_obj.remove("revision");
+            }
+        }
+    }
 
     if agent_id.is_none() {
         let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
@@ -896,6 +1010,7 @@ pub(crate) fn run_cloud_session_turn(
             .to_string();
         session_id = Some(sid.clone());
         initial_last_seq = 0;
+        next_turn = 1;
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
         g.cloud_session_id = Some(sid.clone());
         g.session_id = Some(sid.clone());
@@ -916,12 +1031,26 @@ pub(crate) fn run_cloud_session_turn(
     );
 
     let sess_path = cloud_session_resource_path(&canonical_env, &sid);
+    let has_repo = environment_spec.get("repo").is_some();
+    let execution_opt = capture_cloud_turn_execution(
+        &base,
+        &canonical_env,
+        &api_key,
+        &gateway_key,
+        repo_token.as_deref(),
+        &sess_path,
+        next_turn,
+        has_repo,
+    )?;
     let send_url = format!("{base}/v1/{sess_path}:send");
-    let send_body = json!({
+    let mut send_body = json!({
         "message": {
             "parts": [{ "text": user_message }]
         }
     });
+    if let (Some(exec_val), Some(obj)) = (execution_opt, send_body.as_object_mut()) {
+        obj.insert("execution".to_string(), exec_val);
+    }
     let (st, raw) = curl_post_json(&send_url, Some(&api_key), &send_body)?;
     if !(200..300).contains(&st) {
         return Err(format!("cloud session send HTTP {st}: {}", raw.trim()));
@@ -944,6 +1073,9 @@ pub(crate) fn run_cloud_session_turn(
     let mut sent_any_reply = false;
     let mut self_archived = false;
     let mut assistant_texts: Vec<String> = Vec::new();
+    let mut turn_in_tok: u64 = 0;
+    let mut turn_out_tok: u64 = 0;
+    let mut turn_cache_read_tok: u64 = 0;
     let stall_timeout_ms = env
         .iter()
         .find(|(k, v)| k == "SYLPHX_CLOUD_SESSION_STALL_MS" && !v.trim().is_empty())
@@ -953,7 +1085,7 @@ pub(crate) fn run_cloud_session_turn(
                 .ok()
                 .and_then(|s| s.trim().parse::<u64>().ok())
         })
-        .unwrap_or(20_000);
+        .unwrap_or(180_000);
     let mut last_progress = Instant::now();
 
     while !cancel_flag.load(Ordering::SeqCst) {
@@ -986,7 +1118,7 @@ pub(crate) fn run_cloud_session_turn(
                 }
                 if seq > last_seq {
                     last_seq = seq;
-                    if seq > baseline_seq + 2 {
+                    if seq > baseline_seq + 1 {
                         last_progress = Instant::now();
                     }
                 }
@@ -1078,7 +1210,20 @@ pub(crate) fn run_cloud_session_turn(
                         );
                         last_progress = Instant::now();
                     }
-                } else if ev_type.contains("AGENT_MESSAGE") || ev_type.contains("RESPONSE") {
+                } else if ev_type == "USAGE" {
+                    let parse_u64 = |ptr: &str| -> u64 {
+                        ev.pointer(ptr)
+                            .and_then(|v| {
+                                v.as_u64()
+                                    .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                            })
+                            .unwrap_or(0)
+                    };
+                    turn_in_tok = turn_in_tok.saturating_add(parse_u64("/usage/input_tokens"));
+                    turn_out_tok = turn_out_tok.saturating_add(parse_u64("/usage/output_tokens"));
+                    turn_cache_read_tok =
+                        turn_cache_read_tok.saturating_add(parse_u64("/usage/cached_tokens"));
+                } else if ev_type.contains("AGENT_MESSAGE") {
                     last_progress = Instant::now();
                     if let Some(parts) = ev.pointer("/message/parts").and_then(Value::as_array) {
                         for p in parts {
@@ -1091,11 +1236,22 @@ pub(crate) fn run_cloud_session_turn(
                                 assistant_texts.push(t.to_string());
                             }
                         }
-                    } else if let Some(t) = ev
-                        .pointer("/response/text")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
+                    }
+                } else if ev_type.contains("RESPONSE") {
+                    last_progress = Instant::now();
+                    if ev.pointer("/response/is_error").and_then(Value::as_bool) == Some(true) {
+                        let err_text = ev
+                            .pointer("/response/text")
+                            .and_then(Value::as_str)
+                            .unwrap_or("cloud turn failed");
+                        return Err(format!("cloud session turn error: {err_text}"));
+                    }
+                    if assistant_texts.is_empty()
+                        && let Some(t) = ev
+                            .pointer("/response/text")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
                     {
                         assistant_texts.push(t.to_string());
                     }
@@ -1155,22 +1311,31 @@ pub(crate) fn run_cloud_session_turn(
                         }),
                     );
                 }
-                let in_tok = val
-                    .get("total_input_tokens")
-                    .or_else(|| val.pointer("/usage/input_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let out_tok = val
-                    .get("total_output_tokens")
-                    .or_else(|| val.pointer("/usage/output_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let cache_read_tok = val
-                    .get("total_cache_read_tokens")
-                    .or_else(|| val.pointer("/usage/input_tokens_details/cached_tokens"))
-                    .or_else(|| val.pointer("/usage/cache_read_tokens"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
+                let in_tok = if turn_in_tok > 0 {
+                    turn_in_tok
+                } else {
+                    val.get("total_input_tokens")
+                        .or_else(|| val.pointer("/usage/input_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                };
+                let out_tok = if turn_out_tok > 0 {
+                    turn_out_tok
+                } else {
+                    val.get("total_output_tokens")
+                        .or_else(|| val.pointer("/usage/output_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                };
+                let cache_read_tok = if turn_cache_read_tok > 0 {
+                    turn_cache_read_tok
+                } else {
+                    val.get("total_cache_read_tokens")
+                        .or_else(|| val.pointer("/usage/input_tokens_details/cached_tokens"))
+                        .or_else(|| val.pointer("/usage/cache_read_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0)
+                };
                 let cache_write_tok = val
                     .get("total_cache_write_tokens")
                     .or_else(|| val.pointer("/usage/cache_write_tokens"))
@@ -4257,10 +4422,8 @@ mod tests {
         }
 
         let all_cloud_tools = build_cloud_agent_tools();
-        assert_eq!(all_cloud_tools[0]["name"], "shell");
-        assert_eq!(all_cloud_tools[0]["builtin"]["id"], "shell");
-        assert_eq!(all_cloud_tools[1]["name"], "files");
-        assert_eq!(all_cloud_tools[1]["builtin"]["id"], "files");
+        assert_eq!(all_cloud_tools.len(), client_tools.len());
+        assert_eq!(all_cloud_tools[0]["client"]["timeout"], "600s");
     }
 
     // The fixture launcher never changes UID/groups or invokes setpriv. It only
