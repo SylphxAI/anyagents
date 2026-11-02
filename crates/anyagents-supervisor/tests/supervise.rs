@@ -860,9 +860,7 @@ fn a_model_or_harness_change_drains_and_cuts_over_even_when_turn_never_ends_and_
     .unwrap();
     assert!(wait_until(|| {
         supervisor.live(&agent.id).is_some_and(|live| {
-            live.pid.is_some()
-                && live.process_alive
-                && live.live_model.as_deref() == Some("sonnet")
+            live.pid.is_some() && live.process_alive && live.live_model.as_deref() == Some("sonnet")
         })
     }));
     let first_pid = supervisor.live(&agent.id).unwrap().pid.unwrap();

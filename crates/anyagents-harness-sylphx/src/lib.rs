@@ -2944,12 +2944,8 @@ fn execute_sylphx_tool(
                 return "error: missing `command`".to_string();
             };
             if sandbox_mode == "cloud" {
-                match exec_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    cmd_str,
-                ) {
+                match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str)
+                {
                     Ok(out) => return out,
                     Err(e) => record_cloud_sandbox_fallback(config_dir, &e),
                 }
@@ -2970,12 +2966,8 @@ fn execute_sylphx_tool(
             let start_line = args.get("start_line").and_then(Value::as_u64);
             let end_line = args.get("end_line").and_then(Value::as_u64);
             if sandbox_mode == "cloud" {
-                match read_file_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    rel,
-                ) {
+                match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
+                {
                     Ok(content) => {
                         return format_read_file_output(rel, &content, start_line, end_line);
                     }
@@ -3052,12 +3044,8 @@ fn execute_sylphx_tool(
                 edits_vec.push((old_str.to_string(), new_str.to_string()));
             }
             if sandbox_mode == "cloud" {
-                match read_file_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    rel,
-                ) {
+                match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
+                {
                     Ok(existing) => {
                         match apply_edits_to_content(&existing, &edits_vec, replace_all) {
                             Ok((updated, ranges)) => {

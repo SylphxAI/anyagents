@@ -12,9 +12,9 @@
 //!     `agents`, `conversation`, `groups`, `schedule`, `browser`) through the public
 //!     `SylphxClientToolHandler` trait without privileged backdoors.
 
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 use crate::{
     DEFAULT_SYLPHX_SANDBOX_PARENT, PersistedCloudSession, SharedState, append_transcript_message,
@@ -219,7 +219,10 @@ pub fn teleport_session_to_cloud(
             last_seq: 0,
         },
     );
-    let _ = std::fs::write(config_dir.join("sylphx-session-id"), format!("{session_id}\n"));
+    let _ = std::fs::write(
+        config_dir.join("sylphx-session-id"),
+        format!("{session_id}\n"),
+    );
     let _ = std::fs::remove_file(config_dir.join("sylphx-cloud-session-fallback.json"));
     let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-fallback.json"));
 
@@ -254,8 +257,7 @@ pub fn pull_session_from_cloud(
 
         if let Some(api_key) = resolve_sylphx_cloud_access_key(config_dir, env) {
             let base = resolve_cloud_api_url(env);
-            let sess_path =
-                cloud_session_resource_path(&persisted.env_slug, &persisted.session_id);
+            let sess_path = cloud_session_resource_path(&persisted.env_slug, &persisted.session_id);
             let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
             let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
 
@@ -444,12 +446,7 @@ impl SylphxSdkSession {
         let stdin = std::io::stdin();
         let mut stdout = std::io::stdout();
         loop {
-            write!(
-                stdout,
-                "sylphx ({:?})> ",
-                self.execution_mode
-            )
-            .map_err(|e| e.to_string())?;
+            write!(stdout, "sylphx ({:?})> ", self.execution_mode).map_err(|e| e.to_string())?;
             stdout.flush().map_err(|e| e.to_string())?;
             let mut line = String::new();
             let n = stdin

@@ -3530,9 +3530,7 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
             changed = true;
         }
     }
-    changed
-        .then(|| serde_json::to_vec(&src_val).ok())
-        .flatten()
+    changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
 }
 
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
