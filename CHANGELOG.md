@@ -7,8 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-Nothing is released yet. This section records what has landed on `main` so far;
-the first release will move it under a version heading.
+## 0.1.1
+
+### Added
+
+- Interactive browser takeover for CAPTCHA and two-factor authentication.
+- Configurable sub-agent defaults and automatic idling for the Sylphx harness.
+- Sylphx context editing, parallel tool execution, patch application and richer
+  code tools, with shared and workspace guidance layered together.
+- Core SDK session transfer, cloud-first fallback and quota synchronization.
+
+### Changed
+
+- Conversation history uses lossless lexical and structured search. SQLite
+  readers use WAL without the writer lock, and search filters run in FTS5.
+- Telegram replies use native rich messages. Sylphx prompt caching and usage
+  records include cache-read telemetry.
+- Rust packages inherit one workspace release version, kept in step with the
+  npm launcher and its four platform packages.
+
+### Fixed
+
+- Large Sylphx conversations no longer exceed the operating system's argument
+  limit when HTTP requests use the curl fallback. Request bodies stream through
+  stdin with their original bytes and HTTP status preserved, including early
+  server refusals.
+- Transient Sylphx service failures retry without discarding the conversation;
+  patch recounting and fuzzy matching are supported, and usage is flushed on stop.
+- Dollar signs are escaped in Telegram rich messages.
+
+## 0.1.0
+
+Initial release, published on 2026-10-30.
 
 ### Added
 
@@ -56,10 +86,6 @@ the first release will move it under a version heading.
 
 ### Fixed
 
-- Large Sylphx conversations no longer exceed the operating system's argument
-  limit when HTTP requests use the curl fallback. Request bodies stream through
-  stdin with their original bytes and HTTP status preserved.
-
 - **An OpenCode agent's mailbox stalled after its first turn or two.** The
   adapter wrote one prompt per turn and waited for a turn end it could not
   observe, so every later row stayed `received` and a server restart did not
@@ -96,5 +122,5 @@ the first release will move it under a version heading.
 
 ### Not yet
 
-- Telegram sign-in, the MCP registry entry, and a published release.
+- Telegram sign-in and the MCP registry entry.
 - A TUI or GUI (the API is designed for them).

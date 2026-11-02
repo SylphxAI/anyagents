@@ -53,7 +53,15 @@ cargo build --release -p anyagents  # Build the binary the npm launcher runs
 
 ### Release Process
 
-Nothing is released yet. When there is a release, it is a pull request that bumps the version in the workspace and `packages/anyagents/package.json` together and adds a `## X.Y.Z` section to [CHANGELOG.md](CHANGELOG.md); merging it publishes the npm launcher and its platform packages.
+A release is a pull request that bumps `[workspace.package].version`, the npm
+launcher in `packages/anyagents/package.json`, its platform dependency pins, and
+every platform package in `packages/npm/` together. All Rust members inherit the
+workspace version; update `Cargo.lock` and add a `## X.Y.Z` section to
+[CHANGELOG.md](CHANGELOG.md).
+
+Merging the pull request runs the release workflow, which builds and publishes
+the native binaries, npm packages and GitHub release. A push with an already
+complete published version does not publish new artifacts.
 
 ## License
 
