@@ -834,3 +834,81 @@ fn a_model_or_harness_change_automatically_switches_running_process_at_next_idle
     }));
     drop(supervisor);
 }
+
+#[test]
+fn a_model_or_harness_change_drains_and_cuts_over_even_when_turn_never_ends_and_messages_arrive() {
+    let dir = short_dir();
+    let log = dir.path().join("vendor.log");
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut new_agent = NewAgent::new("alpha", "claude-code");
+    new_agent.model = Some("sonnet".to_string());
+    let agent = store.create_agent(new_agent).unwrap();
+    let work = dir.path().join("work-switch-busy");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_700_000_000_000);
+    // `"hold"` never emits a turn result, so the first message keeps the old
+    // process permanently `InTurn`.
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()) as Arc<dyn Clock>,
+        scripted("hold", log.clone()),
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| {
+        supervisor.live(&agent.id).is_some_and(|live| {
+            live.pid.is_some()
+                && live.process_alive
+                && live.live_model.as_deref() == Some("sonnet")
+        })
+    }));
+    let first_pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+
+    // Start a turn that never completes on its own.
+    store
+        .receive(&agent.id, Incoming::new("initial-long-turn"))
+        .unwrap();
+    assert!(wait_until(|| log_contains(&log, "initial-long-turn")));
+
+    // Request a model switch while the turn is active, and keep sending new
+    // messages to the agent. The retiring process must NOT receive the new
+    // messages, and once the drain window elapses the supervisor cuts over to
+    // the new process and delivers the queued message there.
+    store.set_agent_model(&agent.id, "opus").unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    store
+        .receive(&agent.id, Incoming::new("queued-for-new-model"))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(80));
+    assert!(
+        !log_contains(&log, "queued-for-new-model"),
+        "new mailbox messages must be held back from the retiring process while a switch is pending"
+    );
+
+    // Advance the clock past the 15s drain window so the supervisor preemptively
+    // replaces the non-terminating turn and delivers the queued message on the new model.
+    for step in 1..=20 {
+        clock.set_ms(1_700_000_000_000 + step * 1_000);
+        if supervisor.live(&agent.id).is_some_and(|live| {
+            live.process_alive
+                && live.pid != Some(first_pid)
+                && live.live_model.as_deref() == Some("opus")
+        }) && log_contains(&log, "queued-for-new-model")
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(40));
+    }
+
+    assert!(wait_until(|| {
+        supervisor.live(&agent.id).is_some_and(|live| {
+            live.process_alive
+                && live.pid != Some(first_pid)
+                && live.live_model.as_deref() == Some("opus")
+        }) && log_contains(&log, "queued-for-new-model")
+    }));
+    drop(supervisor);
+}

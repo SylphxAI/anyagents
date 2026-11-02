@@ -946,12 +946,15 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         if view.last_error.is_none() && view.harness == "codex" {
             view.last_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
         }
-        if view.quota_reset_at_ms.is_some_and(|ms| ms > now)
+        if let Some(reset_ms) = view.quota_reset_at_ms.filter(|&ms| ms > now)
             && let Ok(agent_rec) = store.agent(&id)
-            && crate::create::try_rotate_exhausted_profile(&store, data, &agent_rec, true).is_some()
         {
-            view.quota_reset_at_ms = None;
-            view.last_error = None;
+            crate::create::record_profile_quota_reset(data, &agent_rec, reset_ms);
+            if crate::create::try_rotate_exhausted_profile(&store, data, &agent_rec, true).is_some()
+            {
+                view.quota_reset_at_ms = None;
+                view.last_error = None;
+            }
         }
         let mut open_turn = store.has_open_turn(&id).unwrap_or(false);
         if view.state == "running" && view.process == "alive" {

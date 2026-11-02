@@ -2635,11 +2635,12 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
             )
         }
     };
-    if quota.is_some_and(|ms| ms > now)
-        && create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some()
-    {
-        quota = None;
-        last_error = None;
+    if let Some(reset_ms) = quota.filter(|&ms| ms > now) {
+        create::record_profile_quota_reset(store.data_dir(), agent, reset_ms);
+        if create::try_rotate_exhausted_profile(store, store.data_dir(), agent, true).is_some() {
+            quota = None;
+            last_error = None;
+        }
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
         if let Some(ref err_msg) = last_error {

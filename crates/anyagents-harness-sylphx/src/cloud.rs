@@ -18,7 +18,8 @@ use super::auth::{
     resolve_sylphx_api_key, truncate_tool_output_middle_utf8,
 };
 
-const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
+pub const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
+pub const DEFAULT_SYLPHX_SANDBOX_SHAPE: &str = "linux-s";
 pub const CLOUD_WORKSPACE_DIR: &str = "/home/user/workspace";
 
 #[derive(Debug, Clone, Default)]
@@ -29,37 +30,74 @@ pub struct CloudWorktreeSpec {
     pub base: Option<String>,
 }
 
+pub fn normalize_cloud_env_slug(raw: &str) -> String {
+    let trimmed = raw.trim().trim_matches('/');
+    match trimmed {
+        ""
+        | "default"
+        | "prod"
+        | "sylphx"
+        | "sylphx/default/prod"
+        | "orgs/sylphx/projects/default/envs/prod"
+        | "organizations/sylphx/projects/default/environments/prod" => {
+            DEFAULT_SYLPHX_SANDBOX_PARENT.to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
+pub(super) fn resolve_cloud_api_url(env: &[(String, String)]) -> String {
+    env.iter()
+        .find(|(k, v)| k == "SYLPHX_API_URL" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().trim_end_matches('/').to_string())
+        .or_else(|| {
+            std::env::var("SYLPHX_API_URL")
+                .ok()
+                .map(|s| s.trim().trim_end_matches('/').to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string())
+}
+
+pub(super) fn resolve_sandbox_shape(env: &[(String, String)]) -> String {
+    env.iter()
+        .find(|(k, v)| k == "SYLPHX_SANDBOX_SHAPE" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_string())
+        .or_else(|| {
+            std::env::var("SYLPHX_SANDBOX_SHAPE")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SYLPHX_SANDBOX_SHAPE.to_string())
+}
+
 /// Builds a declarative `sylphx.agents.v1.EnvironmentSpec` JSON object for `Sylphx Agents`
 /// BaaS (`POST /v1/{env}/agents` and `POST /v1/{env}/agent_sessions`) so the cloud runtime
-/// provisions a Kata microVM sandbox (`template:agent`) with the agent's Git repository and
-/// branch/revision mounted at `/home/user/workspace`.
+/// provisions a Kata microVM sandbox (`template:agent`, `shape: "linux-s"` warm pool) with
+/// the agent's Git repository and branch/revision mounted at `/home/user/workspace`.
+///
+/// Emits strictly valid `sylphx.agents.v1.EnvironmentSpec` and `RepositorySpec` protobuf
+/// fields (`shape`, `template`, `repo: { uri, revision }`) so strict AIP proto validation
+/// never rejects with `400 UNKNOWN_FIELD`.
 pub fn build_cloud_environment_spec(
     config_dir: &Path,
     work_dir: Option<&Path>,
     env: &[(String, String)],
 ) -> Value {
     let wt = resolve_agent_git_worktree_spec(config_dir, work_dir, env, None, None, None);
+    let shape = resolve_sandbox_shape(env);
     let mut spec = json!({
-        "shape": "linux-xs",
+        "shape": shape,
         "template": "template:agent",
-        "workspace_dir": CLOUD_WORKSPACE_DIR,
     });
     if let Some(uri) = wt.repo_url
         && let Some(obj) = spec.as_object_mut()
     {
         let mut repo_obj = serde_json::Map::new();
         repo_obj.insert("uri".to_string(), json!(uri));
-        if let Some(slug) = wt.repo_slug {
-            repo_obj.insert("slug".to_string(), json!(slug));
-        }
-        if let Some(rev) = wt.branch.clone().or(wt.base.clone()) {
+        if let Some(rev) = wt.branch.or(wt.base) {
             repo_obj.insert("revision".to_string(), json!(rev));
-        }
-        if let Some(br) = wt.branch {
-            repo_obj.insert("branch".to_string(), json!(br));
-        }
-        if let Some(base) = wt.base {
-            repo_obj.insert("base".to_string(), json!(base));
         }
         obj.insert("repo".to_string(), Value::Object(repo_obj));
     }
@@ -364,6 +402,44 @@ pub fn resolve_cloud_sandbox_path(raw: &str) -> String {
     format!("{CLOUD_WORKSPACE_DIR}/{clean}")
 }
 
+pub(super) fn record_cloud_sandbox_fallback(config_dir: &Path, reason: &str) {
+    let fallback_path = config_dir.join("sylphx-sandbox-fallback.json");
+    let doc = json!({
+        "fallback_to": "local",
+        "reason": reason,
+        "timestamp_ms": anyagents_core::now_ms(),
+    });
+    let _ = std::fs::write(&fallback_path, format!("{doc}\n"));
+}
+
+pub(super) fn clear_cloud_sandbox_fallback(config_dir: &Path) {
+    let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-fallback.json"));
+}
+
+pub(super) fn is_cloud_sandbox_in_fallback_cooldown(config_dir: &Path) -> bool {
+    let fallback_path = config_dir.join("sylphx-sandbox-fallback.json");
+    let Ok(raw) = std::fs::read_to_string(&fallback_path) else {
+        return false;
+    };
+    let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        return false;
+    };
+    let Some(ts) = val.get("timestamp_ms").and_then(Value::as_i64) else {
+        return false;
+    };
+    let cooldown_ms = std::env::var("SYLPHX_SANDBOX_FALLBACK_COOLDOWN_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(60_000);
+    let now = anyagents_core::now_ms();
+    if now.saturating_sub(ts) <= cooldown_ms {
+        true
+    } else {
+        let _ = std::fs::remove_file(&fallback_path);
+        false
+    }
+}
+
 pub(super) fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) -> String {
     let raw = env
         .iter()
@@ -396,10 +472,18 @@ pub(super) fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) 
         });
     match raw.as_deref() {
         Some("none" | "stateless" | "off" | "false" | "0") => "none".to_string(),
-        Some("cloud" | "pod" | "kata" | "microvm" | "sandbox") => "cloud".to_string(),
         Some("local" | "host") => "local".to_string(),
+        Some("cloud" | "pod" | "kata" | "microvm" | "sandbox" | "auto") => {
+            if is_cloud_sandbox_in_fallback_cooldown(config_dir) {
+                "local".to_string()
+            } else {
+                "cloud".to_string()
+            }
+        }
         _ => {
-            if config_dir.join("sylphx-sandbox-lease.json").is_file() {
+            if is_cloud_sandbox_in_fallback_cooldown(config_dir) {
+                "local".to_string()
+            } else if config_dir.join("sylphx-sandbox-lease.json").is_file() {
                 "cloud".to_string()
             } else {
                 "local".to_string()
@@ -458,6 +542,8 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx Cloud access key; run `anyagents sign-in sylphx` first".to_string()
     })?;
+    let api_url = resolve_cloud_api_url(env);
+    let shape = resolve_sandbox_shape(env);
     let wt_spec = resolve_agent_git_worktree_spec(
         config_dir,
         work_dir,
@@ -475,7 +561,7 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
             .and_then(Value::as_str)
             .map(str::to_string)
     {
-        let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{name}");
+        let get_url = format!("{api_url}/v1/{name}");
         if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
             && let Ok(live) = serde_json::from_str::<Value>(&body)
         {
@@ -506,7 +592,7 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
                     || (wt_spec.repo_slug.is_some() && wt_spec.repo_slug != prev_repo)
                     || (wt_spec.branch.is_some() && wt_spec.branch != prev_branch);
                 if needs_bootstrap {
-                    bootstrap_cloud_sandbox_worktree(&access_key, &name, &wt_spec, env)?;
+                    bootstrap_cloud_sandbox_worktree(&api_url, &access_key, &name, &wt_spec, env)?;
                     if let Some(obj) = persisted.as_object_mut() {
                         obj.insert("workspace_bootstrapped".to_string(), json!(true));
                         obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
@@ -521,12 +607,13 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
                         let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
                     }
                 }
+                clear_cloud_sandbox_fallback(config_dir);
                 return Ok((name, uid));
             }
         }
     }
 
-    let parent = env
+    let raw_parent = env
         .iter()
         .find(|(k, v)| k == "SYLPHX_SANDBOX_PARENT" && !v.trim().is_empty())
         .map(|(_, v)| v.trim().to_string())
@@ -536,11 +623,12 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
                 .filter(|s| !s.trim().is_empty())
         })
         .unwrap_or_else(|| DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
+    let parent = normalize_cloud_env_slug(&raw_parent);
 
-    let create_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{parent}/leases");
+    let create_url = format!("{api_url}/v1/{parent}/leases");
     let req_body = json!({
         "spec": {
-            "shape": "linux-xs",
+            "shape": shape,
             "kind": "general",
             "image": "template:agent",
             "network": {
@@ -575,7 +663,7 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
             s.eq_ignore_ascii_case("ready") || s.eq_ignore_ascii_case("lease_state_ready")
         });
     if !ready {
-        let get_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}");
+        let get_url = format!("{api_url}/v1/{lease_name}");
         for _ in 0..45 {
             std::thread::sleep(Duration::from_secs(1));
             if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
@@ -605,7 +693,7 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
         ));
     }
 
-    bootstrap_cloud_sandbox_worktree(&access_key, &lease_name, &wt_spec, env)?;
+    bootstrap_cloud_sandbox_worktree(&api_url, &access_key, &lease_name, &wt_spec, env)?;
 
     if let Some(obj) = lease_val.as_object_mut() {
         obj.insert("workspace_bootstrapped".to_string(), json!(true));
@@ -620,16 +708,18 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
     if let Ok(pretty) = serde_json::to_string_pretty(&lease_val) {
         let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
     }
+    clear_cloud_sandbox_fallback(config_dir);
     Ok((lease_name, uid))
 }
 
 fn bootstrap_cloud_sandbox_worktree(
+    api_url: &str,
     access_key: &str,
     lease_name: &str,
     wt_spec: &CloudWorktreeSpec,
     env: &[(String, String)],
 ) -> Result<(), String> {
-    let exec_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:exec");
+    let exec_url = format!("{api_url}/v1/{lease_name}:exec");
     let mut exec_env = serde_json::Map::new();
     exec_env.insert(
         "ANYAGENTS_WORKSPACE".to_string(),
@@ -729,7 +819,8 @@ pub fn release_persisted_sandbox_lease(config_dir: &Path) {
     let Some(access_key) = resolve_sylphx_cloud_access_key(config_dir, &[]) else {
         return;
     };
-    let release_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:release");
+    let api_url = resolve_cloud_api_url(&[]);
+    let release_url = format!("{api_url}/v1/{lease_name}:release");
     let _ = curl_post_json(&release_url, Some(&access_key), &json!({}));
 }
 
@@ -752,7 +843,8 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
         ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
         .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
-    let exec_url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:exec");
+    let api_url = resolve_cloud_api_url(env);
+    let exec_url = format!("{api_url}/v1/{lease_name}:exec");
     let mut exec_env = serde_json::Map::new();
     let needs_git_auth = cmd_str.contains("git") || cmd_str.contains("gh");
     if needs_git_auth && let Some(tok) = resolve_github_token(env) {
@@ -817,8 +909,9 @@ pub(super) fn read_file_in_cloud_sandbox_with_work_dir(
         ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
         .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let api_url = resolve_cloud_api_url(env);
     let guest_path = resolve_cloud_sandbox_path(path);
-    let url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:readFile");
+    let url = format!("{api_url}/v1/{lease_name}:readFile");
     let (status, raw) = curl_post_json(&url, Some(&access_key), &json!({ "path": guest_path }))?;
     if !(200..300).contains(&status) {
         return Err(format!("ReadFile HTTP {status}: {}", raw.trim()));
@@ -850,8 +943,9 @@ pub(super) fn write_file_in_cloud_sandbox_with_work_dir(
         ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
         .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+    let api_url = resolve_cloud_api_url(env);
     let guest_path = resolve_cloud_sandbox_path(path);
-    let url = format!("{DEFAULT_SYLPHX_API_URL}/v1/{lease_name}:writeFile");
+    let url = format!("{api_url}/v1/{lease_name}:writeFile");
     let (status, raw) = curl_post_json(
         &url,
         Some(&access_key),
