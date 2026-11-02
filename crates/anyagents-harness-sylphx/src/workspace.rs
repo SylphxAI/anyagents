@@ -59,7 +59,7 @@ fn file_command(
     script: &str,
     input: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let mut cmd = command(Path::new("bash"), env)?;
+    let mut cmd = command(Path::new("/bin/bash"), env)?;
     cmd.args(["-c", script, "workspace-file"]).arg(path);
     let out = output(cmd, input)?;
     if !out.status.success() {
@@ -76,7 +76,7 @@ pub(super) fn read_to_string(path: &Path, env: &[(String, String)]) -> Result<St
     if !delegated(env) {
         return std::fs::read_to_string(path).map_err(|e| e.to_string());
     }
-    String::from_utf8(file_command(path, env, "cat -- \"$1\"", b"")?).map_err(|e| e.to_string())
+    String::from_utf8(file_command(path, env, "/bin/cat -- \"$1\"", b"")?).map_err(|e| e.to_string())
 }
 
 pub(super) fn write(
@@ -87,14 +87,14 @@ pub(super) fn write(
     if !delegated(env) {
         return std::fs::write(path, content).map_err(|e| e.to_string());
     }
-    file_command(path, env, "cat > \"$1\"", content.as_ref()).map(|_| ())
+    file_command(path, env, "/bin/cat > \"$1\"", content.as_ref()).map(|_| ())
 }
 
 pub(super) fn create_dir_all(path: &Path, env: &[(String, String)]) -> Result<(), String> {
     if !delegated(env) {
         return std::fs::create_dir_all(path).map_err(|e| e.to_string());
     }
-    file_command(path, env, "mkdir -p -- \"$1\"", b"").map(|_| ())
+    file_command(path, env, "/bin/mkdir -p -- \"$1\"", b"").map(|_| ())
 }
 
 pub(super) fn remove_if_exists(path: &Path, env: &[(String, String)]) -> Result<(), String> {
@@ -104,5 +104,5 @@ pub(super) fn remove_if_exists(path: &Path, env: &[(String, String)]) -> Result<
             result => result.map_err(|e| e.to_string()),
         };
     }
-    file_command(path, env, "rm -f -- \"$1\"", b"").map(|_| ())
+    file_command(path, env, "/bin/rm -f -- \"$1\"", b"").map(|_| ())
 }

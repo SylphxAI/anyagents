@@ -1222,7 +1222,31 @@ fn reconcile_stopped_and_backed_off_agents(
     }
 }
 
+fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
+    std::fs::create_dir_all(data)?;
+    let lock_path = data.join("admin.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(Error::Message(format!(
+                "anyagents serve-admin already running on {}",
+                data.display()
+            )));
+        }
+    }
+    Ok(file)
+}
+
 pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let _admin_lock = acquire_admin_lock(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let res = runtime.block_on(async move {
@@ -2014,7 +2038,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "cancel" | "delete" | "remove" | "clear" | "off" => {
+            "cancel" | "delete" | "remove" | "clear" | "off" | "pause" | "disable" | "stop" => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let id_or_all = body
@@ -3478,6 +3502,9 @@ async fn wake_agent_route(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &found.id));
+        if !work_dir.exists() {
+            let _ = std::fs::create_dir_all(&work_dir);
+        }
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
         {

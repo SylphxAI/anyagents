@@ -1349,7 +1349,7 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
-            "inspect" | "status" => {
+            "inspect" | "status" | "get" | "info" | "show" => {
                 let target = args
                     .name
                     .as_deref()
@@ -1536,7 +1536,7 @@ impl AgentMcp {
                     "subagents": resp.agents,
                 })))
             }
-            "inspect" | "status" => {
+            "inspect" | "status" | "get" | "info" | "show" => {
                 let target = args
                     .agent
                     .as_deref()

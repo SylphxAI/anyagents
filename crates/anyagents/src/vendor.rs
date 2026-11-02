@@ -788,7 +788,7 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     } else if request.agent.harness == "grok" {
         let program = crate::install::program(&root, &request.agent.harness);
         let session = session_from_file(&request.config_dir, "grok-session-id");
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+        let exe = crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
         let mcp_args = vec![
             "--data".to_string(),
             request.data_dir.display().to_string(),
@@ -814,7 +814,7 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         Ok(vh)
     } else if request.agent.harness == "sylphx" {
         let session = session_from_file(&request.config_dir, "sylphx-session-id");
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+        let exe = crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
         let mcp_args = vec![
             "--data".to_string(),
             request.data_dir.display().to_string(),

@@ -820,7 +820,7 @@ pub fn hydrate_operator_groups_if_needed() {
         if expected_gids.iter().all(|g| active_gids.contains(g)) {
             return;
         }
-        let Ok(exe) = std::env::current_exe() else {
+        let Ok(exe) = crate::data::current_exe_clean() else {
             return;
         };
         let groups_csv = expected_gids
@@ -839,7 +839,6 @@ pub fn hydrate_operator_groups_if_needed() {
                 &gid_s,
                 "--groups",
                 &groups_csv,
-                "--no-new-privs",
                 "--",
             ])
             .arg(exe)

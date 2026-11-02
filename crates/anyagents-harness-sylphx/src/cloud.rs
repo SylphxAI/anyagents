@@ -897,6 +897,26 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
     Ok((lease_name, uid))
 }
 
+fn post_exec_with_idempotency_retry(
+    exec_url: &str,
+    access_key: &str,
+    payload: &Value,
+) -> Result<(u16, String), String> {
+    for attempt in 0..60 {
+        let (status, raw) = curl_post_json(exec_url, Some(access_key), payload)?;
+        if status == 409 && raw.contains("IDEMPOTENCY_IN_PROGRESS") && attempt < 59 {
+            std::thread::sleep(Duration::from_secs(2));
+            continue;
+        }
+        if matches!(status, 502..=504) && attempt < 5 {
+            std::thread::sleep(Duration::from_secs(1));
+            continue;
+        }
+        return Ok((status, raw));
+    }
+    curl_post_json(exec_url, Some(access_key), payload)
+}
+
 fn bootstrap_cloud_sandbox_worktree(
     api_url: &str,
     access_key: &str,
@@ -972,9 +992,9 @@ fi
 
     let wrapped_bootstrap = wrap_cloud_exec_command_for_zero_exit(bootstrap_script);
     let idempotency_key = next_exec_idempotency_key("bootstrap");
-    let (status, raw) = curl_post_json(
+    let (status, raw) = post_exec_with_idempotency_retry(
         &exec_url,
-        Some(access_key),
+        access_key,
         &json!({
             "idempotency_key": idempotency_key,
             "command": ["bash", "-lc", wrapped_bootstrap],
@@ -1066,9 +1086,9 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
     );
     let wrapped_cmd = wrap_cloud_exec_command_for_zero_exit(&inner_cmd);
     let idempotency_key = next_exec_idempotency_key("exec");
-    let (status, raw) = curl_post_json(
+    let (status, raw) = post_exec_with_idempotency_retry(
         &exec_url,
-        Some(&access_key),
+        &access_key,
         &json!({
             "idempotency_key": idempotency_key,
             "command": ["bash", "-lc", wrapped_cmd],

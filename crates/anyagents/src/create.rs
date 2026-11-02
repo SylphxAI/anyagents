@@ -300,7 +300,7 @@ pub(crate) fn provision_managed_worktree(
         repo_raw.to_ascii_lowercase().as_str(),
         "inherit" | "parent" | "worktree" | "branch" | "isolated"
     ) {
-        let parent_wd = agent
+        let mut parent_wd = agent
             .parent_id
             .as_ref()
             .and_then(|pid| store.agent(pid).ok())
@@ -311,6 +311,12 @@ pub(crate) fn provision_managed_worktree(
                     "repo=\"inherit\" requires a parent agent with an active git workdir".into(),
                 )
             })?;
+        if !is_git_repo_dir(&parent_wd)
+            && let Some(fallback) = crate::server::owner_workdir()
+            && is_git_repo_dir(&fallback)
+        {
+            parent_wd = fallback;
+        }
         add_git_worktree_from_local_repo(&parent_wd, target_wt, &branch, base)?;
     } else if Path::new(repo_raw).is_dir() && is_git_repo_dir(Path::new(repo_raw)) {
         add_git_worktree_from_local_repo(Path::new(repo_raw), target_wt, &branch, base)?;

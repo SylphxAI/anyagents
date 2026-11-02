@@ -123,6 +123,14 @@ pub struct SylphxHarness {
     state: Arc<Mutex<SharedState>>,
 }
 
+pub(crate) fn clean_exe_path(path: &Path) -> PathBuf {
+    let raw = path.display().to_string();
+    match raw.strip_suffix(" (deleted)") {
+        Some(stripped) => PathBuf::from(stripped),
+        None => path.to_path_buf(),
+    }
+}
+
 impl SylphxHarness {
     #[allow(clippy::too_many_arguments)]
     pub fn start(
@@ -175,7 +183,7 @@ impl SylphxHarness {
             work_dir: work_dir.to_path_buf(),
             model: model.map(str::to_string),
             env: env_owned,
-            mcp_command: mcp_command.to_path_buf(),
+            mcp_command: clean_exe_path(mcp_command),
             mcp_args: mcp_args.to_vec(),
             fake_mode,
             fake_log,
@@ -1263,6 +1271,40 @@ fn native_responses_output(response: &Value) -> Result<Vec<Value>, String> {
     ))
 }
 
+fn close_dangling_function_calls(transcript_path: &Path, input_items: &mut Vec<Value>) {
+    let mut answered = std::collections::HashSet::new();
+    for item in input_items.iter() {
+        if item.get("type").and_then(Value::as_str) == Some("function_call_output")
+            && let Some(cid) = item.get("call_id").and_then(Value::as_str)
+        {
+            answered.insert(cid.to_string());
+        }
+    }
+    let mut fixed = Vec::with_capacity(input_items.len());
+    for item in input_items.drain(..) {
+        let missing_cid = if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .filter(|cid| !cid.is_empty() && !answered.contains(*cid))
+                .map(ToString::to_string)
+        } else {
+            None
+        };
+        fixed.push(item);
+        if let Some(cid) = missing_cid {
+            answered.insert(cid.clone());
+            let synthetic = json!({
+                "type": "function_call_output",
+                "call_id": cid,
+                "output": "[tool execution interrupted before output was recorded]",
+            });
+            append_transcript_message(transcript_path, &synthetic);
+            fixed.push(synthetic);
+        }
+    }
+    *input_items = fixed;
+}
+
 /// Runs our native multi-step Sylphx Agent Runtime loop against Sylphx AI's
 /// canonical Responses API (`https://api.sylphx.com/v1/responses`), executing
 /// AnyAgents MCP tools (`agents`, `send`, `conversation`, `groups`, `schedule`,
@@ -1301,6 +1343,7 @@ pub(crate) fn run_native_gateway_turn(
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
     let mut input_items = load_transcript_input_items(&transcript_path);
+    close_dangling_function_calls(&transcript_path, &mut input_items);
     let stripped_body = match initial_user_message.strip_prefix("[anyagents") {
         Some(rest) => rest
             .find("]\n")
@@ -1688,21 +1731,25 @@ pub fn run_stdio_adapter(
                 .and_then(|s| serde_json::from_str::<Value>(&s).ok())
                 .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string))
         });
-    let mcp_command = config_val
-        .get("mcp_command")
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| {
-                    v.pointer("/mcpServers/anyagents/command")
-                        .and_then(Value::as_str)
-                        .map(PathBuf::from)
-                })
-        })
-        .unwrap_or_else(|| std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents")));
+    let mcp_command = clean_exe_path(
+        &config_val
+            .get("mcp_command")
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| {
+                        v.pointer("/mcpServers/anyagents/command")
+                            .and_then(Value::as_str)
+                            .map(PathBuf::from)
+                    })
+            })
+            .unwrap_or_else(|| {
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"))
+            }),
+    );
     let mcp_args: Vec<String> = config_val
         .get("mcp_args")
         .and_then(Value::as_array)
@@ -2669,10 +2716,14 @@ fn execute_sylphx_tool(
                 let skill_md = skill_dir.join("SKILL.md");
                 if skill_md.is_file() {
                     if let Some(r) = ref_name {
-                        let ref_file = if r.ends_with(".md") {
-                            skill_dir.join("references").join(r)
+                        let clean_r = r
+                            .trim_start_matches("./")
+                            .trim_start_matches("references/")
+                            .trim_start_matches('/');
+                        let ref_file = if clean_r.ends_with(".md") {
+                            skill_dir.join("references").join(clean_r)
                         } else {
-                            skill_dir.join("references").join(format!("{r}.md"))
+                            skill_dir.join("references").join(format!("{clean_r}.md"))
                         };
                         return std::fs::read_to_string(&ref_file).unwrap_or_else(|e| {
                             format!("error reading {}: {e}", ref_file.display())
@@ -2907,7 +2958,7 @@ fn execute_sylphx_tool(
                         Err(e) => format!("error: {e}"),
                     }
                 }
-                "status" => {
+                "status" | "help" | "info" | "inspect" | "get" => {
                     let lease_path = config_dir.join("sylphx-sandbox-lease.json");
                     if let Ok(raw) = std::fs::read_to_string(&lease_path)
                         && let Ok(val) = serde_json::from_str::<Value>(&raw)
@@ -2924,7 +2975,7 @@ fn execute_sylphx_tool(
                     }))
                     .unwrap_or_default()
                 }
-                "ensure" | "create" => {
+                "ensure" | "create" | "provision" | "start" | "init" => {
                     let explicit_repo = args.get("repo").and_then(Value::as_str);
                     let explicit_branch = args.get("branch").and_then(Value::as_str);
                     let explicit_base = args.get("base").and_then(Value::as_str);
@@ -3280,7 +3331,8 @@ fn call_anyagents_mcp_tool(
     tool_name: &str,
     arguments: &Value,
 ) -> String {
-    let mut cmd = Command::new(mcp_command);
+    let clean_cmd = clean_exe_path(mcp_command);
+    let mut cmd = Command::new(&clean_cmd);
     cmd.args(mcp_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
