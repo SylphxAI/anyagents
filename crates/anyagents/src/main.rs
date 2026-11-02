@@ -728,6 +728,7 @@ enum AgentsCommand {
 }
 
 fn main() -> ExitCode {
+    sandbox::hydrate_operator_groups_if_needed();
     let cli = Cli::parse();
     match run(cli) {
         Ok(()) => ExitCode::SUCCESS,

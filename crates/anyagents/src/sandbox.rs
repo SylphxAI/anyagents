@@ -729,50 +729,117 @@ pub fn share_socket_with_seats(path: &Path) {
     }
 }
 
-fn migrate_file_to_seat_uid(path: &Path, uid: u32, gid: u32) {
-    if is_isolated_test_env() || !launcher().is_file() {
-        return;
-    }
-    let Some(sock_gid) = sock_gid_for() else {
-        return;
-    };
-    let t_uid = uid.to_string();
-    let t_gid = gid.to_string();
-    let groups = format!("{gid},{sock_gid}");
-    let tmp = path.with_extension("seat_mig_tmp");
-    let status = std::process::Command::new(launcher())
-        .args([
-            "--reuid",
-            &t_uid,
-            "--regid",
-            &t_gid,
-            "--groups",
-            &groups,
-            "--no-new-privs",
-            "--",
-            "cp",
-            "-f",
-        ])
-        .arg(path)
-        .arg(&tmp)
-        .status();
-    if status.is_ok_and(|s| s.success()) {
-        let _ = std::process::Command::new(launcher())
+/// Ensure an operator CLI or server invocation running in a pre-existing login
+/// shell inherits every supplementary `seat-*` / `anyagents-sock` group granted
+/// to the operator user in `/etc/group`.
+pub fn hydrate_operator_groups_if_needed() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        if is_isolated_test_env()
+            || std::env::var_os("ANYAGENTS_GROUPS_HYDRATED").is_some()
+            || !launcher().is_file()
+        {
+            return;
+        }
+        let me = current_uid();
+        if me == 0 || me >= 2100 {
+            return;
+        }
+        let Some(my_name) = lookup_user_name(me) else {
+            return;
+        };
+        let Ok(group_text) = std::fs::read_to_string("/etc/group") else {
+            return;
+        };
+        let my_gid = server_gid();
+        let mut expected_gids = vec![my_gid];
+        for line in group_text.lines() {
+            let mut parts = line.split(':');
+            let (Some(gname), Some(_pw), Some(gid_s), Some(members)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            if !(gname == "anyagents-sock" || gname.starts_with("seat-")) {
+                continue;
+            }
+            let Ok(gid) = gid_s.trim().parse::<u32>() else {
+                continue;
+            };
+            if members.split(',').any(|m| m.trim() == my_name) && !expected_gids.contains(&gid) {
+                expected_gids.push(gid);
+            }
+        }
+        if expected_gids.len() <= 1 {
+            return;
+        }
+        let active_gids = unsafe {
+            let count = libc::getgroups(0, std::ptr::null_mut());
+            if count <= 0 {
+                Vec::new()
+            } else {
+                let mut buf = vec![0 as libc::gid_t; count as usize];
+                let got = libc::getgroups(count, buf.as_mut_ptr());
+                if got > 0 {
+                    buf.truncate(got as usize);
+                    buf
+                } else {
+                    Vec::new()
+                }
+            }
+        };
+        if expected_gids.iter().all(|g| active_gids.contains(g)) {
+            return;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return;
+        };
+        let groups_csv = expected_gids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let me_s = me.to_string();
+        let gid_s = my_gid.to_string();
+        let mut cmd = std::process::Command::new(launcher());
+        cmd.env("ANYAGENTS_GROUPS_HYDRATED", "1")
             .args([
                 "--reuid",
-                &t_uid,
+                &me_s,
                 "--regid",
-                &t_gid,
+                &gid_s,
                 "--groups",
-                &groups,
+                &groups_csv,
                 "--no-new-privs",
                 "--",
-                "chmod",
-                "0660",
             ])
-            .arg(&tmp)
-            .status();
-        let _ = std::process::Command::new(launcher())
+            .arg(exe)
+            .args(std::env::args_os().skip(1));
+        let _ = cmd.exec();
+    }
+}
+
+fn migrate_file_to_seat_uid(path: &Path, uid: u32, gid: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if is_isolated_test_env() || !launcher().is_file() {
+            return;
+        }
+        let Some(sock_gid) = sock_gid_for() else {
+            return;
+        };
+        let f_gid = std::fs::metadata(path).map(|m| m.gid()).unwrap_or(gid);
+        let t_uid = uid.to_string();
+        let t_gid = gid.to_string();
+        let groups = if f_gid != gid && f_gid >= 2100 {
+            format!("{gid},{f_gid},{sock_gid}")
+        } else {
+            format!("{gid},{sock_gid}")
+        };
+        let tmp = path.with_extension("seat_mig_tmp");
+        let status = std::process::Command::new(launcher())
             .args([
                 "--reuid",
                 &t_uid,
@@ -782,12 +849,55 @@ fn migrate_file_to_seat_uid(path: &Path, uid: u32, gid: u32) {
                 &groups,
                 "--no-new-privs",
                 "--",
-                "mv",
+                "cp",
                 "-f",
             ])
-            .arg(&tmp)
             .arg(path)
+            .arg(&tmp)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status();
+        if status.is_ok_and(|s| s.success()) {
+            let _ = std::process::Command::new(launcher())
+                .args([
+                    "--reuid",
+                    &t_uid,
+                    "--regid",
+                    &t_gid,
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "chmod",
+                    "0660",
+                ])
+                .arg(&tmp)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            let _ = std::process::Command::new(launcher())
+                .args([
+                    "--reuid",
+                    &t_uid,
+                    "--regid",
+                    &t_gid,
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "mv",
+                    "-f",
+                ])
+                .arg(&tmp)
+                .arg(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
     }
 }
 
@@ -808,7 +918,30 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         {
             let f_uid = meta.uid().to_string();
             let f_gid = meta.gid().to_string();
-            let groups = format!("{},{sock_gid}", meta.gid());
+            let target_gid = gid.to_string();
+            let groups = if meta.gid() != gid {
+                format!("{},{gid},{sock_gid}", meta.gid())
+            } else {
+                format!("{},{sock_gid}", meta.gid())
+            };
+            let _ = std::process::Command::new(launcher())
+                .args([
+                    "--reuid",
+                    &f_uid,
+                    "--regid",
+                    &f_gid,
+                    "--groups",
+                    &groups,
+                    "--no-new-privs",
+                    "--",
+                    "chgrp",
+                    "-h",
+                    &target_gid,
+                ])
+                .arg(dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
             let _ = std::process::Command::new(launcher())
                 .args([
                     "--reuid",
@@ -820,10 +953,11 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
                     "--no-new-privs",
                     "--",
                     "chmod",
-                    "-R",
-                    "0777",
+                    "02770",
                 ])
                 .arg(dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
                 .status();
         }
     }
@@ -870,7 +1004,60 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
         };
         if meta.uid() != me {
             if meta.uid() != uid {
-                migrate_file_to_seat_uid(&path, uid, gid);
+                if !is_isolated_test_env()
+                    && launcher().is_file()
+                    && let Some(sock_gid) = sock_gid_for()
+                {
+                    let f_uid = meta.uid().to_string();
+                    let f_gid = meta.gid().to_string();
+                    let target_gid = gid.to_string();
+                    let groups = if meta.gid() != gid {
+                        format!("{},{gid},{sock_gid}", meta.gid())
+                    } else {
+                        format!("{},{sock_gid}", meta.gid())
+                    };
+                    let _ = std::process::Command::new(launcher())
+                        .args([
+                            "--reuid",
+                            &f_uid,
+                            "--regid",
+                            &f_gid,
+                            "--groups",
+                            &groups,
+                            "--no-new-privs",
+                            "--",
+                            "chgrp",
+                            "-h",
+                            &target_gid,
+                        ])
+                        .arg(&path)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    let _ = std::process::Command::new(launcher())
+                        .args([
+                            "--reuid",
+                            &f_uid,
+                            "--regid",
+                            &f_gid,
+                            "--groups",
+                            &groups,
+                            "--no-new-privs",
+                            "--",
+                            "chmod",
+                            "g+rw",
+                        ])
+                        .arg(&path)
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+                if name.starts_with("opencode.db")
+                    || name == "serve-exit.jsonl"
+                    || name.contains(".sqlite")
+                {
+                    migrate_file_to_seat_uid(&path, uid, gid);
+                }
             } else if (meta.permissions().mode() & 0o060) != 0o060
                 && !is_isolated_test_env()
                 && launcher().is_file()
@@ -893,6 +1080,8 @@ fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
                         "g+rw",
                     ])
                     .arg(&path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
                     .status();
             }
             continue;
