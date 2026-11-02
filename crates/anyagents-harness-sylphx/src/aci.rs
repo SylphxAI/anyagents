@@ -8,7 +8,9 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use super::workspace;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -80,16 +82,16 @@ pub(super) fn execute_bash_with_timeout(
     timeout_ms: u64,
 ) -> String {
     let bounded_timeout_ms = timeout_ms.clamp(500, 600_000);
-    let mut cmd = Command::new("bash");
+    let mut cmd = match workspace::command(Path::new("bash"), env) {
+        Ok(cmd) => cmd,
+        Err(e) => return format!("error executing bash: {e}"),
+    };
     cmd.arg("-c")
         .arg(cmd_str)
         .current_dir(work_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -538,80 +540,59 @@ fn apply_single_edit_cascade(
 /// 1. Native OpenAI V4A Patch format (`*** Begin Patch` / `*** Update File:` / `*** Add File:` / `*** Delete File:`).
 /// 2. `git apply --recount -C1` and `patch -p1 --fuzz=3` for unified diffs.
 /// 3. Pure-Rust context-addressed unified diff fallback when hunk line numbers/counts are malformed.
-pub(super) fn apply_patch_universal(work_dir: &Path, patch_text: &str) -> Result<String, String> {
+pub(super) fn apply_patch_universal(
+    work_dir: &Path,
+    patch_text: &str,
+    env: &[(String, String)],
+) -> Result<String, String> {
     let trimmed = patch_text.trim();
     if trimmed.is_empty() {
         return Err("empty patch".to_string());
     }
 
     if is_v4a_patch(trimmed) {
-        return apply_v4a_patch_local(work_dir, trimmed);
+        return apply_v4a_patch_local(work_dir, trimmed, env);
     }
 
-    // Try git apply / patch first for standard unified diffs
-    let tmp_path = std::env::temp_dir().join(format!(
-        "sylphx-patch-{}-{}.diff",
-        std::process::id(),
-        anyagents_core::now_ms()
-    ));
+    // Every external attempt uses the same trusted workspace principal. Feed
+    // patches over stdin; a server-owned temp file may be unreadable by a seat.
     let mut patch_with_nl = patch_text.to_string();
     if !patch_with_nl.ends_with('\n') {
         patch_with_nl.push('\n');
     }
-    let _ = std::fs::write(&tmp_path, &patch_with_nl);
-
     let git_attempts: &[&[&str]] = &[
         &["apply", "--recount", "-C1", "--whitespace=nowarn"],
         &["apply", "--recount", "-p0", "-C1", "--whitespace=nowarn"],
         &["apply", "--recount", "--whitespace=nowarn"],
     ];
     for args in git_attempts {
-        if let Ok(out) = Command::new("git")
-            .args(*args)
-            .arg(&tmp_path)
-            .current_dir(work_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
+        let mut cmd = workspace::command(Path::new("git"), env)?;
+        cmd.args(*args).current_dir(work_dir);
+        if let Ok(out) = workspace::output(cmd, patch_with_nl.as_bytes())
             && out.status.success()
         {
-            let _ = std::fs::remove_file(&tmp_path);
             return Ok("exit_code: 0\npatched successfully (git apply)".to_string());
         }
     }
-
     for p_level in ["-p1", "-p0"] {
-        if let Ok(mut child) = Command::new("patch")
-            .args([
-                p_level,
-                "--fuzz=3",
-                "--no-backup-if-mismatch",
-                "--batch",
-                "--silent",
-            ])
-            .current_dir(work_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
+        let mut cmd = workspace::command(Path::new("patch"), env)?;
+        cmd.args([
+            p_level,
+            "--fuzz=3",
+            "--no-backup-if-mismatch",
+            "--batch",
+            "--silent",
+        ])
+        .current_dir(work_dir);
+        if let Ok(out) = workspace::output(cmd, patch_with_nl.as_bytes())
+            && out.status.success()
         {
-            if let Some(mut stdin) = child.stdin.take() {
-                use std::io::Write as _;
-                let _ = stdin.write_all(patch_with_nl.as_bytes());
-            }
-            if let Ok(out) = child.wait_with_output()
-                && out.status.success()
-            {
-                let _ = std::fs::remove_file(&tmp_path);
-                return Ok("exit_code: 0\npatched successfully (patch --fuzz=3)".to_string());
-            }
+            return Ok("exit_code: 0\npatched successfully (patch --fuzz=3)".to_string());
         }
     }
-    let _ = std::fs::remove_file(&tmp_path);
 
     // Pure-Rust context-addressed unified diff fallback (ignores broken @@ line numbers/counts)
-    apply_unified_diff_context_fallback(work_dir, &patch_with_nl)
+    apply_unified_diff_context_fallback(work_dir, &patch_with_nl, env)
 }
 
 pub(super) fn is_v4a_patch(text: &str) -> bool {
@@ -638,7 +619,11 @@ fn resolve_rel_path(work_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
-fn apply_v4a_patch_local(work_dir: &Path, patch_text: &str) -> Result<String, String> {
+fn apply_v4a_patch_local(
+    work_dir: &Path,
+    patch_text: &str,
+    env: &[(String, String)],
+) -> Result<String, String> {
     let normalized = patch_text.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.lines().collect();
     let mut i = 0usize;
@@ -668,13 +653,14 @@ fn apply_v4a_patch_local(work_dir: &Path, patch_text: &str) -> Result<String, St
             }
             let target = resolve_rel_path(work_dir, rel);
             if let Some(p) = target.parent() {
-                let _ = std::fs::create_dir_all(p);
+                workspace::create_dir_all(p, env)?;
             }
             let mut content = body_lines.join("\n");
             if !content.is_empty() && !content.ends_with('\n') {
                 content.push('\n');
             }
-            std::fs::write(&target, content).map_err(|e| format!("failed writing `{rel}`: {e}"))?;
+            workspace::write(&target, content, env)
+                .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
             summary.push(format!("added {rel}"));
             continue;
         }
@@ -684,10 +670,8 @@ fn apply_v4a_patch_local(work_dir: &Path, patch_text: &str) -> Result<String, St
                 i += 1;
             }
             let target = resolve_rel_path(work_dir, rel);
-            if target.exists() {
-                std::fs::remove_file(&target)
-                    .map_err(|e| format!("failed deleting `{rel}`: {e}"))?;
-            }
+            workspace::remove_if_exists(&target, env)
+                .map_err(|e| format!("failed deleting `{rel}`: {e}"))?;
             summary.push(format!("deleted {rel}"));
             continue;
         }
@@ -708,23 +692,23 @@ fn apply_v4a_patch_local(work_dir: &Path, patch_text: &str) -> Result<String, St
                 i += 1;
             }
             let target = resolve_rel_path(work_dir, rel);
-            let existing = std::fs::read_to_string(&target)
+            let existing = workspace::read_to_string(&target, env)
                 .map_err(|e| format!("failed reading `{rel}`: {e}"))?;
             let updated = apply_context_hunks_to_content(&existing, &hunk_lines)
                 .map_err(|e| format!("failed patching `{rel}`: {e}"))?;
             if let Some(dest_rel) = move_to {
                 let dest = resolve_rel_path(work_dir, &dest_rel);
                 if let Some(p) = dest.parent() {
-                    let _ = std::fs::create_dir_all(p);
+                    workspace::create_dir_all(p, env)?;
                 }
-                std::fs::write(&dest, &updated)
+                workspace::write(&dest, &updated, env)
                     .map_err(|e| format!("failed writing `{dest_rel}`: {e}"))?;
                 if dest != target {
-                    let _ = std::fs::remove_file(&target);
+                    workspace::remove_if_exists(&target, env)?;
                 }
                 summary.push(format!("updated {rel} -> {dest_rel}"));
             } else {
-                std::fs::write(&target, &updated)
+                workspace::write(&target, &updated, env)
                     .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
                 summary.push(format!("updated {rel}"));
             }
@@ -742,6 +726,7 @@ fn apply_v4a_patch_local(work_dir: &Path, patch_text: &str) -> Result<String, St
 fn apply_unified_diff_context_fallback(
     work_dir: &Path,
     patch_text: &str,
+    env: &[(String, String)],
 ) -> Result<String, String> {
     let normalized = patch_text.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.lines().collect();
@@ -778,15 +763,13 @@ fn apply_unified_diff_context_fallback(
             }
             if new_header == "/dev/null" {
                 let target = resolve_rel_path(work_dir, old_header);
-                if target.exists() {
-                    std::fs::remove_file(&target)
-                        .map_err(|e| format!("failed deleting `{old_header}`: {e}"))?;
-                }
+                workspace::remove_if_exists(&target, env)
+                    .map_err(|e| format!("failed deleting `{old_header}`: {e}"))?;
                 summary.push(format!("deleted {old_header}"));
             } else if old_header == "/dev/null" {
                 let target = resolve_rel_path(work_dir, new_header);
                 if let Some(p) = target.parent() {
-                    let _ = std::fs::create_dir_all(p);
+                    workspace::create_dir_all(p, env)?;
                 }
                 let mut added = Vec::new();
                 for hl in &hunk_lines {
@@ -803,7 +786,7 @@ fn apply_unified_diff_context_fallback(
                 if !content.is_empty() {
                     content.push('\n');
                 }
-                std::fs::write(&target, content)
+                workspace::write(&target, content, env)
                     .map_err(|e| format!("failed writing `{new_header}`: {e}"))?;
                 summary.push(format!("added {new_header}"));
             } else {
@@ -813,11 +796,11 @@ fn apply_unified_diff_context_fallback(
                     old_header
                 };
                 let target = resolve_rel_path(work_dir, rel);
-                let existing = std::fs::read_to_string(&target)
+                let existing = workspace::read_to_string(&target, env)
                     .map_err(|e| format!("failed reading `{rel}`: {e}"))?;
                 let updated = apply_context_hunks_to_content(&existing, &hunk_lines)
                     .map_err(|e| format!("failed applying hunk to `{rel}`: {e}"))?;
-                std::fs::write(&target, updated)
+                workspace::write(&target, updated, env)
                     .map_err(|e| format!("failed writing `{rel}`: {e}"))?;
                 summary.push(format!("patched {rel}"));
             }
