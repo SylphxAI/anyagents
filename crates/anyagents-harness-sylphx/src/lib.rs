@@ -1199,6 +1199,56 @@ pub(crate) fn run_cloud_session_turn(
     Ok(TurnUsage::default())
 }
 
+fn build_native_responses_request(
+    model: &str,
+    instructions: &str,
+    input: &[Value],
+    tools: &[Value],
+    session_cache_key: &str,
+    reasoning_effort: Option<&str>,
+) -> Result<Value, String> {
+    validate_responses_input(input)?;
+    let mut body = json!({
+        "model": model,
+        "instructions": instructions,
+        "input": input,
+        "tools": tools,
+        "prompt_cache_key": session_cache_key,
+    });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning"] = json!({ "effort": effort });
+    }
+    Ok(body)
+}
+
+fn native_responses_output(response: &Value) -> Result<Vec<Value>, String> {
+    if response.get("error").is_none_or(Value::is_null)
+        && let Some(output) = response.get("output").and_then(Value::as_array)
+    {
+        return Ok(output.clone());
+    }
+    // A successful HTTP transport is not proof of a Responses completion. Keep
+    // enough envelope metadata to distinguish protocol/error responses without
+    // logging model text, arguments, tool results or the full response body.
+    let metadata = json!({
+        "object": response.get("object").and_then(Value::as_str),
+        "status": response.get("status").and_then(Value::as_str),
+        "error_type": response.pointer("/error/type").and_then(Value::as_str),
+        "error_code": response.pointer("/error/code").and_then(Value::as_str),
+        "output_type": response.get("output").map(|v| match v {
+            Value::Null => "null",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+            Value::String(_) => "string",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+        }),
+    });
+    Err(format!(
+        "Sylphx responses API missing valid `output` array: envelope={metadata}"
+    ))
+}
+
 /// Runs our native multi-step Sylphx Agent Runtime loop against Sylphx AI's
 /// canonical Responses API (`https://api.sylphx.com/v1/responses`), executing
 /// AnyAgents MCP tools (`agents`, `send`, `conversation`, `groups`, `schedule`,
@@ -1270,18 +1320,14 @@ pub(crate) fn run_native_gateway_turn(
         }
         drain_steered_messages(state, &transcript_path, &mut input_items);
 
-        let mut req_body = json!({
-            "model": model_id,
-            "instructions": system_prompt,
-            "input": input_items,
-            "tools": tools,
-            "prompt_cache_key": session_cache_key,
-        });
-        if let Some(ref effort) = reasoning_effort
-            && let Some(obj) = req_body.as_object_mut()
-        {
-            obj.insert("reasoning".to_string(), json!({ "effort": effort }));
-        }
+        let req_body = build_native_responses_request(
+            &model_id,
+            &system_prompt,
+            &input_items,
+            &tools,
+            &session_cache_key,
+            reasoning_effort.as_deref(),
+        )?;
 
         let step_t0 = Instant::now();
         let (status, raw) = curl_post_json(&responses_url, Some(&api_key), &req_body)?;
@@ -1348,9 +1394,7 @@ pub(crate) fn run_native_gateway_turn(
             cb();
         }
 
-        let Some(output_arr) = resp.get("output").and_then(Value::as_array).cloned() else {
-            return Err("Sylphx responses API missing `output` array".to_string());
-        };
+        let output_arr = native_responses_output(&resp)?;
 
         let mut function_calls = Vec::new();
         let mut assistant_texts = Vec::new();
@@ -3532,6 +3576,31 @@ mod tests {
         let msg_only_str = serde_json::to_string(&msg_only_val["hits"]).unwrap();
         assert!(msg_only_str.contains("ALPHA_99182_KEY"));
         assert!(!msg_only_str.contains("[tool_call:bash]"));
+    }
+
+    #[test]
+    fn missing_output_is_a_response_envelope_fault_not_input_pairing() {
+        for response in [
+            json!({"object": "error", "error": {"code": "upstream_fault", "type": "server_error", "message": "PRIVATE_RESPONSE"}}),
+            json!({"status": "failed", "output": null}),
+            json!({"output": "PRIVATE_RESPONSE"}),
+            json!({"output": [], "error": {"code": "upstream_fault"}}),
+        ] {
+            let error = native_responses_output(&response).unwrap_err();
+            assert!(error.contains("envelope="));
+            assert!(!error.contains("PRIVATE_RESPONSE"));
+        }
+        assert!(
+            native_responses_output(&json!({"output": []}))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            native_responses_output(&json!({"output": [{"type": "message", "content": "ok"}]}))
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
