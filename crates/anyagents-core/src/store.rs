@@ -2647,7 +2647,7 @@ impl Store {
     }
 
     /// Return the agent's open turn (`opened_seq > completed_seq`) when it is
-    /// eligible for automatic mid-turn recovery (`recovery_count < MAX_RECOVERY_ATTEMPTS`).
+    /// eligible for automatic mid-turn recovery.
     pub fn open_turn(&self, agent_id: &AgentId) -> Result<Option<OpenTurn>, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
@@ -2662,7 +2662,7 @@ impl Store {
         let Some((opened_seq, completed_seq, recovery_count, opened_at_ms)) = row else {
             return Ok(None);
         };
-        if opened_seq <= completed_seq || recovery_count >= MAX_RECOVERY_ATTEMPTS {
+        if opened_seq <= completed_seq {
             return Ok(None);
         }
         let delivered = cursor(&conn, agent_id)?;

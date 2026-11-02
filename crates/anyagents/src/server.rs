@@ -902,10 +902,6 @@ fn reconcile_stopped_and_backed_off_agents(
         guard.initialized = true;
     }
 
-    const MAX_CONCURRENT_SYLPHX_TURNS: usize = 128;
-    const MAX_SYLPHX_SPAWNS_PER_TICK: usize = 32;
-    let mut sylphx_spawned_this_tick = 0usize;
-
     let mut ordered_indices: Vec<usize> = (0..agents.len()).collect();
     ordered_indices.sort_by_key(|&idx| {
         let a = &agents[idx];
@@ -991,10 +987,7 @@ fn reconcile_stopped_and_backed_off_agents(
                     if should_wake {
                         if store.set_agent_state(&agent.id, "running").is_ok() {
                             if agent.harness == "sylphx" {
-                                if !guard.flushing_sylphx.contains(agent.id.as_str())
-                                    && guard.flushing_sylphx.len() < MAX_CONCURRENT_SYLPHX_TURNS
-                                    && sylphx_spawned_this_tick < MAX_SYLPHX_SPAWNS_PER_TICK
-                                {
+                                if !guard.flushing_sylphx.contains(agent.id.as_str()) {
                                     let mut running_agent = agent.clone();
                                     running_agent.state = "running".to_string();
                                     guard.watermark_seq.insert(agent.id.to_string(), max_seq);
@@ -1002,30 +995,11 @@ fn reconcile_stopped_and_backed_off_agents(
                                         .last_backoff_reset_ms
                                         .insert(agent.id.to_string(), now_ms);
                                     guard.flushing_sylphx.insert(agent.id.to_string());
-                                    sylphx_spawned_this_tick += 1;
                                     spawn_admin_sylphx_delivery(
                                         data.to_path_buf(),
                                         running_agent,
                                         health.clone(),
                                         Arc::clone(reconcile),
-                                    );
-                                } else {
-                                    let (delivery_mode, steer_support) = declared(&agent.harness);
-                                    health.publish(
-                                        &agent.id,
-                                        anyagents_supervisor::LiveState {
-                                            process_alive: true,
-                                            turn_state: anyagents_harness::TurnState::Idle,
-                                            delivery_mode,
-                                            steer_support,
-                                            quota_reset_at_ms: None,
-                                            restart_at_ms: None,
-                                            pid: None,
-                                            live_harness: Some(agent.harness.clone()),
-                                            live_model: agent.model.clone(),
-                                            process_started_at_ms: None,
-                                            last_error: None,
-                                        },
                                     );
                                 }
                             } else {
@@ -1093,11 +1067,7 @@ fn reconcile_stopped_and_backed_off_agents(
                         },
                     );
                 }
-                if has_pending_work
-                    && !guard.flushing_sylphx.contains(agent.id.as_str())
-                    && guard.flushing_sylphx.len() < MAX_CONCURRENT_SYLPHX_TURNS
-                    && sylphx_spawned_this_tick < MAX_SYLPHX_SPAWNS_PER_TICK
-                {
+                if has_pending_work && !guard.flushing_sylphx.contains(agent.id.as_str()) {
                     let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                     let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
                     let prev_wm = guard
@@ -1126,7 +1096,6 @@ fn reconcile_stopped_and_backed_off_agents(
                             .last_backoff_reset_ms
                             .insert(agent.id.to_string(), now_ms);
                         guard.flushing_sylphx.insert(agent.id.to_string());
-                        sylphx_spawned_this_tick += 1;
                         spawn_admin_sylphx_delivery(
                             data.to_path_buf(),
                             agent.clone(),
@@ -3175,9 +3144,16 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     let config_dir = agent_root.join("config");
     crate::sylphx::release_persisted_sandbox_lease(&config_dir);
     let seat_ids = detect_seat_ids(&config_dir);
-    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
+    for rel in ["cache-home", "cache", ".tmp", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
+    }
+    if let Ok(store) = Store::open(data_dir.join("state.db"))
+        && let Ok(agent) = store.agent(agent_id)
+        && agent.parent_id.is_some()
+    {
+        let bp = data_dir.join("browser-profiles").join(&agent.name);
+        remove_path_with_seat(&bp, seat_ids);
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
     let marker_val = std::fs::read_to_string(&marker_path)

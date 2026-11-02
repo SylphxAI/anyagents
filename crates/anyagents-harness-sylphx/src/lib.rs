@@ -1385,7 +1385,7 @@ pub(crate) fn run_native_gateway_turn(
     let mut total_cache_write: u64 = 0;
     let mut sent_any_reply = false;
 
-    for step in 0..48 {
+    for step in 0usize.. {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
