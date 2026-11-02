@@ -1,5 +1,6 @@
 //! RFC 8628 Device Flow authentication, credential discovery, and Sylphx configuration.
 
+use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -7,6 +8,9 @@ use std::time::{Duration, Instant};
 use anyagents_installer::{InstallError, LineSink};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+#[cfg(test)]
+mod transport_tests;
 
 pub const DEFAULT_SYLPHX_API_URL: &str = "https://api.sylphx.com";
 pub const DEFAULT_SYLPHX_GATEWAY_URL: &str = "https://api.sylphx.com/v1";
@@ -688,6 +692,14 @@ fn curl_post_json_once(
         }
     }
 
+    curl_post_json_fallback(url, bearer_token, payload)
+}
+
+fn curl_post_json_fallback(
+    url: &str,
+    bearer_token: Option<&str>,
+    payload: &str,
+) -> Result<(u16, String), String> {
     let mut cmd = Command::new("curl");
     cmd.args([
         "-sS",
@@ -703,17 +715,39 @@ fn curl_post_json_once(
     if let Some(tok) = bearer_token {
         cmd.arg("-H").arg(format!("Authorization: Bearer {tok}"));
     }
-    cmd.arg("-d")
-        .arg(payload)
-        .arg(url)
-        .stdin(Stdio::null())
+    // Conversation bodies can exceed the OS limit for one argv entry. Send
+    // the exact serialized bytes through stdin instead of the command line.
+    cmd.arg("--data-binary").arg("@-").arg(url);
+    run_json_post_command(cmd, payload)
+}
+
+fn run_json_post_command(mut cmd: Command, payload: &str) -> Result<(u16, String), String> {
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let out = cmd.output().map_err(|e| e.to_string())?;
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let written = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("HTTP request stdin missing"))
+        .and_then(|mut stdin| stdin.write_all(payload.as_bytes()));
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
     if !out.status.success() && out.stdout.is_empty() {
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
-    parse_curl_status_and_body(&String::from_utf8_lossy(&out.stdout))
+    let response = parse_curl_status_and_body(&String::from_utf8_lossy(&out.stdout));
+    if let Err(error) = written {
+        // A client may close stdin after receiving an early HTTP refusal. Its
+        // actual response takes precedence over our write-side BrokenPipe.
+        if response
+            .as_ref()
+            .is_ok_and(|(status, _)| (100..600).contains(status))
+        {
+            return response;
+        }
+        return Err(format!("writing HTTP request body: {error}"));
+    }
+    response
 }
 
 pub(super) fn curl_post_json(
