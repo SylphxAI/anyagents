@@ -62,6 +62,7 @@ struct State {
     finished: HashSet<String>,
     turns_started: usize,
     quota_reset_at_ms: Option<i64>,
+    sign_in_fault: Option<String>,
     session_id: Option<String>,
     usages: Vec<(String, TurnUsage)>,
     failures: Vec<(String, String)>,
@@ -312,6 +313,7 @@ impl ClaudeHarness {
             let mut state = lock(&self.shared);
             state.child = Some(child);
             state.alive = true;
+            state.sign_in_fault = None;
             state.open.clear();
             state.followups.clear();
             if initial_quota.is_some() {
@@ -474,13 +476,18 @@ impl Harness for ClaudeHarness {
             delivery_mode: DeliveryMode::Steer,
             steer_support: SteerSupport::Yes,
             quota_reset_at_ms: state.quota_reset_at_ms,
-            sign_in_fault: None,
+            sign_in_fault: state.sign_in_fault.clone(),
         }
     }
 
     fn turns_served(&self) -> u32 {
         let state = lock(&self.shared);
-        (state.usages.len() + state.failures.len()) as u32
+        let non_auth_failures = if state.sign_in_fault.is_some() {
+            0
+        } else {
+            state.failures.len()
+        };
+        (state.usages.len() + non_auth_failures) as u32
     }
 
     /// The total of every turn this process has finished. A total rather than
@@ -598,6 +605,7 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     if state.open.is_empty() {
         return;
     }
+    state.sign_in_fault = None;
     for id in state.open.drain(..) {
         state.finished.insert(id.clone());
         state.usages.push((id, usage.clone()));
@@ -705,6 +713,7 @@ fn apply_result(state: &mut State, value: &Value) {
             state.failures.push((id, reason.clone()));
         }
         if is_oauth_expired {
+            state.sign_in_fault = Some(reason);
             if let Some(child) = state.child.as_mut() {
                 let _ = child.kill();
             }
