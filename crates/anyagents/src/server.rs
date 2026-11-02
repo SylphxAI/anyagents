@@ -382,11 +382,14 @@ fn is_transient_sylphx_turn_error(err: &str) -> bool {
         return false;
     }
     lower.contains("model_unavailable")
+        || lower.contains("included_capacity_unavailable")
         || lower.contains("temporarily unavailable")
         || lower.contains("overloaded")
         || lower.contains("server_error")
         || lower.contains("api_error")
         || lower.contains("rate_limit")
+        || lower.contains("\"retryable\":true")
+        || lower.contains("\"retryable\": true")
         || lower.contains("http 408")
         || lower.contains("http 409")
         || lower.contains("http 425")
@@ -495,10 +498,16 @@ fn spawn_admin_sylphx_delivery(
                                     });
                                 if let Some(err_msg) = turn_err {
                                     had_err = true;
-                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                     let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
                                         && store.open_turn(&agent.id).ok().flatten().is_some();
-                                    if !can_auto_recover {
+                                    if can_auto_recover {
+                                        crate::vendor::persist_last_error(&cfg, None, None);
+                                    } else {
+                                        crate::vendor::persist_last_error(
+                                            &cfg,
+                                            Some(&err_msg),
+                                            None,
+                                        );
                                         create::maybe_notify_parent_on_error(
                                             &store, &agent, &cfg, &err_msg,
                                         );
@@ -516,10 +525,12 @@ fn spawn_admin_sylphx_delivery(
                             Err(err) => {
                                 had_err = true;
                                 let err_msg = err.to_string();
-                                crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                 let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
                                     && store.open_turn(&agent.id).ok().flatten().is_some();
-                                if !can_auto_recover {
+                                if can_auto_recover {
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                } else {
+                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                     create::maybe_notify_parent_on_error(
                                         &store, &agent, &cfg, &err_msg,
                                     );
@@ -572,10 +583,16 @@ fn spawn_admin_sylphx_delivery(
                                     });
                                 if let Some(err_msg) = turn_err {
                                     had_err = true;
-                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                     let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
                                         && store.open_turn(&agent.id).ok().flatten().is_some();
-                                    if !can_auto_recover {
+                                    if can_auto_recover {
+                                        crate::vendor::persist_last_error(&cfg, None, None);
+                                    } else {
+                                        crate::vendor::persist_last_error(
+                                            &cfg,
+                                            Some(&err_msg),
+                                            None,
+                                        );
                                         create::maybe_notify_parent_on_error(
                                             &store, &agent, &cfg, &err_msg,
                                         );
@@ -590,10 +607,12 @@ fn spawn_admin_sylphx_delivery(
                             Err(err) => {
                                 had_err = true;
                                 let err_msg = err.to_string();
-                                crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                 let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
                                     && store.open_turn(&agent.id).ok().flatten().is_some();
-                                if !can_auto_recover {
+                                if can_auto_recover {
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                } else {
+                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                     create::maybe_notify_parent_on_error(
                                         &store, &agent, &cfg, &err_msg,
                                     );
@@ -616,15 +635,27 @@ fn spawn_admin_sylphx_delivery(
             }
         }
         let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-        let still_running = Store::open(data.join("state.db"))
+        let (still_running, has_pending_work) = Store::open(data.join("state.db"))
             .ok()
-            .and_then(|s| s.agent(&agent.id).ok())
-            .is_some_and(|a| a.state == "running");
+            .map(|s| {
+                let running = s
+                    .agent(&agent.id)
+                    .ok()
+                    .is_some_and(|a| a.state == "running");
+                let pending = s.next_undelivered(&agent.id).ok().flatten().is_some()
+                    || s.open_turn(&agent.id).ok().flatten().is_some();
+                (running, pending)
+            })
+            .unwrap_or((false, false));
         health.publish(
             &agent.id,
             anyagents_supervisor::LiveState {
                 process_alive: still_running,
-                turn_state: anyagents_harness::TurnState::Idle,
+                turn_state: if still_running && has_pending_work && persisted_err.is_none() {
+                    anyagents_harness::TurnState::InTurn
+                } else {
+                    anyagents_harness::TurnState::Idle
+                },
                 delivery_mode,
                 steer_support,
                 quota_reset_at_ms: None,
@@ -882,6 +913,10 @@ fn reconcile_stopped_and_backed_off_agents(
         guard.initialized = true;
     }
 
+    const MAX_CONCURRENT_SYLPHX_TURNS: usize = 10;
+    const MAX_SYLPHX_SPAWNS_PER_TICK: usize = 4;
+    let mut sylphx_spawned_this_tick = 0usize;
+
     for agent in &agents {
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
         let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
@@ -954,23 +989,46 @@ fn reconcile_stopped_and_backed_off_agents(
                     });
                     if should_wake {
                         if store.set_agent_state(&agent.id, "running").is_ok() {
-                            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                            if agent.harness == "sylphx"
-                                && !guard.flushing_sylphx.contains(agent.id.as_str())
-                            {
-                                let mut running_agent = agent.clone();
-                                running_agent.state = "running".to_string();
-                                guard
-                                    .last_backoff_reset_ms
-                                    .insert(agent.id.to_string(), now_ms);
-                                guard.flushing_sylphx.insert(agent.id.to_string());
-                                spawn_admin_sylphx_delivery(
-                                    data.to_path_buf(),
-                                    running_agent,
-                                    health.clone(),
-                                    Arc::clone(reconcile),
-                                );
+                            if agent.harness == "sylphx" {
+                                if !guard.flushing_sylphx.contains(agent.id.as_str())
+                                    && guard.flushing_sylphx.len() < MAX_CONCURRENT_SYLPHX_TURNS
+                                    && sylphx_spawned_this_tick < MAX_SYLPHX_SPAWNS_PER_TICK
+                                {
+                                    let mut running_agent = agent.clone();
+                                    running_agent.state = "running".to_string();
+                                    guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                                    guard
+                                        .last_backoff_reset_ms
+                                        .insert(agent.id.to_string(), now_ms);
+                                    guard.flushing_sylphx.insert(agent.id.to_string());
+                                    sylphx_spawned_this_tick += 1;
+                                    spawn_admin_sylphx_delivery(
+                                        data.to_path_buf(),
+                                        running_agent,
+                                        health.clone(),
+                                        Arc::clone(reconcile),
+                                    );
+                                } else {
+                                    let (delivery_mode, steer_support) = declared(&agent.harness);
+                                    health.publish(
+                                        &agent.id,
+                                        anyagents_supervisor::LiveState {
+                                            process_alive: true,
+                                            turn_state: anyagents_harness::TurnState::InTurn,
+                                            delivery_mode,
+                                            steer_support,
+                                            quota_reset_at_ms: None,
+                                            restart_at_ms: None,
+                                            pid: None,
+                                            live_harness: Some(agent.harness.clone()),
+                                            live_model: agent.model.clone(),
+                                            process_started_at_ms: None,
+                                            last_error: None,
+                                        },
+                                    );
+                                }
                             } else {
+                                guard.watermark_seq.insert(agent.id.to_string(), max_seq);
                                 create::poke_agent_wake_socket(data, &agent.id);
                                 create::poke_agent_wake_socket_mail(data, &agent.id);
                             }
@@ -988,9 +1046,9 @@ fn reconcile_stopped_and_backed_off_agents(
                 let persisted_err =
                     crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
                 let has_open_recovery = store.open_turn(&agent.id).ok().flatten().is_some();
+                let has_pending_work = oldest_age_ms.is_some() || has_open_recovery;
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
-                    if oldest_age_ms.is_none()
-                        && !has_open_recovery
+                    if !has_pending_work
                         && persisted_err.is_none()
                         && agent.parent_id.is_some()
                         && store.complete_idle_subagent(&agent.id).unwrap_or(false)
@@ -1021,7 +1079,11 @@ fn reconcile_stopped_and_backed_off_agents(
                         &agent.id,
                         anyagents_supervisor::LiveState {
                             process_alive: true,
-                            turn_state: anyagents_harness::TurnState::Idle,
+                            turn_state: if has_pending_work && persisted_err.is_none() {
+                                anyagents_harness::TurnState::InTurn
+                            } else {
+                                anyagents_harness::TurnState::Idle
+                            },
                             delivery_mode,
                             steer_support,
                             quota_reset_at_ms: None,
@@ -1034,8 +1096,10 @@ fn reconcile_stopped_and_backed_off_agents(
                         },
                     );
                 }
-                if (oldest_age_ms.is_some() || has_open_recovery)
+                if has_pending_work
                     && !guard.flushing_sylphx.contains(agent.id.as_str())
+                    && guard.flushing_sylphx.len() < MAX_CONCURRENT_SYLPHX_TURNS
+                    && sylphx_spawned_this_tick < MAX_SYLPHX_SPAWNS_PER_TICK
                 {
                     let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                     let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
@@ -1049,15 +1113,23 @@ fn reconcile_stopped_and_backed_off_agents(
                         .get(agent.id.as_str())
                         .copied()
                         .unwrap_or(0);
-                    if persisted_err.is_none()
-                        || max_seq > prev_wm
-                        || now_ms.saturating_sub(last_try) >= 15_000
-                    {
+                    let ready_to_spawn = if has_open_recovery && oldest_age_ms.is_none() {
+                        last_try == 0 || now_ms.saturating_sub(last_try) >= 10_000
+                    } else {
+                        (persisted_err.is_none()
+                            && (last_try == 0
+                                || max_seq > prev_wm
+                                || now_ms.saturating_sub(last_try) >= 5_000))
+                            || max_seq > prev_wm
+                            || now_ms.saturating_sub(last_try) >= 15_000
+                    };
+                    if ready_to_spawn {
                         guard.watermark_seq.insert(agent.id.to_string(), max_seq);
                         guard
                             .last_backoff_reset_ms
                             .insert(agent.id.to_string(), now_ms);
                         guard.flushing_sylphx.insert(agent.id.to_string());
+                        sylphx_spawned_this_tick += 1;
                         spawn_admin_sylphx_delivery(
                             data.to_path_buf(),
                             agent.clone(),
@@ -1696,39 +1768,7 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
                 .get("last_error")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            if harness_str == "sylphx"
-                && raw_last_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("unknown harness: sylphx"))
-            {
-                if health
-                    .get(&id)
-                    .is_some_and(|cur| cur.turn_state == anyagents_harness::TurnState::InTurn)
-                {
-                    continue;
-                }
-                let cfg = anyagents_core::agent_config_dir(data, &id);
-                let persisted_err =
-                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-                health.publish(
-                    &id,
-                    anyagents_supervisor::LiveState {
-                        process_alive: true,
-                        turn_state: anyagents_harness::TurnState::Idle,
-                        delivery_mode,
-                        steer_support,
-                        quota_reset_at_ms: None,
-                        restart_at_ms: None,
-                        pid: None,
-                        live_harness: Some("sylphx".to_string()),
-                        live_model: item
-                            .get("model")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                        process_started_at_ms: None,
-                        last_error: persisted_err,
-                    },
-                );
+            if harness_str == "sylphx" {
                 continue;
             }
             health.publish(

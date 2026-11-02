@@ -439,9 +439,10 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
 }
 
 fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
+    let skip_sylphx = inner.store.data_dir().join("admin.sock").exists();
     if let Ok(agents) = inner.store.list_agents() {
         for agent in agents {
-            if agent.state == "running" {
+            if agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx") {
                 ensure(&inner, agent.id);
             }
         }
@@ -472,7 +473,10 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
 }
 
 fn is_running(store: &Store, id: &AgentId) -> bool {
-    store.agent(id).is_ok_and(|agent| agent.state == "running")
+    let skip_sylphx = store.data_dir().join("admin.sock").exists();
+    store.agent(id).is_ok_and(|agent| {
+        agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx")
+    })
 }
 
 fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {
