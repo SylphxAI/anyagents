@@ -112,6 +112,11 @@ One adapter per harness. A new harness is an adapter plus a catalog entry; the m
 
 Every harness is admitted. The delivery mode is whatever that tool does best, declared rather than hidden. Every line is written the moment it arrives; the vendor decides whether it joins the running turn or starts the next one.
 
+The native Sylphx HTTP transport sends JSON request bodies as bytes. Its curl
+fallback reads the body from stdin, so growing conversation history does not
+become one command-line argument or encounter the operating system's per-argument
+size limit. HTTP refusals retain their status and response body.
+
 | Harness | Mode | How a line reaches it |
 | --- | --- | --- |
 | `sylphx` | `steer` | Built-in native Sylphx harness (`crates/anyagents-harness-sylphx`). Drains `steer_queue` between every tool step in native Sylphx AI Responses mode (`/v1/responses`) or forwards `POST /v1/{env}/agent_sessions/{id}:steer` in `Sylphx Agents` BaaS mode (`SYLPHX_AGENT_ENV`). |
