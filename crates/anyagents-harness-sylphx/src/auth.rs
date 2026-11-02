@@ -666,11 +666,11 @@ fn gateway_retry_policy() -> (u32, u64) {
     let max_retries = std::env::var("SYLPHX_MAX_RETRIES")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(3);
+        .unwrap_or(5);
     let base_backoff_ms = std::env::var("SYLPHX_RETRY_BACKOFF_MS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(300);
+        .unwrap_or(500);
     (max_retries, base_backoff_ms)
 }
 
