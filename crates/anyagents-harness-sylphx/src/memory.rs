@@ -455,13 +455,75 @@ pub(super) fn maybe_emit_context_watermark_event(
 }
 
 pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) {
-    if let Ok(line) = serde_json::to_string(msg)
-        && let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(transcript_path)
+    let Ok(line) = serde_json::to_string(msg) else {
+        return;
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(transcript_path)
     {
-        let _ = writeln!(f, "{line}");
+        Ok(mut f) => {
+            let _ = writeln!(f, "{line}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Ok(meta) = f.metadata()
+                    && (meta.permissions().mode() & 0o060) != 0o060
+                {
+                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o660));
+                }
+            }
+        }
+        #[cfg(unix)]
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            use std::os::unix::fs::MetadataExt as _;
+            use std::process::{Command, Stdio};
+            let meta = std::fs::metadata(transcript_path).or_else(|_| {
+                transcript_path
+                    .parent()
+                    .ok_or_else(|| std::io::Error::other("missing parent"))
+                    .and_then(std::fs::metadata)
+            });
+            let launcher = std::env::var_os("ANYAGENTS_LAUNCHER")
+                .or_else(|| std::env::var_os("ANYAGENTS_SETPRIV"))
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/usr/local/bin/anyagents-setpriv"));
+            if let Ok(meta) = meta
+                && launcher.is_file()
+            {
+                let uid = meta.uid().to_string();
+                let gid = meta.gid().to_string();
+                if let Ok(mut child) = Command::new(&launcher)
+                    .args([
+                        "--reuid",
+                        &uid,
+                        "--regid",
+                        &gid,
+                        "--groups",
+                        &gid,
+                        "--no-new-privs",
+                        "--",
+                        "sh",
+                        "-c",
+                        "umask 007 && cat >> \"$1\" && chmod 0660 \"$1\"",
+                        "sh",
+                    ])
+                    .arg(transcript_path)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = writeln!(stdin, "{line}");
+                    }
+                    let _ = child.wait();
+                }
+            }
+        }
+        Err(_) => {}
     }
 }
 

@@ -414,6 +414,29 @@ pub fn write_sylphx_config(
                 obj.insert(key.to_string(), json!(val));
             }
         }
+        if !obj.contains_key("repo") {
+            let wt = crate::cloud::resolve_agent_git_worktree_spec(
+                config_dir,
+                None,
+                &[],
+                None,
+                None,
+                None,
+            );
+            if let Some(slug) = wt.repo_slug {
+                obj.insert("repo".to_string(), json!(slug));
+            }
+            if !obj.contains_key("branch")
+                && let Some(br) = wt.branch
+            {
+                obj.insert("branch".to_string(), json!(br));
+            }
+            if !obj.contains_key("base")
+                && let Some(base) = wt.base
+            {
+                obj.insert("base".to_string(), json!(base));
+            }
+        }
         let marker_cloud = worktree_marker
             .as_ref()
             .and_then(|m| m.get("cloud_sandbox"))
@@ -641,10 +664,13 @@ fn shared_http_agent() -> &'static ureq::Agent {
 }
 
 pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
+    let lower = body.to_ascii_lowercase();
+    if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
+        return false;
+    }
     if matches!(status, 408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=529) {
         return true;
     }
-    let lower = body.to_ascii_lowercase();
     if status == 429 {
         return !lower.contains("insufficient_quota")
             && !lower.contains("credit balance is too low")

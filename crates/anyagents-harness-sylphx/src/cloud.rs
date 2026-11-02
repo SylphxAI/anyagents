@@ -7,8 +7,11 @@
 //!   files are purged). Instead, `git` uses an in-memory credential helper (`!f() { ... }`) that
 //!   reads `$GH_TOKEN` from the ephemeral `:exec` process environment when needed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -20,7 +23,48 @@ use super::auth::{
 
 pub const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
 pub const DEFAULT_SYLPHX_SANDBOX_SHAPE: &str = "linux-s";
+pub const DEFAULT_SYLPHX_SANDBOX_IDLE_TIMEOUT: &str = "300s";
 pub const CLOUD_WORKSPACE_DIR: &str = "/home/user/workspace";
+const CLOUD_EXEC_ZERO_SENTINEL: i64 = 200;
+
+fn config_dir_lease_lock(config_dir: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard
+        .entry(config_dir.to_path_buf())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+fn next_exec_idempotency_key(prefix: &str) -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{prefix}_{}_{}_{n}",
+        std::process::id(),
+        anyagents_core::now_ms()
+    )
+}
+
+/// Wraps a guest shell script so an exit code of `0` is emitted over `envd` protojson
+/// as `CLOUD_EXEC_ZERO_SENTINEL` (`200`), avoiding proto3 default-scalar omission of
+/// `"exitCode": 0` in `sandboxes-api`.
+pub(super) fn wrap_cloud_exec_command_for_zero_exit(script: &str) -> String {
+    format!(
+        "( {script}\n); __sylphx_rc=$?; if [ \"$__sylphx_rc\" -eq 0 ]; then exit {CLOUD_EXEC_ZERO_SENTINEL}; else exit \"$__sylphx_rc\"; fi"
+    )
+}
+
+pub(super) fn normalize_cloud_exec_exit_code(raw_code: i64) -> i64 {
+    if raw_code == CLOUD_EXEC_ZERO_SENTINEL {
+        0
+    } else {
+        raw_code
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct CloudWorktreeSpec {
@@ -70,6 +114,19 @@ pub(super) fn resolve_sandbox_shape(env: &[(String, String)]) -> String {
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| DEFAULT_SYLPHX_SANDBOX_SHAPE.to_string())
+}
+
+pub(super) fn resolve_sandbox_idle_timeout(env: &[(String, String)]) -> String {
+    env.iter()
+        .find(|(k, v)| k == "SYLPHX_SANDBOX_IDLE_TIMEOUT" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_string())
+        .or_else(|| {
+            std::env::var("SYLPHX_SANDBOX_IDLE_TIMEOUT")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_SYLPHX_SANDBOX_IDLE_TIMEOUT.to_string())
 }
 
 /// Builds a declarative `sylphx.agents.v1.EnvironmentSpec` JSON object for `Sylphx Agents`
@@ -402,12 +459,59 @@ pub fn resolve_cloud_sandbox_path(raw: &str) -> String {
     format!("{CLOUD_WORKSPACE_DIR}/{clean}")
 }
 
+fn parse_retry_after_ms_from_reason(reason: &str) -> Option<i64> {
+    let idx = reason.find('{')?;
+    let val = serde_json::from_str::<Value>(&reason[idx..]).ok()?;
+    val.get("retry_after_ms")
+        .or_else(|| val.get("retryAfterMs"))
+        .or_else(|| val.pointer("/error/retry_after_ms"))
+        .and_then(Value::as_i64)
+        .filter(|&ms| ms > 0)
+}
+
+fn deterministic_jitter_ms(config_dir: &Path, max_jitter_ms: i64) -> i64 {
+    if max_jitter_ms <= 0 {
+        return 0;
+    }
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in config_dir.to_string_lossy().as_bytes() {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash % (max_jitter_ms as u64)) as i64
+}
+
 pub(super) fn record_cloud_sandbox_fallback(config_dir: &Path, reason: &str) {
     let fallback_path = config_dir.join("sylphx-sandbox-fallback.json");
+    let prev_failures = std::fs::read_to_string(&fallback_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("consecutive_failures").and_then(Value::as_u64))
+        .unwrap_or(0);
+    let consecutive_failures = prev_failures.saturating_add(1);
+    let base_cooldown_ms = std::env::var("SYLPHX_SANDBOX_FALLBACK_COOLDOWN_MS")
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(60_000);
+    let shift = consecutive_failures.saturating_sub(1).min(4) as u32;
+    let exp_cooldown_ms = base_cooldown_ms.saturating_mul(1i64 << shift).min(900_000);
+    let retry_after_ms = parse_retry_after_ms_from_reason(reason).unwrap_or(0);
+    let jitter_ms = if base_cooldown_ms >= 5_000 {
+        deterministic_jitter_ms(config_dir, 15_000)
+    } else {
+        0
+    };
+    let cooldown_ms = exp_cooldown_ms
+        .max(retry_after_ms)
+        .saturating_add(jitter_ms);
+    let now = anyagents_core::now_ms();
     let doc = json!({
         "fallback_to": "local",
         "reason": reason,
-        "timestamp_ms": anyagents_core::now_ms(),
+        "timestamp_ms": now,
+        "consecutive_failures": consecutive_failures,
+        "cooldown_ms": cooldown_ms,
+        "next_retry_at_ms": now.saturating_add(cooldown_ms),
     });
     let _ = std::fs::write(&fallback_path, format!("{doc}\n"));
 }
@@ -427,17 +531,20 @@ pub(super) fn is_cloud_sandbox_in_fallback_cooldown(config_dir: &Path) -> bool {
     let Some(ts) = val.get("timestamp_ms").and_then(Value::as_i64) else {
         return false;
     };
-    let cooldown_ms = std::env::var("SYLPHX_SANDBOX_FALLBACK_COOLDOWN_MS")
-        .ok()
-        .and_then(|s| s.trim().parse::<i64>().ok())
-        .unwrap_or(60_000);
     let now = anyagents_core::now_ms();
-    if now.saturating_sub(ts) <= cooldown_ms {
-        true
-    } else {
-        let _ = std::fs::remove_file(&fallback_path);
-        false
+    if let Ok(explicit_env_ms) = std::env::var("SYLPHX_SANDBOX_FALLBACK_COOLDOWN_MS")
+        && let Ok(cooldown_ms) = explicit_env_ms.trim().parse::<i64>()
+    {
+        return now.saturating_sub(ts) <= cooldown_ms;
     }
+    if let Some(next_retry_at_ms) = val.get("next_retry_at_ms").and_then(Value::as_i64) {
+        return now <= next_retry_at_ms;
+    }
+    let cooldown_ms = val
+        .get("cooldown_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(60_000);
+    now.saturating_sub(ts) <= cooldown_ms
 }
 
 pub(super) fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) -> String {
@@ -531,6 +638,94 @@ pub fn ensure_cloud_sandbox_lease(
     ensure_cloud_sandbox_lease_with_worktree(config_dir, None, env, None, None, None)
 }
 
+fn is_terminal_lease_state(state: &str) -> bool {
+    matches!(
+        state,
+        "refused"
+            | "ended"
+            | "failed"
+            | "expired"
+            | "released"
+            | "lease_state_refused"
+            | "lease_state_ended"
+            | "lease_state_failed"
+            | "lease_state_expired"
+            | "lease_state_released"
+    )
+}
+
+fn is_ready_lease_state(state: &str) -> bool {
+    matches!(state, "ready" | "lease_state_ready")
+}
+
+fn poll_lease_until_ready(
+    api_url: &str,
+    access_key: &str,
+    lease_name: &str,
+    initial_val: Value,
+) -> Result<Value, String> {
+    let mut lease_val = initial_val;
+    let initial_state = lease_val
+        .pointer("/status/state")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_ready_lease_state(&initial_state) {
+        return Ok(lease_val);
+    }
+    if is_terminal_lease_state(&initial_state) {
+        return Err(format!(
+            "Cloud Sandbox Lease `{lease_name}` entered state `{initial_state}`"
+        ));
+    }
+    let get_url = format!("{api_url}/v1/{lease_name}");
+    for _ in 0..45 {
+        std::thread::sleep(Duration::from_secs(1));
+        if let Ok((200..=299, body)) = curl_get(&get_url, Some(access_key))
+            && let Ok(live) = serde_json::from_str::<Value>(&body)
+        {
+            let st = live
+                .pointer("/status/state")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            lease_val = live;
+            if is_ready_lease_state(&st) {
+                return Ok(lease_val);
+            }
+            if is_terminal_lease_state(&st) {
+                return Err(format!(
+                    "Cloud Sandbox Lease `{lease_name}` entered state `{st}`"
+                ));
+            }
+        }
+    }
+    Err(format!(
+        "Cloud Sandbox Lease `{lease_name}` did not become ready within 45s"
+    ))
+}
+
+fn persist_lease_metadata(
+    lease_file: &Path,
+    lease_val: &mut Value,
+    wt_spec: &CloudWorktreeSpec,
+    bootstrapped: bool,
+) {
+    if let Some(obj) = lease_val.as_object_mut() {
+        obj.insert("workspace_bootstrapped".to_string(), json!(bootstrapped));
+        obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
+        if let Some(ref slug) = wt_spec.repo_slug {
+            obj.insert("repo".to_string(), json!(slug));
+        }
+        if let Some(ref br) = wt_spec.branch {
+            obj.insert("branch".to_string(), json!(br));
+        }
+    }
+    if let Ok(pretty) = serde_json::to_string_pretty(lease_val) {
+        let _ = std::fs::write(lease_file, format!("{pretty}\n"));
+    }
+}
+
 pub fn ensure_cloud_sandbox_lease_with_worktree(
     config_dir: &Path,
     work_dir: Option<&Path>,
@@ -539,11 +734,17 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
     explicit_branch: Option<&str>,
     explicit_base: Option<&str>,
 ) -> Result<(String, String), String> {
+    let lock = config_dir_lease_lock(config_dir);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let access_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx Cloud access key; run `anyagents sign-in sylphx` first".to_string()
     })?;
     let api_url = resolve_cloud_api_url(env);
     let shape = resolve_sandbox_shape(env);
+    let idle_timeout = resolve_sandbox_idle_timeout(env);
     let wt_spec = resolve_agent_git_worktree_spec(
         config_dir,
         work_dir,
@@ -555,60 +756,78 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
     let lease_file = config_dir.join("sylphx-sandbox-lease.json");
 
     if let Ok(raw) = std::fs::read_to_string(&lease_file)
-        && let Ok(mut persisted) = serde_json::from_str::<Value>(&raw)
+        && let Ok(persisted) = serde_json::from_str::<Value>(&raw)
         && let Some(name) = persisted
             .get("name")
             .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
             .map(str::to_string)
     {
         let get_url = format!("{api_url}/v1/{name}");
-        if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
-            && let Ok(live) = serde_json::from_str::<Value>(&body)
-        {
-            let state = live
-                .pointer("/status/state")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
-            if state == "ready" || state == "lease_state_ready" {
-                let uid = live
-                    .get("uid")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string();
-                let prev_repo = persisted
-                    .get("repo")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let prev_branch = persisted
-                    .get("branch")
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
-                let already_bootstrapped = persisted
-                    .get("workspace_bootstrapped")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let needs_bootstrap = !already_bootstrapped
-                    || (wt_spec.repo_slug.is_some() && wt_spec.repo_slug != prev_repo)
-                    || (wt_spec.branch.is_some() && wt_spec.branch != prev_branch);
-                if needs_bootstrap {
-                    bootstrap_cloud_sandbox_worktree(&api_url, &access_key, &name, &wt_spec, env)?;
-                    if let Some(obj) = persisted.as_object_mut() {
-                        obj.insert("workspace_bootstrapped".to_string(), json!(true));
-                        obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
-                        if let Some(ref slug) = wt_spec.repo_slug {
-                            obj.insert("repo".to_string(), json!(slug));
+        match curl_get(&get_url, Some(&access_key)) {
+            Ok((200..=299, body)) => {
+                if let Ok(live) = serde_json::from_str::<Value>(&body) {
+                    let state = live
+                        .pointer("/status/state")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if is_terminal_lease_state(&state) {
+                        let _ = std::fs::remove_file(&lease_file);
+                    } else {
+                        let mut ready_live =
+                            match poll_lease_until_ready(&api_url, &access_key, &name, live) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    if e.contains("entered state") {
+                                        let _ = std::fs::remove_file(&lease_file);
+                                    }
+                                    return Err(e);
+                                }
+                            };
+                        let uid = ready_live
+                            .get("uid")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let prev_repo = persisted
+                            .get("repo")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let prev_branch = persisted
+                            .get("branch")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
+                        let already_bootstrapped = persisted
+                            .get("workspace_bootstrapped")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false);
+                        let needs_bootstrap = !already_bootstrapped
+                            || (wt_spec.repo_slug.is_some() && wt_spec.repo_slug != prev_repo)
+                            || (wt_spec.branch.is_some() && wt_spec.branch != prev_branch);
+                        if needs_bootstrap {
+                            bootstrap_cloud_sandbox_worktree(
+                                &api_url,
+                                &access_key,
+                                &name,
+                                &wt_spec,
+                                env,
+                            )?;
+                            persist_lease_metadata(&lease_file, &mut ready_live, &wt_spec, true);
                         }
-                        if let Some(ref br) = wt_spec.branch {
-                            obj.insert("branch".to_string(), json!(br));
-                        }
-                    }
-                    if let Ok(pretty) = serde_json::to_string_pretty(&persisted) {
-                        let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
+                        clear_cloud_sandbox_fallback(config_dir);
+                        return Ok((name, uid));
                     }
                 }
-                clear_cloud_sandbox_fallback(config_dir);
-                return Ok((name, uid));
+            }
+            Ok((404, _)) => {
+                let _ = std::fs::remove_file(&lease_file);
+            }
+            Ok((status, body)) => {
+                return Err(format!("GetLease HTTP {status}: {}", body.trim()));
+            }
+            Err(e) => {
+                return Err(format!("GetLease failed: {e}"));
             }
         }
     }
@@ -635,6 +854,7 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
                 "egress": "allow"
             },
             "ttl": "1800s",
+            "idle_timeout": idle_timeout,
         }
     });
     let (status, raw) = curl_post_json(&create_url, Some(&access_key), &req_body)?;
@@ -655,59 +875,24 @@ pub fn ensure_cloud_sandbox_lease_with_worktree(
         .unwrap_or("")
         .to_string();
 
-    // Poll until status.state == "ready" if not immediately ready
-    let mut ready = lease_val
-        .pointer("/status/state")
-        .and_then(Value::as_str)
-        .is_some_and(|s| {
-            s.eq_ignore_ascii_case("ready") || s.eq_ignore_ascii_case("lease_state_ready")
-        });
-    if !ready {
-        let get_url = format!("{api_url}/v1/{lease_name}");
-        for _ in 0..45 {
-            std::thread::sleep(Duration::from_secs(1));
-            if let Ok((200..=299, body)) = curl_get(&get_url, Some(&access_key))
-                && let Ok(live) = serde_json::from_str::<Value>(&body)
-            {
-                let st = live
-                    .pointer("/status/state")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                lease_val = live;
-                if st == "ready" || st == "lease_state_ready" {
-                    ready = true;
-                    break;
-                }
-                if st == "refused" || st == "ended" || st == "failed" {
-                    return Err(format!(
-                        "Cloud Sandbox Lease `{lease_name}` entered state `{st}`"
-                    ));
-                }
+    // Persist immediately after CreateLease succeeds (`workspace_bootstrapped: false`)
+    // so any failure during readiness polling or worktree bootstrap still tracks the
+    // allocated lease rather than leaking an orphan VM on the next call.
+    persist_lease_metadata(&lease_file, &mut lease_val, &wt_spec, false);
+
+    let mut ready_val = match poll_lease_until_ready(&api_url, &access_key, &lease_name, lease_val)
+    {
+        Ok(v) => v,
+        Err(e) => {
+            if e.contains("entered state") {
+                let _ = std::fs::remove_file(&lease_file);
             }
+            return Err(e);
         }
-    }
-    if !ready {
-        return Err(format!(
-            "Cloud Sandbox Lease `{lease_name}` did not become ready within 45s"
-        ));
-    }
+    };
 
     bootstrap_cloud_sandbox_worktree(&api_url, &access_key, &lease_name, &wt_spec, env)?;
-
-    if let Some(obj) = lease_val.as_object_mut() {
-        obj.insert("workspace_bootstrapped".to_string(), json!(true));
-        obj.insert("workspace_dir".to_string(), json!(CLOUD_WORKSPACE_DIR));
-        if let Some(ref slug) = wt_spec.repo_slug {
-            obj.insert("repo".to_string(), json!(slug));
-        }
-        if let Some(ref br) = wt_spec.branch {
-            obj.insert("branch".to_string(), json!(br));
-        }
-    }
-    if let Ok(pretty) = serde_json::to_string_pretty(&lease_val) {
-        let _ = std::fs::write(&lease_file, format!("{pretty}\n"));
-    }
+    persist_lease_metadata(&lease_file, &mut ready_val, &wt_spec, true);
     clear_cloud_sandbox_fallback(config_dir);
     Ok((lease_name, uid))
 }
@@ -778,11 +963,14 @@ if [ -d "$ANYAGENTS_WORKSPACE/.git" ]; then
 fi
 "#;
 
+    let wrapped_bootstrap = wrap_cloud_exec_command_for_zero_exit(bootstrap_script);
+    let idempotency_key = next_exec_idempotency_key("bootstrap");
     let (status, raw) = curl_post_json(
         &exec_url,
         Some(access_key),
         &json!({
-            "command": ["bash", "-lc", bootstrap_script],
+            "idempotency_key": idempotency_key,
+            "command": ["bash", "-lc", wrapped_bootstrap],
             "env": exec_env,
             "timeout": "180s",
         }),
@@ -792,7 +980,8 @@ fi
     }
     let val: Value =
         serde_json::from_str(&raw).map_err(|e| format!("invalid ExecLease JSON: {e}"))?;
-    let code = val.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    let raw_code = val.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    let code = normalize_cloud_exec_exit_code(raw_code);
     if code != 0 {
         let stderr_b64 = val.get("stderr").and_then(Value::as_str).unwrap_or("");
         let stderr = String::from_utf8_lossy(&base64_decode(stderr_b64)).into_owned();
@@ -805,15 +994,25 @@ fi
 }
 
 pub fn release_persisted_sandbox_lease(config_dir: &Path) {
+    let lock = config_dir_lease_lock(config_dir);
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     let lease_file = config_dir.join("sylphx-sandbox-lease.json");
     let Ok(raw) = std::fs::read_to_string(&lease_file) else {
         return;
     };
-    let _ = std::fs::remove_file(&lease_file);
     let Ok(val) = serde_json::from_str::<Value>(&raw) else {
+        let _ = std::fs::remove_file(&lease_file);
         return;
     };
-    let Some(lease_name) = val.get("name").and_then(Value::as_str) else {
+    let Some(lease_name) = val
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        let _ = std::fs::remove_file(&lease_file);
         return;
     };
     let Some(access_key) = resolve_sylphx_cloud_access_key(config_dir, &[]) else {
@@ -821,7 +1020,11 @@ pub fn release_persisted_sandbox_lease(config_dir: &Path) {
     };
     let api_url = resolve_cloud_api_url(&[]);
     let release_url = format!("{api_url}/v1/{lease_name}:release");
-    let _ = curl_post_json(&release_url, Some(&access_key), &json!({}));
+    if let Ok((status, _)) = curl_post_json(&release_url, Some(&access_key), &json!({}))
+        && ((200..300).contains(&status) || status == 404)
+    {
+        let _ = std::fs::remove_file(&lease_file);
+    }
 }
 
 #[allow(dead_code)]
@@ -851,13 +1054,16 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
         exec_env.insert("GH_TOKEN".to_string(), json!(tok));
         exec_env.insert("GITHUB_TOKEN".to_string(), json!(tok));
     }
-    let wrapped_cmd = format!(
+    let inner_cmd = format!(
         "export PATH=\"$HOME/.local/bin:$PATH\"; mkdir -p \"{CLOUD_WORKSPACE_DIR}\" && cd \"{CLOUD_WORKSPACE_DIR}\" && {cmd_str}"
     );
+    let wrapped_cmd = wrap_cloud_exec_command_for_zero_exit(&inner_cmd);
+    let idempotency_key = next_exec_idempotency_key("exec");
     let (status, raw) = curl_post_json(
         &exec_url,
         Some(&access_key),
         &json!({
+            "idempotency_key": idempotency_key,
             "command": ["bash", "-lc", wrapped_cmd],
             "working_directory": CLOUD_WORKSPACE_DIR,
             "env": exec_env,
@@ -869,7 +1075,8 @@ pub(super) fn exec_in_cloud_sandbox_with_work_dir(
     }
     let val: Value =
         serde_json::from_str(&raw).map_err(|e| format!("invalid ExecLease JSON: {e}"))?;
-    let code = val.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    let raw_code = val.get("exit_code").and_then(Value::as_i64).unwrap_or(0);
+    let code = normalize_cloud_exec_exit_code(raw_code);
     let stdout_b64 = val.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr_b64 = val.get("stderr").and_then(Value::as_str).unwrap_or("");
     let stdout = String::from_utf8_lossy(&base64_decode(stdout_b64)).into_owned();
