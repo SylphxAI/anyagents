@@ -414,11 +414,16 @@ pub fn write_sylphx_config(
                 obj.insert(key.to_string(), json!(val));
             }
         }
-        if worktree_marker
+        let marker_cloud = worktree_marker
             .as_ref()
             .and_then(|m| m.get("cloud_sandbox"))
-            .and_then(Value::as_bool)
-            == Some(true)
+            .and_then(Value::as_bool);
+        if marker_cloud == Some(true)
+            || (!obj.contains_key("sandbox")
+                && marker_cloud != Some(false)
+                && obj.contains_key("repo")
+                && !crate::sandbox::is_isolated_test_env()
+                && crate::cloud::resolve_sylphx_cloud_access_key(config_dir, &[]).is_some())
         {
             obj.insert("sandbox".to_string(), json!("cloud"));
         }

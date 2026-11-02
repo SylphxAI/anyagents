@@ -3500,10 +3500,8 @@ fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
     for ptr in [
         "/claudeAiOauth/accountUuid",
         "/claudeAiOauth/email",
-        "/claudeAiOauth/refreshToken",
         "/id_token_email",
         "/tokens/account_id",
-        "/token/refresh_token",
     ] {
         if let Some(s) = val
             .pointer(ptr)
@@ -3517,6 +3515,24 @@ fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
     None
 }
 
+fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut src_val: serde_json::Value = serde_json::from_slice(src_bytes).ok()?;
+    let dst_val: serde_json::Value = serde_json::from_slice(dst_bytes).ok()?;
+    let dst_oauth = dst_val.get("claudeAiOauth")?.as_object()?;
+    let src_oauth = src_val.get_mut("claudeAiOauth")?.as_object_mut()?;
+    let mut changed = false;
+    for key in ["accountUuid", "email"] {
+        if !src_oauth.contains_key(key)
+            && let Some(v) = dst_oauth.get(key)
+            && v.as_str().is_some_and(|s| !s.trim().is_empty())
+        {
+            src_oauth.insert(key.to_string(), v.clone());
+            changed = true;
+        }
+    }
+    changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
+}
+
 fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     let Ok(src_meta) = std::fs::metadata(src) else {
         return false;
@@ -3527,7 +3543,7 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
     if std::fs::read(src).is_err() {
         chmod_seat_file_readable(src);
     }
-    let Ok(src_bytes) = std::fs::read(src) else {
+    let Ok(mut src_bytes) = std::fs::read(src) else {
         return false;
     };
     if src_bytes.is_empty() {
@@ -3562,6 +3578,9 @@ fn copy_seat_file_if_newer(src: &Path, dst: &Path) -> bool {
                 }
             } else if src_meta.modified().ok() <= dst_meta.modified().ok() {
                 return false;
+            }
+            if let Some(merged) = merge_preserved_oauth_metadata(&src_bytes, &dst_bytes) {
+                src_bytes = merged;
             }
         } else if src_meta.modified().ok() <= dst_meta.modified().ok() {
             return false;
@@ -3854,13 +3873,99 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
     entries
 }
 
+pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms: i64) {
+    let now_ms = anyagents_core::now_ms();
+    if reset_at_ms <= now_ms {
+        return;
+    }
+    let cfg = agent_config_dir(data, &agent.id);
+    let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
+    let prof_name = bound_profile_name(&cfg)
+        .and_then(|b| {
+            let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+            (!p.is_empty()).then_some(p)
+        })
+        .unwrap_or_else(|| "default".to_string());
+    let profile_dir = data.join("profiles").join(&provider).join(&prof_name);
+    if profile_dir.is_dir() {
+        let marker = profile_dir.join(".anyagents-quota-reset-ms");
+        let existing = std::fs::read_to_string(&marker)
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0);
+        if existing != reset_at_ms {
+            let _ = std::fs::write(&marker, format!("{reset_at_ms}\n"));
+        }
+    }
+}
+
+fn overlay_active_quota_reset_on_cached_usage(
+    prof_dir: &Path,
+    last_usage_path: &Path,
+    cached: &str,
+    now_ms: i64,
+) -> String {
+    let reset_marker = prof_dir.join(".anyagents-quota-reset-ms");
+    let Some(reset_ms) = std::fs::read_to_string(&reset_marker)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|&ms| ms > now_ms)
+    else {
+        return cached.to_string();
+    };
+    let usage_mtime_ms = std::fs::metadata(last_usage_path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let reset_mtime_ms = std::fs::metadata(&reset_marker)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(now_ms);
+    if usage_mtime_ms > reset_mtime_ms && now_ms.saturating_sub(usage_mtime_ms) < 60_000 {
+        return cached.to_string();
+    }
+    let eta = format_reset_eta_epoch_ms(reset_ms)
+        .map(|e| format!(" ↻{e}"))
+        .unwrap_or_default();
+    let zero_5h = format!("5h: 0% left{eta}");
+    if cached.starts_with("5h:") {
+        if let Some((_, rest)) = cached.split_once(" · ") {
+            return format!("{zero_5h} · {rest}");
+        }
+        let tier_suffix = cached
+            .rfind(" (")
+            .map(|idx| &cached[idx..])
+            .unwrap_or_default();
+        return format!("{zero_5h}{tier_suffix}");
+    }
+    if cached.is_empty() {
+        zero_5h
+    } else if cached.starts_with('(') {
+        format!("{zero_5h} {cached}")
+    } else {
+        format!("{zero_5h} · {cached}")
+    }
+}
+
 pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
     let profiles_root = data.join("profiles");
+    let now_ms = anyagents_core::now_ms();
     if let Ok(store) = Store::open(data.join("state.db"))
         && let Ok(agents) = store.list_agents()
     {
         for agent in &agents {
             let cfg = agent_config_dir(data, &agent.id);
+            if agent.state != "archived"
+                && agent.harness == "claude-code"
+                && let Some(reset_ms) =
+                    anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now_ms)
+            {
+                record_profile_quota_reset(data, agent, reset_ms);
+            }
             let bound = bound_profile_name(&cfg);
             let seeded = seeded_profile_name(&cfg);
             if seeded.is_some() && bound.is_some() && seeded != bound {
@@ -4517,11 +4622,18 @@ pub(crate) fn probe_one_profile_usage(
                 }
             };
             let last_usage_path = prof_dir.join(".anyagents-last-usage.txt");
+            let backoff_path = prof_dir.join(".anyagents-usage-backoff-until-ms");
+            let now_ms = anyagents_core::now_ms();
             let fallback_cached_usage = |cred_val: &serde_json::Value| -> Option<String> {
                 if let Ok(cached) = std::fs::read_to_string(&last_usage_path) {
                     let trimmed = cached.trim();
                     if !trimmed.is_empty() {
-                        return Some(trimmed.to_string());
+                        return Some(overlay_active_quota_reset_on_cached_usage(
+                            &prof_dir,
+                            &last_usage_path,
+                            trimmed,
+                            now_ms,
+                        ));
                     }
                 }
                 let tier = cred_val
@@ -4539,9 +4651,34 @@ pub(crate) fn probe_one_profile_usage(
                 } else {
                     sub
                 };
-                (!badge.is_empty()).then(|| format!("({badge})"))
+                let base = if badge.is_empty() {
+                    String::new()
+                } else {
+                    format!("({badge})")
+                };
+                let overlaid = overlay_active_quota_reset_on_cached_usage(
+                    &prof_dir,
+                    &last_usage_path,
+                    &base,
+                    now_ms,
+                );
+                (!overlaid.is_empty()).then_some(overlaid)
             };
-            let now_ms = anyagents_core::now_ms();
+            if let Ok(meta) = std::fs::metadata(&last_usage_path)
+                && let Ok(mtime) = meta.modified()
+                && let Ok(dur) = mtime.duration_since(std::time::UNIX_EPOCH)
+                && now_ms.saturating_sub(dur.as_millis() as i64) < 60_000
+                && let Some(cached) = fallback_cached_usage(&cred)
+            {
+                return Some(cached);
+            }
+            if let Some(backoff_until) = std::fs::read_to_string(&backoff_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                && backoff_until > now_ms
+            {
+                return fallback_cached_usage(&cred);
+            }
             let expires_at = cred
                 .pointer("/claudeAiOauth/expiresAt")
                 .and_then(serde_json::Value::as_i64)
@@ -4555,6 +4692,9 @@ pub(crate) fn probe_one_profile_usage(
             let val = match initial_usage {
                 Ok(v) => v,
                 Err(code) if code != 401 => {
+                    if code == 429 {
+                        let _ = std::fs::write(&backoff_path, format!("{}\n", now_ms + 180_000));
+                    }
                     return fallback_cached_usage(&cred);
                 }
                 Err(_) => {
@@ -4564,9 +4704,20 @@ pub(crate) fn probe_one_profile_usage(
                         .and_then(|s| s.trim().parse::<i64>().ok())
                         .unwrap_or(0);
                     if now_ms.saturating_sub(last_attempt_ms) < 300_000 {
+                        if expires_at <= now_ms {
+                            return fallback_cached_usage(&cred);
+                        }
                         match fetch_usage(&token) {
                             Ok(v) => v,
-                            Err(_) => return fallback_cached_usage(&cred),
+                            Err(code) => {
+                                if code == 429 {
+                                    let _ = std::fs::write(
+                                        &backoff_path,
+                                        format!("{}\n", now_ms + 180_000),
+                                    );
+                                }
+                                return fallback_cached_usage(&cred);
+                            }
                         }
                     } else {
                         let rtok = cred
@@ -4660,6 +4811,10 @@ pub(crate) fn probe_one_profile_usage(
             let formatted = format_anthropic_usage_summary(&val, tier_badge);
             if let Some(ref s) = formatted {
                 let _ = std::fs::write(&last_usage_path, format!("{s}\n"));
+                let _ = std::fs::remove_file(&backoff_path);
+                if parse_remaining_pct_from_usage(s, None).is_some_and(|p| p > 0) {
+                    let _ = std::fs::remove_file(prof_dir.join(".anyagents-quota-reset-ms"));
+                }
             }
             formatted
         }
@@ -5530,7 +5685,20 @@ pub(crate) fn probe_profile_remaining_pct(
 ) -> Option<i64> {
     sync_fresher_bound_agent_credentials(data);
     let usage = probe_one_profile_usage(data, provider, profile)?;
-    parse_remaining_pct_from_usage(&usage, model)
+    let pct = parse_remaining_pct_from_usage(&usage, model)?;
+    if provider == "anthropic" && pct > 0 {
+        let prof_dir = data.join("profiles").join(provider).join(profile);
+        let now_ms = anyagents_core::now_ms();
+        let fresh_live_read = std::fs::metadata(prof_dir.join(".anyagents-last-usage.txt"))
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .is_some_and(|d| now_ms.saturating_sub(d.as_millis() as i64) < 65_000);
+        if !fresh_live_read {
+            return None;
+        }
+    }
+    Some(pct)
 }
 
 pub(crate) fn poke_agent_wake_socket(data: &Path, agent_id: &AgentId) {
@@ -5998,11 +6166,18 @@ pub(crate) fn try_rotate_exhausted_profile(
             (!p.is_empty()).then_some(p)
         })
         .unwrap_or_else(|| "default".to_string());
+    let prof_dir = data.join("profiles").join(&provider).join(&current_prof);
     if has_active_quota_hold {
-        let last_check = std::fs::read_to_string(cfg.join(".anyagents-last-quota-check-ms"))
+        let agent_last_check = std::fs::read_to_string(cfg.join(".anyagents-last-quota-check-ms"))
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
+        let prof_last_check =
+            std::fs::read_to_string(prof_dir.join(".anyagents-last-quota-check-ms"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+        let last_check = agent_last_check.max(prof_last_check);
         if now_ms.saturating_sub(last_check) < 120_000 {
             let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
                 .ok()
@@ -6023,6 +6198,13 @@ pub(crate) fn try_rotate_exhausted_profile(
             ".anyagents-last-quota-check-ms",
             &format!("{now_ms}\n"),
         );
+        if prof_dir.is_dir() {
+            write_profile_marker(
+                &prof_dir,
+                ".anyagents-last-quota-check-ms",
+                &format!("{now_ms}\n"),
+            );
+        }
     }
     let _ = store;
     let cur_pct =
@@ -7096,5 +7278,95 @@ mod tests {
         assert_eq!(prof2, "default");
         assert_eq!(acct2.as_deref(), Some("stanleylau_ex@hotmail.com"));
         assert!(!data.join("profiles/anthropic/extra").exists());
+    }
+
+    #[test]
+    fn overlay_active_quota_reset_replaces_stale_cached_5h_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof_dir = tmp.path();
+        let usage_path = prof_dir.join(".anyagents-last-usage.txt");
+        let cached = "5h: 49% left ↻3h01m · 7d: 63% left ↻2d09h (max 20x)";
+        std::fs::write(&usage_path, format!("{cached}\n")).unwrap();
+        let now_ms = anyagents_core::now_ms();
+        let reset_ms = now_ms + 95 * 60 * 1_000;
+        std::fs::write(
+            prof_dir.join(".anyagents-quota-reset-ms"),
+            format!("{reset_ms}\n"),
+        )
+        .unwrap();
+
+        let overlaid =
+            overlay_active_quota_reset_on_cached_usage(prof_dir, &usage_path, cached, now_ms);
+        assert!(
+            overlaid.starts_with("5h: 0% left ↻1h"),
+            "expected 5h: 0% left with live reset ETA, got: {overlaid}"
+        );
+        assert!(
+            overlaid.ends_with(" · 7d: 63% left ↻2d09h (max 20x)"),
+            "expected 7d tail preserved, got: {overlaid}"
+        );
+        assert_eq!(parse_remaining_pct_from_usage(&overlaid, None), Some(0));
+    }
+
+    #[test]
+    fn copy_seat_file_if_newer_syncs_rotated_refresh_token_and_preserves_metadata() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof_cred = tmp.path().join("profile-credentials.json");
+        let seat_cred = tmp.path().join(".credentials.json");
+        let now_ms = anyagents_core::now_ms();
+        std::fs::write(
+            &prof_cred,
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "old-access",
+                    "refreshToken": "old-refresh-token",
+                    "expiresAt": now_ms - 10_000,
+                    "email": "ritaleewoonyee@gmail.com",
+                    "accountUuid": "uuid-rita"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &seat_cred,
+            serde_json::json!({
+                "claudeAiOauth": {
+                    "accessToken": "new-access",
+                    "refreshToken": "rotated-refresh-token",
+                    "expiresAt": now_ms + 3_600_000
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert!(copy_seat_file_if_newer(&seat_cred, &prof_cred));
+        let synced: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&prof_cred).unwrap()).unwrap();
+        assert_eq!(
+            synced
+                .pointer("/claudeAiOauth/accessToken")
+                .and_then(serde_json::Value::as_str),
+            Some("new-access")
+        );
+        assert_eq!(
+            synced
+                .pointer("/claudeAiOauth/refreshToken")
+                .and_then(serde_json::Value::as_str),
+            Some("rotated-refresh-token")
+        );
+        assert_eq!(
+            synced
+                .pointer("/claudeAiOauth/email")
+                .and_then(serde_json::Value::as_str),
+            Some("ritaleewoonyee@gmail.com")
+        );
+        assert_eq!(
+            synced
+                .pointer("/claudeAiOauth/accountUuid")
+                .and_then(serde_json::Value::as_str),
+            Some("uuid-rita")
+        );
     }
 }
