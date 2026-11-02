@@ -371,6 +371,20 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             _ => {}
         }
     }
+    let mut open_calls = std::collections::HashSet::new();
+    history.retain(|(_, item)| match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .is_some_and(|cid| open_calls.insert(cid.to_string())),
+        Some("function_call_output") => item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .is_some_and(|cid| open_calls.remove(cid)),
+        _ => true,
+    });
     if history.len() > WINDOW_MAX_ITEMS {
         let excess = history.len() - WINDOW_STRIDE_ITEMS;
         let block_start = paired_suffix_start(
@@ -1445,5 +1459,35 @@ mod projection_tests {
             );
         }
         validate_responses_input(&load_transcript_input_items(&path)).unwrap();
+    }
+
+    #[test]
+    fn projection_drops_raw_orphan_outputs_without_mutating_transcript() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("orphan.jsonl");
+        for item in [
+            call(0),
+            output(0),
+            output(999),
+            call(1),
+            output(1),
+            json!({"role": "user", "content": "continue"}),
+        ] {
+            append_transcript_message(&path, &item);
+        }
+        let before = std::fs::read(&path).unwrap();
+        let projected = load_transcript_input_items(&path);
+        assert_eq!(
+            projected,
+            vec![
+                call(0),
+                output(0),
+                call(1),
+                output(1),
+                json!({"role": "user", "content": "continue"}),
+            ]
+        );
+        validate_responses_input(&projected).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }
