@@ -56,6 +56,10 @@ the first release will move it under a version heading.
 
 ### Fixed
 
+- Large Sylphx conversations no longer exceed the operating system's argument
+  limit when HTTP requests use the curl fallback. Request bodies stream through
+  stdin with their original bytes and HTTP status preserved.
+
 - **An OpenCode agent's mailbox stalled after its first turn or two.** The
   adapter wrote one prompt per turn and waited for a turn end it could not
   observe, so every later row stayed `received` and a server restart did not
