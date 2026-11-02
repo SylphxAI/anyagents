@@ -23,6 +23,7 @@ mod aci;
 mod auth;
 mod cloud;
 mod memory;
+pub mod sdk;
 
 pub mod sandbox {
     use std::path::PathBuf;
@@ -74,6 +75,7 @@ use aci::*;
 pub use auth::*;
 pub use cloud::*;
 pub use memory::*;
+pub use sdk::*;
 
 use std::collections::VecDeque;
 use std::io::{BufRead, Write};
@@ -90,7 +92,7 @@ use anyagents_harness::{
 use serde_json::{Value, json};
 
 #[derive(Default)]
-struct SharedState {
+pub(crate) struct SharedState {
     in_turn: bool,
     turns_served: u32,
     served_usage: TurnUsage,
@@ -253,17 +255,13 @@ impl Harness for SylphxHarness {
                 if let (Some(env_slug), Some(sess_id)) = (self.cloud_environment(), cloud_sess)
                     && let Some(api_key) = resolve_sylphx_api_key(&self.config_dir, &self.env)
                 {
-                    let api_url = std::env::var("SYLPHX_API_URL")
-                        .ok()
-                        .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
+                    let api_url = resolve_cloud_api_url(&self.env);
                     let sess_path = cloud_session_resource_path(&env_slug, &sess_id);
-                    let steer_url =
-                        format!("{}/v1/{sess_path}:steer", api_url.trim_end_matches('/'));
+                    let steer_url = format!("{api_url}/v1/{sess_path}:steer");
                     let _ = curl_post_json(
                         &steer_url,
                         Some(&api_key),
                         &json!({
-                            "content": marked,
                             "message": {
                                 "parts": [{ "text": marked }]
                             }
@@ -328,7 +326,7 @@ impl Harness for SylphxHarness {
 
         std::thread::spawn(move || {
             let outcome = if let Some(env_slug) = cloud_env {
-                run_cloud_session_turn(
+                match run_cloud_session_turn(
                     &state,
                     &cancel_flag,
                     &config_dir,
@@ -339,7 +337,23 @@ impl Harness for SylphxHarness {
                     &mcp_args,
                     &env_slug,
                     &marked,
-                )
+                ) {
+                    Ok(usage) => Ok(usage),
+                    Err(cloud_err) => {
+                        record_cloud_sandbox_fallback(&config_dir, &cloud_err);
+                        run_native_gateway_turn(
+                            &state,
+                            &cancel_flag,
+                            &config_dir,
+                            &work_dir,
+                            model.as_deref(),
+                            &env,
+                            &mcp_command,
+                            &mcp_args,
+                            &marked,
+                        )
+                    }
+                }
             } else {
                 run_native_gateway_turn(
                     &state,
@@ -535,11 +549,33 @@ fn cloud_session_resource_path(env_slug: &str, sess_id: &str) -> String {
     if trimmed.contains("/agent_sessions/") {
         trimmed.to_string()
     } else {
-        format!(
-            "{}/agent_sessions/{trimmed}",
-            env_slug.trim().trim_matches('/')
-        )
+        let canonical_env = normalize_cloud_env_slug(env_slug);
+        format!("{canonical_env}/agent_sessions/{trimmed}")
     }
+}
+
+/// Returns true only for AnyAgents multi-agent coordination / local takeover tools that
+/// must be bridged to the local AnyAgents daemon via `:submitToolResult`.
+///
+/// Workspace execution (`bash`/`shell`, `read_file`/`write_file`/`edit_file`/`apply_patch`,
+/// `grep`, `glob`, `list_dir`, `code_mode`, `sandbox`) and in-session context tools
+/// (`memory_recall`, `context_budget_read`, `context_edit`, `context_window_open`,
+/// `activate_skill`) are already provided natively by the Cloud Agent Runtime and Sandbox
+/// (`builtin: {id: "shell"}`, `builtin: {id: "files"}`), so they are never duplicated as
+/// client tools.
+fn is_cloud_client_coordination_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "send"
+            | "describe"
+            | "archive"
+            | "agents"
+            | "conversation"
+            | "groups"
+            | "schedule"
+            | "browser"
+            | "goal"
+    )
 }
 
 fn build_cloud_agent_client_tools() -> Vec<Value> {
@@ -547,8 +583,12 @@ fn build_cloud_agent_client_tools() -> Vec<Value> {
         .into_iter()
         .filter_map(|t| {
             let func = t.get("function")?;
+            let name = func.get("name")?.as_str()?;
+            if !is_cloud_client_coordination_tool(name) {
+                return None;
+            }
             Some(json!({
-                "name": func.get("name")?,
+                "name": name,
                 "description": func.get("description").cloned().unwrap_or(Value::String(String::new())),
                 "input_schema": func.get("parameters").cloned().unwrap_or_else(|| json!({"type": "object", "properties": {}})),
                 "client": {},
@@ -557,12 +597,110 @@ fn build_cloud_agent_client_tools() -> Vec<Value> {
         .collect()
 }
 
+fn build_cloud_agent_tools() -> Vec<Value> {
+    let mut tools = vec![
+        json!({
+            "name": "shell",
+            "builtin": { "id": "shell" }
+        }),
+        json!({
+            "name": "files",
+            "builtin": { "id": "files" }
+        }),
+    ];
+    tools.extend(build_cloud_agent_client_tools());
+    tools
+}
+
 /// Runs a turn against the remote Sylphx Cloud Agents BaaS (`/v1/{env}/agent_sessions`),
-/// passing a declarative `EnvironmentSpec` (`shape: "linux-xs"`, `template: "template:agent"`,
-/// `repo: { uri, revision }`) and executing client tool calls (`send`, `agents`, `conversation`,
-/// `groups`, `schedule`, `browser`, `describe`, `archive`) via `:submitToolResult`.
+/// passing a declarative `EnvironmentSpec` (`shape: "linux-s"`, `template: "template:agent"`,
+/// `repo: { uri, revision }`), native cloud `builtin` tools (`shell`, `files`), and bridging
+/// only AnyAgents coordination client tool calls (`send`, `agents`, `conversation`, `groups`,
+/// `schedule`, `browser`, `describe`, `archive`, `goal`) via `:submitToolResult`.
 #[allow(clippy::too_many_arguments)]
-fn run_cloud_session_turn(
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct PersistedCloudSession {
+    pub agent_id: String,
+    pub session_id: String,
+    pub model_id: String,
+    pub env_slug: String,
+    #[serde(default)]
+    pub last_seq: i64,
+}
+
+pub fn load_persisted_cloud_session(config_dir: &Path) -> Option<PersistedCloudSession> {
+    let raw = std::fs::read_to_string(config_dir.join("sylphx-cloud-session.json")).ok()?;
+    let parsed: PersistedCloudSession = serde_json::from_str(&raw).ok()?;
+    if parsed.agent_id.trim().is_empty() || parsed.session_id.trim().is_empty() {
+        return None;
+    }
+    Some(parsed)
+}
+
+pub fn save_persisted_cloud_session(config_dir: &Path, session: &PersistedCloudSession) {
+    if let Ok(raw) = serde_json::to_string_pretty(session) {
+        let _ = std::fs::write(config_dir.join("sylphx-cloud-session.json"), raw);
+    }
+}
+
+pub fn clear_persisted_cloud_session(config_dir: &Path) {
+    let _ = std::fs::remove_file(config_dir.join("sylphx-cloud-session.json"));
+}
+
+/// Builds a bounded continuity digest from `sylphx-transcript.jsonl` when opening a new
+/// Cloud `AgentSession` after prior local turns or after a model switch so the new Cloud
+/// session starts with the agent's recent conversation and tool history.
+pub fn build_prior_transcript_continuity_block(transcript_path: &Path) -> Option<String> {
+    let items = load_transcript_input_items(transcript_path);
+    if items.is_empty() {
+        return None;
+    }
+    let tail_start = items.len().saturating_sub(16);
+    let mut lines = Vec::new();
+    for item in &items[tail_start..] {
+        if let Some(role) = item.get("role").and_then(Value::as_str) {
+            let text = if let Some(s) = item.get("content").and_then(Value::as_str) {
+                s.to_string()
+            } else if let Some(arr) = item.get("content").and_then(Value::as_array) {
+                arr.iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                String::new()
+            };
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let bounded = truncate_tool_output_middle_utf8(trimmed.to_string(), 800, 350, 350);
+                lines.push(format!("[{role}]: {bounded}"));
+            }
+        } else if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let args = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let bounded = truncate_tool_output_middle_utf8(args.to_string(), 300, 140, 140);
+            lines.push(format!("[tool_call:{name}]: {bounded}"));
+        }
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "<prior_session_continuity>\n\
+         The following turns occurred earlier in this agent's durable session (also searchable via `memory_recall`):\n\
+         {}\n\
+         </prior_session_continuity>",
+        lines.join("\n")
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_cloud_session_turn(
     state: &Arc<Mutex<SharedState>>,
     cancel_flag: &Arc<AtomicBool>,
     config_dir: &Path,
@@ -574,42 +712,124 @@ fn run_cloud_session_turn(
     env_slug: &str,
     user_message: &str,
 ) -> Result<TurnUsage, String> {
-    let api_key = resolve_sylphx_api_key(config_dir, env).ok_or_else(|| {
+    let api_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
     })?;
-    let api_url = std::env::var("SYLPHX_API_URL")
-        .ok()
-        .unwrap_or_else(|| DEFAULT_SYLPHX_API_URL.to_string());
-    let base = api_url.trim_end_matches('/');
+    let base = resolve_cloud_api_url(env);
+    let canonical_env = normalize_cloud_env_slug(env_slug);
+    let (model_id, _) = parse_sylphx_model_and_effort(model);
+    let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
     let (mut agent_id, mut session_id) = {
         let g = state.lock().unwrap_or_else(PoisonError::into_inner);
         (g.cloud_agent_id.clone(), g.cloud_session_id.clone())
     };
+    let mut initial_last_seq: i64 = 0;
 
-    let (model_id, _) = parse_sylphx_model_and_effort(model);
-    let system_prompt = assemble_system_prompt(config_dir, work_dir);
+    if let Some(persisted) = load_persisted_cloud_session(config_dir) {
+        if persisted.model_id == model_id && persisted.env_slug == canonical_env {
+            if agent_id.is_none() {
+                agent_id = Some(persisted.agent_id.clone());
+            }
+            if session_id.is_none() {
+                session_id = Some(persisted.session_id.clone());
+            }
+            initial_last_seq = persisted.last_seq;
+        } else {
+            // Model or environment changed: interrupt the old cloud session and open a fresh one for the new model.
+            let old_sess_path =
+                cloud_session_resource_path(&persisted.env_slug, &persisted.session_id);
+            let old_interrupt_url = format!("{base}/v1/{old_sess_path}:interrupt");
+            let _ = curl_post_json(&old_interrupt_url, Some(&api_key), &json!({}));
+            clear_persisted_cloud_session(config_dir);
+            agent_id = None;
+            session_id = None;
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.cloud_agent_id = None;
+            g.cloud_session_id = None;
+        }
+    }
+
+    // If we are re-using an existing Cloud Session, verify it is still healthy and settle any interrupted in-flight turn.
+    if let Some(ref sid) = session_id.clone() {
+        let sess_path = cloud_session_resource_path(&canonical_env, sid);
+        let sess_url = format!("{base}/v1/{sess_path}");
+        match curl_get(&sess_url, Some(&api_key)) {
+            Ok((200..=299, raw_poll)) => {
+                if let Ok(val) = serde_json::from_str::<Value>(&raw_poll) {
+                    let status = val
+                        .get("state")
+                        .or_else(|| val.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    if status == "failed"
+                        || status == "session_state_failed"
+                        || status == "terminated"
+                        || status == "errored"
+                    {
+                        clear_persisted_cloud_session(config_dir);
+                        session_id = None;
+                        initial_last_seq = 0;
+                    } else if status.contains("running")
+                        || status.contains("working")
+                        || status.contains("waiting")
+                    {
+                        let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
+                        let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                    }
+                }
+            }
+            Ok((404, _)) => {
+                clear_persisted_cloud_session(config_dir);
+                agent_id = None;
+                session_id = None;
+                initial_last_seq = 0;
+            }
+            _ => {}
+        }
+    }
+
+    let light_model = env
+        .iter()
+        .find(|(k, v)| k == "SYLPHX_LIGHT_MODEL" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_string())
+        .or_else(|| {
+            std::env::var("SYLPHX_LIGHT_MODEL")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_else(|| "google/gemini-3-flash".to_string());
+    let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
+    if session_id.is_none()
+        && let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path)
+    {
+        system_prompt.push_str("\n\n");
+        system_prompt.push_str(&prior_block);
+    }
     let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
 
     if agent_id.is_none() {
-        let create_agent_url = format!("{base}/v1/{env_slug}/agents");
+        let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
         let agent_short_name = config_dir
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|s| s.to_str())
             .unwrap_or("anyagents-sylphx");
         let spec_body = json!({
+            "meta": {
+                "display_name": agent_short_name,
+            },
             "spec": {
-                "model": model_id,
+                "models": {
+                    "primary": model_id,
+                    "light": light_model,
+                },
                 "instructions": system_prompt,
                 "environment": environment_spec,
-                "tools": build_cloud_agent_client_tools(),
+                "tools": build_cloud_agent_tools(),
             },
-            "name": agent_short_name,
-            "model": model_id,
-            "system_prompt": system_prompt,
-            "environment": environment_spec,
-            "tools": build_tool_definitions(),
         });
         let (st, raw) = curl_post_json(&create_agent_url, Some(&api_key), &spec_body)?;
         if !(200..300).contains(&st) {
@@ -631,11 +851,10 @@ fn run_cloud_session_turn(
     }
 
     if session_id.is_none() {
-        let create_sess_url = format!("{base}/v1/{env_slug}/agent_sessions");
+        let create_sess_url = format!("{base}/v1/{canonical_env}/agent_sessions");
         let agent_ref = agent_id.as_deref().unwrap_or_default();
         let body = json!({
             "agent": agent_ref,
-            "agent_id": agent_ref,
             "title": "AnyAgents Session",
             "environment": environment_spec,
         });
@@ -652,17 +871,29 @@ fn run_cloud_session_turn(
             .ok_or_else(|| "cloud create_session missing name/id".to_string())?
             .to_string();
         session_id = Some(sid.clone());
+        initial_last_seq = 0;
         let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
         g.cloud_session_id = Some(sid.clone());
         g.session_id = Some(sid.clone());
         let _ = std::fs::write(config_dir.join("sylphx-session-id"), format!("{sid}\n"));
     }
 
+    let aid = agent_id.unwrap_or_default();
     let sid = session_id.unwrap_or_default();
-    let sess_path = cloud_session_resource_path(env_slug, &sid);
+    save_persisted_cloud_session(
+        config_dir,
+        &PersistedCloudSession {
+            agent_id: aid.clone(),
+            session_id: sid.clone(),
+            model_id: model_id.clone(),
+            env_slug: canonical_env.clone(),
+            last_seq: initial_last_seq,
+        },
+    );
+
+    let sess_path = cloud_session_resource_path(&canonical_env, &sid);
     let send_url = format!("{base}/v1/{sess_path}:send");
     let send_body = json!({
-        "content": user_message,
         "message": {
             "parts": [{ "text": user_message }]
         }
@@ -671,15 +902,35 @@ fn run_cloud_session_turn(
     if !(200..300).contains(&st) {
         return Err(format!("cloud session send HTTP {st}: {}", raw.trim()));
     }
+    append_transcript_message(
+        &transcript_path,
+        &json!({
+            "role": "user",
+            "content": user_message,
+        }),
+    );
 
     let sess_url = format!("{base}/v1/{sess_path}");
     let events_url = format!("{base}/v1/{sess_path}/session_events");
     let submit_tool_url = format!("{base}/v1/{sess_path}:submitToolResult");
+    let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
     let mut handled_call_ids = std::collections::HashSet::new();
-    let mut last_seq: i64 = 0;
+    let mut last_seq: i64 = initial_last_seq;
+    let baseline_seq: i64 = initial_last_seq;
     let mut sent_any_reply = false;
     let mut self_archived = false;
     let mut assistant_texts: Vec<String> = Vec::new();
+    let stall_timeout_ms = env
+        .iter()
+        .find(|(k, v)| k == "SYLPHX_CLOUD_SESSION_STALL_MS" && !v.trim().is_empty())
+        .and_then(|(_, v)| v.trim().parse::<u64>().ok())
+        .or_else(|| {
+            std::env::var("SYLPHX_CLOUD_SESSION_STALL_MS")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(20_000);
+    let mut last_progress = Instant::now();
 
     while !cancel_flag.load(Ordering::SeqCst) {
         std::thread::sleep(Duration::from_millis(250));
@@ -711,6 +962,9 @@ fn run_cloud_session_turn(
                 }
                 if seq > last_seq {
                     last_seq = seq;
+                    if seq > baseline_seq + 2 {
+                        last_progress = Instant::now();
+                    }
                 }
 
                 let ev_type = ev
@@ -720,6 +974,7 @@ fn run_cloud_session_turn(
                     .to_ascii_uppercase();
 
                 if let Some(tc) = ev.get("tool_call").or_else(|| ev.get("toolCall")) {
+                    last_progress = Instant::now();
                     let call_id = tc
                         .get("id")
                         .or_else(|| tc.get("call_id"))
@@ -761,6 +1016,15 @@ fn run_cloud_session_turn(
                         {
                             self_archived = true;
                         }
+                        append_transcript_message(
+                            &transcript_path,
+                            &json!({
+                                "type": "function_call",
+                                "call_id": call_id,
+                                "name": tool_name,
+                                "arguments": serde_json::to_string(&parsed_args).unwrap_or_else(|_| "{}".to_string()),
+                            }),
+                        );
                         let output = execute_sylphx_tool(
                             tool_name,
                             &parsed_args,
@@ -769,6 +1033,14 @@ fn run_cloud_session_turn(
                             env,
                             mcp_command,
                             mcp_args,
+                        );
+                        append_transcript_message(
+                            &transcript_path,
+                            &json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": output,
+                            }),
                         );
                         let is_err = output.starts_with("error:");
                         let _ = curl_post_json(
@@ -780,8 +1052,10 @@ fn run_cloud_session_turn(
                                 "error": is_err,
                             }),
                         );
+                        last_progress = Instant::now();
                     }
                 } else if ev_type.contains("AGENT_MESSAGE") || ev_type.contains("RESPONSE") {
+                    last_progress = Instant::now();
                     if let Some(parts) = ev.pointer("/message/parts").and_then(Value::as_array) {
                         for p in parts {
                             if let Some(t) = p
@@ -821,7 +1095,27 @@ fn run_cloud_session_turn(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if status == "idle" || status == "session_state_idle" || status == "completed" {
+                save_persisted_cloud_session(
+                    config_dir,
+                    &PersistedCloudSession {
+                        agent_id: aid.clone(),
+                        session_id: sid.clone(),
+                        model_id: model_id.clone(),
+                        env_slug: canonical_env.clone(),
+                        last_seq,
+                    },
+                );
                 let content_text = assistant_texts.join("\n\n");
+                if !content_text.trim().is_empty() {
+                    append_transcript_message(
+                        &transcript_path,
+                        &json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": content_text.trim() }],
+                        }),
+                    );
+                }
                 if !sent_any_reply
                     && !content_text.trim().is_empty()
                     && let Some(reply_to) = extract_envelope_sender(user_message)
@@ -871,10 +1165,35 @@ fn run_cloud_session_turn(
                 || status == "terminated"
                 || status == "errored"
             {
+                clear_persisted_cloud_session(config_dir);
                 return Err(format!("cloud session ended with status `{status}`"));
+            }
+            if last_seq <= baseline_seq + 2
+                && assistant_texts.is_empty()
+                && handled_call_ids.is_empty()
+                && last_progress.elapsed() >= Duration::from_millis(stall_timeout_ms)
+            {
+                let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                return Err(format!(
+                    "cloud session `{sess_path}` stalled in `{status}` for {}ms without progress",
+                    stall_timeout_ms
+                ));
             }
         }
     }
+    if cancel_flag.load(Ordering::SeqCst) {
+        let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+    }
+    save_persisted_cloud_session(
+        config_dir,
+        &PersistedCloudSession {
+            agent_id: aid,
+            session_id: sid,
+            model_id,
+            env_slug: canonical_env,
+            last_seq,
+        },
+    );
     Ok(TurnUsage::default())
 }
 
@@ -885,7 +1204,7 @@ fn run_cloud_session_turn(
 /// `write_file`, `edit_file`) directly, and draining `steer_queue` between every
 /// step so mid-turn steering takes effect immediately on the next step.
 #[allow(clippy::too_many_arguments)]
-fn run_native_gateway_turn(
+pub(crate) fn run_native_gateway_turn(
     state: &Arc<Mutex<SharedState>>,
     cancel_flag: &Arc<AtomicBool>,
     config_dir: &Path,
@@ -916,12 +1235,18 @@ fn run_native_gateway_turn(
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
     let mut input_items = load_transcript_input_items(&transcript_path);
-    let user_msg = json!({
-        "role": "user",
-        "content": initial_user_message,
+    let already_appended_by_cloud = input_items.last().is_some_and(|last| {
+        last.get("role").and_then(Value::as_str) == Some("user")
+            && last.get("content").and_then(Value::as_str) == Some(initial_user_message)
     });
-    append_transcript_message(&transcript_path, &user_msg);
-    input_items.push(user_msg);
+    if !already_appended_by_cloud {
+        let user_msg = json!({
+            "role": "user",
+            "content": initial_user_message,
+        });
+        append_transcript_message(&transcript_path, &user_msg);
+        input_items.push(user_msg);
+    }
 
     let tools = build_responses_tool_definitions();
     let session_cache_key = state
@@ -1417,7 +1742,7 @@ pub fn run_stdio_adapter(
                 .find(|(k, v)| k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty())
                 .map(|(_, v)| v.trim().to_string());
             let outcome = if let Some(env_slug) = cloud_env {
-                run_cloud_session_turn(
+                match run_cloud_session_turn(
                     &state_cl,
                     &cancel_cl,
                     &cfg_cl,
@@ -1428,7 +1753,23 @@ pub fn run_stdio_adapter(
                     &mcp_args_cl,
                     &env_slug,
                     &user_text,
-                )
+                ) {
+                    Ok(usage) => Ok(usage),
+                    Err(cloud_err) => {
+                        record_cloud_sandbox_fallback(&cfg_cl, &cloud_err);
+                        run_native_gateway_turn(
+                            &state_cl,
+                            &cancel_cl,
+                            &cfg_cl,
+                            &work_cl,
+                            model_cl.as_deref(),
+                            &env_cl,
+                            &mcp_cmd_cl,
+                            &mcp_args_cl,
+                            &user_text,
+                        )
+                    }
+                }
             } else {
                 run_native_gateway_turn(
                     &state_cl,
@@ -1757,18 +2098,18 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "send",
-                "description": "Send a message, media attachment, location, poll, checklist, or article, or perform an interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`) to one or more agents, groups, or channels.",
+                "description": "Send message or perform interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`) to agent(s), group(s), or channel(s).",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "to": {
-                            "description": "Recipient(s): a string or array of strings (`\"parent\"` or `[\"parent\"]`, `agent:<name>`, bare name, `children`, `group:<name>`, or `telegram:chat:<id>[:<topic>]`)."
+                            "description": "Recipient(s): string or array (`\"parent\"`, `agent:<name>`, bare name, `children`, `group:<name>`, `telegram:chat:<id>[:<topic>]`)."
                         },
-                        "text": { "type": "string", "description": "Message text or caption." },
-                        "reply_to": { "type": "string", "description": "Optional reply reference (`anyagents:reply:msg_...`)." },
-                        "action": { "type": "string", "description": "Optional interaction action (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`)." },
-                        "target": { "type": "string", "description": "Target message for interaction actions." },
-                        "emoji": { "type": "string", "description": "Emoji for `react`." }
+                        "text": { "type": "string", "description": "Message text." },
+                        "reply_to": { "type": "string", "description": "Reply reference (`anyagents:reply:msg_...`)." },
+                        "action": { "type": "string", "description": "Interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`)." },
+                        "target": { "type": "string" },
+                        "emoji": { "type": "string" }
                     }
                 }
             }
@@ -1777,14 +2118,14 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "describe",
-                "description": "Read or update an agent's role & responsibility description (`agent`: `\"self\"` | `\"all\"` | `\"<agent>\"`, optional `description`, `role`, `clear`).",
+                "description": "Read or update agent role/description (`agent`: `\"self\"` | `\"all\"` | `<name>`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "agent": { "type": "string", "description": "Target agent (`\"self\"`, `\"all\"`, or agent name). Defaults to `\"self\"`." },
-                        "description": { "type": "string", "description": "Updated role/responsibility description." },
-                        "role": { "type": "string", "description": "Optional short role label." },
-                        "clear": { "type": "boolean", "description": "Clear existing description." }
+                        "agent": { "type": "string" },
+                        "description": { "type": "string" },
+                        "role": { "type": "string" },
+                        "clear": { "type": "boolean" }
                     }
                 }
             }
@@ -1793,11 +2134,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "archive",
-                "description": "Archive an agent or sub-agent (`agent`: `\"self\"` or `<agent-name>`) to scale its process to zero while preserving its permanent `agt_...` ID and session.",
+                "description": "Scale agent process to zero while preserving its permanent `agt_...` ID and session.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "agent": { "type": "string", "description": "Target agent (`\"self\"` or sub-agent name). Defaults to `\"self\"`." }
+                        "agent": { "type": "string", "description": "`\"self\"` (default) or sub-agent name." }
                     }
                 }
             }
@@ -1806,26 +2147,26 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "agents",
-                "description": "List, inspect, spawn, configure, wake, archive, pause, or delete agents and sub-agents (`list`, `inspect`, `get`, `spawn`, `create`, `describe`, `steer`, `wake`, `archive`, `pause`, `delete`, `rename`, `role`, `harness`, `models`).",
+                "description": "Manage agents/sub-agents (`list`, `inspect`, `get`, `spawn`, `create`, `describe`, `steer`, `wake`, `archive`, `pause`, `delete`, `rename`, `role`, `harness`, `models`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "description": "`list`, `inspect`, `get`, `spawn`, `create`, `describe`, `steer`, `wake`, `archive`, `pause`, `delete`, `rename`, `role`, `harness`, or `models`." },
-                        "name": { "type": "string", "description": "Target agent or sub-agent name." },
-                        "agent": { "type": "string", "description": "Alias for `name`." },
-                        "parent": { "type": "string", "description": "Parent filter (`self`, `subagents`, `root`, or agent name)." },
-                        "state": { "type": "string", "description": "State filter (`running`, `working`, `paused`, `archived`, `all`)." },
-                        "role": { "type": "string", "description": "Short 2-5 word role title when spawning." },
-                        "harness": { "type": "string", "description": "Harness (`sylphx`, `codex`, `claude-code`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, or `inherit`)." },
-                        "model": { "type": "string", "description": "Model ID." },
-                        "profile": { "type": "string", "description": "Provider profile (`<provider>/<profile>`)." },
-                        "repo": { "type": "string", "description": "Repository (`<org>/<repo>`, local path, or `inherit`)." },
+                        "action": { "type": "string" },
+                        "name": { "type": "string" },
+                        "agent": { "type": "string" },
+                        "parent": { "type": "string" },
+                        "state": { "type": "string" },
+                        "role": { "type": "string" },
+                        "harness": { "type": "string" },
+                        "model": { "type": "string" },
+                        "profile": { "type": "string" },
+                        "repo": { "type": "string" },
                         "branch": { "type": "string" },
                         "base": { "type": "string" },
                         "workdir": { "type": "string" },
-                        "description": { "type": "string", "description": "Role/responsibility description or standing instructions." },
+                        "description": { "type": "string" },
                         "instructions": { "type": "string" },
-                        "prompt": { "type": "string", "description": "Initial task prompt delivered to the spawned or woken agent." }
+                        "prompt": { "type": "string" }
                     }
                 }
             }
@@ -1834,14 +2175,14 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "conversation",
-                "description": "Read or search (`query`) two-way (`in` + `out`) conversation history across agents, channels, groups, and peers.",
+                "description": "Read or search (`query`) two-way (`in`+`out`) conversation history across agents, groups, and channels.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "agent": { "type": "string", "description": "Agent name (`self`, `all`, or peer name)." },
-                        "query": { "type": "string", "description": "Optional Hybrid RAG search query." },
-                        "with": { "type": "string", "description": "Optional peer filter." },
-                        "limit": { "type": "integer", "description": "Max turns to return." }
+                        "agent": { "type": "string" },
+                        "query": { "type": "string" },
+                        "with": { "type": "string" },
+                        "limit": { "type": "integer" }
                     }
                 }
             }
@@ -1850,7 +2191,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "groups",
-                "description": "List, create, delete, or manage agent groups (`list`, `create`, `delete`, `add_member`, `remove_member`).",
+                "description": "Manage agent groups (`list`, `create`, `delete`, `add_member`, `remove_member`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1866,11 +2207,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "schedule",
-                "description": "List, create, pause, resume, or cancel durable timers, recurring intervals, cron schedules, and event-driven watches (`list`, `create`, `pause`, `resume`, `cancel`).",
+                "description": "Manage durable timers, intervals, cron jobs, and watches (`list`, `create`, `pause`, `resume`, `cancel`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "description": "`list`, `create`, `pause`, `resume`, or `cancel`." },
+                        "action": { "type": "string" },
                         "id": { "type": "string" },
                         "kind": { "type": "string", "description": "`after`, `every`, `cron`, or `watch`." },
                         "seconds": { "type": "integer" },
@@ -1886,7 +2227,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "browser",
-                "description": "Drive a headless Chromium browser (`goto`, `snapshot`, `click`, `fill`, `type`, `press`, `eval`, `text`, `html`, `pdf`, `screenshot`, `tabs`, `close`).",
+                "description": "Drive Chromium (`goto`, `snapshot`, `click`, `fill`, `type`, `press`, `eval`, `text`, `html`, `pdf`, `screenshot`, `tabs`, `takeover`, `release_takeover`, `close`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1905,17 +2246,17 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "sandbox",
-                "description": "Manage or execute inside this agent's isolated Cloud Kata microVM Sandbox pod (`https://api.sylphx.com/v1/{parent}/leases`, `template:agent`, worktree at `/home/user/workspace`). Actions: `status`, `ensure`, `exec`, `read_file`, `write_file`, `release`. When `ensure` is called (or when `SYLPHX_SANDBOX=cloud`), the agent's Git repository and branch are automatically cloned and checked out inside `/home/user/workspace` with `GH_TOKEN` (injected ephemerally in memory, never written to disk) and Git author (`Kyle Tse <hi@kylet.se>`) configured, and `bash`, `read_file`, `write_file`, `edit_file`, `apply_patch`, `grep`, `glob`, and `list_dir` run inside the cloud sandbox.",
+                "description": "Manage Cloud Kata microVM Sandbox (`status`, `ensure`, `exec`, `read_file`, `write_file`, `release`, `template:agent`, `/home/user/workspace`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "description": "`status`, `ensure`, `exec`, `read_file`, `write_file`, or `release`." },
-                        "repo": { "type": "string", "description": "Optional GitHub repository (`<org>/<repo>` or HTTPS URL) to clone into `/home/user/workspace` when `action` is `ensure`." },
-                        "branch": { "type": "string", "description": "Optional Git branch to checkout or create inside `/home/user/workspace` when `action` is `ensure`." },
-                        "base": { "type": "string", "description": "Optional starting Git ref/SHA when creating `branch`." },
-                        "command": { "type": "string", "description": "Shell command for `exec`." },
-                        "path": { "type": "string", "description": "File path inside the sandbox for `read_file` or `write_file` (relative paths resolve against `/home/user/workspace`)." },
-                        "content": { "type": "string", "description": "File content for `write_file`." }
+                        "action": { "type": "string" },
+                        "repo": { "type": "string" },
+                        "branch": { "type": "string" },
+                        "base": { "type": "string" },
+                        "command": { "type": "string" },
+                        "path": { "type": "string" },
+                        "content": { "type": "string" }
                     },
                     "required": ["action"]
                 }
@@ -1925,12 +2266,12 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "code_mode",
-                "description": "Programmatic Tool Calling (PTC / Code Mode, `arXiv:2605.18747`): execute a multi-step Python script with a pre-injected zero-import SDK (`read(path, start_line=None, end_line=None)`, `write(path, content)`, `edit(path, target, replacement, replace_all=False)`, `files(pattern='**/*', path='.')`, `grep(pattern, path='.', glob=None)`, `sh(cmd, timeout=120)`, `mcp(tool_name, **kwargs)`, `agents(**kwargs)`, `send(target, message)`, `conversation(**kwargs)`, `schedule(**kwargs)`, `recall(query=None, limit=10)`). Intermediate data stays in script RAM; only `print(...)` output enters the LLM context window.",
+                "description": "Programmatic Tool Calling (Python SDK: `read`, `write`, `edit`, `files`, `grep`, `sh`, `mcp`, `agents`, `send`, `conversation`, `schedule`, `recall`). Only `print(...)` enters context.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "code": { "type": "string", "description": "Python code using pre-injected SDK functions (`read`, `write`, `edit`, `files`, `grep`, `sh`, `mcp`, `agents`, `send`, `conversation`, `schedule`, `recall`). Use `print(...)` to return concise results." },
-                        "timeout_ms": { "type": "integer", "description": "Optional timeout in ms (default 120000)." }
+                        "code": { "type": "string" },
+                        "timeout_ms": { "type": "integer" }
                     },
                     "required": ["code"]
                 }
@@ -1940,12 +2281,12 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "bash",
-                "description": "Execute a bash command in the agent's working directory (or inside the isolated Cloud Kata microVM Sandbox pod when a cloud sandbox lease is active).",
+                "description": "Execute bash command in workspace (Cloud Sandbox when active, automatic local fallback).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "command": { "type": "string", "description": "Shell command to run." },
-                        "timeout_ms": { "type": "integer", "description": "Optional timeout in ms (default 120000)." }
+                        "command": { "type": "string" },
+                        "timeout_ms": { "type": "integer" }
                     },
                     "required": ["command"]
                 }
@@ -1955,11 +2296,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "read_file",
-                "description": "Read a UTF-8 file from the workspace with 1-based line numbers (`[file: <path> (lines S..E of N)]`).",
+                "description": "Read UTF-8 file with 1-based line numbers (`[file: <path> (lines S..E of N)]`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Relative or absolute file path." },
+                        "path": { "type": "string" },
                         "start_line": { "type": "integer" },
                         "end_line": { "type": "integer" }
                     },
@@ -1971,7 +2312,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "write_file",
-                "description": "Write contents to a file in the workspace (creating parent directories if needed).",
+                "description": "Write file in workspace (creates parent dirs).",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1986,17 +2327,16 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "edit_file",
-                "description": "Edit a file by replacing `target` with `replacement` (or applying multiple `edits: [{target, replacement}, ...]`), with automatic whitespace/indentation tolerance.",
+                "description": "Replace `target` with `replacement` (or batch `edits: [{target, replacement}]`) in `path` with whitespace-tolerant matching.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "path": { "type": "string" },
-                        "target": { "type": "string", "description": "Target block to replace." },
-                        "replacement": { "type": "string", "description": "Replacement text." },
-                        "replace_all": { "type": "boolean", "description": "Replace every occurrence if target appears multiple times (default false)." },
+                        "target": { "type": "string" },
+                        "replacement": { "type": "string" },
+                        "replace_all": { "type": "boolean" },
                         "edits": {
                             "type": "array",
-                            "description": "Optional list of `{target, replacement}` edits to apply sequentially in one atomic write.",
                             "items": {
                                 "type": "object",
                                 "properties": {
@@ -2015,11 +2355,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "apply_patch",
-                "description": "Apply a patch to the workspace. Supports both OpenAI V4A patches (`*** Begin Patch` / `*** Update File:` / `*** Add File:` / `*** Delete File:`) and unified diffs (`--- a/... +++ b/...`).",
+                "description": "Apply OpenAI V4A (`*** Begin Patch`) or unified diff (`--- a/... +++ b/...`) patch.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "patch": { "type": "string", "description": "V4A (`*** Begin Patch`) or unified diff (`--- a/... +++ b/...`) patch text." }
+                        "patch": { "type": "string" }
                     },
                     "required": ["patch"]
                 }
@@ -2029,13 +2369,13 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "grep",
-                "description": "Fast regex or literal search across the workspace (`rg` / ripgrep).",
+                "description": "Regex/literal ripgrep search across workspace.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Regex or literal pattern to search for." },
-                        "path": { "type": "string", "description": "Optional directory or file path (defaults to `.`)." },
-                        "glob": { "type": "string", "description": "Optional file glob filter (e.g. `*.rs`)." }
+                        "pattern": { "type": "string" },
+                        "path": { "type": "string" },
+                        "glob": { "type": "string" }
                     },
                     "required": ["pattern"]
                 }
@@ -2045,12 +2385,12 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "glob",
-                "description": "Find files matching a glob pattern in the workspace.",
+                "description": "Find files matching glob pattern.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "pattern": { "type": "string", "description": "Glob pattern (e.g. `**/*.rs`)." },
-                        "path": { "type": "string", "description": "Optional base directory." }
+                        "pattern": { "type": "string" },
+                        "path": { "type": "string" }
                     },
                     "required": ["pattern"]
                 }
@@ -2060,11 +2400,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "list_dir",
-                "description": "List entries in a workspace directory.",
+                "description": "List directory entries.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "path": { "type": "string", "description": "Directory path (defaults to `.`)." }
+                        "path": { "type": "string" }
                     }
                 }
             }
@@ -2073,12 +2413,12 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "activate_skill",
-                "description": "Load the full `SKILL.md` instructions (and list or read `references/*.md`) for a named skill from `.agents/skills`.",
+                "description": "Load `SKILL.md` (or `references/<reference>`) for a skill.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "name": { "type": "string", "description": "Skill name (e.g. `deliver-and-verify`, `self-challenge`, `prove-it`, `clear-writing`, `author-item`, `unblock`, `swarm-fuse`, `refactor`)." },
-                        "reference": { "type": "string", "description": "Optional reference filename inside `references/` (e.g. `architecture.md`)." }
+                        "name": { "type": "string" },
+                        "reference": { "type": "string" }
                     },
                     "required": ["name"]
                 }
@@ -2088,14 +2428,14 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "goal",
-                "description": "Manage the session's durable Goal (`create`, `update`, `complete`, `pause`, `cancel`, `status`). While a Goal is `active`, the harness automatically continues turns until the Goal's acceptance criteria are verified and `complete` is called.",
+                "description": "Manage session Goal (`create`, `update`, `complete`, `pause`, `cancel`, `status`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string", "description": "`create`, `update`, `complete`, `pause`, `cancel`, or `status`." },
-                        "title": { "type": "string", "description": "Goal title." },
-                        "acceptance_criteria": { "type": "array", "items": { "type": "string" }, "description": "Observable acceptance test cases." },
-                        "progress": { "type": "string", "description": "Progress notes or verification evidence." }
+                        "action": { "type": "string" },
+                        "title": { "type": "string" },
+                        "acceptance_criteria": { "type": "array", "items": { "type": "string" } },
+                        "progress": { "type": "string" }
                     },
                     "required": ["action"]
                 }
@@ -2105,21 +2445,21 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_recall",
-                "description": "Zero-Embedding Lossless `Raw-RAG` lexical + structured recall over the full append-only session transcript (including all turns prior to any `context_window_open` compaction boundary). Supports single/multi-query BM25 (`query`, `queries`), negative terms (`exclude`), tool history toggles (`include_tools`, `only_tools`, `tool_name`), `role` filter, ordering (`sort`: `\"relevance\"` | `\"newest\"` | `\"oldest\"`), exact range coordinates (`range`: `transcript:<from>-<to>`), and contiguous episode window expansion (`radius`).",
+                "description": "Lossless Raw-RAG BM25 + range recall (`transcript:<from>-<to>`) across full append-only transcript (including pre-compaction turns).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "query": { "type": "string", "description": "Primary search query (supports English, code identifiers, and CJK / Cantonese terms)." },
-                        "queries": { "type": "array", "items": { "type": "string" }, "description": "Optional additional search queries / synonyms OR-combined with `query`." },
-                        "exclude": { "type": "array", "items": { "type": "string" }, "description": "Optional negative substrings — items containing any of these terms are excluded." },
-                        "include_tools": { "type": "boolean", "description": "Whether to include tool call/output history (`true` by default). Set `false` to search only user/assistant messages." },
-                        "only_tools": { "type": "boolean", "description": "When `true`, searches ONLY tool call and tool output items." },
-                        "tool_name": { "type": "string", "description": "Optional tool name filter (e.g. `\"bash\"`, `\"edit_file\"`, `\"send\"`). Matches both the tool call and its output." },
-                        "role": { "type": "string", "description": "Optional role filter (`\"user\"`, `\"assistant\"`, `\"tool\"`)." },
-                        "sort": { "type": "string", "enum": ["relevance", "newest", "oldest"], "description": "Result ordering (`\"relevance\"` default, `\"newest\"`, or `\"oldest\"`)." },
-                        "range": { "type": "string", "description": "Exact item range coordinate (`transcript:<from>-<to>` or `<from>-<to>`) returned by a previous `memory_recall` hit." },
-                        "limit": { "type": "integer", "description": "Maximum episode windows or filtered items to return (default 5, max 50)." },
-                        "radius": { "type": "integer", "description": "Contiguous neighbor items to include around each matched window to preserve intact `(Event -> Action -> Receipt)` causal chains (default 2, max 10)." }
+                        "query": { "type": "string" },
+                        "queries": { "type": "array", "items": { "type": "string" } },
+                        "exclude": { "type": "array", "items": { "type": "string" } },
+                        "include_tools": { "type": "boolean" },
+                        "only_tools": { "type": "boolean" },
+                        "tool_name": { "type": "string" },
+                        "role": { "type": "string" },
+                        "sort": { "type": "string", "enum": ["relevance", "newest", "oldest"] },
+                        "range": { "type": "string" },
+                        "limit": { "type": "integer" },
+                        "radius": { "type": "integer" }
                     }
                 }
             }
@@ -2128,7 +2468,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "context_budget_read",
-                "description": "Read the active context window's token budget, item count, total persisted raw transcript count, and whether a handoff (`context_window_open`) is due.",
+                "description": "Read active context window token budget and item counts.",
                 "parameters": {
                     "type": "object",
                     "properties": {}
@@ -2139,33 +2479,20 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "context_edit",
-                "description": "Surgically inspect, prune, or compress the active context window without writing a full summary (`Context Language Models`, `arXiv:2609.37725`). Call with `action: \"inspect\"` to see active item indices and top token hogs; pass `drop: [\"4-12\", \"19\"]` (or `keep_only: [\"0-3\", \"20-35\"]`) to drop obsolete turns while automatically preserving tool `call_id` pair integrity; or pass `replace: [{\"range\": \"14-15\", \"with\": \"1-line note\"}]` to compress verbose tool outputs in-place. 100% of raw items remain untouched on disk for `memory_recall`.",
+                "description": "Inspect, prune (`drop`/`keep_only` with automatic tool `call_id` pairing), or compress (`replace`) active context items while keeping 100% raw items on disk for `memory_recall`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["inspect", "edit"],
-                            "description": "`inspect` lists active items and top token hogs; `edit` applies `drop`, `keep_only`, or `replace`."
-                        },
-                        "drop": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Transcript index ranges or indices to remove from the active context window (e.g. `[\"4-12\", \"18\"]`). Paired tool calls/outputs are dropped together automatically."
-                        },
-                        "keep_only": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "Keep only these transcript index ranges in the active context window and drop all others."
-                        },
+                        "action": { "type": "string", "enum": ["inspect", "edit"] },
+                        "drop": { "type": "array", "items": { "type": "string" } },
+                        "keep_only": { "type": "array", "items": { "type": "string" } },
                         "replace": {
                             "type": "array",
-                            "description": "Replace verbose tool outputs or messages in-place with a concise 1-line note.",
                             "items": {
                                 "type": "object",
                                 "properties": {
-                                    "range": { "type": "string", "description": "Target index or range (e.g. `\"14\"` or `\"14-15\"`)." },
-                                    "with": { "type": "string", "description": "Concise 1-line replacement summary/note." }
+                                    "range": { "type": "string" },
+                                    "with": { "type": "string" }
                                 },
                                 "required": ["range", "with"]
                             }
@@ -2178,14 +2505,11 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "context_window_open",
-                "description": "Autonomously compact the active context window at a coherent task milestone by writing a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) and opening a fresh KV-cached window. 100% of prior raw transcript turns remain on disk and searchable via `memory_recall`.",
+                "description": "Compact active context at a milestone with a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`); prior raw turns stay searchable via `memory_recall`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "handoff": {
-                            "type": "string",
-                            "description": "Structured handoff anchoring the new context window: current goal, verified facts/SHAs/paths, key decisions, and immediate next step."
-                        }
+                        "handoff": { "type": "string" }
                     },
                     "required": ["handoff"]
                 }
@@ -2504,7 +2828,7 @@ fn execute_sylphx_tool(
                                 "lease": lease_name,
                                 "uid": uid,
                                 "image": "template:agent",
-                                "shape": "linux-xs",
+                                "shape": resolve_sandbox_shape(env),
                                 "workspace_dir": CLOUD_WORKSPACE_DIR,
                                 "repo": lease_meta.as_ref().and_then(|v| v.get("repo")).cloned().unwrap_or(Value::Null),
                                 "branch": lease_meta.as_ref().and_then(|v| v.get("branch")).cloned().unwrap_or(Value::Null),
@@ -2564,6 +2888,29 @@ fn execute_sylphx_tool(
                     release_persisted_sandbox_lease(config_dir);
                     "released cloud sandbox lease".to_string()
                 }
+                "teleport" | "teleport_to_cloud" | "handoff_to_cloud" => {
+                    let explicit_env = args.get("env").and_then(Value::as_str);
+                    let model = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                        .ok()
+                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                        .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
+                    match teleport_session_to_cloud(
+                        config_dir,
+                        work_dir,
+                        model.as_deref(),
+                        env,
+                        explicit_env,
+                    ) {
+                        Ok(receipt) => serde_json::to_string_pretty(&receipt).unwrap_or_default(),
+                        Err(e) => format!("error teleporting session to cloud: {e}"),
+                    }
+                }
+                "pull" | "pull_from_cloud" | "fallback_to_local" => {
+                    match pull_session_from_cloud(config_dir, env) {
+                        Ok(receipt) => serde_json::to_string_pretty(&receipt).unwrap_or_default(),
+                        Err(e) => format!("error pulling session from cloud: {e}"),
+                    }
+                }
                 other => format!("error: unknown sandbox action `{other}`"),
             }
         }
@@ -2597,15 +2944,11 @@ fn execute_sylphx_tool(
                 return "error: missing `command`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match exec_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    cmd_str,
-                ) {
-                    Ok(out) => out,
-                    Err(e) => format!("error executing in cloud sandbox: {e}"),
-                };
+                match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str)
+                {
+                    Ok(out) => return out,
+                    Err(e) => record_cloud_sandbox_fallback(config_dir, &e),
+                }
             }
             let timeout_ms = args
                 .get("timeout_ms")
@@ -2623,15 +2966,13 @@ fn execute_sylphx_tool(
             let start_line = args.get("start_line").and_then(Value::as_u64);
             let end_line = args.get("end_line").and_then(Value::as_u64);
             if sandbox_mode == "cloud" {
-                return match read_file_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    rel,
-                ) {
-                    Ok(content) => format_read_file_output(rel, &content, start_line, end_line),
-                    Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
-                };
+                match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
+                {
+                    Ok(content) => {
+                        return format_read_file_output(rel, &content, start_line, end_line);
+                    }
+                    Err(e) => record_cloud_sandbox_fallback(config_dir, &e),
+                }
             }
             let target = resolve_workspace_path(work_dir, rel);
             match std::fs::read_to_string(&target) {
@@ -2650,16 +2991,16 @@ fn execute_sylphx_tool(
                 return "error: missing `content`".to_string();
             };
             if sandbox_mode == "cloud" {
-                return match write_file_in_cloud_sandbox_with_work_dir(
+                match write_file_in_cloud_sandbox_with_work_dir(
                     config_dir,
                     Some(work_dir),
                     env,
                     rel,
                     content,
                 ) {
-                    Ok(msg) => msg,
-                    Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
-                };
+                    Ok(msg) => return msg,
+                    Err(e) => record_cloud_sandbox_fallback(config_dir, &e),
+                }
             }
             let target = resolve_workspace_path(work_dir, rel);
             if let Some(p) = target.parent() {
@@ -2703,12 +3044,8 @@ fn execute_sylphx_tool(
                 edits_vec.push((old_str.to_string(), new_str.to_string()));
             }
             if sandbox_mode == "cloud" {
-                return match read_file_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    rel,
-                ) {
+                match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
+                {
                     Ok(existing) => {
                         match apply_edits_to_content(&existing, &edits_vec, replace_all) {
                             Ok((updated, ranges)) => {
@@ -2724,21 +3061,19 @@ fn execute_sylphx_tool(
                                             .iter()
                                             .map(|(s, e)| format!("L{s}..L{e}"))
                                             .collect();
-                                        format!(
+                                        return format!(
                                             "edited `{rel}` in cloud sandbox ({})",
                                             range_desc.join(", ")
-                                        )
+                                        );
                                     }
-                                    Err(e) => {
-                                        format!("error writing `{rel}` in cloud sandbox: {e}")
-                                    }
+                                    Err(e) => record_cloud_sandbox_fallback(config_dir, &e),
                                 }
                             }
-                            Err(e) => format!("error editing `{rel}`: {e}"),
+                            Err(e) => return format!("error editing `{rel}`: {e}"),
                         }
                     }
-                    Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
-                };
+                    Err(e) => record_cloud_sandbox_fallback(config_dir, &e),
+                }
             }
             let target = resolve_workspace_path(work_dir, rel);
             match std::fs::read_to_string(&target) {
@@ -3191,13 +3526,17 @@ mod tests {
         assert_eq!(spec.base.as_deref(), Some("main"));
 
         let env_spec = build_cloud_environment_spec(cfg, None, &[]);
-        assert_eq!(env_spec["shape"], "linux-xs");
+        assert_eq!(env_spec["shape"], "linux-s");
         assert_eq!(env_spec["template"], "template:agent");
+        assert!(env_spec.get("workspace_dir").is_none());
         assert_eq!(
             env_spec["repo"]["uri"],
             "https://github.com/SylphxAI/anyagents.git"
         );
         assert_eq!(env_spec["repo"]["revision"], "agent/cloud-worker");
+        assert!(env_spec["repo"].get("slug").is_none());
+        assert!(env_spec["repo"].get("branch").is_none());
+        assert!(env_spec["repo"].get("base").is_none());
     }
 
     #[test]
@@ -3621,5 +3960,200 @@ mod tests {
             "unexpected fault: {fault}"
         );
         assert!(cfg.join(".anyagents-last-error.json").exists());
+    }
+
+    #[test]
+    fn cloud_agent_tools_separate_builtin_workspace_from_client_coordination_tools() {
+        let client_tools = build_cloud_agent_client_tools();
+        let client_names: Vec<&str> = client_tools
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        // Coordination & local takeover tools ARE bridged as client tools:
+        for expected in [
+            "send",
+            "describe",
+            "archive",
+            "agents",
+            "conversation",
+            "groups",
+            "schedule",
+            "browser",
+            "goal",
+        ] {
+            assert!(
+                client_names.contains(&expected),
+                "missing expected client coordination tool `{expected}`"
+            );
+        }
+        // Workspace & local context tools are NEVER duplicated as client tools:
+        for forbidden in [
+            "bash",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "apply_patch",
+            "grep",
+            "glob",
+            "list_dir",
+            "code_mode",
+            "sandbox",
+            "memory_recall",
+            "context_budget_read",
+            "context_edit",
+            "context_window_open",
+            "activate_skill",
+        ] {
+            assert!(
+                !client_names.contains(&forbidden),
+                "cloud client tools must not duplicate workspace/context tool `{forbidden}`"
+            );
+        }
+
+        let all_cloud_tools = build_cloud_agent_tools();
+        assert_eq!(all_cloud_tools[0]["name"], "shell");
+        assert_eq!(all_cloud_tools[0]["builtin"]["id"], "shell");
+        assert_eq!(all_cloud_tools[1]["name"], "files");
+        assert_eq!(all_cloud_tools[1]["builtin"]["id"], "files");
+    }
+
+    #[test]
+    fn cloud_sandbox_automatically_falls_back_to_local_when_cloud_api_unavailable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        // Point cloud sandbox at an unreachable port with `SYLPHX_SANDBOX=cloud`.
+        let env = vec![
+            ("SYLPHX_SANDBOX".to_string(), "cloud".to_string()),
+            ("SYLPHX_API_KEY".to_string(), "sylphx_sk_test".to_string()),
+            (
+                "SYLPHX_API_URL".to_string(),
+                "http://127.0.0.1:9".to_string(),
+            ),
+        ];
+        assert_eq!(resolve_sandbox_mode(&cfg, &env), "cloud");
+
+        // 1. `write_file` attempts cloud sandbox, fails against dead port, records fallback, and writes locally!
+        let write_out = execute_sylphx_tool(
+            "write_file",
+            &json!({ "path": "fallback.txt", "content": "alpha = 1\n" }),
+            &cfg,
+            &work,
+            &env,
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(write_out.starts_with("wrote "), "unexpected: {write_out}");
+        assert!(cfg.join("sylphx-sandbox-fallback.json").is_file());
+        assert_eq!(resolve_sandbox_mode(&cfg, &env), "local");
+
+        // 2. `edit_file`, `read_file`, and `bash` now run locally without hitting the dead cloud endpoint!
+        let edit_out = execute_sylphx_tool(
+            "edit_file",
+            &json!({
+                "path": "fallback.txt",
+                "target": "alpha = 1",
+                "replacement": "alpha = 42"
+            }),
+            &cfg,
+            &work,
+            &env,
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(edit_out.starts_with("edited "), "unexpected: {edit_out}");
+
+        let read_out = execute_sylphx_tool(
+            "read_file",
+            &json!({ "path": "fallback.txt" }),
+            &cfg,
+            &work,
+            &env,
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(read_out.contains("alpha = 42"), "unexpected: {read_out}");
+
+        let bash_out = execute_sylphx_tool(
+            "bash",
+            &json!({ "command": "cat fallback.txt" }),
+            &cfg,
+            &work,
+            &env,
+            Path::new("anyagents"),
+            &[],
+        );
+        assert!(bash_out.contains("alpha = 42"), "unexpected: {bash_out}");
+    }
+
+    #[test]
+    fn persisted_cloud_session_and_prior_transcript_continuity_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+
+        let saved = PersistedCloudSession {
+            agent_id: "environments/env_1/agents/agt_cloud_1".to_string(),
+            session_id: "environments/env_1/agent_sessions/asess_cloud_1".to_string(),
+            model_id: "openai/gpt-6.1-sol".to_string(),
+            env_slug: "environments/env_1".to_string(),
+            last_seq: 14,
+        };
+        save_persisted_cloud_session(cfg, &saved);
+        let loaded = load_persisted_cloud_session(cfg).expect("persisted cloud session");
+        assert_eq!(loaded.agent_id, saved.agent_id);
+        assert_eq!(loaded.session_id, saved.session_id);
+        assert_eq!(loaded.model_id, "openai/gpt-6.1-sol");
+        assert_eq!(loaded.last_seq, 14);
+
+        let transcript = cfg.join("sylphx-transcript.jsonl");
+        append_transcript_message(
+            &transcript,
+            &json!({ "role": "user", "content": "Check deployment status of service-alpha" }),
+        );
+        append_transcript_message(
+            &transcript,
+            &json!({
+                "type": "function_call",
+                "call_id": "call_99",
+                "name": "bash",
+                "arguments": "{\"command\":\"kubectl get pods\"}"
+            }),
+        );
+        append_transcript_message(
+            &transcript,
+            &json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "service-alpha is healthy (3/3 pods ready)." }]
+            }),
+        );
+
+        let block = build_prior_transcript_continuity_block(&transcript)
+            .expect("prior transcript continuity block");
+        assert!(block.contains("<prior_session_continuity>"));
+        assert!(block.contains("Check deployment status of service-alpha"));
+        assert!(block.contains("[tool_call:bash]"));
+        assert!(block.contains("service-alpha is healthy (3/3 pods ready)."));
+
+        clear_persisted_cloud_session(cfg);
+        assert!(load_persisted_cloud_session(cfg).is_none());
+
+        let sdk_session = SylphxSdkSession::new(
+            cfg,
+            cfg,
+            Some("sylphx/openai/gpt-6.1-sol#medium".to_string()),
+            vec![("SYLPHX_EXECUTION_MODE".to_string(), "local".to_string())],
+        );
+        assert_eq!(sdk_session.execution_mode, SylphxExecutionMode::LocalOnly);
+        assert!(NoopClientTools.tool_definitions().is_empty());
+        assert!(NoopClientTools.execute("send", &json!({})).is_none());
+
+        let receipt = sdk_session.pull_from_cloud().expect("pull from cloud");
+        assert_eq!(receipt.direction, "cloud_to_local");
+        assert_eq!(receipt.mode, "local");
+        assert_eq!(receipt.transcript_items, 3);
     }
 }

@@ -20,6 +20,13 @@ use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, SteerSupport, TurnState, TurnUsage,
 };
 
+/// Maximum drain window (ms) to let an active turn finish naturally after a
+/// harness, model, or profile switch is requested. While draining, new mailbox
+/// messages are held back in SQLite (never steered into the retiring process)
+/// so continuous incoming messages cannot extend the old turn indefinitely.
+/// Once the turn finishes or this drain window expires, the process is replaced.
+const PENDING_SWITCH_DRAIN_MS: i64 = 15_000;
+
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
 pub trait Clock: Send + Sync {
     fn now_ms(&self) -> i64;
@@ -617,6 +624,7 @@ fn run_agent<H: Harness + 'static>(
         pending_recovery: false,
         completed_turn_in_session: false,
         quota_started_at: None,
+        pending_switch_started_at: None,
         process_started_at: None,
         process_profile_rotated_ms: 0,
         last_error: None,
@@ -685,6 +693,7 @@ struct Session<H: Harness> {
     /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
     /// can clear the quota hold before `reset_at`.
     quota_started_at: Option<i64>,
+    pending_switch_started_at: Option<i64>,
     process_started_at: Option<i64>,
     process_profile_rotated_ms: i64,
     last_error: Option<String>,
@@ -793,6 +802,7 @@ impl<H: Harness + 'static> Session<H> {
         match &res {
             Ok(_) => {
                 let rotated_advanced = rotated_ms > self.process_profile_rotated_ms;
+                self.pending_switch_started_at = None;
                 self.process_started_at = Some(self.inner.clock.now_ms());
                 self.process_profile_rotated_ms = rotated_ms;
                 if rotated_advanced || self.consecutive_turn_errors == 0 {
@@ -981,6 +991,19 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
+        if self.try_apply_pending_switch() {
+            return false;
+        }
+        if let Some(switch_started_at) = self.pending_switch_started_at {
+            // A harness, model, or profile switch is pending while the old
+            // process is mid-turn: hold new mailbox messages in SQLite for the
+            // replacement process instead of steering them into the old turn,
+            // and cut over as soon as the turn finishes or the drain window ends.
+            let deadline = switch_started_at.saturating_add(PENDING_SWITCH_DRAIN_MS);
+            let wait_until = deadline.min(self.inner.clock.now_ms() + 1_000);
+            self.inner.clock.wait(Some(wait_until), &self.woken);
+            return false;
+        }
         let outcome = {
             let Some(delivery) = self.delivery.as_mut() else {
                 return false;
@@ -1054,23 +1077,18 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    /// When a running agent's configured harness, model, or profile changed
-    /// while it was working, replace the live process automatically as soon as
-    /// the current turn and any background commands finish.
+    /// When a running agent's configured harness, model, or profile changed,
+    /// hold new incoming mailbox messages at the gate so they cannot extend
+    /// an active turn on the retiring process, and replace the live process
+    /// immediately when idle or once `PENDING_SWITCH_DRAIN_MS` expires.
     fn try_apply_pending_switch(&mut self) -> bool {
-        let (is_idle, pid) = {
+        let is_idle = {
             let Some(delivery) = self.delivery.as_ref() else {
+                self.pending_switch_started_at = None;
                 return false;
             };
-            let health = delivery.harness().health();
-            (
-                health.turn_state == TurnState::Idle,
-                delivery.harness().process_id(),
-            )
+            delivery.harness().health().turn_state == TurnState::Idle
         };
-        if !is_idle {
-            return false;
-        }
         let Ok(fresh) = self.inner.store.agent(&self.id) else {
             return false;
         };
@@ -1082,9 +1100,17 @@ impl<H: Harness + 'static> Session<H> {
         let config_changed = fresh.harness != self.agent.harness
             || fresh.model != self.agent.model
             || current_rotated_ms > self.process_profile_rotated_ms;
-        if !config_changed || harness_has_inflight_processes(pid) {
+        if !config_changed {
+            self.pending_switch_started_at = None;
             return false;
         }
+        let now = self.inner.clock.now_ms();
+        let started_at = *self.pending_switch_started_at.get_or_insert(now);
+        let drain_expired = now.saturating_sub(started_at) >= PENDING_SWITCH_DRAIN_MS;
+        if !is_idle && !drain_expired {
+            return false;
+        }
+        self.pending_switch_started_at = None;
         self.replace_process();
         true
     }
