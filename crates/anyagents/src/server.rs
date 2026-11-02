@@ -897,27 +897,28 @@ fn reconcile_stopped_and_backed_off_agents(
     if !guard.initialized {
         for agent in &agents {
             let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
-            let has_lag = store
-                .lag(&agent.id, now_ms)
-                .ok()
-                .and_then(|l| l.oldest_undelivered_age_ms)
-                .is_some();
-            if !has_lag {
-                guard.watermark_seq.insert(agent.id.to_string(), delivered);
-                continue;
-            }
-            let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
-            let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
-            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+            guard.watermark_seq.insert(agent.id.to_string(), delivered);
         }
         guard.initialized = true;
     }
 
-    const MAX_CONCURRENT_SYLPHX_TURNS: usize = 10;
-    const MAX_SYLPHX_SPAWNS_PER_TICK: usize = 4;
+    const MAX_CONCURRENT_SYLPHX_TURNS: usize = 128;
+    const MAX_SYLPHX_SPAWNS_PER_TICK: usize = 32;
     let mut sylphx_spawned_this_tick = 0usize;
 
-    for agent in &agents {
+    let mut ordered_indices: Vec<usize> = (0..agents.len()).collect();
+    ordered_indices.sort_by_key(|&idx| {
+        let a = &agents[idx];
+        let last_try = guard
+            .last_backoff_reset_ms
+            .get(a.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        (last_try, idx)
+    });
+
+    for idx in ordered_indices {
+        let agent = &agents[idx];
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
         let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
             agents
@@ -1014,7 +1015,7 @@ fn reconcile_stopped_and_backed_off_agents(
                                         &agent.id,
                                         anyagents_supervisor::LiveState {
                                             process_alive: true,
-                                            turn_state: anyagents_harness::TurnState::InTurn,
+                                            turn_state: anyagents_harness::TurnState::Idle,
                                             delivery_mode,
                                             steer_support,
                                             quota_reset_at_ms: None,
@@ -1079,11 +1080,7 @@ fn reconcile_stopped_and_backed_off_agents(
                         &agent.id,
                         anyagents_supervisor::LiveState {
                             process_alive: true,
-                            turn_state: if has_pending_work && persisted_err.is_none() {
-                                anyagents_harness::TurnState::InTurn
-                            } else {
-                                anyagents_harness::TurnState::Idle
-                            },
+                            turn_state: anyagents_harness::TurnState::Idle,
                             delivery_mode,
                             steer_support,
                             quota_reset_at_ms: None,
