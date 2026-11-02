@@ -402,8 +402,16 @@ impl Harness for SylphxHarness {
                             || lower.contains("out of credits")
                         {
                             g.quota_reset_at_ms = Some(anyagents_core::now_ms() + 300_000);
+                        } else if lower.contains("http 401")
+                            || lower.contains("status 401")
+                            || lower.contains("unauthorized")
+                            || lower.contains("invalid_api_key")
+                            || lower.contains("missing sylphx api key")
+                        {
+                            g.sign_in_fault = Some(err_msg.clone());
                         } else {
                             g.sign_in_fault = Some(err_msg.clone());
+                            g.dead_reason = Some(err_msg.clone());
                         }
                         persist_turn_error(&config_dir, &err_msg);
                     }
@@ -1235,10 +1243,17 @@ pub(crate) fn run_native_gateway_turn(
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
     let mut input_items = load_transcript_input_items(&transcript_path);
-    let already_appended_by_cloud = input_items.last().is_some_and(|last| {
-        last.get("role").and_then(Value::as_str) == Some("user")
-            && last.get("content").and_then(Value::as_str) == Some(initial_user_message)
-    });
+    let is_recovery_on_unanswered_tail = initial_user_message
+        .contains("[Recovery] Your previous turn was interrupted")
+        && input_items.last().is_some_and(|last| {
+            last.get("role").and_then(Value::as_str) == Some("user")
+                || last.get("type").and_then(Value::as_str) == Some("function_call_output")
+        });
+    let already_appended_by_cloud = is_recovery_on_unanswered_tail
+        || input_items.last().is_some_and(|last| {
+            last.get("role").and_then(Value::as_str) == Some("user")
+                && last.get("content").and_then(Value::as_str) == Some(initial_user_message)
+        });
     if !already_appended_by_cloud {
         let user_msg = json!({
             "role": "user",

@@ -287,7 +287,34 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             }
         }
     }
+    sanitize_responses_call_pairs(&mut history);
     history
+}
+
+/// Ensures every `function_call_output` in `history` has a preceding matching
+/// `function_call`, preventing `/v1/responses` HTTP 400
+/// (`function output has no preceding open call`) when stride windowing
+/// (`0..block_start`) slices through the middle of a multi-call tool batch.
+fn sanitize_responses_call_pairs(history: &mut Vec<(usize, Value)>) {
+    let mut seen_calls = std::collections::HashSet::new();
+    history.retain(|(_, item)| match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
+                seen_calls.insert(cid.to_string());
+            }
+            true
+        }
+        Some("function_call_output") => item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|cid| seen_calls.contains(cid)),
+        _ => true,
+    });
+    while history.first().is_some_and(|(_, item)| {
+        item.get("type").and_then(Value::as_str) == Some("reasoning")
+    }) {
+        history.remove(0);
+    }
 }
 
 /// Loads persisted transcript items for `/v1/responses` (`input`), starting from
@@ -1076,4 +1103,46 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
         "hits": hits,
     }))
     .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_responses_call_pairs_drops_orphaned_call_or_output() {
+        let mut history = vec![
+            (
+                79,
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_b",
+                    "name": "bash",
+                    "arguments": "{}"
+                }),
+            ),
+            (
+                80,
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_a",
+                    "output": "orphaned output from drained call_a"
+                }),
+            ),
+            (
+                81,
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_b",
+                    "output": "paired output for call_b"
+                }),
+            ),
+        ];
+        sanitize_responses_call_pairs(&mut history);
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].1["type"], "function_call");
+        assert_eq!(history[0].1["call_id"], "call_b");
+        assert_eq!(history[1].1["type"], "function_call_output");
+        assert_eq!(history[1].1["call_id"], "call_b");
+    }
 }
