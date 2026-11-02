@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+pub use anyagents_agent::recovery_outbound;
 use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,

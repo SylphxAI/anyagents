@@ -634,6 +634,34 @@ pub fn share_worktree_with_seat(path: &Path, gid: u32) {
         if is_isolated_test_env() {
             return;
         }
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let normal_depth = canon
+            .components()
+            .filter(|c| matches!(c, std::path::Component::Normal(_)))
+            .count();
+        if normal_depth < 3
+            || matches!(
+                canon.to_str(),
+                Some(
+                    "/"
+                        | "/workspace-data"
+                        | "/workspace-data/workspace"
+                        | "/workspace-data/workspace/.worktrees"
+                        | "/workspace-data/build-targets"
+                        | "/scratch"
+                        | "/scratch/coordinator"
+                        | "/scratch/coordinator/anyagents-data"
+                        | "/scratch/wt"
+                        | "/scratch/wt/owners-main"
+                        | "/home"
+                        | "/home/kyle"
+                        | "/home/kyle/workspace"
+                )
+            )
+            || canon.starts_with("/workspace-data/build-targets")
+        {
+            return;
+        }
         let _ = chown_to_seat_group(path, gid);
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2775));
         let apply_recursive = |target: &Path| {

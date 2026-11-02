@@ -668,14 +668,15 @@ pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
     if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
         return false;
     }
+    let is_hard_quota = lower.contains("insufficient_quota")
+        || lower.contains("credit balance is too low")
+        || lower.contains("out of credits")
+        || lower.contains("quota exceeded");
     if matches!(status, 408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=529) {
         return true;
     }
     if status == 429 {
-        return !lower.contains("insufficient_quota")
-            && !lower.contains("credit balance is too low")
-            && !lower.contains("out of credits")
-            && !lower.contains("quota exceeded");
+        return !is_hard_quota;
     }
     if !(200..300).contains(&status) {
         return lower.contains("model_unavailable")
@@ -685,18 +686,43 @@ pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
             || lower.contains("service unavailable")
             || lower.contains("gateway timeout");
     }
-    false
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Err(_) => true,
+        Ok(val) => {
+            let has_valid_output = val.get("error").is_none_or(Value::is_null)
+                && val.get("output").is_some_and(Value::is_array);
+            if has_valid_output || is_hard_quota {
+                return false;
+            }
+            let has_error_or_failed = !val.get("error").is_none_or(Value::is_null)
+                || val.get("status").and_then(Value::as_str) == Some("failed");
+            has_error_or_failed
+                && (lower.contains("model_unavailable")
+                    || lower.contains("temporarily unavailable")
+                    || lower.contains("overloaded")
+                    || lower.contains("server_error")
+                    || lower.contains("api_error")
+                    || lower.contains("rate_limit")
+                    || lower.contains("bad gateway")
+                    || lower.contains("service unavailable")
+                    || lower.contains("gateway timeout"))
+        }
+    }
 }
 
 fn gateway_retry_policy() -> (u32, u64) {
     let max_retries = std::env::var("SYLPHX_MAX_RETRIES")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(5);
+        .unwrap_or(6);
     let base_backoff_ms = std::env::var("SYLPHX_RETRY_BACKOFF_MS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(500);
+        .unwrap_or(1_000);
     (max_retries, base_backoff_ms)
 }
 

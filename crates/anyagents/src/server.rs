@@ -369,6 +369,41 @@ struct AdminReconcileState {
     flushing_sylphx: std::collections::HashSet<String>,
 }
 
+fn is_transient_sylphx_turn_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
+        return false;
+    }
+    if lower.contains("insufficient_quota")
+        || lower.contains("credit balance is too low")
+        || lower.contains("out of credits")
+        || lower.contains("quota exceeded")
+    {
+        return false;
+    }
+    lower.contains("model_unavailable")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("server_error")
+        || lower.contains("api_error")
+        || lower.contains("rate_limit")
+        || lower.contains("http 408")
+        || lower.contains("http 409")
+        || lower.contains("http 425")
+        || lower.contains("http 429")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("invalid sylphx responses api json")
+        || lower.contains("eof while parsing")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("gateway timeout")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+}
+
 fn spawn_admin_sylphx_delivery(
     data: PathBuf,
     agent: Agent,
@@ -461,9 +496,13 @@ fn spawn_admin_sylphx_delivery(
                                 if let Some(err_msg) = turn_err {
                                     had_err = true;
                                     crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
-                                    create::maybe_notify_parent_on_error(
-                                        &store, &agent, &cfg, &err_msg,
-                                    );
+                                    let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                        && store.open_turn(&agent.id).ok().flatten().is_some();
+                                    if !can_auto_recover {
+                                        create::maybe_notify_parent_on_error(
+                                            &store, &agent, &cfg, &err_msg,
+                                        );
+                                    }
                                     break;
                                 }
                                 let _ = store.note_turn_completed(&agent.id);
@@ -478,10 +517,87 @@ fn spawn_admin_sylphx_delivery(
                                 had_err = true;
                                 let err_msg = err.to_string();
                                 crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
-                                create::maybe_notify_parent_on_error(
-                                    &store, &agent, &cfg, &err_msg,
-                                );
+                                let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                    && store.open_turn(&agent.id).ok().flatten().is_some();
+                                if !can_auto_recover {
+                                    create::maybe_notify_parent_on_error(
+                                        &store, &agent, &cfg, &err_msg,
+                                    );
+                                }
                                 break;
+                            }
+                        }
+                    }
+                    if !had_err
+                        && !completed_any
+                        && let Ok(Some(open)) = store.open_turn(&agent.id)
+                    {
+                        let outbound = anyagents_supervisor::recovery_outbound(&open);
+                        match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
+                            Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
+                                let _ = store.note_turn_recovered(&agent.id, open.opened_seq);
+                                if !turn_finished {
+                                    while anyagents_harness::Harness::health(&harness).turn_state
+                                        == anyagents_harness::TurnState::InTurn
+                                    {
+                                        if let Ok(Some(steered)) = store.next_undelivered(&agent.id)
+                                        {
+                                            let steered_out = anyagents_harness::OutboundMessage {
+                                                id: steered.id.as_str().to_string(),
+                                                seq: steered.seq,
+                                                text: steered.text.clone(),
+                                                sender: steered.sender.clone(),
+                                                reply_to: steered.reply_to.clone(),
+                                                source_time_ms: steered.source_time_ms,
+                                                context: anyagents_harness::Context::default(),
+                                            };
+                                            if anyagents_harness::Harness::deliver(
+                                                &mut harness,
+                                                &steered_out,
+                                            )
+                                            .is_ok()
+                                            {
+                                                let _ =
+                                                    store.note_delivered(&agent.id, steered.seq);
+                                            }
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                    }
+                                }
+                                let turn_err = anyagents_harness::Harness::health(&harness)
+                                    .sign_in_fault
+                                    .or_else(|| {
+                                        crate::vendor::read_persisted_last_error(&cfg)
+                                            .and_then(|(e, _)| e)
+                                    });
+                                if let Some(err_msg) = turn_err {
+                                    had_err = true;
+                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
+                                    let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                        && store.open_turn(&agent.id).ok().flatten().is_some();
+                                    if !can_auto_recover {
+                                        create::maybe_notify_parent_on_error(
+                                            &store, &agent, &cfg, &err_msg,
+                                        );
+                                    }
+                                } else {
+                                    let _ = store.note_turn_completed(&agent.id);
+                                    completed_any = true;
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                had_err = true;
+                                let err_msg = err.to_string();
+                                crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
+                                let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                    && store.open_turn(&agent.id).ok().flatten().is_some();
+                                if !can_auto_recover {
+                                    create::maybe_notify_parent_on_error(
+                                        &store, &agent, &cfg, &err_msg,
+                                    );
+                                }
                             }
                         }
                     }
@@ -768,7 +884,17 @@ fn reconcile_stopped_and_backed_off_agents(
 
     for agent in &agents {
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
-        if is_explicitly_archived(data, agent) {
+        let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
+            agents
+                .iter()
+                .find(|p| &p.id == pid)
+                .is_some_and(|p| is_explicitly_archived(data, p))
+        });
+        if parent_archived && agent.state != "archived" {
+            let _ = store.set_agent_state(&agent.id, "archived");
+            mark_explicitly_archived(store, data, agent);
+        }
+        if is_explicitly_archived(data, agent) || parent_archived {
             if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
                 let _ = store.set_agent_state(&agent.id, "archived");
             }
@@ -803,7 +929,7 @@ fn reconcile_stopped_and_backed_off_agents(
             .lag(&agent.id, now_ms)
             .ok()
             .and_then(|l| l.oldest_undelivered_age_ms);
-        if agent.state == "idle" {
+        if agent.state == "idle" || agent.state == "created" {
             if oldest_age_ms.is_some() {
                 let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                 let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
@@ -812,8 +938,15 @@ fn reconcile_stopped_and_backed_off_agents(
                     .get(agent.id.as_str())
                     .copied()
                     .unwrap_or(delivered);
-                if max_seq > delivered && max_seq > prev_wm {
-                    let should_wake = undelivered.iter().filter(|m| m.seq > prev_wm).any(|m| {
+                let has_new_mail = max_seq > delivered
+                    && (agent.state == "created" || max_seq > prev_wm);
+                if has_new_mail {
+                    let check_from = if agent.state == "created" {
+                        delivered
+                    } else {
+                        prev_wm
+                    };
+                    let should_wake = undelivered.iter().filter(|m| m.seq > check_from).any(|m| {
                         let trimmed = m.text.trim_start();
                         !(agent.parent_id.is_none()
                             && (trimmed.starts_with("[Sub-Agent Completed]")
@@ -854,8 +987,10 @@ fn reconcile_stopped_and_backed_off_agents(
                 let cfg = anyagents_core::agent_config_dir(data, &agent.id);
                 let persisted_err =
                     crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                let has_open_recovery = store.open_turn(&agent.id).ok().flatten().is_some();
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
                     if oldest_age_ms.is_none()
+                        && !has_open_recovery
                         && persisted_err.is_none()
                         && agent.parent_id.is_some()
                         && store.complete_idle_subagent(&agent.id).unwrap_or(false)
@@ -899,7 +1034,9 @@ fn reconcile_stopped_and_backed_off_agents(
                         },
                     );
                 }
-                if oldest_age_ms.is_some() && !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                if (oldest_age_ms.is_some() || has_open_recovery)
+                    && !guard.flushing_sylphx.contains(agent.id.as_str())
+                {
                     let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                     let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
                     let prev_wm = guard
@@ -4686,7 +4823,9 @@ fn deliver_agent(
     key: Option<&str>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
-    if agent.state == "idle" && !is_explicitly_archived(store.data_dir(), &agent) {
+    if (agent.state == "idle" || agent.state == "created")
+        && !is_explicitly_archived(store.data_dir(), &agent)
+    {
         let trimmed = body.text.trim_start();
         let is_auto_subagent_lifecycle = trimmed.starts_with("[Sub-Agent Completed]")
             || trimmed.starts_with("[Sub-Agent Error]");
