@@ -3916,7 +3916,10 @@ fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
         "/claudeAiOauth/accountUuid",
         "/claudeAiOauth/email",
         "/id_token_email",
+        "/email",
+        "/account_id",
         "/tokens/account_id",
+        "/token/refresh_token",
     ] {
         if let Some(s) = val
             .pointer(ptr)
@@ -3933,16 +3936,30 @@ fn json_oauth_identity(bytes: &[u8]) -> Option<String> {
 fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<Vec<u8>> {
     let mut src_val: serde_json::Value = serde_json::from_slice(src_bytes).ok()?;
     let dst_val: serde_json::Value = serde_json::from_slice(dst_bytes).ok()?;
-    let dst_oauth = dst_val.get("claudeAiOauth")?.as_object()?;
-    let src_oauth = src_val.get_mut("claudeAiOauth")?.as_object_mut()?;
     let mut changed = false;
-    for key in ["accountUuid", "email"] {
-        if !src_oauth.contains_key(key)
-            && let Some(v) = dst_oauth.get(key)
-            && v.as_str().is_some_and(|s| !s.trim().is_empty())
-        {
-            src_oauth.insert(key.to_string(), v.clone());
-            changed = true;
+    if let (Some(dst_oauth), Some(src_oauth)) = (
+        dst_val.get("claudeAiOauth").and_then(serde_json::Value::as_object),
+        src_val.get_mut("claudeAiOauth").and_then(serde_json::Value::as_object_mut),
+    ) {
+        for key in ["accountUuid", "email"] {
+            if !src_oauth.contains_key(key)
+                && let Some(v) = dst_oauth.get(key)
+                && v.as_str().is_some_and(|s| !s.trim().is_empty())
+            {
+                src_oauth.insert(key.to_string(), v.clone());
+                changed = true;
+            }
+        }
+    }
+    if let (Some(dst_obj), Some(src_obj)) = (dst_val.as_object(), src_val.as_object_mut()) {
+        for key in ["id_token_email", "email", "account_id"] {
+            if !src_obj.contains_key(key)
+                && let Some(v) = dst_obj.get(key)
+                && v.as_str().is_some_and(|s| !s.trim().is_empty())
+            {
+                src_obj.insert(key.to_string(), v.clone());
+                changed = true;
+            }
         }
     }
     changed.then(|| serde_json::to_vec(&src_val).ok()).flatten()
@@ -4298,6 +4315,26 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
     entries
 }
 
+fn parse_effective_rebalance_pct(usage: &str) -> Option<i64> {
+    let min_pct = parse_remaining_pct_from_usage(usage, None)?;
+    if min_pct <= 0 {
+        return Some(0);
+    }
+    let extract_after = |label: &str| -> Option<i64> {
+        let idx = usage.find(label)?;
+        let rest = &usage[idx + label.len()..];
+        let pct_idx = rest.find("% left")?;
+        rest[..pct_idx].trim().parse::<i64>().ok()
+    };
+    if let (Some(p5), Some(p7)) = (extract_after("5h:"), extract_after("7d:"))
+        && p5 >= 20
+        && p7 >= 10
+    {
+        return Some((p5 + p7) / 2);
+    }
+    Some(min_pct)
+}
+
 fn rebalance_provider_profiles(
     store: &Store,
     data: &Path,
@@ -4314,10 +4351,13 @@ fn rebalance_provider_profiles(
         let mut prof_rem: std::collections::BTreeMap<String, i64> =
             std::collections::BTreeMap::new();
         for e in entries.iter().filter(|e| e.provider == provider) {
-            if let Some(ref u) = e.usage
-                && let Some(pct) = parse_remaining_pct_from_usage(u, None)
-            {
-                prof_rem.insert(e.profile.clone(), pct);
+            if let Some(ref u) = e.usage {
+                if provider == "google-antigravity" && !u.contains("(ultra)") {
+                    continue;
+                }
+                if let Some(pct) = parse_effective_rebalance_pct(u) {
+                    prof_rem.insert(e.profile.clone(), pct);
+                }
             }
         }
         if prof_rem.len() < 2 {
@@ -4391,29 +4431,41 @@ fn rebalance_provider_profiles(
                 }
             }
         }
-        // Step 2: balance overloaded profiles onto healthy profiles with significantly higher per-agent quota.
+        // Step 2: balance overloaded profiles onto healthy profiles so agent counts stay even
+        // (differing by at most 1 across active profiles with healthy quota) and higher-quota
+        // profiles carry the remainder.
         for _ in 0..16 {
             let mut best_move: Option<(String, String, i64)> = None;
             for (src_prof, src_agents) in &bound {
-                if src_agents.len() < 2 {
+                let src_len = src_agents.len() as i64;
+                if src_len < 2 {
                     continue;
                 }
                 let src_pct = prof_rem.get(src_prof).copied().unwrap_or(0);
-                let src_share = (src_pct * 100) / (src_agents.len() as i64);
+                let src_share = (src_pct * 100) / src_len;
                 for (dst_prof, &dst_pct) in &prof_rem {
-                    if dst_prof == src_prof || dst_pct < 30 {
+                    if dst_prof == src_prof || dst_pct < 25 {
                         continue;
                     }
                     let dst_len = bound.get(dst_prof).map(|v| v.len() as i64).unwrap_or(0);
                     let new_dst_share = (dst_pct * 100) / (dst_len + 1);
-                    let gain = new_dst_share - src_share;
-                    let should_move = (dst_len == 0 && dst_pct >= 50 && gain > 0) || gain >= 1500;
-                    if should_move
-                        && best_move
+                    let share_gain = new_dst_share - src_share;
+                    let count_gap = src_len - dst_len;
+                    let should_move = if count_gap >= 2 {
+                        true
+                    } else if count_gap == 1 {
+                        dst_pct > src_pct + 15
+                    } else {
+                        share_gain >= 2500
+                    };
+                    if should_move {
+                        let priority = count_gap * 10_000 + share_gain;
+                        if best_move
                             .as_ref()
-                            .is_none_or(|(_, _, best_gain)| gain > *best_gain)
-                    {
-                        best_move = Some((src_prof.clone(), dst_prof.clone(), gain));
+                            .is_none_or(|(_, _, best_pri)| priority > *best_pri)
+                        {
+                            best_move = Some((src_prof.clone(), dst_prof.clone(), priority));
+                        }
                     }
                 }
             }
