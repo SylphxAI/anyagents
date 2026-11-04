@@ -3300,7 +3300,7 @@ impl Store {
 
     pub fn restore_skipped_at_schedules(&self, min_next_fire_at_ms: i64) -> Result<usize, Error> {
         let conn = self.conn();
-        let updated = conn.execute(
+        let mut updated = conn.execute(
             "UPDATE agent_schedules
              SET state = 'active',
                  last_observed = NULL
@@ -3310,6 +3310,27 @@ impl Store {
                AND last_observed LIKE 'skipped:%'
                AND next_fire_at_ms >= ?1",
             params![min_next_fire_at_ms],
+        )?;
+        updated += conn.execute(
+            "UPDATE agent_schedules
+             SET state = 'active',
+                 watch_baseline = 'checks_completed'
+             WHERE kind = 'watch'
+               AND state = 'fired'
+               AND last_observed = 'checks_completed'
+               AND (
+                   spec LIKE 'github:pr:%'
+                   OR spec LIKE 'gh:pr:%'
+                   OR spec LIKE 'pr:%'
+                   OR spec LIKE 'https://github.com/%/pull/%'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM agent_schedules active_s
+                   WHERE active_s.agent_id = agent_schedules.agent_id
+                     AND active_s.spec = agent_schedules.spec
+                     AND active_s.state = 'active'
+               )",
+            [],
         )?;
         Ok(updated)
     }
