@@ -371,8 +371,8 @@ impl Drop for ClaudeHarness {
 
 impl Harness for ClaudeHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let phase = {
-            let state = lock(&self.shared);
+        {
+            let mut state = lock(&self.shared);
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
@@ -397,22 +397,25 @@ impl Harness for ClaudeHarness {
             if let Some(reset_at_ms) = state.quota_reset_at_ms {
                 return Ok(DeliverOutcome::Quota { reset_at_ms });
             }
-            if state.open.is_empty() {
+            let phase = if state.open.is_empty() {
                 "idle"
             } else {
                 "turn"
-            }
-        };
+            };
+            state.phases.insert(message.id.clone(), phase);
+            accept_message(&mut state, &message.id);
+        }
         let line = Self::create_input(message);
         let write_res = write_stdin(&self.stdin, &line);
         let mut state = lock(&self.shared);
         if write_res.is_err() {
             state.alive = false;
+            state.open.clear();
+            state.followups.clear();
+            state.seen.remove(&message.id);
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
-        state.phases.insert(message.id.clone(), phase);
-        accept_message(&mut state, &message.id);
         Ok(DeliverOutcome::Accepted {
             turn_finished: state.finished.contains(&message.id)
                 && !state.failures.iter().any(|(item, _)| item == &message.id),
@@ -540,7 +543,7 @@ impl Harness for ClaudeHarness {
 
     fn inject(&mut self, message: &OutboundMessage) -> Result<bool, HarnessError> {
         {
-            let state = lock(&self.shared);
+            let mut state = lock(&self.shared);
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
@@ -552,22 +555,25 @@ impl Harness for ClaudeHarness {
             if state.seen.contains(&message.id) {
                 return Ok(false);
             }
+            state.seen.insert(message.id.clone());
+            state.written.push(message.id.clone());
+            if state.open.is_empty() {
+                state.turns_started += 1;
+                state.open.push(message.id.clone());
+            } else {
+                state.followups.push(message.id.clone());
+            }
         }
         let line = Self::steer_input_line(message);
         let write_res = write_stdin(&self.stdin, &line);
-        let mut state = lock(&self.shared);
         if write_res.is_err() {
+            let mut state = lock(&self.shared);
             state.alive = false;
+            state.open.clear();
+            state.followups.clear();
+            state.seen.remove(&message.id);
             self.wake.notify_all();
             return Err(HarnessError::Dead);
-        }
-        state.seen.insert(message.id.clone());
-        state.written.push(message.id.clone());
-        if state.open.is_empty() {
-            state.turns_started += 1;
-            state.open.push(message.id.clone());
-        } else {
-            state.followups.push(message.id.clone());
         }
         Ok(true)
     }

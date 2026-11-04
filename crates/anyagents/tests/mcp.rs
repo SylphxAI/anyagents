@@ -11,7 +11,10 @@ use serde::Deserialize;
 
 fn bin() -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_anyagents"));
-    cmd.env("ANYAGENTS_TESTS", "1");
+    cmd.env("ANYAGENTS_TESTS", "1")
+        .env_remove("ANYAGENTS_AGENT_ROUTE")
+        .env_remove("ANYAGENTS_DATA")
+        .env_remove("ANYAGENTS_AGENT_ID");
     cmd
 }
 
@@ -516,6 +519,43 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(to_children.deliveries.len(), 1);
     assert_eq!(to_children.deliveries[0].to, "agent:worker-1");
+
+    // Multi-level hierarchy (`Root -> L1 -> L2`): `worker-1` spawns a child `worker-1-child` (`L2`),
+    // and `worker-1-child` can message its direct `L1` parent via `to: ["parent"]` and `to: ["worker-1"]`.
+    let worker_1 = connect(dir.path(), "worker-1").await;
+    let spawned_l2: AgentView = ok_json(
+        call(
+            &worker_1,
+            "agents",
+            serde_json::json!({
+                "action": "spawn",
+                "name": "worker-1-child",
+                "prompt": "nested L2 child"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(spawned_l2.parent.as_deref(), Some(spawned.id.as_str()));
+    let worker_l2 = connect(dir.path(), "worker-1-child").await;
+    let l2_to_parent: SendResponse = ok_json(
+        call(
+            &worker_l2,
+            "send",
+            serde_json::json!({"to": ["parent"], "text": "L2 reporting to L1 parent"}),
+        )
+        .await,
+    );
+    assert_eq!(l2_to_parent.deliveries.len(), 1);
+    assert_eq!(l2_to_parent.deliveries[0].to, "agent:worker-1");
+
+    let _: AgentView = ok_json(
+        call(
+            &worker_1,
+            "archive",
+            serde_json::json!({"agent": &spawned_l2.id}),
+        )
+        .await,
+    );
 
     // Root `send(to: ["all"])` / `send(to: ["peers"])` is strictly scoped to Root peers (`parent_id.is_none()`),
     // so even while `worker-1` is `running`, `to: ["all"]` delivers ONLY to `agent:beta` and never leaks into sub-agents!

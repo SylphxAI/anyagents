@@ -64,6 +64,16 @@ impl SylphxExecutionMode {
                             .and_then(Value::as_str)
                             .map(|s| s.trim().to_ascii_lowercase())
                     })
+            })
+            .or_else(|| {
+                std::fs::read_to_string(config_dir.join("sylphx-workspace-placement.json"))
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                    .and_then(|v| {
+                        v.get("placement")
+                            .and_then(Value::as_str)
+                            .map(|s| s.trim().to_ascii_lowercase())
+                    })
             });
         match mode_str.as_deref() {
             Some("local" | "local_only" | "native") => Self::LocalOnly,

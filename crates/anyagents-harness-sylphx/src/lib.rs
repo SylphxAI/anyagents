@@ -215,6 +215,20 @@ pub fn resolve_cloud_agent_environment(
     config_dir: &Path,
     env: &[(String, String)],
 ) -> Option<String> {
+    if std::fs::read_to_string(config_dir.join("sylphx-workspace-placement.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| {
+            v.get("placement")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().eq_ignore_ascii_case("local"))
+        })
+        == Some(true)
+    {
+        clear_persisted_cloud_session(config_dir);
+        let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
+        return None;
+    }
     if matches!(
         sdk::SylphxExecutionMode::from_env(config_dir, env),
         sdk::SylphxExecutionMode::LocalOnly
@@ -4914,5 +4928,23 @@ exec "$@"
         assert_eq!(receipt.mode, "unchanged");
         assert!(!receipt.placement_changed);
         assert_eq!(receipt.transcript_items, 3);
+
+        // When `sylphx-workspace-placement.json` specifies `"placement": "local"`,
+        // `resolve_cloud_agent_environment` returns `None` and purges any stale
+        // `sylphx-cloud-session.json` / `sylphx-sandbox-lease.json`.
+        save_persisted_cloud_session(cfg, &saved);
+        std::fs::write(cfg.join("sylphx-sandbox-lease.json"), "{}").unwrap();
+        std::fs::write(
+            cfg.join("sylphx-workspace-placement.json"),
+            r#"{"placement":"local"}"#,
+        )
+        .unwrap();
+        assert_eq!(resolve_cloud_agent_environment(cfg, &[]), None);
+        assert!(load_persisted_cloud_session(cfg).is_none());
+        assert!(!cfg.join("sylphx-sandbox-lease.json").exists());
+        assert_eq!(
+            SylphxExecutionMode::from_env(cfg, &[]),
+            SylphxExecutionMode::LocalOnly
+        );
     }
 }
