@@ -652,8 +652,11 @@ struct SubagentsArgs {
     /// Optional working directory or workspace mode when `action = "spawn"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory), or `"inherit"` (default when `repo` is omitted: shares parent's `workdir`).
     #[serde(default)]
     workdir: Option<String>,
-    /// Optional system/role instructions when `action = "spawn"`.
-    #[serde(default, alias = "description", alias = "role")]
+    /// Optional concise public description when `action = "spawn"`.
+    #[serde(default)]
+    description: Option<String>,
+    /// Optional private system/role instructions when `action = "spawn"`.
+    #[serde(default, alias = "role")]
     instructions: Option<String>,
     /// Task prompt or follow-up message when `action` is `"spawn"`, `"steer"`, `"send"`, `"wake"`, or `"resume"`.
     #[serde(default, alias = "text", alias = "message")]
@@ -1605,7 +1608,7 @@ impl AgentMcp {
                         branch: args.branch,
                         base: args.base,
                         workdir: args.workdir,
-                        description: None,
+                        description: args.description,
                         instructions: args.instructions,
                         prompt: args.prompt,
                     }))
@@ -2114,4 +2117,41 @@ pub(crate) async fn request_naming(
         .to_bytes()
         .to_vec();
     Ok((status, bytes))
+}
+
+#[cfg(test)]
+mod spawn_args_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn spawn_routes_accept_separate_description_and_instructions() {
+        let input = json!({
+            "action": "spawn",
+            "name": "worker",
+            "description": "Public role",
+            "instructions": "Private instructions"
+        });
+        let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+        let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+        let subagents: SubagentsArgs = serde_json::from_value(input).unwrap();
+        for (description, instructions) in [
+            (agents.description, agents.instructions),
+            (spawn.description, spawn.instructions),
+            (subagents.description, subagents.instructions),
+        ] {
+            assert_eq!(description.as_deref(), Some("Public role"));
+            assert_eq!(instructions.as_deref(), Some("Private instructions"));
+        }
+    }
+
+    #[test]
+    fn subagents_preserves_description_without_synthesizing_instructions() {
+        let args: SubagentsArgs = serde_json::from_value(json!({
+            "action": "spawn", "description": "Public role"
+        }))
+        .unwrap();
+        assert_eq!(args.description.as_deref(), Some("Public role"));
+        assert!(args.instructions.is_none());
+    }
 }

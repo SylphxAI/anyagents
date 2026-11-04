@@ -128,7 +128,7 @@ pub struct CreateAgentRequest {
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -395,4 +395,48 @@ pub struct InteractResponse {
     pub target: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+#[cfg(test)]
+mod create_agent_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn description_and_instructions_remain_independent() {
+        let request: CreateAgentRequest = serde_json::from_value(json!({
+            "name": "worker",
+            "description": "Public role",
+            "instructions": "Private instructions"
+        }))
+        .unwrap();
+        assert_eq!(request.description.as_deref(), Some("Public role"));
+        assert_eq!(
+            request.instructions.as_deref(),
+            Some("Private instructions")
+        );
+        let serialized = serde_json::to_value(request).unwrap();
+        assert_eq!(serialized["description"], "Public role");
+        assert_eq!(serialized["instructions"], "Private instructions");
+    }
+
+    #[test]
+    fn absent_instructions_are_omitted_for_older_daemons() {
+        let request: CreateAgentRequest = serde_json::from_value(json!({
+            "name": "worker", "description": "Legacy instructions"
+        }))
+        .unwrap();
+        assert!(request.instructions.is_none());
+        let serialized = serde_json::to_value(request).unwrap();
+        assert!(serialized.get("instructions").is_none());
+
+        // Older daemons treated description as an alias for instructions.
+        #[derive(Deserialize)]
+        struct LegacyRequest {
+            #[serde(default, alias = "description")]
+            instructions: Option<String>,
+        }
+        let legacy: LegacyRequest = serde_json::from_value(serialized).unwrap();
+        assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
+    }
 }

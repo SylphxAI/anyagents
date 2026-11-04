@@ -632,6 +632,38 @@ async fn mcp_tools_use_the_server_socket() {
         assert_eq!(after_meta.gid(), before_gid);
     }
 
+    for route in ["agents", "subagents"] {
+        let worker: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                route,
+                serde_json::json!({
+                    "action": "spawn",
+                    "name": format!("{route}-separate-instructions"),
+                    "description": "Public role",
+                    "instructions": "Private instructions"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(worker["description"], "Public role");
+        assert_eq!(worker["instructions"], "Private instructions");
+    }
+    let legacy_worker: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({
+                "action": "spawn",
+                "name": "description-only",
+                "description": "Legacy instructions"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(legacy_worker["description"], "Legacy instructions");
+    assert_eq!(legacy_worker["instructions"], "Legacy instructions");
+
     alpha.cancel().await.unwrap();
     beta.cancel().await.unwrap();
     drop(server);

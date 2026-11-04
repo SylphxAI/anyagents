@@ -3913,7 +3913,9 @@ fn call_anyagents_mcp_tool(
     cmd.args(mcp_args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // Stderr is not part of the response. Do not let diagnostics fill a
+        // pipe while we wait for the tool's stdout response.
+        .stderr(Stdio::null());
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -3943,37 +3945,131 @@ fn call_anyagents_mcp_tool(
             "arguments": normalized_args,
         }
     });
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "{init_req}");
-        let _ = writeln!(stdin, "{init_notif}");
-        let _ = writeln!(stdin, "{call_req}");
-    }
-    let Ok(out) = child.wait_with_output() else {
-        return format!("error: failed waiting on anyagents mcp for `{tool_name}`");
-    };
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    for line in stdout.lines().rev() {
-        if let Ok(val) = serde_json::from_str::<Value>(line)
-            && val.get("id").and_then(Value::as_i64) == Some(1)
-        {
-            if let Some(text) = val
-                .pointer("/result/content/0/text")
-                .and_then(Value::as_str)
+    let mut stdin = child.stdin.take().expect("piped MCP stdin");
+    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped MCP stdout"));
+    let response = (|| -> Result<Value, String> {
+        for request in [init_req, init_notif, call_req] {
+            writeln!(stdin, "{request}").map_err(|err| format!("writing MCP request: {err}"))?;
+        }
+        // EOF terminates rmcp's transport and cancels asynchronous tools. Keep
+        // stdin open until our response arrives, ignoring init and notifications.
+        for line in (&mut stdout).lines() {
+            let line = line.map_err(|err| format!("reading MCP response: {err}"))?;
+            if let Ok(value) = serde_json::from_str::<Value>(&line)
+                && value.get("id").and_then(Value::as_i64) == Some(1)
             {
-                return truncate_tool_output_middle_utf8(text.to_string(), 64_000, 30_000, 30_000);
-            }
-            if let Some(err) = val.pointer("/error/message").and_then(Value::as_str) {
-                return format!("error: {err}");
+                return Ok(value);
             }
         }
+        Err("MCP server closed stdout before tool response".to_string())
+    })();
+    drop(stdin);
+    if response.is_err() {
+        let _ = child.kill();
     }
-    truncate_tool_output_middle_utf8(stdout.trim().to_string(), 64_000, 30_000, 30_000)
+    // Drain any trailing output after closing stdin so shutdown cannot block on
+    // a full stdout pipe, then reap the server on success and failure alike.
+    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+    if child.wait().is_err() {
+        return format!("error: failed waiting on anyagents mcp for `{tool_name}`");
+    }
+    let value = match response {
+        Ok(value) => value,
+        Err(err) => return format!("error: {err}"),
+    };
+    if let Some(err) = value.pointer("/error/message").and_then(Value::as_str) {
+        return format!("error: {err}");
+    }
+    let output = value
+        .pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    truncate_tool_output_middle_utf8(output, 64_000, 30_000, 30_000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use anyagents_harness::Context;
+
+    fn mcp_fixture_args(mode: &str) -> Vec<String> {
+        vec![
+            "-c".to_string(),
+            include_str!("../tests/fixtures/mcp_stdio.py").to_string(),
+            mode.to_string(),
+        ]
+    }
+
+    #[test]
+    fn mcp_stdio_waits_for_tool_response_before_closing_stdin() {
+        for (mode, expected) in [
+            ("success", r#"{"snapshot":"ready"}"#),
+            ("error", "error: snapshot failed"),
+        ] {
+            let output = call_anyagents_mcp_tool(
+                Path::new("python3"),
+                &mcp_fixture_args(mode),
+                &[],
+                "browser",
+                &json!({"action": "snapshot"}),
+            );
+            assert_eq!(output, expected, "mode: {mode}");
+        }
+    }
+
+    #[test]
+    fn mcp_stdio_rejects_initialize_without_tool_response() {
+        let output = call_anyagents_mcp_tool(
+            Path::new("python3"),
+            &mcp_fixture_args("initialize_only"),
+            &[],
+            "browser",
+            &json!({"action": "snapshot"}),
+        );
+        assert!(output.starts_with("error:"), "{output}");
+        assert!(!output.contains("capabilities"), "{output}");
+    }
+
+    #[test]
+    fn code_mode_mcp_stdio_observes_response_and_eof_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (mode, code, expected) in [
+            (
+                "success",
+                "print(mcp('browser', action='snapshot')['snapshot'])",
+                "ready",
+            ),
+            (
+                "error",
+                "try:\n    mcp('browser', action='snapshot')\nexcept RuntimeError as error:\n    print(error)",
+                "snapshot failed",
+            ),
+            (
+                "initialize_only",
+                "try:\n    mcp('browser', action='snapshot')\nexcept RuntimeError as error:\n    print(error)",
+                "MCP server closed stdout before tool response",
+            ),
+        ] {
+            let command = build_code_mode_command(
+                code,
+                tmp.path(),
+                Path::new("python3"),
+                &mcp_fixture_args(mode),
+            );
+            let output = Command::new("sh").args(["-c", &command]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                expected,
+                "mode: {mode}"
+            );
+        }
+    }
 
     #[test]
     fn write_sylphx_config_creates_valid_runtime_files() {
