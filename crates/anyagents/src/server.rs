@@ -952,15 +952,15 @@ fn reconcile_stopped_and_backed_off_agents(
     for idx in ordered_indices {
         let agent = &agents[idx];
         if agent.state == "archived" && !health.get(&agent.id).is_some_and(|l| l.process_alive) {
-            if agent.parent_id.is_some()
-                && data
-                    .join("agents")
-                    .join(agent.id.as_str())
-                    .join("work")
-                    .join(".git")
-                    .exists()
-            {
-                reap_subagent_ephemeral_dirs(data, &agent.id);
+            if agent.parent_id.is_some() {
+                let agent_dir = data.join("agents").join(agent.id.as_str());
+                if agent_dir.join("work").join(".git").exists()
+                    || agent_dir.join("config").join("shell-snapshots").exists()
+                    || agent_dir.join("config").join(".claude").exists()
+                    || agent_dir.join("config").join(".gemini").exists()
+                {
+                    reap_subagent_ephemeral_dirs(data, &agent.id);
+                }
             }
             continue;
         }
@@ -3463,11 +3463,25 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         ".rustup",
         ".tmp",
         "tmp",
+        ".claude",
+        ".codex",
+        ".config",
+        "opencode",
+        "projects",
+        "shell-snapshots",
+        "session-env",
+        "todos",
+        "logs",
     ] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
     }
     remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
+    let _ = std::fs::remove_file(
+        data_dir
+            .join("locks")
+            .join(format!("{}.lock", agent_id.as_str())),
+    );
     create::ensure_seat_environment(&config_dir);
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Ok(store) = Store::open(data_dir.join("state.db")) {
@@ -3522,9 +3536,25 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
                 reap_build_outputs_in_worktree(&work_dir, seat_ids);
             }
         } else {
-            remove_path_with_seat(&work_dir, seat_ids);
-            if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
-                let _ = std::fs::remove_file(&marker_path);
+            let mut preserved_dirty_child = false;
+            if let Ok(entries) = std::fs::read_dir(&work_dir) {
+                for entry in entries.flatten() {
+                    let child_path = entry.path();
+                    if child_path.is_dir() && child_path.join(".git").exists() {
+                        if is_git_worktree_safe_to_reap(&child_path, None) {
+                            reap_git_worktree_cleanly(&child_path, seat_ids);
+                        } else {
+                            reap_build_outputs_in_worktree(&child_path, seat_ids);
+                            preserved_dirty_child = true;
+                        }
+                    }
+                }
+            }
+            if !preserved_dirty_child {
+                remove_path_with_seat(&work_dir, seat_ids);
+                if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
+                    let _ = std::fs::remove_file(&marker_path);
+                }
             }
         }
     }

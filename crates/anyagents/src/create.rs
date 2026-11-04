@@ -115,6 +115,10 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
         );
         let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
+        let wd_is_legacy_external = !crate::sandbox::is_isolated_test_env()
+            && (wd_str.starts_with("/scratch/wt")
+                || wd_str.starts_with("/scratch/tmp")
+                || wd_str.starts_with("/workspace-data/desk-repair-prep"));
         let effective_repo = request
             .repo
             .as_deref()
@@ -122,6 +126,11 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             .filter(|s| !s.is_empty())
             .or(if wd_is_worktree_keyword {
                 Some("inherit")
+            } else if wd_is_legacy_external
+                && Path::new(wd_str).is_dir()
+                && is_git_repo_dir(Path::new(wd_str))
+            {
+                Some(wd_str)
             } else {
                 None
             });
@@ -129,6 +138,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             || wd_is_worktree_keyword
             || wd_is_private_keyword
             || wd_is_inherit_keyword
+            || wd_is_legacy_external
         {
             None
         } else {
@@ -818,7 +828,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
              - **Target a Specific Repository (`repo: \"<org>/<repo>\"` or git path/URL)**: Automatically provisions an isolated Git worktree for that agent at `<data>/agents/<id>/work` on branch `agent/<name>` (or custom `branch` from `base`).\n\
              - **Isolated Branch of Your Current Repository (`repo: \"inherit\"` or `workdir: \"worktree\"`)**: Branches a new isolated Git worktree at `<data>/agents/<id>/work` from your current Git repo and `HEAD` — use this whenever spawning parallel coding sub-agents on the same repo so they never collide on `.git/index.lock` or uncommitted edits.\n\
              - **Private Empty Sandbox (`workdir: \"private\"`)**: Gives the agent its own clean directory at `<data>/agents/<id>/work`.\n\
-             - **Default When `repo` and `workdir` Are Omitted**: A sub-agent inherits its parent's `workdir` (`\"inherit\"`) so it immediately works in the same directory/repo as its parent; a root agent defaults to its own isolated `<data>/agents/<id>/work`.\n\
+             - **Default When `repo` and `workdir` Are Omitted**: Every agent and sub-agent defaults to its own isolated `<data>/agents/<id>/work` (pass `workdir: \"inherit\"` only when explicitly sharing your parent directory).\n\
            - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
            - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
