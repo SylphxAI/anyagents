@@ -702,12 +702,12 @@ fn clean_agent_description(
         let after_goal = line[4..].trim_start();
         if let Some(after_colon) = after_goal.strip_prefix(':') {
             line = after_colon.trim();
-        } else if rest.starts_with(' ') || rest.starts_with('(') {
-            if let Some(colon_idx) = after_goal.find("):") {
-                let candidate = after_goal[colon_idx + 2..].trim();
-                if !candidate.is_empty() {
-                    line = candidate;
-                }
+        } else if (rest.starts_with(' ') || rest.starts_with('('))
+            && let Some(colon_idx) = after_goal.find("):")
+        {
+            let candidate = after_goal[colon_idx + 2..].trim();
+            if !candidate.is_empty() {
+                line = candidate;
             }
         }
     } else {
@@ -1190,6 +1190,7 @@ fn style_usage_suffix(suffix: &str, is_exhausted: bool) -> String {
 }
 
 /// Format a profile's `usage` string with semantic per-window colors and highlighted reset timers.
+#[allow(dead_code)]
 pub fn format_profile_usage(usage: Option<&str>) -> String {
     let Some(u) = usage.map(str::trim).filter(|s| !s.is_empty()) else {
         return dim("-");

@@ -1080,20 +1080,15 @@ fn discover_peer_bots_in_chat(
         };
         let probe_tok = other_token.as_deref().unwrap_or(token);
         match cached_probe_member_status(probe_tok, chat_id, &bot) {
-            Some(true) => {
-                if !already_attached {
-                    other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
-                    let _ = save_channel_memory_merged(store, &other.id, &mut other_mem, &[]);
-                }
+            Some(true) if !already_attached => {
+                other_mem.attach_typed(other_agent_id.as_str(), chat_id, Some(chat_type));
+                let _ = save_channel_memory_merged(store, &other.id, &mut other_mem, &[]);
             }
-            Some(false) => {
-                if is_live && already_attached {
-                    other_mem.chats.retain(|l| l.chat_id != chat_id);
-                    let _ =
-                        save_channel_memory_merged(store, &other.id, &mut other_mem, &[chat_id]);
-                }
+            Some(false) if is_live && already_attached => {
+                other_mem.chats.retain(|l| l.chat_id != chat_id);
+                let _ = save_channel_memory_merged(store, &other.id, &mut other_mem, &[chat_id]);
             }
-            None => {}
+            _ => {}
         }
     }
 }

@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+#[allow(unused_imports)]
 pub use anyagents_harness_sylphx::{
     CLOUD_WORKSPACE_DIR, DEFAULT_SYLPHX_MODEL, SylphxHarness, read_sylphx_key_from_dir,
     release_persisted_sandbox_lease, resolve_sylphx_cloud_access_key, run_device_flow_login,
