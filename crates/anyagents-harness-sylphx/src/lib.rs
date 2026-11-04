@@ -23,7 +23,6 @@ mod aci;
 mod auth;
 mod cloud;
 mod memory;
-mod placement;
 pub mod sdk;
 mod workspace;
 
@@ -217,42 +216,39 @@ pub fn resolve_cloud_agent_environment(
     env: &[(String, String)],
 ) -> Option<String> {
     if matches!(
-        placement::selected(config_dir, env),
-        Ok(Some(placement::WorkspacePlacement::Local))
-    ) {
-        return None;
-    }
-    if matches!(
         sdk::SylphxExecutionMode::from_env(config_dir, env),
         sdk::SylphxExecutionMode::LocalOnly
     ) {
         return None;
     }
-    let raw_sbx = env
-        .iter()
-        .find(|(k, v)| k == "SYLPHX_SANDBOX" && !v.trim().is_empty())
-        .map(|(_, v)| v.trim().to_ascii_lowercase())
-        .or_else(|| {
-            std::env::var("SYLPHX_SANDBOX")
-                .ok()
-                .map(|s| s.trim().to_ascii_lowercase())
-                .filter(|s| !s.is_empty())
-        });
-    if matches!(
-        raw_sbx.as_deref(),
-        Some("none" | "stateless" | "off" | "false" | "0" | "local" | "host")
-    ) {
-        return None;
-    }
     for (k, v) in env {
         if k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty() {
-            return Some(normalize_cloud_env_slug(v.trim()));
+            let trimmed = v.trim();
+            if matches!(
+                trimmed.to_ascii_lowercase().as_str(),
+                "local" | "none" | "off" | "false" | "0"
+            ) {
+                return None;
+            }
+            return Some(normalize_cloud_env_slug(trimmed));
         }
     }
     if let Ok(v) = std::env::var("SYLPHX_AGENT_ENV")
         && !v.trim().is_empty()
     {
-        return Some(normalize_cloud_env_slug(v.trim()));
+        let trimmed = v.trim();
+        if matches!(
+            trimmed.to_ascii_lowercase().as_str(),
+            "local" | "none" | "off" | "false" | "0"
+        ) {
+            return None;
+        }
+        return Some(normalize_cloud_env_slug(trimmed));
+    }
+    if let Some(persisted) = load_persisted_cloud_session(config_dir)
+        && !persisted.env_slug.trim().is_empty()
+    {
+        return Some(normalize_cloud_env_slug(&persisted.env_slug));
     }
     let ctx_path = config_dir.join(".config/sylphx/context.json");
     if let Ok(raw) = std::fs::read_to_string(ctx_path)
@@ -267,8 +263,10 @@ pub fn resolve_cloud_agent_environment(
     {
         return Some(normalize_cloud_env_slug(env_slug));
     }
-    if !crate::sandbox::is_isolated_test_env()
-        && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
+    if matches!(
+        sdk::SylphxExecutionMode::from_env(config_dir, env),
+        sdk::SylphxExecutionMode::CloudOnly
+    ) && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
     {
         return Some(DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
     }
@@ -395,9 +393,6 @@ impl Harness for SylphxHarness {
                         if !crate::sandbox::is_isolated_test_env() {
                             Err(cloud_err)
                         } else {
-                            if !cloud_err.contains("turn timeout reached") {
-                                record_cloud_sandbox_fallback(&config_dir, &cloud_err);
-                            }
                             run_native_gateway_turn(
                                 &state,
                                 &cancel_flag,
@@ -957,9 +952,7 @@ pub(crate) fn run_cloud_session_turn(
                         .unwrap_or(0);
                     initial_last_seq = initial_last_seq.max(s_seq);
                     next_turn = tc.saturating_add(1);
-                    let has_legacy_pinned_repo = val.pointer("/environment/repo").is_some();
-                    if has_legacy_pinned_repo
-                        || status == "failed"
+                    if status == "failed"
                         || status == "session_state_failed"
                         || status == "terminated"
                         || status == "errored"
@@ -1070,9 +1063,19 @@ pub(crate) fn run_cloud_session_turn(
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&prior_block);
     }
-    let mut environment_spec = build_cloud_environment_spec(config_dir, None, env);
-    if let Some(obj) = environment_spec.as_object_mut() {
-        obj.remove("repo");
+    let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
+    if let Some(repo_uri) = environment_spec.pointer("/repo/uri").and_then(Value::as_str) {
+        let worktree_spec =
+            resolve_agent_git_worktree_spec(config_dir, Some(work_dir), env, None, None, None);
+        let branch_hint = worktree_spec
+            .branch
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .map(|b| format!(" (target branch: `{b}`)"))
+            .unwrap_or_default();
+        system_prompt.push_str(&format!(
+            "\n\n<cloud_workspace>\nYou are running as a Whole Cloud Agent inside a Cloud Sandbox container.\nYour repository (`{repo_uri}`) is checked out at `{CLOUD_WORKSPACE_DIR}`{branch_hint}.\nRun all workspace commands (`bash`, `read_file`, `write_file`, `edit_file`, `git`) inside `{CLOUD_WORKSPACE_DIR}`.\n</cloud_workspace>"
+        ));
     }
 
     if agent_id.is_none() {
@@ -1488,7 +1491,6 @@ pub(crate) fn run_cloud_session_turn(
         }
 
         if self_archived {
-            release_persisted_sandbox_lease(config_dir);
             break;
         }
 
@@ -2155,7 +2157,6 @@ pub(crate) fn run_native_gateway_turn(
                 maybe_emit_context_watermark_event(&transcript_path, &mut input_items);
             }
             if self_archived {
-                release_persisted_sandbox_lease(config_dir);
                 break;
             }
             continue;
@@ -2372,9 +2373,6 @@ pub fn run_stdio_adapter(
                         if !crate::sandbox::is_isolated_test_env() {
                             Err(cloud_err)
                         } else {
-                            if !cloud_err.contains("turn timeout reached") {
-                                record_cloud_sandbox_fallback(&cfg_cl, &cloud_err);
-                            }
                             run_native_gateway_turn(
                                 &state_cl,
                                 &cancel_cl,
@@ -2863,27 +2861,6 @@ fn build_tool_definitions() -> Vec<Value> {
         json!({
             "type": "function",
             "function": {
-                "name": "sandbox",
-                "description": "Manage workspace placement and Cloud Kata microVM Sandbox. `placement` reads or persistently selects own `local`/`cloud` placement without changing session, model, principal or lease. Explicit selection never silently falls back. `release` releases a lease only; it does not select placement.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "action": { "type": "string" },
-                        "repo": { "type": "string" },
-                        "branch": { "type": "string" },
-                        "base": { "type": "string" },
-                        "placement": { "type": "string", "enum": ["local", "cloud"] },
-                        "command": { "type": "string" },
-                        "path": { "type": "string" },
-                        "content": { "type": "string" }
-                    },
-                    "required": ["action"]
-                }
-            }
-        }),
-        json!({
-            "type": "function",
-            "function": {
                 "name": "code_mode",
                 "description": "Programmatic Tool Calling (Python SDK: `read`, `write`, `edit`, `files`, `grep`, `sh`, `mcp`, `agents`, `send`, `conversation`, `schedule`, `recall`). Only `print(...)` enters context.",
                 "parameters": {
@@ -3147,27 +3124,6 @@ fn execute_sylphx_tool(
     mcp_args: &[String],
 ) -> String {
     let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
-    let workspace_tool = matches!(
-        normalized,
-        "bash"
-            | "shell"
-            | "code_mode"
-            | "read_file"
-            | "write_file"
-            | "edit_file"
-            | "apply_patch"
-            | "grep"
-            | "glob"
-            | "list_dir"
-    );
-    let explicit_placement = match placement::selected(config_dir, env) {
-        Ok(selected) => selected,
-        Err(e) if workspace_tool => return format!("error: {e}"),
-        Err(_) => None, // Coordination/status remains usable to repair a selection.
-    };
-    let sandbox_mode = explicit_placement
-        .map(|p| p.as_str().to_string())
-        .unwrap_or_else(|| resolve_sandbox_mode(config_dir, env));
     match normalized {
         "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
         | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
@@ -3330,36 +3286,13 @@ fn execute_sylphx_tool(
             serde_json::to_string_pretty(&current).unwrap_or_default()
         }
         "apply_patch" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let Some(patch_str) = args.get("patch").and_then(Value::as_str) else {
                 return "error: missing `patch`".to_string();
             };
-            if sandbox_mode != "cloud" {
-                return match apply_patch_universal(work_dir, patch_str, env) {
-                    Ok(msg) => msg,
-                    Err(e) => format!("error applying patch: {e}"),
-                };
+            match apply_patch_universal(work_dir, patch_str, env) {
+                Ok(msg) => msg,
+                Err(e) => format!("error applying patch: {e}"),
             }
-            let patch_b64 = base64_encode(patch_str.as_bytes());
-            let script = format!(
-                "tmp_patch=$(mktemp /tmp/sylphx-patch.XXXXXX) && printf '%s' '{patch_b64}' | base64 -d > \"$tmp_patch\" && \
-                 (git apply --recount -C1 --whitespace=nowarn \"$tmp_patch\" 2>/dev/null || \
-                  git apply --recount -p0 -C1 --whitespace=nowarn \"$tmp_patch\" 2>/dev/null || \
-                  patch -p1 --fuzz=3 --no-backup-if-mismatch < \"$tmp_patch\" 2>/dev/null || \
-                  git apply --recount --whitespace=nowarn \"$tmp_patch\"); \
-                 rc=$?; rm -f \"$tmp_patch\"; exit $rc"
-            );
-            execute_sylphx_tool(
-                "bash",
-                &json!({ "command": script }),
-                config_dir,
-                work_dir,
-                env,
-                mcp_command,
-                mcp_args,
-            )
         }
         "grep" => {
             let Some(pat) = args.get("pattern").and_then(Value::as_str) else {
@@ -3405,11 +3338,8 @@ fn execute_sylphx_tool(
             )
         }
         "list_dir" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let path = args.get("path").and_then(Value::as_str).unwrap_or(".");
-            if sandbox_mode != "cloud" && !workspace::delegated(env) {
+            if !workspace::delegated(env) {
                 return list_dir_native(work_dir, path);
             }
             let escaped_path = path.replace('\'', "'\\''");
@@ -3424,172 +3354,7 @@ fn execute_sylphx_tool(
                 mcp_args,
             )
         }
-        "sandbox" => {
-            let action = args
-                .get("action")
-                .and_then(Value::as_str)
-                .unwrap_or("status")
-                .trim();
-            match action {
-                "placement" => {
-                    if let Some(raw) = args.get("placement") {
-                        let Some(raw) = raw.as_str() else {
-                            return "error: placement must be a string".to_string();
-                        };
-                        if let Err(e) = placement::select(config_dir, env, raw) {
-                            return format!("error: {e}");
-                        }
-                    }
-                    match placement::selected(config_dir, env) {
-                        Ok(selected) => serde_json::to_string_pretty(&json!({
-                            "placement": selected,
-                            "effective_mode": selected.map(|p| p.as_str()).unwrap_or(&sandbox_mode),
-                            "worktree": selected.map(|p| if p == placement::WorkspacePlacement::Cloud {
-                                Path::new(CLOUD_WORKSPACE_DIR)
-                            } else { work_dir }),
-                            "applies_to": "next_workspace_tool",
-                            "session_changed": false,
-                            "lease_changed": false,
-                            "principal_changed": false,
-                        })).unwrap_or_default(),
-                        Err(e) => format!("error: {e}"),
-                    }
-                }
-                "status" | "help" | "info" | "inspect" | "get" => {
-                    let lease_path = config_dir.join("sylphx-sandbox-lease.json");
-                    if let Ok(raw) = std::fs::read_to_string(&lease_path)
-                        && let Ok(val) = serde_json::from_str::<Value>(&raw)
-                    {
-                        return serde_json::to_string_pretty(&json!({
-                            "mode": sandbox_mode,
-                            "active_lease": val,
-                        }))
-                        .unwrap_or_default();
-                    }
-                    serde_json::to_string_pretty(&json!({
-                        "mode": sandbox_mode,
-                        "active_lease": null,
-                    }))
-                    .unwrap_or_default()
-                }
-                "ensure" | "create" | "provision" | "start" | "init" => {
-                    let explicit_repo = args.get("repo").and_then(Value::as_str);
-                    let explicit_branch = args.get("branch").and_then(Value::as_str);
-                    let explicit_base = args.get("base").and_then(Value::as_str);
-                    match ensure_cloud_sandbox_lease_with_worktree(
-                        config_dir,
-                        Some(work_dir),
-                        env,
-                        explicit_repo,
-                        explicit_branch,
-                        explicit_base,
-                    ) {
-                        Ok((lease_name, uid)) => {
-                            let lease_meta = std::fs::read_to_string(
-                                config_dir.join("sylphx-sandbox-lease.json"),
-                            )
-                            .ok()
-                            .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-                            serde_json::to_string_pretty(&json!({
-                                "status": "ready",
-                                "lease": lease_name,
-                                "uid": uid,
-                                "image": "template:agent",
-                                "shape": resolve_sandbox_shape(env),
-                                "workspace_dir": CLOUD_WORKSPACE_DIR,
-                                "repo": lease_meta.as_ref().and_then(|v| v.get("repo")).cloned().unwrap_or(Value::Null),
-                                "branch": lease_meta.as_ref().and_then(|v| v.get("branch")).cloned().unwrap_or(Value::Null),
-                            }))
-                            .unwrap_or_default()
-                        }
-                        Err(e) => format!("error ensuring cloud sandbox lease: {e}"),
-                    }
-                }
-                "exec" => {
-                    let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
-                        return "error: missing `command`".to_string();
-                    };
-                    match exec_in_cloud_sandbox_with_work_dir(
-                        config_dir,
-                        Some(work_dir),
-                        env,
-                        cmd_str,
-                    ) {
-                        Ok(out) => out,
-                        Err(e) => format!("error executing in cloud sandbox: {e}"),
-                    }
-                }
-                "read_file" => {
-                    let Some(rel) = args.get("path").and_then(Value::as_str) else {
-                        return "error: missing `path`".to_string();
-                    };
-                    match read_file_in_cloud_sandbox_with_work_dir(
-                        config_dir,
-                        Some(work_dir),
-                        env,
-                        rel,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => format!("error reading `{rel}` in cloud sandbox: {e}"),
-                    }
-                }
-                "write_file" => {
-                    let Some(rel) = args.get("path").and_then(Value::as_str) else {
-                        return "error: missing `path`".to_string();
-                    };
-                    let Some(content) = args.get("content").and_then(Value::as_str) else {
-                        return "error: missing `content`".to_string();
-                    };
-                    match write_file_in_cloud_sandbox_with_work_dir(
-                        config_dir,
-                        Some(work_dir),
-                        env,
-                        rel,
-                        content,
-                    ) {
-                        Ok(s) => s,
-                        Err(e) => format!("error writing `{rel}` in cloud sandbox: {e}"),
-                    }
-                }
-                "release" | "delete" | "stop" => {
-                    release_persisted_sandbox_lease(config_dir);
-                    serde_json::to_string_pretty(&json!({
-                        "status": "lease_release_requested",
-                        "placement_changed": false,
-                        "placement": explicit_placement,
-                        "note": "Lease release does not change workspace placement; a later cloud tool may acquire a new lease.",
-                    })).unwrap_or_default()
-                }
-                "teleport" | "teleport_to_cloud" | "handoff_to_cloud" => {
-                    let explicit_env = args.get("env").and_then(Value::as_str);
-                    let model = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                        .ok()
-                        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                        .and_then(|v| v.get("model").and_then(Value::as_str).map(str::to_string));
-                    match teleport_session_to_cloud(
-                        config_dir,
-                        work_dir,
-                        model.as_deref(),
-                        env,
-                        explicit_env,
-                    ) {
-                        Ok(receipt) => serde_json::to_string_pretty(&receipt).unwrap_or_default(),
-                        Err(e) => format!("error teleporting session to cloud: {e}"),
-                    }
-                }
-                "pull" | "pull_from_cloud" | "fallback_to_local" => {
-                    match pull_session_from_cloud(config_dir, env) {
-                        Ok(receipt) => serde_json::to_string_pretty(&receipt).unwrap_or_default(),
-                        Err(e) => format!("error pulling session from cloud: {e}"),
-                    }
-                }
-                other => format!("error: unknown sandbox action `{other}`"),
-            }
-        }
         "code_mode" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let Some(code_str) = args.get("code").and_then(Value::as_str) else {
                 return "error: missing `code`".to_string();
             };
@@ -3609,28 +3374,9 @@ fn execute_sylphx_tool(
             )
         }
         "bash" | "shell" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let Some(cmd_str) = args.get("command").and_then(Value::as_str) else {
                 return "error: missing `command`".to_string();
             };
-            if sandbox_mode == "cloud" {
-                match exec_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, cmd_str)
-                {
-                    Ok(out) => return out,
-                    Err(e) => {
-                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
-                            return format!(
-                                "error: selected cloud placement failed (no local fallback): {e}"
-                            );
-                        }
-                        if !e.starts_with("ReadFile HTTP 404:") {
-                            record_cloud_sandbox_fallback(config_dir, &e);
-                        }
-                    }
-                }
-            }
             let timeout_ms = args
                 .get("timeout_ms")
                 .and_then(Value::as_u64)
@@ -3638,100 +3384,30 @@ fn execute_sylphx_tool(
             execute_bash_with_timeout(cmd_str, work_dir, env, timeout_ms)
         }
         "read_file" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
             let start_line = args.get("start_line").and_then(Value::as_u64);
             let end_line = args.get("end_line").and_then(Value::as_u64);
+            let target = resolve_workspace_path(work_dir, rel);
             if let Some(mime) = image_mime_for_path(rel) {
-                if sandbox_mode == "cloud" {
-                    match read_file_bytes_in_cloud_sandbox_with_work_dir(
-                        config_dir,
-                        Some(work_dir),
-                        env,
-                        rel,
-                    ) {
-                        Ok(bytes) => {
-                            return format_image_read_output(rel, mime, &bytes);
-                        }
-                        Err(e) => {
-                            if explicit_placement.is_some()
-                                || !crate::sandbox::is_isolated_test_env()
-                            {
-                                return format!(
-                                    "error: selected cloud placement failed (no local fallback): {e}"
-                                );
-                            }
-                            if !e.starts_with("ReadFile HTTP 404:") {
-                                record_cloud_sandbox_fallback(config_dir, &e);
-                            }
-                        }
-                    }
-                }
-                let target = resolve_workspace_path(work_dir, rel);
                 return match workspace::read_bytes(&target, env) {
                     Ok(bytes) => format_image_read_output(rel, mime, &bytes),
                     Err(e) => format!("error reading {}: {e}", target.display()),
                 };
             }
-            if sandbox_mode == "cloud" {
-                match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
-                {
-                    Ok(content) => {
-                        return format_read_file_output(rel, &content, start_line, end_line);
-                    }
-                    Err(e) => {
-                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
-                            return format!(
-                                "error: selected cloud placement failed (no local fallback): {e}"
-                            );
-                        }
-                        if !e.starts_with("ReadFile HTTP 404:") {
-                            record_cloud_sandbox_fallback(config_dir, &e);
-                        }
-                    }
-                }
-            }
-            let target = resolve_workspace_path(work_dir, rel);
             match workspace::read_to_string(&target, env) {
                 Ok(content) => format_read_file_output(rel, &content, start_line, end_line),
                 Err(e) => format!("error reading {}: {e}", target.display()),
             }
         }
         "write_file" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
             let Some(content) = args.get("content").and_then(Value::as_str) else {
                 return "error: missing `content`".to_string();
             };
-            if sandbox_mode == "cloud" {
-                match write_file_in_cloud_sandbox_with_work_dir(
-                    config_dir,
-                    Some(work_dir),
-                    env,
-                    rel,
-                    content,
-                ) {
-                    Ok(msg) => return msg,
-                    Err(e) => {
-                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
-                            return format!(
-                                "error: selected cloud placement failed (no local fallback): {e}"
-                            );
-                        }
-                        if !e.starts_with("ReadFile HTTP 404:") {
-                            record_cloud_sandbox_fallback(config_dir, &e);
-                        }
-                    }
-                }
-            }
             let target = resolve_workspace_path(work_dir, rel);
             if let Some(p) = target.parent()
                 && let Err(e) = workspace::create_dir_all(p, env)
@@ -3744,9 +3420,6 @@ fn execute_sylphx_tool(
             }
         }
         "edit_file" => {
-            if sandbox_mode == "none" {
-                return "error: sandbox is disabled (`SYLPHX_SANDBOX=none`)".to_string();
-            }
             let Some(rel) = args.get("path").and_then(Value::as_str) else {
                 return "error: missing `path`".to_string();
             };
@@ -3774,56 +3447,6 @@ fn execute_sylphx_tool(
                     return "error: missing `replacement`".to_string();
                 };
                 edits_vec.push((old_str.to_string(), new_str.to_string()));
-            }
-            if sandbox_mode == "cloud" {
-                match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
-                {
-                    Ok(existing) => {
-                        match apply_edits_to_content(&existing, &edits_vec, replace_all) {
-                            Ok((updated, ranges)) => {
-                                match write_file_in_cloud_sandbox_with_work_dir(
-                                    config_dir,
-                                    Some(work_dir),
-                                    env,
-                                    rel,
-                                    &updated,
-                                ) {
-                                    Ok(_) => {
-                                        let range_desc: Vec<String> = ranges
-                                            .iter()
-                                            .map(|(s, e)| format!("L{s}..L{e}"))
-                                            .collect();
-                                        return format!(
-                                            "edited `{rel}` in cloud sandbox ({})",
-                                            range_desc.join(", ")
-                                        );
-                                    }
-                                    Err(e) => {
-                                        if explicit_placement.is_some()
-                                            || !crate::sandbox::is_isolated_test_env()
-                                        {
-                                            return format!(
-                                                "error: selected cloud placement failed (no local fallback): {e}"
-                                            );
-                                        }
-                                        record_cloud_sandbox_fallback(config_dir, &e);
-                                    }
-                                }
-                            }
-                            Err(e) => return format!("error editing `{rel}`: {e}"),
-                        }
-                    }
-                    Err(e) => {
-                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
-                            return format!(
-                                "error: selected cloud placement failed (no local fallback): {e}"
-                            );
-                        }
-                        if !e.starts_with("ReadFile HTTP 404:") {
-                            record_cloud_sandbox_fallback(config_dir, &e);
-                        }
-                    }
-                }
             }
             let target = resolve_workspace_path(work_dir, rel);
             match workspace::read_to_string(&target, env) {
@@ -4387,34 +4010,16 @@ mod tests {
 
     #[test]
     fn cloud_sandbox_path_and_worktree_spec_resolution_work() {
-        assert_eq!(resolve_cloud_sandbox_path("."), "/home/user/workspace");
-        assert_eq!(
-            resolve_cloud_sandbox_path("crates/anyagents/src/lib.rs"),
-            "/home/user/workspace/crates/anyagents/src/lib.rs"
-        );
-        assert_eq!(
-            resolve_cloud_sandbox_path("./README.md"),
-            "/home/user/workspace/README.md"
-        );
-        assert_eq!(
-            resolve_cloud_sandbox_path("/workspace/src/main.rs"),
-            "/home/user/workspace/src/main.rs"
-        );
-        assert_eq!(
-            resolve_cloud_sandbox_path("/tmp/custom.txt"),
-            "/tmp/custom.txt"
-        );
-
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path();
         std::fs::write(
             cfg.join(".anyagents-managed-worktree.json"),
             serde_json::to_string_pretty(&json!({
-                "path": "/home/user/workspace",
+                "path": "/workspace/repository",
                 "cloud_sandbox": true,
                 "repo": "git@github.com:SylphxAI/anyagents.git",
                 "branch": "agent/cloud-worker",
-                "base": "main",
+                "base": "0123456789abcdef0123456789abcdef01234567",
             }))
             .unwrap(),
         )
@@ -4431,9 +4036,8 @@ mod tests {
         let agent_json: Value =
             serde_json::from_str(&std::fs::read_to_string(cfg.join("sylphx-agent.json")).unwrap())
                 .unwrap();
-        assert_eq!(agent_json["sandbox"], "cloud");
         assert_eq!(agent_json["branch"], "agent/cloud-worker");
-        assert_eq!(resolve_sandbox_mode(cfg, &[]), "cloud");
+        assert!(agent_json.get("sandbox").is_none());
 
         let spec = resolve_agent_git_worktree_spec(cfg, None, &[], None, None, None);
         assert_eq!(
@@ -4442,7 +4046,10 @@ mod tests {
         );
         assert_eq!(spec.repo_slug.as_deref(), Some("SylphxAI/anyagents"));
         assert_eq!(spec.branch.as_deref(), Some("agent/cloud-worker"));
-        assert_eq!(spec.base.as_deref(), Some("main"));
+        assert_eq!(
+            spec.base.as_deref(),
+            Some("0123456789abcdef0123456789abcdef01234567")
+        );
 
         let env_spec = build_cloud_environment_spec(cfg, None, &[]);
         assert_eq!(env_spec["shape"], "linux-s");
@@ -4452,7 +4059,10 @@ mod tests {
             env_spec["repo"]["uri"],
             "https://github.com/SylphxAI/anyagents.git"
         );
-        assert_eq!(env_spec["repo"]["revision"], "agent/cloud-worker");
+        assert_eq!(
+            env_spec["repo"]["revision"],
+            "0123456789abcdef0123456789abcdef01234567"
+        );
         assert!(env_spec["repo"].get("slug").is_none());
         assert!(env_spec["repo"].get("branch").is_none());
         assert!(env_spec["repo"].get("base").is_none());
@@ -4974,7 +4584,6 @@ exec "$@"
                     "WORKSPACE_TEST_LAUNCH_LOG".into(),
                     log.display().to_string(),
                 ),
-                ("SYLPHX_SANDBOX".into(), "cloud".into()),
             ],
             log,
         )
@@ -4991,7 +4600,6 @@ exec "$@"
                 "sylphx-transcript.jsonl",
                 "accepted/UNKNOWN operation; never replay",
             ),
-            ("sylphx-sandbox-lease.json", "{\"name\":\"retained-lease\"}"),
             (
                 "sylphx-cloud-session.json",
                 "{\"session_id\":\"retained-cloud\"}",
@@ -5007,26 +4615,17 @@ exec "$@"
     }
 
     #[test]
-    fn selected_local_next_tool_uses_worktree_and_inherited_uid_without_a_seat() {
+    fn local_workspace_tools_use_worktree_and_inherited_uid_without_a_seat() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
         let work = tmp.path().join("selected worktree");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         let preserved = workspace_continuity_fixture(&cfg);
-        let env = vec![("SYLPHX_SANDBOX".into(), "cloud".into())];
+        let env = Vec::new();
         let tool = |name, args: Value| {
             execute_sylphx_tool(name, &args, &cfg, &work, &env, Path::new("unused-mcp"), &[])
         };
-        let receipt: Value = serde_json::from_str(&tool(
-            "sandbox",
-            json!({"action":"placement", "placement":"local"}),
-        ))
-        .unwrap();
-        assert_eq!(receipt["placement"], "local");
-        assert_eq!(receipt["worktree"], work.display().to_string());
-        assert_eq!(receipt["session_changed"], false);
-        assert_eq!(receipt["lease_changed"], false);
         let uid = Command::new("id").arg("-u").output().unwrap();
         let out = tool(
             "bash",
@@ -5058,17 +4657,6 @@ exec "$@"
         let tool = |name, args: Value| {
             execute_sylphx_tool(name, &args, &cfg, &work, &env, Path::new("unused-mcp"), &[])
         };
-        assert!(
-            tool(
-                "sandbox",
-                json!({"action":"placement", "placement":"local"})
-            )
-            .contains("next_workspace_tool")
-        );
-        assert!(
-            !log.exists(),
-            "selection must not run a workspace operation"
-        );
         let cases = [
             (
                 "bash",
@@ -5153,40 +4741,19 @@ exec "$@"
 
     #[test]
     #[cfg(unix)]
-    fn invalid_placement_and_failed_trusted_launcher_never_fall_back_or_mutate_continuity() {
+    fn failed_trusted_launcher_never_falls_back_or_mutates_continuity() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
         let work = tmp.path().join("work");
         std::fs::create_dir_all(&cfg).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         std::fs::write(work.join("retained"), "original").unwrap();
-        let mut preserved = workspace_continuity_fixture(&cfg);
+        let preserved = workspace_continuity_fixture(&cfg);
         let (mut env, log) = workspace_test_launcher(tmp.path());
         env.push(("WORKSPACE_TEST_REFUSE".into(), "1".into()));
         let tool = |name, args: Value, env: &[(String, String)]| {
             execute_sylphx_tool(name, &args, &cfg, &work, env, Path::new("unused-mcp"), &[])
         };
-        assert!(
-            tool(
-                "sandbox",
-                json!({"action":"placement", "placement":"local"}),
-                &env
-            )
-            .contains("next_workspace_tool")
-        );
-        let selection = cfg.join("sylphx-workspace-placement.json");
-        preserved.push((selection.clone(), std::fs::read(&selection).unwrap()));
-        for invalid in ["other-seat", "", "auto"] {
-            assert!(
-                tool(
-                    "sandbox",
-                    json!({"action":"placement", "placement":invalid}),
-                    &env
-                )
-                .starts_with("error:")
-            );
-        }
-        assert!(!log.exists());
         for (name, args) in [
             ("bash", json!({"command":"printf forbidden > retained"})),
             ("read_file", json!({"path":"retained"})),
@@ -5275,302 +4842,6 @@ exec "$@"
             assert!(out.contains("invalid trusted workspace launcher"), "{out}");
         }
         assert_eq!(std::fs::read(&log).unwrap(), count);
-        let mut revoked = env.clone();
-        revoked.push(("SYLPHX_WORKSPACE_PLACEMENTS".into(), "cloud".into()));
-        assert!(
-            tool(
-                "write_file",
-                json!({"path":"retained", "content":"forbidden"}),
-                &revoked
-            )
-            .contains("not granted")
-        );
-        assert_eq!(std::fs::read(&log).unwrap(), count);
-        std::fs::write(&selection, "corrupt").unwrap();
-        assert!(
-            tool(
-                "bash",
-                json!({"command":"printf forbidden > retained"}),
-                &env
-            )
-            .starts_with("error:")
-        );
-        assert_eq!(std::fs::read(&selection).unwrap(), b"corrupt");
-        assert_eq!(std::fs::read(&log).unwrap(), count);
-        assert_eq!(
-            std::fs::read_to_string(work.join("retained")).unwrap(),
-            "original"
-        );
-    }
-
-    fn assert_disabled_placement_refuses_next_tools(
-        cfg: &Path,
-        work: &Path,
-        env: &[(String, String)],
-    ) {
-        let selection = cfg.join("sylphx-workspace-placement.json");
-        let before = std::fs::read(&selection).unwrap();
-        assert_eq!(resolve_sandbox_mode(cfg, env), "none");
-        for (tool, args) in [
-            ("bash", json!({"command": "printf executed > forbidden"})),
-            ("read_file", json!({"path": "retained"})),
-            (
-                "write_file",
-                json!({"path": "forbidden", "content": "executed"}),
-            ),
-            ("list_dir", json!({})),
-        ] {
-            let out = execute_sylphx_tool(tool, &args, cfg, work, env, Path::new("anyagents"), &[]);
-            assert!(
-                out.starts_with("error:"),
-                "{tool} unexpectedly executed: {out}"
-            );
-            assert_eq!(std::fs::read(&selection).unwrap(), before);
-            assert!(!work.join("forbidden").exists());
-        }
-        for desired in ["local", "cloud"] {
-            let out = execute_sylphx_tool(
-                "sandbox",
-                &json!({"action": "placement", "placement": desired}),
-                cfg,
-                work,
-                env,
-                Path::new("anyagents"),
-                &[],
-            );
-            assert!(
-                out.starts_with("error:"),
-                "selection unexpectedly accepted: {out}"
-            );
-        }
-    }
-
-    #[test]
-    fn workspace_placement_mixed_case_disable_refuses_next_tools_without_writes() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path().join("cfg");
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
-        std::fs::write(work.join("retained"), "original").unwrap();
-        let enabled = vec![("SYLPHX_SANDBOX".into(), "local".into())];
-        placement::select(&cfg, &enabled, "local").unwrap();
-        for value in ["OFF", "NONE", "False", " StAtElEsS ", "0"] {
-            let env = vec![
-                ("SYLPHX_SANDBOX".into(), value.into()),
-                ("SYLPHX_WORKSPACE_PLACEMENTS".into(), "local,cloud".into()),
-            ];
-            assert_disabled_placement_refuses_next_tools(&cfg, &work, &env);
-        }
-        assert_eq!(
-            std::fs::read_to_string(work.join("retained")).unwrap(),
-            "original"
-        );
-    }
-
-    #[test]
-    fn workspace_placement_process_config_disable_precedence() {
-        const CHILD: &str = "ANYAGENTS_PLACEMENT_PRECEDENCE_TEST";
-        if std::env::var_os(CHILD).is_none() {
-            // Isolate process-level inputs without mutating the multithreaded
-            // parent test process's environment.
-            let out = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::workspace_placement_process_config_disable_precedence",
-                    "--nocapture",
-                ])
-                .env(CHILD, "1")
-                .env("SYLPHX_SANDBOX", "FaLsE")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            return;
-        }
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path().join("cfg");
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
-        let enabled = vec![("SYLPHX_SANDBOX".into(), "local".into())];
-        placement::select(&cfg, &enabled, "local").unwrap();
-        let setting = if std::env::var(CHILD).unwrap() == "1" {
-            "local"
-        } else {
-            "oFf"
-        };
-        std::fs::write(
-            cfg.join("sylphx-agent.json"),
-            json!({"sandbox": setting}).to_string(),
-        )
-        .unwrap();
-        assert_disabled_placement_refuses_next_tools(&cfg, &work, &[]);
-        // Preserve the existing launch > process > config precedence. A launch
-        // setting from the embedding runtime can override a process default.
-        assert_eq!(resolve_sandbox_mode(&cfg, &enabled), "local");
-        assert!(placement::selected(&cfg, &enabled).is_ok());
-        // The second isolated child has no process override, exposing config.
-        if std::env::var(CHILD).unwrap() == "1" {
-            let out = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "tests::workspace_placement_process_config_disable_precedence",
-                    "--nocapture",
-                ])
-                .env(CHILD, "2")
-                .env_remove("SYLPHX_SANDBOX")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
-
-    #[test]
-    fn explicitly_selected_cloud_failure_never_runs_host_tools_or_changes_continuity() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path().join("cfg");
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
-        let mut preserved = workspace_continuity_fixture(&cfg);
-        std::fs::write(work.join("retained"), "original").unwrap();
-        let env = vec![
-            ("SYLPHX_SANDBOX".into(), "cloud".into()),
-            ("SYLPHX_API_KEY".into(), "sylphx_sk_test".into()),
-            ("SYLPHX_API_URL".into(), "http://127.0.0.1:9".into()),
-        ];
-        let tool = |name, args: Value| {
-            execute_sylphx_tool(name, &args, &cfg, &work, &env, Path::new("unused-mcp"), &[])
-        };
-        let receipt: Value = serde_json::from_str(&tool(
-            "sandbox",
-            json!({"action":"placement", "placement":"cloud"}),
-        ))
-        .unwrap();
-        assert_eq!(receipt["placement"], "cloud");
-        assert_eq!(receipt["worktree"], CLOUD_WORKSPACE_DIR);
-        let selection = cfg.join("sylphx-workspace-placement.json");
-        preserved.push((selection.clone(), std::fs::read(selection).unwrap()));
-        for (name, args) in [
-            ("bash", json!({"command":"printf forbidden > retained"})),
-            ("read_file", json!({"path":"retained"})),
-            (
-                "write_file",
-                json!({"path":"retained", "content":"forbidden"}),
-            ),
-            (
-                "edit_file",
-                json!({"path":"retained", "target":"original", "replacement":"forbidden"}),
-            ),
-            (
-                "apply_patch",
-                json!({"patch":"*** Begin Patch\n*** Delete File: retained\n*** End Patch"}),
-            ),
-            ("grep", json!({"pattern":"original"})),
-            ("glob", json!({"pattern":"*"})),
-            ("list_dir", json!({})),
-            (
-                "code_mode",
-                json!({"code":"write('retained', 'forbidden')"}),
-            ),
-        ] {
-            let out = tool(name, args);
-            assert!(
-                out.contains("selected cloud placement failed (no local fallback)"),
-                "{name}: {out}"
-            );
-            assert_eq!(
-                std::fs::read_to_string(work.join("retained")).unwrap(),
-                "original"
-            );
-            assert!(!cfg.join("sylphx-sandbox-fallback.json").exists());
-            for (path, bytes) in &preserved {
-                assert_eq!(std::fs::read(path).unwrap(), *bytes);
-            }
-        }
-    }
-
-    #[test]
-    fn cloud_sandbox_automatically_falls_back_to_local_when_cloud_api_unavailable() {
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path().join("cfg");
-        let work = tmp.path().join("work");
-        std::fs::create_dir_all(&cfg).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
-
-        // Point cloud sandbox at an unreachable port with `SYLPHX_SANDBOX=cloud`.
-        let env = vec![
-            ("SYLPHX_SANDBOX".to_string(), "cloud".to_string()),
-            ("SYLPHX_API_KEY".to_string(), "sylphx_sk_test".to_string()),
-            (
-                "SYLPHX_API_URL".to_string(),
-                "http://127.0.0.1:9".to_string(),
-            ),
-        ];
-        assert_eq!(resolve_sandbox_mode(&cfg, &env), "cloud");
-
-        // 1. `write_file` attempts cloud sandbox, fails against dead port, records fallback, and writes locally!
-        let write_out = execute_sylphx_tool(
-            "write_file",
-            &json!({ "path": "fallback.txt", "content": "alpha = 1\n" }),
-            &cfg,
-            &work,
-            &env,
-            Path::new("anyagents"),
-            &[],
-        );
-        assert!(write_out.starts_with("wrote "), "unexpected: {write_out}");
-        assert!(cfg.join("sylphx-sandbox-fallback.json").is_file());
-        assert!(cloud::is_cloud_sandbox_in_fallback_cooldown(&cfg));
-        assert_eq!(resolve_sandbox_mode(&cfg, &env), "cloud");
-
-        // 2. `edit_file`, `read_file`, and `bash` now run locally without hitting the dead cloud endpoint!
-        let edit_out = execute_sylphx_tool(
-            "edit_file",
-            &json!({
-                "path": "fallback.txt",
-                "target": "alpha = 1",
-                "replacement": "alpha = 42"
-            }),
-            &cfg,
-            &work,
-            &env,
-            Path::new("anyagents"),
-            &[],
-        );
-        assert!(edit_out.starts_with("edited "), "unexpected: {edit_out}");
-
-        let read_out = execute_sylphx_tool(
-            "read_file",
-            &json!({ "path": "fallback.txt" }),
-            &cfg,
-            &work,
-            &env,
-            Path::new("anyagents"),
-            &[],
-        );
-        assert!(read_out.contains("alpha = 42"), "unexpected: {read_out}");
-
-        let bash_out = execute_sylphx_tool(
-            "bash",
-            &json!({ "command": "cat fallback.txt" }),
-            &cfg,
-            &work,
-            &env,
-            Path::new("anyagents"),
-            &[],
-        );
-        assert!(bash_out.contains("alpha = 42"), "unexpected: {bash_out}");
     }
 
     #[test]
@@ -5640,49 +4911,5 @@ exec "$@"
         assert_eq!(receipt.mode, "unchanged");
         assert!(!receipt.placement_changed);
         assert_eq!(receipt.transcript_items, 3);
-    }
-
-    #[test]
-    fn cloud_sandbox_exec_sentinel_and_fallback_backoff_preserve_lease_and_retry_after() {
-        let wrapped_ok = crate::cloud::wrap_cloud_exec_command_for_zero_exit("true");
-        let out_ok = std::process::Command::new("bash")
-            .args(["-lc", &wrapped_ok])
-            .status()
-            .unwrap();
-        assert_eq!(
-            crate::cloud::normalize_cloud_exec_exit_code(out_ok.code().unwrap_or(-1) as i64),
-            0
-        );
-
-        let wrapped_err = crate::cloud::wrap_cloud_exec_command_for_zero_exit("exit 7");
-        let out_err = std::process::Command::new("bash")
-            .args(["-lc", &wrapped_err])
-            .status()
-            .unwrap();
-        assert_eq!(
-            crate::cloud::normalize_cloud_exec_exit_code(out_err.code().unwrap_or(-1) as i64),
-            7
-        );
-
-        let tmp = tempfile::tempdir().unwrap();
-        let cfg = tmp.path();
-        record_cloud_sandbox_fallback(
-            cfg,
-            "CreateLease HTTP 503: {\"code\":\"NO_CAPACITY\",\"retry_after_ms\":180000}",
-        );
-        let fb1: Value = serde_json::from_str(
-            &std::fs::read_to_string(cfg.join("sylphx-sandbox-fallback.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(fb1["consecutive_failures"].as_u64(), Some(1));
-        assert!(fb1["cooldown_ms"].as_i64().unwrap_or(0) >= 180_000);
-
-        record_cloud_sandbox_fallback(cfg, "CreateLease HTTP 503: {\"code\":\"NO_CAPACITY\"}");
-        let fb2: Value = serde_json::from_str(
-            &std::fs::read_to_string(cfg.join("sylphx-sandbox-fallback.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(fb2["consecutive_failures"].as_u64(), Some(2));
-        assert!(fb2["cooldown_ms"].as_i64().unwrap_or(0) >= 120_000);
     }
 }

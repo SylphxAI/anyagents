@@ -1371,6 +1371,33 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
+            "transfer" | "reparent" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`agents transfer` requires `name` (or `agent`)".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let new_parent = args
+                    .parent
+                    .as_deref()
+                    .or(args.new_name.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let body = serde_json::json!({
+                    "parent": new_parent,
+                    "reason": args.prompt,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/transfer"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
             "inspect" | "status" | "get" | "info" | "show" => {
                 let target = args
                     .name
@@ -1425,7 +1452,7 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(catalogs))
             }
             other => Err(format!(
-                "unknown agents action `{other}`; expected `list`, `inspect`, `spawn`, `create`, `describe`, `steer`, `wake`, `pause`, `archive`, `delete`, `rename`, `role`, `harness`, or `models`"
+                "unknown agents action `{other}`; expected `list`, `inspect`, `spawn`, `create`, `describe`, `steer`, `wake`, `pause`, `archive`, `delete`, `rename`, `role`, `harness`, `transfer`, or `models`"
             )),
         }
     }
@@ -1718,6 +1745,32 @@ impl AgentMcp {
                     .await?;
                 Ok(rmcp::handler::server::wrapper::Json(updated))
             }
+            "transfer" | "reparent" => {
+                let target = args
+                    .agent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| "`subagents transfer` requires `agent`".to_string())?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let new_parent = args
+                    .parent
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let body = serde_json::json!({
+                    "parent": new_parent,
+                    "reason": args.prompt,
+                });
+                let updated: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/transfer"),
+                        Some(serde_json::to_vec(&body).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(updated))
+            }
             "delete" | "kill" | "remove" => {
                 let target = args
                     .agent
@@ -1733,7 +1786,7 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(deleted))
             }
             other => Err(format!(
-                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, `harness`, or `delete`"
+                "unknown subagents action `{other}`; expected `list`, `inspect`, `spawn`, `steer`, `wake`, `pause`, `archive`, `harness`, `transfer`, or `delete`"
             )),
         }
     }

@@ -104,15 +104,15 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         let wd_lower = wd_str.to_ascii_lowercase();
         let wd_is_cloud_keyword = matches!(
             wd_lower.as_str(),
-            "cloud" | "cloud-worktree" | "cloud-sandbox"
-        ) || (agent.harness == "sylphx" && wd_lower == "sandbox");
+            "cloud" | "cloud-worktree" | "cloud-agent"
+        );
         let wd_is_worktree_keyword = matches!(
             wd_lower.as_str(),
             "worktree" | "branch" | "isolated" | "cloud-worktree"
         );
         let wd_is_private_keyword = matches!(
             wd_lower.as_str(),
-            "private" | "sandbox" | "self" | "cloud" | "cloud-sandbox"
+            "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
         );
         let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
         let effective_repo = request
@@ -134,59 +134,21 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
         } else {
             request.workdir.clone()
         };
-        let explicit_local_sandbox = pairs.iter().any(|(k, v)| {
-            k == "SYLPHX_SANDBOX"
-                && matches!(
-                    v.trim().to_ascii_lowercase().as_str(),
-                    "local" | "host" | "none" | "off" | "false" | "0" | "stateless"
-                )
-        }) || std::env::var("SYLPHX_SANDBOX").ok().is_some_and(|v| {
-            matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "local" | "host" | "none" | "off" | "false" | "0" | "stateless"
-            )
-        });
-        let is_cloud_sandbox_mode = wd_is_cloud_keyword
+        let is_cloud_agent_mode = wd_is_cloud_keyword
             || pairs
                 .iter()
-                .any(|(k, v)| k == "SYLPHX_SANDBOX" && v.eq_ignore_ascii_case("cloud"))
-            || std::env::var("SYLPHX_SANDBOX")
+                .any(|(k, v)| k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty())
+            || std::env::var("SYLPHX_AGENT_ENV")
                 .ok()
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cloud"));
-        if is_cloud_sandbox_mode && !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
-            pairs.push(("SYLPHX_SANDBOX".to_string(), "cloud".to_string()));
-        }
-        if is_cloud_sandbox_mode
-            && !explicit_local_sandbox
-            && !crate::sandbox::is_isolated_test_env()
-            && !cfg!(test)
-            && !pairs
-                .iter()
-                .any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
-        {
-            pairs.push((
-                "SYLPHX_WORKSPACE_PLACEMENTS".to_string(),
-                "cloud".to_string(),
-            ));
-        } else if agent.harness == "sylphx" && !is_cloud_sandbox_mode && !explicit_local_sandbox {
-            if !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
-                pairs.push(("SYLPHX_SANDBOX".to_string(), "local".to_string()));
-            }
-            if !pairs
-                .iter()
-                .any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
-            {
-                pairs.push((
-                    "SYLPHX_WORKSPACE_PLACEMENTS".to_string(),
-                    "local".to_string(),
-                ));
-            }
+                .is_some_and(|v| !v.trim().is_empty());
+        if wd_is_cloud_keyword && !pairs.iter().any(|(k, _)| k == "SYLPHX_AGENT_ENV") {
+            pairs.push(("SYLPHX_AGENT_ENV".to_string(), "default".to_string()));
         }
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
         let managed_abs = std::path::absolute(&managed)?;
         let cwd = if let Some(repo_raw) = effective_repo {
-            if agent.harness == "sylphx" && is_cloud_sandbox_mode && explicit_workdir.is_none() {
+            if agent.harness == "sylphx" && is_cloud_agent_mode && explicit_workdir.is_none() {
                 provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -215,7 +177,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                 target_wt
             }
         } else if wd_is_private_keyword {
-            if agent.harness == "sylphx" && is_cloud_sandbox_mode {
+            if agent.harness == "sylphx" && is_cloud_agent_mode {
                 let _ = provision_cloud_sandbox_worktree_marker(
                     store,
                     &agent,
@@ -259,7 +221,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                 }
                 None => {
                     if agent.parent_id.is_some() {
-                        if agent.harness == "sylphx" && is_cloud_sandbox_mode {
+                        if agent.harness == "sylphx" && is_cloud_agent_mode {
                             let _ = provision_cloud_sandbox_worktree_marker(
                                 store,
                                 &agent,

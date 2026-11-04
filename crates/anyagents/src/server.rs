@@ -283,6 +283,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents/{name}/admin", post(set_admin_route))
         .route("/v1/agents/{name}/rename", post(rename_agent_route))
         .route("/v1/agents/{name}/role", post(role_agent_route))
+        .route("/v1/agents/{name}/transfer", post(transfer_agent_route))
         .route("/v1/agents/{name}/model", post(model_route))
         .route("/v1/agents/{name}/harness", post(harness_route))
         .route(
@@ -879,6 +880,9 @@ pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &A
         }
     }
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
+    if agent.parent_id.is_some() {
+        reap_subagent_ephemeral_dirs(data_dir, &agent.id);
+    }
     if let Ok(all_agents) = store.list_agents() {
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(agent.id.clone());
@@ -948,6 +952,16 @@ fn reconcile_stopped_and_backed_off_agents(
     for idx in ordered_indices {
         let agent = &agents[idx];
         if agent.state == "archived" && !health.get(&agent.id).is_some_and(|l| l.process_alive) {
+            if agent.parent_id.is_some()
+                && data
+                    .join("agents")
+                    .join(agent.id.as_str())
+                    .join("work")
+                    .join(".git")
+                    .exists()
+            {
+                reap_subagent_ephemeral_dirs(data, &agent.id);
+            }
             continue;
         }
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
@@ -964,6 +978,9 @@ fn reconcile_stopped_and_backed_off_agents(
         if is_explicitly_archived(data, agent) || parent_archived {
             if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
                 let _ = store.set_agent_state(&agent.id, "archived");
+                if agent.parent_id.is_some() {
+                    reap_subagent_ephemeral_dirs(data, &agent.id);
+                }
             }
             if agent.harness == "sylphx"
                 && !guard.flushing_sylphx.contains(agent.id.as_str())
@@ -1742,6 +1759,131 @@ async fn harness_route(
         )
         .map_err(ApiError::from_store)?;
         Ok(Json(out))
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferAgentRequest {
+    parent: Option<String>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+async fn transfer_agent_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(body): Json<TransferAgentRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let actor = match &principal {
+            Principal::Agent {
+                agent_id,
+                name: caller_name,
+            } if found.parent_id.as_ref() == Some(agent_id) => {
+                format!("agent:{caller_name}")
+            }
+            _ => require_admin_or_operator(&state.store, &principal, "agents.transfer", &found.name)?,
+        };
+        let old_parent_name = found
+            .parent_id
+            .as_ref()
+            .and_then(|pid| state.store.agent(pid).ok())
+            .map(|p| p.name);
+        let new_parent = match body
+            .parent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None | Some("none" | "root" | "null") => None,
+            Some(raw) => {
+                let clean = raw.strip_prefix("agent:").unwrap_or(raw);
+                let target = state
+                    .store
+                    .agent_by_name(clean)
+                    .map_err(ApiError::from_store)?;
+                if target.state == "archived" {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        format!("cannot transfer to archived parent `{}`", target.name),
+                    ));
+                }
+                Some(target)
+            }
+        };
+        let updated = state
+            .store
+            .set_agent_parent(&found.id, new_parent.as_ref().map(|p| &p.id))
+            .map_err(ApiError::from_store)?;
+
+        let mut env_pairs = updated.launch_env.clone();
+        env_pairs.retain(|(k, _)| k != "ANYAGENTS_PARENT_NAME");
+        if let Some(ref np) = new_parent {
+            env_pairs.push(("ANYAGENTS_PARENT_NAME".to_string(), np.name.clone()));
+        }
+        let _ = state.store.set_agent_launch_env(&updated.id, &env_pairs);
+
+        let config = anyagents_core::agent_config_dir(state.store.data_dir(), &updated.id);
+        let work_dir = updated
+            .workdir
+            .as_deref()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                state
+                    .store
+                    .data_dir()
+                    .join("agents")
+                    .join(updated.id.as_str())
+                    .join("work")
+            });
+        let _ = create::reconcile_agent_runtime_config(
+            &state.store,
+            state.store.data_dir(),
+            &updated,
+            &config,
+            &work_dir,
+        );
+
+        let reason_suffix = body
+            .reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|r| format!(" Reason: {r}"))
+            .unwrap_or_default();
+        if let Some(ref np) = new_parent {
+            let notice = format!(
+                "[Custody Transferred] Your parent agent is now `agent:{}` (previously `{}`). Report subsequent progress and completion via `send(to: [\"parent\"], ...)` to `agent:{}`.{reason_suffix}",
+                np.name,
+                old_parent_name.as_deref().unwrap_or("root"),
+                np.name
+            );
+            let mut incoming = Incoming::new(notice);
+            incoming.sender = Some(format!("agent:{actor}"));
+            let _ = state.store.receive(&updated.id, incoming);
+        }
+
+        let mut view =
+            serde_json::to_value(agent_view(&state.store, &state.health, &updated)?).unwrap();
+        if let Some(obj) = view.as_object_mut() {
+            obj.insert(
+                "previous_parent".to_string(),
+                serde_json::json!(old_parent_name),
+            );
+            obj.insert(
+                "new_parent".to_string(),
+                serde_json::json!(new_parent.as_ref().map(|p| p.name.as_str())),
+            );
+            obj.insert("transferred_by".to_string(), serde_json::json!(actor));
+        }
+        Ok(Json(view))
     })
     .await
 }
@@ -3300,7 +3442,6 @@ async fn archive_agent_route(
 pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
-    crate::sylphx::release_persisted_sandbox_lease(&config_dir);
     let seat_ids = detect_seat_ids(&config_dir);
     for rel in ["cache-home", "cache", ".tmp", "tmp"] {
         let target = config_dir.join(rel);
@@ -4615,8 +4756,75 @@ impl SendPlan {
                 .map_err(Error::from)
                 .map_err(ApiError::from_store)?
             {
-                Address::Agent(name) if name == "all" => {
-                    targets.push(Target::Room("all".to_string()));
+                Address::Agent(name)
+                    if matches!(name.as_str(), "all" | "peers" | "siblings" | "team") =>
+                {
+                    if let Actor::Agent(sender_name) = actor
+                        && let Ok(sender) = store.agent_by_name(sender_name)
+                        && let Some(ref pid) = sender.parent_id
+                    {
+                        let siblings: Vec<_> = store
+                            .children_of(pid)
+                            .map_err(ApiError::from_store)?
+                            .into_iter()
+                            .filter(|s| {
+                                s.id != sender.id
+                                    && s.state != "archived"
+                                    && !is_explicitly_archived(store.data_dir(), s)
+                            })
+                            .collect();
+                        if siblings.is_empty() {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "this sub-agent has no active sibling sub-agents under the same parent",
+                            ));
+                        }
+                        for sib in siblings {
+                            targets.push(Target::Agent(sib.name));
+                        }
+                    } else if name == "siblings" {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "root agents have no parent; use `peers` or `group:owners` to message root peers",
+                        ));
+                    } else {
+                        targets.push(Target::Room("all".to_string()));
+                    }
+                }
+                Address::Group(room)
+                    if matches!(room.as_str(), "all" | "peers" | "siblings" | "team") =>
+                {
+                    if let Actor::Agent(sender_name) = actor
+                        && let Ok(sender) = store.agent_by_name(sender_name)
+                        && let Some(ref pid) = sender.parent_id
+                    {
+                        let siblings: Vec<_> = store
+                            .children_of(pid)
+                            .map_err(ApiError::from_store)?
+                            .into_iter()
+                            .filter(|s| {
+                                s.id != sender.id
+                                    && s.state != "archived"
+                                    && !is_explicitly_archived(store.data_dir(), s)
+                            })
+                            .collect();
+                        if siblings.is_empty() {
+                            return Err(ApiError::new(
+                                StatusCode::BAD_REQUEST,
+                                "this sub-agent has no active sibling sub-agents under the same parent",
+                            ));
+                        }
+                        for sib in siblings {
+                            targets.push(Target::Agent(sib.name));
+                        }
+                    } else if room == "siblings" {
+                        return Err(ApiError::new(
+                            StatusCode::BAD_REQUEST,
+                            "root agents have no parent; use `peers` or `group:owners` to message root peers",
+                        ));
+                    } else {
+                        targets.push(Target::Room("all".to_string()));
+                    }
                 }
                 Address::Agent(name) if name == "parent" => {
                     let Actor::Agent(sender_name) = actor else {
@@ -4722,6 +4930,47 @@ impl SendPlan {
     }
 }
 
+/// Enforces strict hierarchy & peer encapsulation (`Encapsulated Actor Hierarchy`):
+/// - Root agents (`parent_id == None`) can message any Root peer (`parent_id == None`) or their own direct children (`recipient.parent_id == Some(sender.id)`).
+/// - Sub-agents (`parent_id == Some(P)`) can message:
+///   1. Their own direct parent (`recipient.id == P`)
+///   2. Their own direct children (`recipient.parent_id == Some(sender.id)`)
+///   3. Their own sibling sub-agents under the same parent (`recipient.parent_id == Some(P)`)
+///   4. Any Root agent (`recipient.parent_id == None`) for cross-domain escalation
+/// - Sending directly to **another agent's sub-agent** (`recipient.parent_id == Some(other)` where `other != sender.id` and `other != sender.parent_id`) is refused unless the caller is the Operator. To hand over a sub-agent across parents, use `agents({ "action": "transfer", "name": "<subagent>", "parent": "<new-parent>" })`.
+fn can_actor_message_agent(
+    store: &Store,
+    actor: &Actor,
+    recipient: &anyagents_core::Agent,
+) -> Result<(), ApiError> {
+    let Actor::Agent(sender_name) = actor else {
+        return Ok(());
+    };
+    let sender = store
+        .agent_by_name(sender_name)
+        .map_err(ApiError::from_store)?;
+    if sender.id == recipient.id {
+        return Ok(());
+    }
+    let Some(ref recip_parent_id) = recipient.parent_id else {
+        // Recipient is a Root agent: always reachable by Root peers and sub-agents.
+        return Ok(());
+    };
+    // Recipient is a sub-agent (`recip_parent_id`):
+    // Allowed if sender IS the recipient's direct parent, OR sender shares the exact same parent (`sibling`).
+    if &sender.id == recip_parent_id || sender.parent_id.as_ref() == Some(recip_parent_id) {
+        return Ok(());
+    }
+    let owner_label = store
+        .agent(recip_parent_id)
+        .map(|p| p.name)
+        .unwrap_or_else(|_| recip_parent_id.as_str().to_string());
+    Err(ApiError::forbidden(format!(
+        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}`; message `agent:{owner_label}` instead, or transfer custody first via `agents({{ \"action\": \"transfer\", \"name\": \"{}\", \"parent\": \"{}\" }})`",
+        recipient.name, recipient.name, sender.name
+    )))
+}
+
 /// Every destination is checked before any write, so a refused address never
 /// leaves half a send behind.
 fn check_targets(
@@ -4733,7 +4982,8 @@ fn check_targets(
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
-                store.agent_by_name(name).map_err(ApiError::from_store)?;
+                let recipient = store.agent_by_name(name).map_err(ApiError::from_store)?;
+                can_actor_message_agent(store, actor, &recipient)?;
             }
             // Counted without writing, so an empty room fails the whole send
             // instead of silently delivering nothing.
@@ -4976,11 +5226,12 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
         .as_deref()
         .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
     let name = room.strip_prefix("group:").unwrap_or(room);
-    if name == "all" {
+    if name == "all" || name == "peers" {
         return store
             .list_agents()
             .unwrap_or_default()
             .into_iter()
+            .filter(|agent| agent.parent_id.is_none())
             .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
             .filter(|agent| agent.state != "running" && agent.state != "archived")
             .map(|agent| crate::api::SkippedDelivery {

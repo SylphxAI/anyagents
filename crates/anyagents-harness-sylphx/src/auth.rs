@@ -395,7 +395,7 @@ pub fn write_sylphx_config(
     });
 
     if let Some(obj) = doc.as_object_mut() {
-        for key in ["sandbox", "repo", "branch", "base"] {
+        for key in ["repo", "branch", "base"] {
             if let Some(val) = worktree_marker
                 .as_ref()
                 .and_then(|m| m.get(key))
@@ -436,18 +436,6 @@ pub fn write_sylphx_config(
             {
                 obj.insert("base".to_string(), json!(base));
             }
-        }
-        let marker_cloud = worktree_marker
-            .as_ref()
-            .and_then(|m| m.get("cloud_sandbox"))
-            .and_then(Value::as_bool);
-        if marker_cloud == Some(true)
-            || (!obj.contains_key("sandbox")
-                && marker_cloud != Some(false)
-                && !crate::sandbox::is_isolated_test_env()
-                && crate::cloud::resolve_sylphx_cloud_access_key(config_dir, &[]).is_some())
-        {
-            obj.insert("sandbox".to_string(), json!("cloud"));
         }
     }
     let text = serde_json::to_string_pretty(&doc)
@@ -981,6 +969,7 @@ pub(super) fn base64_encode(input: &[u8]) -> String {
     out
 }
 
+#[allow(dead_code)]
 pub(super) fn base64_decode(input: &str) -> Vec<u8> {
     fn val(b: u8) -> Option<u8> {
         match b {
