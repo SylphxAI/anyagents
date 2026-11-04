@@ -247,6 +247,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                 let st = Arc::clone(&sched_store);
                 let hb = sched_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    let dd = st.data_dir();
+                    if dd.join("admin.sock").exists() || dd.join("admin.lock").exists() {
+                        return;
+                    }
                     crate::schedule::tick_schedules_once(&st, &hb, now_ms());
                 })
                 .await;
@@ -369,6 +373,44 @@ struct AdminReconcileState {
     flushing_sylphx: std::collections::HashSet<String>,
 }
 
+fn is_transient_sylphx_turn_error(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
+        return false;
+    }
+    if lower.contains("insufficient_quota")
+        || lower.contains("credit balance is too low")
+        || lower.contains("out of credits")
+        || lower.contains("quota exceeded")
+    {
+        return false;
+    }
+    lower.contains("model_unavailable")
+        || lower.contains("included_capacity_unavailable")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("overloaded")
+        || lower.contains("server_error")
+        || lower.contains("api_error")
+        || lower.contains("rate_limit")
+        || lower.contains("\"retryable\":true")
+        || lower.contains("\"retryable\": true")
+        || lower.contains("http 408")
+        || lower.contains("http 409")
+        || lower.contains("http 425")
+        || lower.contains("http 429")
+        || lower.contains("http 500")
+        || lower.contains("http 502")
+        || lower.contains("http 503")
+        || lower.contains("http 504")
+        || lower.contains("invalid sylphx responses api json")
+        || lower.contains("eof while parsing")
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("gateway timeout")
+        || lower.contains("connection reset")
+        || lower.contains("timed out")
+}
+
 fn spawn_admin_sylphx_delivery(
     data: PathBuf,
     agent: Agent,
@@ -376,6 +418,28 @@ fn spawn_admin_sylphx_delivery(
     reconcile: Arc<std::sync::Mutex<AdminReconcileState>>,
 ) {
     std::thread::spawn(move || {
+        let store = match Store::open(data.join("state.db")) {
+            Ok(s) => s,
+            Err(_) => {
+                let mut guard = match reconcile.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.flushing_sylphx.remove(agent.id.as_str());
+                return;
+            }
+        };
+        let _agent_lock = match store.try_lock_agent(&agent.id) {
+            Ok(lock) => lock,
+            Err(_) => {
+                let mut guard = match reconcile.lock() {
+                    Ok(g) => g,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard.flushing_sylphx.remove(agent.id.as_str());
+                return;
+            }
+        };
         let (delivery_mode, steer_support) = declared(&agent.harness);
         let cfg = anyagents_core::agent_config_dir(&data, &agent.id);
         let work_dir = agent
@@ -399,7 +463,12 @@ fn spawn_admin_sylphx_delivery(
                 last_error: None,
             },
         );
-        if let Ok(store) = Store::open(data.join("state.db")) {
+        {
+            create::ensure_seat_environment(&cfg);
+            let _ = std::fs::create_dir_all(&work_dir);
+            if let Some((_, gid, _)) = detect_seat_ids(&cfg) {
+                crate::sandbox::share_worktree_with_seat(&work_dir, gid);
+            }
             let req = anyagents_supervisor::LaunchRequest {
                 agent: agent.clone(),
                 data_dir: data.clone(),
@@ -411,7 +480,10 @@ fn spawn_admin_sylphx_delivery(
                 Ok(mut harness) => {
                     let mut had_err = false;
                     let mut completed_any = false;
-                    while let Ok(Some(message)) = store.next_undelivered(&agent.id) {
+                    while store.has_actionable_undelivered(&agent.id).unwrap_or(false) {
+                        let Ok(Some(message)) = store.next_undelivered(&agent.id) else {
+                            break;
+                        };
                         let outbound = anyagents_harness::OutboundMessage {
                             id: message.id.as_str().to_string(),
                             seq: message.seq,
@@ -419,11 +491,96 @@ fn spawn_admin_sylphx_delivery(
                             sender: message.sender.clone(),
                             reply_to: message.reply_to.clone(),
                             source_time_ms: message.source_time_ms,
-                            context: anyagents_harness::Context::default(),
+                            context: message.context.clone(),
                         };
                         match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
                             Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
                                 let _ = store.note_delivered(&agent.id, message.seq);
+                                if !turn_finished {
+                                    while anyagents_harness::Harness::health(&harness).turn_state
+                                        == anyagents_harness::TurnState::InTurn
+                                    {
+                                        if let Ok(Some(steered)) = store.next_undelivered(&agent.id)
+                                        {
+                                            let steered_out = anyagents_harness::OutboundMessage {
+                                                id: steered.id.as_str().to_string(),
+                                                seq: steered.seq,
+                                                text: steered.text.clone(),
+                                                sender: steered.sender.clone(),
+                                                reply_to: steered.reply_to.clone(),
+                                                source_time_ms: steered.source_time_ms,
+                                                context: steered.context.clone(),
+                                            };
+                                            if anyagents_harness::Harness::deliver(
+                                                &mut harness,
+                                                &steered_out,
+                                            )
+                                            .is_ok()
+                                            {
+                                                let _ =
+                                                    store.note_delivered(&agent.id, steered.seq);
+                                            }
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(100));
+                                    }
+                                }
+                                let turn_err = anyagents_harness::Harness::health(&harness)
+                                    .sign_in_fault
+                                    .or_else(|| {
+                                        crate::vendor::read_persisted_last_error(&cfg)
+                                            .and_then(|(e, _)| e)
+                                    });
+                                if let Some(err_msg) = turn_err {
+                                    had_err = true;
+                                    let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                        && store.open_turn(&agent.id).ok().flatten().is_some();
+                                    if can_auto_recover {
+                                        crate::vendor::persist_last_error(&cfg, None, None);
+                                    } else {
+                                        crate::vendor::persist_last_error(
+                                            &cfg,
+                                            Some(&err_msg),
+                                            None,
+                                        );
+                                        create::maybe_notify_parent_on_error(
+                                            &store, &agent, &cfg, &err_msg,
+                                        );
+                                    }
+                                    break;
+                                }
+                                let _ = store.note_turn_completed(&agent.id);
+                                completed_any = true;
+                                crate::vendor::persist_last_error(&cfg, None, None);
+                            }
+                            Ok(_) => {
+                                let _ = store.note_turn_completed(&agent.id);
+                                break;
+                            }
+                            Err(err) => {
+                                had_err = true;
+                                let err_msg = err.to_string();
+                                let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                    && store.open_turn(&agent.id).ok().flatten().is_some();
+                                if can_auto_recover {
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                } else {
+                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
+                                    create::maybe_notify_parent_on_error(
+                                        &store, &agent, &cfg, &err_msg,
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    if !had_err
+                        && !completed_any
+                        && let Ok(Some(open)) = store.open_turn(&agent.id)
+                    {
+                        let outbound = anyagents_supervisor::recovery_outbound(&open);
+                        match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
+                            Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
+                                let _ = store.note_turn_recovered(&agent.id, open.opened_seq);
                                 if !turn_finished {
                                     while anyagents_harness::Harness::health(&harness).turn_state
                                         == anyagents_harness::TurnState::InTurn
@@ -460,37 +617,45 @@ fn spawn_admin_sylphx_delivery(
                                     });
                                 if let Some(err_msg) = turn_err {
                                     had_err = true;
+                                    let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                        && store.open_turn(&agent.id).ok().flatten().is_some();
+                                    if can_auto_recover {
+                                        crate::vendor::persist_last_error(&cfg, None, None);
+                                    } else {
+                                        crate::vendor::persist_last_error(
+                                            &cfg,
+                                            Some(&err_msg),
+                                            None,
+                                        );
+                                        create::maybe_notify_parent_on_error(
+                                            &store, &agent, &cfg, &err_msg,
+                                        );
+                                    }
+                                } else {
+                                    let _ = store.note_turn_completed(&agent.id);
+                                    completed_any = true;
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                had_err = true;
+                                let err_msg = err.to_string();
+                                let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
+                                    && store.open_turn(&agent.id).ok().flatten().is_some();
+                                if can_auto_recover {
+                                    crate::vendor::persist_last_error(&cfg, None, None);
+                                } else {
                                     crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
                                     create::maybe_notify_parent_on_error(
                                         &store, &agent, &cfg, &err_msg,
                                     );
-                                    break;
                                 }
-                                let _ = store.note_turn_completed(&agent.id);
-                                completed_any = true;
-                                crate::vendor::persist_last_error(&cfg, None, None);
-                            }
-                            Ok(_) => {
-                                let _ = store.note_turn_completed(&agent.id);
-                                break;
-                            }
-                            Err(err) => {
-                                had_err = true;
-                                let err_msg = err.to_string();
-                                crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
-                                create::maybe_notify_parent_on_error(
-                                    &store, &agent, &cfg, &err_msg,
-                                );
-                                break;
                             }
                         }
                     }
-                    if completed_any
-                        && !had_err
-                        && agent.parent_id.is_some()
-                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
-                    {
-                        reap_subagent_ephemeral_dirs(&data, &agent.id);
+                    if completed_any && !had_err && agent.parent_id.is_some() {
+                        let _ = store.complete_idle_subagent(&agent.id);
                     }
                 }
                 Err(reason) => {
@@ -500,11 +665,27 @@ fn spawn_admin_sylphx_delivery(
             }
         }
         let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+        let (still_running, has_pending_work) = Store::open(data.join("state.db"))
+            .ok()
+            .map(|s| {
+                let running = s
+                    .agent(&agent.id)
+                    .ok()
+                    .is_some_and(|a| a.state == "running");
+                let pending = s.next_undelivered(&agent.id).ok().flatten().is_some()
+                    || s.open_turn(&agent.id).ok().flatten().is_some();
+                (running, pending)
+            })
+            .unwrap_or((false, false));
         health.publish(
             &agent.id,
             anyagents_supervisor::LiveState {
-                process_alive: true,
-                turn_state: anyagents_harness::TurnState::Idle,
+                process_alive: still_running,
+                turn_state: if still_running && has_pending_work && persisted_err.is_none() {
+                    anyagents_harness::TurnState::InTurn
+                } else {
+                    anyagents_harness::TurnState::Idle
+                },
                 delivery_mode,
                 steer_support,
                 quota_reset_at_ms: None,
@@ -685,8 +866,7 @@ pub(crate) fn has_explicit_archive_marker(
 }
 
 pub(crate) fn is_explicitly_archived(data_dir: &Path, agent: &Agent) -> bool {
-    has_explicit_archive_marker(data_dir, &agent.id)
-        || (agent.state == "archived" && agent.parent_id.is_none())
+    agent.state == "archived" || has_explicit_archive_marker(data_dir, &agent.id)
 }
 
 pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
@@ -699,6 +879,32 @@ pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &A
         }
     }
     crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
+    if let Ok(all_agents) = store.list_agents() {
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(agent.id.clone());
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(agent.id.clone());
+        while let Some(pid) = queue.pop_front() {
+            for child in all_agents
+                .iter()
+                .filter(|a| a.parent_id.as_ref() == Some(&pid))
+            {
+                if seen.insert(child.id.clone()) {
+                    queue.push_back(child.id.clone());
+                    if child.state != "archived" {
+                        let _ = store.set_agent_state(&child.id, "archived");
+                    }
+                    let c_cfg = anyagents_core::agent_config_dir(data_dir, &child.id);
+                    let _ = std::fs::create_dir_all(&c_cfg);
+                    let _ = std::fs::write(
+                        c_cfg.join(".anyagents-archived"),
+                        format!("{}\n", now_ms()),
+                    );
+                    reap_subagent_ephemeral_dirs(data_dir, &child.id);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
@@ -723,27 +929,63 @@ fn reconcile_stopped_and_backed_off_agents(
     if !guard.initialized {
         for agent in &agents {
             let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
-            let has_lag = store
-                .lag(&agent.id, now_ms)
-                .ok()
-                .and_then(|l| l.oldest_undelivered_age_ms)
-                .is_some();
-            if !has_lag {
-                guard.watermark_seq.insert(agent.id.to_string(), delivered);
-                continue;
-            }
-            let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
-            let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
-            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+            guard.watermark_seq.insert(agent.id.to_string(), delivered);
         }
         guard.initialized = true;
     }
 
-    for agent in &agents {
+    let mut ordered_indices: Vec<usize> = (0..agents.len()).collect();
+    ordered_indices.sort_by_key(|&idx| {
+        let a = &agents[idx];
+        let last_try = guard
+            .last_backoff_reset_ms
+            .get(a.id.as_str())
+            .copied()
+            .unwrap_or(0);
+        (last_try, idx)
+    });
+
+    for idx in ordered_indices {
+        let agent = &agents[idx];
+        if agent.state == "archived" && !health.get(&agent.id).is_some_and(|l| l.process_alive) {
+            continue;
+        }
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
-        if is_explicitly_archived(data, agent) {
+        let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
+            agents
+                .iter()
+                .find(|p| &p.id == pid)
+                .is_some_and(|p| is_explicitly_archived(data, p))
+        });
+        if parent_archived && agent.state != "archived" {
+            let _ = store.set_agent_state(&agent.id, "archived");
+            mark_explicitly_archived(store, data, agent);
+        }
+        if is_explicitly_archived(data, agent) || parent_archived {
             if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
                 let _ = store.set_agent_state(&agent.id, "archived");
+            }
+            if agent.harness == "sylphx"
+                && !guard.flushing_sylphx.contains(agent.id.as_str())
+                && health.get(&agent.id).is_some_and(|l| l.process_alive)
+            {
+                let (delivery_mode, steer_support) = declared(&agent.harness);
+                health.publish(
+                    &agent.id,
+                    anyagents_supervisor::LiveState {
+                        process_alive: false,
+                        turn_state: anyagents_harness::TurnState::Idle,
+                        delivery_mode,
+                        steer_support,
+                        quota_reset_at_ms: None,
+                        restart_at_ms: None,
+                        pid: None,
+                        live_harness: Some(agent.harness.clone()),
+                        live_model: agent.model.clone(),
+                        process_started_at_ms: None,
+                        last_error: None,
+                    },
+                );
             }
             let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
             let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
@@ -754,7 +996,7 @@ fn reconcile_stopped_and_backed_off_agents(
             .lag(&agent.id, now_ms)
             .ok()
             .and_then(|l| l.oldest_undelivered_age_ms);
-        if agent.state == "archived" || agent.state == "idle" {
+        if agent.state == "idle" || agent.state == "created" {
             if oldest_age_ms.is_some() {
                 let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                 let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
@@ -763,8 +1005,18 @@ fn reconcile_stopped_and_backed_off_agents(
                     .get(agent.id.as_str())
                     .copied()
                     .unwrap_or(delivered);
-                if max_seq > delivered && max_seq > prev_wm {
-                    let should_wake = undelivered.iter().filter(|m| m.seq > prev_wm).any(|m| {
+                let has_new_mail =
+                    max_seq > delivered && (agent.state == "created" || max_seq > prev_wm);
+                if has_new_mail {
+                    let check_from = if agent.state == "created" {
+                        delivered
+                    } else {
+                        prev_wm
+                    };
+                    let should_wake = undelivered.iter().filter(|m| m.seq > check_from).any(|m| {
+                        if m.context.event.as_deref() == Some("reaction_passive") {
+                            return false;
+                        }
                         let trimmed = m.text.trim_start();
                         !(agent.parent_id.is_none()
                             && (trimmed.starts_with("[Sub-Agent Completed]")
@@ -772,23 +1024,24 @@ fn reconcile_stopped_and_backed_off_agents(
                     });
                     if should_wake {
                         if store.set_agent_state(&agent.id, "running").is_ok() {
-                            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                            if agent.harness == "sylphx"
-                                && !guard.flushing_sylphx.contains(agent.id.as_str())
-                            {
-                                let mut running_agent = agent.clone();
-                                running_agent.state = "running".to_string();
-                                guard
-                                    .last_backoff_reset_ms
-                                    .insert(agent.id.to_string(), now_ms);
-                                guard.flushing_sylphx.insert(agent.id.to_string());
-                                spawn_admin_sylphx_delivery(
-                                    data.to_path_buf(),
-                                    running_agent,
-                                    health.clone(),
-                                    Arc::clone(reconcile),
-                                );
+                            if agent.harness == "sylphx" {
+                                if !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                                    let mut running_agent = agent.clone();
+                                    running_agent.state = "running".to_string();
+                                    guard.watermark_seq.insert(agent.id.to_string(), max_seq);
+                                    guard
+                                        .last_backoff_reset_ms
+                                        .insert(agent.id.to_string(), now_ms);
+                                    guard.flushing_sylphx.insert(agent.id.to_string());
+                                    spawn_admin_sylphx_delivery(
+                                        data.to_path_buf(),
+                                        running_agent,
+                                        health.clone(),
+                                        Arc::clone(reconcile),
+                                    );
+                                }
                             } else {
+                                guard.watermark_seq.insert(agent.id.to_string(), max_seq);
                                 create::poke_agent_wake_socket(data, &agent.id);
                                 create::poke_agent_wake_socket_mail(data, &agent.id);
                             }
@@ -805,7 +1058,34 @@ fn reconcile_stopped_and_backed_off_agents(
                 let cfg = anyagents_core::agent_config_dir(data, &agent.id);
                 let persisted_err =
                     crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
+                let has_open_recovery = store.open_turn(&agent.id).ok().flatten().is_some();
+                let has_pending_work = oldest_age_ms.is_some() || has_open_recovery;
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                    if !has_pending_work
+                        && persisted_err.is_none()
+                        && agent.parent_id.is_some()
+                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                    {
+                        let (delivery_mode, steer_support) = declared(&agent.harness);
+                        health.publish(
+                            &agent.id,
+                            anyagents_supervisor::LiveState {
+                                process_alive: false,
+                                turn_state: anyagents_harness::TurnState::Idle,
+                                delivery_mode,
+                                steer_support,
+                                quota_reset_at_ms: None,
+                                restart_at_ms: None,
+                                pid: None,
+                                live_harness: Some(agent.harness.clone()),
+                                live_model: agent.model.clone(),
+                                process_started_at_ms: None,
+                                last_error: None,
+                            },
+                        );
+                        guard.watermark_seq.insert(agent.id.to_string(), delivered);
+                        continue;
+                    }
                     let (delivery_mode, steer_support) = declared(&agent.harness);
                     health.publish(
                         &agent.id,
@@ -824,7 +1104,7 @@ fn reconcile_stopped_and_backed_off_agents(
                         },
                     );
                 }
-                if oldest_age_ms.is_some() && !guard.flushing_sylphx.contains(agent.id.as_str()) {
+                if has_pending_work && !guard.flushing_sylphx.contains(agent.id.as_str()) {
                     let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
                     let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
                     let prev_wm = guard
@@ -837,10 +1117,17 @@ fn reconcile_stopped_and_backed_off_agents(
                         .get(agent.id.as_str())
                         .copied()
                         .unwrap_or(0);
-                    if persisted_err.is_none()
-                        || max_seq > prev_wm
-                        || now_ms.saturating_sub(last_try) >= 15_000
-                    {
+                    let ready_to_spawn = if has_open_recovery && oldest_age_ms.is_none() {
+                        last_try == 0 || now_ms.saturating_sub(last_try) >= 10_000
+                    } else {
+                        (persisted_err.is_none()
+                            && (last_try == 0
+                                || max_seq > prev_wm
+                                || now_ms.saturating_sub(last_try) >= 5_000))
+                            || max_seq > prev_wm
+                            || now_ms.saturating_sub(last_try) >= 15_000
+                    };
+                    if ready_to_spawn {
                         guard.watermark_seq.insert(agent.id.to_string(), max_seq);
                         guard
                             .last_backoff_reset_ms
@@ -938,7 +1225,31 @@ fn reconcile_stopped_and_backed_off_agents(
     }
 }
 
+fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
+    std::fs::create_dir_all(data)?;
+    let lock_path = data.join("admin.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(Error::Message(format!(
+                "anyagents serve-admin already running on {}",
+                data.display()
+            )));
+        }
+    }
+    Ok(file)
+}
+
 pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let _admin_lock = acquire_admin_lock(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let res = runtime.block_on(async move {
@@ -956,22 +1267,29 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         if auth.is_confined() {
             crate::sandbox::share_socket_with_seats(&path);
         }
+        if let Ok(agents) = store.list_agents() {
+            for agent in agents {
+                if agent.harness == "sylphx" {
+                    create::poke_agent_wake_socket(data, &agent.id);
+                }
+            }
+        }
         let health = HealthBoard::default();
         sync_health_from_primary_socket(data, &health);
-        let sched_store = Arc::clone(&store);
-        let sched_health = health.clone();
-        let sched_data = data.to_path_buf();
+        let rec_store = Arc::clone(&store);
+        let rec_health = health.clone();
+        let rec_data = data.to_path_buf();
         let reconcile_state = Arc::new(std::sync::Mutex::new(AdminReconcileState::default()));
-        let sched_handle = tokio::spawn(async move {
+        let reconcile_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
             let mut ticks: u64 = 0;
             loop {
                 interval.tick().await;
                 ticks = ticks.wrapping_add(1);
                 let sync_health = ticks.is_multiple_of(5);
-                let st = Arc::clone(&sched_store);
-                let hb = sched_health.clone();
-                let dd = sched_data.clone();
+                let st = Arc::clone(&rec_store);
+                let hb = rec_health.clone();
+                let dd = rec_data.clone();
                 let rec = Arc::clone(&reconcile_state);
                 let _ = tokio::task::spawn_blocking(move || {
                     if sync_health {
@@ -979,6 +1297,20 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
                     }
                     let now = now_ms();
                     reconcile_stopped_and_backed_off_agents(&st, &hb, &dd, &rec, now);
+                })
+                .await;
+            }
+        });
+        let sched_store = Arc::clone(&store);
+        let sched_health = health.clone();
+        let sched_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3));
+            loop {
+                interval.tick().await;
+                let st = Arc::clone(&sched_store);
+                let hb = sched_health.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let now = now_ms();
                     crate::schedule::tick_schedules_once(&st, &hb, now);
                 })
                 .await;
@@ -1075,11 +1407,11 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
                 }
             })
             .await;
+        reconcile_handle.abort();
         sched_handle.abort();
         if let Some(h) = reaper_handle {
             h.abort();
         }
-        let _ = std::fs::remove_file(&path);
         result.map_err(Error::from)
     });
     runtime.shutdown_timeout(std::time::Duration::from_millis(100));
@@ -1484,39 +1816,7 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
                 .get("last_error")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_string);
-            if harness_str == "sylphx"
-                && raw_last_error
-                    .as_deref()
-                    .is_some_and(|e| e.contains("unknown harness: sylphx"))
-            {
-                if health
-                    .get(&id)
-                    .is_some_and(|cur| cur.turn_state == anyagents_harness::TurnState::InTurn)
-                {
-                    continue;
-                }
-                let cfg = anyagents_core::agent_config_dir(data, &id);
-                let persisted_err =
-                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-                health.publish(
-                    &id,
-                    anyagents_supervisor::LiveState {
-                        process_alive: true,
-                        turn_state: anyagents_harness::TurnState::Idle,
-                        delivery_mode,
-                        steer_support,
-                        quota_reset_at_ms: None,
-                        restart_at_ms: None,
-                        pid: None,
-                        live_harness: Some("sylphx".to_string()),
-                        live_model: item
-                            .get("model")
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string),
-                        process_started_at_ms: None,
-                        last_error: persisted_err,
-                    },
-                );
+            if harness_str == "sylphx" {
                 continue;
             }
             health.publish(
@@ -1762,7 +2062,7 @@ async fn handle_schedule_action(
                     "schedules": schedules,
                 })))
             }
-            "cancel" | "delete" | "remove" | "clear" | "off" => {
+            "cancel" | "delete" | "remove" | "clear" | "off" | "pause" | "disable" | "stop" => {
                 let target =
                     authorize_schedule_target(&state.store, &principal, body.agent.as_deref())?;
                 let id_or_all = body
@@ -2102,8 +2402,10 @@ async fn set_subagent_defaults_route(
 
 #[derive(Deserialize, Default)]
 struct DescriptionRequest {
-    #[serde(default, alias = "instructions")]
+    #[serde(default)]
     description: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
@@ -2111,28 +2413,61 @@ struct DescriptionRequest {
 }
 
 async fn get_description_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     spawn_store(move || {
-        let rec = state
-            .store
-            .agent_by_name(&name)
-            .map_err(ApiError::from_store)?;
+        let rec = if name.eq_ignore_ascii_case("self") {
+            match &principal {
+                Principal::Agent { agent_id, .. } => {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                }
+                Principal::Operator => {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "`self` requires an agent caller",
+                    ));
+                }
+            }
+        } else {
+            state
+                .store
+                .agent_by_name(&name)
+                .map_err(ApiError::from_store)?
+        };
+        let can_read_private = match &principal {
+            Principal::Operator => true,
+            Principal::Agent { agent_id, .. } => {
+                *agent_id == rec.id
+                    || rec.parent_id.as_ref() == Some(agent_id)
+                    || state
+                        .store
+                        .agent(agent_id)
+                        .is_ok_and(|caller| caller.is_admin)
+            }
+        };
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
-        let system_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok();
-        Ok(Json(serde_json::json!({
+        let system_prompt = if can_read_private {
+            std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).ok()
+        } else {
+            None
+        };
+        let mut resp = serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
             "harness": rec.harness,
             "model": rec.model,
             "aliases": aliases,
-            "description": rec.instructions,
-            "system_prompt": system_prompt,
-        })))
+            "description": rec.public_description(),
+        });
+        if can_read_private {
+            resp["instructions"] = serde_json::json!(rec.instructions);
+            resp["system_prompt"] = serde_json::json!(system_prompt);
+        }
+        Ok(Json(resp))
     })
     .await
 }
@@ -2146,6 +2481,7 @@ async fn set_description_route(
     spawn_store(move || {
         if name.eq_ignore_ascii_case("all")
             && body.description.is_none()
+            && body.instructions.is_none()
             && body.role.is_none()
             && !body.clear.unwrap_or(false)
         {
@@ -2203,31 +2539,61 @@ async fn set_description_route(
         if body.clear.unwrap_or(false) {
             rec = state
                 .store
-                .set_agent_instructions(&rec.id, None)
+                .set_agent_description(&rec.id, None)
                 .map_err(ApiError::from_store)?;
-        } else if let Some(ref desc) = body.description {
-            let trimmed = desc.trim();
             rec = state
                 .store
-                .set_agent_instructions(
-                    &rec.id,
-                    if trimmed.is_empty() {
-                        None
-                    } else {
-                        Some(trimmed)
-                    },
-                )
+                .set_agent_instructions(&rec.id, None)
                 .map_err(ApiError::from_store)?;
+        } else {
+            if let Some(ref desc) = body.description {
+                let trimmed = desc.trim();
+                let clean_opt = if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                };
+                rec = state
+                    .store
+                    .set_agent_description(&rec.id, clean_opt)
+                    .map_err(ApiError::from_store)?;
+                if body.instructions.is_none() && rec.instructions.is_none() {
+                    rec = state
+                        .store
+                        .set_agent_instructions(&rec.id, clean_opt)
+                        .map_err(ApiError::from_store)?;
+                }
+            }
+            if let Some(ref inst) = body.instructions {
+                let trimmed = inst.trim();
+                rec = state
+                    .store
+                    .set_agent_instructions(
+                        &rec.id,
+                        if trimmed.is_empty() {
+                            None
+                        } else {
+                            Some(trimmed)
+                        },
+                    )
+                    .map_err(ApiError::from_store)?;
+            }
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         create::sync_agent_description_files(&state.store, &rec, &cfg);
+        if rec.parent_id.is_none()
+            && (body.description.is_some() || body.role.is_some() || body.clear.unwrap_or(false))
+        {
+            create::sync_all_agent_instructions(&state.store, state.store.data_dir());
+        }
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
             "aliases": aliases,
-            "description": rec.instructions,
+            "description": rec.public_description(),
+            "instructions": rec.instructions,
             "system_prompt_synced": true,
         })))
     })
@@ -2592,7 +2958,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         pending_switch,
         mut last_error,
     ) = match health.get(&agent.id) {
-        Some(live) => {
+        Some(live) if agent.harness != "sylphx" || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
             let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
@@ -2619,16 +2985,39 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
                 effective_err,
             )
         }
-        None => {
+        _ => {
             let (mode, steer) = declared(&agent.harness);
+            let lock_busy = agent.harness == "sylphx"
+                && matches!(
+                    store.try_lock_agent(&agent.id),
+                    Err(anyagents_core::Error::AgentBusy)
+                );
+            let admin_alive = agent.harness == "sylphx"
+                && agent.state == "running"
+                && (store.data_dir().join("admin.sock").exists()
+                    || store.data_dir().join("admin.lock").exists());
+            let proc_str = if lock_busy || admin_alive {
+                "alive"
+            } else {
+                "down"
+            };
+            let turn_str = if lock_busy { "working" } else { "idle" };
             (
-                "down",
-                "idle",
+                proc_str,
+                turn_str,
                 mode_name(mode),
                 steer_name(steer),
                 session_quota,
-                None,
-                None,
+                if proc_str == "alive" {
+                    Some(agent.harness.clone())
+                } else {
+                    None
+                },
+                if proc_str == "alive" {
+                    agent.model.clone()
+                } else {
+                    None
+                },
                 None,
                 false,
                 session_error,
@@ -2696,7 +3085,8 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         last_error,
         oldest_undelivered_age_ms,
         install: install_state(store, agent),
-        description: agent.instructions.clone(),
+        description: agent.public_description(),
+        instructions: agent.instructions.clone(),
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
@@ -2759,7 +3149,8 @@ async fn create_agent_route(
             body.model,
             body.profile,
         );
-        let agent = create::create(
+        let explicit_description = body.description.clone();
+        let mut agent = create::create(
             &state.store,
             state.store.data_dir(),
             CreateRequest {
@@ -2773,11 +3164,20 @@ async fn create_agent_route(
                 base: body.base,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
-                instructions: body.instructions,
+                instructions: body.instructions.or(body.description),
                 parent_id,
             },
         )
         .map_err(ApiError::from_store)?;
+        if let Some(ref desc) = explicit_description {
+            let trimmed = desc.trim();
+            if !trimmed.is_empty() {
+                agent = state
+                    .store
+                    .set_agent_description(&agent.id, Some(trimmed))
+                    .map_err(ApiError::from_store)?;
+            }
+        }
         if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
             .join("mcp-capability")
             .is_file()
@@ -2902,9 +3302,33 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     let config_dir = agent_root.join("config");
     crate::sylphx::release_persisted_sandbox_lease(&config_dir);
     let seat_ids = detect_seat_ids(&config_dir);
-    for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
+    for rel in ["cache-home", "cache", ".tmp", "tmp"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
+    }
+    create::ensure_seat_environment(&config_dir);
+    let mut shared_workdirs = std::collections::HashSet::new();
+    if let Ok(store) = Store::open(data_dir.join("state.db")) {
+        let parent_id = store.agent(agent_id).ok().and_then(|a| a.parent_id);
+        if parent_id.is_some()
+            && let Ok(agent) = store.agent(agent_id)
+        {
+            let bp = data_dir.join("browser-profiles").join(&agent.name);
+            remove_path_with_seat(&bp, seat_ids);
+        }
+        if let Ok(agents) = store.list_agents() {
+            for other in agents {
+                let keep_protected = &other.id != agent_id
+                    && (other.state != "archived" || parent_id.as_ref() == Some(&other.id));
+                if keep_protected && let Some(wd) = other.workdir {
+                    let wd_path = PathBuf::from(&wd);
+                    if let Ok(abs) = std::path::absolute(&wd_path) {
+                        shared_workdirs.insert(abs);
+                    }
+                    shared_workdirs.insert(wd_path);
+                }
+            }
+        }
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
     let marker_val = std::fs::read_to_string(&marker_path)
@@ -2919,26 +3343,30 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         .as_ref()
         .and_then(|v| v.get("path"))
         .and_then(|v| v.as_str())
-        .map(PathBuf::from);
+        .map(PathBuf::from)
+        .map(|p| std::path::absolute(&p).unwrap_or(p));
 
-    let work_dir = agent_root.join("work");
-    if let Some(ref wt_path) = recorded_wt
-        && wt_path != &work_dir
-        && wt_path.join(".git").exists()
-        && is_git_worktree_safe_to_reap(wt_path, initial_head.as_deref())
-    {
-        reap_git_worktree_cleanly(wt_path, seat_ids);
+    let work_dir =
+        std::path::absolute(agent_root.join("work")).unwrap_or_else(|_| agent_root.join("work"));
+    // Never reap an external `explicit-worktree` (`wt_path != &work_dir`) such as `/scratch/wt/...`
+    // that a parent or operator created and lent to a child agent. Only reap the agent's own
+    // ephemeral `agent_root/work` directory when not shared with another agent.
+    if !shared_workdirs.contains(&work_dir) {
+        if work_dir.join(".git").exists() {
+            if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
+                reap_git_worktree_cleanly(&work_dir, seat_ids);
+                let _ = std::fs::remove_file(&marker_path);
+            }
+        } else {
+            remove_path_with_seat(&work_dir, seat_ids);
+            if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
+                let _ = std::fs::remove_file(&marker_path);
+            }
+        }
     }
-    if work_dir.join(".git").exists() {
-        if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
-            reap_git_worktree_cleanly(&work_dir, seat_ids);
-            let _ = std::fs::remove_file(&marker_path);
-        }
-    } else {
-        remove_path_with_seat(&work_dir, seat_ids);
-        if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
-            let _ = std::fs::remove_file(&marker_path);
-        }
+    let _ = std::fs::create_dir_all(&work_dir);
+    if let Some((_, gid, _)) = seat_ids {
+        crate::sandbox::share_worktree_with_seat(&work_dir, gid);
     }
 }
 
@@ -3226,6 +3654,9 @@ async fn wake_agent_route(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &found.id));
+        if !work_dir.exists() {
+            let _ = std::fs::create_dir_all(&work_dir);
+        }
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
         {
@@ -3259,6 +3690,7 @@ fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::Grou
     let mut out = Vec::with_capacity(members.len());
     for name in members {
         if let Ok(agent) = store.agent_by_name(name) {
+            let description = agent.public_description();
             out.push(crate::api::GroupMemberView {
                 id: agent.id.to_string(),
                 name: agent.name,
@@ -3266,7 +3698,7 @@ fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::Grou
                 harness: agent.harness,
                 model: agent.model,
                 state: agent.state,
-                description: agent.instructions,
+                description,
             });
         }
     }
@@ -4214,9 +4646,14 @@ impl SendPlan {
                     let sender = store
                         .agent_by_name(sender_name)
                         .map_err(ApiError::from_store)?;
-                    let children = store
+                    let children: Vec<_> = store
                         .children_of(&sender.id)
-                        .map_err(ApiError::from_store)?;
+                        .map_err(ApiError::from_store)?
+                        .into_iter()
+                        .filter(|c| {
+                            c.state != "archived" && !is_explicitly_archived(store.data_dir(), c)
+                        })
+                        .collect();
                     if children.is_empty() {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
@@ -4237,9 +4674,14 @@ impl SendPlan {
                     let sender = store
                         .agent_by_name(sender_name)
                         .map_err(ApiError::from_store)?;
-                    let children = store
+                    let children: Vec<_> = store
                         .children_of(&sender.id)
-                        .map_err(ApiError::from_store)?;
+                        .map_err(ApiError::from_store)?
+                        .into_iter()
+                        .filter(|c| {
+                            c.state != "archived" && !is_explicitly_archived(store.data_dir(), c)
+                        })
+                        .collect();
                     if children.is_empty() {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
@@ -4611,15 +5053,14 @@ fn deliver_agent(
     key: Option<&str>,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
-    if (agent.state == "idle" || agent.state == "archived")
+    let trimmed = body.text.trim_start();
+    let is_auto_subagent_lifecycle =
+        trimmed.starts_with("[Sub-Agent Completed]") || trimmed.starts_with("[Sub-Agent Error]");
+    if (agent.state == "idle" || agent.state == "created")
         && !is_explicitly_archived(store.data_dir(), &agent)
+        && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
-        let trimmed = body.text.trim_start();
-        let is_auto_subagent_lifecycle = trimmed.starts_with("[Sub-Agent Completed]")
-            || trimmed.starts_with("[Sub-Agent Error]");
-        if !(agent.parent_id.is_none() && is_auto_subagent_lifecycle) {
-            let _ = store.set_agent_state(&agent.id, "running");
-        }
+        let _ = store.set_agent_state(&agent.id, "running");
     }
     let outcome = store
         .receive(
@@ -4640,6 +5081,10 @@ fn deliver_agent(
         ReceiveOutcome::New(message) => (message, false),
         ReceiveOutcome::Duplicate(message) => (message, true),
     };
+    if !duplicate {
+        crate::create::poke_agent_wake_socket(store.data_dir(), &agent.id);
+        crate::create::poke_agent_wake_socket_mail(store.data_dir(), &agent.id);
+    }
     Ok(Delivery {
         to: format!("agent:{}", agent.name),
         id: message.id.to_string(),

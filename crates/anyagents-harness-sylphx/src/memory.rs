@@ -7,6 +7,7 @@ use std::path::Path;
 use serde_json::{Value, json};
 
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
+pub const MAX_WINDOW_EST_TOKENS: usize = 160_000;
 pub const CONTEXT_WATERMARK_PERCENT: usize = 75;
 pub const WINDOW_MAX_ITEMS: usize = 160;
 pub const WINDOW_STRIDE_ITEMS: usize = 80;
@@ -413,6 +414,79 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
                 if let Some(obj) = item.as_object_mut() {
                     obj.insert("output".to_string(), json!(masked));
                 }
+            }
+        }
+    }
+    // Enforce hard token budget (`MAX_WINDOW_EST_TOKENS`) even when `history.len() <= WINDOW_MAX_ITEMS`
+    // so large tool outputs or reasoning blocks can never grow the active window past the model context limit.
+    let est_chars = |items: &[(usize, Value)]| -> usize {
+        items
+            .iter()
+            .map(|(_, v)| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .sum()
+    };
+    let max_chars = MAX_WINDOW_EST_TOKENS * 4;
+    if est_chars(&history) > max_chars {
+        let older_bound = (history.len() * 3) / 4;
+        for (raw_idx, item) in &mut history[..older_bound] {
+            if item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && let Some(out_str) = item.get("output").and_then(Value::as_str)
+                && out_str.len() > 1_600
+            {
+                let masked = format!(
+                    "{}\n[context_budget (#{raw_idx}): compressed; raw preserved at transcript:{raw_idx}-{raw_idx}]",
+                    super::auth::truncate_tool_output_middle_utf8(
+                        out_str.to_string(),
+                        1_200,
+                        500,
+                        500,
+                    )
+                );
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("output".to_string(), json!(masked));
+                }
+            }
+        }
+        while est_chars(&history) > max_chars && history.len() > 8 {
+            let step_cut = (history.len() / 4).max(4);
+            let block_start = paired_suffix_start(&history, step_cut);
+            if block_start == 0 {
+                // If an outer call spans the entire window, compress the largest tool output in the window.
+                if let Some((raw_idx, largest)) = history
+                    .iter_mut()
+                    .filter(|(_, it)| {
+                        it.get("type").and_then(Value::as_str) == Some("function_call_output")
+                    })
+                    .max_by_key(|(_, it)| {
+                        it.get("output")
+                            .and_then(Value::as_str)
+                            .map(str::len)
+                            .unwrap_or(0)
+                    })
+                    && let Some(out_str) = largest.get("output").and_then(Value::as_str)
+                    && out_str.len() > 1_600
+                {
+                    let masked = format!(
+                        "{}\n[context_budget (#{raw_idx}): compressed; raw preserved at transcript:{raw_idx}-{raw_idx}]",
+                        super::auth::truncate_tool_output_middle_utf8(
+                            out_str.to_string(),
+                            1_200,
+                            500,
+                            500,
+                        )
+                    );
+                    if let Some(obj) = largest.as_object_mut() {
+                        obj.insert("output".to_string(), json!(masked));
+                        continue;
+                    }
+                }
+                break;
+            }
+            history.drain(0..block_start);
+            while history.first().is_some_and(|(_, item)| {
+                item.get("type").and_then(Value::as_str) == Some("reasoning")
+            }) {
+                history.remove(0);
             }
         }
     }

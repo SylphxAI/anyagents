@@ -529,9 +529,22 @@ fn initial_watch_baseline(
                 None
             }
         }
-        WatchTarget::GitHubPr { .. } | WatchTarget::GitHubCheck { .. } => {
-            Some("pending".to_string())
+        WatchTarget::GitHubPr {
+            owner,
+            repo,
+            number,
+        } => {
+            if std::env::var_os("ANYAGENTS_GITHUB_API_BASE").is_none()
+                && let Some((_, state_desc)) =
+                    probe_github_pr_terminal(owner, repo, *number, "schedule-init", now)
+                && state_desc == "checks_completed"
+            {
+                Some("checks_completed".to_string())
+            } else {
+                Some("pending".to_string())
+            }
         }
+        WatchTarget::GitHubCheck { .. } => Some("pending".to_string()),
         WatchTarget::ProcessExit { pid } => Some(
             if probe_process_alive(*pid) {
                 "running"
@@ -599,6 +612,12 @@ pub fn agent_wake_block_reason(
 }
 
 pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
+    if matches!(
+        store.try_lock_agent(&agent.id),
+        Err(anyagents_core::Error::AgentBusy)
+    ) {
+        return true;
+    }
     if store.has_open_turn(&agent.id).unwrap_or(false) {
         return true;
     }
@@ -619,15 +638,25 @@ pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i6
 /// Evaluate all active schedules once at timestamp `now`.
 /// Returns the number of wakes delivered.
 pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usize {
+    let _ = store.restore_skipped_at_schedules(now.saturating_sub(3_600_000));
     let Ok(schedules) = store.list_schedules(None, true) else {
         return 0;
     };
     let mut fired_count = 0;
     for sched in schedules {
+        if (sched.kind == "at" || sched.kind == "every")
+            && sched.next_fire_at_ms.is_none_or(|due| now < due)
+        {
+            continue;
+        }
         let Ok(agent) = store.agent(&sched.agent_id) else {
             let _ = store.cancel_schedule(None, &sched.id);
             continue;
         };
+        if agent.state == "archived" {
+            let _ = store.cancel_schedule(None, &sched.id);
+            continue;
+        }
         let block = agent_wake_block_reason(store, health, &agent, now);
         match sched.kind.as_str() {
             "at" => {
@@ -637,17 +666,9 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if now < due {
                     continue;
                 }
-                if let Some(reason) = block {
-                    // Missed wake while busy/quota-blocked/paused: consume once, never fire twice.
-                    let _ = store.claim_schedule_tick(
-                        &sched.id,
-                        Some(due),
-                        "fired",
-                        None,
-                        None,
-                        None,
-                        Some(&format!("skipped:{reason}")),
-                    );
+                if block.is_some() {
+                    // Defer one-shot timer wakes while the owning agent is busy, paused, or
+                    // quota-blocked so the wake is delivered as soon as the agent becomes idle.
                     continue;
                 }
                 if store
@@ -895,10 +916,24 @@ fn evaluate_watch(
                     baseline: sched.watch_baseline.clone(),
                 };
             };
+            if state_desc == "checks_completed"
+                && sched.watch_baseline.as_deref() == Some("checks_completed")
+            {
+                return WatchEval {
+                    triggered: false,
+                    observed: Some(state_desc),
+                    baseline: Some("checks_completed".to_string()),
+                };
+            }
+            let next_baseline = if !is_terminal {
+                Some(state_desc.clone())
+            } else {
+                sched.watch_baseline.clone()
+            };
             WatchEval {
                 triggered: is_terminal,
                 observed: Some(state_desc),
-                baseline: sched.watch_baseline.clone(),
+                baseline: next_baseline,
             }
         }
         WatchTarget::GitHubCheck {
@@ -1141,16 +1176,18 @@ fn probe_github_pr_terminal(
         return cached.clone();
     }
 
-    let out = std::process::Command::new("gh")
+    let out = std::process::Command::new("timeout")
         .env("ANYAGENTS_AGENT_ID", agent_id)
         .args([
+            "10s",
+            "gh",
             "pr",
             "view",
             &number.to_string(),
             "--repo",
             &format!("{owner}/{repo}"),
             "--json",
-            "state,mergedAt,statusCheckRollup",
+            "state,mergedAt,statusCheckRollup,mergeQueueEntry",
         ])
         .output()
         .ok()?;
@@ -1185,6 +1222,16 @@ fn evaluate_pr_json(val: &serde_json::Value) -> Option<(bool, String)> {
     }
     if state == "CLOSED" {
         return Some((true, "closed".to_string()));
+    }
+    if let Some(mq) = val.get("mergeQueueEntry")
+        && !mq.is_null()
+    {
+        let mq_state = mq
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("QUEUED")
+            .to_ascii_lowercase();
+        return Some((false, format!("merge_queue:{mq_state}")));
     }
     if let Some(rollup) = val
         .get("statusCheckRollup")
@@ -1254,9 +1301,11 @@ fn probe_github_check_terminal(
         return cached.clone();
     }
 
-    let out = std::process::Command::new("gh")
+    let out = std::process::Command::new("timeout")
         .env("ANYAGENTS_AGENT_ID", agent_id)
         .args([
+            "10s",
+            "gh",
             "api",
             &format!("repos/{owner}/{repo}/commits/{clean_ref}/check-runs"),
         ])

@@ -2871,7 +2871,7 @@ fn load_op_service_account_token() -> Option<String> {
     None
 }
 
-fn ensure_caller_op_config_dir() -> Option<PathBuf> {
+fn ensure_caller_op_home_and_config_dir() -> Option<(PathBuf, PathBuf)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -2882,14 +2882,18 @@ fn ensure_caller_op_config_dir() -> Option<PathBuf> {
                 && meta.uid() == uid
                 && (meta.permissions().mode() & 0o777) == 0o700
             {
-                return Some(candidate);
+                return Some((home, candidate));
             }
         }
-        let dir = std::env::temp_dir().join(format!("anyagents-op-cfg-{uid}"));
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-        if dir.is_dir() {
-            return Some(dir);
+        let home_dir = std::env::temp_dir().join(format!("anyagents-op-home-{uid}"));
+        let cfg_root = home_dir.join(".config");
+        let op_dir = cfg_root.join("op");
+        let _ = std::fs::create_dir_all(&op_dir);
+        let _ = std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&cfg_root, std::fs::Permissions::from_mode(0o700));
+        let _ = std::fs::set_permissions(&op_dir, std::fs::Permissions::from_mode(0o700));
+        if op_dir.is_dir() {
+            return Some((home_dir, op_dir));
         }
         None
     }
@@ -2902,7 +2906,12 @@ fn ensure_caller_op_config_dir() -> Option<PathBuf> {
 fn configure_op_command(cmd: &mut Command) {
     cmd.stdin(Stdio::null());
     cmd.env("DESK_SECRET_READ", "1");
-    if let Some(cfg_dir) = ensure_caller_op_config_dir() {
+    if let Some(host_home) = crate::sandbox::host_home_dir() {
+        cmd.env("DESK_OP_HOME", host_home);
+    }
+    if let Some((op_home, cfg_dir)) = ensure_caller_op_home_and_config_dir() {
+        cmd.env("HOME", &op_home);
+        cmd.env("XDG_CONFIG_HOME", op_home.join(".config"));
         cmd.env("OP_CONFIG_DIR", cfg_dir);
     }
     if let Some(token) = load_op_service_account_token() {
@@ -3615,7 +3624,7 @@ pub fn execute(
             }
             Ok(out)
         }
-        "snapshot" | "read" | "dom" => {
+        "snapshot" | "read" | "dom" | "text" | "content" | "html" => {
             let snap = capture_snapshot(data, &profile, &mut cdp)?;
             let mut out = serde_json::json!({
                 "profile": profile,
@@ -3625,6 +3634,14 @@ pub fn execute(
                 "elements": snap.get("elements").cloned().unwrap_or_default(),
                 "captcha_detected": snap.get("captcha_detected").and_then(|v| v.as_bool()).unwrap_or(false),
             });
+            if action == "html"
+                && let Ok(html_val) = eval_js(
+                    &mut cdp,
+                    "document.documentElement ? document.documentElement.outerHTML : ''",
+                )
+            {
+                out["html"] = html_val;
+            }
             if let Some(kind) = snap.get("captcha_kind").cloned() {
                 out["captcha_kind"] = kind;
             }
@@ -4195,21 +4212,71 @@ pub fn execute(
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| Error::Message("screenshot returned no image data".into()))?;
             let png_bytes = decode_base64(b64)?;
-            let out_path = match req.path.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-                Some(p) => PathBuf::from(p),
-                None => {
-                    let shots_dir = profile_dir(data, &profile).join("screenshots");
-                    std::fs::create_dir_all(&shots_dir)?;
-                    shots_dir.join(format!("shot-{}.png", now_ms()))
+            let shots_dir = profile_dir(data, &profile).join("screenshots");
+            std::fs::create_dir_all(&shots_dir)?;
+            let fallback_path = shots_dir.join(format!("shot-{}.png", now_ms()));
+            let requested_path = req
+                .path
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from);
+            let final_path = if let Some(ref target) = requested_path {
+                if let Some(parent) = target.parent()
+                    && !parent.as_os_str().is_empty()
+                {
+                    let _ = std::fs::create_dir_all(parent);
                 }
+                if std::fs::write(target, &png_bytes).is_ok() {
+                    target.clone()
+                } else {
+                    std::fs::write(&fallback_path, &png_bytes)?;
+                    #[cfg(unix)]
+                    let copied_to_seat = {
+                        use std::os::unix::fs::MetadataExt as _;
+                        if let Some(parent) = target.parent()
+                            && let Ok(meta) = std::fs::metadata(parent)
+                            && meta.uid() != unsafe { libc::geteuid() }
+                            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
+                        {
+                            let uid_s = meta.uid().to_string();
+                            let gid_s = meta.gid().to_string();
+                            Command::new("/usr/local/bin/anyagents-setpriv")
+                                .args([
+                                    "--reuid",
+                                    &uid_s,
+                                    "--regid",
+                                    &gid_s,
+                                    "--groups",
+                                    &gid_s,
+                                    "--no-new-privs",
+                                    "--",
+                                    "/bin/cp",
+                                    "-f",
+                                ])
+                                .arg(&fallback_path)
+                                .arg(target)
+                                .status()
+                                .is_ok_and(|s| s.success())
+                        } else {
+                            false
+                        }
+                    };
+                    #[cfg(not(unix))]
+                    let copied_to_seat = false;
+                    if copied_to_seat {
+                        target.clone()
+                    } else {
+                        fallback_path
+                    }
+                }
+            } else {
+                std::fs::write(&fallback_path, &png_bytes)?;
+                fallback_path
             };
-            if let Some(parent) = out_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&out_path, &png_bytes)?;
             Ok(serde_json::json!({
                 "profile": profile,
-                "path": out_path.display().to_string(),
+                "path": final_path.display().to_string(),
                 "bytes": png_bytes.len(),
             }))
         }

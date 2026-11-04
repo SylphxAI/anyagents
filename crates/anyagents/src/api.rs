@@ -41,9 +41,12 @@ pub struct AgentView {
     /// `installed`, `pending`, or `needed: <why>`: whether this agent's harness
     /// has been installed yet, and what stopped it.
     pub install: String,
-    /// Standing role description / current responsibilities (`instructions` column in SQLite).
+    /// Public capability/charter summary (`description` column in SQLite, Layer 1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Private operating instructions (`instructions` column in SQLite, Layer 2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
     /// Assigned OS seat account name (e.g. `seat-atlas`, `seat-rhea`, `seat-worker`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seat_user: Option<String>,
@@ -123,7 +126,9 @@ pub struct CreateAgentRequest {
     pub base: Option<String>,
     #[serde(default)]
     pub workdir: Option<String>,
-    #[serde(default, alias = "description")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default)]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,

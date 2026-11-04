@@ -26,7 +26,9 @@ use std::time::{Duration, Instant};
 
 use anyagents_core::{Channel, FileCredentialStore, Store};
 
-use super::channel::{LONG_POLL_S, delete_webhook, ensure_webhook, poll_channel_once};
+use super::channel::{
+    LONG_POLL_S, delete_webhook, ensure_webhook, poll_channel_once, reconcile_channel_groups,
+};
 
 /// How often the supervisor looks for channels that were added or removed.
 const RECONCILE_EVERY: Duration = Duration::from_secs(2);
@@ -248,6 +250,9 @@ fn run_channel(
                     continue;
                 }
             }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                reconcile_channel_groups(&store, &secrets, &channel);
+            }));
             sleep_for(&stop, &global_stop, Duration::from_secs(30));
             continue;
         }

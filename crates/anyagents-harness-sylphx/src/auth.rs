@@ -444,7 +444,6 @@ pub fn write_sylphx_config(
         if marker_cloud == Some(true)
             || (!obj.contains_key("sandbox")
                 && marker_cloud != Some(false)
-                && obj.contains_key("repo")
                 && !crate::sandbox::is_isolated_test_env()
                 && crate::cloud::resolve_sylphx_cloud_access_key(config_dir, &[]).is_some())
         {
@@ -668,14 +667,15 @@ pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
     if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
         return false;
     }
+    let is_hard_quota = lower.contains("insufficient_quota")
+        || lower.contains("credit balance is too low")
+        || lower.contains("out of credits")
+        || lower.contains("quota exceeded");
     if matches!(status, 408 | 409 | 425 | 500 | 502 | 503 | 504 | 520..=529) {
         return true;
     }
     if status == 429 {
-        return !lower.contains("insufficient_quota")
-            && !lower.contains("credit balance is too low")
-            && !lower.contains("out of credits")
-            && !lower.contains("quota exceeded");
+        return !is_hard_quota;
     }
     if !(200..300).contains(&status) {
         return lower.contains("model_unavailable")
@@ -685,19 +685,67 @@ pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
             || lower.contains("service unavailable")
             || lower.contains("gateway timeout");
     }
-    false
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    match serde_json::from_str::<Value>(trimmed) {
+        Err(_) => true,
+        Ok(val) => {
+            let has_valid_output = val.get("error").is_none_or(Value::is_null)
+                && val.get("output").is_some_and(Value::is_array);
+            if has_valid_output || is_hard_quota {
+                return false;
+            }
+            let has_error_or_failed = !val.get("error").is_none_or(Value::is_null)
+                || val.get("status").and_then(Value::as_str) == Some("failed");
+            has_error_or_failed
+                && (lower.contains("model_unavailable")
+                    || lower.contains("included_capacity_unavailable")
+                    || lower.contains("temporarily unavailable")
+                    || lower.contains("overloaded")
+                    || lower.contains("server_error")
+                    || lower.contains("api_error")
+                    || lower.contains("rate_limit")
+                    || lower.contains("\"retryable\":true")
+                    || lower.contains("\"retryable\": true")
+                    || lower.contains("bad gateway")
+                    || lower.contains("service unavailable")
+                    || lower.contains("gateway timeout"))
+        }
+    }
 }
 
 fn gateway_retry_policy() -> (u32, u64) {
     let max_retries = std::env::var("SYLPHX_MAX_RETRIES")
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
-        .unwrap_or(5);
+        .unwrap_or(8);
     let base_backoff_ms = std::env::var("SYLPHX_RETRY_BACKOFF_MS")
         .ok()
         .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(500);
+        .unwrap_or(1_000);
     (max_retries, base_backoff_ms)
+}
+
+fn parse_retry_after_ms(body: &str) -> Option<u64> {
+    let val = serde_json::from_str::<Value>(body.trim()).ok()?;
+    if let Some(ms) = val
+        .get("retry_after_ms")
+        .or_else(|| val.pointer("/error/retry_after_ms"))
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok()))
+        })
+    {
+        return Some(ms.min(30_000));
+    }
+    let secs = val
+        .get("error")
+        .and_then(|e| e.get("retry_after_seconds"))
+        .and_then(Value::as_u64)
+        .or_else(|| val.get("retry_after_seconds").and_then(Value::as_u64))?;
+    Some(secs.min(30).saturating_mul(1_000))
 }
 
 fn curl_post_json_once(
@@ -732,7 +780,7 @@ fn curl_post_json_fallback(
         "-X",
         "POST",
         "--max-time",
-        "120",
+        "210",
         "-H",
         "Content-Type: application/json",
         "-w",
@@ -783,12 +831,24 @@ pub(super) fn curl_post_json(
 ) -> Result<(u16, String), String> {
     let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
     let (max_retries, base_backoff_ms) = gateway_retry_policy();
+    let jitter_seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0)
+        ^ (std::process::id() as u64);
     let mut attempt = 0u32;
     loop {
         match curl_post_json_once(url, bearer_token, &payload) {
             Ok((code, text)) => {
                 if attempt < max_retries && is_transient_gateway_failure(code, &text) {
-                    let delay_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(4));
+                    let exp_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(4));
+                    let retry_after_ms = parse_retry_after_ms(&text).unwrap_or(0);
+                    let jitter_ms = if base_backoff_ms >= 500 {
+                        (jitter_seed.wrapping_add(attempt as u64 * 313)) % 750
+                    } else {
+                        0
+                    };
+                    let delay_ms = exp_ms.max(retry_after_ms).saturating_add(jitter_ms);
                     std::thread::sleep(Duration::from_millis(delay_ms));
                     attempt += 1;
                     continue;

@@ -23,7 +23,7 @@ pub use store::{
     HistorySearchQuery, HistorySort, Incoming, Lag, MAX_RECOVERY_ATTEMPTS, Message, NewAgent,
     NewChannel, NewSchedule, NewUsage, OpenTurn, Origin, OutboundEffect, ReceiveOutcome, Store,
     UsageRecord, UsageTotal, Wake, agent_config_dir, agent_work_dir, clean_rag_text, now_ms,
-    rag_content_hash, sum_usage, tokenize_hybrid_search_tokens, utc_day,
+    rag_content_hash, read_root_roster, sum_usage, tokenize_hybrid_search_tokens, utc_day,
 };
 
 /// The token a client presents as an agent, when it has one. A capability is

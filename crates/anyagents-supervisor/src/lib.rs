@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+pub use anyagents_agent::recovery_outbound;
 use anyagents_agent::{DeliveryLoop, RunOutcome};
 use anyagents_core::{
     Agent, AgentId, BillingMode, NewUsage, Store, Wake, agent_config_dir, agent_work_dir, utc_day,
@@ -438,9 +439,11 @@ fn listen_wake<H: Harness>(socket: UnixDatagram, inner: Arc<Inner<H>>) {
 }
 
 fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
+    let skip_sylphx = inner.store.data_dir().join("admin.sock").exists()
+        || inner.store.data_dir().join("admin.lock").exists();
     if let Ok(agents) = inner.store.list_agents() {
         for agent in agents {
-            if agent.state == "running" {
+            if agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx") {
                 ensure(&inner, agent.id);
             }
         }
@@ -451,12 +454,14 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
         }
         match wake {
             Wake::Mail { agent_id } => {
-                if let Some(slot) = lock(&inner.workers).get(&agent_id) {
-                    slot.woken.store(true, Ordering::SeqCst);
-                    inner.clock.poke();
-                }
                 if is_running(&inner.store, &agent_id) {
+                    if let Some(slot) = lock(&inner.workers).get(&agent_id) {
+                        slot.woken.store(true, Ordering::SeqCst);
+                        inner.clock.poke();
+                    }
                     ensure(&inner, agent_id);
+                } else {
+                    stop_slot(&inner, &agent_id);
                 }
             }
             Wake::Agent { agent_id } => {
@@ -471,7 +476,11 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
 }
 
 fn is_running(store: &Store, id: &AgentId) -> bool {
-    store.agent(id).is_ok_and(|agent| agent.state == "running")
+    let skip_sylphx = store.data_dir().join("admin.sock").exists()
+        || store.data_dir().join("admin.lock").exists();
+    store
+        .agent(id)
+        .is_ok_and(|agent| agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx"))
 }
 
 fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {

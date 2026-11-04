@@ -334,7 +334,7 @@ pub fn recorded(harness: &str) -> Option<Result<(), String>> {
 /// real vendor and an unusual install can be pointed at.
 pub fn program(root: &Path, harness: &str) -> PathBuf {
     if harness == "sylphx" {
-        return std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+        return crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
     }
     if let Some(named) = std::env::var_os(format!(
         "ANYAGENTS_{}_BIN",

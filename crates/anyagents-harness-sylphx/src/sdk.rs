@@ -389,7 +389,9 @@ impl SylphxSdkSession {
     pub fn run_turn(&self, user_prompt: &str) -> Result<TurnUsage, String> {
         let state = Arc::new(Mutex::new(SharedState::default()));
         let cancel_flag = Arc::new(AtomicBool::new(false));
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents"));
+        let exe = crate::clean_exe_path(
+            &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents")),
+        );
         match self.execution_mode {
             SylphxExecutionMode::LocalOnly => run_native_gateway_turn(
                 &state,
@@ -428,6 +430,7 @@ impl SylphxSdkSession {
                     user_prompt,
                 ) {
                     Ok(u) => Ok(u),
+                    Err(e) if !crate::sandbox::is_isolated_test_env() => Err(e),
                     Err(_) => run_native_gateway_turn(
                         &state,
                         &cancel_flag,

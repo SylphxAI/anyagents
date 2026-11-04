@@ -149,6 +149,9 @@ pub struct Context {
     /// Handles or agents mentioned in this message (`@username`, `agent:<name>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mentions: Vec<String>,
+    /// Agents participating in this group or channel conversation (`name (role)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<String>,
 }
 
 impl Context {
@@ -201,6 +204,12 @@ impl Context {
                 xml_attr_escape(&self.mentions.join(", "))
             ));
         }
+        if !self.participants.is_empty() {
+            out.push_str(&format!(
+                " participants=\"{}\"",
+                xml_attr_escape(&self.participants.join(", "))
+            ));
+        }
         out.push_str(&format!(
             " reply_to=\"{}\"",
             xml_attr_escape(&reply_ref(id))
@@ -241,6 +250,9 @@ impl Context {
         if !self.mentions.is_empty() {
             out.push_str(&format!("mentions: {}\n", self.mentions.join(", ")));
         }
+        if !self.participants.is_empty() {
+            out.push_str(&format!("participants: {}\n", self.participants.join(", ")));
+        }
         out.push_str(&format!("{REPLY_HINT_PREFIX}{}\n", reply_ref(id)));
         if let Some(destination) = &self.destination {
             out.push_str(&format!("answer to: {destination}\n"));
@@ -277,19 +289,32 @@ pub fn spawn_command(
     let mut command = match seat {
         Some(spec) => match spec.split('\t').collect::<Vec<_>>().as_slice() {
             [launcher, uid, gid, groups] => {
-                let mut command = std::process::Command::new(launcher);
-                command.args([
-                    "--reuid",
-                    uid,
-                    "--regid",
-                    gid,
-                    "--groups",
-                    groups,
-                    "--no-new-privs",
-                    "--",
-                ]);
-                command.arg(program);
-                command
+                #[cfg(unix)]
+                let already_in_seat = {
+                    unsafe extern "C" {
+                        fn geteuid() -> u32;
+                    }
+                    unsafe { geteuid() }.to_string() == *uid
+                };
+                #[cfg(not(unix))]
+                let already_in_seat = false;
+                if already_in_seat {
+                    std::process::Command::new(program)
+                } else {
+                    let mut command = std::process::Command::new(launcher);
+                    command.args([
+                        "--reuid",
+                        uid,
+                        "--regid",
+                        gid,
+                        "--groups",
+                        groups,
+                        "--no-new-privs",
+                        "--",
+                    ]);
+                    command.arg(program);
+                    command
+                }
             }
             _ => std::process::Command::new(program),
         },

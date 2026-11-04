@@ -82,13 +82,22 @@ pub(super) fn execute_bash_with_timeout(
     timeout_ms: u64,
 ) -> String {
     let bounded_timeout_ms = timeout_ms.clamp(500, 600_000);
+    if !work_dir.exists() {
+        let _ = workspace::create_dir_all(work_dir, env);
+        let _ = std::fs::create_dir_all(work_dir);
+    }
+    let effective_dir = if work_dir.is_dir() {
+        work_dir
+    } else {
+        Path::new("/tmp")
+    };
     let mut cmd = match workspace::command(Path::new("bash"), env) {
         Ok(cmd) => cmd,
         Err(e) => return format!("error executing bash: {e}"),
     };
     cmd.arg("-c")
         .arg(cmd_str)
-        .current_dir(work_dir)
+        .current_dir(effective_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -129,10 +138,25 @@ pub(super) fn execute_bash_with_timeout(
                 if Instant::now() >= deadline {
                     timed_out = true;
                     #[cfg(unix)]
-                    unsafe {
+                    {
                         let pgid = child.id() as i32;
                         if pgid > 0 {
-                            let _ = libc::kill(-pgid, libc::SIGKILL);
+                            unsafe {
+                                let _ = libc::kill(-pgid, libc::SIGKILL);
+                            }
+                            if workspace::delegated(env)
+                                && let Ok(mut kcmd) =
+                                    workspace::command(Path::new("/bin/kill"), env)
+                            {
+                                let neg_pgid = format!("-{pgid}");
+                                let pos_pgid = pgid.to_string();
+                                let _ = kcmd
+                                    .args(["-s", "KILL", "--", &neg_pgid, &pos_pgid])
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status();
+                            }
                         }
                     }
                     let _ = child.kill();
@@ -221,6 +245,9 @@ pub(super) fn format_read_file_output(
 
 /// Native directory listing for local workspaces without spawning a `bash` subprocess.
 pub(super) fn list_dir_native(work_dir: &Path, raw_path: &str) -> String {
+    if (raw_path == "." || raw_path.is_empty()) && !work_dir.exists() {
+        let _ = std::fs::create_dir_all(work_dir);
+    }
     let target = if Path::new(raw_path).is_absolute() {
         PathBuf::from(raw_path)
     } else {
@@ -929,7 +956,12 @@ pub(super) fn build_code_mode_command(
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> String {
-    let mut mcp_cmd_vec = vec![mcp_command.display().to_string()];
+    let raw_mcp_cmd = mcp_command.display().to_string();
+    let clean_mcp_cmd = raw_mcp_cmd
+        .strip_suffix(" (deleted)")
+        .unwrap_or(&raw_mcp_cmd)
+        .to_string();
+    let mut mcp_cmd_vec = vec![clean_mcp_cmd];
     mcp_cmd_vec.extend(mcp_args.iter().cloned());
     let mcp_cmd_json = serde_json::to_string(&mcp_cmd_vec).unwrap_or_else(|_| "[]".to_string());
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
