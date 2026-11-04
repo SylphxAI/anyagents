@@ -5435,7 +5435,8 @@ exec "$@"
         );
         assert!(write_out.starts_with("wrote "), "unexpected: {write_out}");
         assert!(cfg.join("sylphx-sandbox-fallback.json").is_file());
-        assert_eq!(resolve_sandbox_mode(&cfg, &env), "local");
+        assert!(cloud::is_cloud_sandbox_in_fallback_cooldown(&cfg));
+        assert_eq!(resolve_sandbox_mode(&cfg, &env), "cloud");
 
         // 2. `edit_file`, `read_file`, and `bash` now run locally without hitting the dead cloud endpoint!
         let edit_out = execute_sylphx_tool(
