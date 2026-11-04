@@ -36,7 +36,7 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
      reply_to, received_at_ms, delivered_at_ms, origin, context";
 
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
-     created_at_ms, launch_env, parent_id, is_admin, role";
+     created_at_ms, launch_env, parent_id, is_admin, role, description";
 
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,9 +45,12 @@ pub struct Agent {
     pub id: AgentId,
     pub name: String,
     pub role: Option<String>,
+    /// Public capability/charter summary shared in team and group rosters (Layer 1).
+    pub description: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
+    /// Private operating instructions injected only into this agent's system prompt (Layer 2).
     pub instructions: Option<String>,
     pub state: String,
     pub created_at_ms: i64,
@@ -58,11 +61,38 @@ pub struct Agent {
     pub parent_id: Option<AgentId>,
 }
 
+impl Agent {
+    /// Returns the agent's public capability/charter summary (`description`) for team and group
+    /// rosters without exposing multi-paragraph private `instructions`.
+    pub fn public_description(&self) -> Option<String> {
+        if let Some(desc) = self
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(desc.to_string());
+        }
+        let raw = self
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())?;
+        let first_line = raw.lines().next().unwrap_or(raw).trim();
+        if first_line.is_empty() {
+            return None;
+        }
+        let truncated: String = first_line.chars().take(300).collect();
+        Some(truncated)
+    }
+}
+
 /// Fields for `agents.create`. The harness value is a catalog key.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NewAgent {
     pub name: String,
     pub role: Option<String>,
+    pub description: Option<String>,
     pub harness: String,
     pub model: Option<String>,
     pub workdir: Option<String>,
@@ -75,6 +105,7 @@ impl NewAgent {
         Self {
             name: name.into(),
             role: None,
+            description: None,
             harness: harness.into(),
             model: None,
             workdir: None,
@@ -743,11 +774,28 @@ impl Store {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string);
+        let clean_description = new
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                new.instructions
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .and_then(|raw| raw.lines().next())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|line| line.chars().take(300).collect())
+            });
         let agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
             role: clean_role,
+            description: clean_description,
             harness: new.harness,
             model: new.model,
             workdir: new.workdir,
@@ -769,8 +817,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -781,6 +829,7 @@ impl Store {
                 agent.created_at_ms,
                 agent.parent_id.as_ref().map(|id| id.as_str()),
                 agent.role,
+                agent.description,
             ],
         )?;
         tx.execute(
@@ -929,6 +978,22 @@ impl Store {
         Ok(())
     }
 
+    /// Set or clear an agent's public capability/charter description (`description` column, Layer 1).
+    pub fn set_agent_description(
+        &self,
+        id: &AgentId,
+        description: Option<&str>,
+    ) -> Result<Agent, Error> {
+        let clean = description.map(str::trim).filter(|s| !s.is_empty());
+        let conn = self.conn();
+        agent_by_id(&conn, id)?;
+        conn.execute(
+            "UPDATE agents SET description = ?1 WHERE id = ?2",
+            params![clean, id.as_str()],
+        )?;
+        agent_by_id(&conn, id)
+    }
+
     pub fn set_agent_instructions(
         &self,
         id: &AgentId,
@@ -936,10 +1001,19 @@ impl Store {
     ) -> Result<Agent, Error> {
         let clean = instructions.map(str::trim).filter(|s| !s.is_empty());
         let conn = self.conn();
-        agent_by_id(&conn, id)?;
+        let current = agent_by_id(&conn, id)?;
+        let derived_desc = if current.description.is_none() {
+            clean
+                .and_then(|raw| raw.lines().next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|line| line.chars().take(300).collect::<String>())
+        } else {
+            current.description
+        };
         conn.execute(
-            "UPDATE agents SET instructions = ?1 WHERE id = ?2",
-            params![clean, id.as_str()],
+            "UPDATE agents SET instructions = ?1, description = ?2 WHERE id = ?3",
+            params![clean, derived_desc, id.as_str()],
         )?;
         agent_by_id(&conn, id)
     }
@@ -960,7 +1034,7 @@ impl Store {
         let aliased = conn
             .query_row(
                 "SELECT a.id, a.name, a.harness, a.model, a.workdir, a.instructions, a.state, \
-                        a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role \
+                        a.created_at_ms, a.launch_env, a.parent_id, a.is_admin, a.role, a.description \
                  FROM agent_aliases al \
                  JOIN agents a ON a.id = al.agent_id \
                  WHERE al.alias = ?1",
@@ -1284,10 +1358,35 @@ impl Store {
         {
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
-        let reply_to_author = incoming
+        let mut body = body;
+        let mut reply_to_author = incoming
             .quote
             .as_ref()
             .and_then(|quote| resolve_quote_author(&tx, quote));
+        if incoming.text.starts_with("[Reaction ")
+            && let Some(origin) = incoming.origin
+            && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
+            && let Some((orig_sender, orig_text)) =
+                resolve_origin_message_author_and_excerpt(&tx, chat_id, message_id)
+        {
+            if reply_to_author.is_none() {
+                reply_to_author = Some(orig_sender.clone());
+            }
+            if incoming.quote.is_none() && !orig_text.is_empty() {
+                let synth_quote = crate::Quote {
+                    author: orig_sender.clone(),
+                    author_is_bot: orig_sender.starts_with("agent:"),
+                    sender_id: None,
+                    text: orig_text,
+                    reference: Some(crate::QuoteRef {
+                        chat_id,
+                        message_id,
+                    }),
+                    mentions: Vec::new(),
+                };
+                body = crate::quote::compose(&incoming.text, Some(&synth_quote));
+            }
+        }
         if let Some(origin) = incoming.origin
             && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
             && !incoming.text.starts_with("[Edited ")
@@ -1306,6 +1405,16 @@ impl Store {
             tx.commit()?;
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
+        let mentions = resolve_mentions(&tx, &incoming.text);
+        let recipient_agent = agent_by_id(&tx, agent_id).ok();
+        let recipient = recipient_agent
+            .as_ref()
+            .map(|a| format!("agent:{}", a.name));
+        let chat_id_val = incoming.origin.and_then(|origin| origin.chat_id);
+        let (chat_title, chat_type) = match chat_id_val {
+            Some(cid) => resolve_chat_metadata(&tx, cid),
+            None => (None, None),
+        };
         let event = if incoming.text.starts_with("[Pinned message #")
             || incoming.text.starts_with("[pinned message")
         {
@@ -1315,7 +1424,22 @@ impl Store {
         } else if incoming.text.starts_with("[Deleted message #") {
             Some("deleted".to_string())
         } else if incoming.text.starts_with("[Reaction ") {
-            Some("reaction".to_string())
+            let is_targeted_reaction = chat_id_val.is_none_or(|cid| cid > 0)
+                || recipient_agent.as_ref().is_some_and(|a| {
+                    let agent_tag = format!("agent:{}", a.name);
+                    let bracket_tag = format!("[agent:{}]", a.name);
+                    reply_to_author.as_deref().is_some_and(|rta| {
+                        rta.eq_ignore_ascii_case(&agent_tag)
+                            || rta.ends_with(&bracket_tag)
+                            || rta.eq_ignore_ascii_case(&a.name)
+                    })
+                })
+                || chat_id_val.is_some_and(|cid| chat_attached_agent_count(&tx, cid) <= 1);
+            if is_targeted_reaction {
+                Some("reaction".to_string())
+            } else {
+                Some("reaction_passive".to_string())
+            }
         } else if incoming.text.starts_with("[Member joined group:")
             || incoming.text.starts_with("[Added to group chat")
         {
@@ -1329,16 +1453,31 @@ impl Store {
         } else {
             None
         };
-        let mentions = resolve_mentions(&tx, &incoming.text);
-        let recipient_agent = agent_by_id(&tx, agent_id).ok();
-        let recipient = recipient_agent
-            .as_ref()
-            .map(|a| format!("agent:{}", a.name));
-        let chat_id_val = incoming.origin.and_then(|origin| origin.chat_id);
-        let (chat_title, chat_type) = match chat_id_val {
-            Some(cid) => resolve_chat_metadata(&tx, cid),
-            None => (None, None),
-        };
+        let resolved_destination = incoming.reply_to.clone().or_else(|| {
+            source_key
+                .as_deref()
+                .and_then(|k| k.strip_prefix("room:"))
+                .and_then(|rest| rest.split(':').next())
+                .map(|room| {
+                    if room.starts_with("group:") || room.starts_with("telegram:") {
+                        room.to_string()
+                    } else {
+                        format!("group:{room}")
+                    }
+                })
+                .or_else(|| {
+                    incoming
+                        .sender
+                        .as_deref()
+                        .filter(|s| s.starts_with("agent:"))
+                        .map(str::to_string)
+                })
+        });
+        let participants = resolve_conversation_participants(
+            &tx,
+            chat_id_val,
+            resolved_destination.as_deref(),
+        );
         // The trusted header is built from the record that arrives, before any
         // field is moved into the row: the author, the channel, the chat and
         // topic, and the reply a bare answer reaches.
@@ -1357,29 +1496,11 @@ impl Store {
             chat_type,
             thread_id: incoming.origin.and_then(|origin| origin.thread_id),
             message_id: incoming.origin.and_then(|origin| origin.message_id),
-            destination: incoming.reply_to.clone().or_else(|| {
-                source_key
-                    .as_deref()
-                    .and_then(|k| k.strip_prefix("room:"))
-                    .and_then(|rest| rest.split(':').next())
-                    .map(|room| {
-                        if room.starts_with("group:") || room.starts_with("telegram:") {
-                            room.to_string()
-                        } else {
-                            format!("group:{room}")
-                        }
-                    })
-                    .or_else(|| {
-                        incoming
-                            .sender
-                            .as_deref()
-                            .filter(|s| s.starts_with("agent:"))
-                            .map(str::to_string)
-                    })
-            }),
+            destination: resolved_destination,
             event,
             reply_to_author,
             mentions,
+            participants,
         };
         let message = Message {
             id: MessageId::generate(),
@@ -1416,10 +1537,16 @@ impl Store {
                 serde_json::to_string(&message.context).ok(),
             ],
         )?;
-        let woke_idle = tx.execute(
-            "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'idle'",
-            [agent_id.as_str()],
-        )? > 0;
+        let is_passive_reaction =
+            message.context.event.as_deref() == Some("reaction_passive");
+        let woke_idle = if is_passive_reaction {
+            false
+        } else {
+            tx.execute(
+                "UPDATE agents SET state = 'running' WHERE id = ?1 AND state = 'idle'",
+                [agent_id.as_str()],
+            )? > 0
+        };
         if let Ok(agent) = agent_by_id(&tx, agent_id) {
             let _ = index_rag_chunk(
                 &tx,
@@ -1446,9 +1573,11 @@ impl Store {
                 agent_id: agent_id.clone(),
             });
         }
-        self.notify(Wake::Mail {
-            agent_id: agent_id.clone(),
-        });
+        if !is_passive_reaction {
+            self.notify(Wake::Mail {
+                agent_id: agent_id.clone(),
+            });
+        }
         Ok(ReceiveOutcome::New(message))
     }
 
@@ -2523,6 +2652,30 @@ impl Store {
         Ok(None)
     }
 
+    /// True if there is at least one undelivered message that should wake an idle
+    /// agent (`event != "reaction_passive"`). Passive group reactions remain in
+    /// the mailbox and are delivered on the agent's next active turn.
+    pub fn has_actionable_undelivered(&self, agent_id: &AgentId) -> Result<bool, Error> {
+        let conn = self.conn();
+        agent_by_id(&conn, agent_id)?;
+        let delivered = cursor(&conn, agent_id)?;
+        let mut stmt = conn.prepare(
+            "SELECT context FROM messages WHERE agent_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+        )?;
+        let mut rows = stmt.query(params![agent_id.as_str(), delivered])?;
+        while let Some(row) = rows.next()? {
+            let ctx_raw: Option<String> = row.get(0)?;
+            let is_passive = ctx_raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<anyagents_harness::Context>(s).ok())
+                .is_some_and(|ctx| ctx.event.as_deref() == Some("reaction_passive"));
+            if !is_passive {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub fn received_cursor(&self, agent_id: &AgentId) -> Result<i64, Error> {
         let conn = self.conn();
         agent_by_id(&conn, agent_id)?;
@@ -2818,14 +2971,22 @@ impl Store {
 
     fn age_at(&self, agent_id: &AgentId, seq: i64, now_ms: i64) -> Result<Option<i64>, Error> {
         let conn = self.conn();
-        let received_at: Option<i64> = conn
-            .query_row(
-                "SELECT received_at_ms FROM messages WHERE agent_id = ?1 AND seq = ?2",
-                params![agent_id.as_str(), seq],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(received_at.map(|at| (now_ms - at).max(0)))
+        let mut stmt = conn.prepare(
+            "SELECT received_at_ms, context FROM messages WHERE agent_id = ?1 AND seq >= ?2 ORDER BY seq ASC",
+        )?;
+        let mut rows = stmt.query(params![agent_id.as_str(), seq])?;
+        while let Some(row) = rows.next()? {
+            let received_at: i64 = row.get(0)?;
+            let ctx_raw: Option<String> = row.get(1)?;
+            let is_passive = ctx_raw
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<anyagents_harness::Context>(s).ok())
+                .is_some_and(|ctx| ctx.event.as_deref() == Some("reaction_passive"));
+            if !is_passive {
+                return Ok(Some((now_ms - received_at).max(0)));
+            }
+        }
+        Ok(None)
     }
 
     fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -3156,6 +3317,87 @@ pub fn agent_config_dir(data_dir: &Path, id: &AgentId) -> PathBuf {
     data_dir.join("agents").join(id.as_str()).join("config")
 }
 
+/// Reads the active root agent roster `(name, role, public_description)` from
+/// `{data}/state.db` read-only when present, without creating or locking the database.
+pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<String>)> {
+    let db_path = data_dir.join("state.db");
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(&db_path, flags) else {
+        return Vec::new();
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(500));
+    let query_with_desc = "SELECT name, role, description, instructions
+         FROM agents
+         WHERE parent_id IS NULL AND state = 'running'
+         ORDER BY name ASC";
+    let mut roster = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(query_with_desc) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            let name: String = row.get(0)?;
+            let role: Option<String> = row.get(1)?;
+            let description: Option<String> = row.get(2)?;
+            let instructions: Option<String> = row.get(3)?;
+            Ok((name, role, description, instructions))
+        }) {
+            for item in rows.flatten() {
+                let (name, role, description, instructions) = item;
+                let dummy = Agent {
+                    id: AgentId::generate(),
+                    name: name.clone(),
+                    role: role.clone(),
+                    parent_id: None,
+                    harness: String::new(),
+                    model: None,
+                    workdir: None,
+                    description,
+                    instructions,
+                    is_admin: false,
+                    state: "running".to_string(),
+                    created_at_ms: 0,
+                    launch_env: Vec::new(),
+                };
+                roster.push((name, role, dummy.public_description()));
+            }
+            return roster;
+        }
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT name, role, instructions
+         FROM agents
+         WHERE parent_id IS NULL AND state = 'running'
+         ORDER BY name ASC",
+    ) && let Ok(rows) = stmt.query_map([], |row| {
+        let name: String = row.get(0)?;
+        let role: Option<String> = row.get(1)?;
+        let instructions: Option<String> = row.get(2)?;
+        Ok((name, role, instructions))
+    }) {
+        for item in rows.flatten() {
+            let (name, role, instructions) = item;
+            let dummy = Agent {
+                id: AgentId::generate(),
+                name: name.clone(),
+                role: role.clone(),
+                parent_id: None,
+                harness: String::new(),
+                model: None,
+                workdir: None,
+                description: None,
+                instructions,
+                is_admin: false,
+                state: "running".to_string(),
+                created_at_ms: 0,
+                launch_env: Vec::new(),
+            };
+            roster.push((name, role, dummy.public_description()));
+        }
+    }
+    roster
+}
+
 /// UTC calendar day for a Unix millisecond timestamp, `YYYY-MM-DD`.
 pub fn utc_day(unix_ms: i64) -> String {
     let days = unix_ms.div_euclid(86_400_000);
@@ -3434,6 +3676,7 @@ fn agent_from_row(row: &rusqlite::Row<'_>) -> Result<Agent, rusqlite::Error> {
         id: agent_id,
         name: row.get(1)?,
         role: row.get(11)?,
+        description: row.get(12)?,
         harness: row.get(2)?,
         model: row.get(3)?,
         workdir: row.get(4)?,
@@ -3904,17 +4147,30 @@ fn message_by_origin(
             .source_key
             .as_deref()
             .is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
+        let incoming_is_meta_event = incoming_body.starts_with("[Reaction ")
+            || incoming_body.starts_with("[Deleted message #");
+        let stored_is_meta_event = msg.text.starts_with("[Reaction ")
+            || msg.text.starts_with("[Deleted message #");
         if origin.message_id == Some(message_id)
             && (!is_basic_group || (!in_is_relay && !stored_is_relay))
         {
-            return Ok(Some(msg));
+            if incoming_is_meta_event || stored_is_meta_event {
+                if strip_quoted_block(&msg.text) == strip_quoted_block(incoming_body)
+                    && in_user == telegram_sender_user_key(msg.sender.as_deref())
+                {
+                    return Ok(Some(msg));
+                }
+            } else {
+                return Ok(Some(msg));
+            }
         }
         // Basic Telegram groups (`chat_type == "group"`, negative non-`-100...` IDs)
         // assign each bot its own account-local `message_id` for the same human
         // message. Match by `(chat_id, sender user, source_time_ms, body)` so cross-bot
         // passive relay and direct webhook delivery coalesce into a single message.
         if (in_is_relay || stored_is_relay)
-            && strip_quoted_block(&msg.text) == strip_quoted_block(incoming_body)
+            && normalize_telegram_body_for_dedup(strip_quoted_block(&msg.text))
+                == normalize_telegram_body_for_dedup(strip_quoted_block(incoming_body))
             && in_user.is_some()
             && in_user == telegram_sender_user_key(msg.sender.as_deref())
             && match (msg.source_time_ms, incoming_source_time_ms) {
@@ -3982,6 +4238,30 @@ fn message_by_origin(
     Ok(None)
 }
 
+fn normalize_telegram_body_for_dedup(s: &str) -> String {
+    let mut lines = Vec::new();
+    for line in s.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("[Local media (") && trimmed.ends_with(']') {
+            continue;
+        }
+        if (trimmed.starts_with("[Attachment (") || trimmed.starts_with("[Sticker"))
+            && let Some(pos) = line.find("file_id=")
+        {
+            let after = &line[pos + "file_id=".len()..];
+            let end_rel = after.find([',', ']']).unwrap_or(after.len());
+            let mut norm = String::with_capacity(line.len());
+            norm.push_str(&line[..pos + "file_id=".len()]);
+            norm.push('*');
+            norm.push_str(&after[end_rel..]);
+            lines.push(norm);
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    lines.join("\n")
+}
+
 fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<String> {
     let author = quote.author.trim();
     if author.is_empty() {
@@ -4013,6 +4293,169 @@ fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<Strin
         }
     }
     Some(author.to_string())
+}
+
+fn resolve_origin_message_author_and_excerpt(
+    conn: &Connection,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<(String, String)> {
+    let pattern = format!("%\"message_id\":{message_id}%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT sender, body, origin FROM messages
+             WHERE origin LIKE ?1
+               AND body NOT LIKE '[Reaction %'
+               AND body NOT LIKE '[Deleted message #%'
+             ORDER BY rowid DESC LIMIT 32",
+        )
+        .ok()?;
+    let mut rows = stmt.query([pattern]).ok()?;
+    while let Some(row) = rows.next().ok()? {
+        let sender: Option<String> = row.get(0).ok()?;
+        let body: String = row.get(1).ok()?;
+        let origin_raw: Option<String> = row.get(2).ok()?;
+        let Some(origin_str) = origin_raw else {
+            continue;
+        };
+        let Ok(origin) = serde_json::from_str::<Origin>(&origin_str) else {
+            continue;
+        };
+        if origin.chat_id == Some(chat_id) && origin.message_id == Some(message_id) {
+            let author = sender.unwrap_or_else(|| "unknown".to_string());
+            let clean = strip_quoted_block(&body).trim().to_string();
+            return Some((author, clean));
+        }
+    }
+    None
+}
+
+fn chat_attached_agent_count(conn: &Connection, chat_id: i64) -> usize {
+    let mut distinct_agents = std::collections::HashSet::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT c.state, ca.agent_id
+         FROM channels c
+         JOIN channel_agents ca ON ca.channel_id = c.id
+         WHERE c.kind = 'telegram'",
+    ) && let Ok(mut rows) = stmt.query([])
+    {
+        while let Ok(Some(row)) = rows.next() {
+            let Ok(state) = row.get::<_, String>(0) else {
+                continue;
+            };
+            let Ok(aid) = row.get::<_, String>(1) else {
+                continue;
+            };
+            let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) else {
+                continue;
+            };
+            let Some(chats) = val.get("chats").and_then(serde_json::Value::as_array) else {
+                continue;
+            };
+            if chats
+                .iter()
+                .any(|link| link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(chat_id))
+            {
+                distinct_agents.insert(aid);
+            }
+        }
+    }
+    let pattern = format!("%\"chat_id\":{chat_id}%");
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT DISTINCT agent_id FROM messages WHERE origin LIKE ?1 LIMIT 16",
+    ) && let Ok(mut rows) = stmt.query([pattern])
+    {
+        while let Ok(Some(row)) = rows.next() {
+            if let Ok(aid) = row.get::<_, String>(0) {
+                distinct_agents.insert(aid);
+            }
+        }
+    }
+    distinct_agents.len()
+}
+
+fn resolve_conversation_participants(
+    conn: &Connection,
+    chat_id: Option<i64>,
+    destination: Option<&str>,
+) -> Vec<String> {
+    let mut agent_ids = std::collections::BTreeSet::new();
+    if let Some(cid) = chat_id
+        && cid < 0
+    {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT c.state, ca.agent_id
+             FROM channels c
+             JOIN channel_agents ca ON ca.channel_id = c.id
+             WHERE c.kind = 'telegram'",
+        ) && let Ok(mut rows) = stmt.query([])
+        {
+            while let Ok(Some(row)) = rows.next() {
+                let Ok(state) = row.get::<_, String>(0) else {
+                    continue;
+                };
+                let Ok(aid) = row.get::<_, String>(1) else {
+                    continue;
+                };
+                let Ok(val) = serde_json::from_str::<serde_json::Value>(&state) else {
+                    continue;
+                };
+                let Some(chats) = val.get("chats").and_then(serde_json::Value::as_array) else {
+                    continue;
+                };
+                if chats
+                    .iter()
+                    .any(|link| link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(cid))
+                {
+                    agent_ids.insert(aid);
+                }
+            }
+        }
+    } else if let Some(group_name) = destination.and_then(|d| d.strip_prefix("group:")) {
+        if group_name == "all" {
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id FROM agents WHERE parent_id IS NULL AND state IN ('running', 'idle')",
+            ) && let Ok(mut rows) = stmt.query([])
+            {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(aid) = row.get::<_, String>(0) {
+                        agent_ids.insert(aid);
+                    }
+                }
+            }
+        } else if let Ok(mut stmt) = conn.prepare(
+            "SELECT agent_id FROM group_members WHERE group_name = ?1",
+        ) && let Ok(mut rows) = stmt.query([group_name])
+        {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(aid) = row.get::<_, String>(0) {
+                    agent_ids.insert(aid);
+                }
+            }
+        }
+    }
+    if agent_ids.len() <= 1 {
+        return Vec::new();
+    }
+    let mut participants = Vec::new();
+    for aid in agent_ids {
+        if let Ok((name, role, state)) = conn.query_row(
+            "SELECT name, role, state FROM agents WHERE id = ?1",
+            [&aid],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)),
+        ) {
+            if state == "archived" {
+                continue;
+            }
+            if let Some(role) = role.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                participants.push(format!("{name} ({role})"));
+            } else {
+                participants.push(name);
+            }
+        }
+    }
+    participants.sort();
+    participants
 }
 
 fn strip_quoted_block(text: &str) -> &str {
@@ -5137,5 +5580,64 @@ mod tests {
             vec!["plutus".to_string()]
         );
         assert_eq!(store.inbox(&argon.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn telegram_reaction_is_not_dropped_by_origin_dedup_and_wakes_targeted_author_only() {
+        let (_dir, store) = setup();
+        let orion = agent(&store, "orion");
+        let nova = agent(&store, "nova");
+
+        // 1. Orion posts message #42 in group -100999, which is recorded in both bots' mailboxes.
+        let mut msg42 = Incoming::new("Here is the HKMT economy simulation report.");
+        msg42.sender = Some("agent:orion".to_string());
+        msg42.origin = Some(Origin {
+            chat_id: Some(-100999),
+            thread_id: None,
+            message_id: Some(42),
+        });
+        store.receive(&orion.id, msg42.clone()).unwrap();
+        store.receive(&nova.id, msg42).unwrap();
+        store.note_delivered(&orion.id, 1).unwrap();
+        store.note_delivered(&nova.id, 1).unwrap();
+        store.set_agent_state(&orion.id, "idle").unwrap();
+        store.set_agent_state(&nova.id, "idle").unwrap();
+
+        // 2. Kyle reacts 👍 on message #42. Neither bot drops it as a duplicate of #42!
+        //    Orion (the author of #42) receives `event = "reaction"` and wakes to `running`.
+        //    Nova (a peer bot in the same multi-bot group) receives `event = "reaction_passive"`
+        //    in full awareness without waking from `idle` on the reaction alone.
+        let mut react = Incoming::new("[Reaction 👍 on message #42]");
+        react.sender = Some("telegram:user:777:kyle".to_string());
+        react.origin = Some(Origin {
+            chat_id: Some(-100999),
+            thread_id: None,
+            message_id: Some(42),
+        });
+
+        let orion_out = store.receive(&orion.id, react.clone()).unwrap();
+        let ReceiveOutcome::New(orion_msg) = orion_out else {
+            panic!("reaction must not be dropped as duplicate of original message #42");
+        };
+        assert_eq!(orion_msg.context.event.as_deref(), Some("reaction"));
+        assert_eq!(
+            orion_msg.context.reply_to_author.as_deref(),
+            Some("agent:orion")
+        );
+        assert!(
+            orion_msg
+                .text
+                .contains("Here is the HKMT economy simulation report.")
+        );
+        assert_eq!(store.agent(&orion.id).unwrap().state, "running");
+        assert!(store.has_actionable_undelivered(&orion.id).unwrap());
+
+        let nova_out = store.receive(&nova.id, react).unwrap();
+        let ReceiveOutcome::New(nova_msg) = nova_out else {
+            panic!("peer bot must also record reaction for full awareness");
+        };
+        assert_eq!(nova_msg.context.event.as_deref(), Some("reaction_passive"));
+        assert_eq!(store.agent(&nova.id).unwrap().state, "idle");
+        assert!(!store.has_actionable_undelivered(&nova.id).unwrap());
     }
 }

@@ -457,23 +457,32 @@ pub fn describe_cmd(
         crate::telegram::sync_agent_telegram_bot_name(&store, data, &rec);
     }
     if clear {
+        rec = store.set_agent_description(&rec.id, None)?;
         rec = store.set_agent_instructions(&rec.id, None)?;
     } else if let Some(ref text) = new_desc {
-        rec = store.set_agent_instructions(&rec.id, Some(text))?;
+        rec = store.set_agent_description(&rec.id, Some(text))?;
+        if rec.instructions.is_none() {
+            rec = store.set_agent_instructions(&rec.id, Some(text))?;
+        }
     }
-    let cfg = anyagents_core::agent_config_dir(data, &rec.id);
-    crate::create::sync_agent_description_files(&store, &rec, &cfg);
+    if rec.parent_id.is_none() {
+        crate::create::sync_all_agent_instructions(&store, data);
+    } else {
+        let cfg = anyagents_core::agent_config_dir(data, &rec.id);
+        crate::create::sync_agent_description_files(&store, &rec, &cfg);
+    }
+    let pub_desc = rec.public_description();
     if new_desc.is_some() || role.is_some() || clear {
         println!(
             "updated\t{}\t{}",
             crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
-            rec.instructions.as_deref().unwrap_or("-")
+            pub_desc.as_deref().unwrap_or("-")
         );
     } else {
         println!(
             "{}\t{}",
             crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
-            rec.instructions.as_deref().unwrap_or("-")
+            pub_desc.as_deref().unwrap_or("-")
         );
     }
     Ok(())
@@ -670,6 +679,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
+    let public_desc = agent.public_description();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
@@ -693,7 +703,8 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         last_error: None,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
-        description: agent.instructions,
+        description: public_desc,
+        instructions: agent.instructions,
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
@@ -777,6 +788,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let (mode, steer) = declared(&agent.harness);
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
+    let public_desc = agent.public_description();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
@@ -800,7 +812,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         last_error: None,
         oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
         install: "-".to_string(),
-        description: agent.instructions,
+        description: public_desc,
+        instructions: agent.instructions,
         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
@@ -936,11 +949,33 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             {
                 view.process = "alive".to_string();
             }
+        } else if view.state == "running"
+            && view.process != "alive"
+            && (data.join("anyagents.sock").exists() || data.join("admin.sock").exists())
+            && matches!(
+                store.try_lock_agent(&id),
+                Err(anyagents_core::Error::AgentBusy)
+            )
+        {
+            view.process = "alive".to_string();
         }
         let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
+        let cleared_ms = std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+            .max(rotated_ms);
+        if cleared_ms > 0
+            && view
+                .process_started_at_ms
+                .is_none_or(|started| started < cleared_ms)
+        {
+            view.quota_reset_at_ms = None;
+            view.last_error = None;
+        }
         let (persisted_q, persisted_err) =
             anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
@@ -948,6 +983,32 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
                 anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now).or(persisted_q);
         } else if view.quota_reset_at_ms.is_none() {
             view.quota_reset_at_ms = persisted_q;
+        }
+        if view.quota_reset_at_ms.is_none()
+            && let Ok(agent_rec) = store.agent(&id)
+        {
+            let prov = crate::create::upstream_provider_of(
+                &agent_rec.harness,
+                agent_rec.model.as_deref(),
+            );
+            let prof = crate::create::bound_profile_name(&cfg)
+                .and_then(|b| b.split_once('/').map(|(_, p)| p.to_string()).or(Some(b)))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "default".to_string());
+            let prof_dir = data.join("profiles").join(&prov).join(&prof);
+            if let Ok(usage_txt) =
+                std::fs::read_to_string(prof_dir.join(".anyagents-last-usage.txt"))
+                && crate::create::parse_remaining_pct_from_usage(
+                    &usage_txt,
+                    agent_rec.model.as_deref(),
+                ) == Some(0)
+                && let Ok(raw_ms) =
+                    std::fs::read_to_string(prof_dir.join(".anyagents-quota-reset-ms"))
+                && let Ok(ms) = raw_ms.trim().parse::<i64>()
+                && ms > now
+            {
+                view.quota_reset_at_ms = Some(ms);
+            }
         }
         if view.last_error.is_none() {
             view.last_error = persisted_err;
@@ -1009,19 +1070,26 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         }
         view.block_reason =
             server::compute_block_reason(view.quota_reset_at_ms, view.last_error.as_deref(), now);
-        if view.oldest_undelivered_age_ms.is_none()
-            && open_turn
-            && (view.quota_reset_at_ms.is_some()
-                || view.last_error.is_some()
-                || view.turn_state != "working")
-        {
-            view.oldest_undelivered_age_ms = store.open_turn(&id).ok().flatten().map(|open| {
-                open.messages
-                    .first()
-                    .map(|m| now.saturating_sub(m.received_at_ms))
-                    .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
-            });
-        }
+        let real_lag = store
+            .lag(&id, now)
+            .ok()
+            .and_then(|l| l.oldest_undelivered_age_ms);
+        view.oldest_undelivered_age_ms = match real_lag {
+            Some(age) => Some(age),
+            None if open_turn
+                && (view.quota_reset_at_ms.is_some()
+                    || view.last_error.is_some()
+                    || view.turn_state != "working") =>
+            {
+                store.open_turn(&id).ok().flatten().map(|open| {
+                    open.messages
+                        .first()
+                        .map(|m| now.saturating_sub(m.received_at_ms))
+                        .unwrap_or_else(|| now.saturating_sub(open.opened_at_ms))
+                })
+            }
+            None => None,
+        };
     }
 }
 
@@ -1209,6 +1277,7 @@ fn list_filtered(
         let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
         let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
         if pretty {
+            let public_desc = agent.public_description();
             fallback_views.push(AgentView {
                 id: agent.id.to_string(),
                 name: agent.name,
@@ -1232,7 +1301,8 @@ fn list_filtered(
                 last_error: None,
                 oldest_undelivered_age_ms: lag.oldest_undelivered_age_ms,
                 install: "-".to_string(),
-                description: agent.instructions,
+                description: public_desc,
+                instructions: agent.instructions,
                 seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
                 seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                 seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
@@ -1344,7 +1414,8 @@ pub fn named(data: &Path, agent: &str) -> Result<Agent, Error> {
                 harness: found.harness,
                 model: found.model,
                 workdir: found.workdir,
-                instructions: found.description,
+                description: found.description,
+                instructions: found.instructions,
                 state: found.state,
                 created_at_ms: 0,
                 launch_env: Vec::new(),

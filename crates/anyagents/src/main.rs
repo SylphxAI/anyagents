@@ -2276,6 +2276,7 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                     let (mode, steer) = anyagents_supervisor::declared(&a.harness);
                     let seat_info = create::resolved_agent_seat_info(&store, &a);
                     let aliases = store.agent_aliases(&a.id).unwrap_or_default();
+                    let public_desc = a.public_description();
                     fallback.push(api::AgentView {
                         id: a.id.to_string(),
                         name: a.name,
@@ -2299,7 +2300,8 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         last_error: None,
                         oldest_undelivered_age_ms: None,
                         install: "recorded".to_string(),
-                        description: a.instructions,
+                        description: public_desc,
+                        instructions: a.instructions,
                         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
                         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),

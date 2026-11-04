@@ -433,6 +433,12 @@ fn lookup_user_name(uid: u32) -> Option<String> {
 }
 
 fn chown_to_seat_group(path: &Path, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    if let Ok(meta) = std::fs::symlink_metadata(path)
+        && meta.gid() == gid
+    {
+        return Ok(());
+    }
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| std::io::Error::other("seat path"))?;
     // SAFETY: `c_path` is NUL-terminated; `u32::MAX` keeps the owner.
@@ -445,17 +451,25 @@ fn chown_to_seat_group(path: &Path, gid: u32) -> std::io::Result<()> {
         && server_user_in_group_db(gid)
         && launcher().is_file()
     {
-        let me = current_uid().to_string();
-        let my_gid = server_gid().to_string();
+        let (f_uid, f_gid) = std::fs::symlink_metadata(path)
+            .map(|m| (m.uid(), m.gid()))
+            .unwrap_or_else(|_| (current_uid(), server_gid()));
+        let uid_s = f_uid.to_string();
+        let gid_s = f_gid.to_string();
         let target_gid = gid.to_string();
+        let groups_s = if f_gid != gid {
+            format!("{f_gid},{gid}")
+        } else {
+            target_gid.clone()
+        };
         if let Ok(status) = std::process::Command::new(launcher())
             .args([
                 "--reuid",
-                &me,
+                &uid_s,
                 "--regid",
-                &my_gid,
+                &gid_s,
                 "--groups",
-                &target_gid,
+                &groups_s,
                 "--no-new-privs",
                 "--",
                 "chgrp",
@@ -463,6 +477,8 @@ fn chown_to_seat_group(path: &Path, gid: u32) -> std::io::Result<()> {
                 &target_gid,
             ])
             .arg(path)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             && status.success()
         {

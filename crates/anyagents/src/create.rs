@@ -152,16 +152,27 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                 .any(|(k, v)| k == "SYLPHX_SANDBOX" && v.eq_ignore_ascii_case("cloud"))
             || std::env::var("SYLPHX_SANDBOX")
                 .ok()
-                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cloud"))
-            || (agent.harness == "sylphx"
-                && agent.parent_id.is_some()
-                && explicit_workdir.is_none()
-                && !wd_is_inherit_keyword
-                && !explicit_local_sandbox
-                && !crate::sandbox::is_isolated_test_env()
-                && crate::sylphx::resolve_sylphx_cloud_access_key(&config, &pairs).is_some());
+                .is_some_and(|v| v.trim().eq_ignore_ascii_case("cloud"));
         if is_cloud_sandbox_mode && !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
             pairs.push(("SYLPHX_SANDBOX".to_string(), "cloud".to_string()));
+        }
+        if is_cloud_sandbox_mode
+            && !explicit_local_sandbox
+            && !crate::sandbox::is_isolated_test_env()
+            && !cfg!(test)
+            && !pairs.iter().any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
+        {
+            pairs.push(("SYLPHX_WORKSPACE_PLACEMENTS".to_string(), "cloud".to_string()));
+        } else if agent.harness == "sylphx"
+            && !is_cloud_sandbox_mode
+            && !explicit_local_sandbox
+        {
+            if !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
+                pairs.push(("SYLPHX_SANDBOX".to_string(), "local".to_string()));
+            }
+            if !pairs.iter().any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS") {
+                pairs.push(("SYLPHX_WORKSPACE_PLACEMENTS".to_string(), "local".to_string()));
+            }
         }
         let workdir_created =
             explicit_workdir.as_ref().is_some_and(|p| !p.exists()) || effective_repo.is_some();
@@ -201,7 +212,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                     store,
                     &agent,
                     &config,
-                    "inherit",
+                    "",
                     request.branch.as_deref(),
                     request.base.as_deref(),
                 );
@@ -245,7 +256,7 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                                 store,
                                 &agent,
                                 &config,
-                                "inherit",
+                                "",
                                 request.branch.as_deref(),
                                 request.base.as_deref(),
                             );
@@ -702,8 +713,6 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
     let Ok(agents) = store.list_agents() else {
         return;
     };
-    #[cfg(unix)]
-    let host_home = crate::sandbox::host_home_dir();
     for agent in &agents {
         if agent.state == "archived" {
             continue;
@@ -712,16 +721,7 @@ pub(crate) fn sync_all_agent_instructions(store: &Store, data: &Path) {
         if !cfg.is_dir() {
             continue;
         }
-        #[cfg(unix)]
-        if let Some(ref hh) = host_home {
-            ensure_seat_skills(&cfg, hh);
-        }
-        let work_dir = agent
-            .workdir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| agent_work_dir(data, &agent.id));
-        let _ = reconcile_agent_runtime_config(store, data, agent, &cfg, &work_dir);
+        sync_agent_description_files(store, agent, &cfg);
     }
 }
 
@@ -764,6 +764,11 @@ pub(crate) fn write_agent_instructions_with_continuity(
     {
         doc.push_str(&format!("- **Role Label**: `{role}`\n"));
     }
+    if let Some(pub_desc) = agent.public_description() {
+        doc.push_str(&format!(
+            "- **Public Description (`description` — visible to all peers & group rosters)**: {pub_desc}\n"
+        ));
+    }
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
             "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `agents({{ \"action\": \"archive\" }})` to retire yourself.\n"
@@ -778,23 +783,63 @@ pub(crate) fn write_agent_instructions_with_continuity(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        doc.push_str("\n## 2. Role, Responsibilities & Standing Description\n\n");
+        doc.push_str("\n## 2. Role, Responsibilities & Private Instructions (`instructions`)\n\n");
         doc.push_str(custom);
         doc.push('\n');
+    }
+
+    if let Some(data_dir) = config
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        let roster = anyagents_core::read_root_roster(data_dir);
+        if !roster.is_empty() {
+            doc.push_str(
+                "\n## 2.1 Team Roster & Multi-Agent Coordination (`description` vs. `instructions`)\n\n\
+                 - **Two-Layer Identity Architecture**:\n\
+                   - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in the Team Roster below and in `groups({ \"action\": \"list\" })` / `agents({ \"action\": \"describe\", \"name\": \"all\" })` so every peer knows who owns what without leaking full system prompts.\n\
+                   - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain private in Section 2 above so they never pollute other agents' context windows.\n\
+                 - **Three-Regime Group & Team Coordination Protocol (Goal-Driven Custody, Not Blind Racing)**:\n\
+                   - **Regime 1 — Single-Owner Match (Direct Execution & Peer Silence)**: When a group message or event clearly matches **one** agent's goal/domain (and was not explicitly addressed to you), only that owning agent answers and executes; all other agents stay silent (`NO_REPLY`) instead of racing or echoing.\n\
+                   - **Regime 2 — Multi-Goal Overlap (Coordinate Custody First)**: When a group topic genuinely spans **2–3 agents' goals** (or crosses domain boundaries), those relevant agents briefly coordinate in the group first to agree on single-writer custody (who owns what part) before mutating shared state.\n\
+                   - **Regime 3 — Out-of-Domain Discovery (Global Sensing, Specialized Handoff)**: Every agent keeps global situational awareness, not rigid tunnel vision. If you discover a blocker or incident outside your domain or capability (e.g., you own growth/users and spot a dead server or cluster failure), **do not** attempt to fix it yourself and **do not** ignore it — hand it off (`send` or `@mention` in the group) with your concrete evidence to the peer whose `description` owns that domain.\n\
+                 - **Active Root Agent Roster (`agent:<name>` — `role` — `description`)**:\n",
+            );
+            for (peer_name, peer_role, peer_desc) in &roster {
+                let marker = if peer_name == &agent.name {
+                    " *(you)*"
+                } else {
+                    ""
+                };
+                let role_str = peer_role
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|r| format!(" [{r}]"))
+                    .unwrap_or_default();
+                let desc_str = peer_desc
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("(no public description set)");
+                doc.push_str(&format!(
+                    "  - `agent:{peer_name}`{role_str}{marker}: {desc_str}\n"
+                ));
+            }
+        }
     }
 
     doc.push_str(
         "\n## 3. Runtime Awareness & the 6 Canonical MCP Tools (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`)\n\n\
          - **Cache-Stable Architecture (Static System Prompt + Tail Events & On-Demand Tools)**:\n\
            - This System Prompt is **strictly static** so your LLM prompt prefix KV cache is never invalidated when groups, channels, peers, or sub-agents change.\n\
-           - Live routing context arrives **inline per message** at the tail of your context inside the `<message ...>` XML envelope (`id`, `from`, `sender_name`, `to`, `channel`, `chat`, `chat_title`, `chat_type`, `topic`, `event`, `in_reply_to`, `mentions`, `reply_to`, `answer_to`).\n\
+           - Live routing context arrives **inline per message** at the tail of your context inside the `<message ...>` XML envelope (`id`, `from`, `sender_name`, `to`, `participants`, `channel`, `chat`, `chat_title`, `chat_type`, `topic`, `event`, `in_reply_to`, `mentions`, `reply_to`, `answer_to`).\n\
            - Always call your native **AnyAgents MCP tools** (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`) directly (or via `await tools.anyagents.<tool>({...})` inside `execute` in OpenCode Code Mode) — they are schema-typed, zero-overlap, and automatically authenticated as your seat.\n\
          - **1. Unified Agent & Sub-Agent Manager (`agents` MCP Tool — Native Harness Sub-Agents Disabled by Default)**:\n\
            - Built-in harness sub-agent tools (`Task`/`Agent`/`task`/`invoke_subagent`) are **disabled by default** so sub-agents are never trapped inside a single vendor CLI. Always use `agents` for all peer, role, and sub-agent operations:\n\
              - **List Peers or Sub-Agents**: `agents({ \"action\": \"list\" })` (all agents), `agents({ \"action\": \"list\", \"parent\": \"self\" })` (your sub-agents + summary counts), `agents({ \"action\": \"list\", \"parent\": \"root\" })` (root agents), with optional `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`.\n\
              - **Inspect Status & Recent Turns**: `agents({ \"action\": \"inspect\", \"name\": \"<name-or-id>\", \"limit\": 10 })` (live status, schedules, and recent conversation turns in one call).\n\
              - **Spawn a Sub-Agent**: `agents({ \"action\": \"spawn\", \"name\": \"<optional-name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"base\": \"<optional-base>\", \"workdir\": \"<optional-path-or-mode>\", \"description\": \"...\", \"prompt\": \"...\" })`. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`sylphx` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
-             - **Read or Update Role Description (`describe`)**: `agents({ \"action\": \"describe\", \"name\": \"self\" })` (read your own role), `agents({ \"action\": \"describe\", \"name\": \"self\", \"description\": \"...\" })` (update your own role/mission description; syncs your private system prompt and group roster), `agents({ \"action\": \"describe\", \"name\": \"all\" })` (read every peer's role & responsibilities).\n\
+             - **Read or Update Public Description vs. Private Instructions (`describe`)**: `agents({ \"action\": \"describe\", \"name\": \"self\" })` (read your own `description` and `instructions`), `agents({ \"action\": \"describe\", \"name\": \"self\", \"description\": \"...\", \"instructions\": \"...\" })` (update your concise public `description` visible in the team/group roster, your detailed private `instructions`, or both), `agents({ \"action\": \"describe\", \"name\": \"all\" })` (read every peer's public `description` & role).\n\
              - **Steer & Lifecycle Control**: `agents({ \"action\": \"steer\", \"name\": \"<name-or-id>\", \"prompt\": \"...\" })`, `agents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"name\": \"<name-or-id>\" })` (omit `name` on `\"archive\"` to archive yourself).\n\
              - **Admin / Configuration**: `agents({ \"action\": \"create\" | \"rename\" | \"role\" | \"harness\" | \"models\", ... })`.\n\
          - **Per-Agent Workspace (`workdir` / `repo`), Managed Git Worktrees & Shared Context Architecture**:\n\
@@ -950,7 +995,13 @@ pub(crate) fn extract_file_tilde_refs(text: &str) -> Vec<String> {
 
 pub(crate) fn ensure_seat_environment(target_config: &Path) {
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
-        let _ = std::fs::create_dir_all(target_config.join(subdir));
+        let dir = target_config.join(subdir);
+        let _ = std::fs::create_dir_all(&dir);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
+        }
     }
     let gitconfig = target_config.join(".gitconfig");
     if !gitconfig.exists() {
@@ -972,15 +1023,20 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
             let host_bin = host_local.join("bin");
             if let Ok(entries) = std::fs::read_dir(&host_bin) {
                 for entry in entries.flatten() {
+                    let fname = entry.file_name();
+                    if fname == "claude" {
+                        continue;
+                    }
                     let src = entry.path();
-                    let dst = bin_dir.join(entry.file_name());
+                    let dst = bin_dir.join(fname);
                     if src.exists() && !dst.exists() {
                         let _ = std::os::unix::fs::symlink(&src, &dst);
                     }
                 }
             }
+            let _ = std::fs::remove_file(bin_dir.join("claude"));
         }
-        for shared_dir in [".kube", ".config/gh"] {
+        for shared_dir in [".kube", ".config/gh", ".local/share/desk-claude"] {
             let src = host_home.join(shared_dir);
             let dst = target_config.join(shared_dir);
             if src.exists() && !dst.exists() {
@@ -3528,6 +3584,13 @@ pub(crate) fn resolve_and_commit_staged_signin(
     finalize_profile_signin(data, provider, &chosen_profile);
     deduplicate_same_account_profiles(data);
     let (final_email, final_id) = extract_profile_account_identity(&final_dir, provider);
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+        && data.join("state.db").is_file()
+        && let Ok(store) = Store::open(data.join("state.db"))
+    {
+        let _ = sync_and_list_provider_profiles_with_options(&store, data, true);
+    }
     Ok((chosen_profile, final_dir, final_email.or(final_id)))
 }
 
@@ -4175,8 +4238,14 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
         enrich_profiles_usage(data, &mut entries);
     }
 
-    // Bind active agents to their resolved `<provider>/<profile>` without cross-profile
-    // fallback or cross-profile rotation (strict 1-account-per-profile isolation).
+    if probe_usage
+        && !crate::sandbox::is_isolated_test_env()
+        && let Ok(store) = Store::open(data.join("state.db"))
+    {
+        rebalance_provider_profiles(&store, data, &agents, &entries);
+    }
+
+    // Bind active agents to their resolved `<provider>/<profile>`.
     let mut ordered_agents: Vec<&Agent> = agents.iter().filter(|a| a.state != "archived").collect();
     ordered_agents.sort_by_key(|a| a.parent_id.is_some());
     for agent in ordered_agents {
@@ -4221,12 +4290,173 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
     entries
 }
 
+fn rebalance_provider_profiles(
+    store: &Store,
+    data: &Path,
+    agents: &[Agent],
+    entries: &[ProviderProfileEntry],
+) {
+    let mut providers: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for e in entries {
+        if e.kind == "subscription" {
+            providers.insert(e.provider.clone());
+        }
+    }
+    for provider in providers {
+        let mut prof_rem: std::collections::BTreeMap<String, i64> =
+            std::collections::BTreeMap::new();
+        for e in entries.iter().filter(|e| e.provider == provider) {
+            if let Some(ref u) = e.usage
+                && let Some(pct) = parse_remaining_pct_from_usage(u, None)
+            {
+                prof_rem.insert(e.profile.clone(), pct);
+            }
+        }
+        if prof_rem.len() < 2 {
+            continue;
+        }
+        let mut bound: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for p in prof_rem.keys() {
+            bound.insert(p.clone(), Vec::new());
+        }
+        let mut root_agents: Vec<&Agent> = agents
+            .iter()
+            .filter(|a| a.parent_id.is_none() && a.state != "archived")
+            .collect();
+        root_agents.sort_by(|a, b| a.name.cmp(&b.name));
+        for a in root_agents {
+            let exp_prov = upstream_provider_of(&a.harness, a.model.as_deref());
+            if exp_prov != provider {
+                continue;
+            }
+            let cfg = agent_config_dir(data, &a.id);
+            let prof_name = bound_profile_name(&cfg)
+                .and_then(|b| {
+                    let p = b.split_once('/').map(|(_, p)| p.to_string()).unwrap_or(b);
+                    (!p.is_empty()).then_some(p)
+                })
+                .unwrap_or_else(|| "default".to_string());
+            bound.entry(prof_name).or_default().push(a.name.clone());
+        }
+        // Step 1: evacuate exhausted profiles (0% left) onto any profile with remaining quota (> 0% left).
+        let prof_keys: Vec<String> = bound.keys().cloned().collect();
+        for src_prof in &prof_keys {
+            let src_pct = prof_rem.get(src_prof).copied().unwrap_or(0);
+            if src_pct > 0 {
+                continue;
+            }
+            let to_move = bound.get(src_prof).cloned().unwrap_or_default();
+            for agent_name in to_move {
+                let mut best_dst: Option<(String, i64, i64)> = None;
+                for (cand_prof, &cand_pct) in &prof_rem {
+                    if cand_prof == src_prof || cand_pct <= 0 {
+                        continue;
+                    }
+                    let cnt = bound.get(cand_prof).map(|v| v.len() as i64).unwrap_or(0);
+                    let score = (cand_pct * 100) / (cnt + 1);
+                    if best_dst
+                        .as_ref()
+                        .is_none_or(|(_, bs, br)| (score, cand_pct) > (*bs, *br))
+                    {
+                        best_dst = Some((cand_prof.clone(), score, cand_pct));
+                    }
+                }
+                if let Some((dst_prof, _, _)) = best_dst {
+                    let target = format!("{provider}/{dst_prof}");
+                    if configure_agent_runtime(
+                        store,
+                        data,
+                        "system:profile-rebalance",
+                        &agent_name,
+                        None,
+                        None,
+                        Some(&target),
+                    )
+                    .is_ok()
+                    {
+                        if let Some(v) = bound.get_mut(src_prof) {
+                            v.retain(|n| n != &agent_name);
+                        }
+                        bound.entry(dst_prof).or_default().push(agent_name);
+                    }
+                }
+            }
+        }
+        // Step 2: balance overloaded profiles onto healthy profiles with significantly higher per-agent quota.
+        for _ in 0..16 {
+            let mut best_move: Option<(String, String, i64)> = None;
+            for (src_prof, src_agents) in &bound {
+                if src_agents.len() < 2 {
+                    continue;
+                }
+                let src_pct = prof_rem.get(src_prof).copied().unwrap_or(0);
+                let src_share = (src_pct * 100) / (src_agents.len() as i64);
+                for (dst_prof, &dst_pct) in &prof_rem {
+                    if dst_prof == src_prof || dst_pct < 30 {
+                        continue;
+                    }
+                    let dst_len = bound.get(dst_prof).map(|v| v.len() as i64).unwrap_or(0);
+                    let new_dst_share = (dst_pct * 100) / (dst_len + 1);
+                    let gain = new_dst_share - src_share;
+                    let should_move =
+                        (dst_len == 0 && dst_pct >= 50 && gain > 0) || gain >= 1500;
+                    if should_move
+                        && best_move
+                            .as_ref()
+                            .is_none_or(|(_, _, best_gain)| gain > *best_gain)
+                    {
+                        best_move = Some((src_prof.clone(), dst_prof.clone(), gain));
+                    }
+                }
+            }
+            let Some((src_prof, dst_prof, _)) = best_move else {
+                break;
+            };
+            let Some(agent_name) = bound.get(&src_prof).and_then(|v| v.last().cloned()) else {
+                break;
+            };
+            let target = format!("{provider}/{dst_prof}");
+            if configure_agent_runtime(
+                store,
+                data,
+                "system:profile-rebalance",
+                &agent_name,
+                None,
+                None,
+                Some(&target),
+            )
+            .is_ok()
+            {
+                if let Some(v) = bound.get_mut(&src_prof) {
+                    v.retain(|n| n != &agent_name);
+                }
+                bound.entry(dst_prof).or_default().push(agent_name);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
 pub(crate) fn record_profile_quota_reset(data: &Path, agent: &Agent, reset_at_ms: i64) {
     let now_ms = anyagents_core::now_ms();
     if reset_at_ms <= now_ms {
         return;
     }
     let cfg = agent_config_dir(data, &agent.id);
+    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let cleared_ms = std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(rotated_ms);
+    if cleared_ms > 0 && now_ms.saturating_sub(cleared_ms) < 45_000 {
+        return;
+    }
     let provider = upstream_provider_of(&agent.harness, agent.model.as_deref());
     let prof_name = bound_profile_name(&cfg)
         .and_then(|b| {
@@ -5473,8 +5703,8 @@ pub(crate) fn probe_one_profile_usage(
             {
                 let mut gem_5h: Option<(i64, Option<String>)> = None;
                 let mut gem_7d: Option<(i64, Option<String>)> = None;
-                let mut opus_5h: Option<(i64, Option<String>)> = None;
-                let mut opus_7d: Option<(i64, Option<String>)> = None;
+                let mut opus_5h: Option<i64> = None;
+                let mut opus_7d: Option<i64> = None;
                 for g in groups {
                     let Some(buckets) = g.get("buckets").and_then(serde_json::Value::as_array)
                     else {
@@ -5500,48 +5730,78 @@ pub(crate) fn probe_one_profile_usage(
                         match bid {
                             "gemini-5h" => gem_5h = Some((pct, eta)),
                             "gemini-weekly" => gem_7d = Some((pct, eta)),
-                            "3p-5h" => opus_5h = Some((pct, eta)),
-                            "3p-weekly" => opus_7d = Some((pct, eta)),
+                            "3p-5h" => opus_5h = Some(pct),
+                            "3p-weekly" => opus_7d = Some(pct),
                             _ => {}
                         }
                     }
                 }
-                if let (
-                    Some((g5, g5_eta)),
-                    Some((g7, g7_eta)),
-                    Some((o5, o5_eta)),
-                    Some((o7, o7_eta)),
-                ) = (gem_5h, gem_7d, opus_5h, opus_7d)
-                {
-                    let fmt_pool =
-                        |label: &str, p5: i64, e5: Option<String>, p7: i64, e7: Option<String>| {
-                            let p = p5.min(p7);
-                            let mut parts = Vec::new();
-                            if p5 < 100 {
-                                let es = e5.map(|e| format!(" ↻{e}")).unwrap_or_default();
-                                if p5 == p && p5 < p7 {
-                                    parts.push(format!("5h{es}"));
-                                } else {
-                                    parts.push(format!("5h {p5}%{es}"));
-                                }
-                            }
-                            if p7 < 100 {
-                                let es = e7.map(|e| format!(" ↻{e}")).unwrap_or_default();
-                                if p7 == p {
-                                    parts.push(format!("7d{es}"));
-                                } else {
-                                    parts.push(format!("7d {p7}%{es}"));
-                                }
-                            }
-                            if parts.is_empty() {
-                                format!("{label}: {p}% left")
-                            } else {
-                                format!("{label}: {p}% left ({})", parts.join(", "))
-                            }
-                        };
-                    let gem_s = fmt_pool("gemini", g5, g5_eta, g7, g7_eta);
-                    let opus_s = fmt_pool("opus", o5, o5_eta, o7, o7_eta);
-                    return Some(format!("{gem_s} · {opus_s}"));
+                if let (Some((g5, g5_eta)), Some((mut g7, mut g7_eta))) = (gem_5h, gem_7d) {
+                    let now_ms = anyagents_core::now_ms();
+                    let tier_cache_path = prof_dir.join(".anyagents-agy-tier.txt");
+                    let tier_fresh = std::fs::metadata(&tier_cache_path)
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .is_some_and(|d| now_ms.saturating_sub(d.as_millis() as i64) < 600_000)
+                        && prof_dir.join(".anyagents-profile-meta-sync-ms").exists();
+                    let tier = if tier_fresh
+                        && let Ok(cached_tier) = std::fs::read_to_string(&tier_cache_path)
+                        && !cached_tier.trim().is_empty()
+                        && cached_tier.trim() != "free"
+                    {
+                        cached_tier.trim().to_string()
+                    } else {
+                        let resolved_tier = http
+                            .post("https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:loadCodeAssist")
+                            .header("authorization", &format!("Bearer {active_token}"))
+                            .header("content-type", "application/json")
+                            .header("user-agent", "antigravity/3.0.0")
+                            .send(b"{}")
+                            .ok()
+                            .and_then(|r| r.into_body().read_to_string().ok())
+                            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
+                            .and_then(|v| {
+                                v.pointer("/paidTier/id")
+                                    .or_else(|| v.pointer("/currentTier/id"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|id| {
+                                        if id.contains("ultra") {
+                                            "ultra".to_string()
+                                        } else if id.contains("pro") {
+                                            "pro".to_string()
+                                        } else {
+                                            "free".to_string()
+                                        }
+                                    })
+                            })
+                            .unwrap_or_else(|| "ultra".to_string());
+                        let _ = std::fs::write(&tier_cache_path, format!("{resolved_tier}\n"));
+                        let _ = std::fs::write(
+                            prof_dir.join(".anyagents-profile-meta-sync-ms"),
+                            format!("{now_ms}\n"),
+                        );
+                        resolved_tier
+                    };
+                    let reset_marker = prof_dir.join(".anyagents-quota-reset-ms");
+                    if tier == "ultra" && g5.min(g7) > 0 {
+                        let _ = std::fs::remove_file(&reset_marker);
+                    } else if let Ok(raw_reset) = std::fs::read_to_string(&reset_marker)
+                        && let Ok(reset_ms) = raw_reset.trim().parse::<i64>()
+                    {
+                        if reset_ms <= now_ms {
+                            let _ = std::fs::remove_file(&reset_marker);
+                        } else {
+                            g7 = 0;
+                            g7_eta = format_reset_eta_secs((reset_ms - now_ms) / 1_000).or(g7_eta);
+                        }
+                    }
+                    let e5 = g5_eta.map(|e| format!(" ↻{e}")).unwrap_or_default();
+                    let e7 = g7_eta.map(|e| format!(" ↻{e}")).unwrap_or_default();
+                    let opus_min = opus_5h.unwrap_or(100).min(opus_7d.unwrap_or(100));
+                    return Some(format!(
+                        "5h: {g5}% left{e5} · 7d: {g7}% left{e7} · opus: {opus_min}% left ({tier})"
+                    ));
                 }
             }
             let val = fetch_models(&active_token)?;
@@ -5566,13 +5826,7 @@ pub(crate) fn probe_one_profile_usage(
                 "gemini-2.5-pro",
                 "gemini-3-flash",
             ])?;
-            let opus = frac_of(&[
-                "claude-opus-5-5-thinking",
-                "claude-opus-5-5-high",
-                "claude-opus-5-5-medium",
-                "claude-opus-4-6-thinking",
-            ])?;
-            Some(format!("gemini: {gem}% left · opus: {opus}% left"))
+            Some(format!("5h: {gem}% left · 7d: {gem}% left"))
         }
         "kimi-code-plan" => {
             let key = read_first_non_empty_file(
@@ -6089,16 +6343,14 @@ pub(crate) fn parse_remaining_pct_from_usage(usage: &str, model: Option<&str>) -
         let pct_idx = rest.find("% left")?;
         rest[..pct_idx].trim().parse::<i64>().ok()
     };
-    if usage.contains("gemini:") && usage.contains("opus:") {
-        let wants_opus = model
-            .map(|m| {
-                let lower = m.to_ascii_lowercase();
-                lower.contains("opus") || lower.contains("claude")
-            })
-            .unwrap_or(false);
-        if wants_opus {
-            return extract_after("opus:");
-        }
+    let wants_opus = model.is_some_and(|m| {
+        let lower = m.to_ascii_lowercase();
+        lower.contains("opus") || lower.contains("claude")
+    });
+    if wants_opus && usage.contains("opus:") {
+        return extract_after("opus:");
+    }
+    if usage.contains("gemini:") {
         return extract_after("gemini:");
     }
     let mut min_pct: Option<i64> = None;
@@ -6399,16 +6651,34 @@ pub(crate) fn clear_stale_agy_quota_error_steps(config_dir: &Path) {
         let (my_uid, my_gid) = std::fs::metadata("/proc/self")
             .map(|m| (m.uid(), m.gid()))
             .unwrap_or((conv_meta.uid(), conv_meta.gid()));
+        let mut seat_uid_gid: Option<(u32, u32)> = None;
         if conv_meta.uid() != my_uid {
+            seat_uid_gid = Some((conv_meta.uid(), conv_meta.gid()));
+        } else if conv_meta.gid() != my_gid {
+            seat_uid_gid = Some((conv_meta.gid(), conv_meta.gid()));
+        }
+        if let Ok(entries) = std::fs::read_dir(&conv_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("db")
+                    && let Ok(m) = entry.metadata()
+                    && m.uid() != my_uid
+                {
+                    seat_uid_gid = Some((m.uid(), m.gid()));
+                    break;
+                }
+            }
+        }
+        if let Some((target_uid, target_gid)) = seat_uid_gid {
             let sock_gid = config_dir
                 .parent()
                 .and_then(|p| p.parent())
                 .and_then(|p| std::fs::metadata(p).ok())
                 .map(|m| m.gid())
                 .unwrap_or(my_gid);
-            let uid_s = conv_meta.uid().to_string();
-            let gid_s = conv_meta.gid().to_string();
-            let groups_s = format!("{},{},{}", conv_meta.gid(), sock_gid, my_gid);
+            let uid_s = target_uid.to_string();
+            let gid_s = target_gid.to_string();
+            let groups_s = format!("{target_gid},{sock_gid},{my_gid}");
             let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
                 .args([
                     "--reuid",
@@ -6602,27 +6872,21 @@ pub(crate) fn try_rotate_exhausted_profile(
         })
         .unwrap_or_else(|| "default".to_string());
     let prof_dir = data.join("profiles").join(&provider).join(&current_prof);
+    let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0);
+    let cleared_ms = std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms"))
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .max(rotated_ms);
     if has_active_quota_hold {
-        let agent_last_check = std::fs::read_to_string(cfg.join(".anyagents-last-quota-check-ms"))
+        let last_check = std::fs::read_to_string(cfg.join(".anyagents-last-quota-check-ms"))
             .ok()
             .and_then(|s| s.trim().parse::<i64>().ok())
             .unwrap_or(0);
-        let prof_last_check =
-            std::fs::read_to_string(prof_dir.join(".anyagents-last-quota-check-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-        let last_check = agent_last_check.max(prof_last_check);
         if now_ms.saturating_sub(last_check) < 120_000 {
-            let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0);
-            let cleared_ms = std::fs::read_to_string(cfg.join(".anyagents-quota-cleared-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0)
-                .max(rotated_ms);
             if cleared_ms >= last_check && now_ms.saturating_sub(cleared_ms) < 120_000 {
                 return Some(format!("{provider}/{current_prof}"));
             }
@@ -6633,24 +6897,98 @@ pub(crate) fn try_rotate_exhausted_profile(
             ".anyagents-last-quota-check-ms",
             &format!("{now_ms}\n"),
         );
-        if prof_dir.is_dir() {
-            write_profile_marker(
-                &prof_dir,
-                ".anyagents-last-quota-check-ms",
-                &format!("{now_ms}\n"),
-            );
-        }
     }
-    let _ = store;
-    let cur_pct =
-        probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref());
-    if has_active_quota_hold && cur_pct.is_some_and(|p| p > 5) {
+    let post_clear_error = std::fs::read_to_string(cfg.join(".anyagents-last-error.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .is_some_and(|val| {
+            let ts = val
+                .get("timestamp_ms")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            let q = val
+                .get("quota_reset_at_ms")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            cleared_ms > 0
+                && ts > cleared_ms
+                && q > now_ms
+                && now_ms.saturating_sub(ts) < 900_000
+        });
+    let cur_pct = if post_clear_error {
+        Some(0)
+    } else {
+        probe_profile_remaining_pct(data, &provider, &current_prof, agent.model.as_deref())
+    };
+    if has_active_quota_hold && cur_pct.is_some_and(|p| p > 0) {
         write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &format!("{now_ms}\n"));
+        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
+        let _ = std::fs::remove_file(prof_dir.join(".anyagents-quota-reset-ms"));
         if agent.harness == "agy" {
             clear_stale_agy_quota_error_steps(&cfg);
         }
         poke_agent_wake_socket(data, &agent.id);
         return Some(format!("{provider}/{current_prof}"));
+    }
+    if has_active_quota_hold && cur_pct.unwrap_or(0) <= 0 {
+        let mut bound_counts: std::collections::HashMap<String, i64> =
+            std::collections::HashMap::new();
+        if let Ok(all_agents) = store.list_agents() {
+            for a in all_agents {
+                if a.parent_id.is_none() && a.state != "archived" && a.id != agent.id {
+                    let acfg = agent_config_dir(data, &a.id);
+                    if let Some(b) = bound_profile_name(&acfg) {
+                        let (bp, bprof) = b
+                            .split_once('/')
+                            .map(|(p, n)| (p.to_string(), n.to_string()))
+                            .unwrap_or_else(|| {
+                                (
+                                    upstream_provider_of(&a.harness, a.model.as_deref()),
+                                    b.clone(),
+                                )
+                            });
+                        if bp == provider {
+                            *bound_counts.entry(bprof).or_insert(0) += 1;
+                        }
+                    }
+                }
+            }
+        }
+        let mut best: Option<(String, i64, i64)> = None;
+        for (cand_prof, _) in list_harness_profiles(data, &provider) {
+            if cand_prof == current_prof {
+                continue;
+            }
+            if let Some(rem_pct) =
+                probe_profile_remaining_pct(data, &provider, &cand_prof, agent.model.as_deref())
+                && rem_pct > 0
+            {
+                let cnt = bound_counts.get(&cand_prof).copied().unwrap_or(0);
+                let score = (rem_pct * 100) / (cnt + 1);
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best_score, best_rem)| (score, rem_pct) > (*best_score, *best_rem))
+                {
+                    best = Some((cand_prof, score, rem_pct));
+                }
+            }
+        }
+        if let Some((best_prof, _, _)) = best {
+            let target_prof = format!("{provider}/{best_prof}");
+            if configure_agent_runtime(
+                store,
+                data,
+                "system:quota-rotate",
+                &agent.name,
+                None,
+                None,
+                Some(&target_prof),
+            )
+            .is_ok()
+            {
+                return Some(target_prof);
+            }
+        }
     }
     None
 }
@@ -7017,6 +7355,7 @@ mod tests {
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
                 workdir: Some("/scratch/wt/owners-main".to_string()),
+                description: Some("Root coordinator".to_string()),
                 instructions: Some("Root coordinator".to_string()),
                 parent_id: None,
             })
@@ -7028,6 +7367,7 @@ mod tests {
                 harness: "opencode".to_string(),
                 model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
                 workdir: Some("/scratch/wt/owners-main".to_string()),
+                description: Some("Product Owner for AnyMD. Paused scope.".to_string()),
                 instructions: Some("Product Owner for AnyMD. Paused scope.".to_string()),
                 parent_id: Some(parent.id.clone()),
             })
@@ -7311,7 +7651,8 @@ mod tests {
             last_error: None,
             oldest_undelivered_age_ms: None,
             install: "installed".to_string(),
-            description: child.instructions.clone(),
+            description: child.public_description(),
+            instructions: child.instructions.clone(),
             seat_user: None,
             seat_uid: None,
             seat_gid: None,

@@ -957,8 +957,10 @@ pub fn detect_session_quota_reset_ms(config_dir: &Path, now_ms: i64) -> Option<i
         if let Some(reset_at_ms) = quota_from_claude(&val) {
             return (reset_at_ms > now_ms).then_some(reset_at_ms);
         }
-        if val.get("type").and_then(Value::as_str) == Some("assistant")
-            && val.get("error").is_none()
+        if matches!(
+            val.get("type").and_then(Value::as_str),
+            Some("assistant" | "user" | "api-request")
+        ) && val.get("error").is_none()
             && val.get("apiError").is_none()
         {
             return None;

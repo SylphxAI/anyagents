@@ -523,8 +523,11 @@ struct AgentsArgs {
     /// Optional working directory or workspace mode when `action` is `"spawn"` or `"create"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default for sub-agents when `repo` is omitted: shares parent's `workdir`).
     #[serde(default)]
     workdir: Option<String>,
-    /// Role/responsibility description or standing instructions when `action` is `"spawn"`, `"create"`, or `"describe"`.
-    #[serde(default, alias = "description")]
+    /// Concise public role/mission summary (`description`, Layer 1 — visible to all peers and group rosters) when `action` is `"spawn"`, `"create"`, or `"describe"`.
+    #[serde(default)]
+    description: Option<String>,
+    /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt) when `action` is `"spawn"`, `"create"`, or `"describe"`.
+    #[serde(default)]
     instructions: Option<String>,
     /// Task prompt or follow-up message when `action` is `"spawn"`, `"create"`, `"steer"`, `"send"`, or `"wake"`.
     #[serde(default, alias = "text", alias = "message")]
@@ -571,8 +574,11 @@ struct SpawnArgs {
     /// Optional working directory or workspace mode: an explicit path, `"worktree"` / `"branch"` (provisions an isolated Git worktree branched from the parent's repo at `<data>/agents/<id>/work`), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default when `repo` is omitted: inherits the parent agent's `workdir`).
     #[serde(default)]
     workdir: Option<String>,
-    /// Optional system/role description or standing instructions for the spawned agent.
-    #[serde(default, alias = "description")]
+    /// Optional concise public description (`description`, Layer 1) for the spawned agent.
+    #[serde(default)]
+    description: Option<String>,
+    /// Optional detailed private standing instructions (`instructions`, Layer 2) for the spawned agent.
+    #[serde(default)]
     instructions: Option<String>,
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
@@ -584,14 +590,17 @@ struct DescribeArgs {
     /// Target agent name (`"self"`, `"xenon"`, `"sage"`, `"all"`, or `agt_...` ID). Defaults to `"self"`.
     #[serde(default, alias = "name", alias = "target")]
     agent: Option<String>,
-    /// New role/responsibility description to set (syncs into the agent's private system prompt and group roster).
+    /// Concise public role/responsibility summary (`description`, Layer 1 — visible to all peers and group rosters).
     /// Omit to read the current description.
-    #[serde(default, alias = "instructions", alias = "text")]
+    #[serde(default, alias = "text")]
     description: Option<String>,
+    /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
+    #[serde(default)]
+    instructions: Option<String>,
     /// Optional short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...).
     #[serde(default)]
     role: Option<String>,
-    /// Set `true` to clear the agent's custom description.
+    /// Set `true` to clear the agent's custom description/instructions.
     #[serde(default)]
     clear: Option<bool>,
 }
@@ -1023,16 +1032,18 @@ impl AgentMcp {
         match action.as_str() {
             "list" | "ls" => {
                 let mut response: AgentsResponse = self.client.get_agents().await?;
-                if let Some(state_filter) = args
-                    .state
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
-                {
-                    response.agents.retain(|a| {
-                        a.state.eq_ignore_ascii_case(state_filter)
-                            || a.turn_state.eq_ignore_ascii_case(state_filter)
-                    });
+                let state_trimmed = args.state.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                match state_trimmed {
+                    Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
+                        response.agents.retain(|a| {
+                            a.state.eq_ignore_ascii_case(state_filter)
+                                || a.turn_state.eq_ignore_ascii_case(state_filter)
+                        });
+                    }
+                    Some(_) => {}
+                    None => {
+                        response.agents.retain(|a| a.state != "archived");
+                    }
                 }
                 if let Some(parent_filter) = args
                     .parent
@@ -1132,6 +1143,7 @@ impl AgentMcp {
                         branch: args.branch,
                         base: args.base,
                         workdir: args.workdir,
+                        description: args.description,
                         instructions: args.instructions,
                         prompt: args.prompt,
                     }))
@@ -1176,6 +1188,7 @@ impl AgentMcp {
                     branch: args.branch,
                     base: args.base,
                     workdir: args.workdir,
+                    description: args.description,
                     instructions: args.instructions,
                     parent: parent_val,
                     prompt: args.prompt,
@@ -1194,7 +1207,8 @@ impl AgentMcp {
             "describe" => {
                 self.describe(Parameters(DescribeArgs {
                     agent: args.name,
-                    description: args.instructions,
+                    description: args.description,
+                    instructions: args.instructions,
                     role: args.role,
                     clear: args.clear,
                 }))
@@ -1440,6 +1454,7 @@ impl AgentMcp {
             branch: args.branch,
             base: args.base,
             workdir: args.workdir,
+            description: args.description,
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
             prompt: args.prompt,
@@ -1586,6 +1601,7 @@ impl AgentMcp {
                         branch: args.branch,
                         base: args.base,
                         workdir: args.workdir,
+                        description: None,
                         instructions: args.instructions,
                         prompt: args.prompt,
                     }))
@@ -1861,6 +1877,7 @@ impl AgentMcp {
         };
         if resolved_target.eq_ignore_ascii_case("all")
             && args.description.is_none()
+            && args.instructions.is_none()
             && args.role.is_none()
             && !args.clear.unwrap_or(false)
         {
@@ -1887,9 +1904,14 @@ impl AgentMcp {
                 "agents": roster,
             })));
         }
-        if args.description.is_some() || args.role.is_some() || args.clear.unwrap_or(false) {
+        if args.description.is_some()
+            || args.instructions.is_some()
+            || args.role.is_some()
+            || args.clear.unwrap_or(false)
+        {
             let body = serde_json::json!({
                 "description": args.description,
+                "instructions": args.instructions,
                 "role": args.role,
                 "clear": args.clear.unwrap_or(false),
             });

@@ -6,10 +6,12 @@
 mod channel;
 pub mod poller;
 
+#[allow(unused_imports)]
 pub use channel::{
-    WebhookError, chat_member_is_in, close_poll, delete_chat_message, edit_message, pin_message,
-    post_article, post_checklist, post_location, post_media, post_poll, post_text, react_message,
-    receive_webhook, record_chat, sync_agent_telegram_bot_name,
+    WebhookError, chat_member_is_in, chat_member_status, close_poll, delete_chat_message,
+    edit_message, pin_message, post_article, post_checklist, post_location, post_media, post_poll,
+    post_text, react_message, receive_webhook, reconcile_channel_groups, record_chat,
+    sync_agent_telegram_bot_name,
 };
 pub(crate) use channel::{detach_archived_agent_from_telegram_groups, outbound_call};
 pub use poller::Poller;

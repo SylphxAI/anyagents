@@ -94,7 +94,18 @@ impl<H: Harness> DeliveryLoop<H> {
     /// quota answer is returned, not retried.
     pub fn run_once(&mut self) -> Result<RunOutcome, Error> {
         let mut delivered = 0u64;
+        if self.harness.health().turn_state == TurnState::Idle
+            && !self.store.has_actionable_undelivered(&self.agent_id)?
+        {
+            return Ok(RunOutcome::Idle);
+        }
         loop {
+            if delivered > 0
+                && self.harness.health().turn_state == TurnState::Idle
+                && !self.store.has_actionable_undelivered(&self.agent_id)?
+            {
+                return Ok(RunOutcome::Delivered { delivered });
+            }
             let Some(message) = self.store.next_undelivered(&self.agent_id)? else {
                 return Ok(if delivered == 0 {
                     RunOutcome::Idle

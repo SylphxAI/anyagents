@@ -430,6 +430,7 @@ impl SylphxSdkSession {
                     user_prompt,
                 ) {
                     Ok(u) => Ok(u),
+                    Err(e) if !crate::sandbox::is_isolated_test_env() => Err(e),
                     Err(_) => run_native_gateway_turn(
                         &state,
                         &cancel_flag,

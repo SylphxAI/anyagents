@@ -93,7 +93,23 @@ impl CommandRunner for ProcessRunner {
                 .unwrap_or(dir);
             return crate::sylphx::run_device_flow_login(target_dir, on_line);
         }
-        let mut command = Command::new(program);
+        let resolved_program: std::path::PathBuf = if std::env::var_os("ANYAGENTS_FAKE_MODE")
+            .is_none()
+            && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()
+        {
+            let harness = match program {
+                "claude" => "claude-code",
+                other => other,
+            };
+            dir.ancestors()
+                .find(|a| a.join("harnesses").is_dir())
+                .map(|root| crate::install::program(root, harness))
+                .filter(|p| p.is_file())
+                .unwrap_or_else(|| std::path::PathBuf::from(program))
+        } else {
+            std::path::PathBuf::from(program)
+        };
+        let mut command = Command::new(&resolved_program);
         command
             .args(args)
             .current_dir(dir)

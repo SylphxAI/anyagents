@@ -1125,7 +1125,7 @@ impl Poll {
             body: serde_json::json!({
                 "offset": self.offset,
                 "timeout": timeout_s,
-                "allowed_updates": ["message", "my_chat_member"],
+                "allowed_updates": ["message", "edited_message", "my_chat_member", "message_reaction"],
             }),
         }
     }

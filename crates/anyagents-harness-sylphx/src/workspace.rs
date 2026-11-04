@@ -72,11 +72,15 @@ fn file_command(
     Ok(out.stdout)
 }
 
-pub(super) fn read_to_string(path: &Path, env: &[(String, String)]) -> Result<String, String> {
+pub(super) fn read_bytes(path: &Path, env: &[(String, String)]) -> Result<Vec<u8>, String> {
     if !delegated(env) {
-        return std::fs::read_to_string(path).map_err(|e| e.to_string());
+        return std::fs::read(path).map_err(|e| e.to_string());
     }
-    String::from_utf8(file_command(path, env, "/bin/cat -- \"$1\"", b"")?).map_err(|e| e.to_string())
+    file_command(path, env, "/bin/cat -- \"$1\"", b"")
+}
+
+pub(super) fn read_to_string(path: &Path, env: &[(String, String)]) -> Result<String, String> {
+    String::from_utf8(read_bytes(path, env)?).map_err(|e| e.to_string())
 }
 
 pub(super) fn write(

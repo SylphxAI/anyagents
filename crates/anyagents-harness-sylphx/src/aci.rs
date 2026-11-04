@@ -138,10 +138,24 @@ pub(super) fn execute_bash_with_timeout(
                 if Instant::now() >= deadline {
                     timed_out = true;
                     #[cfg(unix)]
-                    unsafe {
+                    {
                         let pgid = child.id() as i32;
                         if pgid > 0 {
-                            let _ = libc::kill(-pgid, libc::SIGKILL);
+                            unsafe {
+                                let _ = libc::kill(-pgid, libc::SIGKILL);
+                            }
+                            if workspace::delegated(env)
+                                && let Ok(mut kcmd) = workspace::command(Path::new("/bin/kill"), env)
+                            {
+                                let neg_pgid = format!("-{pgid}");
+                                let pos_pgid = pgid.to_string();
+                                let _ = kcmd
+                                    .args(["-s", "KILL", "--", &neg_pgid, &pos_pgid])
+                                    .stdin(Stdio::null())
+                                    .stdout(Stdio::null())
+                                    .stderr(Stdio::null())
+                                    .status();
+                            }
                         }
                     }
                     let _ = child.kill();

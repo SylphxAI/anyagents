@@ -208,31 +208,71 @@ impl SylphxHarness {
     }
 
     fn cloud_environment(&self) -> Option<String> {
-        for (k, v) in &self.env {
-            if k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty() {
-                return Some(v.trim().to_string());
-            }
-        }
-        if let Ok(v) = std::env::var("SYLPHX_AGENT_ENV")
-            && !v.trim().is_empty()
-        {
-            return Some(v.trim().to_string());
-        }
-        let ctx_path = self.config_dir.join(".config/sylphx/context.json");
-        if let Ok(raw) = std::fs::read_to_string(ctx_path)
-            && let Ok(val) = serde_json::from_str::<Value>(&raw)
-            && val.get("cloud_session").and_then(Value::as_bool) == Some(true)
-            && let Some(env_slug) = val
-                .get("environment")
-                .or_else(|| val.get("env"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-        {
-            return Some(env_slug.to_string());
-        }
-        None
+        resolve_cloud_agent_environment(&self.config_dir, &self.env)
     }
+}
+
+pub fn resolve_cloud_agent_environment(
+    config_dir: &Path,
+    env: &[(String, String)],
+) -> Option<String> {
+    if matches!(
+        placement::selected(config_dir, env),
+        Ok(Some(placement::WorkspacePlacement::Local))
+    ) {
+        return None;
+    }
+    if matches!(
+        sdk::SylphxExecutionMode::from_env(config_dir, env),
+        sdk::SylphxExecutionMode::LocalOnly
+    ) {
+        return None;
+    }
+    let raw_sbx = env
+        .iter()
+        .find(|(k, v)| k == "SYLPHX_SANDBOX" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_ascii_lowercase())
+        .or_else(|| {
+            std::env::var("SYLPHX_SANDBOX")
+                .ok()
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+        });
+    if matches!(
+        raw_sbx.as_deref(),
+        Some("none" | "stateless" | "off" | "false" | "0" | "local" | "host")
+    ) {
+        return None;
+    }
+    for (k, v) in env {
+        if k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty() {
+            return Some(normalize_cloud_env_slug(v.trim()));
+        }
+    }
+    if let Ok(v) = std::env::var("SYLPHX_AGENT_ENV")
+        && !v.trim().is_empty()
+    {
+        return Some(normalize_cloud_env_slug(v.trim()));
+    }
+    let ctx_path = config_dir.join(".config/sylphx/context.json");
+    if let Ok(raw) = std::fs::read_to_string(ctx_path)
+        && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        && val.get("cloud_session").and_then(Value::as_bool) == Some(true)
+        && let Some(env_slug) = val
+            .get("environment")
+            .or_else(|| val.get("env"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        return Some(normalize_cloud_env_slug(env_slug));
+    }
+    if !crate::sandbox::is_isolated_test_env()
+        && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
+    {
+        return Some(DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
+    }
+    None
 }
 
 impl Harness for SylphxHarness {
@@ -352,18 +392,24 @@ impl Harness for SylphxHarness {
                 ) {
                     Ok(usage) => Ok(usage),
                     Err(cloud_err) => {
-                        record_cloud_sandbox_fallback(&config_dir, &cloud_err);
-                        run_native_gateway_turn(
-                            &state,
-                            &cancel_flag,
-                            &config_dir,
-                            &work_dir,
-                            model.as_deref(),
-                            &env,
-                            &mcp_command,
-                            &mcp_args,
-                            &marked,
-                        )
+                        if !crate::sandbox::is_isolated_test_env() {
+                            Err(cloud_err)
+                        } else {
+                            if !cloud_err.contains("turn timeout reached") {
+                                record_cloud_sandbox_fallback(&config_dir, &cloud_err);
+                            }
+                            run_native_gateway_turn(
+                                &state,
+                                &cancel_flag,
+                                &config_dir,
+                                &work_dir,
+                                model.as_deref(),
+                                &env,
+                                &mcp_command,
+                                &mcp_args,
+                                &marked,
+                            )
+                        }
                     }
                 }
             } else {
@@ -660,6 +706,7 @@ fn capture_cloud_turn_execution(
     api_key: &str,
     gateway_key: &str,
     repo_token: Option<&str>,
+    kubeconfig_b64: Option<&str>,
     sess_path: &str,
     turn: i64,
     has_repo: bool,
@@ -705,13 +752,34 @@ fn capture_cloud_turn_execution(
         "inference".to_string(),
         json!({ "handle": inference_handle }),
     );
-    if has_repo
-        && let Some(tok) = repo_token.filter(|s| !s.trim().is_empty())
-        && let Some(repo_handle) = capture_one("execution", &["repository"], tok)?
+    if let Some(tok) = repo_token.filter(|s| !s.trim().is_empty()) {
+        if has_repo
+            && let Some(repo_handle) = capture_one("execution", &["repository"], tok)?
+        {
+            credentials.insert(
+                "repository".to_string(),
+                json!({ "handle": repo_handle }),
+            );
+        }
+        if let Ok(Some(gh_handle)) = capture_one("execution", &["sandbox", "GH_TOKEN"], tok) {
+            credentials.insert("GH_TOKEN".to_string(), json!({ "handle": gh_handle }));
+        }
+    }
+    if !api_key.trim().is_empty()
+        && let Ok(Some(sylphx_handle)) =
+            capture_one("execution", &["sandbox", "SYLPHX_API_KEY"], api_key)
     {
         credentials.insert(
-            "repository".to_string(),
-            json!({ "handle": repo_handle }),
+            "SYLPHX_API_KEY".to_string(),
+            json!({ "handle": sylphx_handle }),
+        );
+    }
+    if let Some(kc) = kubeconfig_b64.filter(|s| !s.trim().is_empty())
+        && let Ok(Some(kc_handle)) = capture_one("execution", &["sandbox", "KUBECONFIG_B64"], kc)
+    {
+        credentials.insert(
+            "KUBECONFIG_B64".to_string(),
+            json!({ "handle": kc_handle }),
         );
     }
     Ok(Some(json!({
@@ -826,6 +894,7 @@ pub(crate) fn run_cloud_session_turn(
     })?;
     let gateway_key = resolve_sylphx_gateway_key(config_dir, env).unwrap_or_else(|| api_key.clone());
     let repo_token = resolve_github_token(env);
+    let kubeconfig_b64 = resolve_kubeconfig_b64(env);
     let base = resolve_cloud_api_url(env);
     let canonical_env = normalize_cloud_env_slug(env_slug);
     let (model_id, _) = parse_sylphx_model_and_effort(model);
@@ -877,21 +946,45 @@ pub(crate) fn run_cloud_session_turn(
                         .to_ascii_lowercase();
                     let tc = val
                         .get("turn_count")
+                        .or_else(|| val.get("turnCount"))
                         .and_then(|v| {
                             v.as_i64()
                                 .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
                         })
                         .unwrap_or(0);
+                    let s_seq = val
+                        .get("last_event_sequence")
+                        .or_else(|| val.get("lastEventSequence"))
+                        .and_then(|v| {
+                            v.as_i64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                        })
+                        .unwrap_or(0);
+                    initial_last_seq = initial_last_seq.max(s_seq);
                     next_turn = tc.saturating_add(1);
-                    if status == "failed"
+                    let has_legacy_pinned_repo = val.pointer("/environment/repo").is_some();
+                    if has_legacy_pinned_repo
+                        || status == "failed"
                         || status == "session_state_failed"
                         || status == "terminated"
                         || status == "errored"
                     {
+                        if status.contains("running")
+                            || status.contains("working")
+                            || status.contains("waiting")
+                            || status.contains("awaiting")
+                        {
+                            let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
+                            let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                        }
                         clear_persisted_cloud_session(config_dir);
+                        agent_id = None;
                         session_id = None;
                         initial_last_seq = 0;
                         next_turn = 1;
+                        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.cloud_agent_id = None;
+                        g.cloud_session_id = None;
                     } else if status.contains("running")
                         || status.contains("working")
                         || status.contains("waiting")
@@ -899,6 +992,57 @@ pub(crate) fn run_cloud_session_turn(
                     {
                         let interrupt_url = format!("{base}/v1/{sess_path}:interrupt");
                         let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                        let mut settled = false;
+                        for _ in 0..20 {
+                            std::thread::sleep(Duration::from_millis(200));
+                            if let Ok((200..=299, raw_after)) = curl_get(&sess_url, Some(&api_key))
+                                && let Ok(val_after) = serde_json::from_str::<Value>(&raw_after)
+                            {
+                                let st_after = val_after
+                                    .get("state")
+                                    .or_else(|| val_after.get("status"))
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                                    .to_ascii_lowercase();
+                                let tc_after = val_after
+                                    .get("turn_count")
+                                    .or_else(|| val_after.get("turnCount"))
+                                    .and_then(|v| {
+                                        v.as_i64().or_else(|| {
+                                            v.as_str().and_then(|s| s.parse::<i64>().ok())
+                                        })
+                                    })
+                                    .unwrap_or(tc);
+                                let seq_after = val_after
+                                    .get("last_event_sequence")
+                                    .or_else(|| val_after.get("lastEventSequence"))
+                                    .and_then(|v| {
+                                        v.as_i64().or_else(|| {
+                                            v.as_str().and_then(|s| s.parse::<i64>().ok())
+                                        })
+                                    })
+                                    .unwrap_or(initial_last_seq);
+                                initial_last_seq = initial_last_seq.max(seq_after);
+                                next_turn = tc_after.saturating_add(1);
+                                if st_after == "idle"
+                                    || st_after == "session_state_idle"
+                                    || st_after == "completed"
+                                {
+                                    settled = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if !settled {
+                            clear_persisted_cloud_session(config_dir);
+                            agent_id = None;
+                            session_id = None;
+                            initial_last_seq = 0;
+                            next_turn = 1;
+                            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            g.cloud_agent_id = None;
+                            g.cloud_session_id = None;
+                        }
                     }
                 }
             }
@@ -931,21 +1075,9 @@ pub(crate) fn run_cloud_session_turn(
         system_prompt.push_str("\n\n");
         system_prompt.push_str(&prior_block);
     }
-    let mut environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
+    let mut environment_spec = build_cloud_environment_spec(config_dir, None, env);
     if let Some(obj) = environment_spec.as_object_mut() {
-        if repo_token.is_none() {
-            obj.remove("repo");
-        } else if let Some(repo_obj) = obj.get_mut("repo").and_then(Value::as_object_mut)
-            && let Some(rev) = repo_obj
-                .get("revision")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        {
-            let is_sha = rev.len() == 40 && rev.chars().all(|c| c.is_ascii_hexdigit());
-            if !is_sha && rev != "HEAD" && !rev.starts_with("origin/") {
-                repo_obj.remove("revision");
-            }
-        }
+        obj.remove("repo");
     }
 
     if agent_id.is_none() {
@@ -1018,7 +1150,7 @@ pub(crate) fn run_cloud_session_turn(
     }
 
     let aid = agent_id.unwrap_or_default();
-    let sid = session_id.unwrap_or_default();
+    let mut sid = session_id.unwrap_or_default();
     save_persisted_cloud_session(
         config_dir,
         &PersistedCloudSession {
@@ -1030,7 +1162,7 @@ pub(crate) fn run_cloud_session_turn(
         },
     );
 
-    let sess_path = cloud_session_resource_path(&canonical_env, &sid);
+    let mut sess_path = cloud_session_resource_path(&canonical_env, &sid);
     let has_repo = environment_spec.get("repo").is_some();
     let execution_opt = capture_cloud_turn_execution(
         &base,
@@ -1038,6 +1170,7 @@ pub(crate) fn run_cloud_session_turn(
         &api_key,
         &gateway_key,
         repo_token.as_deref(),
+        kubeconfig_b64.as_deref(),
         &sess_path,
         next_turn,
         has_repo,
@@ -1051,7 +1184,74 @@ pub(crate) fn run_cloud_session_turn(
     if let (Some(exec_val), Some(obj)) = (execution_opt, send_body.as_object_mut()) {
         obj.insert("execution".to_string(), exec_val);
     }
-    let (st, raw) = curl_post_json(&send_url, Some(&api_key), &send_body)?;
+    let (mut st, mut raw) = curl_post_json(&send_url, Some(&api_key), &send_body)?;
+    if matches!(st, 400 | 404 | 409 | 410)
+        && (raw.contains("INVALID_STATE")
+            || raw.contains("undelivered waits")
+            || raw.contains("NOT_FOUND"))
+    {
+        let interrupt_old = format!("{base}/v1/{sess_path}:interrupt");
+        let _ = curl_post_json(&interrupt_old, Some(&api_key), &json!({}));
+        clear_persisted_cloud_session(config_dir);
+        let create_sess_url = format!("{base}/v1/{canonical_env}/agent_sessions");
+        let body = json!({
+            "agent": aid,
+            "title": "AnyAgents Session",
+            "environment": environment_spec,
+        });
+        let (st_new, raw_new) = curl_post_json(&create_sess_url, Some(&api_key), &body)?;
+        if (200..300).contains(&st_new)
+            && let Ok(val_new) = serde_json::from_str::<Value>(&raw_new)
+            && let Some(new_sid) = val_new
+                .get("name")
+                .or_else(|| val_new.get("id"))
+                .or_else(|| val_new.get("uid"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        {
+            sid = new_sid.clone();
+            initial_last_seq = 0;
+            next_turn = 1;
+            {
+                let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                g.cloud_session_id = Some(sid.clone());
+                g.session_id = Some(sid.clone());
+            }
+            let _ = std::fs::write(config_dir.join("sylphx-session-id"), format!("{sid}\n"));
+            save_persisted_cloud_session(
+                config_dir,
+                &PersistedCloudSession {
+                    agent_id: aid.clone(),
+                    session_id: sid.clone(),
+                    model_id: model_id.clone(),
+                    env_slug: canonical_env.clone(),
+                    last_seq: 0,
+                },
+            );
+            sess_path = cloud_session_resource_path(&canonical_env, &sid);
+            let new_exec = capture_cloud_turn_execution(
+                &base,
+                &canonical_env,
+                &api_key,
+                &gateway_key,
+                repo_token.as_deref(),
+                kubeconfig_b64.as_deref(),
+                &sess_path,
+                1,
+                has_repo,
+            )?;
+            let new_send_url = format!("{base}/v1/{sess_path}:send");
+            let mut new_send_body = json!({
+                "message": {
+                    "parts": [{ "text": user_message }]
+                }
+            });
+            if let (Some(exec_val), Some(obj)) = (new_exec, new_send_body.as_object_mut()) {
+                obj.insert("execution".to_string(), exec_val);
+            }
+            (st, raw) = curl_post_json(&new_send_url, Some(&api_key), &new_send_body)?;
+        }
+    }
     if !(200..300).contains(&st) {
         return Err(format!("cloud session send HTTP {st}: {}", raw.trim()));
     }
@@ -1122,6 +1322,16 @@ pub(crate) fn run_cloud_session_turn(
                         last_progress = Instant::now();
                     }
                 }
+                let ev_turn = ev
+                    .get("turn")
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    })
+                    .unwrap_or(0);
+                if ev_turn > 0 && ev_turn < next_turn {
+                    continue;
+                }
 
                 let ev_type = ev
                     .get("type")
@@ -1137,14 +1347,18 @@ pub(crate) fn run_cloud_session_turn(
                         .and_then(Value::as_str)
                         .unwrap_or("")
                         .to_string();
-                    let is_client = tc.get("client").and_then(Value::as_bool).unwrap_or(true);
+                    let tool_name = tc
+                        .get("tool")
+                        .or_else(|| tc.get("name"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let norm_fn = tool_name
+                        .strip_prefix("mcp__anyagents__")
+                        .unwrap_or(tool_name);
+                    let is_client = is_cloud_client_coordination_tool(norm_fn)
+                        && tc.get("client").and_then(Value::as_bool).unwrap_or(true);
                     if !call_id.is_empty() && is_client && handled_call_ids.insert(call_id.clone())
                     {
-                        let tool_name = tc
-                            .get("tool")
-                            .or_else(|| tc.get("name"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("");
                         let input_val = tc
                             .get("input")
                             .or_else(|| tc.get("arguments"))
@@ -1244,6 +1458,23 @@ pub(crate) fn run_cloud_session_turn(
                             .pointer("/response/text")
                             .and_then(Value::as_str)
                             .unwrap_or("cloud turn failed");
+                        if err_text.contains("permanent") {
+                            clear_persisted_cloud_session(config_dir);
+                            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            g.cloud_agent_id = None;
+                            g.cloud_session_id = None;
+                        } else {
+                            save_persisted_cloud_session(
+                                config_dir,
+                                &PersistedCloudSession {
+                                    agent_id: aid.clone(),
+                                    session_id: sid.clone(),
+                                    model_id: model_id.clone(),
+                                    env_slug: canonical_env.clone(),
+                                    last_seq,
+                                },
+                            );
+                        }
                         return Err(format!("cloud session turn error: {err_text}"));
                     }
                     if assistant_texts.is_empty()
@@ -1255,6 +1486,8 @@ pub(crate) fn run_cloud_session_turn(
                     {
                         assistant_texts.push(t.to_string());
                     }
+                } else if ev_type == "ERROR" || ev_type == "TOOL_RESULT" || ev_type == "SANDBOX" {
+                    last_progress = Instant::now();
                 }
             }
         }
@@ -1275,6 +1508,17 @@ pub(crate) fn run_cloud_session_turn(
                 .unwrap_or("")
                 .to_ascii_lowercase();
             if status == "idle" || status == "session_state_idle" || status == "completed" {
+                let session_last_seq = val
+                    .get("last_event_sequence")
+                    .or_else(|| val.get("lastEventSequence"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+                    })
+                    .unwrap_or(0);
+                if session_last_seq > last_seq {
+                    continue;
+                }
                 save_persisted_cloud_session(
                     config_dir,
                     &PersistedCloudSession {
@@ -1436,6 +1680,44 @@ fn native_responses_output(response: &Value) -> Result<Vec<Value>, String> {
     ))
 }
 
+const ATTACHED_IMAGE_MARKER_PREFIX: &str = "\n__ANYAGENTS_ATTACHED_IMAGE_DATA_URL__:";
+
+fn image_mime_for_path(path: &str) -> Option<&'static str> {
+    let lower = path.trim().to_ascii_lowercase();
+    if lower.ends_with(".png") {
+        Some("image/png")
+    } else if lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+        Some("image/jpeg")
+    } else if lower.ends_with(".webp") {
+        Some("image/webp")
+    } else if lower.ends_with(".gif") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn format_image_read_output(path: &str, mime: &str, bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return format!("error: image file `{path}` is empty (0 bytes)");
+    }
+    let b64 = auth::base64_encode(bytes);
+    format!(
+        "Loaded image `{path}` ({mime}, {} bytes) into visual context.{ATTACHED_IMAGE_MARKER_PREFIX}data:{mime};base64,{b64}",
+        bytes.len()
+    )
+}
+
+fn extract_attached_image_marker(output: &str) -> (String, Option<String>) {
+    if let Some((clean, data_url)) = output.split_once(ATTACHED_IMAGE_MARKER_PREFIX) {
+        let trimmed = data_url.trim();
+        if trimmed.starts_with("data:image/") {
+            return (clean.to_string(), Some(trimmed.to_string()));
+        }
+    }
+    (output.to_string(), None)
+}
+
 fn close_dangling_function_calls(transcript_path: &Path, input_items: &mut Vec<Value>) {
     let mut answered = std::collections::HashSet::new();
     for item in input_items.iter() {
@@ -1550,11 +1832,18 @@ pub(crate) fn run_native_gateway_turn(
     let mut total_cache_write: u64 = 0;
     let mut sent_any_reply = false;
 
+    let mut overflow_compacted_in_turn = false;
     for step in 0usize.. {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
         drain_steered_messages(state, &transcript_path, &mut input_items);
+        if input_items.len() > memory::WINDOW_MAX_ITEMS
+            || memory::estimate_items_tokens(&input_items) > memory::MAX_WINDOW_EST_TOKENS
+        {
+            input_items = load_transcript_input_items(&transcript_path);
+            close_dangling_function_calls(&transcript_path, &mut input_items);
+        }
 
         let req_body = build_native_responses_request(
             &model_id,
@@ -1569,6 +1858,33 @@ pub(crate) fn run_native_gateway_turn(
         let (status, raw) = curl_post_json(&responses_url, Some(&api_key), &req_body)?;
         let step_elapsed_ms = step_t0.elapsed().as_millis() as u64;
         if !(200..300).contains(&status) {
+            let is_context_overflow = matches!(status, 400 | 413 | 503)
+                && (raw.contains("context_length_exceeded")
+                    || raw.contains("exceeds the model's context window")
+                    || raw.contains("maximum context length"));
+            if is_context_overflow && !overflow_compacted_in_turn {
+                overflow_compacted_in_turn = true;
+                let continuity = build_prior_transcript_continuity_block(&transcript_path)
+                    .unwrap_or_else(|| "Prior turns preserved in raw transcript.".to_string());
+                let handoff = format!(
+                    "Auto-compacted after context window limit.\n{continuity}\nActive prompt:\n{}",
+                    truncate_tool_output_middle_utf8(
+                        initial_user_message.to_string(),
+                        4_000,
+                        1_800,
+                        1_800
+                    )
+                );
+                let anchor = json!({
+                    "type": "context_window_open",
+                    "handoff": handoff,
+                    "timestamp_ms": anyagents_core::now_ms(),
+                });
+                append_transcript_message(&transcript_path, &anchor);
+                input_items = load_transcript_input_items(&transcript_path);
+                close_dangling_function_calls(&transcript_path, &mut input_items);
+                continue;
+            }
             return Err(format!(
                 "Sylphx responses API HTTP {status}: {}",
                 raw.trim()
@@ -1802,13 +2118,32 @@ pub(crate) fn run_native_gateway_turn(
                         mcp_command,
                         mcp_args,
                     );
+                    let (clean_output, attached_image_data_url) =
+                        extract_attached_image_marker(&output);
                     let tool_out_item = json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": output,
+                        "output": clean_output,
                     });
                     append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
+                    if let Some(data_url) = attached_image_data_url {
+                        let image_item = json!({
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": format!("[Image loaded by `{fn_name}`]"),
+                                },
+                                {
+                                    "type": "input_image",
+                                    "image_url": data_url,
+                                }
+                            ]
+                        });
+                        append_transcript_message(&transcript_path, &image_item);
+                        input_items.push(image_item);
+                    }
                 }
             }
             if let Some(handoff) = pending_window_handoff {
@@ -2023,10 +2358,7 @@ pub fn run_stdio_adapter(
         let sess_cl = session_id.clone();
 
         std::thread::spawn(move || {
-            let cloud_env = env_cl
-                .iter()
-                .find(|(k, v)| k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty())
-                .map(|(_, v)| v.trim().to_string());
+            let cloud_env = resolve_cloud_agent_environment(&cfg_cl, &env_cl);
             let outcome = if let Some(env_slug) = cloud_env {
                 match run_cloud_session_turn(
                     &state_cl,
@@ -2042,18 +2374,24 @@ pub fn run_stdio_adapter(
                 ) {
                     Ok(usage) => Ok(usage),
                     Err(cloud_err) => {
-                        record_cloud_sandbox_fallback(&cfg_cl, &cloud_err);
-                        run_native_gateway_turn(
-                            &state_cl,
-                            &cancel_cl,
-                            &cfg_cl,
-                            &work_cl,
-                            model_cl.as_deref(),
-                            &env_cl,
-                            &mcp_cmd_cl,
-                            &mcp_args_cl,
-                            &user_text,
-                        )
+                        if !crate::sandbox::is_isolated_test_env() {
+                            Err(cloud_err)
+                        } else {
+                            if !cloud_err.contains("turn timeout reached") {
+                                record_cloud_sandbox_fallback(&cfg_cl, &cloud_err);
+                            }
+                            run_native_gateway_turn(
+                                &state_cl,
+                                &cancel_cl,
+                                &cfg_cl,
+                                &work_cl,
+                                model_cl.as_deref(),
+                                &env_cl,
+                                &mcp_cmd_cl,
+                                &mcp_args_cl,
+                                &user_text,
+                            )
+                        }
                     }
                 }
             } else {
@@ -2493,18 +2831,17 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "schedule",
-                "description": "Manage durable timers, intervals, cron jobs, and watches (`list`, `create`, `pause`, `resume`, `cancel`).",
+                "description": "Schedule your own wakes (`at` or `every` with `prompt`) and external event watches (`watch` with `prompt`), or `list` and `cancel` (`id`: `<sch_...>` | `\"all\"`) your schedules. Supported `watch` specs: `github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`, `pid:<pid>`, `file:<path>`.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string" },
+                        "action": { "type": "string", "description": "`set`, `list`, or `cancel`." },
+                        "at": { "type": "string", "description": "One-off wake duration (`\"1m\"`, `\"30s\"`, `\"2h\"`) or ISO-8601 timestamp." },
+                        "every": { "type": "string", "description": "Recurring wake interval (`\"1m\"`, `\"5m\"`, `\"15m\"`, `\"30m\"`, `\"1h\"`)." },
+                        "watch": { "type": "string", "description": "Event watch spec (`github:pr:<owner>/<repo>#<num>`, `github:check:<owner>/<repo>@<ref>`, `spiron:promise:<id>`, `agent:idle:<name_or_id>`, `pid:<pid>`, `file:<path>`)." },
+                        "prompt": { "type": "string" },
                         "id": { "type": "string" },
-                        "kind": { "type": "string", "description": "`after`, `every`, `cron`, or `watch`." },
-                        "seconds": { "type": "integer" },
-                        "cron": { "type": "string" },
-                        "watch_kind": { "type": "string", "description": "`command`, `process`, `file`, `http`, or `subagent`." },
-                        "watch_target": { "type": "string" },
-                        "prompt": { "type": "string" }
+                        "agent": { "type": "string" }
                     }
                 }
             }
@@ -3288,7 +3625,7 @@ fn execute_sylphx_tool(
                 {
                     Ok(out) => return out,
                     Err(e) => {
-                        if explicit_placement.is_some() {
+                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
                             return format!(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
@@ -3314,6 +3651,37 @@ fn execute_sylphx_tool(
             };
             let start_line = args.get("start_line").and_then(Value::as_u64);
             let end_line = args.get("end_line").and_then(Value::as_u64);
+            if let Some(mime) = image_mime_for_path(rel) {
+                if sandbox_mode == "cloud" {
+                    match read_file_bytes_in_cloud_sandbox_with_work_dir(
+                        config_dir,
+                        Some(work_dir),
+                        env,
+                        rel,
+                    ) {
+                        Ok(bytes) => {
+                            return format_image_read_output(rel, mime, &bytes);
+                        }
+                        Err(e) => {
+                            if explicit_placement.is_some()
+                                || !crate::sandbox::is_isolated_test_env()
+                            {
+                                return format!(
+                                    "error: selected cloud placement failed (no local fallback): {e}"
+                                );
+                            }
+                            if !e.starts_with("ReadFile HTTP 404:") {
+                                record_cloud_sandbox_fallback(config_dir, &e);
+                            }
+                        }
+                    }
+                }
+                let target = resolve_workspace_path(work_dir, rel);
+                return match workspace::read_bytes(&target, env) {
+                    Ok(bytes) => format_image_read_output(rel, mime, &bytes),
+                    Err(e) => format!("error reading {}: {e}", target.display()),
+                };
+            }
             if sandbox_mode == "cloud" {
                 match read_file_in_cloud_sandbox_with_work_dir(config_dir, Some(work_dir), env, rel)
                 {
@@ -3321,7 +3689,7 @@ fn execute_sylphx_tool(
                         return format_read_file_output(rel, &content, start_line, end_line);
                     }
                     Err(e) => {
-                        if explicit_placement.is_some() {
+                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
                             return format!(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
@@ -3358,7 +3726,7 @@ fn execute_sylphx_tool(
                 ) {
                     Ok(msg) => return msg,
                     Err(e) => {
-                        if explicit_placement.is_some() {
+                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
                             return format!(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
@@ -3436,7 +3804,9 @@ fn execute_sylphx_tool(
                                         );
                                     }
                                     Err(e) => {
-                                        if explicit_placement.is_some() {
+                                        if explicit_placement.is_some()
+                                            || !crate::sandbox::is_isolated_test_env()
+                                        {
                                             return format!(
                                                 "error: selected cloud placement failed (no local fallback): {e}"
                                             );
@@ -3449,7 +3819,7 @@ fn execute_sylphx_tool(
                         }
                     }
                     Err(e) => {
-                        if explicit_placement.is_some() {
+                        if explicit_placement.is_some() || !crate::sandbox::is_isolated_test_env() {
                             return format!(
                                 "error: selected cloud placement failed (no local fallback): {e}"
                             );
@@ -3489,6 +3859,50 @@ fn resolve_workspace_path(work_dir: &Path, raw: &str) -> PathBuf {
     }
 }
 
+fn normalize_mcp_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
+    if tool_name != "schedule" {
+        return arguments.clone();
+    }
+    let Some(mut obj) = arguments.as_object().cloned() else {
+        return arguments.clone();
+    };
+    if obj.get("action").and_then(Value::as_str) == Some("create") {
+        obj.insert("action".to_string(), json!("set"));
+    }
+    let kind = obj
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if let Some(secs) = obj.get("seconds").and_then(Value::as_u64) {
+        let dur_str = format!("{}s", secs.max(1));
+        if kind == "every" || kind == "interval" {
+            obj.entry("every".to_string()).or_insert_with(|| json!(dur_str));
+        } else {
+            obj.entry("at".to_string()).or_insert_with(|| json!(dur_str));
+        }
+    }
+    if !obj.contains_key("watch")
+        && let Some(wt) = obj
+            .get("watch_target")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        let wk = obj
+            .get("watch_kind")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let watch_spec = match wk {
+            Some(k) if !wt.contains(':') => format!("{k}:{wt}"),
+            _ => wt.to_string(),
+        };
+        obj.insert("watch".to_string(), json!(watch_spec));
+    }
+    Value::Object(obj)
+}
+
 fn call_anyagents_mcp_tool(
     mcp_command: &Path,
     mcp_args: &[String],
@@ -3496,6 +3910,7 @@ fn call_anyagents_mcp_tool(
     tool_name: &str,
     arguments: &Value,
 ) -> String {
+    let normalized_args = normalize_mcp_tool_arguments(tool_name, arguments);
     let clean_cmd = clean_exe_path(mcp_command);
     let mut cmd = Command::new(&clean_cmd);
     cmd.args(mcp_args)
@@ -3528,7 +3943,7 @@ fn call_anyagents_mcp_tool(
         "method": "tools/call",
         "params": {
             "name": tool_name,
-            "arguments": arguments,
+            "arguments": normalized_args,
         }
     });
     if let Some(mut stdin) = child.stdin.take() {
@@ -3548,14 +3963,14 @@ fn call_anyagents_mcp_tool(
                 .pointer("/result/content/0/text")
                 .and_then(Value::as_str)
             {
-                return text.to_string();
+                return truncate_tool_output_middle_utf8(text.to_string(), 64_000, 30_000, 30_000);
             }
             if let Some(err) = val.pointer("/error/message").and_then(Value::as_str) {
                 return format!("error: {err}");
             }
         }
     }
-    stdout.trim().to_string()
+    truncate_tool_output_middle_utf8(stdout.trim().to_string(), 64_000, 30_000, 30_000)
 }
 
 #[cfg(test)]

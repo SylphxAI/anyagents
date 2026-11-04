@@ -374,11 +374,12 @@ impl Table {
             }
         }
 
+        let term_w = terminal_width();
         let max_last_col = if self.fit_terminal && cols > 1 && !self.headers[cols - 1].1 {
             let prefix_cols: usize = visible_width(self.indent)
                 + widths[..cols - 1].iter().sum::<usize>()
                 + 2 * (cols - 1);
-            Some(terminal_width().saturating_sub(prefix_cols).max(24))
+            Some(term_w.saturating_sub(prefix_cols).max(16))
         } else {
             None
         };
@@ -400,6 +401,9 @@ impl Table {
                     header_line.push_str("  ");
                 }
             }
+        }
+        if self.fit_terminal && term_w >= 115 && visible_width(&header_line) > term_w {
+            header_line = truncate_visible(&header_line, term_w);
         }
         println!("{header_line}");
 
@@ -425,6 +429,9 @@ impl Table {
                         line.push_str("  ");
                     }
                 }
+            }
+            if self.fit_terminal && term_w >= 115 && visible_width(&line) > term_w {
+                line = truncate_visible(&line, term_w);
             }
             println!("{line}");
         }
@@ -615,8 +622,55 @@ fn format_status_with_alerts(agent: &AgentView, now: i64) -> String {
     base
 }
 
-fn clean_agent_description(raw: &str, is_subagent: bool) -> String {
-    let mut line = raw.lines().next().unwrap_or("").trim();
+fn clean_agent_description(
+    raw: &str,
+    agent_name: &str,
+    role: Option<&str>,
+    is_subagent: bool,
+) -> String {
+    let mut line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("");
+    line = line.trim_start_matches('#').trim();
+
+    // Strip redundant `<Name> · <Role>` prefix when it repeats the AGENT column
+    let name_lower = agent_name.to_ascii_lowercase();
+    if line
+        .get(..agent_name.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(&name_lower))
+    {
+        let after_name = line[agent_name.len()..].trim_start();
+        if let Some(after_dot) = after_name
+            .strip_prefix('·')
+            .or_else(|| after_name.strip_prefix('-'))
+            .or_else(|| after_name.strip_prefix(':'))
+        {
+            let mut rest = after_dot.trim_start();
+            if let Some(r) = role.map(str::trim).filter(|s| !s.is_empty())
+                && let Some(after_role) = rest.strip_prefix(r)
+            {
+                rest = after_role.trim_start();
+            }
+            if rest.starts_with('(')
+                && let Some(close_idx) = rest.find(')')
+            {
+                let inside = rest[1..close_idx].trim();
+                let after_paren = rest[close_idx + 1..]
+                    .trim_start_matches(['.', ':', '-', '—'])
+                    .trim();
+                if !after_paren.is_empty() {
+                    line = after_paren;
+                } else if !inside.is_empty() {
+                    line = inside;
+                }
+            } else if !rest.is_empty() {
+                line = rest;
+            }
+        }
+    }
+
     if is_subagent {
         let lower = line.to_ascii_lowercase();
         if lower.starts_with("sub-agent of ") || lower.starts_with("subagent of ") {
@@ -634,8 +688,42 @@ fn clean_agent_description(raw: &str, is_subagent: bool) -> String {
             && idx < 40
         {
             line = line[idx + 2..].trim();
+        } else if (lower.contains(" sub-agent:") || lower.contains("'s sub-agent:"))
+            && let Some(idx) = line.find(':')
+            && idx < 48
+        {
+            line = line[idx + 1..].trim();
         }
     }
+
+    // Strip leading "Goal:" / "Goal (...):" / "Sole writer:" / "Sole writer for" boilerplate
+    let lower = line.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("goal") {
+        let after_goal = line[4..].trim_start();
+        if let Some(after_colon) = after_goal.strip_prefix(':') {
+            line = after_colon.trim();
+        } else if rest.starts_with(' ') || rest.starts_with('(') {
+            if let Some(colon_idx) = after_goal.find("):") {
+                let candidate = after_goal[colon_idx + 2..].trim();
+                if !candidate.is_empty() {
+                    line = candidate;
+                }
+            }
+        }
+    } else {
+        for prefix in [
+            "sole writer for ",
+            "sole writer: ",
+            "one writer: ",
+            "one writer for ",
+        ] {
+            if lower.starts_with(prefix) {
+                line = line[prefix.len()..].trim();
+                break;
+            }
+        }
+    }
+
     line.to_string()
 }
 
@@ -1045,7 +1133,9 @@ pub fn print_agents_table_with_options(
             let cleaned = agent
                 .description
                 .as_deref()
-                .map(|s| clean_agent_description(s, node.depth > 0))
+                .map(|s| {
+                    clean_agent_description(s, &agent.name, agent.role.as_deref(), node.depth > 0)
+                })
                 .filter(|s| !s.is_empty());
             let desc_text = cleaned.as_deref().unwrap_or("-");
             row.push(if is_dim || desc_text == "-" {
@@ -1137,6 +1227,146 @@ pub fn format_profile_usage(usage: Option<&str>) -> String {
     styled_segments.join(&dim(" · "))
 }
 
+/// Format a single rate-limit window segment (`5h: 94% left ↻4h44m` -> ` 94% ↻4h44m`)
+/// with right-aligned percentage so all rows align vertically.
+fn format_quota_window_cell(seg: &str, period_tag: Option<&str>) -> String {
+    if let Some((before_left, after_left)) = seg.split_once("% left") {
+        let pct_str = before_left
+            .split_once(':')
+            .map_or(before_left, |(_, p)| p)
+            .trim();
+        let pct = pct_str.parse::<i64>().unwrap_or(100);
+        let pct_badge = format!("{pct:>3}%");
+        let styled_pct = if pct <= 0 {
+            red(&bold(&pct_badge))
+        } else if pct <= 25 {
+            yellow(&pct_badge)
+        } else {
+            green(&pct_badge)
+        };
+        let styled_after = style_usage_suffix(after_left, pct <= 0);
+        let suffix = period_tag.map(|t| dim(&format!(" ({t})"))).unwrap_or_default();
+        return format!("{styled_pct}{styled_after}{suffix}");
+    }
+    green(seg)
+}
+
+/// Split a profile's `(kind, usage)` into `(plan_cell, window_5h_cell, window_7d_or_balance_cell)`.
+fn parse_profile_usage_columns(kind: &str, usage: Option<&str>) -> (String, String, String) {
+    let empty_dash = || dim("   -");
+    let default_plan = |k: &str| -> String {
+        match k {
+            "oauth" | "subscription" => green("sub"),
+            "coding-plan" => cyan("coding-plan"),
+            _ => yellow(k),
+        }
+    };
+    let style_plan_tier = |tier: &str| -> String {
+        match tier {
+            "ultra" | "max 20x" | "promax" => bold_cyan(tier),
+            "max 5x" | "pro" | "plus" | "max" | "team" | "enterprise" => green(tier),
+            "free" => dim("free"),
+            "api-key" => yellow("api-key"),
+            "coding-plan" => cyan("coding-plan"),
+            other => green(other),
+        }
+    };
+
+    let Some(raw) = usage.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (default_plan(kind), empty_dash(), empty_dash());
+    };
+
+    let mut core = raw;
+    let mut extracted_tier: Option<&str> = None;
+    if let Some(open_idx) = raw.rfind(" (")
+        && raw.ends_with(')')
+    {
+        let tag = raw[open_idx + 2..raw.len() - 1].trim();
+        let normalized = match tag {
+            "Max Usage" => Some("max"),
+            "ultra" | "pro" | "free" | "promax" | "plus" | "max 5x" | "max 20x" | "max"
+            | "api-key" | "team" | "enterprise" => Some(tag),
+            _ => None,
+        };
+        if let Some(t) = normalized {
+            extracted_tier = Some(t);
+            core = raw[..open_idx].trim();
+        }
+    }
+
+    let plan_cell = match extracted_tier {
+        Some(t) => style_plan_tier(t),
+        None => default_plan(kind),
+    };
+
+    let mut cell_5h: Option<String> = None;
+    let mut cell_long: Option<String> = None;
+    let mut extra_parts: Vec<String> = Vec::new();
+
+    for seg in core.split(" · ") {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if seg.starts_with("5h:") {
+            cell_5h = Some(format_quota_window_cell(seg, None));
+        } else if seg.starts_with("7d:") {
+            cell_long = Some(format_quota_window_cell(seg, None));
+        } else if seg.starts_with("mo:") {
+            cell_long = Some(format_quota_window_cell(seg, Some("mo")));
+        } else if seg.starts_with("opus:") {
+            if let Some((before_left, _)) = seg.split_once("% left")
+                && let Some((_, pct_str)) = before_left.split_once(':')
+            {
+                let pct = pct_str.trim().parse::<i64>().unwrap_or(100);
+                let pct_badge = format!("{pct}%");
+                let styled_pct = if pct <= 0 {
+                    red(&pct_badge)
+                } else if pct <= 25 {
+                    yellow(&pct_badge)
+                } else {
+                    green(&pct_badge)
+                };
+                extra_parts.push(format!("{} {styled_pct}", dim("· opus")));
+            }
+        } else if let Some((rem_part, tail)) = seg.split_once(" left (") {
+            // e.g. "$15.56 left ($2981 / $2996)" -> "$15.56 / $2996"
+            let tail_clean = tail.trim_end_matches(')');
+            if let Some((_, total_part)) = tail_clean.split_once('/') {
+                extra_parts.push(format!(
+                    "{} {}",
+                    green(rem_part.trim()),
+                    dim(&format!("/ {}", total_part.trim()))
+                ));
+            } else {
+                extra_parts.push(format!(
+                    "{} {}",
+                    green(rem_part.trim()),
+                    dim(&format!("({tail_clean})"))
+                ));
+            }
+        } else if let Some(amt) = seg.strip_suffix(" left") {
+            extra_parts.push(green(amt.trim()));
+        } else if seg == "online (gateway-edge)" {
+            extra_parts.push(format!("{} {}", green("online"), dim("(gateway)")));
+        } else if let Some((head, tail)) = seg.split_once(" (") {
+            extra_parts.push(format!("{} {}", green(head), dim(&format!("({tail}"))));
+        } else {
+            extra_parts.push(green(seg));
+        }
+    }
+
+    let final_5h = cell_5h.unwrap_or_else(empty_dash);
+    let final_long = match (cell_long, extra_parts.is_empty()) {
+        (Some(long_s), true) => long_s,
+        (Some(long_s), false) => format!("{long_s} {}", extra_parts.join(" ")),
+        (None, false) => extra_parts.join(&dim(" · ")),
+        (None, true) => empty_dash(),
+    };
+
+    (plan_cell, final_5h, final_long)
+}
+
 /// Pretty-print upstream provider profiles (`anyagents profiles`).
 pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEntry]) {
     if entries.is_empty() {
@@ -1165,7 +1395,7 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
         }
         if e.usage
             .as_deref()
-            .is_some_and(|u| u.contains(": 0% left") || u.starts_with("0% left"))
+            .is_some_and(|u| crate::create::parse_remaining_pct_from_usage(u, None) == Some(0))
         {
             exhausted_count += 1;
         }
@@ -1196,17 +1426,17 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
         ("PROVIDER", false),
         ("PROFILE", false),
         ("ACCOUNT", false),
-        ("KIND", false),
-        ("USAGE / BALANCE", false),
+        ("PLAN", false),
+        ("5H QUOTA", false),
+        ("7D / BALANCE", false),
         ("AGENTS", false),
-        ("HARNESSES", false),
     ]);
 
     for e in entries {
         let is_exhausted = e
             .usage
             .as_deref()
-            .is_some_and(|u| u.contains(": 0% left") || u.starts_with("0% left"));
+            .is_some_and(|u| crate::create::parse_remaining_pct_from_usage(u, None) == Some(0));
         let provider_cell = if is_exhausted {
             red(&bold(&e.provider))
         } else {
@@ -1225,15 +1455,14 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
+            Some(acct) if acct.starts_with("user_") && acct.len() > 14 => {
+                dim(&format!("{}…", &acct[..11]))
+            }
             Some(acct) => dim(acct),
             None => dim("-"),
         };
-        let kind_badge = match e.kind.as_str() {
-            "oauth" | "subscription" => green(&e.kind),
-            "coding-plan" => cyan(&e.kind),
-            _ => yellow(&e.kind),
-        };
-        let usage_cell = format_profile_usage(e.usage.as_deref());
+        let (plan_cell, window_5h_cell, window_long_cell) =
+            parse_profile_usage_columns(&e.kind, e.usage.as_deref());
 
         let agents_cell = if e.assigned_agents.is_empty() && e.subagent_count == 0 {
             dim("-")
@@ -1262,22 +1491,14 @@ pub(crate) fn print_profiles_pretty(entries: &[crate::create::ProviderProfileEnt
             parts.join(" ")
         };
 
-        let harnesses_cell = if e.compatible_harnesses.len() <= 3 {
-            dim(&e.compatible_harnesses.join(", "))
-        } else {
-            let first_two = e.compatible_harnesses[..2].join(", ");
-            let rem = e.compatible_harnesses.len() - 2;
-            dim(&format!("{first_two} +{rem}"))
-        };
-
         table.add_row(vec![
             provider_cell,
             profile_cell,
             account_cell,
-            kind_badge,
-            usage_cell,
+            plan_cell,
+            window_5h_cell,
+            window_long_cell,
             agents_cell,
-            harnesses_cell,
         ]);
     }
 
@@ -1397,6 +1618,8 @@ mod tests {
         assert_eq!(
             clean_agent_description(
                 "Sub-agent of Sage. Outcome: no live Fun, Big2 or HKMT player loses data",
+                "sage-sub-1",
+                None,
                 true
             ),
             "no live Fun, Big2 or HKMT player loses data"

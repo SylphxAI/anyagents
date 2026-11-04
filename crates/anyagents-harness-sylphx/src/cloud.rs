@@ -148,6 +148,7 @@ pub fn build_cloud_environment_spec(
         "shape": shape,
         "template": "template:agent",
         "ttl": "1800s",
+        "idle_standby": "900s",
     });
     if let Some(uri) = wt.repo_url
         && let Some(obj) = spec.as_object_mut()
@@ -309,17 +310,17 @@ pub fn resolve_agent_git_worktree_spec(
     let mut candidate_git_dirs: Vec<PathBuf> = Vec::new();
     if let Some(wd) = work_dir {
         candidate_git_dirs.push(wd.to_path_buf());
-    }
-    if let Some(p) = marker
-        .as_ref()
-        .and_then(|m| m.get("path"))
-        .and_then(Value::as_str)
-        .map(PathBuf::from)
-    {
-        candidate_git_dirs.push(p);
-    }
-    if let Some(parent) = config_dir.parent() {
-        candidate_git_dirs.push(parent.join("work"));
+        if let Some(p) = marker
+            .as_ref()
+            .and_then(|m| m.get("path"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+        {
+            candidate_git_dirs.push(p);
+        }
+        if let Some(parent) = config_dir.parent() {
+            candidate_git_dirs.push(parent.join("work"));
+        }
     }
 
     let (repo_url, repo_slug) = raw_repo
@@ -453,6 +454,46 @@ pub(super) fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
                 }
                 return Some(tok);
             }
+        }
+    }
+    None
+}
+
+pub(super) fn resolve_kubeconfig_b64(env: &[(String, String)]) -> Option<String> {
+    for (k, v) in env {
+        if k == "KUBECONFIG_B64" && !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    if let Ok(v) = std::env::var("KUBECONFIG_B64")
+        && !v.trim().is_empty()
+    {
+        return Some(v.trim().to_string());
+    }
+    let explicit_path = env
+        .iter()
+        .find(|(k, v)| k == "KUBECONFIG" && !v.trim().is_empty())
+        .map(|(_, v)| PathBuf::from(v.trim().split(':').next().unwrap_or("")))
+        .or_else(|| {
+            std::env::var("KUBECONFIG")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| PathBuf::from(s.trim().split(':').next().unwrap_or("")))
+        });
+    if let Some(p) = explicit_path
+        && let Ok(bytes) = std::fs::read(&p)
+        && !bytes.is_empty()
+        && bytes.len() <= 65_536
+    {
+        return Some(base64_encode(&bytes));
+    }
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        let kc = home.join(".kube/config");
+        if let Ok(bytes) = std::fs::read(&kc)
+            && !bytes.is_empty()
+            && bytes.len() <= 65_536
+        {
+            return Some(base64_encode(&bytes));
         }
     }
     None
@@ -594,20 +635,11 @@ pub(super) fn resolve_sandbox_mode(config_dir: &Path, env: &[(String, String)]) 
     match raw.as_deref() {
         Some("none" | "stateless" | "off" | "false" | "0") => "none".to_string(),
         Some("local" | "host") => "local".to_string(),
-        Some("cloud" | "pod" | "kata" | "microvm" | "sandbox" | "auto") => {
-            if is_cloud_sandbox_in_fallback_cooldown(config_dir) {
-                "local".to_string()
-            } else {
-                "cloud".to_string()
-            }
-        }
+        Some("cloud" | "pod" | "kata" | "microvm" | "sandbox" | "auto") => "cloud".to_string(),
         _ => {
-            if is_cloud_sandbox_in_fallback_cooldown(config_dir) {
-                "local".to_string()
-            } else if config_dir.join("sylphx-sandbox-lease.json").is_file() {
-                "cloud".to_string()
-            } else if !crate::sandbox::is_isolated_test_env()
-                && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
+            if config_dir.join("sylphx-sandbox-lease.json").is_file()
+                || (!crate::sandbox::is_isolated_test_env()
+                    && resolve_sylphx_cloud_access_key(config_dir, env).is_some())
             {
                 "cloud".to_string()
             } else {
@@ -1124,39 +1156,56 @@ pub(super) fn exec_in_cloud_sandbox(
     exec_in_cloud_sandbox_with_work_dir(config_dir, None, env, cmd_str)
 }
 
+fn is_stale_or_expired_cloud_lease_http(status: u16, raw: &str) -> bool {
+    matches!(status, 400 | 404 | 410)
+        && (raw.contains("The lease has expired")
+            || raw.contains("The lease has ended")
+            || raw.contains("LEASE_NOT_FOUND")
+            || raw.contains("INVALID_STATE"))
+}
+
 pub(super) fn exec_in_cloud_sandbox_with_work_dir(
     config_dir: &Path,
     work_dir: Option<&Path>,
     env: &[(String, String)],
     cmd_str: &str,
 ) -> Result<String, String> {
-    let (lease_name, _) =
-        ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
-    let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
-        .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
-    let api_url = resolve_cloud_api_url(env);
-    let exec_url = format!("{api_url}/v1/{lease_name}:exec");
-    let mut exec_env = serde_json::Map::new();
-    if let Some(tok) = resolve_github_token(env) {
-        exec_env.insert("GH_TOKEN".to_string(), json!(tok));
-        exec_env.insert("GITHUB_TOKEN".to_string(), json!(tok));
-    }
-    let inner_cmd = format!(
-        "export PATH=\"$HOME/.local/bin:$PATH\"; mkdir -p \"{CLOUD_WORKSPACE_DIR}\" && cd \"{CLOUD_WORKSPACE_DIR}\" && {cmd_str}"
-    );
-    let wrapped_cmd = wrap_cloud_exec_command_for_zero_exit(&inner_cmd);
-    let idempotency_key = next_exec_idempotency_key("exec");
-    let (status, raw) = post_exec_with_idempotency_retry(
-        &exec_url,
-        &access_key,
-        &json!({
-            "idempotency_key": idempotency_key,
-            "command": ["bash", "-lc", wrapped_cmd],
-            "working_directory": CLOUD_WORKSPACE_DIR,
-            "env": exec_env,
-            "timeout": "180s",
-        }),
-    )?;
+    let mut retried_stale_lease = false;
+    let (status, raw) = loop {
+        let (lease_name, _) =
+            ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
+        let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
+            .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+        let api_url = resolve_cloud_api_url(env);
+        let exec_url = format!("{api_url}/v1/{lease_name}:exec");
+        let mut exec_env = serde_json::Map::new();
+        if let Some(tok) = resolve_github_token(env) {
+            exec_env.insert("GH_TOKEN".to_string(), json!(tok));
+            exec_env.insert("GITHUB_TOKEN".to_string(), json!(tok));
+        }
+        let inner_cmd = format!(
+            "export PATH=\"$HOME/.local/bin:$PATH\"; mkdir -p \"{CLOUD_WORKSPACE_DIR}\" && cd \"{CLOUD_WORKSPACE_DIR}\" && {cmd_str}"
+        );
+        let wrapped_cmd = wrap_cloud_exec_command_for_zero_exit(&inner_cmd);
+        let idempotency_key = next_exec_idempotency_key("exec");
+        let (status, raw) = post_exec_with_idempotency_retry(
+            &exec_url,
+            &access_key,
+            &json!({
+                "idempotency_key": idempotency_key,
+                "command": ["bash", "-lc", wrapped_cmd],
+                "working_directory": CLOUD_WORKSPACE_DIR,
+                "env": exec_env,
+                "timeout": "180s",
+            }),
+        )?;
+        if !retried_stale_lease && is_stale_or_expired_cloud_lease_http(status, &raw) {
+            retried_stale_lease = true;
+            let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
+            continue;
+        }
+        break (status, raw);
+    };
     if status == 409 && raw.contains("EXEC_OUTCOME_UNKNOWN") {
         return Ok(
             "exit_code: 125\nstderr:\ncloud sandbox command stream interrupted (EXEC_OUTCOME_UNKNOWN); the command was already dispatched in /home/user/workspace — check workspace state (e.g. git status / ls) before retrying.\n"
@@ -1199,27 +1248,47 @@ pub(super) fn read_file_in_cloud_sandbox(
     read_file_in_cloud_sandbox_with_work_dir(config_dir, None, env, path)
 }
 
-pub(super) fn read_file_in_cloud_sandbox_with_work_dir(
+pub(super) fn read_file_bytes_in_cloud_sandbox_with_work_dir(
     config_dir: &Path,
     work_dir: Option<&Path>,
     env: &[(String, String)],
     path: &str,
-) -> Result<String, String> {
-    let (lease_name, _) =
-        ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
-    let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
-        .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
-    let api_url = resolve_cloud_api_url(env);
-    let guest_path = resolve_cloud_sandbox_path(path);
-    let url = format!("{api_url}/v1/{lease_name}:readFile");
-    let (status, raw) = curl_post_json(&url, Some(&access_key), &json!({ "path": guest_path }))?;
+) -> Result<Vec<u8>, String> {
+    let mut retried_stale_lease = false;
+    let (status, raw) = loop {
+        let (lease_name, _) =
+            ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
+        let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
+            .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+        let api_url = resolve_cloud_api_url(env);
+        let guest_path = resolve_cloud_sandbox_path(path);
+        let url = format!("{api_url}/v1/{lease_name}:readFile");
+        let (status, raw) =
+            curl_post_json(&url, Some(&access_key), &json!({ "path": guest_path }))?;
+        if !retried_stale_lease && is_stale_or_expired_cloud_lease_http(status, &raw) {
+            retried_stale_lease = true;
+            let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
+            continue;
+        }
+        break (status, raw);
+    };
     if !(200..300).contains(&status) {
         return Err(format!("ReadFile HTTP {status}: {}", raw.trim()));
     }
     let val: Value =
         serde_json::from_str(&raw).map_err(|e| format!("invalid ReadFile JSON: {e}"))?;
     let content_b64 = val.get("content").and_then(Value::as_str).unwrap_or("");
-    Ok(String::from_utf8_lossy(&base64_decode(content_b64)).into_owned())
+    Ok(base64_decode(content_b64))
+}
+
+pub(super) fn read_file_in_cloud_sandbox_with_work_dir(
+    config_dir: &Path,
+    work_dir: Option<&Path>,
+    env: &[(String, String)],
+    path: &str,
+) -> Result<String, String> {
+    let bytes = read_file_bytes_in_cloud_sandbox_with_work_dir(config_dir, work_dir, env, path)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[allow(dead_code)]
@@ -1239,21 +1308,30 @@ pub(super) fn write_file_in_cloud_sandbox_with_work_dir(
     path: &str,
     content: &str,
 ) -> Result<String, String> {
-    let (lease_name, _) =
-        ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
-    let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
-        .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
-    let api_url = resolve_cloud_api_url(env);
-    let guest_path = resolve_cloud_sandbox_path(path);
-    let url = format!("{api_url}/v1/{lease_name}:writeFile");
-    let (status, raw) = curl_post_json(
-        &url,
-        Some(&access_key),
-        &json!({
-            "path": guest_path,
-            "content": base64_encode(content.as_bytes()),
-        }),
-    )?;
+    let mut retried_stale_lease = false;
+    let (lease_name, guest_path, status, raw) = loop {
+        let (lease_name, _) =
+            ensure_cloud_sandbox_lease_with_worktree(config_dir, work_dir, env, None, None, None)?;
+        let access_key = resolve_sylphx_cloud_access_key(config_dir, env)
+            .ok_or_else(|| "missing Sylphx Cloud access key".to_string())?;
+        let api_url = resolve_cloud_api_url(env);
+        let guest_path = resolve_cloud_sandbox_path(path);
+        let url = format!("{api_url}/v1/{lease_name}:writeFile");
+        let (status, raw) = curl_post_json(
+            &url,
+            Some(&access_key),
+            &json!({
+                "path": guest_path,
+                "content": base64_encode(content.as_bytes()),
+            }),
+        )?;
+        if !retried_stale_lease && is_stale_or_expired_cloud_lease_http(status, &raw) {
+            retried_stale_lease = true;
+            let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
+            continue;
+        }
+        break (lease_name, guest_path, status, raw);
+    };
     if !(200..300).contains(&status) {
         return Err(format!("WriteFile HTTP {status}: {}", raw.trim()));
     }
