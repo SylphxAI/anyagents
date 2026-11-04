@@ -517,13 +517,97 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(to_children.deliveries.len(), 1);
     assert_eq!(to_children.deliveries[0].to, "agent:worker-1");
 
-    // Archive the sub-agent (`state = archived`), then send to its `agt_...` ID and verify it auto-wakes.
+    // Root `send(to: ["all"])` / `send(to: ["peers"])` is strictly scoped to Root peers (`parent_id.is_none()`),
+    // so even while `worker-1` is `running`, `to: ["all"]` delivers ONLY to `agent:beta` and never leaks into sub-agents!
+    let to_all_while_worker_running: SendResponse = ok_json(
+        call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["all"], "text": "root peer broadcast while worker running"}),
+        )
+        .await,
+    );
+    let running_all_recipients: Vec<&str> = to_all_while_worker_running
+        .deliveries
+        .iter()
+        .map(|d| d.to.as_str())
+        .collect();
+    assert_eq!(running_all_recipients, vec!["agent:beta"]);
+    assert!(to_all_while_worker_running.skipped.is_empty());
+
+    // Another Root peer (`beta`) cannot directly message `alpha`'s private sub-agent (`worker-1`)!
+    let cross_parent_err = error_text(
+        &call(
+            &beta,
+            "send",
+            serde_json::json!({"to": ["worker-1"], "text": "intruding into alpha's sub-agent"}),
+        )
+        .await,
+    );
+    assert!(
+        cross_parent_err.contains("cannot message sub-agent `worker-1` directly")
+            && cross_parent_err.contains("agent:alpha"),
+        "unexpected error: {cross_parent_err}"
+    );
+
+    // Custody transfer (`agents` `action = "transfer"`): `alpha` transfers `worker-1` to `beta`,
+    // after which `beta` CAN message `worker-1` directly, and `beta` transfers `worker-1` back to `alpha`.
+    let transferred_to_beta: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({
+                "action": "transfer",
+                "name": &spawned.id,
+                "parent": "beta",
+                "prompt": "handing off worker-1 to beta"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(transferred_to_beta["previous_parent"], "alpha");
+    assert_eq!(transferred_to_beta["new_parent"], "beta");
+
+    let beta_to_worker: SendResponse = ok_json(
+        call(
+            &beta,
+            "send",
+            serde_json::json!({"to": ["worker-1"], "text": "now beta is your parent"}),
+        )
+        .await,
+    );
+    assert_eq!(beta_to_worker.deliveries[0].to, "agent:worker-1");
+
+    let transferred_back: serde_json::Value = ok_json(
+        call(
+            &beta,
+            "agents",
+            serde_json::json!({
+                "action": "transfer",
+                "name": &spawned.id,
+                "parent": "alpha",
+                "prompt": "returning worker-1 to alpha"
+            }),
+        )
+        .await,
+    );
+    assert_eq!(transferred_back["previous_parent"], "beta");
+    assert_eq!(transferred_back["new_parent"], "alpha");
+
+    // Archive the sub-agent (`state = archived`), then pause `beta` to verify `to: ["all"]` reports paused Root peers in `skipped`.
     let archived: AgentView =
         ok_json(call(&alpha, "archive", serde_json::json!({"agent": &spawned.id})).await);
     assert_eq!(archived.state, "archived");
 
-    // While archived, `group:all` skips it.
-    // Also pause `worker-1` via unified `agents` tool after joining `crew` to verify `skipped` reports paused agents with reason.
+    // Also join `worker-1` to `crew` and pause `worker-1` via unified `agents` tool to verify `group:crew` reports paused members in `skipped`.
+    let _: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "groups",
+            serde_json::json!({"action": "join", "group": "crew", "agent": &spawned.id}),
+        )
+        .await,
+    );
     let paused_worker: AgentView = ok_json(
         call(
             &alpha,
@@ -534,21 +618,21 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(paused_worker.state, "paused");
 
-    let to_all_with_paused: SendResponse = ok_json(
+    let to_crew_with_paused: SendResponse = ok_json(
         call(
             &alpha,
             "send",
-            serde_json::json!({"to": ["all"], "text": "broadcast while worker paused"}),
+            serde_json::json!({"to": ["group:crew"], "text": "group message while worker paused"}),
         )
         .await,
     );
     assert!(
-        to_all_with_paused
+        to_crew_with_paused
             .skipped
             .iter()
             .any(|s| s.to == "agent:worker-1" && s.reason == "paused"),
-        "expected paused worker in skipped receipt: {:?}",
-        to_all_with_paused.skipped
+        "expected paused worker in group skipped receipt: {:?}",
+        to_crew_with_paused.skipped
     );
 
     let archived: AgentView = ok_json(
@@ -679,9 +763,9 @@ async fn mcp_tools_use_the_server_socket() {
         "{}",
         String::from_utf8_lossy(&inbox.stderr)
     );
-    // Two addressed lines, the room line, and the two `all` broadcast lines, each readable from the CLI too.
+    // Two addressed lines, the room line, and the three `all` broadcast lines, each readable from the CLI too.
     let listed = String::from_utf8(inbox.stdout).unwrap();
-    assert_eq!(listed.lines().count(), 5, "{listed}");
+    assert_eq!(listed.lines().count(), 6, "{listed}");
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
 }

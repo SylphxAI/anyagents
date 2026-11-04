@@ -965,6 +965,52 @@ impl Store {
         agent_by_id(&conn, id)
     }
 
+    /// Transfer custody (reparent) of an agent to a new parent agent (or `None` to promote to root).
+    /// Rejects self-parenting and cycles in the hierarchy tree.
+    pub fn set_agent_parent(
+        &self,
+        agent_id: &AgentId,
+        new_parent_id: Option<&AgentId>,
+    ) -> Result<Agent, Error> {
+        let updated = {
+            let conn = self.conn();
+            let current = agent_by_id(&conn, agent_id)?;
+            if let Some(np) = new_parent_id {
+                if np == agent_id {
+                    return Err(Error::Message(
+                        "cannot transfer an agent to itself as parent".into(),
+                    ));
+                }
+                let mut cursor = Some(np.clone());
+                let mut hops = 0usize;
+                while let Some(cid) = cursor {
+                    if &cid == agent_id {
+                        return Err(Error::Message(
+                            "cannot transfer an agent under its own descendant (cycle detected)"
+                                .into(),
+                        ));
+                    }
+                    hops += 1;
+                    if hops > 64 {
+                        break;
+                    }
+                    let anc = agent_by_id(&conn, &cid)?;
+                    cursor = anc.parent_id;
+                }
+            }
+            let parent_str = new_parent_id.map(AgentId::as_str);
+            conn.execute(
+                "UPDATE agents SET parent_id = ?1 WHERE id = ?2",
+                params![parent_str, current.id.as_str()],
+            )?;
+            agent_by_id(&conn, agent_id)?
+        };
+        self.notify(Wake::Agent {
+            agent_id: agent_id.clone(),
+        });
+        Ok(updated)
+    }
+
     /// Former names recorded for this agent via `rename_agent`.
     pub fn agent_aliases(&self, id: &AgentId) -> Result<Vec<String>, Error> {
         let conn = self.conn();
@@ -1161,11 +1207,15 @@ impl Store {
             return Ok(Some(self.chat_members(chat_id)?));
         }
         let name = room.strip_prefix("group:").unwrap_or(room);
-        if name == "all" {
+        if name == "all" || name == "peers" {
             let names = self
                 .list_agents()?
                 .into_iter()
-                .filter(|agent| agent.state != "archived" && agent.state != "paused")
+                .filter(|agent| {
+                    agent.parent_id.is_none()
+                        && agent.state != "archived"
+                        && agent.state != "paused"
+                })
                 .map(|agent| agent.name)
                 .collect();
             return Ok(Some(names));
