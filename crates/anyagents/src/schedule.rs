@@ -878,7 +878,10 @@ fn evaluate_watch(
     now: i64,
 ) -> WatchEval {
     let Ok(target) = parse_watch_spec(&sched.spec) else {
-        return WatchEval::pending(sched.watch_baseline.clone(), Some("invalid_spec".to_string()));
+        return WatchEval::pending(
+            sched.watch_baseline.clone(),
+            Some("invalid_spec".to_string()),
+        );
     };
     match target {
         WatchTarget::AgentIdle { target } => {
@@ -1668,7 +1671,11 @@ mod tests {
             inbox[0].text
         );
         let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(active.len(), 1, "PR watch must stay active after checks_completed");
+        assert_eq!(
+            active.len(),
+            1,
+            "PR watch must stay active after checks_completed"
+        );
         assert_eq!(
             active[0].watch_baseline.as_deref(),
             Some("checks_completed")
@@ -1699,9 +1706,9 @@ mod tests {
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 2);
         assert!(
-            inbox[1]
-                .text
-                .starts_with("[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=evicted]\nverify PR 452"),
+            inbox[1].text.starts_with(
+                "[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=evicted]\nverify PR 452"
+            ),
             "unexpected eviction wake text: {}",
             inbox[1].text
         );
@@ -1717,9 +1724,9 @@ mod tests {
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert_eq!(inbox.len(), 3);
         assert!(
-            inbox[2]
-                .text
-                .starts_with("[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=merged]\nverify PR 452"),
+            inbox[2].text.starts_with(
+                "[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=merged]\nverify PR 452"
+            ),
             "unexpected merge wake text: {}",
             inbox[2].text
         );
