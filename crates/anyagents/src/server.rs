@@ -4946,16 +4946,16 @@ fn can_actor_message_agent(
     let Actor::Agent(sender_name) = actor else {
         return Ok(());
     };
-    let sender = store
-        .agent_by_name(sender_name)
-        .map_err(ApiError::from_store)?;
-    if sender.id == recipient.id {
-        return Ok(());
-    }
     let Some(ref recip_parent_id) = recipient.parent_id else {
         // Recipient is a Root agent: always reachable by Root peers and sub-agents.
         return Ok(());
     };
+    let Ok(sender) = store.agent_by_name(sender_name) else {
+        return Ok(());
+    };
+    if sender.id == recipient.id {
+        return Ok(());
+    }
     // Recipient is a sub-agent (`recip_parent_id`):
     // Allowed if sender IS the recipient's direct parent, OR sender shares the exact same parent (`sibling`).
     if &sender.id == recip_parent_id || sender.parent_id.as_ref() == Some(recip_parent_id) {
