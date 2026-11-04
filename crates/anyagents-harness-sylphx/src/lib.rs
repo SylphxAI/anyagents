@@ -1064,7 +1064,10 @@ pub(crate) fn run_cloud_session_turn(
         system_prompt.push_str(&prior_block);
     }
     let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
-    if let Some(repo_uri) = environment_spec.pointer("/repo/uri").and_then(Value::as_str) {
+    if let Some(repo_uri) = environment_spec
+        .pointer("/repo/uri")
+        .and_then(Value::as_str)
+    {
         let worktree_spec =
             resolve_agent_git_worktree_spec(config_dir, Some(work_dir), env, None, None, None);
         let branch_hint = worktree_spec
