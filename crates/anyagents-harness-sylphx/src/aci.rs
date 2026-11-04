@@ -1042,21 +1042,30 @@ def mcp(tool_name, **kwargs):
         {{"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {{"name": tool_name, "arguments": kwargs}}}},
     ]
     payload = "\n".join(json.dumps(r) for r in reqs) + "\n"
-    proc = subprocess.run(_MCP_CMD, input=payload, capture_output=True, text=True)
-    for line in reversed(proc.stdout.splitlines()):
+    with subprocess.Popen(_MCP_CMD, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True) as proc:
         try:
-            msg = json.loads(line)
-        except Exception:
-            continue
-        if msg.get("id") == 1:
-            if "error" in msg:
-                raise RuntimeError(msg["error"].get("message", str(msg["error"])))
-            text = (((msg.get("result") or {{}}).get("content") or [{{}}])[0]).get("text", "")
-            try:
-                return json.loads(text)
-            except Exception:
-                return text
-    return proc.stdout.strip()
+            proc.stdin.write(payload)
+            proc.stdin.flush()
+            # EOF cancels asynchronous tools: close stdin only after id 1.
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(msg, dict) or msg.get("id") != 1:
+                    continue
+                if "error" in msg:
+                    raise RuntimeError(msg["error"].get("message", str(msg["error"])))
+                text = (((msg.get("result") or {{}}).get("content") or [{{}}])[0]).get("text", "")
+                try:
+                    return json.loads(text)
+                except ValueError:
+                    return text
+            raise RuntimeError("MCP server closed stdout before tool response")
+        finally:
+            proc.stdin.close()
+            for _ in proc.stdout:
+                pass
 
 def agents(**kwargs):
     return mcp("agents", **kwargs)
