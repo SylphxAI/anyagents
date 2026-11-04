@@ -3120,8 +3120,16 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
                 mode_name(live.delivery_mode),
                 steer_name(live.steer_support),
                 effective_quota,
-                live.live_harness.clone(),
-                live.live_model.clone(),
+                if live.process_alive {
+                    live.live_harness.clone()
+                } else {
+                    Some(agent.harness.clone())
+                },
+                if live.process_alive {
+                    live.live_model.clone()
+                } else {
+                    agent.model.clone()
+                },
                 live.process_started_at_ms,
                 switch_pending,
                 effective_err,
@@ -4930,14 +4938,28 @@ impl SendPlan {
     }
 }
 
+fn root_ancestor_id(store: &Store, agent: &anyagents_core::Agent) -> anyagents_core::AgentId {
+    let mut current_id = agent.id.clone();
+    let mut next_parent = agent.parent_id.clone();
+    for _ in 0..16 {
+        let Some(pid) = next_parent else {
+            break;
+        };
+        current_id = pid.clone();
+        next_parent = store.agent(&pid).ok().and_then(|parent| parent.parent_id);
+    }
+    current_id
+}
+
 /// Enforces strict hierarchy & peer encapsulation (`Encapsulated Actor Hierarchy`):
-/// - Root agents (`parent_id == None`) can message any Root peer (`parent_id == None`) or their own direct children (`recipient.parent_id == Some(sender.id)`).
+/// - Root agents (`parent_id == None`) can message any Root peer (`parent_id == None`) or any descendant inside their own hierarchy tree.
 /// - Sub-agents (`parent_id == Some(P)`) can message:
 ///   1. Their own direct parent (`recipient.id == P`)
 ///   2. Their own direct children (`recipient.parent_id == Some(sender.id)`)
 ///   3. Their own sibling sub-agents under the same parent (`recipient.parent_id == Some(P)`)
-///   4. Any Root agent (`recipient.parent_id == None`) for cross-domain escalation
-/// - Sending directly to **another agent's sub-agent** (`recipient.parent_id == Some(other)` where `other != sender.id` and `other != sender.parent_id`) is refused unless the caller is the Operator. To hand over a sub-agent across parents, use `agents({ "action": "transfer", "name": "<subagent>", "parent": "<new-parent>" })`.
+///   4. Any ancestor or descendant within the same Root agent's hierarchy tree (`root_ancestor_id(sender) == root_ancestor_id(recipient)`)
+///   5. Any Root agent (`recipient.parent_id == None`) for cross-domain escalation
+/// - Sending directly to **another Root agent's sub-agent** (`root_ancestor_id(sender) != root_ancestor_id(recipient)`) is refused unless the caller is the Operator. To hand over a sub-agent across parents, use `agents({ "action": "transfer", "name": "<subagent>", "parent": "<new-parent>" })`.
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -4957,8 +4979,13 @@ fn can_actor_message_agent(
         return Ok(());
     }
     // Recipient is a sub-agent (`recip_parent_id`):
-    // Allowed if sender IS the recipient's direct parent, OR sender shares the exact same parent (`sibling`).
-    if &sender.id == recip_parent_id || sender.parent_id.as_ref() == Some(recip_parent_id) {
+    // Allowed if sender IS the recipient's direct parent, OR recipient IS the sender's direct parent,
+    // OR sender shares the exact same parent (`sibling`), OR both belong to the same Root hierarchy tree.
+    if &sender.id == recip_parent_id
+        || sender.parent_id.as_ref() == Some(&recipient.id)
+        || sender.parent_id.as_ref() == Some(recip_parent_id)
+        || root_ancestor_id(store, &sender) == root_ancestor_id(store, recipient)
+    {
         return Ok(());
     }
     let owner_label = store
