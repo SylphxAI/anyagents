@@ -4405,7 +4405,8 @@ fn enrich_quote_from_store(
                 while let Ok(Some(row)) = rows.next() {
                     if let Ok(body) = row.get::<_, String>(0) {
                         let clean = strip_quoted_block(&body).trim().to_string();
-                        if clean.starts_with(&base_quote_text) && clean.len() > base_quote_text.len()
+                        if clean.starts_with(&base_quote_text)
+                            && clean.len() > base_quote_text.len()
                         {
                             stored_excerpt = Some(clean);
                             break;
@@ -6045,7 +6046,8 @@ mod tests {
             thread_id: None,
             message_id: Some(3255),
         });
-        let ReceiveOutcome::New(first_msg) = store.receive(&sage.id, unquoted_relay).unwrap() else {
+        let ReceiveOutcome::New(first_msg) = store.receive(&sage.id, unquoted_relay).unwrap()
+        else {
             panic!("first relay must be stored");
         };
         assert!(!has_quoted_block(&first_msg.text));
