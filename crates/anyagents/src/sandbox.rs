@@ -661,8 +661,7 @@ pub fn share_worktree_with_seat(path: &Path, gid: u32) {
             || matches!(
                 canon.to_str(),
                 Some(
-                    "/"
-                        | "/workspace-data"
+                    "/" | "/workspace-data"
                         | "/workspace-data/workspace"
                         | "/workspace-data/workspace/.worktrees"
                         | "/workspace-data/build-targets"

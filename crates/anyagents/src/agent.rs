@@ -987,10 +987,8 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         if view.quota_reset_at_ms.is_none()
             && let Ok(agent_rec) = store.agent(&id)
         {
-            let prov = crate::create::upstream_provider_of(
-                &agent_rec.harness,
-                agent_rec.model.as_deref(),
-            );
+            let prov =
+                crate::create::upstream_provider_of(&agent_rec.harness, agent_rec.model.as_deref());
             let prof = crate::create::bound_profile_name(&cfg)
                 .and_then(|b| b.split_once('/').map(|(_, p)| p.to_string()).or(Some(b)))
                 .filter(|s| !s.is_empty())

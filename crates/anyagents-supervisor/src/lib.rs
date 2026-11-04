@@ -478,9 +478,9 @@ fn route<H: Harness + 'static>(inner: Arc<Inner<H>>, events: Receiver<Wake>) {
 fn is_running(store: &Store, id: &AgentId) -> bool {
     let skip_sylphx = store.data_dir().join("admin.sock").exists()
         || store.data_dir().join("admin.lock").exists();
-    store.agent(id).is_ok_and(|agent| {
-        agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx")
-    })
+    store
+        .agent(id)
+        .is_ok_and(|agent| agent.state == "running" && !(skip_sylphx && agent.harness == "sylphx"))
 }
 
 fn stop_slot<H: Harness + 'static>(inner: &Arc<Inner<H>>, id: &AgentId) {

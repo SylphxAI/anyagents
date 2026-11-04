@@ -145,7 +145,8 @@ pub(super) fn execute_bash_with_timeout(
                                 let _ = libc::kill(-pgid, libc::SIGKILL);
                             }
                             if workspace::delegated(env)
-                                && let Ok(mut kcmd) = workspace::command(Path::new("/bin/kill"), env)
+                                && let Ok(mut kcmd) =
+                                    workspace::command(Path::new("/bin/kill"), env)
                             {
                                 let neg_pgid = format!("-{pgid}");
                                 let pos_pgid = pgid.to_string();

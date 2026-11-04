@@ -1032,7 +1032,11 @@ impl AgentMcp {
         match action.as_str() {
             "list" | "ls" => {
                 let mut response: AgentsResponse = self.client.get_agents().await?;
-                let state_trimmed = args.state.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let state_trimmed = args
+                    .state
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
                 match state_trimmed {
                     Some(state_filter) if !state_filter.eq_ignore_ascii_case("all") => {
                         response.agents.retain(|a| {

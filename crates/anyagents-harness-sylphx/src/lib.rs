@@ -713,33 +713,35 @@ fn capture_cloud_turn_execution(
 ) -> Result<Option<Value>, String> {
     let capture_url = format!("{base}/v1/{canonical_env}/agents:capture-credential");
     let expires_at = format_rfc3339_utc_plus_secs(10_800);
-    let capture_one =
-        |purpose: &str, allowed_tools: &[&str], credential: &str| -> Result<Option<String>, String> {
-            let body = json!({
-                "session": sess_path,
-                "turn": turn,
-                "purpose": purpose,
-                "allowed_tools": allowed_tools,
-                "credential": credential,
-                "expires_at": expires_at,
-            });
-            let (st, raw) = curl_post_json(&capture_url, Some(api_key), &body)?;
-            if st == 404 {
-                return Ok(None);
-            }
-            if !(200..300).contains(&st) {
-                return Err(format!(
-                    "cloud capture-credential ({purpose}) HTTP {st}: {}",
-                    raw.trim()
-                ));
-            }
-            let val: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
-            val.get("handle")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(|s| Some(s.to_string()))
-                .ok_or_else(|| format!("cloud capture-credential ({purpose}) missing handle"))
-        };
+    let capture_one = |purpose: &str,
+                       allowed_tools: &[&str],
+                       credential: &str|
+     -> Result<Option<String>, String> {
+        let body = json!({
+            "session": sess_path,
+            "turn": turn,
+            "purpose": purpose,
+            "allowed_tools": allowed_tools,
+            "credential": credential,
+            "expires_at": expires_at,
+        });
+        let (st, raw) = curl_post_json(&capture_url, Some(api_key), &body)?;
+        if st == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&st) {
+            return Err(format!(
+                "cloud capture-credential ({purpose}) HTTP {st}: {}",
+                raw.trim()
+            ));
+        }
+        let val: Value = serde_json::from_str(&raw).map_err(|e| e.to_string())?;
+        val.get("handle")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(|s| Some(s.to_string()))
+            .ok_or_else(|| format!("cloud capture-credential ({purpose}) missing handle"))
+    };
 
     let Some(runtime_handle) = capture_one("runtime", &["runtime_api"], api_key)? else {
         return Ok(None);
@@ -753,13 +755,8 @@ fn capture_cloud_turn_execution(
         json!({ "handle": inference_handle }),
     );
     if let Some(tok) = repo_token.filter(|s| !s.trim().is_empty()) {
-        if has_repo
-            && let Some(repo_handle) = capture_one("execution", &["repository"], tok)?
-        {
-            credentials.insert(
-                "repository".to_string(),
-                json!({ "handle": repo_handle }),
-            );
+        if has_repo && let Some(repo_handle) = capture_one("execution", &["repository"], tok)? {
+            credentials.insert("repository".to_string(), json!({ "handle": repo_handle }));
         }
         if let Ok(Some(gh_handle)) = capture_one("execution", &["sandbox", "GH_TOKEN"], tok) {
             credentials.insert("GH_TOKEN".to_string(), json!({ "handle": gh_handle }));
@@ -777,10 +774,7 @@ fn capture_cloud_turn_execution(
     if let Some(kc) = kubeconfig_b64.filter(|s| !s.trim().is_empty())
         && let Ok(Some(kc_handle)) = capture_one("execution", &["sandbox", "KUBECONFIG_B64"], kc)
     {
-        credentials.insert(
-            "KUBECONFIG_B64".to_string(),
-            json!({ "handle": kc_handle }),
-        );
+        credentials.insert("KUBECONFIG_B64".to_string(), json!({ "handle": kc_handle }));
     }
     Ok(Some(json!({
         "turn": turn,
@@ -892,7 +886,8 @@ pub(crate) fn run_cloud_session_turn(
     let api_key = resolve_sylphx_cloud_access_key(config_dir, env).ok_or_else(|| {
         "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
     })?;
-    let gateway_key = resolve_sylphx_gateway_key(config_dir, env).unwrap_or_else(|| api_key.clone());
+    let gateway_key =
+        resolve_sylphx_gateway_key(config_dir, env).unwrap_or_else(|| api_key.clone());
     let repo_token = resolve_github_token(env);
     let kubeconfig_b64 = resolve_kubeconfig_b64(env);
     let base = resolve_cloud_api_url(env);
@@ -3877,9 +3872,11 @@ fn normalize_mcp_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
     if let Some(secs) = obj.get("seconds").and_then(Value::as_u64) {
         let dur_str = format!("{}s", secs.max(1));
         if kind == "every" || kind == "interval" {
-            obj.entry("every".to_string()).or_insert_with(|| json!(dur_str));
+            obj.entry("every".to_string())
+                .or_insert_with(|| json!(dur_str));
         } else {
-            obj.entry("at".to_string()).or_insert_with(|| json!(dur_str));
+            obj.entry("at".to_string())
+                .or_insert_with(|| json!(dur_str));
         }
     }
     if !obj.contains_key("watch")

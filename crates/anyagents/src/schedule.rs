@@ -544,9 +544,7 @@ fn initial_watch_baseline(
                 Some("pending".to_string())
             }
         }
-        WatchTarget::GitHubCheck { .. } => {
-            Some("pending".to_string())
-        }
+        WatchTarget::GitHubCheck { .. } => Some("pending".to_string()),
         WatchTarget::ProcessExit { pid } => Some(
             if probe_process_alive(*pid) {
                 "running"

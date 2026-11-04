@@ -242,11 +242,7 @@ fn resolve_chat_title_and_type(
 /// Proactively reconcile `channel`'s group chat bindings (`chat_id < 0`) and
 /// missing chat titles against Telegram's authoritative `getChatMember` and `getChat`.
 /// Runs in both webhook mode and long-polling mode.
-pub fn reconcile_channel_groups(
-    store: &Store,
-    secrets: &FileCredentialStore,
-    channel: &Channel,
-) {
+pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, channel: &Channel) {
     if std::env::var_os("ANYAGENTS_TELEGRAM_API").is_some()
         || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
         || channel.kind != "telegram"
@@ -304,9 +300,7 @@ pub fn reconcile_channel_groups(
             let ch_mem = Memory::from_state(&ch.state);
             for link in ch_mem.chats {
                 if link.chat_id < 0 {
-                    let entry = candidate_groups
-                        .entry(link.chat_id)
-                        .or_insert((None, None));
+                    let entry = candidate_groups.entry(link.chat_id).or_insert((None, None));
                     if entry.0.is_none() && link.chat_type.is_some() {
                         entry.0 = link.chat_type;
                     }
@@ -331,13 +325,14 @@ pub fn reconcile_channel_groups(
         match cached_probe_member_status(&token, gid, &bot_tag) {
             Some(true) => {
                 if !already_attached {
-                    let fallback_type = known_type.as_deref().unwrap_or(
-                        if gid.to_string().starts_with("-100") {
-                            "supergroup"
-                        } else {
-                            "group"
-                        },
-                    );
+                    let fallback_type =
+                        known_type
+                            .as_deref()
+                            .unwrap_or(if gid.to_string().starts_with("-100") {
+                                "supergroup"
+                            } else {
+                                "group"
+                            });
                     memory.attach_typed_titled(
                         agent_id.as_str(),
                         gid,
@@ -2290,7 +2285,13 @@ pub fn chat_member_status(token: &str, chat_id: i64, user_id: i64) -> Option<boo
                 .unwrap_or(true),
         ),
         Some("left" | "kicked") => Some(false),
-        _ => if is_mock_test { Some(false) } else { None },
+        _ => {
+            if is_mock_test {
+                Some(false)
+            } else {
+                None
+            }
+        }
     }
 }
 

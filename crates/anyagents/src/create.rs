@@ -160,18 +160,26 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             && !explicit_local_sandbox
             && !crate::sandbox::is_isolated_test_env()
             && !cfg!(test)
-            && !pairs.iter().any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
+            && !pairs
+                .iter()
+                .any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
         {
-            pairs.push(("SYLPHX_WORKSPACE_PLACEMENTS".to_string(), "cloud".to_string()));
-        } else if agent.harness == "sylphx"
-            && !is_cloud_sandbox_mode
-            && !explicit_local_sandbox
-        {
+            pairs.push((
+                "SYLPHX_WORKSPACE_PLACEMENTS".to_string(),
+                "cloud".to_string(),
+            ));
+        } else if agent.harness == "sylphx" && !is_cloud_sandbox_mode && !explicit_local_sandbox {
             if !pairs.iter().any(|(k, _)| k == "SYLPHX_SANDBOX") {
                 pairs.push(("SYLPHX_SANDBOX".to_string(), "local".to_string()));
             }
-            if !pairs.iter().any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS") {
-                pairs.push(("SYLPHX_WORKSPACE_PLACEMENTS".to_string(), "local".to_string()));
+            if !pairs
+                .iter()
+                .any(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
+            {
+                pairs.push((
+                    "SYLPHX_WORKSPACE_PLACEMENTS".to_string(),
+                    "local".to_string(),
+                ));
             }
         }
         let workdir_created =
@@ -4399,8 +4407,7 @@ fn rebalance_provider_profiles(
                     let dst_len = bound.get(dst_prof).map(|v| v.len() as i64).unwrap_or(0);
                     let new_dst_share = (dst_pct * 100) / (dst_len + 1);
                     let gain = new_dst_share - src_share;
-                    let should_move =
-                        (dst_len == 0 && dst_pct >= 50 && gain > 0) || gain >= 1500;
+                    let should_move = (dst_len == 0 && dst_pct >= 50 && gain > 0) || gain >= 1500;
                     if should_move
                         && best_move
                             .as_ref()
@@ -6910,10 +6917,7 @@ pub(crate) fn try_rotate_exhausted_profile(
                 .get("quota_reset_at_ms")
                 .and_then(serde_json::Value::as_i64)
                 .unwrap_or(0);
-            cleared_ms > 0
-                && ts > cleared_ms
-                && q > now_ms
-                && now_ms.saturating_sub(ts) < 900_000
+            cleared_ms > 0 && ts > cleared_ms && q > now_ms && now_ms.saturating_sub(ts) < 900_000
         });
     let cur_pct = if post_clear_error {
         Some(0)
@@ -6965,10 +6969,9 @@ pub(crate) fn try_rotate_exhausted_profile(
             {
                 let cnt = bound_counts.get(&cand_prof).copied().unwrap_or(0);
                 let score = (rem_pct * 100) / (cnt + 1);
-                if best
-                    .as_ref()
-                    .is_none_or(|(_, best_score, best_rem)| (score, rem_pct) > (*best_score, *best_rem))
-                {
+                if best.as_ref().is_none_or(|(_, best_score, best_rem)| {
+                    (score, rem_pct) > (*best_score, *best_rem)
+                }) {
                     best = Some((cand_prof, score, rem_pct));
                 }
             }

@@ -1245,7 +1245,9 @@ fn format_quota_window_cell(seg: &str, period_tag: Option<&str>) -> String {
             green(&pct_badge)
         };
         let styled_after = style_usage_suffix(after_left, pct <= 0);
-        let suffix = period_tag.map(|t| dim(&format!(" ({t})"))).unwrap_or_default();
+        let suffix = period_tag
+            .map(|t| dim(&format!(" ({t})")))
+            .unwrap_or_default();
         return format!("{styled_pct}{styled_after}{suffix}");
     }
     green(seg)

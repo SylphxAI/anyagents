@@ -843,12 +843,11 @@ pub(super) fn curl_post_json(
                 if attempt < max_retries && is_transient_gateway_failure(code, &text) {
                     let exp_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(4));
                     let retry_after_ms = parse_retry_after_ms(&text).unwrap_or(0);
-                    let jitter_ms =
-                        if base_backoff_ms >= 500 {
-                            (jitter_seed.wrapping_add(attempt as u64 * 313)) % 750
-                        } else {
-                            0
-                        };
+                    let jitter_ms = if base_backoff_ms >= 500 {
+                        (jitter_seed.wrapping_add(attempt as u64 * 313)) % 750
+                    } else {
+                        0
+                    };
                     let delay_ms = exp_ms.max(retry_after_ms).saturating_add(jitter_ms);
                     std::thread::sleep(Duration::from_millis(delay_ms));
                     attempt += 1;

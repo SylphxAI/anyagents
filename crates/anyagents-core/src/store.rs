@@ -1473,11 +1473,8 @@ impl Store {
                         .map(str::to_string)
                 })
         });
-        let participants = resolve_conversation_participants(
-            &tx,
-            chat_id_val,
-            resolved_destination.as_deref(),
-        );
+        let participants =
+            resolve_conversation_participants(&tx, chat_id_val, resolved_destination.as_deref());
         // The trusted header is built from the record that arrives, before any
         // field is moved into the row: the author, the channel, the chat and
         // topic, and the reply a bare answer reaches.
@@ -1537,8 +1534,7 @@ impl Store {
                 serde_json::to_string(&message.context).ok(),
             ],
         )?;
-        let is_passive_reaction =
-            message.context.event.as_deref() == Some("reaction_passive");
+        let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
         let woke_idle = if is_passive_reaction {
             false
         } else {
@@ -3324,7 +3320,8 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
     if !db_path.is_file() {
         return Vec::new();
     }
-    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
     let Ok(conn) = Connection::open_with_flags(&db_path, flags) else {
         return Vec::new();
     };
@@ -4149,8 +4146,8 @@ fn message_by_origin(
             .is_some_and(|k| k.starts_with("tg-in:") || k.starts_with("room:"));
         let incoming_is_meta_event = incoming_body.starts_with("[Reaction ")
             || incoming_body.starts_with("[Deleted message #");
-        let stored_is_meta_event = msg.text.starts_with("[Reaction ")
-            || msg.text.starts_with("[Deleted message #");
+        let stored_is_meta_event =
+            msg.text.starts_with("[Reaction ") || msg.text.starts_with("[Deleted message #");
         if origin.message_id == Some(message_id)
             && (!is_basic_group || (!in_is_relay && !stored_is_relay))
         {
@@ -4352,18 +4349,17 @@ fn chat_attached_agent_count(conn: &Connection, chat_id: i64) -> usize {
             let Some(chats) = val.get("chats").and_then(serde_json::Value::as_array) else {
                 continue;
             };
-            if chats
-                .iter()
-                .any(|link| link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(chat_id))
-            {
+            if chats.iter().any(|link| {
+                link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(chat_id)
+            }) {
                 distinct_agents.insert(aid);
             }
         }
     }
     let pattern = format!("%\"chat_id\":{chat_id}%");
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT DISTINCT agent_id FROM messages WHERE origin LIKE ?1 LIMIT 16",
-    ) && let Ok(mut rows) = stmt.query([pattern])
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT DISTINCT agent_id FROM messages WHERE origin LIKE ?1 LIMIT 16")
+        && let Ok(mut rows) = stmt.query([pattern])
     {
         while let Ok(Some(row)) = rows.next() {
             if let Ok(aid) = row.get::<_, String>(0) {
@@ -4403,10 +4399,9 @@ fn resolve_conversation_participants(
                 let Some(chats) = val.get("chats").and_then(serde_json::Value::as_array) else {
                     continue;
                 };
-                if chats
-                    .iter()
-                    .any(|link| link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(cid))
-                {
+                if chats.iter().any(|link| {
+                    link.get("chat_id").and_then(serde_json::Value::as_i64) == Some(cid)
+                }) {
                     agent_ids.insert(aid);
                 }
             }
@@ -4423,9 +4418,9 @@ fn resolve_conversation_participants(
                     }
                 }
             }
-        } else if let Ok(mut stmt) = conn.prepare(
-            "SELECT agent_id FROM group_members WHERE group_name = ?1",
-        ) && let Ok(mut rows) = stmt.query([group_name])
+        } else if let Ok(mut stmt) =
+            conn.prepare("SELECT agent_id FROM group_members WHERE group_name = ?1")
+            && let Ok(mut rows) = stmt.query([group_name])
         {
             while let Ok(Some(row)) = rows.next() {
                 if let Ok(aid) = row.get::<_, String>(0) {
@@ -4442,7 +4437,13 @@ fn resolve_conversation_participants(
         if let Ok((name, role, state)) = conn.query_row(
             "SELECT name, role, state FROM agents WHERE id = ?1",
             [&aid],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, String>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         ) {
             if state == "archived" {
                 continue;

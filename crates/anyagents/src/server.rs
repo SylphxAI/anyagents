@@ -896,8 +896,10 @@ pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &A
                     }
                     let c_cfg = anyagents_core::agent_config_dir(data_dir, &child.id);
                     let _ = std::fs::create_dir_all(&c_cfg);
-                    let _ =
-                        std::fs::write(c_cfg.join(".anyagents-archived"), format!("{}\n", now_ms()));
+                    let _ = std::fs::write(
+                        c_cfg.join(".anyagents-archived"),
+                        format!("{}\n", now_ms()),
+                    );
                     reap_subagent_ephemeral_dirs(data_dir, &child.id);
                 }
             }
@@ -1003,8 +1005,8 @@ fn reconcile_stopped_and_backed_off_agents(
                     .get(agent.id.as_str())
                     .copied()
                     .unwrap_or(delivered);
-                let has_new_mail = max_seq > delivered
-                    && (agent.state == "created" || max_seq > prev_wm);
+                let has_new_mail =
+                    max_seq > delivered && (agent.state == "created" || max_seq > prev_wm);
                 if has_new_mail {
                     let check_from = if agent.state == "created" {
                         delivered
@@ -2439,7 +2441,10 @@ async fn get_description_route(
             Principal::Agent { agent_id, .. } => {
                 *agent_id == rec.id
                     || rec.parent_id.as_ref() == Some(agent_id)
-                    || state.store.agent(agent_id).is_ok_and(|caller| caller.is_admin)
+                    || state
+                        .store
+                        .agent(agent_id)
+                        .is_ok_and(|caller| caller.is_admin)
             }
         };
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
@@ -2576,7 +2581,9 @@ async fn set_description_route(
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         create::sync_agent_description_files(&state.store, &rec, &cfg);
-        if rec.parent_id.is_none() && (body.description.is_some() || body.role.is_some() || body.clear.unwrap_or(false)) {
+        if rec.parent_id.is_none()
+            && (body.description.is_some() || body.role.is_some() || body.clear.unwrap_or(false))
+        {
             create::sync_all_agent_instructions(&state.store, state.store.data_dir());
         }
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
@@ -3302,10 +3309,7 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     create::ensure_seat_environment(&config_dir);
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Ok(store) = Store::open(data_dir.join("state.db")) {
-        let parent_id = store
-            .agent(agent_id)
-            .ok()
-            .and_then(|a| a.parent_id);
+        let parent_id = store.agent(agent_id).ok().and_then(|a| a.parent_id);
         if parent_id.is_some()
             && let Ok(agent) = store.agent(agent_id)
         {
@@ -3342,8 +3346,8 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         .map(PathBuf::from)
         .map(|p| std::path::absolute(&p).unwrap_or(p));
 
-    let work_dir = std::path::absolute(agent_root.join("work"))
-        .unwrap_or_else(|_| agent_root.join("work"));
+    let work_dir =
+        std::path::absolute(agent_root.join("work")).unwrap_or_else(|_| agent_root.join("work"));
     // Never reap an external `explicit-worktree` (`wt_path != &work_dir`) such as `/scratch/wt/...`
     // that a parent or operator created and lent to a child agent. Only reap the agent's own
     // ephemeral `agent_root/work` directory when not shared with another agent.
