@@ -575,6 +575,7 @@ pub(super) fn clear_cloud_sandbox_fallback(config_dir: &Path) {
     let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-fallback.json"));
 }
 
+#[allow(dead_code)]
 pub(super) fn is_cloud_sandbox_in_fallback_cooldown(config_dir: &Path) -> bool {
     let fallback_path = config_dir.join("sylphx-sandbox-fallback.json");
     let Ok(raw) = std::fs::read_to_string(&fallback_path) else {

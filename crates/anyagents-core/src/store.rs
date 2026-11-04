@@ -3331,35 +3331,35 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
          WHERE parent_id IS NULL AND state = 'running'
          ORDER BY name ASC";
     let mut roster = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(query_with_desc) {
-        if let Ok(rows) = stmt.query_map([], |row| {
+    if let Ok(mut stmt) = conn.prepare(query_with_desc)
+        && let Ok(rows) = stmt.query_map([], |row| {
             let name: String = row.get(0)?;
             let role: Option<String> = row.get(1)?;
             let description: Option<String> = row.get(2)?;
             let instructions: Option<String> = row.get(3)?;
             Ok((name, role, description, instructions))
-        }) {
-            for item in rows.flatten() {
-                let (name, role, description, instructions) = item;
-                let dummy = Agent {
-                    id: AgentId::generate(),
-                    name: name.clone(),
-                    role: role.clone(),
-                    parent_id: None,
-                    harness: String::new(),
-                    model: None,
-                    workdir: None,
-                    description,
-                    instructions,
-                    is_admin: false,
-                    state: "running".to_string(),
-                    created_at_ms: 0,
-                    launch_env: Vec::new(),
-                };
-                roster.push((name, role, dummy.public_description()));
-            }
-            return roster;
+        })
+    {
+        for item in rows.flatten() {
+            let (name, role, description, instructions) = item;
+            let dummy = Agent {
+                id: AgentId::generate(),
+                name: name.clone(),
+                role: role.clone(),
+                parent_id: None,
+                harness: String::new(),
+                model: None,
+                workdir: None,
+                description,
+                instructions,
+                is_admin: false,
+                state: "running".to_string(),
+                created_at_ms: 0,
+                launch_env: Vec::new(),
+            };
+            roster.push((name, role, dummy.public_description()));
         }
+        return roster;
     }
     if let Ok(mut stmt) = conn.prepare(
         "SELECT name, role, instructions
