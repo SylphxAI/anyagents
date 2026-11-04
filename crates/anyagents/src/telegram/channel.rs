@@ -711,6 +711,30 @@ fn ingest_updates(
                     inbound.text.push_str(&downloaded.join("\n"));
                 }
             }
+            if !inbound.quoted_media.is_empty() {
+                let downloaded = download_inbound_media(
+                    store.data_dir(),
+                    token,
+                    &channel.id,
+                    &inbound.quoted_media,
+                );
+                if !downloaded.is_empty()
+                    && let Some(ref mut quote) = inbound.quote
+                {
+                    if !quote.text.is_empty() {
+                        quote.text.push('\n');
+                    }
+                    quote.text.push_str(&downloaded.join("\n"));
+                }
+            }
+            // In multi-bot Telegram groups, only the bot whose message was replied to
+            // receives `reply_to_message` (`inbound.quote.is_some()`), while peer bots
+            // receive the same human message within ~50–100ms with `quote = None`.
+            // Coalesce unquoted live group messages briefly so the bot carrying the
+            // quote delivers and relays the full quoted context first.
+            if is_group && is_live && inbound.quote.is_none() && !inbound.text.starts_with('[') {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            }
         }
         // The bot was added to, or removed from, a chat.
         if let Routed::Membership {
