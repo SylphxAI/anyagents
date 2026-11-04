@@ -658,6 +658,7 @@ pub fn share_worktree_with_seat(path: &Path, gid: u32) {
             .filter(|c| matches!(c, std::path::Component::Normal(_)))
             .count();
         if normal_depth < 3
+            || host_home_dir().is_some_and(|h| canon == h || canon == h.join("workspace"))
             || matches!(
                 canon.to_str(),
                 Some(
@@ -666,13 +667,9 @@ pub fn share_worktree_with_seat(path: &Path, gid: u32) {
                         | "/workspace-data/workspace/.worktrees"
                         | "/workspace-data/build-targets"
                         | "/scratch"
-                        | "/scratch/coordinator"
-                        | "/scratch/coordinator/anyagents-data"
                         | "/scratch/wt"
                         | "/scratch/wt/owners-main"
                         | "/home"
-                        | "/home/kyle"
-                        | "/home/kyle/workspace"
                 )
             )
             || canon.starts_with("/workspace-data/build-targets")

@@ -172,15 +172,17 @@ fn save_channel_memory_merged(
     store.set_channel_state(channel_id, &memory.to_state())
 }
 
-const KNOWN_SEED_GROUP_IDS: &[i64] = &[
-    -5460290765,
-    -5290931492,
-    -5382267958,
-    -5597546327,
-    -5593833365,
-    -1004454035247,
-    -1003544170260,
-];
+fn seed_group_ids_from_env() -> Vec<i64> {
+    std::env::var("ANYAGENTS_TELEGRAM_SEED_GROUPS")
+        .ok()
+        .map(|raw| {
+            raw.split(',')
+                .filter_map(|s| s.trim().parse::<i64>().ok())
+                .filter(|&id| id < 0)
+                .collect()
+        })
+        .unwrap_or_default()
+}
 
 fn resolve_chat_title_and_type(
     token: &str,
@@ -284,7 +286,7 @@ pub fn reconcile_channel_groups(store: &Store, secrets: &FileCredentialStore, ch
 
     let mut candidate_groups: std::collections::BTreeMap<i64, (Option<String>, Option<String>)> =
         std::collections::BTreeMap::new();
-    for &gid in KNOWN_SEED_GROUP_IDS {
+    for gid in seed_group_ids_from_env() {
         let default_kind = if gid.to_string().starts_with("-100") {
             "supergroup"
         } else {
