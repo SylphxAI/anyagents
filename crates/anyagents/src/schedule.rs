@@ -467,7 +467,7 @@ pub fn create_agent_schedule(
         }
     } else if let Some(watch_str) = watch_opt {
         let parsed = parse_watch_spec(watch_str)?;
-        let baseline = initial_watch_baseline(store, health, &parsed, now);
+        let baseline = initial_watch_baseline(store, health, &parsed, agent.id.as_str(), now);
         NewSchedule {
             agent_id: agent.id.clone(),
             kind: "watch".to_string(),
@@ -514,6 +514,7 @@ fn initial_watch_baseline(
     store: &Store,
     health: &HealthBoard,
     target: &WatchTarget,
+    agent_id: &str,
     now: i64,
 ) -> Option<String> {
     match target {
@@ -536,10 +537,11 @@ fn initial_watch_baseline(
         } => {
             if std::env::var_os("ANYAGENTS_GITHUB_API_BASE").is_none()
                 && let Some((_, state_desc)) =
-                    probe_github_pr_terminal(owner, repo, *number, "schedule-init", now)
-                && state_desc == "checks_completed"
+                    probe_github_pr_terminal(owner, repo, *number, agent_id, now)
+                && state_desc != "merged"
+                && state_desc != "closed"
             {
-                Some("checks_completed".to_string())
+                Some(state_desc)
             } else {
                 Some("pending".to_string())
             }
@@ -762,7 +764,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                     .claim_schedule_tick(
                         &sched.id,
                         None,
-                        "fired",
+                        eval.next_state,
                         None,
                         Some(now),
                         eval.baseline.as_deref(),
@@ -770,11 +772,20 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                     )
                     .unwrap_or(false)
                 {
-                    deliver_scheduled_wake(
+                    let (wake_prompt, source_key) = if let Some(ref tr) = eval.transition {
+                        (
+                            format!("[watch: {} transition={tr}]\n{}", sched.spec, sched.prompt),
+                            format!("schedule:{}:watch:{tr}:{now}", sched.id),
+                        )
+                    } else {
+                        (sched.prompt.clone(), format!("schedule:{}:watch", sched.id))
+                    };
+                    deliver_scheduled_wake_with_prompt(
                         store,
                         &agent,
                         &sched,
-                        &format!("schedule:{}:watch", sched.id),
+                        &wake_prompt,
+                        &source_key,
                         now,
                     );
                     fired_count += 1;
@@ -793,6 +804,17 @@ fn deliver_scheduled_wake(
     source_key: &str,
     now: i64,
 ) {
+    deliver_scheduled_wake_with_prompt(store, agent, sched, &sched.prompt, source_key, now);
+}
+
+fn deliver_scheduled_wake_with_prompt(
+    store: &Store,
+    agent: &Agent,
+    sched: &AgentSchedule,
+    prompt_text: &str,
+    source_key: &str,
+    now: i64,
+) {
     if agent.state == "paused"
         || agent.state == "archived"
         || crate::server::is_explicitly_archived(store.data_dir(), agent)
@@ -805,7 +827,7 @@ fn deliver_scheduled_wake(
     let _ = store.receive(
         &agent.id,
         Incoming {
-            text: sched.prompt.clone(),
+            text: prompt_text.to_string(),
             sender: Some(format!("schedule:{}", sched.id)),
             source_time_ms: Some(now),
             source_key: Some(source_key.to_string()),
@@ -821,8 +843,32 @@ fn deliver_scheduled_wake(
 
 struct WatchEval {
     triggered: bool,
+    next_state: &'static str,
+    transition: Option<String>,
     observed: Option<String>,
     baseline: Option<String>,
+}
+
+impl WatchEval {
+    fn pending(baseline: Option<String>, observed: Option<String>) -> Self {
+        Self {
+            triggered: false,
+            next_state: "active",
+            transition: None,
+            observed,
+            baseline,
+        }
+    }
+
+    fn fired(baseline: Option<String>, observed: Option<String>) -> Self {
+        Self {
+            triggered: true,
+            next_state: "fired",
+            transition: None,
+            observed,
+            baseline,
+        }
+    }
 }
 
 fn evaluate_watch(
@@ -832,72 +878,42 @@ fn evaluate_watch(
     now: i64,
 ) -> WatchEval {
     let Ok(target) = parse_watch_spec(&sched.spec) else {
-        return WatchEval {
-            triggered: false,
-            observed: Some("invalid_spec".to_string()),
-            baseline: sched.watch_baseline.clone(),
-        };
+        return WatchEval::pending(
+            sched.watch_baseline.clone(),
+            Some("invalid_spec".to_string()),
+        );
     };
     match target {
         WatchTarget::AgentIdle { target } => {
             let Ok(found) = store.agent_by_name(&target) else {
-                return WatchEval {
-                    triggered: false,
-                    observed: Some("not_found".to_string()),
-                    baseline: sched.watch_baseline.clone(),
-                };
+                return WatchEval::pending(
+                    sched.watch_baseline.clone(),
+                    Some("not_found".to_string()),
+                );
             };
             if is_agent_busy(store, health, &found, now) {
-                WatchEval {
-                    triggered: false,
-                    observed: Some("working".to_string()),
-                    baseline: Some("working".to_string()),
-                }
+                WatchEval::pending(Some("working".to_string()), Some("working".to_string()))
             } else {
-                WatchEval {
-                    triggered: true,
-                    observed: Some("idle".to_string()),
-                    baseline: sched.watch_baseline.clone(),
-                }
+                WatchEval::fired(sched.watch_baseline.clone(), Some("idle".to_string()))
             }
         }
         WatchTarget::SpironPromise { id, kind } => {
             let Some(current) = probe_spiron_state(&id, &kind) else {
-                return WatchEval {
-                    triggered: false,
-                    observed: None,
-                    baseline: sched.watch_baseline.clone(),
-                };
+                return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
             match &sched.watch_baseline {
                 Some(base) => {
                     if &current != base {
-                        WatchEval {
-                            triggered: true,
-                            observed: Some(format!("{base}->{current}")),
-                            baseline: Some(base.clone()),
-                        }
+                        WatchEval::fired(Some(base.clone()), Some(format!("{base}->{current}")))
                     } else {
-                        WatchEval {
-                            triggered: false,
-                            observed: Some(current),
-                            baseline: Some(base.clone()),
-                        }
+                        WatchEval::pending(Some(base.clone()), Some(current))
                     }
                 }
                 None => {
                     if is_spiron_terminal(&current) {
-                        WatchEval {
-                            triggered: true,
-                            observed: Some(current.clone()),
-                            baseline: Some(current),
-                        }
+                        WatchEval::fired(Some(current.clone()), Some(current))
                     } else {
-                        WatchEval {
-                            triggered: false,
-                            observed: Some(current.clone()),
-                            baseline: Some(current),
-                        }
+                        WatchEval::pending(Some(current.clone()), Some(current))
                     }
                 }
             }
@@ -907,34 +923,40 @@ fn evaluate_watch(
             repo,
             number,
         } => {
-            let Some((is_terminal, state_desc)) =
+            let Some((_, state_desc)) =
                 probe_github_pr_terminal(&owner, &repo, number, sched.agent_id.as_str(), now)
             else {
-                return WatchEval {
-                    triggered: false,
-                    observed: None,
-                    baseline: sched.watch_baseline.clone(),
-                };
+                return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
-            if state_desc == "checks_completed"
-                && sched.watch_baseline.as_deref() == Some("checks_completed")
-            {
+            let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
+            if state_desc == "merged" || state_desc == "closed" {
                 return WatchEval {
-                    triggered: false,
-                    observed: Some(state_desc),
+                    triggered: true,
+                    next_state: "fired",
+                    transition: Some(state_desc.clone()),
+                    observed: Some(state_desc.clone()),
+                    baseline: Some(state_desc),
+                };
+            }
+            if prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
+                return WatchEval {
+                    triggered: true,
+                    next_state: "active",
+                    transition: Some("evicted".to_string()),
+                    observed: Some(format!("evicted:{state_desc}")),
+                    baseline: Some(state_desc),
+                };
+            }
+            if state_desc == "checks_completed" && prev != "checks_completed" {
+                return WatchEval {
+                    triggered: true,
+                    next_state: "active",
+                    transition: Some("checks_completed".to_string()),
+                    observed: Some("checks_completed".to_string()),
                     baseline: Some("checks_completed".to_string()),
                 };
             }
-            let next_baseline = if !is_terminal {
-                Some(state_desc.clone())
-            } else {
-                sched.watch_baseline.clone()
-            };
-            WatchEval {
-                triggered: is_terminal,
-                observed: Some(state_desc),
-                baseline: next_baseline,
-            }
+            WatchEval::pending(Some(state_desc.clone()), Some(state_desc))
         }
         WatchTarget::GitHubCheck {
             owner,
@@ -948,31 +970,19 @@ fn evaluate_watch(
                 sched.agent_id.as_str(),
                 now,
             ) else {
-                return WatchEval {
-                    triggered: false,
-                    observed: None,
-                    baseline: sched.watch_baseline.clone(),
-                };
+                return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
-            WatchEval {
-                triggered: is_terminal,
-                observed: Some(state_desc),
-                baseline: sched.watch_baseline.clone(),
+            if is_terminal {
+                WatchEval::fired(sched.watch_baseline.clone(), Some(state_desc))
+            } else {
+                WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc))
             }
         }
         WatchTarget::ProcessExit { pid } => {
             if probe_process_alive(pid) {
-                WatchEval {
-                    triggered: false,
-                    observed: Some("running".to_string()),
-                    baseline: Some("running".to_string()),
-                }
+                WatchEval::pending(Some("running".to_string()), Some("running".to_string()))
             } else {
-                WatchEval {
-                    triggered: true,
-                    observed: Some("exited".to_string()),
-                    baseline: sched.watch_baseline.clone(),
-                }
+                WatchEval::fired(sched.watch_baseline.clone(), Some("exited".to_string()))
             }
         }
         WatchTarget::PathChanged { path } => {
@@ -980,32 +990,16 @@ fn evaluate_watch(
             match &sched.watch_baseline {
                 Some(base) => {
                     if &current != base {
-                        WatchEval {
-                            triggered: true,
-                            observed: Some(format!("{base}->{current}")),
-                            baseline: Some(base.clone()),
-                        }
+                        WatchEval::fired(Some(base.clone()), Some(format!("{base}->{current}")))
                     } else {
-                        WatchEval {
-                            triggered: false,
-                            observed: Some(current),
-                            baseline: Some(base.clone()),
-                        }
+                        WatchEval::pending(Some(base.clone()), Some(current))
                     }
                 }
                 None => {
                     if current != "missing" {
-                        WatchEval {
-                            triggered: true,
-                            observed: Some(current.clone()),
-                            baseline: Some(current),
-                        }
+                        WatchEval::fired(Some(current.clone()), Some(current))
                     } else {
-                        WatchEval {
-                            triggered: false,
-                            observed: Some(current.clone()),
-                            baseline: Some(current),
-                        }
+                        WatchEval::pending(Some(current.clone()), Some(current))
                     }
                 }
             }
@@ -1593,5 +1587,164 @@ mod tests {
         );
         assert_eq!(tick_schedules_once(&store, &health, fourth_due + 1_000), 0);
         assert_eq!(store.inbox(&owner.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn github_pr_watch_stays_active_across_checks_and_eviction_until_merged() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = Arc::new(Mutex::new(
+            r#"{"state":"OPEN","merged":false,"statusCheckRollup":[{"status":"IN_PROGRESS"}]}"#
+                .to_string(),
+        ));
+        let server_payload = Arc::clone(&payload);
+        let server = std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = server_payload.lock().unwrap().clone();
+                if body == "STOP" {
+                    break;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        // Point GitHub PR probes at our local mock server.
+        // SAFETY: serialized within this test process for ANYAGENTS_GITHUB_API_BASE.
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("owner-pr-watch", "codex"))
+            .unwrap();
+        store.set_agent_running(&owner.id, "/work").unwrap();
+
+        let sched = create_agent_schedule(
+            &store,
+            &health,
+            &owner,
+            None,
+            None,
+            Some("github:pr:Cubeage/hk-mahjong-tycoon#452"),
+            "verify PR 452",
+        )
+        .unwrap();
+
+        let now = anyagents_core::now_ms();
+        // 1. Checks in progress -> no wake, baseline recorded as checks_in_progress, watch stays active.
+        assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(
+            active[0].watch_baseline.as_deref(),
+            Some("checks_in_progress")
+        );
+
+        // 2. Checks complete while PR is still OPEN -> wakes once with transition=checks_completed,
+        // and the watch STAYS active (not consumed as `fired`)!
+        *payload.lock().unwrap() =
+            r#"{"state":"OPEN","merged":false,"statusCheckRollup":[{"status":"COMPLETED","state":"SUCCESS"}]}"#
+                .to_string();
+        assert_eq!(tick_schedules_once(&store, &health, now + 1_000), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert!(
+            inbox[0]
+                .text
+                .starts_with("[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=checks_completed]\nverify PR 452"),
+            "unexpected wake text: {}",
+            inbox[0].text
+        );
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(
+            active.len(),
+            1,
+            "PR watch must stay active after checks_completed"
+        );
+        assert_eq!(
+            active[0].watch_baseline.as_deref(),
+            Some("checks_completed")
+        );
+        store.note_delivered(&owner.id, inbox[0].seq).unwrap();
+        store.note_turn_completed(&owner.id).unwrap();
+
+        // Repeated checks_completed poll does NOT re-fire.
+        assert_eq!(tick_schedules_once(&store, &health, now + 2_000), 0);
+
+        // 3. PR enters the merge queue -> baseline updates to merge_queue:queued without waking.
+        *payload.lock().unwrap() =
+            r#"{"state":"OPEN","merged":false,"mergeQueueEntry":{"state":"QUEUED"},"statusCheckRollup":[{"status":"COMPLETED","state":"SUCCESS"}]}"#
+                .to_string();
+        assert_eq!(tick_schedules_once(&store, &health, now + 3_000), 0);
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(
+            active[0].watch_baseline.as_deref(),
+            Some("merge_queue:queued")
+        );
+
+        // 4. PR is evicted from the merge queue back to OPEN with completed checks ->
+        // wakes once with transition=evicted and STILL stays active!
+        *payload.lock().unwrap() =
+            r#"{"state":"OPEN","merged":false,"mergeQueueEntry":null,"statusCheckRollup":[{"status":"COMPLETED","state":"SUCCESS"}]}"#
+                .to_string();
+        assert_eq!(tick_schedules_once(&store, &health, now + 4_000), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 2);
+        assert!(
+            inbox[1].text.starts_with(
+                "[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=evicted]\nverify PR 452"
+            ),
+            "unexpected eviction wake text: {}",
+            inbox[1].text
+        );
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(active.len(), 1, "PR watch must stay active after eviction");
+        store.note_delivered(&owner.id, inbox[1].seq).unwrap();
+        store.note_turn_completed(&owner.id).unwrap();
+
+        // 5. PR merges -> wakes with transition=merged and transitions schedule state to `fired`.
+        *payload.lock().unwrap() =
+            r#"{"state":"MERGED","merged":true,"mergedAt":"2026-11-04T13:55:00Z"}"#.to_string();
+        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert_eq!(inbox.len(), 3);
+        assert!(
+            inbox[2].text.starts_with(
+                "[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=merged]\nverify PR 452"
+            ),
+            "unexpected merge wake text: {}",
+            inbox[2].text
+        );
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(
+            active.len(),
+            0,
+            "PR watch must retire (`fired`) once PR is merged"
+        );
+        let all = store.list_schedules(Some(&owner.id), false).unwrap();
+        assert_eq!(all[0].id, sched.id);
+        assert_eq!(all[0].state, "fired");
+
+        *payload.lock().unwrap() = "STOP".to_string();
+        let _ = std::net::TcpStream::connect(addr);
+        let _ = server.join();
+        unsafe {
+            std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+        }
     }
 }
