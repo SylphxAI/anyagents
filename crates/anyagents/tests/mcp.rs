@@ -548,6 +548,95 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(l2_to_parent.deliveries.len(), 1);
     assert_eq!(l2_to_parent.deliveries[0].to, "agent:worker-1");
 
+    // Strict vertical parent-child boundary: L2 (`worker-1-child`) cannot skip its direct parent (`worker-1`)
+    // to message Root `alpha` directly, and Root `alpha` cannot skip `worker-1` to message `worker-1-child` directly.
+    let l2_skip_parent_err = error_text(
+        &call(
+            &worker_l2,
+            "send",
+            serde_json::json!({"to": ["alpha"], "text": "skipping L1 parent"}),
+        )
+        .await,
+    );
+    assert!(
+        l2_skip_parent_err.contains("only direct parent-child communication is allowed")
+            && l2_skip_parent_err.contains("agent:worker-1"),
+        "unexpected error: {l2_skip_parent_err}"
+    );
+    let root_skip_l1_err = error_text(
+        &call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["worker-1-child"], "text": "skipping L1 to L2"}),
+        )
+        .await,
+    );
+    assert!(
+        root_skip_l1_err.contains("cannot message sub-agent `worker-1-child` directly")
+            && root_skip_l1_err.contains("agent:worker-1"),
+        "unexpected error: {root_skip_l1_err}"
+    );
+
+    // Zero peer-to-peer between sibling sub-agents: spawn a sibling `worker-2` under `alpha`,
+    // and verify `worker-1` cannot message `worker-2` directly or via `peers`/`siblings`,
+    // and `worker-1` cannot message non-parent Root `beta`.
+    let spawned_sib: AgentView = ok_json(
+        call(
+            &alpha,
+            "spawn",
+            serde_json::json!({
+                "name": "worker-2",
+                "prompt": "sibling subagent task"
+            }),
+        )
+        .await,
+    );
+    let p2p_direct_err = error_text(
+        &call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["worker-2"], "text": "sibling peer-to-peer attempt"}),
+        )
+        .await,
+    );
+    assert!(
+        p2p_direct_err.contains("peer-to-peer messaging between sibling sub-agents is disabled"),
+        "unexpected error: {p2p_direct_err}"
+    );
+    let p2p_alias_err = error_text(
+        &call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["siblings"], "text": "sibling broadcast attempt"}),
+        )
+        .await,
+    );
+    assert!(
+        p2p_alias_err.contains("peer-to-peer messaging between sub-agents is disabled"),
+        "unexpected error: {p2p_alias_err}"
+    );
+    let cross_root_err = error_text(
+        &call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["beta"], "text": "sub-agent messaging unrelated root"}),
+        )
+        .await,
+    );
+    assert!(
+        cross_root_err.contains("only direct parent-child communication is allowed")
+            && cross_root_err.contains("agent:alpha"),
+        "unexpected error: {cross_root_err}"
+    );
+    let _: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "delete", "name": &spawned_sib.id}),
+        )
+        .await,
+    );
+
     let _: AgentView = ok_json(
         call(
             &worker_1,

@@ -1184,6 +1184,7 @@ fn peer_ids(
     let Routed::EchoToPeers { chat_id, .. } = one else {
         return Ok(Vec::new());
     };
+    let sender_agent = store.agent_by_name(sender).ok();
     let attached: Vec<(&str, i64)> = attached
         .iter()
         .map(|(name, chat)| (name.as_str(), *chat))
@@ -1193,6 +1194,11 @@ fn peer_ids(
         if let Ok(agent) = store.agent_by_name(name)
             && agent.state != "archived"
             && agent.state != "paused"
+            && sender_agent.as_ref().is_none_or(|sa| {
+                sa.parent_id.as_ref() == Some(&agent.id)
+                    || agent.parent_id.as_ref() == Some(&sa.id)
+                    || (sa.parent_id.is_none() && agent.parent_id.is_none())
+            })
         {
             peers.push((agent.id, *chat_id));
         }

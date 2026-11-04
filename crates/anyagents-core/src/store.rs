@@ -1147,9 +1147,10 @@ impl Store {
         let author = sender
             .as_deref()
             .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
-        let author_id = author
+        let author_agent = author
             .as_deref()
-            .and_then(|a| self.agent_by_name(a).ok().map(|ag| ag.id));
+            .and_then(|a| self.agent_by_name(a).ok());
+        let author_id = author_agent.as_ref().map(|ag| ag.id.clone());
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
@@ -1161,6 +1162,14 @@ impl Store {
                 || author_id.as_ref() == Some(&agent.id)
             {
                 continue;
+            }
+            if let Some(ref sa) = author_agent {
+                let allowed = sa.parent_id.as_ref() == Some(&agent.id)
+                    || agent.parent_id.as_ref() == Some(&sa.id)
+                    || (sa.parent_id.is_none() && agent.parent_id.is_none());
+                if !allowed {
+                    continue;
+                }
             }
             if let Some(members) = &members
                 && !members.iter().any(|name| name == &agent.name)
@@ -1801,7 +1810,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let parent_id_opt: Option<AgentId> = tx
                 .query_row(
-                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
+                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL AND (role IS NULL OR TRIM(role) = '')",
                     [id.as_str()],
                     |r| {
                         let pid: String = r.get(0)?;
@@ -1817,6 +1826,7 @@ impl Store {
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
+                       AND (a.role IS NULL OR TRIM(a.role) = '')
                        AND a.state = 'running'
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
@@ -1840,6 +1850,7 @@ impl Store {
                  SET state = 'idle'
                  WHERE id = ?1
                    AND parent_id IS NOT NULL
+                   AND (role IS NULL OR TRIM(role) = '')
                    AND state = 'running'
                    AND NOT EXISTS (
                        SELECT 1 FROM agents child
@@ -3526,6 +3537,59 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
                 model: None,
                 workdir: None,
                 description: None,
+                instructions,
+                is_admin: false,
+                state: "running".to_string(),
+                created_at_ms: 0,
+                launch_env: Vec::new(),
+            };
+            roster.push((name, role, dummy.public_description()));
+        }
+    }
+    roster
+}
+
+/// Reads the active direct child sub-agents `(name, role, public_description)` for `parent_id`
+/// that have a standing `role` label from `{data}/state.db` read-only.
+pub fn read_children_roster(
+    data_dir: &Path,
+    parent_id: &str,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    let db_path = data_dir.join("state.db");
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(&db_path, flags) else {
+        return Vec::new();
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(500));
+    let query = "SELECT name, role, description, instructions
+         FROM agents
+         WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != ''
+         ORDER BY name ASC";
+    let mut roster = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(query)
+        && let Ok(rows) = stmt.query_map([parent_id], |row| {
+            let name: String = row.get(0)?;
+            let role: Option<String> = row.get(1)?;
+            let description: Option<String> = row.get(2)?;
+            let instructions: Option<String> = row.get(3)?;
+            Ok((name, role, description, instructions))
+        })
+    {
+        for item in rows.flatten() {
+            let (name, role, description, instructions) = item;
+            let dummy = Agent {
+                id: AgentId::generate(),
+                name: name.clone(),
+                role: role.clone(),
+                parent_id: None,
+                harness: String::new(),
+                model: None,
+                workdir: None,
+                description,
                 instructions,
                 is_admin: false,
                 state: "running".to_string(),

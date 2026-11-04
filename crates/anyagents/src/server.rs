@@ -3414,6 +3414,11 @@ async fn archive_agent_route(
                 "agents.archive_root",
                 &found.name,
             )?;
+        } else if is_self && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a standing domain sub-agent (with a role) cannot archive itself; report completion to `parent` instead",
+            ));
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -3488,6 +3493,7 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         let parent_id = store.agent(agent_id).ok().and_then(|a| a.parent_id);
         if parent_id.is_some()
             && let Ok(agent) = store.agent(agent_id)
+            && agent.role.as_deref().is_none_or(|r| r.trim().is_empty())
         {
             let bp = data_dir.join("browser-profiles").join(&agent.name);
             remove_path_with_seat(&bp, seat_ids);
@@ -3882,7 +3888,7 @@ async fn delete_agent_route(
 }
 
 async fn wake_agent_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AgentView>, ApiError> {
@@ -3891,6 +3897,16 @@ async fn wake_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        if let Principal::Agent {
+            name: ref caller_name,
+            ..
+        } = principal
+        {
+            let actor = Actor::Agent(caller_name.clone());
+            if can_actor_message_agent(&state.store, &actor, &found).is_err() {
+                require_admin_or_operator(&state.store, &principal, "agents.wake", &found.name)?;
+            }
+        }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
         let work_dir = found
             .workdir
@@ -4449,6 +4465,7 @@ fn interact_sync(
                     && peer.state != "archived"
                     && peer.state != "paused"
                     && !is_explicitly_archived(store.data_dir(), &peer)
+                    && can_actor_message_agent(store, &actor, &peer).is_ok()
                 {
                     let mut incoming = Incoming::new(summary.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
@@ -4522,6 +4539,7 @@ fn interact_sync(
                     && peer.state != "archived"
                     && peer.state != "paused"
                     && !is_explicitly_archived(store.data_dir(), &peer)
+                    && can_actor_message_agent(store, &actor, &peer).is_ok()
                 {
                     let mut incoming = Incoming::new(ballot.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
@@ -4863,27 +4881,11 @@ impl SendPlan {
                 {
                     if let Actor::Agent(sender_name) = actor
                         && let Ok(sender) = store.agent_by_name(sender_name)
-                        && let Some(ref pid) = sender.parent_id
+                        && sender.parent_id.is_some()
                     {
-                        let siblings: Vec<_> = store
-                            .children_of(pid)
-                            .map_err(ApiError::from_store)?
-                            .into_iter()
-                            .filter(|s| {
-                                s.id != sender.id
-                                    && s.state != "archived"
-                                    && !is_explicitly_archived(store.data_dir(), s)
-                            })
-                            .collect();
-                        if siblings.is_empty() {
-                            return Err(ApiError::new(
-                                StatusCode::BAD_REQUEST,
-                                "this sub-agent has no active sibling sub-agents under the same parent",
-                            ));
-                        }
-                        for sib in siblings {
-                            targets.push(Target::Agent(sib.name));
-                        }
+                        return Err(ApiError::forbidden(
+                            "peer-to-peer messaging between sub-agents is disabled; only direct parent-child communication (`to: [\"parent\"]` or `to: [\"children\"]`) is allowed",
+                        ));
                     } else if name == "siblings" {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
@@ -4898,27 +4900,11 @@ impl SendPlan {
                 {
                     if let Actor::Agent(sender_name) = actor
                         && let Ok(sender) = store.agent_by_name(sender_name)
-                        && let Some(ref pid) = sender.parent_id
+                        && sender.parent_id.is_some()
                     {
-                        let siblings: Vec<_> = store
-                            .children_of(pid)
-                            .map_err(ApiError::from_store)?
-                            .into_iter()
-                            .filter(|s| {
-                                s.id != sender.id
-                                    && s.state != "archived"
-                                    && !is_explicitly_archived(store.data_dir(), s)
-                            })
-                            .collect();
-                        if siblings.is_empty() {
-                            return Err(ApiError::new(
-                                StatusCode::BAD_REQUEST,
-                                "this sub-agent has no active sibling sub-agents under the same parent",
-                            ));
-                        }
-                        for sib in siblings {
-                            targets.push(Target::Agent(sib.name));
-                        }
+                        return Err(ApiError::forbidden(
+                            "peer-to-peer messaging between sub-agents is disabled; only direct parent-child communication (`to: [\"parent\"]` or `to: [\"children\"]`) is allowed",
+                        ));
                     } else if room == "siblings" {
                         return Err(ApiError::new(
                             StatusCode::BAD_REQUEST,
@@ -5032,28 +5018,15 @@ impl SendPlan {
     }
 }
 
-fn root_ancestor_id(store: &Store, agent: &anyagents_core::Agent) -> anyagents_core::AgentId {
-    let mut current_id = agent.id.clone();
-    let mut next_parent = agent.parent_id.clone();
-    for _ in 0..16 {
-        let Some(pid) = next_parent else {
-            break;
-        };
-        current_id = pid.clone();
-        next_parent = store.agent(&pid).ok().and_then(|parent| parent.parent_id);
-    }
-    current_id
-}
-
-/// Enforces strict hierarchy & peer encapsulation (`Encapsulated Actor Hierarchy`):
-/// - Root agents (`parent_id == None`) can message any Root peer (`parent_id == None`) or any descendant inside their own hierarchy tree.
-/// - Sub-agents (`parent_id == Some(P)`) can message:
-///   1. Their own direct parent (`recipient.id == P`)
-///   2. Their own direct children (`recipient.parent_id == Some(sender.id)`)
-///   3. Their own sibling sub-agents under the same parent (`recipient.parent_id == Some(P)`)
-///   4. Any ancestor or descendant within the same Root agent's hierarchy tree (`root_ancestor_id(sender) == root_ancestor_id(recipient)`)
-///   5. Any Root agent (`recipient.parent_id == None`) for cross-domain escalation
-/// - Sending directly to **another Root agent's sub-agent** (`root_ancestor_id(sender) != root_ancestor_id(recipient)`) is refused unless the caller is the Operator. To hand over a sub-agent across parents, use `agents({ "action": "transfer", "name": "<subagent>", "parent": "<new-parent>" })`.
+/// Enforces strict vertical Parent-Child communication & zero peer-to-peer between sub-agents:
+/// - Any agent can message:
+///   1. Itself (`sender.id == recipient.id`)
+///   2. Its own direct Child Sub-Agents (`recipient.parent_id == Some(sender.id)`)
+///   3. Its own direct Parent Agent (`sender.parent_id == Some(recipient.id)`)
+///   4. Another Root Agent when both are Root Agents (`sender.parent_id.is_none() && recipient.parent_id.is_none()`)
+/// - Forbidden:
+///   - Peer-to-peer messaging between sibling sub-agents (`sender.parent_id.is_some() && recipient.parent_id == sender.parent_id`)
+///   - Messaging another agent's sub-agent or skipping hierarchy levels (`recipient.parent_id != Some(sender.id)` and `sender.parent_id != Some(recipient.id)`)
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -5062,33 +5035,40 @@ fn can_actor_message_agent(
     let Actor::Agent(sender_name) = actor else {
         return Ok(());
     };
-    let Some(ref recip_parent_id) = recipient.parent_id else {
-        // Recipient is a Root agent: always reachable by Root peers and sub-agents.
-        return Ok(());
-    };
     let Ok(sender) = store.agent_by_name(sender_name) else {
         return Ok(());
     };
-    if sender.id == recipient.id {
-        return Ok(());
-    }
-    // Recipient is a sub-agent (`recip_parent_id`):
-    // Allowed if sender IS the recipient's direct parent, OR recipient IS the sender's direct parent,
-    // OR sender shares the exact same parent (`sibling`), OR both belong to the same Root hierarchy tree.
-    if &sender.id == recip_parent_id
+    if sender.id == recipient.id
+        || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
-        || sender.parent_id.as_ref() == Some(recip_parent_id)
-        || root_ancestor_id(store, &sender) == root_ancestor_id(store, recipient)
+        || (sender.parent_id.is_none() && recipient.parent_id.is_none())
     {
         return Ok(());
     }
-    let owner_label = store
-        .agent(recip_parent_id)
-        .map(|p| p.name)
-        .unwrap_or_else(|_| recip_parent_id.as_str().to_string());
+    if let Some(ref recip_parent_id) = recipient.parent_id {
+        let owner_label = store
+            .agent(recip_parent_id)
+            .map(|p| p.name)
+            .unwrap_or_else(|_| recip_parent_id.as_str().to_string());
+        if sender.parent_id.as_ref() == Some(recip_parent_id) {
+            return Err(ApiError::forbidden(format!(
+                "peer-to-peer messaging between sibling sub-agents is disabled: cannot message sub-agent `{}` directly because only parent-child communication is allowed; message your parent `agent:{owner_label}` (`to: [\"parent\"]`) instead",
+                recipient.name
+            )));
+        }
+        return Err(ApiError::forbidden(format!(
+            "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}`; message `agent:{owner_label}` instead, or transfer custody first via `agents({{ \"action\": \"transfer\", \"name\": \"{}\", \"parent\": \"{}\" }})`",
+            recipient.name, recipient.name, sender.name
+        )));
+    }
+    let sender_parent_label = sender
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
+        .unwrap_or_else(|| "parent".to_string());
     Err(ApiError::forbidden(format!(
-        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}`; message `agent:{owner_label}` instead, or transfer custody first via `agents({{ \"action\": \"transfer\", \"name\": \"{}\", \"parent\": \"{}\" }})`",
-        recipient.name, recipient.name, sender.name
+        "cannot message `agent:{}` directly because only direct parent-child communication is allowed; message your direct parent `agent:{sender_parent_label}` (`to: [\"parent\"]`) instead",
+        recipient.name
     )))
 }
 
@@ -5109,6 +5089,20 @@ fn check_targets(
             // Counted without writing, so an empty room fails the whole send
             // instead of silently delivering nothing.
             Target::Room(room) => {
+                if let Actor::Agent(sender_name) = actor
+                    && let Ok(sender) = store.agent_by_name(sender_name)
+                    && sender.parent_id.is_some()
+                    && let Ok(Some(members)) = store.room_members(room)
+                {
+                    for member_name in &members {
+                        if member_name != &sender.name
+                            && let Ok(member) = store.agent_by_name(member_name)
+                            && member.state != "archived"
+                        {
+                            can_actor_message_agent(store, actor, &member)?;
+                        }
+                    }
+                }
                 if room_recipients(store, body, room).is_empty() {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -5322,6 +5316,9 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .sender
         .as_deref()
         .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
+    let sender_agent = sender
+        .as_deref()
+        .and_then(|s| store.agent_by_name(s).ok());
     let members = match store.room_members(room) {
         Ok(members) => members,
         Err(_) => return Vec::new(),
@@ -5332,6 +5329,13 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .into_iter()
         .filter(|agent| agent.state == "running")
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+        .filter(|agent| {
+            sender_agent.as_ref().is_none_or(|sa| {
+                sa.parent_id.as_ref() == Some(&agent.id)
+                    || agent.parent_id.as_ref() == Some(&sa.id)
+                    || (sa.parent_id.is_none() && agent.parent_id.is_none())
+            })
+        })
         .filter(|agent| {
             members
                 .as_ref()

@@ -750,9 +750,15 @@ pub(crate) fn write_agent_instructions_with_continuity(
         ));
     }
     if let Some(parent) = parent_name {
-        doc.push_str(&format!(
-            "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `agents({{ \"action\": \"archive\" }})` to retire yourself.\n"
-        ));
+        if agent.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            doc.push_str(&format!(
+                "- **Role**: Standing Domain Sub-Agent under Parent `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). You are a permanent domain owner under `agent:{parent}` — **do not** archive yourself; stay active and spawn your own child sub-agents (`agents({{ \"action\": \"spawn\", ... }})`) to execute concrete tasks end-to-end.\n"
+            ));
+        } else {
+            doc.push_str(&format!(
+                "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `agents({{ \"action\": \"archive\" }})` to retire yourself.\n"
+            ));
+        }
     } else {
         doc.push_str("- **Role**: Root Agent\n");
     }
@@ -774,36 +780,67 @@ pub(crate) fn write_agent_instructions_with_continuity(
         .and_then(|p| p.parent())
     {
         let roster = anyagents_core::read_root_roster(data_dir);
-        if !roster.is_empty() {
+        let child_roster = anyagents_core::read_children_roster(data_dir, agent.id.as_str());
+        if !roster.is_empty() || !child_roster.is_empty() || parent_name.is_some() {
             doc.push_str(
-                "\n## 2.1 Team Roster & Multi-Agent Coordination (`description` vs. `instructions`)\n\n\
+                "\n## 2.1 Hierarchy & Strict Vertical Parent-Child Communication Protocol (`description` vs. `instructions`)\n\n\
                  - **Two-Layer Identity Architecture**:\n\
-                   - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in the Team Roster below and in `groups({ \"action\": \"list\" })` / `agents({ \"action\": \"describe\", \"name\": \"all\" })` so every peer knows who owns what without leaking full system prompts.\n\
+                   - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in `agents({ \"action\": \"describe\", \"name\": \"all\" })` without leaking full system prompts.\n\
                    - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain private in Section 2 above so they never pollute other agents' context windows.\n\
-                 - **Three-Regime Group & Team Coordination Protocol (Goal-Driven Custody, Not Blind Racing)**:\n\
-                   - **Regime 1 — Single-Owner Match (Direct Execution & Peer Silence)**: When a group message or event clearly matches **one** agent's goal/domain (and was not explicitly addressed to you), only that owning agent answers and executes; all other agents stay silent (`NO_REPLY`) instead of racing or echoing.\n\
-                   - **Regime 2 — Multi-Goal Overlap (Coordinate Custody First)**: When a group topic genuinely spans **2–3 agents' goals** (or crosses domain boundaries), those relevant agents briefly coordinate in the group first to agree on single-writer custody (who owns what part) before mutating shared state.\n\
-                   - **Regime 3 — Out-of-Domain Discovery (Global Sensing, Specialized Handoff)**: Every agent keeps global situational awareness, not rigid tunnel vision. If you discover a blocker or incident outside your domain or capability (e.g., you own growth/users and spot a dead server or cluster failure), **do not** attempt to fix it yourself and **do not** ignore it — hand it off (`send` or `@mention` in the group) with your concrete evidence to the peer whose `description` owns that domain.\n\
-                 - **Active Root Agent Roster (`agent:<name>` — `role` — `description`)**:\n",
+                 - **Strict Vertical Parent-Child Communication (Zero Peer-to-Peer Between Sub-Agents)**:\n\
+                   - **Allowed Recipients**: An agent may contact **only**:\n\
+                     1. Its own direct **Child Sub-Agents** (`to: [\"children\"]` or `to: [\"agent:<child>\"]`).\n\
+                     2. Its own direct **Parent Agent** (`to: [\"parent\"]` or `to: [\"agent:<parent>\"]`).\n\
+                     3. Another **Root Agent** only when the sender is itself a **Root Agent** (`parent_id == None`).\n\
+                   - **Forbidden Recipients (Enforced by Server 403)**: Sub-agents **cannot** message sibling/peer sub-agents (`peers`/`siblings` disabled) and **cannot** message another peer's sub-agents or skip hierarchy levels. If you discover a cross-domain issue or need another domain's help, report it to your **Parent Agent** (`to: [\"parent\"]`) with concrete evidence so your Parent routes or dispatches it.\n\
+                   - **Group Chat Discipline**: When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
             );
-            for (peer_name, peer_role, peer_desc) in &roster {
-                let marker = if peer_name == &agent.name {
-                    " *(you)*"
-                } else {
-                    ""
-                };
-                let role_str = peer_role
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map(|r| format!(" [{r}]"))
-                    .unwrap_or_default();
-                let desc_str = peer_desc
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("(no public description set)");
+            if let Some(parent) = parent_name {
                 doc.push_str(&format!(
-                    "  - `agent:{peer_name}`{role_str}{marker}: {desc_str}\n"
+                    "                 - **Your Direct Parent Agent**: `agent:{parent}` (send upward via `to: [\"parent\"]` or `to: [\"agent:{parent}\"]`)\n"
                 ));
+            } else if !roster.is_empty() {
+                doc.push_str(
+                    "                 - **Active Root Agent Roster (`agent:<name>` — `role` — `description`)**:\n",
+                );
+                for (peer_name, peer_role, peer_desc) in &roster {
+                    let marker = if peer_name == &agent.name {
+                        " *(you)*"
+                    } else {
+                        ""
+                    };
+                    let role_str = peer_role
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|r| format!(" [{r}]"))
+                        .unwrap_or_default();
+                    let desc_str = peer_desc
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(no public description set)");
+                    doc.push_str(&format!(
+                        "                   - `agent:{peer_name}`{role_str}{marker}: {desc_str}\n"
+                    ));
+                }
+            }
+            if !child_roster.is_empty() {
+                doc.push_str(
+                    "                 - **Your Direct Standing Domain Sub-Agents (`agent:<name>` — `role` — `description`)**:\n",
+                );
+                for (child_name, child_role, child_desc) in &child_roster {
+                    let role_str = child_role
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(|r| format!(" [{r}]"))
+                        .unwrap_or_default();
+                    let desc_str = child_desc
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(no public description set)");
+                    doc.push_str(&format!(
+                        "                   - `agent:{child_name}`{role_str}: {desc_str}\n"
+                    ));
+                }
             }
         }
     }
@@ -832,7 +869,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
            - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
-           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"sage\"]`, `[\"group:owners\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`).\n\
+           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"agent:<direct-child>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Remember: sub-agents can only message their direct Parent Agent or their own direct Child Sub-Agents — never sibling sub-agents (`peers`/`siblings`) or another peer's sub-agents.\n\
            - **Reactions, Poll Votes & Edits**: Pass `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]`), `\"check\"` / `\"uncheck\"`, `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"` along with `target` (or `reply_to`: `anyagents:reply:msg_...`) on `send`.\n\
          - **3. Memory, History & Zero-Embedding Lexical + Structured Search (`conversation` & `search` MCP Tools)**:\n\
            - Incoming messages are pushed automatically to your session — never poll an inbox. Every historical and live turn across all agents is stored lossless in the append-only store (`Raw-RAG`).\n\
