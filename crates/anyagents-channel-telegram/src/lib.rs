@@ -69,6 +69,8 @@ pub struct Inbound {
     pub sender_username: Option<String>,
     /// Media attachments (`photo`, `video`, `audio`, `voice`, `document`, etc.) on this message.
     pub media: Vec<MediaAttachment>,
+    /// Media attachments on the quoted (`reply_to_message` or `pinned_message`) message, when present.
+    pub quoted_media: Vec<MediaAttachment>,
     pub text: String,
     /// The message this one quotes, when Telegram sent it, with the quoted
     /// author, text and mentions as Telegram named them.
@@ -674,6 +676,14 @@ impl TgMessage {
         Some(tid)
     }
 
+    fn quoted_attachments(&self) -> Vec<MediaAttachment> {
+        self.reply_to_message
+            .as_deref()
+            .or(self.pinned_message.as_deref())
+            .map(TgMessage::attachments)
+            .unwrap_or_default()
+    }
+
     /// The quote Telegram sent with this message: the replied-to (or pinned)
     /// message's own author, text and mentions, and the ids that name it.
     fn quote(&self) -> Option<Quote> {
@@ -682,14 +692,20 @@ impl TgMessage {
             .as_deref()
             .or(self.pinned_message.as_deref())?;
         let mentions = quoted.entity_mentions();
-        let quoted_text = self
+        let base_text = self
             .quote
             .as_ref()
             .map(|q| q.text.as_str())
             .filter(|t| !t.is_empty())
             .map(str::to_string)
-            .or_else(|| quoted.body())
-            .unwrap_or_default();
+            .or_else(|| quoted.body());
+        let rich = quoted.rich_payload_summary();
+        let quoted_text = match (base_text, rich) {
+            (Some(body), Some(summary)) => format!("{body}\n{summary}"),
+            (Some(body), None) => body,
+            (None, Some(summary)) => summary,
+            (None, None) => String::new(),
+        };
         let quote = Quote {
             reference: Some(QuoteRef {
                 chat_id: quoted.chat.id,
@@ -1026,6 +1042,7 @@ impl Poll {
                             .as_ref()
                             .and_then(|user| user.username.clone()),
                         media: Vec::new(),
+                        quoted_media: Vec::new(),
                         text: reaction_text,
                         quote: None,
                         source_time_s: reaction.date,
@@ -1067,6 +1084,7 @@ impl Poll {
                         sender_is_bot: false,
                         sender_username: None,
                         media: Vec::new(),
+                        quoted_media: Vec::new(),
                         text: String::new(),
                         quote: None,
                         source_time_s: message.date,
@@ -1097,6 +1115,7 @@ impl Poll {
                     sender_is_bot: message.from.as_ref().is_some_and(|user| user.is_bot),
                     sender_username: message.from.as_ref().and_then(|user| user.username.clone()),
                     media: message.attachments(),
+                    quoted_media: message.quoted_attachments(),
                     text,
                     quote: message.quote(),
                     source_time_s: message.date,
@@ -2963,5 +2982,79 @@ mod membership_tests {
             extract_rich_message_text(&rm).as_deref(),
             Some("今日 S$766.87 同 US$170 已經入帳")
         );
+    }
+
+    #[test]
+    fn quoting_a_photo_message_preserves_attachment_summary_and_quoted_media() {
+        let mut poll = Poll::resume(0);
+        let updates = r#"[
+          {
+            "update_id": 801,
+            "message": {
+              "message_id": 14256,
+              "date": 1793798561,
+              "chat": { "id": -5290931492, "type": "group", "title": "錢💰" },
+              "from": { "id": 107671190, "is_bot": false, "first_name": "Kyle", "username": "kyletse" },
+              "reply_to_message": {
+                "message_id": 11967,
+                "date": 1793790000,
+                "chat": { "id": -5290931492, "type": "group", "title": "錢💰" },
+                "from": { "id": 9001, "is_bot": true, "first_name": "Sage", "username": "sage_bot" },
+                "caption": "翠扇第二版定稿",
+                "photo": [
+                  { "file_id": "thumb_11967", "width": 320, "height": 320 },
+                  { "file_id": "full_11967", "width": 1200, "height": 1200, "file_size": 184320 }
+                ]
+              },
+              "text": "呢啲上咗未？"
+            }
+          },
+          {
+            "update_id": 802,
+            "message": {
+              "message_id": 14257,
+              "date": 1793798602,
+              "chat": { "id": -5290931492, "type": "group", "title": "錢💰" },
+              "from": { "id": 107671190, "is_bot": false, "first_name": "Kyle", "username": "kyletse" },
+              "reply_to_message": {
+                "message_id": 1750,
+                "date": 1793780000,
+                "chat": { "id": -5290931492, "type": "group", "title": "錢💰" },
+                "from": { "id": 9002, "is_bot": true, "first_name": "Plutus", "username": "plutus_bot" },
+                "photo": [
+                  { "file_id": "robe_3d_id", "width": 1200, "height": 1200, "file_size": 256000 }
+                ]
+              },
+              "text": "仲有呢啲"
+            }
+          }
+        ]"#;
+        let routed = poll.route("bot_sage", "sage", updates).unwrap();
+        assert_eq!(routed.len(), 2);
+
+        let Routed::ToAgent { inbound: msg1, .. } = &routed[0] else {
+            panic!("{:?}", routed[0]);
+        };
+        let q1 = msg1.quote.as_ref().expect("quote on captioned photo");
+        assert!(q1.text.contains("翠扇第二版定稿"), "{}", q1.text);
+        assert!(
+            q1.text.contains("[Attachment (photo): file_id=full_11967"),
+            "{}",
+            q1.text
+        );
+        assert_eq!(msg1.quoted_media.len(), 1);
+        assert_eq!(msg1.quoted_media[0].file_id, "full_11967");
+
+        let Routed::ToAgent { inbound: msg2, .. } = &routed[1] else {
+            panic!("{:?}", routed[1]);
+        };
+        let q2 = msg2.quote.as_ref().expect("quote on captionless photo");
+        assert!(
+            q2.text.contains("[Attachment (photo): file_id=robe_3d_id"),
+            "{}",
+            q2.text
+        );
+        assert_eq!(msg2.quoted_media.len(), 1);
+        assert_eq!(msg2.quoted_media[0].file_id, "robe_3d_id");
     }
 }

@@ -1357,8 +1357,8 @@ impl Store {
     /// Append one message, or return the row already stored for this source key.
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
-        let body = incoming.body();
-        let source_key = incoming.source_key.filter(|key| !key.is_empty());
+        let mut incoming = incoming;
+        let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1368,7 +1368,10 @@ impl Store {
         {
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
-        let mut body = body;
+        if let Some(ref mut quote) = incoming.quote {
+            enrich_quote_from_store(&tx, quote, incoming.origin);
+        }
+        let mut body = incoming.body();
         let mut reply_to_author = incoming
             .quote
             .as_ref()
@@ -4217,24 +4220,19 @@ fn message_by_origin(
             || incoming_body.starts_with("[Deleted message #");
         let stored_is_meta_event =
             msg.text.starts_with("[Reaction ") || msg.text.starts_with("[Deleted message #");
-        if origin.message_id == Some(message_id)
+        let matched_by_id = origin.message_id == Some(message_id)
             && (!is_basic_group || (!in_is_relay && !stored_is_relay))
-        {
-            if incoming_is_meta_event || stored_is_meta_event {
-                if strip_quoted_block(&msg.text) == strip_quoted_block(incoming_body)
+            && if incoming_is_meta_event || stored_is_meta_event {
+                strip_quoted_block(&msg.text) == strip_quoted_block(incoming_body)
                     && in_user == telegram_sender_user_key(msg.sender.as_deref())
-                {
-                    return Ok(Some(msg));
-                }
             } else {
-                return Ok(Some(msg));
-            }
-        }
+                true
+            };
         // Basic Telegram groups (`chat_type == "group"`, negative non-`-100...` IDs)
         // assign each bot its own account-local `message_id` for the same human
         // message. Match by `(chat_id, sender user, source_time_ms, body)` so cross-bot
         // passive relay and direct webhook delivery coalesce into a single message.
-        if (in_is_relay || stored_is_relay)
+        let matched_by_group_relay = (in_is_relay || stored_is_relay)
             && normalize_telegram_body_for_dedup(strip_quoted_block(&msg.text))
                 == normalize_telegram_body_for_dedup(strip_quoted_block(incoming_body))
             && in_user.is_some()
@@ -4242,9 +4240,10 @@ fn message_by_origin(
             && match (msg.source_time_ms, incoming_source_time_ms) {
                 (Some(a), Some(b)) => (a - b).abs() <= 5_000,
                 _ => (now_ms() - msg.received_at_ms).abs() <= 15_000,
-            }
-        {
-            let best_body = if incoming_body.len() > msg.text.len() {
+            };
+        if matched_by_id || matched_by_group_relay {
+            let was_unquoted = !has_quoted_block(&msg.text) && has_quoted_block(incoming_body);
+            let best_body = if was_unquoted || incoming_body.len() > msg.text.len() {
                 Some(incoming_body.to_string())
             } else {
                 None
@@ -4297,6 +4296,9 @@ fn message_by_origin(
                 if let Some(b) = best_body {
                     msg.text = b;
                 }
+            }
+            if was_unquoted && cursor(conn, agent_id).unwrap_or(0) >= msg.seq {
+                return Ok(None);
             }
             return Ok(Some(msg));
         }
@@ -4359,6 +4361,79 @@ fn resolve_quote_author(conn: &Connection, quote: &crate::Quote) -> Option<Strin
         }
     }
     Some(author.to_string())
+}
+
+fn enrich_quote_from_store(
+    conn: &Connection,
+    quote: &mut crate::Quote,
+    incoming_origin: Option<Origin>,
+) {
+    let chat_id = quote
+        .reference
+        .as_ref()
+        .map(|r| r.chat_id)
+        .or_else(|| incoming_origin.and_then(|o| o.chat_id));
+    let Some(chat_id) = chat_id else {
+        return;
+    };
+    let mut stored_excerpt = quote
+        .reference
+        .as_ref()
+        .and_then(|r| resolve_origin_message_author_and_excerpt(conn, r.chat_id, r.message_id))
+        .map(|(_, excerpt)| excerpt);
+    if stored_excerpt.is_none() {
+        let base_quote_text: String = quote
+            .text
+            .lines()
+            .filter(|line| {
+                let t = line.trim();
+                !((t.starts_with("[Attachment (") || t.starts_with("[Local media ("))
+                    && t.ends_with(']'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string();
+        if !base_quote_text.is_empty() {
+            let dest_pattern = format!("telegram:chat:{chat_id}%");
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT body FROM outbound_messages
+                 WHERE destination LIKE ?1
+                 ORDER BY sent_at_ms DESC LIMIT 32",
+            ) && let Ok(mut rows) = stmt.query([dest_pattern])
+            {
+                while let Ok(Some(row)) = rows.next() {
+                    if let Ok(body) = row.get::<_, String>(0) {
+                        let clean = strip_quoted_block(&body).trim().to_string();
+                        if clean.starts_with(&base_quote_text) && clean.len() > base_quote_text.len()
+                        {
+                            stored_excerpt = Some(clean);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let Some(excerpt) = stored_excerpt else {
+        return;
+    };
+    if quote.text.trim().is_empty() {
+        quote.text = excerpt;
+        return;
+    }
+    for line in excerpt.lines() {
+        let trimmed = line.trim();
+        if (trimmed.starts_with("[Attachment (") || trimmed.starts_with("[Local media ("))
+            && trimmed.ends_with(']')
+            && !quote.text.contains(trimmed)
+        {
+            if !quote.text.ends_with('\n') {
+                quote.text.push('\n');
+            }
+            quote.text.push_str(trimmed);
+        }
+    }
 }
 
 fn resolve_origin_message_author_and_excerpt(
@@ -4688,6 +4763,11 @@ fn resolve_conversation_participants(
     }
     participants.sort();
     participants
+}
+
+fn has_quoted_block(text: &str) -> bool {
+    text.contains("\n\n----- quoted message -----\n")
+        || text.starts_with("----- quoted message -----\n")
 }
 
 fn strip_quoted_block(text: &str) -> &str {
@@ -5933,5 +6013,92 @@ mod tests {
         edit3.origin = Some(origin);
         let out3 = store.receive(&argus.id, edit3).unwrap();
         assert!(matches!(out3, ReceiveOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn group_quote_enriches_stored_attachments_and_delivers_late_quote_upgrade() {
+        let (_dir, store) = setup();
+        let sage = agent(&store, "sage");
+        let plutus = agent(&store, "plutus");
+        let chat_id = -5290931492;
+
+        // 1. Original post by plutus (`message_id = 1750`) with local attachment path in `messages`
+        let mut orig = Incoming::new(
+            "重型國風刺繡錦袍 3D 牌桌實測渲染\n[Attachment (photo): /scratch/tmp/renders/robe_3d.png]",
+        );
+        orig.sender = Some("agent:plutus".to_string());
+        orig.source_key = Some(format!("tg-out:{chat_id}:plutus:1750"));
+        orig.origin = Some(Origin {
+            chat_id: Some(chat_id),
+            thread_id: None,
+            message_id: Some(1750),
+        });
+        store.receive(&sage.id, orig).unwrap();
+
+        // 2. Peer bot without quote relays human reply first (`message_id = 3255`, `quote = None`)
+        let mut unquoted_relay = Incoming::new("仲有呢啲");
+        unquoted_relay.sender = Some("telegram:user:107671190:3255 (Kyle @kyletse)".to_string());
+        unquoted_relay.source_time_ms = Some(1_793_798_602_000);
+        unquoted_relay.source_key = Some(format!("tg-in:{chat_id}:vulcan:3255"));
+        unquoted_relay.origin = Some(Origin {
+            chat_id: Some(chat_id),
+            thread_id: None,
+            message_id: Some(3255),
+        });
+        let ReceiveOutcome::New(first_msg) = store.receive(&sage.id, unquoted_relay).unwrap() else {
+            panic!("first relay must be stored");
+        };
+        assert!(!has_quoted_block(&first_msg.text));
+
+        // Simulate harness having already delivered `orig` (seq 1) and `first_msg` (seq 2) before the quoted webhook arrives
+        store.note_delivered(&sage.id, 1).unwrap();
+        store.note_delivered(&sage.id, first_msg.seq).unwrap();
+
+        // 3. Replied-to bot (`plutus`, `message_id = 2506`) relays the same message WITH `quote`
+        let mut quoted_relay = Incoming::new("仲有呢啲");
+        quoted_relay.sender = Some("telegram:user:107671190:2506 (Kyle @kyletse)".to_string());
+        quoted_relay.source_time_ms = Some(1_793_798_602_000);
+        quoted_relay.source_key = Some(format!("tg-in:{chat_id}:{}:2506", plutus.id));
+        quoted_relay.quote = Some(crate::Quote {
+            author: "Plutus (@plutus_bot)".to_string(),
+            author_is_bot: true,
+            sender_id: Some(9002),
+            text: "重型國風刺繡錦袍 3D 牌桌實測渲染".to_string(),
+            reference: Some(crate::QuoteRef {
+                chat_id,
+                message_id: 1750,
+            }),
+            mentions: Vec::new(),
+        });
+        quoted_relay.origin = Some(Origin {
+            chat_id: Some(chat_id),
+            thread_id: None,
+            message_id: Some(2506),
+        });
+        let ReceiveOutcome::New(upgraded_msg) = store.receive(&sage.id, quoted_relay).unwrap()
+        else {
+            panic!("late quote arrival after unquoted delivery must deliver the quoted message");
+        };
+        assert!(has_quoted_block(&upgraded_msg.text));
+        assert!(
+            upgraded_msg
+                .text
+                .contains("[Attachment (photo): /scratch/tmp/renders/robe_3d.png]"),
+            "quote must be enriched with stored attachment path: {}",
+            upgraded_msg.text
+        );
+
+        // 4. Subsequent webhook from sage's own bot (`message_id = 14257`) is deduplicated
+        let mut third_webhook = Incoming::new("仲有呢啲");
+        third_webhook.sender = Some("telegram:user:107671190:14257 (Kyle @kyletse)".to_string());
+        third_webhook.source_time_ms = Some(1_793_798_602_000);
+        third_webhook.source_key = Some("bot_sage:99999".to_string());
+        third_webhook.origin = Some(Origin {
+            chat_id: Some(chat_id),
+            thread_id: None,
+            message_id: Some(14257),
+        });
+        let third_out = store.receive(&sage.id, third_webhook).unwrap();
+        assert!(matches!(third_out, ReceiveOutcome::Duplicate(_)));
     }
 }
