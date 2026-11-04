@@ -540,6 +540,16 @@ impl Store {
                 [],
             );
         }
+        let _ = conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS message_versions (
+                agent_id TEXT NOT NULL,
+                chat_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                body TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (agent_id, chat_id, message_id)
+            );",
+        );
         let _ = ensure_lexical_fts_backfilled(&mut conn);
         Ok(Self {
             conn: Mutex::new(conn),
@@ -1405,6 +1415,64 @@ impl Store {
             tx.commit()?;
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
+        if let Some((edited_msg_id, new_raw_text)) = parse_edited_message_text(&incoming.text) {
+            let msg_id = incoming
+                .origin
+                .and_then(|o| o.message_id)
+                .unwrap_or(edited_msg_id);
+            if let Some(chat_id) = incoming.origin.and_then(|o| o.chat_id) {
+                let prev_text = resolve_previous_message_version(&tx, agent_id, chat_id, msg_id);
+                let _ = tx.execute(
+                    "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)
+                     ON CONFLICT (agent_id, chat_id, message_id) DO UPDATE SET
+                         body = excluded.body,
+                         updated_at_ms = excluded.updated_at_ms",
+                    params![
+                        agent_id.as_str(),
+                        chat_id,
+                        msg_id,
+                        new_raw_text.trim(),
+                        received_at_ms
+                    ],
+                );
+                if let Some(prev) = prev_text {
+                    if prev.trim() == new_raw_text.trim()
+                        && let Some(existing) =
+                            latest_message_for_origin(&tx, agent_id, chat_id, msg_id)?
+                    {
+                        tx.commit()?;
+                        return Ok(ReceiveOutcome::Duplicate(existing));
+                    }
+                    let diff = format_edited_message_diff(&prev, new_raw_text);
+                    let formatted_edit = format!("[Edited message #{msg_id}]:\n{diff}");
+                    body = match incoming.quote.as_ref() {
+                        Some(q) => crate::quote::compose(&formatted_edit, Some(q)),
+                        None => formatted_edit,
+                    };
+                }
+            }
+        } else if let Some(origin) = incoming.origin
+            && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
+            && !incoming.text.starts_with("[Reaction ")
+            && !incoming.text.starts_with("[Deleted message #")
+            && !incoming.text.starts_with("[Pinned message #")
+            && !incoming.text.starts_with("[pinned message")
+            && !incoming.text.starts_with("[Member ")
+        {
+            let _ = tx.execute(
+                "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (agent_id, chat_id, message_id) DO NOTHING",
+                params![
+                    agent_id.as_str(),
+                    chat_id,
+                    message_id,
+                    incoming.text.trim(),
+                    received_at_ms
+                ],
+            );
+        }
         let mentions = resolve_mentions(&tx, &incoming.text);
         let recipient_agent = agent_by_id(&tx, agent_id).ok();
         let recipient = recipient_agent
@@ -1790,6 +1858,7 @@ impl Store {
                 "mailbox_cursors",
                 "turn_recovery",
                 "messages",
+                "message_versions",
                 "outbound_messages",
                 "rag_chunks",
                 "group_agents",
@@ -4327,6 +4396,168 @@ fn resolve_origin_message_author_and_excerpt(
     None
 }
 
+fn parse_edited_message_text(text: &str) -> Option<(i64, &str)> {
+    let rest = text.strip_prefix("[Edited message #")?;
+    let (id_part, body_part) = rest.split_once("]:")?;
+    let msg_id = id_part.trim().parse::<i64>().ok()?;
+    let raw = body_part.strip_prefix(' ').unwrap_or(body_part);
+    Some((msg_id, raw))
+}
+
+fn resolve_previous_message_version(
+    conn: &Connection,
+    agent_id: &AgentId,
+    chat_id: i64,
+    message_id: i64,
+) -> Option<String> {
+    if let Ok(Some(version)) = conn
+        .query_row(
+            "SELECT body FROM message_versions
+             WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3",
+            params![agent_id.as_str(), chat_id, message_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+    {
+        return Some(version);
+    }
+    let pattern = format!("%\"message_id\":{message_id}%");
+    let mut stmt = conn
+        .prepare(
+            "SELECT agent_id, body, origin FROM messages
+             WHERE origin LIKE ?1
+               AND body NOT LIKE '[Edited message #%'
+               AND body NOT LIKE '[Reaction %'
+               AND body NOT LIKE '[Deleted message #%'
+             ORDER BY CASE WHEN agent_id = ?2 THEN 0 ELSE 1 END, rowid DESC
+             LIMIT 32",
+        )
+        .ok()?;
+    let mut rows = stmt.query(params![pattern, agent_id.as_str()]).ok()?;
+    while let Some(row) = rows.next().ok()? {
+        let body: String = row.get(1).ok()?;
+        let origin_raw: Option<String> = row.get(2).ok()?;
+        let Some(origin_str) = origin_raw else {
+            continue;
+        };
+        let Ok(origin) = serde_json::from_str::<Origin>(&origin_str) else {
+            continue;
+        };
+        if origin.chat_id == Some(chat_id) && origin.message_id == Some(message_id) {
+            return Some(strip_quoted_block(&body).trim().to_string());
+        }
+    }
+    None
+}
+
+fn latest_message_for_origin(
+    conn: &Connection,
+    agent_id: &AgentId,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<Option<Message>, Error> {
+    let pattern = format!("%\"message_id\":{message_id}%");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {MESSAGE_COLS} FROM messages
+         WHERE agent_id = ?1 AND origin LIKE ?2
+         ORDER BY seq DESC LIMIT 16"
+    ))?;
+    let mut rows = stmt.query(params![agent_id.as_str(), pattern])?;
+    while let Some(row) = rows.next()? {
+        let msg = message_from_row(conn, row)?;
+        if let Some(origin) = msg.origin
+            && origin.chat_id == Some(chat_id)
+            && origin.message_id == Some(message_id)
+        {
+            return Ok(Some(msg));
+        }
+    }
+    Ok(None)
+}
+
+pub fn format_edited_message_diff(old: &str, new: &str) -> String {
+    let old_trimmed = old.trim();
+    let new_trimmed = new.trim();
+    if old_trimmed.is_empty() {
+        return new_trimmed.to_string();
+    }
+    let old_lines: Vec<&str> = old_trimmed.lines().map(str::trim_end).collect();
+    let new_lines: Vec<&str> = new_trimmed.lines().map(str::trim_end).collect();
+    let n = old_lines.len();
+    let m = new_lines.len();
+    if n * m > 120_000 {
+        return new_trimmed.to_string();
+    }
+    let mut dp = vec![0u16; (n + 1) * (m + 1)];
+    let stride = m + 1;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i * stride + j] = if old_lines[i] == new_lines[j] {
+                dp[(i + 1) * stride + j + 1].saturating_add(1)
+            } else {
+                dp[(i + 1) * stride + j].max(dp[i * stride + j + 1])
+            };
+        }
+    }
+    #[derive(Clone, Copy)]
+    enum DiffOp<'a> {
+        Equal(&'a str),
+        Remove(&'a str),
+        Add(&'a str),
+    }
+    let mut ops = Vec::with_capacity(n + m);
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if old_lines[i] == new_lines[j] {
+            ops.push(DiffOp::Equal(old_lines[i]));
+            i += 1;
+            j += 1;
+        } else if dp[(i + 1) * stride + j] >= dp[i * stride + j + 1] {
+            ops.push(DiffOp::Remove(old_lines[i]));
+            i += 1;
+        } else {
+            ops.push(DiffOp::Add(new_lines[j]));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(DiffOp::Remove(old_lines[i]));
+        i += 1;
+    }
+    while j < m {
+        ops.push(DiffOp::Add(new_lines[j]));
+        j += 1;
+    }
+    let mut keep = vec![false; ops.len()];
+    for (idx, op) in ops.iter().enumerate() {
+        if matches!(op, DiffOp::Remove(_) | DiffOp::Add(_)) {
+            let lo = idx.saturating_sub(1);
+            let hi = (idx + 1).min(ops.len().saturating_sub(1));
+            for k in &mut keep[lo..=hi] {
+                *k = true;
+            }
+        }
+    }
+    let mut out = Vec::new();
+    let mut skipped_run = false;
+    for (idx, op) in ops.iter().enumerate() {
+        if !keep[idx] {
+            if !skipped_run {
+                out.push("...".to_string());
+                skipped_run = true;
+            }
+            continue;
+        }
+        skipped_run = false;
+        match op {
+            DiffOp::Equal(line) => out.push(format!("  {line}")),
+            DiffOp::Remove(line) => out.push(format!("- {line}")),
+            DiffOp::Add(line) => out.push(format!("+ {line}")),
+        }
+    }
+    out.join("\n")
+}
+
 fn chat_attached_agent_count(conn: &Connection, chat_id: i64) -> usize {
     let mut distinct_agents = std::collections::HashSet::new();
     if let Ok(mut stmt) = conn.prepare(
@@ -5640,5 +5871,67 @@ mod tests {
         assert_eq!(nova_msg.context.event.as_deref(), Some("reaction_passive"));
         assert_eq!(store.agent(&nova.id).unwrap().state, "idle");
         assert!(!store.has_actionable_undelivered(&nova.id).unwrap());
+    }
+
+    #[test]
+    fn edited_message_delivers_compact_line_diff_preserving_edit_awareness_and_skips_noop() {
+        let (_dir, store) = setup();
+        let argus = agent(&store, "argus");
+        let origin = Origin {
+            chat_id: Some(-100777),
+            thread_id: None,
+            message_id: Some(88),
+        };
+
+        let v0 = "\
+## Daily Progress Report
+- Line A: Unchanged 1
+- Line B: Unchanged 2
+- Line C: Unchanged 3
+- Status: CI running
+- Deploy: pending
+- Line D: Unchanged 4
+- Line E: Unchanged 5";
+        let mut initial = Incoming::new(v0);
+        initial.sender = Some("agent:helios".to_string());
+        initial.origin = Some(origin);
+        let ReceiveOutcome::New(msg0) = store.receive(&argus.id, initial).unwrap() else {
+            panic!("initial message must be stored");
+        };
+        assert_eq!(msg0.text, v0);
+
+        // Edit 1: changes `Status: CI running` -> `Status: Merged (#67)`
+        let v1 = v0.replace("Status: CI running", "Status: Merged (#67)");
+        let mut edit1 = Incoming::new(format!("[Edited message #88]: {v1}"));
+        edit1.sender = Some("agent:helios".to_string());
+        edit1.origin = Some(origin);
+        let ReceiveOutcome::New(msg1) = store.receive(&argus.id, edit1).unwrap() else {
+            panic!("first edit must deliver a new edited event");
+        };
+        assert_eq!(msg1.context.event.as_deref(), Some("edited"));
+        assert!(msg1.text.starts_with("[Edited message #88]:\n"));
+        assert!(msg1.text.contains("- - Status: CI running"));
+        assert!(msg1.text.contains("+ - Status: Merged (#67)"));
+        assert!(!msg1.text.contains("Line A: Unchanged 1"));
+
+        // Edit 2: changes `Deploy: pending` -> `Deploy: live` (must diff against v1, not v0!)
+        let v2 = v1.replace("Deploy: pending", "Deploy: live");
+        let mut edit2 = Incoming::new(format!("[Edited message #88]: {v2}"));
+        edit2.sender = Some("agent:helios".to_string());
+        edit2.origin = Some(origin);
+        let ReceiveOutcome::New(msg2) = store.receive(&argus.id, edit2).unwrap() else {
+            panic!("second edit must deliver a new edited event");
+        };
+        assert_eq!(msg2.context.event.as_deref(), Some("edited"));
+        assert!(msg2.text.contains("- - Deploy: pending"));
+        assert!(msg2.text.contains("+ - Deploy: live"));
+        assert!(!msg2.text.contains("- - Status: CI running"));
+
+        // Edit 3: no-op edit with identical v2 text must be skipped as Duplicate
+        let mut edit3 = Incoming::new(format!("[Edited message #88]: {v2}"));
+        edit3.sender = Some("agent:helios".to_string());
+        edit3.origin = Some(origin);
+        let out3 = store.receive(&argus.id, edit3).unwrap();
+        assert!(matches!(out3, ReceiveOutcome::Duplicate(_)));
     }
 }
