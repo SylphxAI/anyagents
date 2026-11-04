@@ -3938,8 +3938,12 @@ fn merge_preserved_oauth_metadata(src_bytes: &[u8], dst_bytes: &[u8]) -> Option<
     let dst_val: serde_json::Value = serde_json::from_slice(dst_bytes).ok()?;
     let mut changed = false;
     if let (Some(dst_oauth), Some(src_oauth)) = (
-        dst_val.get("claudeAiOauth").and_then(serde_json::Value::as_object),
-        src_val.get_mut("claudeAiOauth").and_then(serde_json::Value::as_object_mut),
+        dst_val
+            .get("claudeAiOauth")
+            .and_then(serde_json::Value::as_object),
+        src_val
+            .get_mut("claudeAiOauth")
+            .and_then(serde_json::Value::as_object_mut),
     ) {
         for key in ["accountUuid", "email"] {
             if !src_oauth.contains_key(key)
