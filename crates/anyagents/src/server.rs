@@ -5056,10 +5056,7 @@ fn deliver_agent(
     let trimmed = body.text.trim_start();
     let is_auto_subagent_lifecycle =
         trimmed.starts_with("[Sub-Agent Completed]") || trimmed.starts_with("[Sub-Agent Error]");
-    if agent.state == "archived" && agent.parent_id.is_some() && !is_auto_subagent_lifecycle {
-        clear_explicitly_archived(store.data_dir(), &agent.id);
-        let _ = store.set_agent_state(&agent.id, "running");
-    } else if (agent.state == "idle" || agent.state == "created")
+    if (agent.state == "idle" || agent.state == "created")
         && !is_explicitly_archived(store.data_dir(), &agent)
         && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
