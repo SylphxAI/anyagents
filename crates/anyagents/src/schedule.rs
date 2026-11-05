@@ -614,10 +614,13 @@ pub fn agent_wake_block_reason(
 }
 
 pub fn is_agent_busy(store: &Store, health: &HealthBoard, agent: &Agent, now: i64) -> bool {
-    if matches!(
-        store.try_lock_agent(&agent.id),
-        Err(anyagents_core::Error::AgentBusy)
-    ) {
+    // Local DeliveryLoops hold this lock while idle; Sylphx locks only per turn.
+    if agent.harness == "sylphx"
+        && matches!(
+            store.try_lock_agent(&agent.id),
+            Err(anyagents_core::Error::AgentBusy)
+        )
+    {
         return true;
     }
     if store.has_open_turn(&agent.id).unwrap_or(false) {
@@ -1386,6 +1389,86 @@ mod tests {
                 path: "/tmp/out.json".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn local_schedule_watch_fires_with_idle_delivery_loop_lock() {
+        for harness in ["agy", "claude-code", "codex", "opencode", "muse", "omp"] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Store::open(dir.path().join("state.db")).unwrap();
+            let health = HealthBoard::default();
+            let owner = store.create_agent(NewAgent::new("owner", harness)).unwrap();
+            store.set_agent_running(&owner.id, "/work").unwrap();
+            // DeliveryLoop retains the lock for the process lifetime, even while idle.
+            let _lock = store.try_lock_agent(&owner.id).unwrap();
+            let mut live = LiveState {
+                process_alive: true,
+                turn_state: TurnState::Idle,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: SteerSupport::Yes,
+                quota_reset_at_ms: None,
+                restart_at_ms: None,
+                pid: None,
+                live_harness: Some(harness.to_string()),
+                live_model: None,
+                process_started_at_ms: Some(1000),
+                last_error: None,
+            };
+            health.publish(&owner.id, live.clone());
+            let now = anyagents_core::now_ms();
+            assert!(!is_agent_busy(&store, &health, &owner, now), "{harness}");
+            let path = dir.path().join("wake.trigger");
+            std::fs::write(&path, "before").unwrap();
+            create_agent_schedule(
+                &store,
+                &health,
+                &owner,
+                None,
+                None,
+                Some(&format!("file:{}", path.display())),
+                "file changed",
+            )
+            .unwrap();
+            assert_eq!(tick_schedules_once(&store, &health, now), 0);
+            std::fs::write(&path, "after with different length").unwrap();
+            live.turn_state = TurnState::InTurn;
+            health.publish(&owner.id, live.clone());
+            assert!(is_agent_busy(&store, &health, &owner, now));
+            assert_eq!(tick_schedules_once(&store, &health, now + 1000), 0);
+            assert_eq!(
+                store.list_schedules(Some(&owner.id), true).unwrap().len(),
+                1
+            );
+            live.turn_state = TurnState::Idle;
+            health.publish(&owner.id, live);
+            assert_eq!(tick_schedules_once(&store, &health, now + 2000), 1);
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            assert_eq!(inbox.len(), 1);
+            assert_eq!(inbox[0].text, "file changed");
+            assert!(
+                store
+                    .list_schedules(Some(&owner.id), true)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(tick_schedules_once(&store, &health, now + 3000), 0);
+        }
+    }
+
+    #[test]
+    fn sylphx_schedule_owner_is_busy_while_turn_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        let owner = store
+            .create_agent(NewAgent::new("owner", "sylphx"))
+            .unwrap();
+        let now = anyagents_core::now_ms();
+        assert!(!is_agent_busy(&store, &health, &owner, now));
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        assert!(is_agent_busy(&store, &health, &owner, now));
+        drop(lock);
+        assert!(!is_agent_busy(&store, &health, &owner, now));
     }
 
     #[test]
