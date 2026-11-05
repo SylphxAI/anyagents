@@ -529,6 +529,12 @@ struct AgentsArgs {
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
     instructions: Option<String>,
+    /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage (and allows outside agents to invite it to virtual groups). Defaults to `false` (`private`) when spawning a sub-agent.
+    #[serde(default, alias = "allow_external")]
+    public: Option<bool>,
+    /// Optional internal virtual group name(s) (comma-separated, e.g. `"auth-migration"`) to atomically join both the parent and the spawned sub-agent into upon creation.
+    #[serde(default)]
+    group: Option<String>,
     /// Task prompt or follow-up message when `action` is `"spawn"`, `"create"`, `"steer"`, `"send"`, or `"wake"`.
     #[serde(default, alias = "text", alias = "message")]
     prompt: Option<String>,
@@ -580,6 +586,12 @@ struct SpawnArgs {
     /// Optional detailed private standing instructions (`instructions`, Layer 2) for the spawned agent.
     #[serde(default)]
     instructions: Option<String>,
+    /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
+    #[serde(default, alias = "allow_external")]
+    public: Option<bool>,
+    /// Optional internal virtual group name(s) (comma-separated, e.g. `"auth-migration"`) to atomically join both the parent and the spawned sub-agent into upon creation.
+    #[serde(default)]
+    group: Option<String>,
     /// Optional initial task/message to deliver immediately to the spawned agent.
     #[serde(default)]
     prompt: Option<String>,
@@ -600,6 +612,9 @@ struct DescribeArgs {
     /// Optional short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...).
     #[serde(default)]
     role: Option<String>,
+    /// Optional toggle (`true` or `false`) for whether a sub-agent accepts external messages from agents outside its direct parent/child lineage.
+    #[serde(default, alias = "allow_external")]
+    public: Option<bool>,
     /// Set `true` to clear the agent's custom description/instructions.
     #[serde(default)]
     clear: Option<bool>,
@@ -658,6 +673,12 @@ struct SubagentsArgs {
     /// Optional private system/role instructions when `action = "spawn"`.
     #[serde(default, alias = "role")]
     instructions: Option<String>,
+    /// Whether this sub-agent accepts external messages (`true`) from agents outside its direct parent/child lineage. Defaults to `false` (`private`).
+    #[serde(default, alias = "allow_external")]
+    public: Option<bool>,
+    /// Optional internal virtual group name(s) (comma-separated) to atomically join both the parent and the spawned sub-agent into upon creation.
+    #[serde(default)]
+    group: Option<String>,
     /// Task prompt or follow-up message when `action` is `"spawn"`, `"steer"`, `"send"`, `"wake"`, or `"resume"`.
     #[serde(default, alias = "text", alias = "message")]
     prompt: Option<String>,
@@ -700,9 +721,15 @@ struct GroupsArgs {
     /// Group name (e.g. `"owners"`, `"review-team"`). Required for `"join"`, `"leave"`, `"members"`.
     #[serde(default)]
     group: Option<String>,
-    /// Optional agent name or `agt_...` ID to add/remove (defaults to this agent).
+    /// Optional agent name(s) or `agt_...` ID(s) to add/remove (comma-separated, defaults to this agent). When creating a new group and adding another agent, the creator is automatically joined too.
     #[serde(default)]
     agent: Option<String>,
+    /// Optional list of agent names or `agt_...` IDs to add/remove in a single batch call.
+    #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
+    agents: Vec<String>,
+    /// Optional group visibility toggle: `false` (default = Private / Invite-Only group where only existing members or their parent can add members or post) or `true` (Public / Open group).
+    #[serde(default, alias = "allow_external")]
+    public: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
@@ -1152,6 +1179,8 @@ impl AgentMcp {
                         workdir: args.workdir,
                         description: args.description,
                         instructions: args.instructions,
+                        public: args.public,
+                        group: args.group,
                         prompt: args.prompt,
                     }))
                     .await?
@@ -1198,6 +1227,8 @@ impl AgentMcp {
                     description: args.description,
                     instructions: args.instructions,
                     parent: parent_val,
+                    public: args.public,
+                    group: args.group,
                     prompt: args.prompt,
                 };
                 let created: AgentView = self
@@ -1217,6 +1248,7 @@ impl AgentMcp {
                     description: args.description,
                     instructions: args.instructions,
                     role: args.role,
+                    public: args.public,
                     clear: args.clear,
                 }))
                 .await
@@ -1491,6 +1523,8 @@ impl AgentMcp {
             description: args.description,
             instructions: args.instructions,
             parent: Some(self.agent.id.to_string()),
+            public: args.public,
+            group: args.group,
             prompt: args.prompt,
         };
         let response = self
@@ -1637,6 +1671,8 @@ impl AgentMcp {
                         workdir: args.workdir,
                         description: args.description,
                         instructions: args.instructions,
+                        public: args.public,
+                        group: args.group,
                         prompt: args.prompt,
                     }))
                     .await?
@@ -1874,10 +1910,28 @@ impl AgentMcp {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("groups {action} requires a `group` name"))?
             .to_string();
+        let combined_agent = {
+            let mut list = Vec::new();
+            if let Some(a) = args.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                list.push(a.to_string());
+            }
+            for item in args.agents {
+                let trimmed = item.trim();
+                if !trimmed.is_empty() {
+                    list.push(trimmed.to_string());
+                }
+            }
+            if list.is_empty() {
+                None
+            } else {
+                Some(list.join(","))
+            }
+        };
         let body = GroupActionRequest {
             action: action.to_string(),
             group,
-            agent: args.agent,
+            agent: combined_agent,
+            public: args.public,
         };
         let one: GroupView = self
             .client
@@ -1939,6 +1993,7 @@ impl AgentMcp {
             && args.description.is_none()
             && args.instructions.is_none()
             && args.role.is_none()
+            && args.public.is_none()
             && !args.clear.unwrap_or(false)
         {
             let resp: AgentsResponse = self.client.get_agents().await?;
@@ -1967,12 +2022,14 @@ impl AgentMcp {
         if args.description.is_some()
             || args.instructions.is_some()
             || args.role.is_some()
+            || args.public.is_some()
             || args.clear.unwrap_or(false)
         {
             let body = serde_json::json!({
                 "description": args.description,
                 "instructions": args.instructions,
                 "role": args.role,
+                "public": args.public,
                 "clear": args.clear.unwrap_or(false),
             });
             let updated: serde_json::Value = self

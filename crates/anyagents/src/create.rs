@@ -783,16 +783,14 @@ pub(crate) fn write_agent_instructions_with_continuity(
         let child_roster = anyagents_core::read_children_roster(data_dir, agent.id.as_str());
         if !roster.is_empty() || !child_roster.is_empty() || parent_name.is_some() {
             doc.push_str(
-                "\n## 2.1 Hierarchy & Strict Vertical Parent-Child Communication Protocol (`description` vs. `instructions`)\n\n\
+                "\n## 2.1 Hierarchy & Sub-Agent Communication Encapsulation (`description` vs. `instructions` & `public: false` Default)\n\n\
                  - **Two-Layer Identity Architecture**:\n\
                    - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in `agents({ \"action\": \"describe\", \"name\": \"all\" })` without leaking full system prompts.\n\
                    - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain private in Section 2 above so they never pollute other agents' context windows.\n\
-                 - **Strict Vertical Parent-Child Communication (Zero Peer-to-Peer Between Sub-Agents)**:\n\
-                   - **Allowed Recipients**: An agent may contact **only**:\n\
-                     1. Its own direct **Child Sub-Agents** (`to: [\"children\"]` or `to: [\"agent:<child>\"]`).\n\
-                     2. Its own direct **Parent Agent** (`to: [\"parent\"]` or `to: [\"agent:<parent>\"]`).\n\
-                     3. Another **Root Agent** only when the sender is itself a **Root Agent** (`parent_id == None`).\n\
-                   - **Forbidden Recipients (Enforced by Server 403)**: Sub-agents **cannot** message sibling/peer sub-agents (`peers`/`siblings` disabled) and **cannot** message another peer's sub-agents or skip hierarchy levels. If you discover a cross-domain issue or need another domain's help, report it to your **Parent Agent** (`to: [\"parent\"]`) with concrete evidence so your Parent routes or dispatches it.\n\
+                 - **Sub-Agent Communication Encapsulation (`public: false` Default)**:\n\
+                   - **Default Private Sub-Agents (`public: false`)**: Newly spawned sub-agents default to `public: false` so unrelated agents cannot DM or interfere with a working sub-agent. By default, a sub-agent can only be messaged by its direct **Parent Agent** (`to: [\"parent\"]` / `to: [\"agent:<parent>\"]`), its own direct **Child Sub-Agents** (`to: [\"children\"]` / `to: [\"agent:<child>\"]`), or members of a **shared Group or Channel**.\n\
+                   - **Parent Opt-In (`public: true` / `allow_external: true`)**: A Parent Agent can set `public: true` when spawning a sub-agent (`agents({ \"action\": \"spawn\", ..., \"public\": true })`) or at any time via `describe` (`agents({ \"action\": \"describe\", \"name\": \"<child>\", \"public\": true })`) to allow external agents to DM that sub-agent directly or invite it into virtual groups.\n\
+                   - **Virtual Groups (`groups`) & External Channels (`Telegram`)**: Agents in the same internal virtual group (`group:<name>`, created/joined via `groups({ \"action\": \"join\", \"group\": \"<topic>\", \"agent\": \"<name>\" })`) or the same external Telegram chat can always communicate freely with each other.\n\
                    - **Group Chat Discipline**: When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
             );
             if let Some(parent) = parent_name {

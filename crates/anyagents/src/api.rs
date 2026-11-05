@@ -132,6 +132,10 @@ pub struct CreateAgentRequest {
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "allow_external")]
+    pub public: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 }
@@ -153,6 +157,8 @@ pub struct GroupMemberView {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GroupView {
     pub name: String,
+    #[serde(default)]
+    pub public: bool,
     pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roster: Vec<GroupMemberView>,
@@ -163,12 +169,14 @@ pub struct GroupsResponse {
     pub groups: Vec<GroupView>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GroupActionRequest {
     pub action: String,
     pub group: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "allow_external")]
+    pub public: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

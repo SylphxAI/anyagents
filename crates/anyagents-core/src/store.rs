@@ -85,6 +85,22 @@ impl Agent {
         let truncated: String = first_line.chars().take(300).collect();
         Some(truncated)
     }
+
+    /// Whether this sub-agent has been explicitly opted in (`public: true` / `ANYAGENTS_PUBLIC=1`)
+    /// by its Parent Agent to accept external messages and group invites.
+    pub fn is_public_subagent(&self) -> bool {
+        self.launch_env
+            .iter()
+            .find(|(k, _)| k == "ANYAGENTS_PUBLIC")
+            .is_some_and(|(_, v)| matches!(v.trim(), "1" | "true" | "yes" | "public"))
+    }
+
+    /// Whether this agent accepts direct messages and group invites from agents
+    /// outside its direct parent/child lineage. Root agents are always public (`true`);
+    /// sub-agents default to `false` (`private`) unless their Parent sets `public: true`.
+    pub fn is_public(&self) -> bool {
+        self.parent_id.is_none() || self.is_public_subagent()
+    }
 }
 
 /// Fields for `agents.create`. The harness value is a catalog key.
@@ -549,6 +565,10 @@ impl Store {
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (agent_id, chat_id, message_id)
             );",
+        );
+        let _ = conn.execute(
+            "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
+            [],
         );
         let _ = ensure_lexical_fts_backfilled(&mut conn);
         Ok(Self {
@@ -1147,10 +1167,9 @@ impl Store {
         let author = sender
             .as_deref()
             .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
-        let author_agent = author
+        let author_id = author
             .as_deref()
-            .and_then(|a| self.agent_by_name(a).ok());
-        let author_id = author_agent.as_ref().map(|ag| ag.id.clone());
+            .and_then(|a| self.agent_by_name(a).ok().map(|ag| ag.id));
         let members = self.room_members(room)?;
         let mut delivered = Vec::new();
         for agent in self.list_agents()? {
@@ -1163,19 +1182,26 @@ impl Store {
             {
                 continue;
             }
-            if let Some(ref sa) = author_agent {
-                let allowed = sa.parent_id.as_ref() == Some(&agent.id)
-                    || agent.parent_id.as_ref() == Some(&sa.id)
-                    || (sa.parent_id.is_none() && agent.parent_id.is_none());
-                if !allowed {
-                    continue;
-                }
-            }
             if let Some(members) = &members
                 && !members.iter().any(|name| name == &agent.name)
             {
                 continue;
             }
+            let default_room_reply = incoming.reply_to.clone().or_else(|| {
+                let clean = room
+                    .strip_prefix("group:")
+                    .or_else(|| room.strip_prefix("telegram:chat:"))
+                    .or_else(|| room.strip_prefix("chat:"))
+                    .unwrap_or(room);
+                if clean == "all"
+                    || clean == "peers"
+                    || clean.split(':').next().unwrap_or(clean).parse::<i64>().is_ok()
+                {
+                    None
+                } else {
+                    Some(format!("group:{clean}"))
+                }
+            });
             let mut one = Incoming {
                 text: incoming.text.clone(),
                 sender: sender.clone(),
@@ -1184,7 +1210,7 @@ impl Store {
                     .source_key
                     .as_ref()
                     .map(|key| format!("room:{room}:{key}")),
-                reply_to: incoming.reply_to.clone(),
+                reply_to: default_room_reply,
                 quote: incoming.quote.clone(),
                 origin: incoming.origin,
                 received_at_ms: incoming.received_at_ms,
@@ -1281,6 +1307,43 @@ impl Store {
             params![name, agent_id.as_str()],
         )?;
         Ok(())
+    }
+
+    /// Remove an agent from all non-system virtual groups (`group_agents`, excluding `owners`)
+    /// when an ephemeral sub-agent is archived or deleted.
+    pub fn leave_all_groups(&self, agent_id: &AgentId) -> Result<(), Error> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM group_agents WHERE agent_id = ?1 AND group_name != 'owners'",
+            [agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Set whether a named virtual group is `public` (`true` = open to any public agent;
+    /// `false` = private/invite-only to group members and their parents).
+    pub fn set_group_public(&self, name: &str, public: bool) -> Result<(), Error> {
+        if name.is_empty() || name.contains(':') || name.chars().any(char::is_whitespace) {
+            return Err(Error::Message(format!("invalid group name: {name}")));
+        }
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO groups (name, created_at_ms, public) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET public = excluded.public",
+            params![name, now_ms(), i32::from(public)],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a named virtual group is `public` (`true`) or `private` (`false`, default).
+    pub fn is_group_public(&self, name: &str) -> bool {
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT public FROM groups WHERE name = ?1",
+            [name],
+            |r| Ok(r.get::<_, i64>(0)? != 0),
+        )
+        .unwrap_or(false)
     }
 
     /// The agents in a named group, by name. An unknown group is empty.
@@ -2886,6 +2949,83 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Set whether a sub-agent accepts external messages from agents outside its
+    /// direct parent/child lineage (`ANYAGENTS_PUBLIC=1` in `launch_env`).
+    pub fn set_agent_public(&self, agent_id: &AgentId, public: bool) -> Result<Agent, Error> {
+        let agent = self.agent(agent_id)?;
+        let mut env: Vec<(String, String)> = agent
+            .launch_env
+            .into_iter()
+            .filter(|(k, _)| k != "ANYAGENTS_PUBLIC")
+            .collect();
+        if public {
+            env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
+        }
+        self.set_agent_launch_env(agent_id, &env)
+    }
+
+    /// Returns `true` when `agent_a` and `agent_b` are members of at least one shared
+    /// internal virtual group (`group_agents`) or attached to the same Telegram chat.
+    pub fn share_any_group_or_chat(&self, agent_a: &AgentId, agent_b: &AgentId) -> bool {
+        let shares_group = {
+            let conn = self.conn();
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM group_agents g1
+                     JOIN group_agents g2 ON g1.group_name = g2.group_name
+                     WHERE g1.agent_id = ?1 AND g2.agent_id = ?2
+                 )",
+                params![agent_a.as_str(), agent_b.as_str()],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+        };
+        if shares_group {
+            return true;
+        }
+        let Ok(channels) = self.list_channels() else {
+            return false;
+        };
+        let mut chats_a = std::collections::HashSet::new();
+        let mut chats_b = std::collections::HashSet::new();
+        for ch in channels {
+            let has_a = ch.agents.iter().any(|id| id == agent_a);
+            let has_b = ch.agents.iter().any(|id| id == agent_b);
+            if !has_a && !has_b {
+                continue;
+            }
+            for (_, chat_id) in telegram_chat_links(&ch.state) {
+                if has_a {
+                    chats_a.insert(chat_id);
+                }
+                if has_b {
+                    chats_b.insert(chat_id);
+                }
+            }
+        }
+        chats_a.iter().any(|cid| chats_b.contains(cid))
+    }
+
+    /// Stateful reply capability: returns `true` if `from_agent` has previously sent a direct
+    /// message to `to_agent`, allowing `to_agent` to reply back even if `from_agent` is `public: false`.
+    pub fn has_messaged(&self, from_agent: &Agent, to_agent: &Agent) -> bool {
+        let dest_name = format!("agent:{}", to_agent.name);
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM outbound_messages
+                 WHERE agent_id = ?1 AND (destination = ?2 OR destination = ?3)
+             )",
+            params![
+                from_agent.id.as_str(),
+                dest_name,
+                to_agent.id.as_str()
+            ],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
     }
 
     /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
@@ -4861,7 +5001,7 @@ fn resolve_conversation_participants(
                 }
             }
         } else if let Ok(mut stmt) =
-            conn.prepare("SELECT agent_id FROM group_members WHERE group_name = ?1")
+            conn.prepare("SELECT agent_id FROM group_agents WHERE group_name = ?1")
             && let Ok(mut rows) = stmt.query([group_name])
         {
             while let Ok(Some(row)) = rows.next() {

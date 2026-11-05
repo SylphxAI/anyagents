@@ -1450,6 +1450,7 @@ pub fn join_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), Er
             action: "join".to_string(),
             group: group.to_string(),
             agent: Some(agent_id.to_string()),
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let _ = client::call::<GroupView>(
@@ -1471,6 +1472,7 @@ pub fn leave_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), E
             action: "leave".to_string(),
             group: group.to_string(),
             agent: Some(agent_id.to_string()),
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let _ = client::call::<GroupView>(
@@ -1493,6 +1495,7 @@ pub fn group_members(data: &Path, group: &str) -> Result<Vec<String>, Error> {
             action: "members".to_string(),
             group: group.to_string(),
             agent: None,
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let resp = client::call::<GroupView>(
