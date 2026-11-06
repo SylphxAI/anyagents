@@ -2822,13 +2822,7 @@ async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    if matches!(principal, Principal::Operator) {
-        // allowed
-    } else if let Principal::Agent { ref agent_id, .. } = principal
-        && state.store.agent(agent_id).is_err()
-    {
-        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-    }
+    require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
     let channels: Vec<_> = state
         .store
         .list_channels()
