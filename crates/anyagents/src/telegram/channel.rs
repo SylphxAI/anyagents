@@ -1922,6 +1922,7 @@ fn handle_managed_bot_event(
 /// Request a new Telegram Managed Bot (`https://t.me/newbot/<manager_bot>/<bot_username>?name=...`)
 /// or immediately bind an existing Managed Bot (`bot_id` via `getManagedBotToken`), existing spare
 /// channel (`bot_username`), or raw `token` to `target_agent`.
+#[allow(clippy::too_many_arguments)]
 pub fn request_or_bind_telegram_channel(
     store: &Store,
     data_dir: &std::path::Path,
@@ -2267,9 +2268,9 @@ pub fn sync_agent_telegram_bot_name(
             .collect()
     };
 
-    static SYNCED_PROFILES: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, (String, String, String)>>,
-    > = std::sync::OnceLock::new();
+    type SyncedProfileMap = std::collections::HashMap<String, (String, String, String)>;
+    static SYNCED_PROFILES: std::sync::OnceLock<std::sync::Mutex<SyncedProfileMap>> =
+        std::sync::OnceLock::new();
     let cache =
         SYNCED_PROFILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let desired = (bot_name.clone(), short_desc.clone(), full_desc.clone());
