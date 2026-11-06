@@ -7706,6 +7706,9 @@ mod tests {
             seat_user: None,
             seat_uid: None,
             seat_gid: None,
+            scope: child.scope().to_string(),
+            relationship: None,
+            can_message: None,
             schedules: Vec::new(),
         }];
 

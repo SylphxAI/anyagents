@@ -481,6 +481,34 @@ fn spawn_admin_sylphx_delivery(
                 Ok(mut harness) => {
                     let mut had_err = false;
                     let mut completed_any = false;
+                    let mut recorded_usage = anyagents_harness::TurnUsage::default();
+                    let flush_harness_usage =
+                        |harness: &crate::vendor::VendorHarness,
+                         recorded: &mut anyagents_harness::TurnUsage| {
+                            let served = anyagents_harness::Harness::last_usage(harness);
+                            let diff = served.difference(recorded.clone());
+                            if diff.input_tokens > 0 || diff.output_tokens > 0 {
+                                let _ = store.record_usage(anyagents_core::NewUsage {
+                                    agent_id: agent.id.clone(),
+                                    harness: agent.harness.clone(),
+                                    model: agent.model.clone(),
+                                    input_tokens: i64::try_from(diff.input_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    output_tokens: i64::try_from(diff.output_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    cache_read_tokens: i64::try_from(diff.cache_read_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    cache_write_tokens: i64::try_from(diff.cache_write_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    reported_cost_micros: diff.reported_cost_micros,
+                                    estimated_cost_micros: None,
+                                    billing_mode: anyagents_core::BillingMode::Subscription,
+                                    quota_state: None,
+                                    day: anyagents_core::utc_day(now_ms()),
+                                });
+                                *recorded = served;
+                            }
+                        };
                     while store.has_actionable_undelivered(&agent.id).unwrap_or(false) {
                         let Ok(Some(message)) = store.next_undelivered(&agent.id) else {
                             break;
@@ -525,6 +553,7 @@ fn spawn_admin_sylphx_delivery(
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
+                                flush_harness_usage(&harness, &mut recorded_usage);
                                 let turn_err = anyagents_harness::Harness::health(&harness)
                                     .sign_in_fault
                                     .or_else(|| {
@@ -554,6 +583,7 @@ fn spawn_admin_sylphx_delivery(
                                 crate::vendor::persist_last_error(&cfg, None, None);
                             }
                             Ok(_) => {
+                                flush_harness_usage(&harness, &mut recorded_usage);
                                 let _ = store.note_turn_completed(&agent.id);
                                 break;
                             }
@@ -610,6 +640,7 @@ fn spawn_admin_sylphx_delivery(
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
+                                flush_harness_usage(&harness, &mut recorded_usage);
                                 let turn_err = anyagents_harness::Harness::health(&harness)
                                     .sign_in_fault
                                     .or_else(|| {
@@ -638,7 +669,9 @@ fn spawn_admin_sylphx_delivery(
                                     crate::vendor::persist_last_error(&cfg, None, None);
                                 }
                             }
-                            Ok(_) => {}
+                            Ok(_) => {
+                                flush_harness_usage(&harness, &mut recorded_usage);
+                            }
                             Err(err) => {
                                 had_err = true;
                                 let err_msg = err.to_string();
@@ -655,6 +688,7 @@ fn spawn_admin_sylphx_delivery(
                             }
                         }
                     }
+                    flush_harness_usage(&harness, &mut recorded_usage);
                     if completed_any && !had_err && agent.parent_id.is_some() {
                         let _ = store.complete_idle_subagent(&agent.id);
                     }
@@ -2550,6 +2584,8 @@ struct DescriptionRequest {
     instructions: Option<String>,
     #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
     #[serde(default)]
@@ -2580,17 +2616,7 @@ async fn get_description_route(
                 .agent_by_name(&name)
                 .map_err(ApiError::from_store)?
         };
-        let can_read_private = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { agent_id, .. } => {
-                *agent_id == rec.id
-                    || rec.parent_id.as_ref() == Some(agent_id)
-                    || state
-                        .store
-                        .agent(agent_id)
-                        .is_ok_and(|caller| caller.is_admin)
-            }
-        };
+        let can_read_private = can_actor_read_agent_private(&state.store, &principal, &rec);
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         let system_prompt = if can_read_private {
@@ -2602,6 +2628,7 @@ async fn get_description_route(
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
+            "scope": rec.scope(),
             "public": rec.is_public(),
             "harness": rec.harness,
             "model": rec.model,
@@ -2628,6 +2655,7 @@ async fn set_description_route(
             && body.description.is_none()
             && body.instructions.is_none()
             && body.role.is_none()
+            && body.scope.is_none()
             && body.public.is_none()
             && !body.clear.unwrap_or(false)
         {
@@ -2657,9 +2685,9 @@ async fn set_description_route(
         };
         let is_self_or_parent = match &principal {
             Principal::Agent { agent_id, .. } => {
-                *agent_id == target.id || target.parent_id.as_ref() == Some(agent_id)
+                is_self_or_ancestor(&state.store, agent_id, &target)
             }
-            Principal::Operator => false,
+            Principal::Operator => true,
         };
         if !is_self_or_parent {
             require_admin_or_operator(
@@ -2670,12 +2698,22 @@ async fn set_description_route(
             )?;
         }
         let mut rec = target;
-        if let Some(pub_val) = body.public {
-            let is_parent = match &principal {
-                Principal::Agent { agent_id, .. } => rec.parent_id.as_ref() == Some(agent_id),
-                Principal::Operator => true,
-            };
-            if !is_parent {
+        let is_ancestor = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                *agent_id != rec.id && is_self_or_ancestor(&state.store, agent_id, &rec)
+            }
+            Principal::Operator => true,
+        };
+        if let Some(ref scope_val) = body.scope {
+            if !is_ancestor {
+                require_admin_or_operator(&state.store, &principal, "agents.scope", &rec.name)?;
+            }
+            rec = state
+                .store
+                .set_agent_scope(&rec.id, scope_val)
+                .map_err(ApiError::from_store)?;
+        } else if let Some(pub_val) = body.public {
+            if !is_ancestor {
                 require_admin_or_operator(&state.store, &principal, "agents.public", &rec.name)?;
             }
             rec = state
@@ -2684,7 +2722,9 @@ async fn set_description_route(
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref role_str) = body.role {
-            require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+            if !is_ancestor {
+                require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+            }
             rec = state
                 .store
                 .set_agent_role(&rec.id, Some(role_str.as_str()))
@@ -2722,6 +2762,11 @@ async fn set_description_route(
                         .set_agent_instructions(&rec.id, clean_opt)
                         .map_err(ApiError::from_store)?;
                 }
+                crate::telegram::sync_agent_telegram_bot_name(
+                    &state.store,
+                    state.store.data_dir(),
+                    &rec,
+                );
             }
             if let Some(ref inst) = body.instructions {
                 let trimmed = inst.trim();
@@ -2740,16 +2785,12 @@ async fn set_description_route(
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         create::sync_agent_description_files(&state.store, &rec, &cfg);
-        if rec.parent_id.is_none()
-            && (body.description.is_some() || body.role.is_some() || body.clear.unwrap_or(false))
-        {
-            create::sync_all_agent_instructions(&state.store, state.store.data_dir());
-        }
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
+            "scope": rec.scope(),
             "public": rec.is_public(),
             "aliases": aliases,
             "description": rec.public_description(),
@@ -2781,17 +2822,96 @@ async fn channels_route(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-    let channels: Vec<_> = state.store.list_channels().map_err(ApiError::from_store)?.into_iter().map(|c| serde_json::json!({"id": c.id.to_string(), "kind": c.kind, "agents": c.agents.iter().filter_map(|id| state.store.agent(id).ok().map(|a| a.name)).collect::<Vec<_>>()})).collect();
+    if matches!(principal, Principal::Operator) {
+        // allowed
+    } else if let Principal::Agent { ref agent_id, .. } = principal {
+        if state.store.agent(agent_id).is_err() {
+            require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
+        }
+    }
+    let channels: Vec<_> = state
+        .store
+        .list_channels()
+        .map_err(ApiError::from_store)?
+        .into_iter()
+        .map(|c| {
+            let mem = anyagents_channel_telegram::Memory::from_state(&c.state);
+            let bot_username = c
+                .identity
+                .clone()
+                .or_else(|| {
+                    mem.bot
+                        .as_deref()
+                        .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
+                })
+                .map(|u| {
+                    let clean = u.trim().trim_start_matches('@');
+                    format!("@{clean}")
+                });
+            let agents: Vec<String> = c
+                .agents
+                .iter()
+                .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
+                .collect();
+            serde_json::json!({
+                "id": c.id.to_string(),
+                "kind": c.kind,
+                "bot": bot_username,
+                "agents": agents,
+                "pending_managed_bots": mem.pending_managed_bots,
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({"channels": channels})))
 }
 
+fn default_channel_kind() -> String {
+    "telegram".to_string()
+}
+
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ChannelRequest {
+    #[serde(default = "default_channel_kind")]
     kind: String,
     agent: String,
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default, alias = "managed_bot_id", alias = "user_id")]
+    bot_id: Option<i64>,
+    #[serde(
+        default,
+        alias = "username",
+        alias = "suggested_username",
+        alias = "bot"
+    )]
+    bot_username: Option<String>,
+    #[serde(default)]
+    manager: Option<String>,
+    #[serde(default)]
+    replace_token: Option<bool>,
+}
+
+fn is_self_or_ancestor(
+    store: &Store,
+    caller_id: &anyagents_core::AgentId,
+    target: &anyagents_core::Agent,
+) -> bool {
+    if caller_id == &target.id {
+        return true;
+    }
+    let mut cursor = target.parent_id.clone();
+    let mut depth = 0usize;
+    while let Some(pid) = cursor {
+        if &pid == caller_id {
+            return true;
+        }
+        cursor = store.agent(&pid).ok().and_then(|a| a.parent_id);
+        depth += 1;
+        if depth > 16 {
+            break;
+        }
+    }
+    false
 }
 
 async fn add_channel_route(
@@ -2799,40 +2919,58 @@ async fn add_channel_route(
     State(state): State<AppState>,
     Json(body): Json<ChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
-    if body.kind != "telegram"
-        || body.token.trim().is_empty()
-        || body
-            .token
-            .trim()
-            .chars()
-            .any(|c| c.is_whitespace() || c == '/')
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid channel kind or token",
-        ));
-    }
-    let agent = state
-        .store
-        .agent_by_name(&body.agent)
-        .map_err(ApiError::from_store)?;
-    crate::channel::record(
-        &state.store,
-        state.store.data_dir(),
-        &body.kind,
-        &agent.id,
-        body.token.trim().as_bytes(),
-    )
-    .map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not record channel",
+    spawn_store(move || {
+        if body.kind != "telegram" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid channel kind",
+            ));
+        }
+        if let Some(ref tok) = body.token {
+            let trimmed = tok.trim();
+            if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c == '/') {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid channel kind or token",
+                ));
+            }
+        }
+        let target_clean = body.agent.trim().strip_prefix("agent:").unwrap_or(body.agent.trim());
+        let agent = state
+            .store
+            .agent_by_name(target_clean)
+            .map_err(ApiError::from_store)?;
+        let caller_agent = match &principal {
+            Principal::Agent { agent_id, .. } => state.store.agent(agent_id).ok(),
+            Principal::Operator => None,
+        };
+        let authorized_by_lineage = match &principal {
+            Principal::Agent { agent_id, .. } => is_self_or_ancestor(&state.store, agent_id, &agent),
+            Principal::Operator => true,
+        };
+        if !authorized_by_lineage {
+            require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
+        }
+        let result = crate::telegram::request_or_bind_telegram_channel(
+            &state.store,
+            state.store.data_dir(),
+            caller_agent.as_ref(),
+            &agent,
+            body.token.as_deref(),
+            body.bot_id,
+            body.bot_username.as_deref(),
+            body.manager.as_deref(),
+            body.replace_token.unwrap_or(false),
         )
-    })?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "kind": body.kind}),
-    ))
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("could not bind or request channel: {err}"),
+            )
+        })?;
+        Ok(Json(result))
+    })
+    .await
 }
 
 /// A loopback port the operating system picked, held open until the caller
@@ -3031,11 +3169,9 @@ async fn list_agents(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<AgentsResponse>, ApiError> {
-    // Any authenticated principal may see who is on the server. The operator
-    // sees the gateway origin; an agent learns it from its own start.
     let operator = principal.is_operator();
     spawn_store(move || {
-        let mut listed = list_agents_sync(&state)?;
+        let mut listed = list_agents_sync_for_principal(&state, &principal)?;
         if !operator {
             listed.0.gateway = None;
         }
@@ -3044,10 +3180,56 @@ async fn list_agents(
     .await
 }
 
-fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> {
+fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
+    if caller.id == target.id {
+        "self".to_string()
+    } else if caller.parent_id.as_ref() == Some(&target.id) {
+        "parent".to_string()
+    } else if target.parent_id.as_ref() == Some(&caller.id) {
+        "child".to_string()
+    } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
+        "sibling".to_string()
+    } else if is_self_or_ancestor(store, &target.id, caller) {
+        "ancestor".to_string()
+    } else if is_self_or_ancestor(store, &caller.id, target) {
+        "descendant".to_string()
+    } else if caller.parent_id.is_none() && target.parent_id.is_none() {
+        "peer".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn list_agents_sync_for_principal(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Json<AgentsResponse>, ApiError> {
+    let caller_agent = match principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => state.store.agent(agent_id).ok(),
+    };
     let mut agents = Vec::new();
     for agent in state.store.list_agents().map_err(ApiError::from_store)? {
-        agents.push(agent_view(&state.store, &state.health, &agent)?);
+        if let Some(ref caller) = caller_agent
+            && caller.is_isolated()
+            && !is_self_or_ancestor(&state.store, &caller.id, &agent)
+            && caller.parent_id.as_ref() != Some(&agent.id)
+            && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
+        {
+            continue;
+        }
+        let mut view = agent_view(&state.store, &state.health, &agent)?;
+        if let Some(ref caller) = caller_agent {
+            view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
+            view.can_message = Some(
+                can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
+                    .is_ok(),
+            );
+            if !can_actor_read_agent_private(&state.store, principal, &agent) {
+                view.instructions = None;
+            }
+        }
+        agents.push(view);
     }
     Ok(Json(AgentsResponse {
         agents,
@@ -3236,6 +3418,9 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         role: agent.role.clone(),
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: agent.scope().to_string(),
+        relationship: None,
+        can_message: None,
         harness: agent.harness.clone(),
         model: agent.model.clone(),
         live_harness,
@@ -3346,10 +3531,20 @@ async fn create_agent_route(
                     .map_err(ApiError::from_store)?;
             }
         }
-        if body.public == Some(true) {
+        if let Some(ref scope_val) = body.scope {
+            agent = state
+                .store
+                .set_agent_scope(&agent.id, scope_val)
+                .map_err(ApiError::from_store)?;
+        } else if body.public == Some(true) {
             agent = state
                 .store
                 .set_agent_public(&agent.id, true)
+                .map_err(ApiError::from_store)?;
+        } else if body.public == Some(false) {
+            agent = state
+                .store
+                .set_agent_public(&agent.id, false)
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref grp_raw) = body.group {
@@ -3527,12 +3722,14 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Ok(store) = Store::open(data_dir.join("state.db")) {
         let parent_id = store.agent(agent_id).ok().and_then(|a| a.parent_id);
-        if parent_id.is_some()
-            && let Ok(agent) = store.agent(agent_id)
-            && agent.role.as_deref().is_none_or(|r| r.trim().is_empty())
-        {
-            let bp = data_dir.join("browser-profiles").join(&agent.name);
-            remove_path_with_seat(&bp, seat_ids);
+        if let Ok(agent) = store.agent(agent_id) {
+            let _ = crate::browser::stop_profile(data_dir, &agent.name);
+            if parent_id.is_some()
+                && agent.role.as_deref().is_none_or(|r| r.trim().is_empty())
+            {
+                let bp = data_dir.join("browser-profiles").join(&agent.name);
+                remove_path_with_seat(&bp, seat_ids);
+            }
         }
         if let Ok(agents) = store.list_agents() {
             for other in agents {
@@ -4299,12 +4496,53 @@ async fn inbox(
 }
 
 async fn conversation_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
+        let mut effective_name = name.clone();
+        if let Principal::Agent { ref agent_id, .. } = principal
+            && let Ok(caller) = state.store.agent(agent_id)
+        {
+            if caller.is_isolated() {
+                if effective_name.eq_ignore_ascii_case("all")
+                    || effective_name == "*"
+                    || effective_name.eq_ignore_ascii_case("self")
+                {
+                    effective_name = caller.name.clone();
+                } else if let Ok(target) = state.store.agent_by_name(&effective_name) {
+                    if !is_self_or_ancestor(&state.store, &caller.id, &target) {
+                        return Err(ApiError::forbidden(format!(
+                            "isolated agent `{}` (`scope: isolated`) can only read its own or its descendants' conversation history",
+                            caller.name
+                        )));
+                    }
+                }
+            } else if !effective_name.eq_ignore_ascii_case("all")
+                && effective_name != "*"
+                && !effective_name.eq_ignore_ascii_case("self")
+                && let Ok(target) = state.store.agent_by_name(&effective_name)
+                && !is_self_or_ancestor(&state.store, &caller.id, &target)
+            {
+                let allowed = !target.is_isolated()
+                    && (caller.parent_id.is_none()
+                        || (caller.allows_sibling_messages()
+                            && caller.parent_id == target.parent_id)
+                        || target.is_public()
+                        || state.store.share_any_group_or_chat(&caller.id, &target.id));
+                if !allowed {
+                    return Err(ApiError::forbidden(format!(
+                        "agent `{}` cannot read private conversation history of `{}` (`scope: {}`)",
+                        caller.name,
+                        target.name,
+                        target.scope()
+                    )));
+                }
+            }
+        }
+        let name = effective_name;
         let clean_q = query
             .query
             .as_deref()
@@ -5216,15 +5454,31 @@ impl SendPlan {
     }
 }
 
-/// Enforces sub-agent communication encapsulation:
-/// - Any agent can message:
+fn can_actor_read_agent_private(
+    store: &Store,
+    principal: &Principal,
+    target: &anyagents_core::Agent,
+) -> bool {
+    match principal {
+        Principal::Operator => true,
+        Principal::Agent { agent_id, .. } => {
+            is_self_or_ancestor(store, agent_id, target)
+                || store
+                    .agent(agent_id)
+                    .is_ok_and(|caller| caller.is_admin && caller.parent_id.is_none())
+        }
+    }
+}
+
+/// Enforces sub-agent communication encapsulation across scopes (`isolated`, `private`, `siblings`, `public`):
+/// - An `isolated` sub-agent can only message itself, its direct parent, its own direct children, or a shared group/chat.
+/// - Otherwise, any agent can message:
 ///   1. Itself (`sender.id == recipient.id`)
 ///   2. Its own direct Child Sub-Agents (`recipient.parent_id == Some(sender.id)`)
 ///   3. Its own direct Parent Agent (`sender.parent_id == Some(recipient.id)`)
-///   4. Any Root Agent or Sub-Agent whose Parent opted in to external messages (`recipient.is_public()`)
-///   5. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
-/// - Otherwise (`recipient` is a private sub-agent with `public: false`, and `sender` has no direct
-///   parent-child relationship and shares no group/channel with `recipient`), the send is refused (`403 Forbidden`).
+///   4. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
+///   5. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
+///   6. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -5239,10 +5493,32 @@ fn can_actor_message_agent(
     if sender.id == recipient.id
         || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
-        || recipient.is_public_subagent()
-        || (recipient.parent_id.is_none() && sender.is_public())
-        || store.share_any_group_or_chat(&sender.id, &recipient.id)
+    {
+        return Ok(());
+    }
+    if sender.is_isolated() || recipient.is_isolated() {
+        let sender_parent = sender
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
+            .unwrap_or_else(|| "parent".to_string());
+        return Err(ApiError::forbidden(format!(
+            "sub-agent `{}` or `{}` is isolated (`scope: isolated`) and only communicates 1-to-1 with its direct parent and children; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
+            sender.name, recipient.name
+        )));
+    }
+    if store.share_any_group_or_chat(&sender.id, &recipient.id)
         || store.has_messaged(recipient, &sender)
+    {
+        return Ok(());
+    }
+    let same_parent_siblings = sender.parent_id.is_some()
+        && sender.parent_id == recipient.parent_id
+        && sender.allows_sibling_messages()
+        && recipient.allows_sibling_messages();
+    if same_parent_siblings
+        || recipient.is_public_subagent()
+        || (recipient.parent_id.is_none() && sender.allows_sibling_messages())
     {
         return Ok(());
     }
