@@ -626,7 +626,7 @@ enum ChannelsCommand {
         manager: Option<String>,
     },
     /// Generate a Telegram Bot API 9.6 `https://t.me/newbot/<manager>/<bot>?name=...` creation link and register pending auto-binding for `--agent`.
-    #[command(visible_alias = "new-bot", alias = "request-bot")]
+    #[command(visible_alias = "new-bot", alias = "request_bot")]
     RequestBot {
         #[arg(long)]
         agent: String,
