@@ -8,9 +8,7 @@
 
 use std::path::Path;
 
-use anyagents_core::{
-    Address, CredentialStore, Error, FileCredentialStore, Incoming, NewChannel, Quote, Store,
-};
+use anyagents_core::{Address, Error, Incoming, Quote, Store};
 
 use crate::agent::{named, open};
 use crate::api::{
@@ -598,26 +596,6 @@ pub fn add_channel_with_options(
         false,
     )?;
     println!("{out}");
-    Ok(())
-}
-
-pub(crate) fn record(
-    store: &Store,
-    data: &Path,
-    kind: &str,
-    agent_id: &anyagents_core::AgentId,
-    secret: &[u8],
-) -> Result<(), Error> {
-    let channel = store.create_channel(NewChannel {
-        kind: kind.to_string(),
-        identity: None,
-        config: "{}".to_string(),
-        credential_ref: None,
-    })?;
-    let credential_ref = format!("channels/{}", channel.id);
-    FileCredentialStore::new(data).write(&credential_ref, secret)?;
-    store.set_credential_ref(&channel.id, &credential_ref)?;
-    store.attach_channel(&channel.id, agent_id)?;
     Ok(())
 }
 

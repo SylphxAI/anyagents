@@ -2824,10 +2824,10 @@ async fn channels_route(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     if matches!(principal, Principal::Operator) {
         // allowed
-    } else if let Principal::Agent { ref agent_id, .. } = principal {
-        if state.store.agent(agent_id).is_err() {
-            require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-        }
+    } else if let Principal::Agent { ref agent_id, .. } = principal
+        && state.store.agent(agent_id).is_err()
+    {
+        require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
     }
     let channels: Vec<_> = state
         .store
@@ -4516,13 +4516,13 @@ async fn conversation_route(
                     || effective_name.eq_ignore_ascii_case("self")
                 {
                     effective_name = caller.name.clone();
-                } else if let Ok(target) = state.store.agent_by_name(&effective_name) {
-                    if !is_self_or_ancestor(&state.store, &caller.id, &target) {
-                        return Err(ApiError::forbidden(format!(
-                            "isolated agent `{}` (`scope: isolated`) can only read its own or its descendants' conversation history",
-                            caller.name
-                        )));
-                    }
+                } else if let Ok(target) = state.store.agent_by_name(&effective_name)
+                    && !is_self_or_ancestor(&state.store, &caller.id, &target)
+                {
+                    return Err(ApiError::forbidden(format!(
+                        "isolated agent `{}` (`scope: isolated`) can only read its own or its descendants' conversation history",
+                        caller.name
+                    )));
                 }
             } else if !effective_name.eq_ignore_ascii_case("all")
                 && effective_name != "*"

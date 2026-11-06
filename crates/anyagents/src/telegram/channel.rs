@@ -1675,19 +1675,17 @@ pub fn bind_agent_telegram_token(
                 let _ = store.detach_channel_agent(&other.id, &target_agent.id);
             }
         }
-        crate::channel::record(
-            store,
-            data_dir,
-            "telegram",
-            &target_agent.id,
-            token.as_bytes(),
-        )?;
-        store
-            .list_channels()?
-            .into_iter()
-            .find(|c| c.agents.contains(&target_agent.id))
-            .map(|c| c.id)
-            .ok_or_else(|| anyagents_core::Error::Message("channel was not recorded".into()))?
+        let channel = store.create_channel(anyagents_core::NewChannel {
+            kind: "telegram".to_string(),
+            identity: None,
+            config: "{}".to_string(),
+            credential_ref: None,
+        })?;
+        let cred_ref = format!("channels/{}", channel.id);
+        secrets.write(&cred_ref, token.as_bytes())?;
+        store.set_credential_ref(&channel.id, &cred_ref)?;
+        store.attach_channel(&channel.id, &target_agent.id)?;
+        channel.id
     };
 
     if let Some((bot_id, ref bot_username)) = resolved_identity {

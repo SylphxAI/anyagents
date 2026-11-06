@@ -2188,7 +2188,7 @@ impl AgentMcp {
             || args.instructions.is_some()
             || args.role.is_some()
             || args.scope.is_some()
-            || args.public.is_none().then(|| ()).is_none()
+            || args.public.is_some()
             || args.clear.unwrap_or(false)
         {
             let body = serde_json::json!({
