@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use anyagents_core::{Address, Error, Incoming, Quote, Store};
+use anyagents_core::{Address, Error, Incoming, Quote};
 
 use crate::agent::{named, open};
 use crate::api::{

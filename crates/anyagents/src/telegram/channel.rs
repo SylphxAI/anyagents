@@ -1798,17 +1798,17 @@ fn handle_managed_bot_event(
             }
         }
     }
-    if matched_target.is_none() && memory.pending_managed_bots.len() == 1 {
-        if let Some((k, target_ref)) = memory
+    if matched_target.is_none()
+        && memory.pending_managed_bots.len() == 1
+        && let Some((k, target_ref)) = memory
             .pending_managed_bots
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .next()
-        {
-            removed_pending.push(k.clone());
-            memory.pending_managed_bots.remove(&k);
-            matched_target = store.agent_by_name(&target_ref).ok();
-        }
+    {
+        removed_pending.push(k.clone());
+        memory.pending_managed_bots.remove(&k);
+        matched_target = store.agent_by_name(&target_ref).ok();
     }
 
     let creator_note = event
@@ -1817,8 +1817,8 @@ fn handle_managed_bot_event(
         .map(|n| format!(" by {n}"))
         .unwrap_or_default();
 
-    if let Some(target_agent) = matched_target {
-        if bind_agent_telegram_token(
+    if let Some(target_agent) = matched_target
+        && bind_agent_telegram_token(
             store,
             store.data_dir(),
             &target_agent,
@@ -1826,27 +1826,47 @@ fn handle_managed_bot_event(
             Some((event.bot_id, &event.bot_username)),
         )
         .is_ok()
-        {
-            let disp =
-                format_telegram_bot_display_name(&target_agent.name, target_agent.role.as_deref());
-            let notice = format!(
-                "[Telegram Managed Bot @{} (id={}) created{} and automatically bound to agent `{}` (`{}`). Display name synced to \"{}\" and `public = true` enabled.]",
-                event.bot_username,
-                event.bot_id,
-                creator_note,
-                target_agent.name,
-                target_agent.id,
-                disp
-            );
+    {
+        let disp =
+            format_telegram_bot_display_name(&target_agent.name, target_agent.role.as_deref());
+        let notice = format!(
+            "[Telegram Managed Bot @{} (id={}) created{} and automatically bound to agent `{}` (`{}`). Display name synced to \"{}\" and `public = true` enabled.]",
+            event.bot_username,
+            event.bot_id,
+            creator_note,
+            target_agent.name,
+            target_agent.id,
+            disp
+        );
+        let _ = store.receive(
+            manager_agent_id,
+            anyagents_core::Incoming {
+                text: notice.clone(),
+                sender: Some(format!("agent:{}", target_agent.name)),
+                source_time_ms: None,
+                source_key: Some(format!(
+                    "tg-managed-bot:{}:{}:{}",
+                    manager_channel.id, event.bot_id, event.update_id
+                )),
+                reply_to: None,
+                quote: None,
+                origin: None,
+                received_at_ms: None,
+            },
+        );
+        if &target_agent.id != manager_agent_id {
             let _ = store.receive(
-                manager_agent_id,
+                &target_agent.id,
                 anyagents_core::Incoming {
-                    text: notice.clone(),
-                    sender: Some(format!("agent:{}", target_agent.name)),
+                    text: notice,
+                    sender: store
+                        .agent(manager_agent_id)
+                        .ok()
+                        .map(|a| format!("agent:{}", a.name)),
                     source_time_ms: None,
                     source_key: Some(format!(
-                        "tg-managed-bot:{}:{}:{}",
-                        manager_channel.id, event.bot_id, event.update_id
+                        "tg-managed-bot-self:{}:{}:{}",
+                        target_agent.id, event.bot_id, event.update_id
                     )),
                     reply_to: None,
                     quote: None,
@@ -1854,29 +1874,8 @@ fn handle_managed_bot_event(
                     received_at_ms: None,
                 },
             );
-            if &target_agent.id != manager_agent_id {
-                let _ = store.receive(
-                    &target_agent.id,
-                    anyagents_core::Incoming {
-                        text: notice,
-                        sender: store
-                            .agent(manager_agent_id)
-                            .ok()
-                            .map(|a| format!("agent:{}", a.name)),
-                        source_time_ms: None,
-                        source_key: Some(format!(
-                            "tg-managed-bot-self:{}:{}:{}",
-                            target_agent.id, event.bot_id, event.update_id
-                        )),
-                        reply_to: None,
-                        quote: None,
-                        origin: None,
-                        received_at_ms: None,
-                    },
-                );
-            }
-            return true;
         }
+        return true;
     }
 
     // No pending target agent matched yet: store the managed bot channel unattached
@@ -1891,8 +1890,10 @@ fn handle_managed_bot_event(
         let secrets = FileCredentialStore::new(store.data_dir());
         if secrets.write(&cred_ref, new_bot_token.as_bytes()).is_ok() {
             let _ = store.set_credential_ref(&ch.id, &cred_ref);
-            let mut mem = Memory::default();
-            mem.bot = Some(format!("{}:{}", event.bot_id, clean_uname));
+            let mem = Memory {
+                bot: Some(format!("{}:{}", event.bot_id, clean_uname)),
+                ..Default::default()
+            };
             let _ = store.set_channel_state(&ch.id, &mem.to_state());
         }
     }
