@@ -622,6 +622,312 @@ pub fn parse_sylphx_model_and_effort(raw: Option<&str>) -> (String, Option<Strin
     (stripped, effort)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UpstreamGatewayKind {
+    SylphxResponses,
+    OpenAiChatCompletions {
+        provider: String,
+        user_agent: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ResolvedUpstreamEndpoint {
+    pub kind: UpstreamGatewayKind,
+    pub url: String,
+    pub api_key: String,
+    pub model_id: String,
+    pub reasoning_effort: Option<String>,
+}
+
+/// Returns `true` when the configured model belongs to an external OpenAI-compatible
+/// coding plan or provider (`kimi-code-plan/*`, `qwen-token-plan/*`, `glm-code-plan/*`,
+/// `minimax-code-plan/*`, `openrouter/*`) rather than Sylphx Cloud Gateway (`sylphx/*`).
+pub fn is_external_chat_provider_model(raw_model: Option<&str>, config_dir: &Path) -> bool {
+    let resolved = raw_model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("model")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+        });
+    let Some(m) = resolved else {
+        return false;
+    };
+    let base = m.split('#').next().unwrap_or(&m).trim();
+    matches!(
+        base.split_once('/').map(|(p, _)| p),
+        Some(
+            "kimi-code-plan"
+                | "qwen-token-plan"
+                | "glm-code-plan"
+                | "minimax-code-plan"
+                | "openrouter"
+        )
+    )
+}
+
+fn read_provider_key_from_dir(base: &Path, key_filenames: &[&str]) -> Option<String> {
+    for rel in key_filenames {
+        if let Ok(raw) = std::fs::read_to_string(base.join(rel)) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_external_provider_key(
+    config_dir: &Path,
+    env: &[(String, String)],
+    provider: &str,
+    env_keys: &[&str],
+    key_filenames: &[&str],
+) -> Option<String> {
+    for (k, v) in env {
+        if env_keys.iter().any(|ek| k == ek) && !v.trim().is_empty() {
+            return Some(v.trim().to_string());
+        }
+    }
+    for ek in env_keys {
+        if let Ok(v) = std::env::var(ek)
+            && !v.trim().is_empty()
+        {
+            return Some(v.trim().to_string());
+        }
+    }
+    let mut candidate_dirs = vec![config_dir.to_path_buf()];
+    let bound_profile = std::fs::read_to_string(config_dir.join(".anyagents-profile"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(data_dir) = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        if let Some(ref b) = bound_profile {
+            let prof_rel = if b.contains('/') {
+                b.clone()
+            } else {
+                format!("{provider}/{b}")
+            };
+            candidate_dirs.push(data_dir.join("profiles").join(prof_rel));
+        }
+        candidate_dirs.push(data_dir.join("profiles").join(provider).join("default"));
+        if let Ok(entries) = std::fs::read_dir(data_dir.join("profiles").join(provider)) {
+            let mut subdirs: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+            subdirs.sort();
+            for sd in subdirs {
+                if sd.is_dir() && !candidate_dirs.contains(&sd) {
+                    candidate_dirs.push(sd);
+                }
+            }
+        }
+    }
+    if let Some(home) = crate::sandbox::host_home_dir() {
+        candidate_dirs.push(home);
+    }
+    for dir in &candidate_dirs {
+        if let Some(k) = read_provider_key_from_dir(dir, key_filenames) {
+            return Some(k);
+        }
+    }
+    None
+}
+
+/// Resolves the upstream inference endpoint (`SylphxResponses` vs `OpenAiChatCompletions`)
+/// and credentials for `run_native_gateway_turn`.
+pub fn resolve_upstream_endpoint(
+    config_dir: &Path,
+    env: &[(String, String)],
+    raw_model: Option<&str>,
+) -> Result<ResolvedUpstreamEndpoint, String> {
+    let effective_model = raw_model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+                .ok()
+                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+                .and_then(|v| {
+                    v.get("model")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
+        });
+    let (stripped, reasoning_effort) =
+        parse_sylphx_model_and_effort(effective_model.as_deref());
+    if let Some((provider, submodel)) = stripped.split_once('/') {
+        match provider {
+            "kimi-code-plan" => {
+                let api_key = resolve_external_provider_key(
+                    config_dir,
+                    env,
+                    "kimi-code-plan",
+                    &["KIMI_CODE_PLAN_API_KEY", "KIMI_API_KEY"],
+                    &[
+                        ".config/opencode/kimi-code-plan.key",
+                        ".config/opencode/kimi.key",
+                        "kimi-code-plan.key",
+                        "kimi.key",
+                    ],
+                )
+                .ok_or_else(|| {
+                    "missing Kimi Code Plan API key (`.config/opencode/kimi-code-plan.key`)"
+                        .to_string()
+                })?;
+                return Ok(ResolvedUpstreamEndpoint {
+                    kind: UpstreamGatewayKind::OpenAiChatCompletions {
+                        provider: provider.to_string(),
+                        user_agent: Some("claude-code/1.0".to_string()),
+                    },
+                    url: "https://api.kimi.com/coding/v1/chat/completions".to_string(),
+                    api_key,
+                    model_id: submodel.to_string(),
+                    reasoning_effort,
+                });
+            }
+            "qwen-token-plan" => {
+                let api_key = resolve_external_provider_key(
+                    config_dir,
+                    env,
+                    "qwen-token-plan",
+                    &["QWEN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
+                    &[
+                        ".config/opencode/qwen-token-plan.key",
+                        ".config/opencode/qwen-coding-plan.key",
+                        "qwen-token-plan.key",
+                        "qwen-coding-plan.key",
+                    ],
+                )
+                .ok_or_else(|| {
+                    "missing Qwen Token Plan API key (`.config/opencode/qwen-token-plan.key`)"
+                        .to_string()
+                })?;
+                return Ok(ResolvedUpstreamEndpoint {
+                    kind: UpstreamGatewayKind::OpenAiChatCompletions {
+                        provider: provider.to_string(),
+                        user_agent: None,
+                    },
+                    url: "https://token-plan.maas.qwencloudapi.com/compatible-mode/v1/chat/completions"
+                        .to_string(),
+                    api_key,
+                    model_id: submodel.to_string(),
+                    reasoning_effort,
+                });
+            }
+            "glm-code-plan" => {
+                let api_key = resolve_external_provider_key(
+                    config_dir,
+                    env,
+                    "glm-code-plan",
+                    &["GLM_CODE_PLAN_API_KEY", "ZAI_API_KEY"],
+                    &[".config/opencode/glm-code-plan.key", "glm-code-plan.key"],
+                )
+                .ok_or_else(|| {
+                    "missing GLM Code Plan API key (`.config/opencode/glm-code-plan.key`)"
+                        .to_string()
+                })?;
+                return Ok(ResolvedUpstreamEndpoint {
+                    kind: UpstreamGatewayKind::OpenAiChatCompletions {
+                        provider: provider.to_string(),
+                        user_agent: None,
+                    },
+                    url: "https://api.z.ai/api/coding/paas/v4/chat/completions".to_string(),
+                    api_key,
+                    model_id: submodel.to_string(),
+                    reasoning_effort,
+                });
+            }
+            "minimax-code-plan" => {
+                let api_key = resolve_external_provider_key(
+                    config_dir,
+                    env,
+                    "minimax-code-plan",
+                    &["MINIMAX_CODE_PLAN_API_KEY", "MINIMAX_API_KEY"],
+                    &[
+                        ".config/opencode/minimax-code-plan.key",
+                        "minimax-code-plan.key",
+                    ],
+                )
+                .ok_or_else(|| {
+                    "missing MiniMax Code Plan API key (`.config/opencode/minimax-code-plan.key`)"
+                        .to_string()
+                })?;
+                return Ok(ResolvedUpstreamEndpoint {
+                    kind: UpstreamGatewayKind::OpenAiChatCompletions {
+                        provider: provider.to_string(),
+                        user_agent: None,
+                    },
+                    url: "https://api.minimax.io/v1/chat/completions".to_string(),
+                    api_key,
+                    model_id: submodel.to_string(),
+                    reasoning_effort,
+                });
+            }
+            "openrouter" => {
+                let api_key = resolve_external_provider_key(
+                    config_dir,
+                    env,
+                    "openrouter",
+                    &["OPENROUTER_API_KEY"],
+                    &[".config/opencode/openrouter.key", "openrouter.key"],
+                )
+                .ok_or_else(|| {
+                    "missing OpenRouter API key (`.config/opencode/openrouter.key`)".to_string()
+                })?;
+                return Ok(ResolvedUpstreamEndpoint {
+                    kind: UpstreamGatewayKind::OpenAiChatCompletions {
+                        provider: provider.to_string(),
+                        user_agent: None,
+                    },
+                    url: "https://openrouter.ai/api/v1/chat/completions".to_string(),
+                    api_key,
+                    model_id: submodel.to_string(),
+                    reasoning_effort,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    let api_key = resolve_sylphx_gateway_key(config_dir, env).ok_or_else(|| {
+        "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
+    })?;
+    let gateway_base = env
+        .iter()
+        .find(|(k, _)| k == "SYLPHX_GATEWAY_URL")
+        .map(|(_, v)| normalize_sylphx_gateway_url(v))
+        .or_else(|| {
+            std::env::var("SYLPHX_GATEWAY_URL")
+                .ok()
+                .map(|s| normalize_sylphx_gateway_url(&s))
+        })
+        .unwrap_or_else(|| DEFAULT_SYLPHX_GATEWAY_URL.to_string());
+    Ok(ResolvedUpstreamEndpoint {
+        kind: UpstreamGatewayKind::SylphxResponses,
+        url: format!("{gateway_base}/responses"),
+        api_key,
+        model_id: stripped,
+        reasoning_effort,
+    })
+}
+
 /// Normalizes legacy Sylphx AI hostnames (`api.models.sylphx.ai`, `models.sylphx.ai`,
 /// `ai.sylphx.com`, `api.sylphx.ai`) to the canonical `https://api.sylphx.com/v1`.
 pub fn normalize_sylphx_gateway_url(raw: &str) -> String {
@@ -681,7 +987,8 @@ pub(super) fn is_transient_gateway_failure(status: u16, body: &str) -> bool {
         Err(_) => true,
         Ok(val) => {
             let has_valid_output = val.get("error").is_none_or(Value::is_null)
-                && val.get("output").is_some_and(Value::is_array);
+                && (val.get("output").is_some_and(Value::is_array)
+                    || val.get("choices").is_some_and(Value::is_array));
             if has_valid_output || is_hard_quota {
                 return false;
             }
@@ -739,6 +1046,7 @@ fn parse_retry_after_ms(body: &str) -> Option<u64> {
 fn curl_post_json_once(
     url: &str,
     bearer_token: Option<&str>,
+    user_agent: Option<&str>,
     payload: &str,
 ) -> Result<(u16, String), String> {
     let mut req = shared_http_agent()
@@ -747,6 +1055,9 @@ fn curl_post_json_once(
     if let Some(tok) = bearer_token {
         req = req.header("authorization", &format!("Bearer {tok}"));
     }
+    if let Some(ua) = user_agent {
+        req = req.header("user-agent", ua);
+    }
     if let Ok(resp) = req.send(payload.as_bytes()) {
         let code = resp.status().as_u16();
         if let Ok(text) = resp.into_body().read_to_string() {
@@ -754,12 +1065,22 @@ fn curl_post_json_once(
         }
     }
 
-    curl_post_json_fallback(url, bearer_token, payload)
+    curl_post_json_fallback_with_ua(url, bearer_token, user_agent, payload)
 }
 
+#[allow(dead_code)]
 fn curl_post_json_fallback(
     url: &str,
     bearer_token: Option<&str>,
+    payload: &str,
+) -> Result<(u16, String), String> {
+    curl_post_json_fallback_with_ua(url, bearer_token, None, payload)
+}
+
+fn curl_post_json_fallback_with_ua(
+    url: &str,
+    bearer_token: Option<&str>,
+    user_agent: Option<&str>,
     payload: &str,
 ) -> Result<(u16, String), String> {
     let mut cmd = Command::new("curl");
@@ -776,6 +1097,9 @@ fn curl_post_json_fallback(
     ]);
     if let Some(tok) = bearer_token {
         cmd.arg("-H").arg(format!("Authorization: Bearer {tok}"));
+    }
+    if let Some(ua) = user_agent {
+        cmd.arg("-H").arg(format!("User-Agent: {ua}"));
     }
     // Conversation bodies can exceed the OS limit for one argv entry. Send
     // the exact serialized bytes through stdin instead of the command line.
@@ -817,6 +1141,15 @@ pub(super) fn curl_post_json(
     bearer_token: Option<&str>,
     body: &Value,
 ) -> Result<(u16, String), String> {
+    curl_post_json_with_headers(url, bearer_token, None, body)
+}
+
+pub(super) fn curl_post_json_with_headers(
+    url: &str,
+    bearer_token: Option<&str>,
+    user_agent: Option<&str>,
+    body: &Value,
+) -> Result<(u16, String), String> {
     let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
     let (max_retries, base_backoff_ms) = gateway_retry_policy();
     let jitter_seed = std::time::SystemTime::now()
@@ -826,7 +1159,7 @@ pub(super) fn curl_post_json(
         ^ (std::process::id() as u64);
     let mut attempt = 0u32;
     loop {
-        match curl_post_json_once(url, bearer_token, &payload) {
+        match curl_post_json_once(url, bearer_token, user_agent, &payload) {
             Ok((code, text)) => {
                 if attempt < max_retries && is_transient_gateway_failure(code, &text) {
                     let exp_ms = base_backoff_ms.saturating_mul(1u64 << attempt.min(4));

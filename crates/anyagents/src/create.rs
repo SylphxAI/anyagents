@@ -774,73 +774,27 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push('\n');
     }
 
-    if let Some(data_dir) = config
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-    {
-        let roster = anyagents_core::read_root_roster(data_dir);
-        let child_roster = anyagents_core::read_children_roster(data_dir, agent.id.as_str());
-        if !roster.is_empty() || !child_roster.is_empty() || parent_name.is_some() {
-            doc.push_str(
-                "\n## 2.1 Hierarchy & Sub-Agent Communication Encapsulation (`description` vs. `instructions` & `public: false` Default)\n\n\
-                 - **Two-Layer Identity Architecture**:\n\
-                   - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in `agents({ \"action\": \"describe\", \"name\": \"all\" })` without leaking full system prompts.\n\
-                   - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain private in Section 2 above so they never pollute other agents' context windows.\n\
-                 - **Sub-Agent Communication Encapsulation (`public: false` Default)**:\n\
-                   - **Default Private Sub-Agents (`public: false`)**: Newly spawned sub-agents default to `public: false` so unrelated agents cannot DM or interfere with a working sub-agent. By default, a sub-agent can only be messaged by its direct **Parent Agent** (`to: [\"parent\"]` / `to: [\"agent:<parent>\"]`), its own direct **Child Sub-Agents** (`to: [\"children\"]` / `to: [\"agent:<child>\"]`), or members of a **shared Group or Channel**.\n\
-                   - **Parent Opt-In (`public: true` / `allow_external: true`)**: A Parent Agent can set `public: true` when spawning a sub-agent (`agents({ \"action\": \"spawn\", ..., \"public\": true })`) or at any time via `describe` (`agents({ \"action\": \"describe\", \"name\": \"<child>\", \"public\": true })`) to allow external agents to DM that sub-agent directly or invite it into virtual groups.\n\
-                   - **Virtual Groups (`groups`) & External Channels (`Telegram`)**: Agents in the same internal virtual group (`group:<name>`, created/joined via `groups({ \"action\": \"join\", \"group\": \"<topic>\", \"agent\": \"<name>\" })`) or the same external Telegram chat can always communicate freely with each other.\n\
-                   - **Group Chat Discipline**: When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
-            );
-            if let Some(parent) = parent_name {
-                doc.push_str(&format!(
-                    "                 - **Your Direct Parent Agent**: `agent:{parent}` (send upward via `to: [\"parent\"]` or `to: [\"agent:{parent}\"]`)\n"
-                ));
-            } else if !roster.is_empty() {
-                doc.push_str(
-                    "                 - **Active Root Agent Roster (`agent:<name>` — `role` — `description`)**:\n",
-                );
-                for (peer_name, peer_role, peer_desc) in &roster {
-                    let marker = if peer_name == &agent.name {
-                        " *(you)*"
-                    } else {
-                        ""
-                    };
-                    let role_str = peer_role
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .map(|r| format!(" [{r}]"))
-                        .unwrap_or_default();
-                    let desc_str = peer_desc
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("(no public description set)");
-                    doc.push_str(&format!(
-                        "                   - `agent:{peer_name}`{role_str}{marker}: {desc_str}\n"
-                    ));
-                }
-            }
-            if !child_roster.is_empty() {
-                doc.push_str(
-                    "                 - **Your Direct Standing Domain Sub-Agents (`agent:<name>` — `role` — `description`)**:\n",
-                );
-                for (child_name, child_role, child_desc) in &child_roster {
-                    let role_str = child_role
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .map(|r| format!(" [{r}]"))
-                        .unwrap_or_default();
-                    let desc_str = child_desc
-                        .as_deref()
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("(no public description set)");
-                    doc.push_str(&format!(
-                        "                   - `agent:{child_name}`{role_str}: {desc_str}\n"
-                    ));
-                }
-            }
-        }
+    doc.push_str(
+        "\n## 2.1 Hierarchy, Event-Driven Topology & Scope Encapsulation\n\n\
+         - **Two-Layer Identity Architecture (`description` vs. `instructions`)**:\n\
+           - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in `agents({ \"action\": \"describe\", \"name\": \"all\" })` without leaking private instructions.\n\
+           - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain strictly private in Section 2 above (visible only to you and your ancestor supervisors).\n\
+         - **Event-Driven Topology (100% Static System Prompt + User-Message `<topology>` Events)**:\n\
+           - To keep your LLM prompt prefix KV cache 100% stable, dynamic peer/sibling/sub-agent rosters are **never** injected into this System Prompt.\n\
+           - Instead, your initial relationship snapshot arrives on your first user message inside `<topology event=\"initial\" self=\"...\" scope=\"...\" parent=\"...\" siblings=\"...\" children=\"...\" groups=\"...\" />`, and any subsequent changes (when a sibling, peer, standing child, or group is added or removed) arrive as incremental inbox events `<topology event=\"delta\" changes=\"+sibling: ...; -sibling: ...\" />`.\n\
+           - Every incoming `<message ...>` also carries `sender_rel=\"parent|sibling|child|peer|external_user\"` and `sender_role=\"...\"`.\n\
+         - **Orthogonal Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`) & External Channels**:\n\
+           - **`\"isolated\"` *(External Partner / Personal Liaison Bots)*:** Confined strictly to direct `parent`, own `children`, and bound external channels (e.g. Telegram). Cannot message or read siblings or other roots.\n\
+           - **`\"private\"` *(Default for Task Sub-Agents)*:** Only direct `parent`, own `children`, or members of a shared `group:<name>` can message it; reports upward via `to: [\"parent\"]`.\n\
+           - **`\"siblings\"` *(Default for Standing Domain Sub-Agents with a `role`)*:** Can freely collaborate with and message direct `parent`, own `children`, and sibling domain sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`), without crossing into another root manager's tree.\n\
+           - **`\"public\"` *(Root Agents & Cross-Tree Shared Services)*:** Reachable across the workspace.\n\
+           - **Downward-Only Supervision:** A parent/ancestor can inspect its descendants' `instructions` and `conversation` history, never the reverse (a child or sibling can never read its parent's or sibling's private instructions or private conversations).\n\
+           - **Group Chat Discipline:** When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
+    );
+    if let Some(parent) = parent_name {
+        doc.push_str(&format!(
+            "         - **Your Direct Parent Agent**: `agent:{parent}` (send upward via `to: [\"parent\"]` or `to: [\"agent:{parent}\"]`)\n"
+        ));
     }
 
     doc.push_str(
@@ -867,7 +821,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
            - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
-           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"agent:<direct-child>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Remember: sub-agents can only message their direct Parent Agent or their own direct Child Sub-Agents — never sibling sub-agents (`peers`/`siblings`) or another peer's sub-agents.\n\
+           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Standing domain sub-agents (`scope: \"siblings\"`) can message their `parent`, `children`, and reachable `siblings`; task sub-agents (`scope: \"private\"`) and external liaison assistants (`scope: \"isolated\"`) report upward to `parent` (or shared `group:<name>`).\n\
            - **Reactions, Poll Votes & Edits**: Pass `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]`), `\"check\"` / `\"uncheck\"`, `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"` along with `target` (or `reply_to`: `anyagents:reply:msg_...`) on `send`.\n\
          - **3. Memory, History & Zero-Embedding Lexical + Structured Search (`conversation` & `search` MCP Tools)**:\n\
            - Incoming messages are pushed automatically to your session — never poll an inbox. Every historical and live turn across all agents is stored lossless in the append-only store (`Raw-RAG`).\n\
@@ -1599,6 +1553,13 @@ pub(crate) fn seed_harness_credentials(
             ".config/sylphx/context.json",
             ".config/sylphx/key",
             ".config/opencode/sylphx.key",
+            ".config/opencode/kimi-code-plan.key",
+            ".config/opencode/kimi.key",
+            ".config/opencode/qwen-token-plan.key",
+            ".config/opencode/qwen-coding-plan.key",
+            ".config/opencode/glm-code-plan.key",
+            ".config/opencode/minimax-code-plan.key",
+            ".config/opencode/openrouter.key",
             ".config/opencode/opencode.json",
             "sylphx-agent.json",
         ],
@@ -2497,6 +2458,12 @@ pub(crate) fn configure_agent_runtime(
 ) -> Result<serde_json::Value, Error> {
     let existing = store.agent_by_name(name)?;
     let previous_harness = existing.harness.clone();
+    let resolved_model = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| existing.model.clone());
+    let config = agent_config_dir(data, &existing.id);
     let target_harness = match harness.map(str::trim) {
         Some("") => return Err(Error::Message("harness is empty".into())),
         Some("sylphx-agent" | "sylphx_agent") => "sylphx".to_string(),
@@ -2508,12 +2475,6 @@ pub(crate) fn configure_agent_runtime(
     {
         crate::install::record(data, &target_harness).map_err(Error::Message)?;
     }
-    let resolved_model = model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| existing.model.clone());
-    let config = agent_config_dir(data, &existing.id);
     let current_bound = bound_profile_name(&config);
 
     let (provider, profile_name) =
@@ -3859,7 +3820,7 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         ),
         "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan" | "minimax-code-plan" => (
             "coding-plan",
-            harnesses(&["opencode", "omp", "claude-code", "codex", "dsh"]),
+            harnesses(&["sylphx", "opencode", "omp", "claude-code", "codex", "dsh"]),
         ),
         "anthropic" => (
             "subscription",
@@ -4251,7 +4212,16 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
                         }
                     }
                 }
-                if provider == "sylphx" && !compatible_harnesses.iter().any(|h| h == "sylphx") {
+                if matches!(
+                    provider.as_str(),
+                    "sylphx"
+                        | "kimi-code-plan"
+                        | "qwen-token-plan"
+                        | "glm-code-plan"
+                        | "minimax-code-plan"
+                        | "openrouter"
+                ) && !compatible_harnesses.iter().any(|h| h == "sylphx")
+                {
                     compatible_harnesses.insert(0, "sylphx".to_string());
                 }
                 let (acct_email, acct_id) = extract_profile_account_identity(&prof_path, &provider);

@@ -414,20 +414,8 @@ impl SylphxSdkSession {
                 &[],
                 user_prompt,
             ),
-            SylphxExecutionMode::CloudOnly => run_cloud_session_turn(
-                &state,
-                &cancel_flag,
-                &self.config_dir,
-                &self.work_dir,
-                self.model.as_deref(),
-                &self.env,
-                &exe,
-                &[],
-                DEFAULT_SYLPHX_SANDBOX_PARENT,
-                user_prompt,
-            ),
-            SylphxExecutionMode::AutoCloudFirst => {
-                match run_cloud_session_turn(
+            SylphxExecutionMode::CloudOnly => {
+                let first = run_cloud_session_turn(
                     &state,
                     &cancel_flag,
                     &self.config_dir,
@@ -438,20 +426,81 @@ impl SylphxSdkSession {
                     &[],
                     DEFAULT_SYLPHX_SANDBOX_PARENT,
                     user_prompt,
-                ) {
+                );
+                match first {
                     Ok(u) => Ok(u),
-                    Err(e) if !crate::sandbox::is_isolated_test_env() => Err(e),
-                    Err(_) => run_native_gateway_turn(
-                        &state,
-                        &cancel_flag,
-                        &self.config_dir,
-                        &self.work_dir,
-                        self.model.as_deref(),
-                        &self.env,
-                        &exe,
-                        &[],
-                        user_prompt,
-                    ),
+                    Err(ref e) if crate::is_recoverable_cloud_session_lease_error(e) => {
+                        clear_persisted_cloud_session(&self.config_dir);
+                        run_cloud_session_turn(
+                            &state,
+                            &cancel_flag,
+                            &self.config_dir,
+                            &self.work_dir,
+                            self.model.as_deref(),
+                            &self.env,
+                            &exe,
+                            &[],
+                            DEFAULT_SYLPHX_SANDBOX_PARENT,
+                            user_prompt,
+                        )
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            SylphxExecutionMode::AutoCloudFirst => {
+                let first = run_cloud_session_turn(
+                    &state,
+                    &cancel_flag,
+                    &self.config_dir,
+                    &self.work_dir,
+                    self.model.as_deref(),
+                    &self.env,
+                    &exe,
+                    &[],
+                    DEFAULT_SYLPHX_SANDBOX_PARENT,
+                    user_prompt,
+                );
+                let resolved = match first {
+                    Ok(u) => Ok(u),
+                    Err(ref e) if crate::is_recoverable_cloud_session_lease_error(e) => {
+                        clear_persisted_cloud_session(&self.config_dir);
+                        run_cloud_session_turn(
+                            &state,
+                            &cancel_flag,
+                            &self.config_dir,
+                            &self.work_dir,
+                            self.model.as_deref(),
+                            &self.env,
+                            &exe,
+                            &[],
+                            DEFAULT_SYLPHX_SANDBOX_PARENT,
+                            user_prompt,
+                        )
+                    }
+                    Err(e) => Err(e),
+                };
+                match resolved {
+                    Ok(u) => Ok(u),
+                    Err(_) => {
+                        clear_persisted_cloud_session(&self.config_dir);
+                        {
+                            let mut g =
+                                state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            g.cloud_agent_id = None;
+                            g.cloud_session_id = None;
+                        }
+                        run_native_gateway_turn(
+                            &state,
+                            &cancel_flag,
+                            &self.config_dir,
+                            &self.work_dir,
+                            self.model.as_deref(),
+                            &self.env,
+                            &exe,
+                            &[],
+                            user_prompt,
+                        )
+                    }
                 }
             }
         }
