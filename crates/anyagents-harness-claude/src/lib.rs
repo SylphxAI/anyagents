@@ -612,9 +612,14 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
         return;
     }
     state.sign_in_fault = None;
-    for id in state.open.drain(..) {
+    for (idx, id) in state.open.drain(..).enumerate() {
         state.finished.insert(id.clone());
-        state.usages.push((id, usage.clone()));
+        let item_usage = if idx == 0 {
+            usage.clone()
+        } else {
+            TurnUsage::default()
+        };
+        state.usages.push((id, item_usage));
     }
     promote_followups(state);
 }

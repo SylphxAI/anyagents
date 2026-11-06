@@ -625,7 +625,7 @@ fn spawn_admin_sylphx_delivery(
                                                 sender: steered.sender.clone(),
                                                 reply_to: steered.reply_to.clone(),
                                                 source_time_ms: steered.source_time_ms,
-                                                context: anyagents_harness::Context::default(),
+                                                context: steered.context.clone(),
                                             };
                                             if anyagents_harness::Harness::deliver(
                                                 &mut harness,

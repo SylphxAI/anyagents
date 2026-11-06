@@ -14,6 +14,15 @@ pub struct AgentView {
     pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
+    #[serde(default)]
+    pub scope: String,
+    /// Structural relationship of this agent to the authenticated caller (`"self"`, `"parent"`, `"sibling"`, `"child"`, `"descendant"`, `"ancestor"`, `"peer"`, `"other"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+    /// Whether the authenticated caller is permitted to message this agent directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_message: Option<bool>,
     pub harness: String,
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +141,8 @@ pub struct CreateAgentRequest {
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "allow_external")]
     pub public: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -79,6 +79,18 @@ pub struct Inbound {
     pub source_time_s: i64,
 }
 
+/// A subordinate bot created or updated under this manager bot (`managed_bot` update
+/// or `managed_bot_created` service message in Telegram Bot API 9.6+).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBotEvent {
+    pub update_id: i64,
+    pub creator_id: Option<i64>,
+    pub creator_name: Option<String>,
+    pub bot_id: i64,
+    pub bot_username: String,
+    pub bot_first_name: Option<String>,
+}
+
 /// What the server does with one accepted update.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Routed {
@@ -106,6 +118,11 @@ pub enum Routed {
         chat_type: Option<String>,
         joined: bool,
     },
+    /// A subordinate bot managed by this bot was created or had its token updated (Bot API 9.6+).
+    ManagedBot {
+        agent: String,
+        event: ManagedBotEvent,
+    },
     /// Already seen: the same update, or our own post coming back.
     Dropped,
 }
@@ -122,6 +139,20 @@ struct Update {
     /// A reaction on a message in the chat changed (`message_reaction`).
     #[serde(default)]
     message_reaction: Option<TgMessageReactionUpdated>,
+    /// A bot managed by this bot was created or its token was updated (`managed_bot`, Bot API 9.6+).
+    #[serde(default)]
+    managed_bot: Option<TgManagedBotUpdated>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgManagedBotUpdated {
+    user: TgUser,
+    bot: TgUser,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct TgManagedBotCreated {
+    bot: TgUser,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -221,6 +252,9 @@ struct TgMessage {
     checklist: Option<TgChecklist>,
     #[serde(default)]
     dice: Option<TgDice>,
+    /// Service update when a user creates a managed bot via `KeyboardButtonRequestManagedBot` (Bot API 9.6+).
+    #[serde(default)]
+    managed_bot_created: Option<TgManagedBotCreated>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -827,6 +861,10 @@ pub struct Memory {
     /// The Telegram chats each agent answers in, and each chat's title.
     #[serde(default)]
     pub chats: Vec<ChatLink>,
+    /// Pending managed-bot bindings requested through this manager bot:
+    /// lowercase `bot_username` (without `@`) -> target `agent_id` or `agent_name`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub pending_managed_bots: std::collections::BTreeMap<String, String>,
 }
 
 /// One chat an agent answers in.
@@ -1000,6 +1038,26 @@ impl Poll {
                 });
                 continue;
             }
+            if let Some(mb) = update.managed_bot {
+                let key = format!("{bot}:{}", update.update_id);
+                if self.seen.iter().any(|k| k == &key) {
+                    out.push(Routed::Dropped);
+                    continue;
+                }
+                self.seen.push(key);
+                out.push(Routed::ManagedBot {
+                    agent: agent.to_string(),
+                    event: ManagedBotEvent {
+                        update_id: update.update_id,
+                        creator_id: Some(mb.user.id),
+                        creator_name: Some(mb.user.display_name()),
+                        bot_id: mb.bot.id,
+                        bot_username: mb.bot.username.unwrap_or_default(),
+                        bot_first_name: mb.bot.first_name,
+                    },
+                });
+                continue;
+            }
             if let Some(reaction) = update.message_reaction {
                 let emojis: Vec<String> = reaction
                     .new_reaction
@@ -1061,6 +1119,19 @@ impl Poll {
                 continue;
             }
             self.seen.push(key.clone());
+            if let Some(ref mbc) = message.managed_bot_created {
+                out.push(Routed::ManagedBot {
+                    agent: agent.to_string(),
+                    event: ManagedBotEvent {
+                        update_id: update.update_id,
+                        creator_id: message.from.as_ref().map(|u| u.id),
+                        creator_name: message.from.as_ref().map(TgUser::display_name),
+                        bot_id: mbc.bot.id,
+                        bot_username: mbc.bot.username.clone().unwrap_or_default(),
+                        bot_first_name: mbc.bot.first_name.clone(),
+                    },
+                });
+            }
             if !is_edited
                 && let Some(record) = self
                     .outbound
@@ -1144,7 +1215,7 @@ impl Poll {
             body: serde_json::json!({
                 "offset": self.offset,
                 "timeout": timeout_s,
-                "allowed_updates": ["message", "edited_message", "my_chat_member", "message_reaction"],
+                "allowed_updates": ["message", "edited_message", "my_chat_member", "message_reaction", "managed_bot"],
             }),
         }
     }
@@ -2255,11 +2326,41 @@ pub fn get_me() -> BotCall {
     }
 }
 
-/// The bot's id and user name from a `getMe` response.
+/// `getManagedBotToken` (Telegram Bot API 9.6+) to retrieve the HTTP API token
+/// of a subordinate bot managed by this bot.
+pub fn get_managed_bot_token(bot_user_id: i64) -> BotCall {
+    BotCall {
+        method: "getManagedBotToken".to_string(),
+        body: serde_json::json!({ "user_id": bot_user_id }),
+    }
+}
+
+/// `replaceManagedBotToken` (Telegram Bot API 9.6+) to revoke and regenerate
+/// the HTTP API token of a subordinate bot managed by this bot.
+pub fn replace_managed_bot_token(bot_user_id: i64) -> BotCall {
+    BotCall {
+        method: "replaceManagedBotToken".to_string(),
+        body: serde_json::json!({ "user_id": bot_user_id }),
+    }
+}
+
+/// Extract the subordinate bot token string from a `getManagedBotToken` or
+/// `replaceManagedBotToken` response.
+pub fn managed_bot_token_of(response: &str) -> Result<String, PollError> {
+    ok_result(response)?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| PollError::BadPayload("no token string in result".to_string()))
+}
+
+/// The bot's id, user name, and `can_manage_bots` capability from a `getMe` response.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BotIdentity {
     pub id: i64,
     pub username: String,
+    pub can_manage_bots: bool,
 }
 
 pub fn bot_identity(response: &str) -> Result<BotIdentity, PollError> {
@@ -2273,7 +2374,15 @@ pub fn bot_identity(response: &str) -> Result<BotIdentity, PollError> {
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| PollError::BadPayload("no result.username".to_string()))?
         .to_string();
-    Ok(BotIdentity { id, username })
+    let can_manage_bots = value
+        .get("can_manage_bots")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Ok(BotIdentity {
+        id,
+        username,
+        can_manage_bots,
+    })
 }
 
 /// The message id Telegram assigned to a `sendMessage` we made.
@@ -2320,8 +2429,8 @@ pub fn deliver_to_mailbox(
 ) -> Result<(), anyagents_core::Error> {
     match routed {
         Routed::Dropped => Ok(()),
-        // Membership is recorded by the caller, which owns the channel state.
-        Routed::Membership { .. } => Ok(()),
+        // Membership and ManagedBot are handled by the caller, which owns channel state & secrets.
+        Routed::Membership { .. } | Routed::ManagedBot { .. } => Ok(()),
         Routed::ToAgent { agent, inbound } => {
             let agent_id = anyagents_core::AgentId::parse(agent)?;
             store.receive(&agent_id, incoming_from(inbound))?;
@@ -2725,10 +2834,20 @@ mod tests {
             identity,
             BotIdentity {
                 id: 777,
-                username: "ada_bot".into()
+                username: "ada_bot".into(),
+                can_manage_bots: false,
             }
         );
         assert_eq!(get_me().method, "getMe");
+        let manager = bot_identity(
+            r#"{"ok":true,"result":{"id":888,"is_bot":true,"first_name":"Vulcan","username":"vulcan_bot","can_manage_bots":true}}"#,
+        )
+        .unwrap();
+        assert!(manager.can_manage_bots);
+        assert_eq!(
+            managed_bot_token_of(r#"{"ok":true,"result":"999:AAExampleManagedToken"}"#).unwrap(),
+            "999:AAExampleManagedToken"
+        );
     }
 
     #[test]

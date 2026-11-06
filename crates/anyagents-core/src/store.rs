@@ -86,20 +86,72 @@ impl Agent {
         Some(truncated)
     }
 
-    /// Whether this sub-agent has been explicitly opted in (`public: true` / `ANYAGENTS_PUBLIC=1`)
-    /// by its Parent Agent to accept external messages and group invites.
-    pub fn is_public_subagent(&self) -> bool {
-        self.launch_env
+    /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`):
+    /// - `"isolated"`: strictly confined to direct `parent`, own `children`, and bound external channels;
+    ///   cannot message or read siblings or other roots.
+    /// - `"private"` (default for task sub-agents without a standing `role`): only direct `parent`,
+    ///   own `children`, or shared `group:<name>` can message it; can message `public` agents.
+    /// - `"siblings"` (default for standing domain sub-agents with a `role` that are not `*-assistant`):
+    ///   reachable by `parent`, `children`, and sibling sub-agents under the same `parent` with
+    ///   `"siblings"` or `"public"` scope.
+    /// - `"public"` (default for Root Agents, or sub-agents with `public: true`): reachable across the workspace.
+    pub fn scope(&self) -> &'static str {
+        if let Some((_, v)) = self
+            .launch_env
+            .iter()
+            .find(|(k, _)| k == "ANYAGENTS_SCOPE")
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "isolated" | "none" => return "isolated",
+                "private" | "false" | "0" => return "private",
+                "siblings" | "sibling" | "team" => return "siblings",
+                "public" | "org" | "all" | "true" | "1" => return "public",
+                _ => {}
+            }
+        }
+        if let Some((_, v)) = self
+            .launch_env
             .iter()
             .find(|(k, _)| k == "ANYAGENTS_PUBLIC")
-            .is_some_and(|(_, v)| matches!(v.trim(), "1" | "true" | "yes" | "public"))
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "public" => return "public",
+                "siblings" | "sibling" | "team" => return "siblings",
+                "isolated" => return "isolated",
+                "0" | "false" | "no" | "private" => return "private",
+                _ => {}
+            }
+        }
+        if self.parent_id.is_none() {
+            "public"
+        } else if self.name.ends_with("-assistant") {
+            "isolated"
+        } else if self.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            "siblings"
+        } else {
+            "private"
+        }
+    }
+
+    pub fn is_isolated(&self) -> bool {
+        self.scope() == "isolated"
+    }
+
+    pub fn allows_sibling_messages(&self) -> bool {
+        matches!(self.scope(), "siblings" | "public")
+    }
+
+    /// Whether this sub-agent has been explicitly opted in (`public: true` / `ANYAGENTS_PUBLIC=1`)
+    /// by its Parent Agent to accept external messages and group invites across the workspace.
+    pub fn is_public_subagent(&self) -> bool {
+        self.parent_id.is_some() && self.scope() == "public"
     }
 
     /// Whether this agent accepts direct messages and group invites from agents
     /// outside its direct parent/child lineage. Root agents are always public (`true`);
     /// sub-agents default to `false` (`private`) unless their Parent sets `public: true`.
     pub fn is_public(&self) -> bool {
-        self.parent_id.is_none() || self.is_public_subagent()
+        self.parent_id.is_none() || self.scope() == "public"
     }
 }
 
@@ -564,6 +616,11 @@ impl Store {
                 body TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (agent_id, chat_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_topology_state (
+                agent_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
             );",
         );
         let _ = conn.execute(
@@ -1476,6 +1533,47 @@ impl Store {
         Ok(())
     }
 
+    /// Update a channel's external identity (e.g. Telegram `@username` or `id:username`).
+    pub fn set_channel_identity(
+        &self,
+        channel_id: &ChannelId,
+        identity: Option<&str>,
+    ) -> Result<(), Error> {
+        let clean = identity.map(str::trim).filter(|s| !s.is_empty());
+        let changed = self.conn().execute(
+            "UPDATE channels SET identity = ?2 WHERE id = ?1",
+            params![channel_id.as_str(), clean],
+        )?;
+        if changed == 0 {
+            return Err(Error::ChannelNotFound(channel_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Detach all agents currently bound to `channel_id` (used when re-assigning a channel).
+    pub fn detach_channel_agents(&self, channel_id: &ChannelId) -> Result<(), Error> {
+        let conn = self.conn();
+        channel_with(&conn, channel_id)?;
+        conn.execute(
+            "DELETE FROM channel_agents WHERE channel_id = ?1",
+            params![channel_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Detach one agent from `channel_id`.
+    pub fn detach_channel_agent(
+        &self,
+        channel_id: &ChannelId,
+        agent_id: &AgentId,
+    ) -> Result<(), Error> {
+        self.conn().execute(
+            "DELETE FROM channel_agents WHERE channel_id = ?1 AND agent_id = ?2",
+            params![channel_id.as_str(), agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// Append one message, or return the row already stored for this source key.
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
@@ -1668,12 +1766,24 @@ impl Store {
         });
         let participants =
             resolve_conversation_participants(&tx, chat_id_val, resolved_destination.as_deref());
+        let (sender_role, sender_rel) = resolve_sender_relationship_and_role(
+            &tx,
+            recipient_agent.as_ref(),
+            incoming.sender.as_deref(),
+        );
+        let topology = if event.as_deref() == Some("reaction_passive") {
+            None
+        } else {
+            compute_and_diff_topology_event(&tx, recipient_agent.as_ref(), received_at_ms)
+        };
         // The trusted header is built from the record that arrives, before any
         // field is moved into the row: the author, the channel, the chat and
         // topic, and the reply a bare answer reaches.
         let context = anyagents_harness::Context {
             sender: incoming.sender.clone(),
             sender_name: None,
+            sender_role,
+            sender_rel,
             recipient,
             channel: incoming
                 .sender
@@ -1691,6 +1801,7 @@ impl Store {
             reply_to_author,
             mentions,
             participants,
+            topology,
         };
         let message = Message {
             id: MessageId::generate(),
@@ -2951,19 +3062,36 @@ impl Store {
         Ok(())
     }
 
-    /// Set whether a sub-agent accepts external messages from agents outside its
-    /// direct parent/child lineage (`ANYAGENTS_PUBLIC=1` in `launch_env`).
-    pub fn set_agent_public(&self, agent_id: &AgentId, public: bool) -> Result<Agent, Error> {
+    /// Set the internal communication and discovery scope (`"isolated"`, `"private"`, `"siblings"`, or `"public"`).
+    pub fn set_agent_scope(&self, agent_id: &AgentId, scope: &str) -> Result<Agent, Error> {
+        let normalized = match scope.trim().to_ascii_lowercase().as_str() {
+            "isolated" | "none" => "isolated",
+            "private" | "false" | "0" => "private",
+            "siblings" | "sibling" | "team" => "siblings",
+            "public" | "org" | "all" | "true" | "1" => "public",
+            other => {
+                return Err(Error::Message(format!(
+                    "invalid scope `{other}`; expected `isolated`, `private`, `siblings`, or `public`"
+                )));
+            }
+        };
         let agent = self.agent(agent_id)?;
         let mut env: Vec<(String, String)> = agent
             .launch_env
             .into_iter()
-            .filter(|(k, _)| k != "ANYAGENTS_PUBLIC")
+            .filter(|(k, _)| k != "ANYAGENTS_PUBLIC" && k != "ANYAGENTS_SCOPE")
             .collect();
-        if public {
+        env.push(("ANYAGENTS_SCOPE".to_string(), normalized.to_string()));
+        if normalized == "public" {
             env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
         }
         self.set_agent_launch_env(agent_id, &env)
+    }
+
+    /// Set whether a sub-agent accepts external messages from agents outside its
+    /// direct parent/child lineage (`ANYAGENTS_PUBLIC=1` in `launch_env`).
+    pub fn set_agent_public(&self, agent_id: &AgentId, public: bool) -> Result<Agent, Error> {
+        self.set_agent_scope(agent_id, if public { "public" } else { "private" })
     }
 
     /// Returns `true` when `agent_a` and `agent_b` are members of at least one shared
@@ -5041,6 +5169,300 @@ fn resolve_conversation_participants(
     participants
 }
 
+fn format_agent_topology_tag(name: &str, role: Option<&str>) -> String {
+    match role.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => format!("agent:{name} [{r}]"),
+        None => format!("agent:{name}"),
+    }
+}
+
+fn xml_escape_attr_local(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn is_ancestor_in_conn(conn: &Connection, ancestor_id: &AgentId, target: &Agent) -> bool {
+    let mut cursor = target.parent_id.clone();
+    let mut depth = 0usize;
+    while let Some(pid) = cursor {
+        if &pid == ancestor_id {
+            return true;
+        }
+        depth += 1;
+        if depth > 32 {
+            break;
+        }
+        cursor = agent_by_id(conn, &pid).ok().and_then(|a| a.parent_id);
+    }
+    false
+}
+
+fn resolve_sender_relationship_and_role(
+    conn: &Connection,
+    recipient: Option<&Agent>,
+    sender: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(sender_raw) = sender.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    if sender_raw.starts_with("telegram:user:") {
+        return (None, Some("external_user".to_string()));
+    }
+    if sender_raw == "operator" {
+        return (None, Some("operator".to_string()));
+    }
+    let Some(sender_name) = sender_raw.strip_prefix("agent:") else {
+        return (None, None);
+    };
+    let Some(sender_id_str) = conn
+        .query_row(
+            "SELECT id FROM agents WHERE name = ?1",
+            [sender_name],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    else {
+        return (None, None);
+    };
+    let Ok(sender_id) = AgentId::parse(&sender_id_str) else {
+        return (None, None);
+    };
+    let Ok(sender_agent) = agent_by_id(conn, &sender_id) else {
+        return (None, None);
+    };
+    let sender_role = sender_agent
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let Some(rec) = recipient else {
+        return (sender_role, None);
+    };
+    let rel = if sender_agent.id == rec.id {
+        "self"
+    } else if rec.parent_id.as_ref() == Some(&sender_agent.id) {
+        "parent"
+    } else if sender_agent.parent_id.as_ref() == Some(&rec.id) {
+        "child"
+    } else if rec.parent_id.is_some() && rec.parent_id == sender_agent.parent_id {
+        "sibling"
+    } else if is_ancestor_in_conn(conn, &sender_agent.id, rec) {
+        "ancestor"
+    } else if is_ancestor_in_conn(conn, &rec.id, &sender_agent) {
+        "descendant"
+    } else {
+        "peer"
+    };
+    (sender_role, Some(rel.to_string()))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedTopologyState {
+    scope: String,
+    parent: Option<String>,
+    peers: Vec<String>,
+    children: Vec<String>,
+    groups: Vec<String>,
+}
+
+fn compute_and_diff_topology_event(
+    conn: &Connection,
+    recipient: Option<&Agent>,
+    now_ms: i64,
+) -> Option<String> {
+    let rec = recipient?;
+    let scope = rec.scope().to_string();
+    let parent = rec
+        .parent_id
+        .as_ref()
+        .and_then(|pid| agent_by_id(conn, pid).ok())
+        .map(|p| format_agent_topology_tag(&p.name, p.role.as_deref()));
+
+    let mut peers = Vec::new();
+    if rec.parent_id.is_none() {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM agents WHERE parent_id IS NULL AND state != 'archived' AND id != ?1 ORDER BY name ASC",
+        ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+        {
+            for id_str in rows.flatten() {
+                if let Ok(aid) = AgentId::parse(&id_str)
+                    && let Ok(peer) = agent_by_id(conn, &aid)
+                {
+                    peers.push(format_agent_topology_tag(&peer.name, peer.role.as_deref()));
+                }
+            }
+        }
+    } else if rec.allows_sibling_messages()
+        && let Some(ref pid) = rec.parent_id
+        && let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+        )
+        && let Ok(rows) = stmt.query_map(params![pid.as_str(), rec.id.as_str()], |r| {
+            r.get::<_, String>(0)
+        })
+    {
+        for id_str in rows.flatten() {
+            if let Ok(aid) = AgentId::parse(&id_str)
+                && let Ok(sib) = agent_by_id(conn, &aid)
+                && sib.allows_sibling_messages()
+            {
+                peers.push(format_agent_topology_tag(&sib.name, sib.role.as_deref()));
+            }
+        }
+    }
+
+    let mut children = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+    ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+    {
+        for id_str in rows.flatten() {
+            if let Ok(aid) = AgentId::parse(&id_str)
+                && let Ok(child) = agent_by_id(conn, &aid)
+            {
+                children.push(format_agent_topology_tag(&child.name, child.role.as_deref()));
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT group_name FROM group_agents WHERE agent_id = ?1 ORDER BY group_name ASC",
+    ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+    {
+        for g in rows.flatten() {
+            groups.push(format!("group:{g}"));
+        }
+    }
+
+    let current = PersistedTopologyState {
+        scope: scope.clone(),
+        parent: parent.clone(),
+        peers: peers.clone(),
+        children: children.clone(),
+        groups: groups.clone(),
+    };
+    let current_json = serde_json::to_string(&current).ok()?;
+
+    let prev_json: Option<String> = conn
+        .query_row(
+            "SELECT state_json FROM agent_topology_state WHERE agent_id = ?1",
+            [rec.id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+
+    match prev_json.and_then(|s| serde_json::from_str::<PersistedTopologyState>(&s).ok()) {
+        None => {
+            let _ = conn.execute(
+                "INSERT INTO agent_topology_state (agent_id, state_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (agent_id) DO UPDATE SET state_json = excluded.state_json, updated_at_ms = excluded.updated_at_ms",
+                params![rec.id.as_str(), current_json, now_ms],
+            );
+            let self_tag = format_agent_topology_tag(&rec.name, rec.role.as_deref());
+            let mut tag = format!(
+                "<topology event=\"initial\" self=\"{}\" scope=\"{}\"",
+                xml_escape_attr_local(&self_tag),
+                xml_escape_attr_local(&scope)
+            );
+            if let Some(ref p) = parent {
+                tag.push_str(&format!(" parent=\"{}\"", xml_escape_attr_local(p)));
+            }
+            if !peers.is_empty() {
+                let attr_name = if rec.parent_id.is_some() {
+                    "siblings"
+                } else {
+                    "peers"
+                };
+                tag.push_str(&format!(
+                    " {attr_name}=\"{}\"",
+                    xml_escape_attr_local(&peers.join(", "))
+                ));
+            }
+            if !children.is_empty() {
+                tag.push_str(&format!(
+                    " children=\"{}\"",
+                    xml_escape_attr_local(&children.join(", "))
+                ));
+            }
+            if !groups.is_empty() {
+                tag.push_str(&format!(
+                    " groups=\"{}\"",
+                    xml_escape_attr_local(&groups.join(", "))
+                ));
+            }
+            tag.push_str(" />");
+            Some(tag)
+        }
+        Some(prev) if prev == current => None,
+        Some(prev) => {
+            let _ = conn.execute(
+                "UPDATE agent_topology_state SET state_json = ?1, updated_at_ms = ?2 WHERE agent_id = ?3",
+                params![current_json, now_ms, rec.id.as_str()],
+            );
+            let mut changes = Vec::new();
+            if prev.scope != current.scope {
+                changes.push(format!("scope: {} -> {}", prev.scope, current.scope));
+            }
+            if prev.parent != current.parent {
+                changes.push(format!(
+                    "parent: {}",
+                    current.parent.as_deref().unwrap_or("none")
+                ));
+            }
+            let peer_label = if rec.parent_id.is_some() {
+                "sibling"
+            } else {
+                "peer"
+            };
+            for p in &current.peers {
+                if !prev.peers.contains(p) {
+                    changes.push(format!("+{peer_label}: {p}"));
+                }
+            }
+            for p in &prev.peers {
+                if !current.peers.contains(p) {
+                    changes.push(format!("-{peer_label}: {p}"));
+                }
+            }
+            for c in &current.children {
+                if !prev.children.contains(c) {
+                    changes.push(format!("+child: {c}"));
+                }
+            }
+            for c in &prev.children {
+                if !current.children.contains(c) {
+                    changes.push(format!("-child: {c}"));
+                }
+            }
+            for g in &current.groups {
+                if !prev.groups.contains(g) {
+                    changes.push(format!("+group: {g}"));
+                }
+            }
+            for g in &prev.groups {
+                if !current.groups.contains(g) {
+                    changes.push(format!("-group: {g}"));
+                }
+            }
+            if changes.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "<topology event=\"delta\" changes=\"{}\" />",
+                    xml_escape_attr_local(&changes.join("; "))
+                ))
+            }
+        }
+    }
+}
+
 fn has_quoted_block(text: &str) -> bool {
     text.contains("\n\n----- quoted message -----\n")
         || text.starts_with("----- quoted message -----\n")
@@ -6377,5 +6799,127 @@ mod tests {
         });
         let third_out = store.receive(&sage.id, third_webhook).unwrap();
         assert!(matches!(third_out, ReceiveOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn event_driven_topology_initial_delta_and_isolated_scope() {
+        let (_dir, store) = setup();
+        let argus = store
+            .create_agent(NewAgent {
+                name: "argus".to_string(),
+                role: Some("公司業務總管".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: None,
+            })
+            .unwrap();
+        let helios = store
+            .create_agent(NewAgent {
+                name: "helios".to_string(),
+                role: Some("產品與功能".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        let plutus = store
+            .create_agent(NewAgent {
+                name: "plutus".to_string(),
+                role: Some("商業化與營收".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(argus.scope(), "public");
+        assert_eq!(helios.scope(), "siblings");
+        assert_eq!(plutus.scope(), "siblings");
+
+        // 1. First message to helios from argus -> emits `<topology event="initial" ... />`
+        let mut m1 = Incoming::new("Start sprint");
+        m1.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg1) = store.receive(&helios.id, m1).unwrap() else {
+            panic!("expected new message");
+        };
+        assert_eq!(msg1.context.sender_rel.as_deref(), Some("parent"));
+        assert_eq!(msg1.context.sender_role.as_deref(), Some("公司業務總管"));
+        let topo1 = msg1.context.topology.as_deref().expect("initial topology");
+        assert!(topo1.contains("event=\"initial\""), "topo1={topo1}");
+        assert!(topo1.contains("scope=\"siblings\""), "topo1={topo1}");
+        assert!(topo1.contains("parent=\"agent:argus [公司業務總管]\""), "topo1={topo1}");
+        assert!(topo1.contains("agent:plutus [商業化與營收]"), "topo1={topo1}");
+
+        // 2. Second message with no topology change -> `topology` is None
+        let mut m2 = Incoming::new("Status check");
+        m2.sender = Some("agent:plutus".to_string());
+        let ReceiveOutcome::New(msg2) = store.receive(&helios.id, m2).unwrap() else {
+            panic!("expected new message");
+        };
+        assert_eq!(msg2.context.sender_rel.as_deref(), Some("sibling"));
+        assert!(msg2.context.topology.is_none(), "no delta expected when unchanged");
+
+        // 3. New standing sibling `sage` added -> next message to helios emits `<topology event="delta" ... />`
+        let sage = store
+            .create_agent(NewAgent {
+                name: "sage".to_string(),
+                role: Some("用戶體驗與設計".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        let mut m3 = Incoming::new("Design sync");
+        m3.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
+            panic!("expected new message");
+        };
+        let topo3 = msg3.context.topology.as_deref().expect("delta topology on add");
+        assert!(topo3.contains("event=\"delta\""), "topo3={topo3}");
+        assert!(topo3.contains("+sibling: agent:sage [用戶體驗與設計]"), "topo3={topo3}");
+
+        // 4. Archive `sage` -> next message to helios emits `-sibling: sage`
+        store.set_agent_state(&sage.id, "archived").unwrap();
+        let mut m4 = Incoming::new("After archive");
+        m4.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg4) = store.receive(&helios.id, m4).unwrap() else {
+            panic!("expected new message");
+        };
+        let topo4 = msg4.context.topology.as_deref().expect("delta topology on archive");
+        assert!(topo4.contains("-sibling: agent:sage [用戶體驗與設計]"), "topo4={topo4}");
+
+        // 5. External liaison `stanley-assistant` defaults to `scope = "isolated"` and sees no siblings
+        let stanley = store
+            .create_agent(NewAgent {
+                name: "stanley-assistant".to_string(),
+                role: Some("Stanley 專屬助手".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(stanley.scope(), "isolated");
+        let mut m5 = Incoming::new("Hello Stanley");
+        m5.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {
+            panic!("expected new message");
+        };
+        let topo5 = msg5.context.topology.as_deref().expect("initial topology for isolated");
+        assert!(topo5.contains("scope=\"isolated\""), "topo5={topo5}");
+        assert!(!topo5.contains("siblings="), "topo5={topo5}");
     }
 }

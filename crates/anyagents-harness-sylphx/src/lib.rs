@@ -90,7 +90,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message,
+    SteerSupport, TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
@@ -306,9 +306,17 @@ pub(crate) fn is_retryable_cloud_turn_error(err: &str) -> bool {
         || err.contains("stalled in")
 }
 
+fn compose_text(message: &OutboundMessage) -> String {
+    let mut context = message.context.clone();
+    if context.sender.is_none() {
+        context.sender = message.sender.clone();
+    }
+    compose_message(&message.id, &context, &message.text)
+}
+
 impl Harness for SylphxHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let marked = marked_message(&message.id, &message.text);
+        let marked = compose_text(message);
         if let Some(ref log_path) = self.fake_log {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
@@ -2191,16 +2199,24 @@ pub(crate) fn run_native_gateway_turn(
     let mut total_out: u64 = 0;
     let mut total_cache_read: u64 = 0;
     let mut total_cache_write: u64 = 0;
-    let mut sent_any_reply = false;
+    let mut unanswered_reply_target: Option<String> =
+        extract_envelope_sender(initial_user_message);
 
     let mut overflow_compacted_in_turn = false;
     for step in 0usize.. {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
-        drain_steered_messages(state, &transcript_path, &mut input_items);
+        drain_steered_messages(
+            state,
+            &transcript_path,
+            &mut input_items,
+            &mut unanswered_reply_target,
+        );
+        let (_, max_window_est_tokens, _) =
+            memory::resolve_context_window_for_transcript(&transcript_path);
         if input_items.len() > memory::WINDOW_MAX_ITEMS
-            || memory::estimate_items_tokens(&input_items) > memory::MAX_WINDOW_EST_TOKENS
+            || memory::estimate_items_tokens(&input_items) > max_window_est_tokens
         {
             input_items = load_transcript_input_items(&transcript_path);
             close_dangling_function_calls(&transcript_path, &mut input_items);
@@ -2396,8 +2412,10 @@ pub(crate) fn run_native_gateway_turn(
                 let parsed_args: Value =
                     serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
                 let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
-                if norm_fn == "send" {
-                    sent_any_reply = true;
+                if norm_fn == "send"
+                    && send_args_satisfy_target(&parsed_args, unanswered_reply_target.as_deref())
+                {
+                    unanswered_reply_target = None;
                 }
                 if matches!(norm_fn, "context_edit" | "context_prune") {
                     did_context_edit = true;
@@ -2551,7 +2569,30 @@ pub(crate) fn run_native_gateway_turn(
             continue;
         }
 
-        if drain_steered_messages(state, &transcript_path, &mut input_items) {
+        let content_text = assistant_texts.join("\n\n");
+        let trimmed_content = content_text.trim();
+        if !trimmed_content.is_empty()
+            && !trimmed_content.eq_ignore_ascii_case("NO_REPLY")
+            && let Some(reply_to) = unanswered_reply_target.take()
+        {
+            let _ = call_anyagents_mcp_tool(
+                mcp_command,
+                mcp_args,
+                env,
+                "send",
+                &json!({
+                    "to": reply_to,
+                    "text": trimmed_content,
+                }),
+            );
+        }
+
+        if drain_steered_messages(
+            state,
+            &transcript_path,
+            &mut input_items,
+            &mut unanswered_reply_target,
+        ) {
             continue;
         }
 
@@ -2565,22 +2606,6 @@ pub(crate) fn run_native_gateway_turn(
             continue;
         }
 
-        let content_text = assistant_texts.join("\n\n");
-        if !sent_any_reply
-            && !content_text.trim().is_empty()
-            && let Some(reply_to) = extract_envelope_sender(initial_user_message)
-        {
-            let _ = call_anyagents_mcp_tool(
-                mcp_command,
-                mcp_args,
-                env,
-                "send",
-                &json!({
-                    "to": reply_to,
-                    "text": content_text.trim(),
-                }),
-            );
-        }
         break;
     }
 
@@ -2879,12 +2904,14 @@ fn drain_steered_messages(
     state: &Arc<Mutex<SharedState>>,
     transcript_path: &Path,
     messages: &mut Vec<Value>,
+    unanswered_reply_target: &mut Option<String>,
 ) -> bool {
     let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
     if g.steer_queue.is_empty() {
         return false;
     }
     while let Some(steered) = g.steer_queue.pop_front() {
+        update_unanswered_reply_target(unanswered_reply_target, &steered);
         let msg = json!({
             "role": "user",
             "content": steered,
@@ -2896,12 +2923,64 @@ fn drain_steered_messages(
     true
 }
 
+fn update_unanswered_reply_target(current: &mut Option<String>, incoming_text: &str) {
+    if let Some(new_target) = extract_envelope_sender(incoming_text) {
+        if new_target.starts_with("telegram:")
+            || current
+                .as_deref()
+                .is_none_or(|c| !c.starts_with("telegram:"))
+        {
+            *current = Some(new_target);
+        }
+    }
+}
+
+fn send_args_satisfy_target(parsed_args: &Value, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if !expected.starts_with("telegram:") {
+        return true;
+    }
+    let chat_suffix = expected.rsplit(':').next().unwrap_or(expected);
+    let matches_addr = |s: &str| {
+        let t = s.trim();
+        t == expected
+            || t.starts_with("telegram:")
+            || (!chat_suffix.is_empty() && t.ends_with(chat_suffix))
+    };
+    if let Some(s) = parsed_args.get("to").and_then(Value::as_str)
+        && s.split(',').any(matches_addr)
+    {
+        return true;
+    }
+    if let Some(arr) = parsed_args.get("to").and_then(Value::as_array)
+        && arr
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|s| s.split(',').any(matches_addr))
+    {
+        return true;
+    }
+    false
+}
+
 fn extract_envelope_sender(text: &str) -> Option<String> {
+    if let Some(idx) = text.find("answer_to=\"") {
+        let rest = &text[idx + 11..];
+        if let Some(end) = rest.find('"') {
+            let dest = rest[..end].trim();
+            if !dest.is_empty() {
+                return Some(dest.to_string());
+            }
+        }
+    }
     let idx = text.find("from=\"")?;
     let rest = &text[idx + 6..];
     let end = rest.find('"')?;
     let sender = rest[..end].trim();
-    (!sender.is_empty()).then(|| sender.to_string())
+    (!sender.is_empty() && !sender.starts_with("schedule:") && sender != "unknown")
+        .then(|| sender.to_string())
 }
 
 fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {

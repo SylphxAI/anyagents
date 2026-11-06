@@ -474,39 +474,88 @@ fn print_messages(target: &str, read: InboxResponse) {
     }
 }
 
-/// `channels add` and `channels list`.
+/// `channels add`, `channels request-bot`, and `channels list`.
 pub fn channels(data: &Path, action: crate::ChannelsCommand) -> Result<(), Error> {
     match action {
         crate::ChannelsCommand::Add {
             kind,
             agent,
             token_file,
-        } => add_channel(data, &kind, &agent, &token_file),
+            bot_id,
+            bot_username,
+            manager,
+        } => add_channel_with_options(
+            data,
+            &kind,
+            &agent,
+            token_file.as_deref(),
+            bot_id,
+            bot_username.as_deref(),
+            manager.as_deref(),
+        ),
+        crate::ChannelsCommand::RequestBot {
+            agent,
+            bot_username,
+            manager,
+        } => add_channel_with_options(
+            data,
+            "telegram",
+            &agent,
+            None,
+            None,
+            bot_username.as_deref(),
+            manager.as_deref(),
+        ),
         crate::ChannelsCommand::List => list_channels(data),
     }
 }
 
 /// Record a channel and copy its secret into the credential store.
+#[allow(dead_code)]
 pub fn add_channel(
     data: &Path,
     kind: &str,
     agent_name: &str,
     token_file: &Path,
 ) -> Result<(), Error> {
+    add_channel_with_options(data, kind, agent_name, Some(token_file), None, None, None)
+}
+
+pub fn add_channel_with_options(
+    data: &Path,
+    kind: &str,
+    agent_name: &str,
+    token_file: Option<&Path>,
+    bot_id: Option<i64>,
+    bot_username: Option<&str>,
+    manager: Option<&str>,
+) -> Result<(), Error> {
     if kind != "telegram" {
         return Err(Error::Message(format!("unsupported channel kind: {kind}")));
     }
-    let token = std::fs::read(token_file)?;
-    let token =
-        String::from_utf8(token).map_err(|_| Error::Message("token file is not text".into()))?;
-    let token = token.trim();
-    if token.is_empty() || token.chars().any(|ch| ch.is_whitespace() || ch == '/') {
-        return Err(Error::Message(
-            "token is empty or contains whitespace or a slash".into(),
-        ));
-    }
+    let token_opt = if let Some(tf) = token_file {
+        let raw = std::fs::read(tf)?;
+        let text =
+            String::from_utf8(raw).map_err(|_| Error::Message("token file is not text".into()))?;
+        let trimmed = text.trim().to_string();
+        if trimmed.is_empty() || trimmed.chars().any(|ch| ch.is_whitespace() || ch == '/') {
+            return Err(Error::Message(
+                "token is empty or contains whitespace or a slash".into(),
+            ));
+        }
+        Some(trimmed)
+    } else {
+        None
+    };
     if client::can_call_server(data) {
-        let body = serde_json::json!({"kind": kind, "agent": agent_name, "token": token});
+        let body = serde_json::json!({
+            "kind": kind,
+            "agent": agent_name,
+            "token": token_opt,
+            "bot_id": bot_id,
+            "bot_username": bot_username,
+            "manager": manager,
+        });
         match client::call::<serde_json::Value>(
             data,
             "POST",
@@ -527,13 +576,28 @@ pub fn add_channel(
     }
     let store = open(data)?;
     let agent = store.agent_by_name(agent_name)?;
-    record(&store, data, kind, &agent.id, token.as_bytes())?;
-    let recorded = store
-        .list_channels()?
-        .into_iter()
-        .find(|channel| channel.agents.contains(&agent.id))
-        .ok_or_else(|| Error::Message("no channel was recorded".into()))?;
-    println!("{}\t{}", recorded.id, recorded.kind);
+    if let Some(ref token) = token_opt {
+        let _ = crate::telegram::bind_agent_telegram_token(&store, data, &agent, token, None)?;
+        let recorded = store
+            .list_channels()?
+            .into_iter()
+            .find(|channel| channel.agents.contains(&agent.id))
+            .ok_or_else(|| Error::Message("no channel was recorded".into()))?;
+        println!("{}\t{}", recorded.id, recorded.kind);
+        return Ok(());
+    }
+    let out = crate::telegram::request_or_bind_telegram_channel(
+        &store,
+        data,
+        None,
+        &agent,
+        None,
+        bot_id,
+        bot_username,
+        manager,
+        false,
+    )?;
+    println!("{out}");
     Ok(())
 }
 
