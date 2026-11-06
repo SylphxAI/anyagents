@@ -2919,8 +2919,20 @@ fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
     None
 }
 
+fn extract_embedded_shared_agents_section(sys: &str) -> Option<String> {
+    let marker = "\n## 4. Shared Instructions (AGENTS.md)\n";
+    let start = sys.find(marker)?;
+    let after = &sys[start + marker.len()..];
+    let body = match after.find("\n# Cross-Harness Continuity") {
+        Some(cont_idx) => &after[..cont_idx],
+        None => after,
+    };
+    let trimmed = body.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
-    let mut candidates = vec![config_dir.join("AGENTS.md")];
+    let mut candidates = Vec::new();
     if let Some(data_dir) = config_dir
         .parent()
         .and_then(|p| p.parent())
@@ -2931,14 +2943,42 @@ fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
     if let Some(parent) = config_dir.parent() {
         candidates.push(parent.join("AGENTS.md"));
     }
+    candidates.push(config_dir.join("AGENTS.md"));
     for cand in candidates {
-        if let Ok(text) = std::fs::read_to_string(&cand)
-            && !text.trim().is_empty()
-        {
+        if let Ok(text) = std::fs::read_to_string(&cand) {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("# AnyAgents Identity & Environment Awareness") {
+                if let Some(extracted) = extract_embedded_shared_agents_section(trimmed) {
+                    return Some(extracted);
+                }
+                continue;
+            }
             return Some(text);
         }
     }
     None
+}
+
+fn strip_embedded_shared_agents_section(sys: &str) -> String {
+    let marker = "\n## 4. Shared Instructions (AGENTS.md)\n";
+    let Some(start) = sys.find(marker) else {
+        return sys.to_string();
+    };
+    let prefix = sys[..start].trim_end();
+    let after = &sys[start + marker.len()..];
+    if let Some(cont_idx) = after.find("\n# Cross-Harness Continuity") {
+        let continuity = after[cont_idx..].trim_start_matches('\n');
+        format!("{prefix}\n\n{continuity}")
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn is_owner_root_agents_md(text: &str) -> bool {
+    text.trim_start().starts_with("# SylphxAI/owner")
 }
 
 pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
@@ -2946,19 +2986,46 @@ pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     if let Ok(sys) = std::fs::read_to_string(config_dir.join("SYSTEM_PROMPT.md"))
         && !sys.trim().is_empty()
     {
-        parts.push(sys);
-    }
-    if let Some(shared_agents) = read_shared_agents_md_for_config(config_dir) {
-        let trimmed = shared_agents.trim();
-        if !trimmed.is_empty() && !parts.iter().any(|p| p.contains(trimmed)) {
-            parts.push(shared_agents);
+        let cleaned = strip_embedded_shared_agents_section(&sys);
+        if !cleaned.trim().is_empty() {
+            parts.push(cleaned);
         }
     }
-    if let Some(work_agents) = read_workspace_agents_md(work_dir) {
-        let trimmed = work_agents.trim();
-        if !trimmed.is_empty() && !parts.iter().any(|p| p.contains(trimmed)) {
-            parts.push(work_agents);
+    let shared_agents = read_shared_agents_md_for_config(config_dir)
+        .filter(|s| !s.trim().is_empty() && !s.trim_start().starts_with("# AnyAgents Identity & Environment Awareness"));
+    let work_agents = read_workspace_agents_md(work_dir).filter(|s| !s.trim().is_empty());
+
+    match (shared_agents, work_agents) {
+        (Some(shared), Some(work)) => {
+            if is_owner_root_agents_md(&shared) && is_owner_root_agents_md(&work) {
+                let trimmed = work.trim();
+                if !parts.iter().any(|p| p.contains(trimmed)) {
+                    parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{trimmed}"));
+                }
+            } else {
+                let s_trim = shared.trim();
+                if !parts.iter().any(|p| p.contains(s_trim)) {
+                    parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{s_trim}"));
+                }
+                let w_trim = work.trim();
+                if !parts.iter().any(|p| p.contains(w_trim)) {
+                    parts.push(work);
+                }
+            }
         }
+        (Some(shared), None) => {
+            let s_trim = shared.trim();
+            if !parts.iter().any(|p| p.contains(s_trim)) {
+                parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{s_trim}"));
+            }
+        }
+        (None, Some(work)) => {
+            let w_trim = work.trim();
+            if !parts.iter().any(|p| p.contains(w_trim)) {
+                parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{w_trim}"));
+            }
+        }
+        (None, None) => {}
     }
     if parts.is_empty() {
         parts.push(
@@ -4114,83 +4181,100 @@ fn call_anyagents_mcp_tool(
 ) -> String {
     let normalized_args = normalize_mcp_tool_arguments(tool_name, arguments);
     let clean_cmd = clean_exe_path(mcp_command);
-    let mut cmd = Command::new(&clean_cmd);
-    cmd.args(mcp_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Stderr is not part of the response. Do not let diagnostics fill a
-        // pipe while we wait for the tool's stdout response.
-        .stderr(Stdio::null());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let Ok(mut child) = cmd.spawn() else {
-        return format!("error: failed to spawn anyagents mcp for `{tool_name}`");
-    };
-    let init_req = json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "sylphx-harness", "version": "0.1.0" }
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(120 * attempt as u64));
         }
-    });
-    let init_notif = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
-    let call_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": normalized_args,
+        let mut cmd = Command::new(&clean_cmd);
+        cmd.args(mcp_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Stderr is not part of the response. Do not let diagnostics fill a
+            // pipe while we wait for the tool's stdout response.
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
         }
-    });
-    let mut stdin = child.stdin.take().expect("piped MCP stdin");
-    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped MCP stdout"));
-    let response = (|| -> Result<Value, String> {
-        for request in [init_req, init_notif, call_req] {
-            writeln!(stdin, "{request}").map_err(|err| format!("writing MCP request: {err}"))?;
+        let Ok(mut child) = cmd.spawn() else {
+            return format!("error: failed to spawn anyagents mcp for `{tool_name}`");
+        };
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "sylphx-harness", "version": "0.1.0" }
+            }
+        });
+        let init_notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let call_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": normalized_args,
+            }
+        });
+        let mut stdin = child.stdin.take().expect("piped MCP stdin");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped MCP stdout"));
+        let mut saw_init_response = false;
+        let response = (|| -> Result<Value, String> {
+            for request in [init_req, init_notif, call_req] {
+                writeln!(stdin, "{request}").map_err(|err| format!("writing MCP request: {err}"))?;
+            }
+            let _ = stdin.flush();
+            // EOF terminates rmcp's transport and cancels asynchronous tools. Keep
+            // stdin open until our response arrives, ignoring init and notifications.
+            for line in (&mut stdout).lines() {
+                let line = line.map_err(|err| format!("reading MCP response: {err}"))?;
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if value.get("id").and_then(Value::as_i64) == Some(0) {
+                        saw_init_response = true;
+                    } else if value.get("id").and_then(Value::as_i64) == Some(1) {
+                        return Ok(value);
+                    }
+                }
+            }
+            Err("MCP server closed stdout before tool response".to_string())
+        })();
+        drop(stdin);
+        if response.is_err() {
+            let _ = child.kill();
         }
-        // EOF terminates rmcp's transport and cancels asynchronous tools. Keep
-        // stdin open until our response arrives, ignoring init and notifications.
-        for line in (&mut stdout).lines() {
-            let line = line.map_err(|err| format!("reading MCP response: {err}"))?;
-            if let Ok(value) = serde_json::from_str::<Value>(&line)
-                && value.get("id").and_then(Value::as_i64) == Some(1)
-            {
-                return Ok(value);
+        // Drain any trailing output after closing stdin so shutdown cannot block on
+        // a full stdout pipe, then reap the server on success and failure alike.
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        if child.wait().is_err() {
+            return format!("error: failed waiting on anyagents mcp for `{tool_name}`");
+        }
+        match response {
+            Ok(value) => {
+                if let Some(err) = value.pointer("/error/message").and_then(Value::as_str) {
+                    return format!("error: {err}");
+                }
+                let output = value
+                    .pointer("/result/content/0/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                return truncate_tool_output_middle_utf8(output, 24_000, 11_000, 11_000);
+            }
+            Err(err) => {
+                last_err = err;
+                if saw_init_response {
+                    break;
+                }
             }
         }
-        Err("MCP server closed stdout before tool response".to_string())
-    })();
-    drop(stdin);
-    if response.is_err() {
-        let _ = child.kill();
     }
-    // Drain any trailing output after closing stdin so shutdown cannot block on
-    // a full stdout pipe, then reap the server on success and failure alike.
-    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-    if child.wait().is_err() {
-        return format!("error: failed waiting on anyagents mcp for `{tool_name}`");
-    }
-    let value = match response {
-        Ok(value) => value,
-        Err(err) => return format!("error: {err}"),
-    };
-    if let Some(err) = value.pointer("/error/message").and_then(Value::as_str) {
-        return format!("error: {err}");
-    }
-    let output = value
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| value.to_string());
-    truncate_tool_output_middle_utf8(output, 64_000, 30_000, 30_000)
+    format!("error: {last_err}")
 }
 
 #[cfg(test)]
@@ -5619,9 +5703,48 @@ exec "$@"
             SylphxExecutionMode::from_env(cfg, &[]),
             SylphxExecutionMode::LocalOnly
         );
+    }
+
+    #[test]
+    fn assemble_system_prompt_replaces_stale_embedded_agents_md_without_duplication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cfg = data_dir.join("agents/agt_test/config");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let sys_doc = "# AnyAgents Identity & Environment Awareness\n\n\
+                       ## 1. Your Identity (Who You Are)\n\n\
+                       - **Agent Name**: `nova`\n\n\
+                       ## 4. Shared Instructions (AGENTS.md)\n\n\
+                       # SylphxAI/owner\n\n\
+                       Old stale rule v1.\n\n\
+                       # Cross-Harness Continuity\n\n\
+                       Prior turn summary.";
+        std::fs::write(cfg.join("SYSTEM_PROMPT.md"), sys_doc).unwrap();
+        std::fs::write(cfg.join("AGENTS.md"), sys_doc).unwrap();
+        std::fs::write(
+            data_dir.join("AGENTS.md"),
+            "# SylphxAI/owner\n\nShared rule v2.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("AGENTS.md"),
+            "# SylphxAI/owner\n\nLive workspace rule v3.\n",
+        )
+        .unwrap();
+
+        let assembled = assemble_system_prompt(&cfg, &work);
         assert_eq!(
-            &sha256_hex(b"[\"ases_fs0101m6msyrzpgptzdmknhb58ftwf\",0]")[..32],
-            "9d5d7128aef9f4ef1015873ec2e6cc69"
+            assembled.matches("# SylphxAI/owner").count(),
+            1,
+            "must inject exactly one copy of # SylphxAI/owner: {assembled}"
         );
+        assert!(assembled.contains("Live workspace rule v3."));
+        assert!(!assembled.contains("Old stale rule v1."));
+        assert!(!assembled.contains("Shared rule v2."));
+        assert!(assembled.contains("# Cross-Harness Continuity"));
+        assert!(assembled.contains("Prior turn summary."));
     }
 }

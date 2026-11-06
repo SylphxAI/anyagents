@@ -1058,26 +1058,28 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
 
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
-    let data_skills = data_dir.join("skills");
-    if let Ok(skills_dir) = std::fs::canonicalize(&data_skills)
-        && let Some(repo_root) = skills_dir.parent()
-        && repo_root.join(".git").exists()
-    {
-        let is_clean = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_root)
-            .args(["status", "--porcelain"])
-            .output()
-            .ok()
-            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-        if is_clean {
-            let _ = std::process::Command::new("git")
+    for rel in ["skills", "AGENTS.md"] {
+        let target_path = data_dir.join(rel);
+        if let Ok(resolved) = std::fs::canonicalize(&target_path)
+            && let Some(repo_root) = resolved.parent()
+            && repo_root.join(".git").exists()
+        {
+            let is_clean = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo_root)
-                .args(["pull", "--ff-only", "--quiet", "origin", "main"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+            if is_clean {
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_root)
+                    .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 }
@@ -2078,6 +2080,18 @@ pub(crate) fn reconcile_agent_runtime_config(
             "--config".to_string(),
             config.display().to_string(),
         ];
+        for (other_harness, stale_file) in [
+            ("opencode", "opencode.json"),
+            ("codex", "config.toml"),
+            ("muse", "settings.json"),
+            ("claude-code", ".claude.json"),
+            ("claude-code", "mcp.json"),
+            ("sylphx", "sylphx-agent.json"),
+        ] {
+            if agent.harness != other_harness {
+                let _ = std::fs::remove_file(config.join(stale_file));
+            }
+        }
         match agent.harness.as_str() {
             "codex" => {
                 let codex_toml = config.join("config.toml");

@@ -1170,6 +1170,7 @@ impl AgentMcp {
                         }
                     }
                 }
+                let total_matched = response.agents.len();
                 let running = response
                     .agents
                     .iter()
@@ -1195,12 +1196,28 @@ impl AgentMcp {
                     .iter()
                     .filter(|a| a.state == "archived")
                     .count();
+                let max_archived = args.limit.unwrap_or(25);
+                if archived > max_archived {
+                    let mut skip_archived = archived - max_archived;
+                    response.agents.retain(|a| {
+                        if a.state == "archived" && skip_archived > 0 {
+                            skip_archived -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                for a in &mut response.agents {
+                    a.instructions = None;
+                }
                 let mut val = serde_json::to_value(&response).map_err(|e| e.to_string())?;
                 if let Some(obj) = val.as_object_mut() {
                     obj.insert(
                         "summary".to_string(),
                         serde_json::json!({
-                            "total": response.agents.len(),
+                            "total": total_matched,
+                            "returned": response.agents.len(),
                             "running": running,
                             "working": working,
                             "errored": errored,
@@ -1676,6 +1693,7 @@ impl AgentMcp {
                         a.state.eq_ignore_ascii_case(st) || a.turn_state.eq_ignore_ascii_case(st)
                     });
                 }
+                let total_matched = resp.agents.len();
                 let running = resp.agents.iter().filter(|a| a.state == "running").count();
                 let working = resp
                     .agents
@@ -1689,10 +1707,26 @@ impl AgentMcp {
                     .count();
                 let paused = resp.agents.iter().filter(|a| a.state == "paused").count();
                 let archived = resp.agents.iter().filter(|a| a.state == "archived").count();
+                let max_archived = args.limit.unwrap_or(25);
+                if archived > max_archived {
+                    let mut skip_archived = archived - max_archived;
+                    resp.agents.retain(|a| {
+                        if a.state == "archived" && skip_archived > 0 {
+                            skip_archived -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                for a in &mut resp.agents {
+                    a.instructions = None;
+                }
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "parent": self.agent.name,
                     "summary": {
-                        "total": resp.agents.len(),
+                        "total": total_matched,
+                        "returned": resp.agents.len(),
                         "running": running,
                         "working": working,
                         "errored": errored,
