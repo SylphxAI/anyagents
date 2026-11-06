@@ -770,8 +770,7 @@ pub fn resolve_upstream_endpoint(
                         .map(str::to_string)
                 })
         });
-    let (stripped, reasoning_effort) =
-        parse_sylphx_model_and_effort(effective_model.as_deref());
+    let (stripped, reasoning_effort) = parse_sylphx_model_and_effort(effective_model.as_deref());
     if let Some((provider, submodel)) = stripped.split_once('/') {
         match provider {
             "kimi-code-plan" => {

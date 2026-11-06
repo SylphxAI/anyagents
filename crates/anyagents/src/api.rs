@@ -143,7 +143,11 @@ pub struct CreateAgentRequest {
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "allow_external")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "allow_external"
+    )]
     pub public: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
@@ -186,7 +190,11 @@ pub struct GroupActionRequest {
     pub group: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", alias = "allow_external")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "allow_external"
+    )]
     pub public: Option<bool>,
 }
 

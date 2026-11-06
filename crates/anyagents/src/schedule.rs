@@ -1223,10 +1223,7 @@ fn probe_github_pr_terminal(
     } else {
         Some((
             false,
-            format!(
-                "probe_error:gh_exit:{}",
-                out.status.code().unwrap_or(-1)
-            ),
+            format!("probe_error:gh_exit:{}", out.status.code().unwrap_or(-1)),
         ))
     };
     if let Ok(mut guard) = GH_PROBE_CACHE.lock() {

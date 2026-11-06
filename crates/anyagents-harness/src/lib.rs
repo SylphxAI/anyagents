@@ -192,10 +192,7 @@ impl Context {
             ));
         }
         if let Some(sender_rel) = &self.sender_rel {
-            out.push_str(&format!(
-                " sender_rel=\"{}\"",
-                xml_attr_escape(sender_rel)
-            ));
+            out.push_str(&format!(" sender_rel=\"{}\"", xml_attr_escape(sender_rel)));
         }
         if let Some(recipient) = &self.recipient {
             out.push_str(&format!(" to=\"{}\"", xml_attr_escape(recipient)));

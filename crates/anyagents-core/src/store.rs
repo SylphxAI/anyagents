@@ -96,11 +96,7 @@ impl Agent {
     ///   `"siblings"` or `"public"` scope.
     /// - `"public"` (default for Root Agents, or sub-agents with `public: true`): reachable across the workspace.
     pub fn scope(&self) -> &'static str {
-        if let Some((_, v)) = self
-            .launch_env
-            .iter()
-            .find(|(k, _)| k == "ANYAGENTS_SCOPE")
-        {
+        if let Some((_, v)) = self.launch_env.iter().find(|(k, _)| k == "ANYAGENTS_SCOPE") {
             match v.trim().to_ascii_lowercase().as_str() {
                 "isolated" | "none" => return "isolated",
                 "private" | "false" | "0" => return "private",
@@ -1252,7 +1248,12 @@ impl Store {
                     .unwrap_or(room);
                 if clean == "all"
                     || clean == "peers"
-                    || clean.split(':').next().unwrap_or(clean).parse::<i64>().is_ok()
+                    || clean
+                        .split(':')
+                        .next()
+                        .unwrap_or(clean)
+                        .parse::<i64>()
+                        .is_ok()
                 {
                     None
                 } else {
@@ -1395,11 +1396,9 @@ impl Store {
     /// Whether a named virtual group is `public` (`true`) or `private` (`false`, default).
     pub fn is_group_public(&self, name: &str) -> bool {
         let conn = self.conn();
-        conn.query_row(
-            "SELECT public FROM groups WHERE name = ?1",
-            [name],
-            |r| Ok(r.get::<_, i64>(0)? != 0),
-        )
+        conn.query_row("SELECT public FROM groups WHERE name = ?1", [name], |r| {
+            Ok(r.get::<_, i64>(0)? != 0)
+        })
         .unwrap_or(false)
     }
 
@@ -3146,11 +3145,7 @@ impl Store {
                  SELECT 1 FROM outbound_messages
                  WHERE agent_id = ?1 AND (destination = ?2 OR destination = ?3)
              )",
-            params![
-                from_agent.id.as_str(),
-                dest_name,
-                to_agent.id.as_str()
-            ],
+            params![from_agent.id.as_str(), dest_name, to_agent.id.as_str()],
             |r| r.get::<_, bool>(0),
         )
         .unwrap_or(false)
@@ -5329,9 +5324,9 @@ fn compute_and_diff_topology_event(
     }
 
     let mut groups = Vec::new();
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT group_name FROM group_agents WHERE agent_id = ?1 ORDER BY group_name ASC",
-    ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT group_name FROM group_agents WHERE agent_id = ?1 ORDER BY group_name ASC")
+        && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
     {
         for g in rows.flatten() {
             groups.push(format!("group:{g}"));
@@ -6855,8 +6850,14 @@ mod tests {
         let topo1 = msg1.context.topology.as_deref().expect("initial topology");
         assert!(topo1.contains("event=\"initial\""), "topo1={topo1}");
         assert!(topo1.contains("scope=\"siblings\""), "topo1={topo1}");
-        assert!(topo1.contains("parent=\"agent:argus [公司業務總管]\""), "topo1={topo1}");
-        assert!(topo1.contains("agent:plutus [商業化與營收]"), "topo1={topo1}");
+        assert!(
+            topo1.contains("parent=\"agent:argus [公司業務總管]\""),
+            "topo1={topo1}"
+        );
+        assert!(
+            topo1.contains("agent:plutus [商業化與營收]"),
+            "topo1={topo1}"
+        );
 
         // 2. Second message with no topology change -> `topology` is None
         let mut m2 = Incoming::new("Status check");
@@ -6865,7 +6866,10 @@ mod tests {
             panic!("expected new message");
         };
         assert_eq!(msg2.context.sender_rel.as_deref(), Some("sibling"));
-        assert!(msg2.context.topology.is_none(), "no delta expected when unchanged");
+        assert!(
+            msg2.context.topology.is_none(),
+            "no delta expected when unchanged"
+        );
 
         // 3. New standing sibling `sage` added -> next message to helios emits `<topology event="delta" ... />`
         let sage = store
@@ -6885,9 +6889,16 @@ mod tests {
         let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
             panic!("expected new message");
         };
-        let topo3 = msg3.context.topology.as_deref().expect("delta topology on add");
+        let topo3 = msg3
+            .context
+            .topology
+            .as_deref()
+            .expect("delta topology on add");
         assert!(topo3.contains("event=\"delta\""), "topo3={topo3}");
-        assert!(topo3.contains("+sibling: agent:sage [用戶體驗與設計]"), "topo3={topo3}");
+        assert!(
+            topo3.contains("+sibling: agent:sage [用戶體驗與設計]"),
+            "topo3={topo3}"
+        );
 
         // 4. Archive `sage` -> next message to helios emits `-sibling: sage`
         store.set_agent_state(&sage.id, "archived").unwrap();
@@ -6896,8 +6907,15 @@ mod tests {
         let ReceiveOutcome::New(msg4) = store.receive(&helios.id, m4).unwrap() else {
             panic!("expected new message");
         };
-        let topo4 = msg4.context.topology.as_deref().expect("delta topology on archive");
-        assert!(topo4.contains("-sibling: agent:sage [用戶體驗與設計]"), "topo4={topo4}");
+        let topo4 = msg4
+            .context
+            .topology
+            .as_deref()
+            .expect("delta topology on archive");
+        assert!(
+            topo4.contains("-sibling: agent:sage [用戶體驗與設計]"),
+            "topo4={topo4}"
+        );
 
         // 5. External liaison `stanley-assistant` defaults to `scope = "isolated"` and sees no siblings
         let stanley = store
@@ -6918,7 +6936,11 @@ mod tests {
         let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {
             panic!("expected new message");
         };
-        let topo5 = msg5.context.topology.as_deref().expect("initial topology for isolated");
+        let topo5 = msg5
+            .context
+            .topology
+            .as_deref()
+            .expect("initial topology for isolated");
         assert!(topo5.contains("scope=\"isolated\""), "topo5={topo5}");
         assert!(!topo5.contains("siblings="), "topo5={topo5}");
     }

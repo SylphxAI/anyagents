@@ -1636,9 +1636,7 @@ pub fn bind_agent_telegram_token(
         let same_identity = resolved_identity.as_ref().is_some_and(|(_, uname)| {
             ch.identity.as_deref().is_some_and(|id_str| {
                 let u = id_str.split_once(':').map(|(_, u)| u).unwrap_or(id_str);
-                u.trim()
-                    .trim_start_matches('@')
-                    .eq_ignore_ascii_case(uname)
+                u.trim().trim_start_matches('@').eq_ignore_ascii_case(uname)
             })
         });
         if same_token || same_identity {
@@ -1677,7 +1675,13 @@ pub fn bind_agent_telegram_token(
                 let _ = store.detach_channel_agent(&other.id, &target_agent.id);
             }
         }
-        crate::channel::record(store, data_dir, "telegram", &target_agent.id, token.as_bytes())?;
+        crate::channel::record(
+            store,
+            data_dir,
+            "telegram",
+            &target_agent.id,
+            token.as_bytes(),
+        )?;
         store
             .list_channels()?
             .into_iter()
@@ -1829,7 +1833,12 @@ fn handle_managed_bot_event(
                 format_telegram_bot_display_name(&target_agent.name, target_agent.role.as_deref());
             let notice = format!(
                 "[Telegram Managed Bot @{} (id={}) created{} and automatically bound to agent `{}` (`{}`). Display name synced to \"{}\" and `public = true` enabled.]",
-                event.bot_username, event.bot_id, creator_note, target_agent.name, target_agent.id, disp
+                event.bot_username,
+                event.bot_id,
+                creator_note,
+                target_agent.name,
+                target_agent.id,
+                disp
             );
             let _ = store.receive(
                 manager_agent_id,
@@ -1955,7 +1964,13 @@ pub fn request_or_bind_telegram_channel(
             }
         }
         let mut last_err = None;
-        for ch in candidate_manager_channels(store, &all_channels, caller_agent, target_agent, manager_override) {
+        for ch in candidate_manager_channels(
+            store,
+            &all_channels,
+            caller_agent,
+            target_agent,
+            manager_override,
+        ) {
             let Some(cred) = ch.credential_ref.as_deref() else {
                 continue;
             };
@@ -1967,11 +1982,10 @@ pub fn request_or_bind_telegram_channel(
             } else {
                 get_managed_bot_token(wanted_bot_id)
             };
-            match call_api(&mgr_tok, &call, SHORT_TIMEOUT_S, Some(&ch.id))
-                .and_then(|resp| {
-                    managed_bot_token_of(&resp)
-                        .map_err(|e| anyagents_core::Error::Message(e.to_string()))
-                }) {
+            match call_api(&mgr_tok, &call, SHORT_TIMEOUT_S, Some(&ch.id)).and_then(|resp| {
+                managed_bot_token_of(&resp)
+                    .map_err(|e| anyagents_core::Error::Message(e.to_string()))
+            }) {
                 Ok(fetched_token) => {
                     return bind_agent_telegram_token(
                         store,
@@ -2007,7 +2021,11 @@ pub fn request_or_bind_telegram_channel(
             let ch_uname = ch
                 .identity
                 .as_deref()
-                .or_else(|| mem.bot.as_deref().and_then(|b| b.split_once(':').map(|(_, u)| u)))
+                .or_else(|| {
+                    mem.bot
+                        .as_deref()
+                        .and_then(|b| b.split_once(':').map(|(_, u)| u))
+                })
                 .map(|u| u.trim().trim_start_matches('@'));
             if ch_uname.is_some_and(|u| u.eq_ignore_ascii_case(req_uname)) {
                 let is_spare = ch.agents.is_empty()
@@ -2029,8 +2047,13 @@ pub fn request_or_bind_telegram_channel(
 
     // Resolve the Manager Bot with `can_manage_bots = true` to generate the `t.me/newbot/...` link
     // and register the pending binding.
-    let candidates =
-        candidate_manager_channels(store, &all_channels, caller_agent, target_agent, manager_override);
+    let candidates = candidate_manager_channels(
+        store,
+        &all_channels,
+        caller_agent,
+        target_agent,
+        manager_override,
+    );
     let is_live = std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
         && std::env::var_os("RUST_TEST_THREADS").is_none()
         && std::env::var_os("CARGO_TARGET_TMPDIR").is_none()
@@ -2050,7 +2073,11 @@ pub fn request_or_bind_telegram_channel(
         let fallback_uname = ch
             .identity
             .as_deref()
-            .or_else(|| mem.bot.as_deref().and_then(|b| b.split_once(':').map(|(_, u)| u)))
+            .or_else(|| {
+                mem.bot
+                    .as_deref()
+                    .and_then(|b| b.split_once(':').map(|(_, u)| u))
+            })
             .unwrap_or("manager_bot")
             .trim()
             .trim_start_matches('@')
@@ -2130,18 +2157,17 @@ fn candidate_manager_channels(
     manager_override: Option<&str>,
 ) -> Vec<Channel> {
     let mut ordered: Vec<Channel> = Vec::new();
-    let push_agent_channel =
-        |ordered: &mut Vec<Channel>, agent_id: &anyagents_core::AgentId| {
-            for ch in all_channels {
-                if ch.kind == "telegram"
-                    && ch.credential_ref.is_some()
-                    && ch.agents.contains(agent_id)
-                    && !ordered.iter().any(|existing| existing.id == ch.id)
-                {
-                    ordered.push(ch.clone());
-                }
+    let push_agent_channel = |ordered: &mut Vec<Channel>, agent_id: &anyagents_core::AgentId| {
+        for ch in all_channels {
+            if ch.kind == "telegram"
+                && ch.credential_ref.is_some()
+                && ch.agents.contains(agent_id)
+                && !ordered.iter().any(|existing| existing.id == ch.id)
+            {
+                ordered.push(ch.clone());
             }
-        };
+        }
+    };
 
     if let Some(mgr_name) = manager_override.map(str::trim).filter(|s| !s.is_empty()) {
         let clean = mgr_name
@@ -2228,18 +2254,25 @@ pub fn sync_agent_telegram_bot_name(
     let short_desc: String = if clean_desc.is_empty() {
         bot_name.clone()
     } else {
-        format!("{bot_name} — {clean_desc}").chars().take(120).collect()
+        format!("{bot_name} — {clean_desc}")
+            .chars()
+            .take(120)
+            .collect()
     };
     let full_desc: String = if clean_desc.is_empty() {
         bot_name.clone()
     } else {
-        format!("{bot_name}\n\n{clean_desc}").chars().take(512).collect()
+        format!("{bot_name}\n\n{clean_desc}")
+            .chars()
+            .take(512)
+            .collect()
     };
 
     static SYNCED_PROFILES: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<String, (String, String, String)>>,
     > = std::sync::OnceLock::new();
-    let cache = SYNCED_PROFILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let cache =
+        SYNCED_PROFILES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let desired = (bot_name.clone(), short_desc.clone(), full_desc.clone());
     if let Ok(guard) = cache.lock()
         && guard.get(channel.id.as_str()) == Some(&desired)
@@ -3355,9 +3388,22 @@ fn api_error(
 ) -> anyagents_core::Error {
     // BotCall is internal today, but do not make that a redaction dependency.
     let method = match method {
-        "sendMessage" | "sendRichMessage" | "editMessageText" | "sendPhoto" | "sendVideo"
-        | "sendAudio" | "sendVoice" | "sendDocument" | "sendAnimation" | "sendLocation"
-        | "sendVenue" | "sendPoll" | "getFile" | "getUpdates" | "getMe" | "getChat"
+        "sendMessage"
+        | "sendRichMessage"
+        | "editMessageText"
+        | "sendPhoto"
+        | "sendVideo"
+        | "sendAudio"
+        | "sendVoice"
+        | "sendDocument"
+        | "sendAnimation"
+        | "sendLocation"
+        | "sendVenue"
+        | "sendPoll"
+        | "getFile"
+        | "getUpdates"
+        | "getMe"
+        | "getChat"
         | "getChatMember"
         | "setWebhook"
         | "deleteWebhook"

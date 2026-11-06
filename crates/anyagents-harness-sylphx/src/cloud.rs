@@ -103,7 +103,7 @@ pub fn build_cloud_environment_spec(
     _config_dir: &Path,
     _work_dir: Option<&Path>,
     env: &[(String, String)],
-  ) -> Value {
+) -> Value {
     let shape = resolve_sandbox_shape(env);
     json!({
         "shape": shape,
@@ -408,4 +408,3 @@ pub(super) fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
     }
     None
 }
-

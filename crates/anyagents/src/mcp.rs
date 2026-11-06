@@ -543,7 +543,12 @@ struct AgentsArgs {
     #[serde(default, alias = "text", alias = "message")]
     prompt: Option<String>,
     /// Suggested Telegram `@username` (or existing spare bot `@username`) when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
-    #[serde(default, alias = "bot", alias = "suggested_username", alias = "username")]
+    #[serde(
+        default,
+        alias = "bot",
+        alias = "suggested_username",
+        alias = "username"
+    )]
     bot_username: Option<String>,
     /// Telegram bot user ID (`getManagedBotToken`) when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
     #[serde(default, alias = "managed_bot_id", alias = "user_id")]
@@ -705,7 +710,12 @@ struct SubagentsArgs {
     #[serde(default, alias = "text", alias = "message")]
     prompt: Option<String>,
     /// Suggested Telegram `@username` (or existing spare bot `@username`) when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
-    #[serde(default, alias = "bot", alias = "suggested_username", alias = "username")]
+    #[serde(
+        default,
+        alias = "bot",
+        alias = "suggested_username",
+        alias = "username"
+    )]
     bot_username: Option<String>,
     /// Telegram bot user ID (`getManagedBotToken`) when `action = "telegram_bot"` / `"bind_telegram"` / `"channel"`.
     #[serde(default, alias = "managed_bot_id", alias = "user_id")]
@@ -2058,7 +2068,12 @@ impl AgentMcp {
             .to_string();
         let combined_agent = {
             let mut list = Vec::new();
-            if let Some(a) = args.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(a) = args
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
                 list.push(a.to_string());
             }
             for item in args.agents {

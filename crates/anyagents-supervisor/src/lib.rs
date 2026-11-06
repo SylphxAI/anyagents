@@ -1184,7 +1184,11 @@ impl<H: Harness + 'static> Session<H> {
     /// to the sub-agent automatically wakes and resumes it.
     fn try_auto_archive_subagent(&mut self) -> bool {
         if self.agent.parent_id.is_none()
-            || self.agent.role.as_deref().is_some_and(|r| !r.trim().is_empty())
+            || self
+                .agent
+                .role
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty())
             || !self.completed_turn_in_session
             || self.last_error.is_some()
         {

@@ -1987,10 +1987,7 @@ fn chat_completions_to_responses_envelope(raw_resp: &Value) -> Result<Value, Str
         }
         if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
             for (i, tc) in tcs.iter().enumerate() {
-                let cid = tc
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("call_0");
+                let cid = tc.get("id").and_then(Value::as_str).unwrap_or("call_0");
                 let fname = tc
                     .pointer("/function/name")
                     .or_else(|| tc.get("name"))
@@ -2199,8 +2196,7 @@ pub(crate) fn run_native_gateway_turn(
     let mut total_out: u64 = 0;
     let mut total_cache_read: u64 = 0;
     let mut total_cache_write: u64 = 0;
-    let mut unanswered_reply_target: Option<String> =
-        extract_envelope_sender(initial_user_message);
+    let mut unanswered_reply_target: Option<String> = extract_envelope_sender(initial_user_message);
 
     let mut overflow_compacted_in_turn = false;
     for step in 0usize.. {
@@ -2792,8 +2788,7 @@ pub fn run_stdio_adapter(
                         } else {
                             clear_persisted_cloud_session(&cfg_cl);
                             {
-                                let mut g =
-                                    state_cl.lock().unwrap_or_else(PoisonError::into_inner);
+                                let mut g = state_cl.lock().unwrap_or_else(PoisonError::into_inner);
                                 g.cloud_agent_id = None;
                                 g.cloud_session_id = None;
                             }
@@ -3070,8 +3065,12 @@ pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
             parts.push(cleaned);
         }
     }
-    let shared_agents = read_shared_agents_md_for_config(config_dir)
-        .filter(|s| !s.trim().is_empty() && !s.trim_start().starts_with("# AnyAgents Identity & Environment Awareness"));
+    let shared_agents = read_shared_agents_md_for_config(config_dir).filter(|s| {
+        !s.trim().is_empty()
+            && !s
+                .trim_start()
+                .starts_with("# AnyAgents Identity & Environment Awareness")
+    });
     let work_agents = read_workspace_agents_md(work_dir).filter(|s| !s.trim().is_empty());
 
     match (shared_agents, work_agents) {
@@ -3079,7 +3078,9 @@ pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
             if is_owner_root_agents_md(&shared) && is_owner_root_agents_md(&work) {
                 let trimmed = work.trim();
                 if !parts.iter().any(|p| p.contains(trimmed)) {
-                    parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{trimmed}"));
+                    parts.push(format!(
+                        "## 4. Shared Instructions (AGENTS.md)\n\n{trimmed}"
+                    ));
                 }
             } else {
                 let s_trim = shared.trim();
@@ -4306,7 +4307,8 @@ fn call_anyagents_mcp_tool(
         let mut saw_init_response = false;
         let response = (|| -> Result<Value, String> {
             for request in [init_req, init_notif, call_req] {
-                writeln!(stdin, "{request}").map_err(|err| format!("writing MCP request: {err}"))?;
+                writeln!(stdin, "{request}")
+                    .map_err(|err| format!("writing MCP request: {err}"))?;
             }
             let _ = stdin.flush();
             // EOF terminates rmcp's transport and cancels asynchronous tools. Keep

@@ -43,7 +43,10 @@ fn parse_models_catalog_json(val: &Value, map: &mut RemoteModelLimitsMap) {
         let cw = item
             .pointer("/limits/constraints/context_window_tokens")
             .and_then(Value::as_u64)
-            .or_else(|| item.pointer("/limits/context_window").and_then(Value::as_u64))
+            .or_else(|| {
+                item.pointer("/limits/context_window")
+                    .and_then(Value::as_u64)
+            })
             .or_else(|| item.get("context_window").and_then(Value::as_u64))
             .or_else(|| item.get("max_context_window").and_then(Value::as_u64))
             .or_else(|| item.get("context_length").and_then(Value::as_u64))

@@ -484,8 +484,9 @@ impl SylphxSdkSession {
                     Err(_) => {
                         clear_persisted_cloud_session(&self.config_dir);
                         {
-                            let mut g =
-                                state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut g = state
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
                             g.cloud_agent_id = None;
                             g.cloud_session_id = None;
                         }

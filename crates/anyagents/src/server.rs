@@ -2935,7 +2935,11 @@ async fn add_channel_route(
                 ));
             }
         }
-        let target_clean = body.agent.trim().strip_prefix("agent:").unwrap_or(body.agent.trim());
+        let target_clean = body
+            .agent
+            .trim()
+            .strip_prefix("agent:")
+            .unwrap_or(body.agent.trim());
         let agent = state
             .store
             .agent_by_name(target_clean)
@@ -2945,7 +2949,9 @@ async fn add_channel_route(
             Principal::Operator => None,
         };
         let authorized_by_lineage = match &principal {
-            Principal::Agent { agent_id, .. } => is_self_or_ancestor(&state.store, agent_id, &agent),
+            Principal::Agent { agent_id, .. } => {
+                is_self_or_ancestor(&state.store, agent_id, &agent)
+            }
             Principal::Operator => true,
         };
         if !authorized_by_lineage {
@@ -3724,9 +3730,7 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         let parent_id = store.agent(agent_id).ok().and_then(|a| a.parent_id);
         if let Ok(agent) = store.agent(agent_id) {
             let _ = crate::browser::stop_profile(data_dir, &agent.name);
-            if parent_id.is_some()
-                && agent.role.as_deref().is_none_or(|r| r.trim().is_empty())
-            {
+            if parent_id.is_some() && agent.role.as_deref().is_none_or(|r| r.trim().is_empty()) {
                 let bp = data_dir.join("browser-profiles").join(&agent.name);
                 remove_path_with_seat(&bp, seat_ids);
             }
