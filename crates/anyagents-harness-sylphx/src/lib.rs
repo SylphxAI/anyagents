@@ -2919,14 +2919,13 @@ fn drain_steered_messages(
 }
 
 fn update_unanswered_reply_target(current: &mut Option<String>, incoming_text: &str) {
-    if let Some(new_target) = extract_envelope_sender(incoming_text) {
-        if new_target.starts_with("telegram:")
+    if let Some(new_target) = extract_envelope_sender(incoming_text)
+        && (new_target.starts_with("telegram:")
             || current
                 .as_deref()
-                .is_none_or(|c| !c.starts_with("telegram:"))
-        {
-            *current = Some(new_target);
-        }
+                .is_none_or(|c| !c.starts_with("telegram:")))
+    {
+        *current = Some(new_target);
     }
 }
 
