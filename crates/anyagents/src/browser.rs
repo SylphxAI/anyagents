@@ -5599,10 +5599,12 @@ mod tests {
             window.events=[];
             for (const type of ['pointerdown','mousedown','mouseup','click','focus','blur','focusout'])
                 document.addEventListener(type,e=>{
-                    window.events.push({type,target:e.target.id||e.target.tagName,
+                    const event={type,target:e.target.id||e.target.tagName,
+                        trusted:e.isTrusted,x:e.clientX,y:e.clientY,at:performance.now()};
+                    if(type==='blur'||type==='focusout') Object.assign(event,{
                         related:e.relatedTarget?.outerHTML||null,active:document.activeElement?.outerHTML,
-                        focused:document.hasFocus(),stack:new Error('event '+type).stack,
-                        trusted:e.isTrusted,x:e.clientX,y:e.clientY,at:performance.now()});
+                        focused:document.hasFocus(),stack:new Error('event '+type).stack});
+                    window.events.push(event);
                 },true);
         </script>"#;
         let child = spawn_html_server(
