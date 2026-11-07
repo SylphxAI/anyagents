@@ -7299,9 +7299,9 @@ pub(crate) fn resolve_archetype_template(
     if let Some(ow) = crate::server::owner_workdir() {
         search_dirs.push(ow.join(".agents").join("agents"));
     }
-    search_dirs.push(PathBuf::from(
-        "/home/kyle/workspace/github.com/SylphxAI/owner/.agents/agents",
-    ));
+    if let Some(home) = std::env::var_os("HOME") {
+        search_dirs.push(PathBuf::from(home).join(".agents").join("agents"));
+    }
 
     for dir in search_dirs {
         for candidate in [
