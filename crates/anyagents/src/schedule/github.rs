@@ -328,7 +328,10 @@ impl Probes {
                 if let Error::RateLimited(until) = error {
                     self.limit_interval =
                         (self.limit_interval * 2).clamp(MIN_INTERVAL, MAX_INTERVAL);
-                    self.limited_until = until.max(now.saturating_add(self.limit_interval));
+                    self.limited_until = self
+                        .limited_until
+                        .max(until)
+                        .max(now.saturating_add(self.limit_interval));
                 } else {
                     if matches!(error, Error::Auth) {
                         self.auth_until
@@ -625,8 +628,10 @@ fn token_from_file(path: &std::path::Path) -> Result<String, Error> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
+    // Reject special files via the opened descriptor without blocking first
+    // on a FIFO's writer while the process-wide probe gate is held.
     #[cfg(unix)]
-    options.custom_flags(libc::O_NOFOLLOW);
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options.open(path).map_err(|_| Error::Auth)?;
     let metadata = file.metadata().map_err(|_| Error::Auth)?;
     if !metadata.is_file() {
@@ -1398,6 +1403,62 @@ mod tests {
     }
 
     #[test]
+    fn secondary_retry_never_shortens_the_reserve_hold_from_the_same_response() {
+        let mut probes = Probes::default();
+        let mut calls = 0;
+        assert_eq!(
+            probes
+                .probe("floor", "o", "r", "sha", false, 0, |_, _, _| {
+                    calls += 1;
+                    Ok(response(
+                        403,
+                        json!({"message":"You have exceeded a secondary rate limit."}),
+                        &[
+                            ("retry-after", "60"),
+                            ("x-ratelimit-remaining", "1499"),
+                            ("x-ratelimit-reset", "3600"),
+                        ],
+                    ))
+                })
+                .1,
+            "probe_error:rate_limited"
+        );
+        assert_eq!(probes.limited_until, 3_600_000);
+        for now in [60_000, 359_999, 3_599_999, 3_600_000, 3_601_000] {
+            assert_eq!(
+                probes
+                    .probe("other", "other-owner", "r", "sha", false, now, |_, _, _| {
+                        calls += 1;
+                        Ok(response(200, pending(), &[]))
+                    })
+                    .1,
+                "probe_error:rate_limited"
+            );
+        }
+        assert_eq!(calls, 1);
+        let resume = probes.targets["other"].resume_at;
+        assert!(resume >= 3_660_000);
+        assert_eq!(
+            probes
+                .probe(
+                    "other",
+                    "other-owner",
+                    "r",
+                    "sha",
+                    false,
+                    resume,
+                    |_, _, _| {
+                        calls += 1;
+                        Ok(response(200, pending(), &[]))
+                    }
+                )
+                .1,
+            "checks_in_progress"
+        );
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
     fn paused_targets_resume_across_the_window_without_a_reset_herd() {
         const N: usize = 96;
         const RESET: i64 = 600_000;
@@ -1865,6 +1926,81 @@ mod tests {
             "checks_in_progress"
         );
         server.join().unwrap();
+    }
+
+    #[test]
+    fn fifo_credential_is_refused_without_stalling_other_owners() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("bad.token");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let good = dir.path().join("good.token");
+        std::fs::write(&good, "fixture-other-owner").unwrap();
+        std::fs::set_permissions(good, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let (base, server) = credential_server(vec![(
+            "repos/good/r/commits/sha/check-runs?per_page=100&page=1".to_string(),
+            "fixture-other-owner".to_string(),
+            200,
+            None,
+        )]);
+        let token_dir = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            // Match the process-wide entrypoint's mutex lifetime: credential
+            // selection runs while the probe lock is held, then another owner
+            // must be able to use that same gate.
+            let probes = Mutex::new(Probes::default());
+            for owner in ["bad", "good"] {
+                let observation = probes.lock().unwrap().probe(
+                    owner,
+                    owner,
+                    "r",
+                    "sha",
+                    false,
+                    0,
+                    |path, etag, modified| {
+                        request_with_token_dir(
+                            &base,
+                            path,
+                            etag,
+                            modified,
+                            "agent",
+                            owner,
+                            Some(&token_dir),
+                        )
+                    },
+                );
+                tx.send(observation.1).unwrap();
+            }
+        });
+        let first = rx.recv_timeout(Duration::from_secs(2));
+        let returned_without_writer = first.is_ok();
+        // If the regression returns, unblock its old blocking-open behavior so
+        // the test can report a bounded failure instead of hanging the suite.
+        let _rescue = if returned_without_writer {
+            None
+        } else {
+            Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open(&fifo)
+                    .unwrap(),
+            )
+        };
+        let first = first.unwrap_or_else(|_| rx.recv_timeout(Duration::from_secs(2)).unwrap());
+        assert_eq!(first, "probe_error:auth");
+        let second = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert_eq!(second, "checks_in_progress");
+        assert!(
+            returned_without_writer,
+            "FIFO open stalled the shared probe gate"
+        );
     }
 
     #[test]

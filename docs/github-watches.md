@@ -20,7 +20,10 @@ directory containing `<owner>.token` files, for example `SylphxAI.token` and
 `Cubeage.token`. Each contains that owner's raw GitHub App installation token
 (an optional trailing newline is accepted). Owner matching is case-insensitive;
 ambiguous filenames are refused. Each file must be a regular, non-symlink file,
-mode **0600**, owned by the daemon's effective user. The daemon re-reads the
+mode **0600**, owned by the daemon's effective user. Files are opened with
+nonblocking/no-follow flags and validated through the opened descriptor before
+reading, so a FIFO without a writer is refused rather than stopping all probes.
+The daemon re-reads the
 selected file **before every actual HTTP request**, so it can be replaced
 atomically without restarting the daemon. The issuer should refresh it before
 expiry (the desk minter plans 45–60 minutes). The daemon never writes these files.
@@ -64,7 +67,9 @@ including successful 200/304 responses. Below the floor, no subsequent page or
 target is requested until the UTC reset. The crossing response can still finish
 an observation. Other probes report `probe_error:rate_limited`, not `transport`.
 Missing/past reset metadata uses a 60-second cooldown. Secondary limits retain
-`Retry-After` and bounded exponential backoff. New watches cannot bypass holds.
+`Retry-After` and bounded exponential backoff. The latest applicable deadline
+always wins: a shorter secondary retry cannot shorten an existing reserve hold.
+New watches cannot bypass holds.
 
 The reset is an admission barrier, not a common retry time. After either a
 reserve or rate-limit pause, retained targets resume across **reset + 60–300
