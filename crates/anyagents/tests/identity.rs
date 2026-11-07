@@ -685,3 +685,292 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
         assert!(offline.stdout.is_empty(), "{offline:?}");
     }
 }
+
+#[test]
+fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let server = start_server(&data);
+    let owner = create(&data, "group-owner");
+    let member = create(&data, "other-agent");
+    let outsider = create(&data, "outsider");
+    create(&data, "invited");
+    let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
+    let request = |id: &str, payload: Value| {
+        let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, id));
+        support::call_raw(
+            &server.socket,
+            "POST",
+            "/v1/groups",
+            &payload.to_string(),
+            &auth,
+        )
+    };
+    let good = |id: &str, payload: Value| {
+        let response = request(id, payload);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response
+    };
+    let forbidden = |id: &str, payload: Value, reason: &str| {
+        let response = request(id, payload);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains(reason), "{body}");
+    };
+    let created = good(
+        &owner,
+        json!({"action":"join", "group":"private-room", "agent":"other-agent"}),
+    );
+    let body: Value = serde_json::from_str(created.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["owner_agent_id"], owner);
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "other-agent"]
+    );
+
+    // Vesta's exact P1: public input neither authorizes the outsider nor flips visibility.
+    forbidden(
+        &outsider,
+        json!({"action":"join","group":"private-room","agent":"self","public":true}),
+        "is private",
+    );
+    assert!(!store.is_group_public("private-room"));
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "other-agent"]
+    );
+    // Vesta's exact P2: a caller cannot remove another agent's membership.
+    forbidden(
+        &outsider,
+        json!({"action":"leave","group":"private-room","agent":"other-agent"}),
+        "removing another member",
+    );
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "other-agent"]
+    );
+
+    // Non-owner members may invite, but cannot change visibility or evict peers.
+    good(
+        &member,
+        json!({"action":"join","group":"private-room","agent":"invited","public":true}),
+    );
+    assert!(!store.is_group_public("private-room"));
+    forbidden(
+        &member,
+        json!({"action":"members","group":"private-room","public":true}),
+        "changing visibility",
+    );
+    forbidden(
+        &member,
+        json!({"action":"leave","group":"private-room","agent":"self,invited"}),
+        "removing another member",
+    );
+    forbidden(
+        &member,
+        json!({"action":"leave","group":"private-room","agent":"self","public":true}),
+        "changing visibility",
+    );
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "invited", "other-agent"]
+    );
+    good(
+        &member,
+        json!({"action":"leave","group":"private-room","agent":"self"}),
+    );
+
+    // Creation's `group` option is not an alternate invitation bypass. The
+    // refusal happens before creating an agent or joining any earlier group.
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &outsider));
+    let rejected = support::call_raw(
+        &server.socket,
+        "POST",
+        "/v1/agents",
+        &json!({"name":"uninvited-child","group":"would-be-new,private-room"}).to_string(),
+        &auth,
+    );
+    assert!(
+        rejected.starts_with("HTTP/1.1 403") && rejected.contains("is private"),
+        "{rejected}"
+    );
+    assert!(store.agent_by_name("uninvited-child").is_err());
+    assert!(store.group("would-be-new").unwrap().is_none());
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &owner));
+    let child = support::call_raw(
+        &server.socket,
+        "POST",
+        "/v1/agents",
+        &json!({"name":"invited-child","group":"private-room"}).to_string(),
+        &auth,
+    );
+    assert!(child.starts_with("HTTP/1.1 201"), "{child}");
+    assert!(
+        store
+            .group_members("private-room")
+            .unwrap()
+            .contains(&"invited-child".to_string())
+    );
+    // The group's creator may remove members; a parent may remove its child.
+    good(
+        &owner,
+        json!({"action":"leave","group":"private-room","agent":"invited"}),
+    );
+    let child = store.agent_by_name("invited-child").unwrap();
+    good(
+        child.id.as_str(),
+        json!({"action":"join","group":"child-owned","agent":"self"}),
+    );
+    good(
+        &owner,
+        json!({"action":"members","group":"child-owned","public":true}),
+    );
+    good(
+        &owner,
+        json!({"action":"leave","group":"child-owned","agent":"invited-child"}),
+    );
+
+    // Ownership is not inferred from remaining members or an empty roster.
+    good(
+        &owner,
+        json!({"action":"leave","group":"private-room","agent":"self,invited-child"}),
+    );
+    assert!(store.group_members("private-room").unwrap().is_empty());
+    forbidden(
+        &outsider,
+        json!({"action":"join","group":"private-room","agent":"self"}),
+        "is private",
+    );
+    good(
+        &owner,
+        json!({"action":"join","group":"private-room","agent":"self"}),
+    );
+    assert_eq!(
+        store
+            .group("private-room")
+            .unwrap()
+            .unwrap()
+            .owner_agent_id
+            .unwrap()
+            .as_str(),
+        owner
+    );
+    // A root admin has explicit visibility authority; revocation is immediate.
+    let outsider_id = store.agent_by_name("outsider").unwrap().id;
+    store.set_agent_admin(&outsider_id, true).unwrap();
+    good(
+        &outsider,
+        json!({"action":"members","group":"private-room","public":true}),
+    );
+    store.set_agent_admin(&outsider_id, false).unwrap();
+    forbidden(
+        &outsider,
+        json!({"action":"members","group":"private-room","public":false}),
+        "changing visibility",
+    );
+    good(
+        &outsider,
+        json!({"action":"join","group":"private-room","agent":"self"}),
+    );
+    good(
+        &owner,
+        json!({"action":"members","group":"private-room","public":false}),
+    );
+    forbidden(
+        &outsider,
+        json!({"action":"members","group":"private-room","public":true}),
+        "changing visibility",
+    );
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/groups",
+        &json!({"action":"leave","group":"private-room","agent":"outsider"}).to_string(),
+    );
+    assert!(status.contains("200"), "{status}");
+    // Operator-created groups have NULL ownership, not their first member's ID.
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/groups",
+        &json!({"action":"join","group":"operator-room","agent":"other-agent"}).to_string(),
+    );
+    assert!(status.contains("200"), "{status}");
+    assert_eq!(
+        store
+            .group("operator-room")
+            .unwrap()
+            .unwrap()
+            .owner_agent_id,
+        None
+    );
+    forbidden(
+        &member,
+        json!({"action":"members","group":"operator-room","public":true}),
+        "changing visibility",
+    );
+}
+
+#[test]
+fn agent_group_cli_mutations_refuse_offline_database_fallback() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
+    let agent = store
+        .create_agent(anyagents_core::NewAgent::new(
+            "offline-agent",
+            "claude-code",
+        ))
+        .unwrap();
+    store.join_group("offline-room", &agent.id).unwrap();
+    for action in ["join", "leave"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .args([
+                "--data",
+                data.to_str().unwrap(),
+                "groups",
+                action,
+                "offline-room",
+                "offline-agent",
+            ])
+            .env("ANYAGENTS_AGENT_ID", agent.id.as_str())
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "unexpected {action} success");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("authenticated server"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            store.group_members("offline-room").unwrap(),
+            ["offline-agent"]
+        );
+    }
+    // The supported offline operator path remains available.
+    let output = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .args([
+            "--data",
+            data.to_str().unwrap(),
+            "groups",
+            "leave",
+            "offline-room",
+            "offline-agent",
+        ])
+        .env_remove("ANYAGENTS_AGENT_ID")
+        .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(store.group_members("offline-room").unwrap().is_empty());
+}

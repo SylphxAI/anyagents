@@ -18,6 +18,9 @@ use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
 use crate::quote::Quote;
 
+mod group_policy;
+pub use group_policy::{Group, GroupAction, GroupActor};
+
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Origin {
@@ -1467,7 +1470,7 @@ impl Store {
     }
 
     /// Set whether a named virtual group is `public` (`true` = open to any public agent;
-    /// `false` = private/invite-only to group members and their parents).
+    /// `false` = private/invite-only; participation requires membership or an invitation).
     pub fn set_group_public(&self, name: &str, public: bool) -> Result<(), Error> {
         if name.is_empty() || name.contains(':') || name.chars().any(char::is_whitespace) {
             return Err(Error::Message(format!("invalid group name: {name}")));
