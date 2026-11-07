@@ -38,6 +38,7 @@ fn bin_in(dir: &std::path::Path) -> Command {
     let mut command = bin();
     command
         .env("PATH", machine_path(dir))
+        .env("ANYAGENTS_TESTS", "1")
         .env("ANYAGENTS_CLAUDE_CODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
         .arg("--data")
         .arg(dir);

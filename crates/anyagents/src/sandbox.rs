@@ -89,13 +89,16 @@ pub fn configured_seat() -> Option<(u32, u32, u32)> {
 /// Whether the process is running inside a unit or integration test harness
 /// that must never read the host user's personal home directory or host seats.
 pub fn is_isolated_test_env() -> bool {
-    cfg!(test)
+    isolated_test_env(cfg!(test))
+}
+
+fn isolated_test_env(test_build: bool) -> bool {
+    test_build
         || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
         || std::env::var_os("ANYAGENTS_TESTS").is_some()
         || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
         || std::env::var_os("ANYAGENTS_HARNESS_BIN").is_some()
         || std::env::var_os("ANYAGENTS_CLAUDE_BIN").is_some()
-        || std::env::var_os("ANYAGENTS_CLAUDE_CODE_BIN").is_some()
         || std::env::var_os("ANYAGENTS_CODEX_BIN").is_some()
         || std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_some()
         || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
@@ -993,6 +996,42 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_executable_override_does_not_select_test_isolation() {
+        const PROBE: &str = "ANYAGENTS_ISOLATION_REGRESSION_PROBE";
+        if let Some(expected) = std::env::var_os(PROBE) {
+            // Unit binaries are test builds; exercise the exact production
+            // predicate with that compile-time input false, without host reads.
+            assert_eq!(isolated_test_env(false), expected == "true");
+            assert!(is_isolated_test_env());
+            return;
+        }
+        for (override_bin, explicit_test) in [(false, false), (true, false), (true, true)] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .env_clear()
+                .env(PROBE, explicit_test.to_string())
+                .args([
+                    "--exact",
+                    "sandbox::tests::claude_executable_override_does_not_select_test_isolation",
+                    "--nocapture",
+                ]);
+            if override_bin {
+                child.env("ANYAGENTS_CLAUDE_CODE_BIN", "/opt/vendor/claude");
+            }
+            if explicit_test {
+                child.env("ANYAGENTS_TESTS", "1");
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "override={override_bin}, explicit_test={explicit_test}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
 
     #[test]
     fn an_unconfigured_seat_is_refused_before_anything_starts() {

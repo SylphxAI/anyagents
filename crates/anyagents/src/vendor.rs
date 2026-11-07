@@ -1973,6 +1973,15 @@ done
                 std::fs::remove_file(config.join(".claude")).unwrap();
             } else {
                 std::fs::remove_file(config.join(".claude/skills")).unwrap();
+                // Launch reconciliation writes its managed instructions into
+                // this fixture-owned parent. Remove only that proven output;
+                // unexpected entries must still make remove_dir fail.
+                let generated = config.join(".claude/CLAUDE.md");
+                assert_eq!(
+                    std::fs::read(&generated).unwrap(),
+                    std::fs::read(config.join("CLAUDE.md")).unwrap()
+                );
+                std::fs::remove_file(generated).unwrap();
                 std::fs::remove_dir(config.join(".claude")).unwrap();
             }
             println!(
