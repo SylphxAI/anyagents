@@ -1992,8 +1992,10 @@ done
         std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
         assert_eq!(snapshot(), before, "protected bytes or permissions changed");
         println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
-        // Cleanup needs DAC override only for this fixture's private seat parent;
-        // perform it under that parent's owner, never widen any outside path.
+        // The daemon has no DAC override and is not in the private parent's
+        // group. Its owner removes only the proven managed link and empty
+        // parent; neither widening modes nor recursive foreign-link traversal
+        // belongs in this fixture teardown.
         let output = std::process::Command::new("/usr/bin/setpriv")
             .args([
                 "--reuid",
@@ -2003,13 +2005,22 @@ done
                 "--clear-groups",
                 "--no-new-privs",
                 "--",
-                "chmod",
-                "0770",
+                "/bin/sh",
+                "-c",
+                "set -eu; [ \"$(readlink \"$1/skills\")\" = \"$2\" ]; rm -- \"$1/skills\"; rmdir -- \"$1\"",
+                "fixture-owner-cleanup",
             ])
             .arg(config.join(".agy"))
+            .arg(root.join("skills-view"))
             .output()
             .unwrap();
-        assert!(output.status.success());
+        assert!(output.status.success(), "owner fixture cleanup: {output:?}");
+        assert!(!config.join(".agy").exists());
+        // Global read-only fixtures are daemon-owned, but deletion still
+        // requires owner write permission after all preservation assertions.
+        for path in [data.join("skills/global"), data.join("skills")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         std::fs::remove_dir_all(&fixture).unwrap();
         assert!(!fixture.exists());
         println!("NATIVE_VENDOR_FIXTURE_REMOVED");
