@@ -71,7 +71,7 @@ impl RawSegment {
         // Recover only a provably unacknowledged final frame. A complete v2
         // header has an integrity MAC; a changed length is metadata corruption
         // and is never repaired by deleting acknowledged history.
-        scan(&mut file.0, &segment.path, segment.format, true)?;
+        segment.recover(&mut file.0)?;
         Ok(segment)
     }
 
@@ -89,6 +89,25 @@ impl RawSegment {
         let mut file = segment.lock()?;
         scan(&mut file.0, &segment.path, segment.format, false)?;
         Ok(segment)
+    }
+
+    fn recover(&self, file: &mut File) -> io::Result<Vec<RawCoordinate>> {
+        if self.format == SegmentFormat::Jsonl {
+            return scan_jsonl(file, &self.path, false);
+        }
+        let size = file.metadata()?.len();
+        let frontier = read_frontier(&self.path, size)?;
+        if frontier > size {
+            return Err(io::Error::other("acknowledged raw segment shortened"));
+        }
+        // Validate the acknowledged prefix before touching any tail. Its header
+        // and payload integrity are independent of the acknowledgement marker.
+        let records = scan_framed(file, &self.path, self.format, false, Some(frontier))?;
+        if size > frontier {
+            file.set_len(frontier)?;
+            file.sync_all()?;
+        }
+        Ok(records)
     }
 
     fn lock(&self) -> io::Result<LockedFile> {
@@ -113,14 +132,45 @@ impl RawSegment {
         match self.format {
             SegmentFormat::Jsonl => append_jsonl(&mut file.0, &self.path, payload),
             SegmentFormat::FramedV1 | SegmentFormat::FramedV2 => {
-                append_framed(&mut file.0, &self.path, self.format, payload)
+                {
+                    self.recover(&mut file.0)?;
+                    let coordinate = append_framed(&mut file.0, &self.path, self.format, payload)?;
+                    write_frontier(&self.path, file.0.metadata()?.len())?;
+                    Ok(coordinate)
+                }
             }
         }
     }
 
     pub fn records(&self) -> io::Result<Vec<RawCoordinate>> {
-        scan(&mut self.lock()?.0, &self.path, self.format, false)
+        self.recover(&mut self.lock()?.0)
     }
+}
+
+fn frontier_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".ack");
+    PathBuf::from(name)
+}
+fn write_frontier(path: &Path, end: u64) -> io::Result<()> {
+    let mut bytes = end.to_le_bytes().to_vec();
+    let hash = Sha256::digest(&bytes);
+    bytes.extend_from_slice(&hash);
+    crate::learned_memory::atomic_write(&frontier_path(path), &bytes)
+}
+fn read_frontier(path: &Path, size: u64) -> io::Result<u64> {
+    let bytes = match fs::read(frontier_path(path)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound && size == 0 => {
+            write_frontier(path, 0)?;
+            return Ok(0);
+        }
+        Err(e) => return Err(e),
+    };
+    if bytes.len() != 40 || Sha256::digest(&bytes[..8])[..] != bytes[8..] {
+        return Err(io::Error::other("raw acknowledgement frontier integrity mismatch"));
+    }
+    Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
 }
 
 fn detect_format(path: &Path) -> io::Result<SegmentFormat> {
@@ -238,7 +288,7 @@ fn scan(
     match format {
         SegmentFormat::Jsonl => scan_jsonl(file, path, recover_tail),
         SegmentFormat::FramedV1 | SegmentFormat::FramedV2 => {
-            scan_framed(file, path, format, recover_tail)
+            scan_framed(file, path, format, recover_tail, None)
         }
     }
 }
@@ -248,9 +298,10 @@ fn scan_framed(
     path: &Path,
     format: SegmentFormat,
     recover_tail: bool,
+    limit: Option<u64>,
 ) -> io::Result<Vec<RawCoordinate>> {
     file.seek(SeekFrom::Start(0))?;
-    let size = file.metadata()?.len();
+    let size = limit.unwrap_or(file.metadata()?.len());
     let header_len = match format {
         SegmentFormat::FramedV1 => HEADER_V1,
         SegmentFormat::FramedV2 => HEADER_V2,
