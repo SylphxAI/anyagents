@@ -5,7 +5,15 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { increment, nextVersion, shippedPath, updateManifests } from '../scripts/release-cut.mjs';
+import { increment, isVersionCut, nextVersion, shippedPath, updateManifests } from '../scripts/release-cut.mjs';
+
+test('a cut is recognized only when its subject and committed version change agree', () => {
+  assert.equal(isVersionCut('release: v0.1.2 (#123)', '0.1.2', '0.1.1'), true);
+  assert.equal(isVersionCut('release: v0.1.2', '0.1.2', '0.1.1'), true);
+  assert.equal(isVersionCut('release: v0.1.2', '0.1.1', '0.1.1'), false);
+  assert.equal(isVersionCut('release: v0.1.2', '0.1.2', '0.1.2'), false);
+  assert.equal(isVersionCut('feat: change source', '0.1.2', '0.1.1'), false);
+});
 
 test('patch is the default, and superseded cuts never reuse the committed version', () => {
   assert.equal(nextVersion('0.1.1', '0.1.1'), '0.1.2');
@@ -123,7 +131,8 @@ if(value!==undefined) console.log(typeof value==='string'?value:JSON.stringify(v
     write(path, contents); git(author, 'add', '.'); git(author, 'commit', '-m', subject); git(author, 'push', 'origin', 'main');
     return git(author, 'rev-parse', 'HEAD');
   };
-  return { root, author, work, remote, git, run, advance, state: () => JSON.parse(readFileSync(state)), cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return { root, author, work, remote, git, run, advance, state: () => JSON.parse(readFileSync(state)),
+    updateState: (value) => writeFileSync(state, JSON.stringify(value)), cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
 test('real Git cut is head-pinned, version-only and updates the same branch without losing new main bytes', () => {
@@ -173,5 +182,25 @@ test('an npm outage fails closed before any branch or PR publication', () => {
     assert.notEqual(result.status, 0);
     assert.equal(f.state().open, null);
     assert.equal(f.git(f.work, 'ls-remote', '--heads', 'origin', 'refs/heads/release/next'), '');
+  } finally { f.cleanup(); }
+});
+
+test('unique non-version work on the rolling branch is preserved and refused', () => {
+  const f = fixture();
+  try {
+    f.advance('crates/anyagents/src/main.rs', '// new\n');
+    const first = f.run();
+    assert.equal(first.status, 0, first.stderr);
+    writeFileSync(join(f.work, 'unique-work.txt'), 'must not be overwritten\n');
+    f.git(f.work, 'add', 'unique-work.txt');
+    f.git(f.work, 'commit', '-m', 'preserve unique branch work');
+    f.git(f.work, 'push', 'origin', 'HEAD:release/next');
+    const unique = f.git(f.work, 'rev-parse', 'HEAD');
+    const state = f.state(); state.open.headRefOid = unique; f.updateState(state);
+    const result = f.run();
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /contains non-version changes/);
+    assert.equal(f.git(f.root, '--git-dir', f.remote, 'rev-parse', 'release/next'), unique);
+    assert.equal(f.git(f.root, '--git-dir', f.remote, 'show', 'release/next:unique-work.txt'), 'must not be overwritten');
   } finally { f.cleanup(); }
 });

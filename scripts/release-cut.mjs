@@ -27,6 +27,10 @@ export function shippedPath(path) {
   // build scripts and other resources without having to maintain a second map.
   return /^(Cargo\.(toml|lock)|rust-toolchain(\.toml)?|\.cargo\/.*|crates\/.*|packages\/.*)$/.test(path);
 }
+export function isVersionCut(subject, version, previous) {
+  const match = /^release: v(\d+\.\d+\.\d+)(?: \(#\d+\))?$/.exec(subject);
+  return Boolean(match && match[1] === version && version !== previous);
+}
 export function increment(pulls, commits) {
   const labels = new Set(pulls.filter((pr) => pr.merged_at && commits.has(pr.merge_commit_sha))
     .flatMap((pr) => pr.labels.map((label) => label.name)));
@@ -78,7 +82,9 @@ export function main() {
   const head = git('rev-parse', 'origin/main');
   git('checkout', '--detach', head);
   const subject = git('log', '-1', '--format=%s');
-  if (/^release: v\d+\.\d+\.\d+(?: \(#\d+\))?$/.test(subject)) {
+  const current = JSON.parse(readFileSync('packages/anyagents/package.json', 'utf8')).version;
+  const previous = JSON.parse(git('show', `${head}^:packages/anyagents/package.json`)).version;
+  if (isVersionCut(subject, current, previous)) {
     summary(`no-op: ${head} is a version cut; successful main CI admits publication`);
     return;
   }
@@ -104,7 +110,6 @@ export function main() {
   }
   const commits = new Set(git('rev-list', '--first-parent', `${baseline}..${head}`).split('\n'));
   const pulls = JSON.parse(gh('api', '--paginate', '--slurp', `repos/${repo}/pulls?state=closed&base=main&per_page=100`)).flat();
-  const current = JSON.parse(readFileSync('packages/anyagents/package.json', 'utf8')).version;
   const open = JSON.parse(gh('pr', 'list', '-R', repo, '--state', 'open', '--head', BRANCH,
     '--json', 'number,headRefOid,title,autoMergeRequest'));
   if (open.length > 1) throw new Error('more than one rolling release PR');
@@ -155,6 +160,9 @@ export function main() {
     const refs = git('ls-remote', '--heads', 'origin', `refs/heads/${BRANCH}`);
     if (refs) {
       git('fetch', 'origin', `refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}`);
+      const base = git('merge-base', head, `origin/${BRANCH}`);
+      const owned = git('diff', '--name-only', base, `origin/${BRANCH}`).split('\n').filter(Boolean);
+      if (owned.some((path) => !VERSION_FILES.includes(path))) throw new Error('closed release branch contains non-version changes; preserve it for review');
       git('-c', 'user.name=Kyle Tse', '-c', 'user.email=hi@kylet.se', 'merge', '-s', 'ours', '--no-edit', `origin/${BRANCH}`);
     }
   }
