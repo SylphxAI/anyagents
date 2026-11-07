@@ -22,6 +22,8 @@
 mod aci;
 mod auth;
 mod cloud;
+#[cfg(test)]
+mod masking_tests;
 mod memory;
 pub mod sdk;
 mod workspace;

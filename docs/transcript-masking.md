@@ -26,3 +26,7 @@ for masking diagnostics.
 Regression tests exercise the actual transcript file, nested snapshots, returned
 active-context records, persisted tool-history text and search, with Unicode,
 quoted values, credential references and byte-identical non-secret controls.
+A loopback Responses API fixture also runs real file-read tools through both the
+sequential and parallel native tool paths, then verifies the next HTTP request
+and persisted transcript contain only masked results with intact call ids and
+actionable diagnostics. No external model or provider is called by that fixture.
