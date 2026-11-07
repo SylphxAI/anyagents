@@ -749,32 +749,45 @@ pub(crate) fn write_agent_instructions_with_continuity(
         }
     }
 
+    // Sylphx assembles the shared layer independently. Native harnesses load
+    // their global AGENTS.md / CLAUDE.md / GEMINI.md instead, so those files
+    // must retain the shared layer even though SYSTEM_PROMPT.md stays compact.
+    let mut native_doc = doc.clone();
+    if let Some(shared) = read_shared_agents_md(config) {
+        native_doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
+        native_doc.push_str(&shared);
+        native_doc.push('\n');
+    }
     if let Some(cont) = continuity.map(str::trim).filter(|s| !s.is_empty()) {
-        // Keep the full rendered prompt under Antigravity's 24,000-byte per-file rule cap.
+        // Reserve each file's own shared-layer budget before adding continuity.
+        // Never truncate company instructions to make room for history.
         const MAX_DOC_BYTES: usize = 23_200;
-        let remaining = MAX_DOC_BYTES.saturating_sub(doc.len() + 2);
-        if remaining >= 256 {
-            doc.push('\n');
-            if cont.len() <= remaining {
-                doc.push_str(cont);
-            } else {
-                let mut cut = remaining;
-                while cut > 0 && !cont.is_char_boundary(cut) {
-                    cut -= 1;
+        for rendered in [&mut doc, &mut native_doc] {
+            let remaining = MAX_DOC_BYTES.saturating_sub(rendered.len() + 2);
+            if remaining >= 256 {
+                rendered.push('\n');
+                if cont.len() <= remaining {
+                    rendered.push_str(cont);
+                } else {
+                    let mut cut = remaining;
+                    while cut > 0 && !cont.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    if let Some(nl) = cont[..cut].rfind('\n')
+                        && nl > 0
+                    {
+                        cut = nl;
+                    }
+                    rendered.push_str(&cont[..cut]);
                 }
-                if let Some(nl) = cont[..cut].rfind('\n')
-                    && nl > 0
-                {
-                    cut = nl;
-                }
-                doc.push_str(&cont[..cut]);
+                rendered.push('\n');
             }
-            doc.push('\n');
         }
     }
 
     let sys_prompt_path = config.join("SYSTEM_PROMPT.md");
-    let prompt_changed = std::fs::read(&sys_prompt_path).ok().as_deref() != Some(doc.as_bytes());
+    let prompt_changed = std::fs::read(&sys_prompt_path).ok().as_deref() != Some(doc.as_bytes())
+        || std::fs::read(config.join("AGENTS.md")).ok().as_deref() != Some(native_doc.as_bytes());
     if prompt_changed && config.join("sylphx-cloud-session.json").is_file() {
         let _ = write_seat_shared_file(
             &config.join(".sylphx-cloud-instructions-fingerprint"),
@@ -784,25 +797,25 @@ pub(crate) fn write_agent_instructions_with_continuity(
     }
 
     let paths = [
-        sys_prompt_path,
-        config.join("AGENTS.md"),
-        config.join("opencode").join("AGENTS.md"),
-        config.join(".config").join("opencode").join("AGENTS.md"),
-        config.join("CLAUDE.md"),
-        config.join(".claude").join("CLAUDE.md"),
-        config.join(".gemini").join("config").join("GEMINI.md"),
-        config.join("muse").join("AGENTS.md"),
-        config.join(".config").join("muse").join("AGENTS.md"),
-        config.join(".omp").join("agent").join("APPEND_SYSTEM.md"),
-        config.join(".omp").join("agent").join("AGENTS.md"),
-        config.join(".dsh").join("AGENTS.md"),
-        config.join(".grok").join("AGENTS.md"),
+        (sys_prompt_path, &doc),
+        (config.join("AGENTS.md"), &native_doc),
+        (config.join("opencode/AGENTS.md"), &native_doc),
+        (config.join(".config/opencode/AGENTS.md"), &native_doc),
+        (config.join("CLAUDE.md"), &native_doc),
+        (config.join(".claude/CLAUDE.md"), &native_doc),
+        (config.join(".gemini/config/GEMINI.md"), &native_doc),
+        (config.join("muse/AGENTS.md"), &native_doc),
+        (config.join(".config/muse/AGENTS.md"), &native_doc),
+        (config.join(".omp/agent/APPEND_SYSTEM.md"), &native_doc),
+        (config.join(".omp/agent/AGENTS.md"), &native_doc),
+        (config.join(".dsh/AGENTS.md"), &native_doc),
+        (config.join(".grok/AGENTS.md"), &native_doc),
     ];
-    for path in &paths {
-        if std::fs::read(path).ok().as_deref() == Some(doc.as_bytes()) {
+    for (path, contents) in &paths {
+        if std::fs::read(path).ok().as_deref() == Some(contents.as_bytes()) {
             continue;
         }
-        let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
+        let _ = write_seat_shared_file(path, contents.as_bytes(), 0o664);
     }
     // agy identifies GEMINI.md as "user_global", but rules by file path: even
     // symlinks inject the prompt twice. Keep only the canonical global rule and
@@ -977,6 +990,14 @@ pub(crate) fn data_dir_from_config(config: &Path) -> Option<PathBuf> {
     } else {
         Some(parent1.to_path_buf())
     }
+}
+
+pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
+    let data_dir = data_dir_from_config(config)?;
+    std::fs::read_to_string(data_dir.join("AGENTS.md"))
+        .ok()
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 #[cfg(unix)]
@@ -9747,8 +9768,8 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             2
         );
 
-        // 6. Identity mirrors stay compact at every depth; the harness owns
-        // loading shared company instructions independently.
+        // 6. Sylphx identity stays compact at every depth, while native
+        // harness entrypoints retain the shared company instructions.
         for (ag, expected_desc) in [
             (&root, "Root owner role description."),
             (&l1, "L1 worker role description."),
@@ -9756,9 +9777,13 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         ] {
             let cfg = anyagents_core::agent_config_dir(data, &ag.id);
             let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+            let native_prompt = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+            assert!(native_prompt.starts_with(&prompt));
             assert_eq!(
-                std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap(),
-                prompt
+                native_prompt
+                    .matches("# SylphxAI Shared Constitution")
+                    .count(),
+                1
             );
             assert!(prompt.len() < 3_500, "{}: {} bytes", ag.name, prompt.len());
             assert!(
@@ -10094,6 +10119,87 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
+    fn shared_agents_md_reaches_native_aliases_and_sylphx_assembly_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let shared_path = data.join("AGENTS.md");
+        let work = data.join("workspace");
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::fs::write(
+            work.join("AGENTS.md"),
+            "# Repository rules\nLOCAL_ONLY_RULE\n",
+        )
+        .unwrap();
+        let shared = "# SylphxAI/owner\nCOMPANY_ONLY_RULE 繁體\n";
+
+        for harness in ["agy", "claude-code", "codex", "sylphx"] {
+            std::fs::write(&shared_path, shared).unwrap();
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(harness, harness))
+                .unwrap();
+            let config = agent_config_dir(data, &agent.id);
+            std::fs::create_dir_all(&config).unwrap();
+            write_agent_instructions_with_continuity(&config, &agent, None, None);
+
+            let compact = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+            assert!(!compact.contains("COMPANY_ONLY_RULE"), "{harness}");
+            assert!(!compact.contains("## 4. Shared Instructions (AGENTS.md)"));
+            for path in [
+                "AGENTS.md",
+                "CLAUDE.md",
+                ".claude/CLAUDE.md",
+                ".gemini/config/GEMINI.md",
+            ] {
+                let native = std::fs::read_to_string(config.join(path)).unwrap();
+                assert!(native.starts_with(&compact), "{harness}: {path}");
+                assert!(native.contains(shared.trim()), "{harness}: {path}");
+                assert_eq!(
+                    native.matches("COMPANY_ONLY_RULE").count(),
+                    1,
+                    "{harness}: {path}"
+                );
+                assert_eq!(
+                    native
+                        .matches("## 4. Shared Instructions (AGENTS.md)")
+                        .count(),
+                    1,
+                    "{harness}: {path}"
+                );
+            }
+            assert!(!config.join(".gemini/config/AGENTS.md").exists());
+            assert!(!config.join(".gemini/config/rules/AGENTS.md").exists());
+
+            // Sylphx's native-gateway and cloud paths share this real assembler.
+            // It must read current shared rules, not also load the native alias.
+            let assembled = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
+            assert_eq!(
+                assembled.matches("COMPANY_ONLY_RULE").count(),
+                1,
+                "{harness}"
+            );
+            assert_eq!(assembled.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
+            assert_eq!(assembled.matches("# AnyAgents Identity").count(), 1);
+            std::fs::write(&shared_path, "# SylphxAI/owner\nUPDATED_COMPANY_RULE\n").unwrap();
+            let updated = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
+            assert_eq!(updated.matches("UPDATED_COMPANY_RULE").count(), 1);
+            assert!(!updated.contains("COMPANY_ONLY_RULE"));
+
+            // If the global mount is unavailable, recover the shared layer
+            // from config/AGENTS.md without copying the identity layer twice.
+            std::fs::remove_file(&shared_path).unwrap();
+            let fallback = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
+            assert_eq!(
+                fallback.matches("COMPANY_ONLY_RULE").count(),
+                1,
+                "{harness}"
+            );
+            assert_eq!(fallback.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
+            assert_eq!(fallback.matches("# AnyAgents Identity").count(), 1);
+        }
+    }
+
+    #[test]
     fn create_compact_prompt_removes_legacy_gemini_rules_and_bounds_continuity() {
         let dir = tempfile::TempDir::new().unwrap();
         let data = dir.path();
@@ -10152,7 +10258,10 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         let gemini_md = cfg.join(".gemini/config/GEMINI.md");
         let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
         let gemini_rules_agents = cfg.join(".gemini/config/rules/AGENTS.md");
-        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), base_prompt);
+        let base_native_prompt = std::fs::read_to_string(&gemini_md).unwrap();
+        assert!(base_native_prompt.starts_with(&base_prompt));
+        assert!(base_native_prompt.contains(shared_constitution.trim()));
+        assert_eq!(base_native_prompt.matches("# SylphxAI/owner").count(), 1);
         assert!(!gemini_agents.exists());
         assert!(!gemini_rules_agents.exists());
 
@@ -10165,7 +10274,10 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         write_agent_instructions_with_continuity(&cfg, &agent, None, None);
         assert!(!gemini_agents.exists());
         assert!(!gemini_rules_agents.exists());
-        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), base_prompt);
+        assert_eq!(
+            std::fs::read_to_string(&gemini_md).unwrap(),
+            base_native_prompt
+        );
         std::fs::write(cfg.join("sylphx-cloud-session.json"), "{}").unwrap();
 
         // The previous symlink deduplication did not work: agy identifies the
@@ -10203,7 +10315,21 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "stale\n"
         );
 
-        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
+        let native_prompt = std::fs::read_to_string(&gemini_md).unwrap();
+        assert!(native_prompt.starts_with(&base_native_prompt));
+        assert!(native_prompt.contains(shared_constitution.trim()));
+        assert_eq!(native_prompt.matches("# SylphxAI/owner").count(), 1);
+        assert!(native_prompt.contains("## 4. Cross-Harness Session Continuity"));
+        assert!(
+            native_prompt.len() < 24_000,
+            "{} bytes",
+            native_prompt.len()
+        );
+        let assembled = anyagents_harness_sylphx::assemble_system_prompt(
+            &cfg,
+            Path::new(agent.workdir.as_deref().unwrap()),
+        );
+        assert_eq!(assembled.matches("# SylphxAI/owner").count(), 1);
         assert!(!gemini_agents.exists());
         assert!(!gemini_rules_agents.exists());
         // exists() alone also accepts dangling symlinks; neither alias may remain.
@@ -10221,7 +10347,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         write_agent_instructions_with_continuity(&cfg, &agent, None, Some(&huge_continuity));
         assert!(std::fs::symlink_metadata(&gemini_agents).is_err());
         assert!(std::fs::symlink_metadata(&gemini_rules_agents).is_err());
-        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
+        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), native_prompt);
     }
 }
 
