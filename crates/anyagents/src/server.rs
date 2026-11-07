@@ -6477,7 +6477,6 @@ pub(crate) mod tests {
         new.role = Some("Mind".into());
         let mind = store.create_agent(new).unwrap();
         let state = AppState {
-            send_namespace: "test".into(),
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
@@ -6567,7 +6566,6 @@ pub(crate) mod tests {
             .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
             .unwrap();
         let state = AppState {
-            send_namespace: "test".into(),
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
