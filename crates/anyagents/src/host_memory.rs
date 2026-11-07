@@ -42,8 +42,30 @@ fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Resu
 /// Deploy/startup migration inventories every registered identity, including
 /// archived identities that will never launch. Process locks, not SQL state,
 /// establish quiescence; live or busy identities are explicitly deferred.
-pub(crate) fn on_start(store: &Store) -> Result<(), Error> {
-    on_start_from(store, Path::new("/scratch/tmp/owners"))
+pub(crate) fn on_start(store: &Store) {
+    // Migration is maintenance, never a prerequisite for binding host sockets.
+    // Failed integrity checks preserve their sources; keep a retryable receipt
+    // and allow authorized non-migration operations to remain available.
+    if let Err(error) = on_start_from(store, Path::new("/scratch/tmp/owners")) {
+        let receipt = serde_json::json!({"version":1,"timestamp_ms":anyagents_core::now_ms(),
+            "status":"deferred_error","retryable":true,"error":error.to_string()});
+        let path = store
+            .data_dir()
+            .join("host-memory-migration/startup-error-v1.json");
+        if let Err(write_error) = serde_json::to_vec_pretty(&receipt)
+            .map_err(std::io::Error::other)
+            .and_then(|bytes| anyagents_core::learned_memory::atomic_write(&path, &bytes))
+        {
+            eprintln!(
+                "warning: host memory migration deferred: {error}; receipt write failed: {write_error}"
+            );
+        } else {
+            eprintln!(
+                "warning: host memory migration deferred: {error}; receipt: {}",
+                path.display()
+            );
+        }
+    }
 }
 fn on_start_from(store: &Store, owners_pages: &Path) -> Result<(), Error> {
     let directory = store.data_dir().join("host-memory-migration");
@@ -78,7 +100,16 @@ fn on_start_from(store: &Store, owners_pages: &Path) -> Result<(), Error> {
     }
     let mut migration = HostMigration::open(store.data_dir())?;
     migration.discover(&owners, owners_pages)?;
-    migration.stage(&stopped)?;
+    let mut failures = Vec::new();
+    let mut selected: Vec<_> = registry.iter().map(|a| a.id.to_string()).collect();
+    selected.sort();
+    for id in selected {
+        if let Err(error) = migration.stage_selected(&stopped, Some(&HashSet::from([id.clone()]))) {
+            failures.push(
+                serde_json::json!({"agent_id":id,"retryable":true,"error":error.to_string()}),
+            );
+        }
+    }
     let mut statuses = std::collections::BTreeMap::<String, usize>::new();
     for entry in &migration.manifest.entries {
         *statuses.entry(format!("{:?}", entry.status)).or_default() += 1;
@@ -87,7 +118,7 @@ fn on_start_from(store: &Store, owners_pages: &Path) -> Result<(), Error> {
     stopped.sort();
     deferred.sort();
     let receipt = serde_json::json!({"version": 1, "timestamp_ms": anyagents_core::now_ms(),
-        "population_count": registry.len(), "stopped_agents": stopped,
+        "population_count": registry.len(), "stopped_agents": stopped, "deferred_failed_agents": failures,
         "deferred_active_or_busy_agents": deferred, "entry_counts": statuses,
         "manifest_sha256": anyagents_core::learned_memory::sha256(&fs::read(directory.join("manifest-v1.json"))?)});
     anyagents_core::learned_memory::atomic_write(

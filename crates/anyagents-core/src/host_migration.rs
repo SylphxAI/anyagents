@@ -309,12 +309,10 @@ impl HostMigration {
                 if matches!(
                     entry.status,
                     MigrationStatus::Planned
-                        | MigrationStatus::Prepared
                         | MigrationStatus::PendingRawHandoff
                         | MigrationStatus::RetainedActiveWriter
                 ) {
                     self.manifest.entries[idx].status = MigrationStatus::RetainedActiveWriter;
-                    self.manifest.entries[idx].source_fingerprint = None;
                     self.manifest.entries[idx].reason = Some(
                         "active/busy writer deferred; retry at a quiescent lifecycle boundary"
                             .into(),
@@ -808,6 +806,19 @@ mod tests {
         migration.manifest.entries[idx].status = MigrationStatus::Prepared;
         migration.save().unwrap();
         rename_verified(&source, &destination, &fp).unwrap();
+        drop(migration);
+        let mut migration = HostMigration::open(dir.path()).unwrap();
+        // A busy startup between rename and completion receipt must retain the
+        // original stable proof, without reading or hashing the active source.
+        migration.stage(&HashSet::new()).unwrap();
+        assert_eq!(
+            migration.manifest.entries[idx].status,
+            MigrationStatus::Prepared
+        );
+        assert_eq!(
+            migration.manifest.entries[idx].source_fingerprint,
+            Some(fp.clone())
+        );
         drop(migration);
         let mut migration = HostMigration::open(dir.path()).unwrap();
         migration
