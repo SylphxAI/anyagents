@@ -1,0 +1,186 @@
+{
+  "read_at_utc": "2026-11-07T05:09:45.154818+00:00",
+  "base_tag": "v0.1.2",
+  "cut_source_sha": "5382dfda23877f5cd3b69dfa3cd6316cb58f1e2b",
+  "release_candidate_branch": "agent/lyra-anyagents-release-0.1.3",
+  "release_gate": "Full Linux, macOS and exact-head ci-ok must pass on the release candidate before the normal merge queue.",
+  "pull_requests": [
+    {
+      "number": 110,
+      "merge_sha": "0ff7d3752aba9de3334579ca56622814876a0625",
+      "title": "[review] fix: bind releases to exact successful main CI (#110)",
+      "head_sha": "2913d58780e6701c3b4f826aaebf1359da98fc9e",
+      "merged_at": "2026-11-07T04:10:40Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42336617016/job/128295824018"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 111,
+      "merge_sha": "986dfb69fbb97fac95e8498ad4cd326aab248cb3",
+      "title": "Enforce group ownership and membership permissions (#111)",
+      "head_sha": "dcbcf67226696710a7c54fdb5416303360c1fa3d",
+      "merged_at": "2026-11-07T04:13:36Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42336703026/job/128296186687"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 112,
+      "merge_sha": "6f13e5460191827f8f5968d1f9a03413a7319436",
+      "title": "fix(auth): remove provider keys from curl environment (#112)",
+      "head_sha": "47740d87edc27c361399b0d802013353dd97546e",
+      "merged_at": "2026-11-07T04:13:37Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42335860978/job/128293330494"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 106,
+      "merge_sha": "abebc308922f7e97fe4a013a85fcdc33878eae15",
+      "title": "feat: expose serving process identity in health probes (#106)",
+      "head_sha": "b0d2e37369c22d320b2b15c963070cf0c84bf72b",
+      "merged_at": "2026-11-07T04:29:58Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42336327957/job/128294969347"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 116,
+      "merge_sha": "dc139c6f2a3a24b710805393936b7860c5cdd605",
+      "title": "Test OpenCode handoff collisions with owned sockets (#116)",
+      "head_sha": "135ff4d829dc4d6d2d695220772852f164e78dfe",
+      "merged_at": "2026-11-07T04:36:45Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42338175854/job/128300550825"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 118,
+      "merge_sha": "354e9d1cd7c1c228accd908aeeea639e38976bae",
+      "title": "test(browser): quarantine intermittent clipboard fixture startup (#118)",
+      "head_sha": "bf4d8e80b427d01052c92a4ef59ff5b09d8de18a",
+      "merged_at": "2026-11-07T04:37:20Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42338493306/job/128301473280"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 119,
+      "merge_sha": "375a6d0457fee22282a304af13f0b2d9ec63fb4f",
+      "title": "refactor(auth): share provider key environment aliases (#119)",
+      "head_sha": "45c56accd4099552ecf7ebe670683491b6fc54c3",
+      "merged_at": "2026-11-07T04:48:15Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42338545893/job/128301685968"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 117,
+      "merge_sha": "149235caab91920a4860c3a49026c477e6e380de",
+      "title": "[review] Keep native context compaction within the model budget (#117)",
+      "head_sha": "2d854cf07b66f68b788d6af8c68bad70ecb456a8",
+      "merged_at": "2026-11-07T04:57:15Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42339052013/job/128303279077"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 92,
+      "merge_sha": "7cd1899a1cb950ded48e25de65ffadc51ea12420",
+      "title": "[review] feat: add audited conversation redaction (#92)",
+      "head_sha": "91af59f5cc95bae248407bd3dcde22204b6f3e80",
+      "merged_at": "2026-11-07T05:02:26Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42339086629/job/128303674562"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 114,
+      "merge_sha": "5382dfda23877f5cd3b69dfa3cd6316cb58f1e2b",
+      "title": "fix(test): wait for the Telegram batch checkpoint (#114)",
+      "head_sha": "c637b6d6c49591ee000eb49ccda65d5f516df331",
+      "merged_at": "2026-11-07T05:03:02Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42339604413/job/128304988128"
+      },
+      "disposition": "included"
+    }
+  ],
+  "not_merged_at_cut": [
+    {
+      "number": 108,
+      "state": "OPEN",
+      "headRefOid": "eaf28abdb8831ca1d453d06746af4fc02c3e9830",
+      "mergedAt": null
+    },
+    {
+      "number": 115,
+      "state": "OPEN",
+      "headRefOid": "d34ccaf35a7d2c68a4200beda2249c9bde9204c1",
+      "mergedAt": null
+    },
+    {
+      "number": 120,
+      "state": "OPEN",
+      "headRefOid": "7f6255ef203fdb8b7a0806ad9e5efc05b61035dd",
+      "mergedAt": null
+    },
+    {
+      "number": 121,
+      "state": "OPEN",
+      "headRefOid": "b743d60fdeebce4a5473977dfe34be4a320b2149",
+      "mergedAt": null
+    },
+    {
+      "number": 122,
+      "state": "OPEN",
+      "headRefOid": "5fc0b3298eabbe99f2ea54776f9ee6aa7a24d0c0",
+      "mergedAt": null
+    }
+  ],
+  "previous_release_queue_base_delta": {
+    "pull_request": 113,
+    "merge_sha": "1a2fcb93f02ee7b30b7eba7d2ef206e96a6edfb1",
+    "disposition": "Already shipped in v0.1.2; not counted again."
+  }
+}
