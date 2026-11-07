@@ -1,7 +1,7 @@
 //! REST-only, process-wide GitHub watch observations. The mutex is an intentional
 //! single-flight/serial request gate (not a database lock): GitHub recommends
 //! serial requests to avoid secondary limits. Cached pages retain summaries, not
-//! thousands of full Check Run objects.
+//! full Check Run objects; IDs are retained to validate distinct populations.
 use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
@@ -17,6 +17,8 @@ type Observation = (bool, String);
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Checks {
     count: usize,
+    // IDs survive page caching/304s; raw row counts cannot prove completeness.
+    ids: HashSet<u64>,
     pending: bool,
     review_failed: bool,
 }
@@ -24,6 +26,7 @@ struct Checks {
 impl Checks {
     fn add(&mut self, other: &Self) {
         self.count += other.count;
+        self.ids.extend(&other.ids);
         self.pending |= other.pending;
         self.review_failed |= other.review_failed;
     }
@@ -415,19 +418,38 @@ fn read_checks(
     request: &mut impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
 ) -> Result<Checks, Error> {
     let mut checks = Checks::default();
-    let mut total_count = 0;
+    let check_runs = endpoint.ends_with("/check-runs");
+    let mut total_count = None;
     for n in 1..=MAX_PAGES {
         let path = format!("{endpoint}?per_page=100&page={n}");
         let page = read_page(target, &path, now, request)?;
         let Summary::Checks(summary) = page.summary else {
             return Err(Error::Payload);
         };
+        if check_runs {
+            let page_total = page.total_count.ok_or(Error::Payload)?;
+            // Offset pages are not an atomic snapshot. A changed total proves
+            // a torn read even if the fetched completed rows reach that total.
+            if total_count.is_some_and(|previous| previous != page_total) {
+                return Err(Error::Payload);
+            }
+            total_count = Some(page_total);
+        } else {
+            total_count = Some(total_count.unwrap_or(0).max(page.total_count.unwrap_or(0)));
+        }
         checks.add(&summary);
+        let observed_count = if check_runs {
+            checks.ids.len() as u64
+        } else {
+            checks.count as u64
+        };
+        let total = total_count.unwrap_or(0);
+        if check_runs && observed_count > total {
+            return Err(Error::Payload);
+        }
         // A cold 304 can restore a body without the original Link header.
-        // Retain the largest declared population across all pages, including
-        // warm cached ones, so a later smaller/missing total cannot truncate it.
-        total_count = total_count.max(page.total_count.unwrap_or(0));
-        let next = page.next || (checks.count as u64) < total_count;
+        // Only distinct IDs from a stable declared population can satisfy it.
+        let next = page.next || observed_count < total;
         if !next {
             return Ok(checks);
         }
@@ -531,9 +553,9 @@ fn read_page(
                 .to_string(),
         }
     } else {
+        let check_runs = path.contains("/check-runs?");
         let runs = json
-            .get("check_runs")
-            .or_else(|| json.get("statuses"))
+            .get(if check_runs { "check_runs" } else { "statuses" })
             .and_then(Value::as_array)
             .ok_or(Error::Payload)?;
         total_count = json
@@ -542,13 +564,22 @@ fn read_page(
             .transpose()?;
         // Legacy status envelopes need not declare a total. A full page can
         // never prove exhaustion when an adapter omitted pagination headers.
-        next |= json.get("statuses").is_some() && runs.len() == 100;
+        next |= !check_runs && runs.len() == 100;
         let mut checks = Checks {
             count: runs.len(),
             ..Checks::default()
         };
         for item in runs {
-            checks.pending |= !super::check_item_is_terminal(item);
+            if check_runs {
+                checks.ids.insert(
+                    item.get("id")
+                        .and_then(Value::as_u64)
+                        .ok_or(Error::Payload)?,
+                );
+                checks.pending |= item.get("status").and_then(Value::as_str) != Some("completed");
+            } else {
+                checks.pending |= !super::check_item_is_terminal(item);
+            }
             let name = item
                 .get("name")
                 .or_else(|| item.get("context"))
@@ -941,7 +972,12 @@ mod tests {
                     let count = if n == 3 { 1 } else { 100 };
                     Ok(response(
                         cold_status,
-                        json!({"total_count":201,"check_runs":vec![json!({"status":"completed"});count]}),
+                        json!({
+                            "total_count": 201,
+                            "check_runs": (0..count)
+                                .map(|id| json!({"id": (n - 1) * 100 + id, "status": "completed"}))
+                                .collect::<Vec<_>>()
+                        }),
                         &[("etag", "page")],
                     ))
                 });
@@ -949,6 +985,119 @@ mod tests {
                 assert_eq!(seen, [1, 2, 3]);
             }
         }
+    }
+
+    #[test]
+    fn added_pending_check_with_rising_total_must_not_complete_duplicate_population() {
+        let mut probes = Probes::default();
+        for now in [0, MIN_INTERVAL] {
+            let mut pages = vec![];
+            let result = probes.probe("offset-race", "o", "r", SHA, false, now, |path, etag, _| {
+                let page: usize = path.rsplit_once("page=").unwrap().1.parse().unwrap();
+                pages.push(page);
+                match page {
+                    // The cold 304 restores the original first 100 IDs and no
+                    // Link header. The second cycle reuses that warm summary.
+                    1 if now == 0 => parse_response(COLD_PAGE1.as_bytes()),
+                    1 => {
+                        assert_eq!(etag, Some("\"page1-v1\""));
+                        Ok(response_body(304, "", &[]))
+                    }
+                    // Pending id 102 was inserted at the front, shifting the
+                    // offset: id 99 repeats, id 100 is new, and both fetched
+                    // rows are completed. The pending run is on old page 1.
+                    2 => Ok(response(
+                        200,
+                        json!({
+                            "total_count": 102,
+                            "check_runs": [
+                                {"id": 99, "status": "completed"},
+                                {"id": 100, "status": "completed"}
+                            ]
+                        }),
+                        &[],
+                    )),
+                    _ => panic!("offset race requested unexpected page {page}"),
+                }
+            });
+            assert_eq!(pages, [1, 2]);
+            assert_eq!(result, (false, "probe_error:payload".to_string()));
+            assert!(!probes.targets["offset-race"].settled);
+        }
+    }
+
+    #[test]
+    fn duplicate_completed_ids_cannot_satisfy_an_unchanged_total() {
+        let mut probes = Probes::default();
+        let mut pages = vec![];
+        let result = probes.probe("duplicate", "o", "r", SHA, false, 0, |path, _, _| {
+            let page: usize = path.rsplit_once("page=").unwrap().1.parse().unwrap();
+            pages.push(page);
+            let runs = match page {
+                1 => json!([{"id":1,"status":"completed"}]),
+                2 => json!([{"id":1,"status":"completed"}, {"id":2,"status":"completed"}]),
+                3 => json!([]),
+                _ => panic!("incomplete population did not stop on an empty page"),
+            };
+            Ok(response(
+                200,
+                json!({"total_count":3,"check_runs":runs}),
+                &[],
+            ))
+        });
+        assert_eq!(pages, [1, 2, 3]);
+        assert_eq!(result, (false, "probe_error:payload".to_string()));
+        assert!(!probes.targets["duplicate"].settled);
+    }
+
+    #[test]
+    fn changed_total_is_inconsistent_even_without_duplicate_ids() {
+        for later_total in [1, 3] {
+            let mut probes = Probes::default();
+            let result = probes.probe("changed-total", "o", "r", SHA, false, 0, |path, _, _| {
+                let (total, id) = if path.ends_with("page=1") {
+                    (2, 1)
+                } else {
+                    (later_total, 2)
+                };
+                Ok(response(
+                    200,
+                    json!({"total_count":total,"check_runs":[{"id":id,"status":"completed"}]}),
+                    &[],
+                ))
+            });
+            assert_eq!(result, (false, "probe_error:payload".to_string()));
+            assert!(!probes.targets["changed-total"].settled);
+        }
+    }
+
+    #[test]
+    fn check_run_completion_requires_valid_ids_totals_and_completed_status() {
+        for body in [
+            json!({"check_runs":[{"id":1,"status":"completed"}]}),
+            json!({"total_count":1,"check_runs":[{"status":"completed"}]}),
+            json!({"total_count":1,"check_runs":[{"id":null,"status":"completed"}]}),
+            json!({"total_count":1,"check_runs":[{"id":"1","status":"completed"}]}),
+            json!({"total_count":0,"check_runs":[{"id":1,"status":"completed"}]}),
+        ] {
+            let mut probes = Probes::default();
+            let result = probes.probe("invalid", "o", "r", SHA, false, 0, |_, _, _| {
+                Ok(response(200, body.clone(), &[]))
+            });
+            assert_eq!(result, (false, "probe_error:payload".to_string()), "{body}");
+            assert!(!probes.targets["invalid"].settled);
+        }
+        // A legacy terminal state cannot substitute for a check-run status.
+        let mut probes = Probes::default();
+        let result = probes.probe("missing-status", "o", "r", SHA, false, 0, |_, _, _| {
+            Ok(response(
+                200,
+                json!({"total_count":1,"check_runs":[{"id":1,"state":"success"}]}),
+                &[],
+            ))
+        });
+        assert_eq!(result, (false, "checks_in_progress".to_string()));
+        assert!(!probes.targets["missing-status"].settled);
     }
 
     #[test]
@@ -977,7 +1126,7 @@ mod tests {
                     } else {
                         Ok(response(
                             200,
-                            json!({"total_count":101,"check_runs":[{"status":"completed"}]}),
+                            json!({"total_count":101,"check_runs":[{"id":101,"status":"completed"}]}),
                             &[],
                         ))
                     }
@@ -1043,7 +1192,7 @@ mod tests {
                 let result = probes.probe("bad-count", "o", "r", SHA, false, 0, |_, _, _| {
                     Ok(response(
                         status,
-                        json!({"total_count":total,"check_runs":[{"status":"completed"}]}),
+                        json!({"total_count":total,"check_runs":[{"id":1,"status":"completed"}]}),
                         &[],
                     ))
                 });
@@ -1062,14 +1211,14 @@ mod tests {
             Ok(if path.ends_with("page=1") {
                 response(
                     304,
-                    json!({"total_count":1,"check_runs":[{"status":"completed"}]}),
+                    json!({"total_count":2,"check_runs":[{"id":1,"status":"completed"}]}),
                     &[("link", "<page2>; rel=\"next\"")],
                 )
             } else {
                 assert!(path.ends_with("page=2"));
                 response(
                     200,
-                    json!({"total_count":2,"check_runs":[{"status":"in_progress"}]}),
+                    json!({"total_count":2,"check_runs":[{"id":2,"status":"in_progress"}]}),
                     &[],
                 )
             })
@@ -1086,7 +1235,7 @@ mod tests {
             calls += 1;
             Ok(response(
                 304,
-                json!({"total_count":u64::MAX,"check_runs":[{"status":"completed"}]}),
+                json!({"total_count":u64::MAX,"check_runs":[{"id":1,"status":"completed"}]}),
                 &[],
             ))
         });
@@ -1108,6 +1257,7 @@ mod tests {
                 total_count: None,
                 summary: Summary::Checks(Checks {
                     count: 1,
+                    ids: HashSet::from([1]),
                     pending: true,
                     review_failed: false,
                 }),
@@ -1471,16 +1621,16 @@ mod tests {
                 "review_failed",
             ),
             (
-                json!({"check_runs":[{"name":"review","status":"completed","conclusion":"timed_out"}]}),
+                json!({"total_count":1,"check_runs":[{"id":1,"name":"review","status":"completed","conclusion":"timed_out"}]}),
                 json!([]),
                 "review_failed",
             ),
             (
-                json!({"check_runs":[]}),
+                json!({"total_count":0,"check_runs":[]}),
                 json!([{"context":"ci","state":"error"}]),
                 "checks_completed",
             ),
-            (json!({"check_runs":[]}), json!([]), "open"),
+            (json!({"total_count":0,"check_runs":[]}), json!([]), "open"),
         ] {
             let mut probes = Probes::default();
             assert_eq!(
