@@ -214,10 +214,10 @@ impl Probes {
             .retain(|_, target| now.saturating_sub(target.accessed_at) < 3_600_000);
         let target = self.targets.entry(key.to_string()).or_default();
         target.accessed_at = now;
-        if target.settled {
-            if let Some(result) = &target.successful {
-                return result.clone();
-            }
+        if target.settled
+            && let Some(result) = &target.successful
+        {
+            return result.clone();
         }
         target.changed = false;
         // A cooldown overrides the normal interval. Always re-read on recovery,
@@ -612,10 +612,31 @@ fn request(
     agent_id: &str,
     owner: &str,
 ) -> Result<Response, Error> {
+    let token_dir = std::env::var_os("ANYAGENTS_GITHUB_TOKEN_DIR");
+    request_with_token_dir(
+        base,
+        path,
+        etag,
+        modified,
+        agent_id,
+        owner,
+        token_dir.as_deref().map(std::path::Path::new),
+    )
+}
+
+fn request_with_token_dir(
+    base: &str,
+    path: &str,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    agent_id: &str,
+    owner: &str,
+    token_dir: Option<&std::path::Path>,
+) -> Result<Response, Error> {
     // Presence, not readability, selects dedicated mode. Rotation is an atomic
     // file replacement; re-read for every wire request and never fall back.
-    let token = std::env::var_os("ANYAGENTS_GITHUB_TOKEN_DIR")
-        .map(|path| token_for_owner(std::path::Path::new(&path), owner))
+    let token = token_dir
+        .map(|dir| token_for_owner(dir, owner))
         .transpose()?;
     if !base.is_empty() || token.is_some() {
         let base = if base.is_empty() {
@@ -1421,6 +1442,208 @@ mod tests {
             std::fs::write(&path, token).unwrap();
             assert!(matches!(token_from_file(&path), Err(Error::Auth)));
         }
+    }
+
+    // A real socket boundary checks routing, credentials and prepared headers;
+    // injected responses alone cannot establish which identity went on the wire.
+    fn credential_server(
+        expected: Vec<(String, String, u16, Option<String>)>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        listener.set_nonblocking(true).unwrap();
+        let thread = std::thread::spawn(move || {
+            for (path, token, status, location) in expected {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let mut stream = loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(std::time::Instant::now() < deadline, "missing HTTP request");
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("fixture accept: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, format!("GET /{path} HTTP/1.1\r\n"));
+                let mut headers = HashMap::new();
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.trim().split_once(':').unwrap();
+                    headers.insert(key.to_ascii_lowercase(), value.trim().to_string());
+                }
+                assert_eq!(headers["authorization"], format!("Bearer {token}"));
+                assert_eq!(headers["accept"], "application/vnd.github+json");
+                assert_eq!(headers["x-github-api-version"], "2022-11-28");
+                let body = pending().to_string();
+                let location = location
+                    .map(|v| format!("Location: {v}\r\n"))
+                    .unwrap_or_default();
+                write!(stream, "HTTP/1.1 {status} Fixture\r\n{location}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+            }
+        });
+        (base, thread)
+    }
+
+    #[test]
+    fn dedicated_http_routes_and_rotates_owner_tokens_and_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let write_token = |owner: &str, value: &str| {
+            // Match the publisher's atomic replacement rather than mutating an
+            // inode that a concurrent reader may already have open.
+            let staged = dir.path().join("staged");
+            std::fs::write(&staged, value).unwrap();
+            std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(staged, dir.path().join(format!("{owner}.token"))).unwrap();
+        };
+        write_token("SylphxAI", "fixture-first");
+        write_token("Cubeage", "fixture-cubeage");
+        let path =
+            |owner: &str| format!("repos/{owner}/r/commits/sha/check-runs?per_page=100&page=1");
+        let expected = [
+            ("sylphxai", "fixture-first", 200),
+            ("cubeage", "fixture-cubeage", 200),
+            ("sylphxai", "fixture-rotated", 200),
+            ("cubeage", "fixture-cubeage", 401),
+            ("sylphxai", "fixture-rotated", 200),
+            ("cubeage", "fixture-recovered", 200),
+            ("sylphxai", "fixture-rotated", 200),
+        ]
+        .into_iter()
+        .map(|(owner, token, status)| (path(owner), token.to_string(), status, None))
+        .collect();
+        let (base, server) = credential_server(expected);
+        // A configured missing/bad file must never reach either HTTP or gh.
+        assert!(matches!(
+            request_with_token_dir(
+                &base,
+                &path("missing"),
+                None,
+                None,
+                "agent",
+                "missing",
+                Some(dir.path())
+            ),
+            Err(Error::Auth)
+        ));
+        let cubeage = dir.path().join("Cubeage.token");
+        std::fs::set_permissions(&cubeage, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            request_with_token_dir(
+                &base,
+                &path("cubeage"),
+                None,
+                None,
+                "agent",
+                "cubeage",
+                Some(dir.path())
+            ),
+            Err(Error::Auth)
+        ));
+        std::fs::set_permissions(&cubeage, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut probes = Probes::default();
+        let poll = |probes: &mut Probes, key: &str, owner: &str, now: i64| {
+            probes
+                .probe(
+                    key,
+                    owner,
+                    "r",
+                    "sha",
+                    false,
+                    now,
+                    |path, etag, modified| {
+                        request_with_token_dir(
+                            &base,
+                            path,
+                            etag,
+                            modified,
+                            "agent",
+                            owner,
+                            Some(dir.path()),
+                        )
+                    },
+                )
+                .1
+        };
+        assert_eq!(poll(&mut probes, "s", "sylphxai", 0), "checks_in_progress");
+        assert_eq!(poll(&mut probes, "c", "cubeage", 0), "checks_in_progress");
+        write_token("SylphxAI", "fixture-rotated");
+        assert_eq!(
+            poll(&mut probes, "s", "sylphxai", 60_000),
+            "checks_in_progress"
+        );
+        assert_eq!(
+            poll(&mut probes, "c", "cubeage", 60_000),
+            "probe_error:auth"
+        );
+        // The owner's 401 holds all its targets, but not the other owner.
+        assert_eq!(
+            poll(&mut probes, "c2", "Cubeage", 119_999),
+            "probe_error:auth"
+        );
+        assert_eq!(
+            poll(&mut probes, "s2", "sylphxai", 119_999),
+            "checks_in_progress"
+        );
+        write_token("Cubeage", "fixture-recovered");
+        assert_eq!(
+            poll(&mut probes, "c", "cubeage", 120_000),
+            "checks_in_progress"
+        );
+        assert_eq!(
+            poll(&mut probes, "s", "sylphxai", 180_000),
+            "checks_in_progress"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn dedicated_http_never_forwards_credentials_on_redirect() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("o.token");
+        std::fs::write(&token, "fixture-origin-only").unwrap();
+        std::fs::set_permissions(token, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let destination = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let (base, server) = credential_server(vec![(
+            "repos/o/r/pulls/1".to_string(),
+            "fixture-origin-only".to_string(),
+            302,
+            Some(format!(
+                "http://{}/redirected",
+                destination.local_addr().unwrap()
+            )),
+        )]);
+        let mut probes = Probes::default();
+        let result = probes.probe(
+            "redirect",
+            "o",
+            "r",
+            "1",
+            true,
+            0,
+            |path, etag, modified| {
+                request_with_token_dir(&base, path, etag, modified, "agent", "o", Some(dir.path()))
+            },
+        );
+        assert_eq!(result.1, "probe_error:http:302");
+        server.join().unwrap();
+        assert!(
+            matches!(destination.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]
