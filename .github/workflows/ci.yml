@@ -94,8 +94,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Release admission policy
         run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
-      - name: Takeover geometry
-        run: node --test tests/browser-takeover-geometry.test.mjs
+      - name: Browser fixture tests
+        run: npm test
       - name: Test
         run: cargo test --workspace --locked
 
@@ -118,6 +118,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Browser fixture cleanup
+        run: node --test tests/browser-process-group.test.mjs
       - name: Test
         run: cargo test --workspace --locked
 
