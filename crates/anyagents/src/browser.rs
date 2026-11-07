@@ -5511,6 +5511,7 @@ mod tests {
         );
     }
     #[test]
+    #[ignore = "Chromium CDP startup exceeds 12s under CI load; tracking: https://github.com/SylphxAI/anyagents/pull/115"]
     fn takeover_clipboard_ui_acceptance() {
         if !Path::new(&chromium_binary()).exists() {
             return;

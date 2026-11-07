@@ -33,6 +33,18 @@ cargo test --workspace --locked
 npm test
 ```
 
+## OpenCode port-collision fixtures
+
+The scripted child owns a competing socket before publishing its handoff barrier
+by atomic rename, then deliberately attempts the conflicting bind. The transient
+case releases that holder before acknowledging its bind failure and cannot exit
+until the test acknowledges the release. Both cases require the witnessed bind
+failure, startup retry and a different persisted port. The stored-port fixture
+retains its socket throughout setup; restart checks accept a legal replacement
+rather than assuming a released number stays available on a shared runner.
+These cases run in the ordinary OpenCode `protocol` suite without product hooks
+or an installed vendor CLI. The real-CLI case remains optional and ignored.
+
 ## Archived sub-agent cleanup
 
 ```sh
