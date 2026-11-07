@@ -64,6 +64,15 @@ hash of it**. Replay of the original target/span, including equivalent mailbox
 id/seq selectors, returns the existing audit id and receipt without a second edit.
 Coordinates are otherwise relative to the body's current version.
 
+An inbound redaction also binds its recipient and provider `(chat_id, message_id)`
+when present. Later deliveries or edits with those coordinates return the existing
+redacted row without changing its body, metadata, edit baseline, index or audit,
+regardless of source key, relay/direct delivery, or age. Any redacted mailbox row
+is excluded from duplicate body enrichment. This freezes the selected message,
+including after a partial-span redaction; new provider edits are not accepted as
+permission to overwrite it. Other recipients, chats and provider message ids
+remain independent.
+
 Read `full_scrub`, `scrubbed_paths` and `unscrubbed` in the returned receipt.
 Unreadable/invalid JSONL, symlinked/hard-linked sessions, known binary harness
 stores and retained remote-session metadata are explicitly listed by path; no

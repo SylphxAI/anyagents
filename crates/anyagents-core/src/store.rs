@@ -1672,6 +1672,21 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         agent_by_id(&tx, agent_id)?;
+        // Erasure is authoritative over provider retries/edits, including basic
+        // group relays and rows outside the normal bounded origin scan. Refuse
+        // resurrection before source dedup, quote/mention enrichment, baseline
+        // writes, mailbox allocation or indexing can retain the incoming text.
+        if let Some(origin) = incoming.origin
+            && let (Some(chat_id), Some(message_id)) = (
+                origin.chat_id,
+                origin
+                    .message_id
+                    .or_else(|| parse_edited_message_text(&incoming.text).map(|(id, _)| id)),
+            )
+            && let Some(existing) = redacted_message_by_origin(&tx, agent_id, chat_id, message_id)?
+        {
+            return Ok(ReceiveOutcome::Duplicate(existing));
+        }
         if let Some(key) = &source_key
             && let Some(existing) = message_by_source(&tx, agent_id, key)?
         {
@@ -4736,6 +4751,35 @@ fn message_by_source(
     found.transpose()
 }
 
+/// Resolve only explicitly redacted provider origins, with no bounded history
+/// scan or body-based matching. A missing canonical row is a storage error, not
+/// permission to append the original again.
+fn redacted_message_by_origin(
+    conn: &Connection,
+    agent_id: &AgentId,
+    chat_id: i64,
+    message_id: i64,
+) -> Result<Option<Message>, Error> {
+    let target_id: Option<String> = conn
+        .query_row(
+            "SELECT target_id FROM conversation_redactions
+         WHERE agent_id = ?1 AND origin_chat_id = ?2 AND origin_message_id = ?3
+         ORDER BY created_at_ms DESC, id DESC LIMIT 1",
+            params![agent_id.as_str(), chat_id, message_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(target_id) = target_id else {
+        return Ok(None);
+    };
+    let row = conn.query_row(
+        &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND id = ?2"),
+        params![agent_id.as_str(), target_id],
+        |r| Ok(message_from_row(conn, r)),
+    )??;
+    Ok(Some(row))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn message_by_origin(
     conn: &Connection,
@@ -4795,6 +4839,17 @@ fn message_by_origin(
                 _ => (now_ms() - msg.received_at_ms).abs() <= 15_000,
             };
         if matched_by_id || matched_by_group_relay {
+            // Guard BOTH body UPDATE paths below by canonical identity as well
+            // as the ingress origin binding. This check and every caller's
+            // enrichment writes share receive_with_wake's IMMEDIATE transaction,
+            // serialized with redaction, so an audit cannot race this decision.
+            let redacted: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2)",
+                params![agent_id.as_str(), msg.id.as_str()], |r| r.get(0),
+            )?;
+            if redacted {
+                return Ok(Some(msg));
+            }
             let was_unquoted = !has_quoted_block(&msg.text) && has_quoted_block(incoming_body);
             let best_body = if was_unquoted || incoming_body.len() > msg.text.len() {
                 Some(incoming_body.to_string())

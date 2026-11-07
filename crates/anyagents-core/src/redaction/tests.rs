@@ -137,6 +137,224 @@ fn redaction_preserves_mailbox_order_metadata_other_rows_and_removes_search_term
     }
 }
 
+// A provider retry/edit is not permission to undo an audited erasure. Exercise
+// both duplicate-enrichment branches, basic groups, and an origin older than
+// the ordinary deduplicator's bounded history window.
+#[test]
+fn redacted_provider_redelivery_and_edits_preserve_body_index_and_audit() {
+    for chat_id in [-100_123_456_7890, -1234] {
+        for source in ["webhook:initial", "tg-in:initial"] {
+            for partial in [false, true] {
+                let f = Fixture::new();
+                let original =
+                    "prefix providerredeliverycanary and additional private fixture text suffix";
+                let mut incoming = Incoming::new(original);
+                incoming.sender = Some("telegram:user:123".into());
+                incoming.source_key = Some(source.into());
+                incoming.source_time_ms = Some(123);
+                incoming.origin = Some(crate::Origin {
+                    chat_id: Some(chat_id),
+                    message_id: Some(42),
+                    thread_id: Some(7),
+                });
+                let ReceiveOutcome::New(m) =
+                    f.store.receive(&f.target.id, incoming.clone()).unwrap()
+                else {
+                    panic!("initial message must be new");
+                };
+                let span = partial.then(|| chars(7, original.chars().count() - 7));
+                let req = request(m.id.as_str(), span);
+                let receipt = f.redact(&req).unwrap();
+                assert!(receipt.full_scrub, "{receipt:?}");
+                let mut expected = m.clone();
+                expected.text = if partial {
+                    "prefix [redacted] suffix".into()
+                } else {
+                    TOMBSTONE.into()
+                };
+                let audit_before: String = f
+                    .store
+                    .conn()
+                    .query_row(
+                        "SELECT receipt FROM conversation_redactions WHERE id = ?1",
+                        [&receipt.audit_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                let binding: (i64, i64) = f.store.conn().query_row(
+                    "SELECT origin_chat_id, origin_message_id FROM conversation_redactions WHERE id = ?1",
+                    [&receipt.audit_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+                assert_eq!(binding, (chat_id, 42));
+                let baseline_before: String = f.store.conn().query_row(
+                    "SELECT body FROM message_versions WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = 42",
+                    params![f.target.id.as_str(), chat_id], |r| r.get(0)).unwrap();
+                // Use a second connection so protection must survive persistence.
+                let reopened = Store::open(f.dir.path().join("state.db")).unwrap();
+                for aged in [false, true] {
+                    if aged {
+                        for i in 0..65 {
+                            let mut filler = Incoming::new("unrelated provider history");
+                            filler.origin = Some(crate::Origin {
+                                chat_id: Some(chat_id),
+                                message_id: Some(1000 + i),
+                                thread_id: None,
+                            });
+                            reopened.receive(&f.target.id, filler).unwrap();
+                        }
+                    }
+                    for (key, text) in [
+                        (source, original.to_string()),
+                        ("webhook:retry", original.to_string()),
+                        ("tg-in:retry", original.to_string()),
+                        ("room:retry", original.to_string()),
+                        (
+                            "webhook:edit",
+                            format!("[Edited message #42]: {original} extended edit"),
+                        ),
+                    ] {
+                        let mut retry = incoming.clone();
+                        retry.source_key = Some(key.into());
+                        retry.text = text;
+                        let outcome = reopened.receive(&f.target.id, retry).unwrap();
+                        let ReceiveOutcome::Duplicate(duplicate) = outcome else {
+                            panic!("redacted origin must not append a new row: {outcome:?}");
+                        };
+                        assert_eq!(
+                            duplicate, expected,
+                            "{chat_id} {source} {partial} {aged} {key}"
+                        );
+                        assert_eq!(reopened.inbox(&f.target.id, None).unwrap()[0], expected);
+                        assert!(
+                            reopened
+                                .search_conversation(
+                                    Some("child"),
+                                    None,
+                                    None,
+                                    None,
+                                    "providerredeliverycanary"
+                                )
+                                .unwrap()
+                                .is_empty()
+                        );
+                        let conn = reopened.conn();
+                        let (audit, count): (String, i64) = conn.query_row(
+                            "SELECT receipt, (SELECT count(*) FROM conversation_redactions) FROM conversation_redactions WHERE id = ?1",
+                            [&receipt.audit_id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+                        assert_eq!(audit, audit_before);
+                        assert_eq!(count, 1);
+                        let baseline: String = conn.query_row(
+                            "SELECT body FROM message_versions WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = 42",
+                            params![f.target.id.as_str(), chat_id], |r| r.get(0)).unwrap();
+                        assert_eq!(baseline, baseline_before);
+                        let indexed: String = conn
+                            .query_row(
+                                "SELECT text FROM rag_chunks WHERE chunk_id = ?1",
+                                [m.id.as_str()],
+                                |r| r.get(0),
+                            )
+                            .unwrap();
+                        assert_eq!(indexed, expected.text);
+                    }
+                }
+                assert_eq!(f.redact(&req).unwrap(), receipt);
+                assert_eq!(reopened.inbox(&f.target.id, None).unwrap().len(), 66);
+                // Binding is recipient + chat + provider message, never message id alone.
+                let mut other_chat = incoming.clone();
+                other_chat.source_key = Some("webhook:other-chat".into());
+                other_chat.origin.as_mut().unwrap().chat_id = Some(chat_id - 1);
+                assert!(matches!(
+                    reopened.receive(&f.target.id, other_chat).unwrap(),
+                    ReceiveOutcome::New(_)
+                ));
+                assert!(matches!(
+                    reopened.receive(&f.peer.id, incoming).unwrap(),
+                    ReceiveOutcome::New(_)
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn redacted_relay_alias_cannot_enrich_either_body_update_path() {
+    // Different bot-local message IDs bypass the exact-origin binding. The
+    // existing relay matcher still finds this canonical row by safe body/user/
+    // time; its identity guard must refuse a quote upgrade containing old text.
+    for (stored_key, retry_key) in [
+        ("tg-in:initial", "webhook:alias"),
+        ("webhook:initial", "tg-in:alias"),
+    ] {
+        let f = Fixture::new();
+        let mut incoming = Incoming::new("prefix relayaliascanary suffix");
+        incoming.sender = Some("telegram:user:123".into());
+        incoming.source_time_ms = Some(123);
+        incoming.source_key = Some(stored_key.into());
+        incoming.origin = Some(crate::Origin {
+            chat_id: Some(-1234),
+            message_id: Some(42),
+            thread_id: None,
+        });
+        let ReceiveOutcome::New(mut expected) =
+            f.store.receive(&f.target.id, incoming.clone()).unwrap()
+        else {
+            panic!("initial message must be new");
+        };
+        let req = request(expected.id.as_str(), Some(chars(7, 23)));
+        let receipt = f.redact(&req).unwrap();
+        expected.text = "prefix [redacted] suffix".into();
+        incoming.text = expected.text.clone();
+        incoming.source_key = Some(retry_key.into());
+        incoming.origin.as_mut().unwrap().message_id = Some(43);
+        incoming.quote = Some(crate::Quote {
+            author: "external:user".into(),
+            author_is_bot: false,
+            sender_id: None,
+            text: "relayaliascanary in a late quote upgrade".into(),
+            reference: None,
+            mentions: Vec::new(),
+        });
+        let outcome = f.store.receive(&f.target.id, incoming).unwrap();
+        let ReceiveOutcome::Duplicate(duplicate) = outcome else {
+            panic!("relay alias must resolve the existing row: {outcome:?}");
+        };
+        assert_eq!(duplicate, expected);
+        assert_eq!(f.store.inbox(&f.target.id, None).unwrap(), vec![expected]);
+        assert_eq!(f.redact(&req).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn unredacted_provider_duplicates_still_enrich_both_body_update_paths() {
+    for source in ["webhook:initial", "tg-in:initial"] {
+        let f = Fixture::new();
+        let mut incoming = Incoming::new("short body");
+        incoming.sender = Some("telegram:user:123".into());
+        incoming.source_key = Some(source.into());
+        incoming.origin = Some(crate::Origin {
+            chat_id: Some(-100_123_456_7890),
+            message_id: Some(42),
+            thread_id: None,
+        });
+        let ReceiveOutcome::New(m) = f.store.receive(&f.target.id, incoming.clone()).unwrap()
+        else {
+            panic!("initial message must be new");
+        };
+        incoming.source_key = Some("webhook:retry".into());
+        incoming.text = "short body with legitimate extra context".into();
+        let ReceiveOutcome::Duplicate(enriched) =
+            f.store.receive(&f.target.id, incoming.clone()).unwrap()
+        else {
+            panic!("unredacted retry must enrich the existing row");
+        };
+        assert_eq!(enriched.id, m.id);
+        assert_eq!(enriched.text, incoming.text);
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            incoming.text
+        );
+    }
+}
+
 #[test]
 fn replay_by_original_span_or_seq_returns_existing_audit_after_reopen() {
     let f = Fixture::new();

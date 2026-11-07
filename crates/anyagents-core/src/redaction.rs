@@ -615,7 +615,16 @@ impl Store {
                 [],
             )?;
         }
-        tx.execute("INSERT INTO conversation_redactions (id, agent_id, target_id, request_key, actor, permission, reason, created_at_ms, span_unit, span_start, span_end, removed_bytes, removed_chars, receipt) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        // Bind erasure to the provider identity in the same IMMEDIATE transaction
+        // as the body/index rewrite. Ingress checks this before any enrichment or
+        // edit-baseline write; neither a new source key nor an aged-out row escapes.
+        tx.execute("INSERT INTO conversation_redactions (
+                id, agent_id, target_id, request_key, actor, permission, reason,
+                created_at_ms, span_unit, span_start, span_end, removed_bytes,
+                removed_chars, receipt, origin_chat_id, origin_message_id
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
+                (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
             params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
         tx.commit()?;
         for mut session in prepared {
