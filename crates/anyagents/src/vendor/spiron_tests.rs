@@ -33,6 +33,7 @@ impl Drop for Environment {
         }
     }
 }
+#[track_caller]
 fn eventually(mut check: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !check() {
@@ -348,7 +349,19 @@ for line in sys.stdin:
     }
 }
 
-fn external_probe(temp: &Path, script: &str) -> (Store, anyagents_core::Agent, StreamHarness) {
+fn external_probe(
+    temp: &Path,
+    script: &str,
+) -> (
+    std::sync::MutexGuard<'static, ()>,
+    Store,
+    anyagents_core::Agent,
+    StreamHarness,
+) {
+    // A child inherits process-global environment even when this fixture never
+    // mutates it. Keep the shared guard until its harness and restart are done,
+    // not merely until launch returns.
+    let environment = crate::server::tests::env_lock();
     let config = temp.join("config");
     let work = temp.join("work");
     std::fs::create_dir_all(&config).unwrap();
@@ -361,7 +374,7 @@ fn external_probe(temp: &Path, script: &str) -> (Store, anyagents_core::Agent, S
         .create_agent(NewAgent::new("external-probe", "spiron"))
         .unwrap();
     let harness = start_spiron(&program, &config, &work, &agent, None, &[]).unwrap();
-    (store, agent, harness)
+    (environment, store, agent, harness)
 }
 
 #[test]
@@ -387,7 +400,7 @@ for line in sys.stdin:
   print(json.dumps({'type':'steer_ack','request_id':m['request_id'],'accepted':True,'turn_id':first}),flush=True)
   pathlib.Path(os.environ['HOME'],'steer-ack').touch()
 "#;
-    let (store, agent, harness) = external_probe(temp.path(), script);
+    let (_environment, store, agent, harness) = external_probe(temp.path(), script);
     let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("first")).unwrap()
     else {
         panic!("fresh mailbox message expected")
@@ -497,7 +510,7 @@ for line in sys.stdin:
   out.write(json.dumps(m)+'\n')
  print(json.dumps({'type':'accepted','request_id':m['request_id']}),flush=True)
 "#;
-    let (store, agent, harness) = external_probe(temp.path(), script);
+    let (_environment, store, agent, harness) = external_probe(temp.path(), script);
     let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("first")).unwrap()
     else {
         panic!("fresh mailbox message expected")
@@ -616,7 +629,7 @@ for line in sys.stdin:
   print(json.dumps({'type':'text_delta','request_id':id,'text':char}),flush=True)
  print(json.dumps({'type':'result','request_id':id,'status':'completed','usage':{'input_tokens':7}}),flush=True)
 "#;
-    let (store, agent, mut harness) = external_probe(temp.path(), script);
+    let (_environment, store, agent, mut harness) = external_probe(temp.path(), script);
     eventually(|| {
         matches!(
             harness.deliver(
@@ -673,7 +686,7 @@ sys.exit({exit})
 "#,
             after_input = if after_input { "True" } else { "False" }
         );
-        let (_, _, mut harness) = external_probe(temp.path(), &script);
+        let (_environment, _, _, mut harness) = external_probe(temp.path(), &script);
         if after_input {
             // The peer can die between writing and observing acceptance.
             let _ = harness.deliver(
