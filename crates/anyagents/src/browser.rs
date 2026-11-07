@@ -4840,6 +4840,17 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
 
+    // Each real-browser scenario owns its Chromium processes until teardown.
+    // Starting every fixture together can starve CDP startup on a small runner;
+    // keep the production 12s readiness ceiling and all interaction assertions.
+    static BROWSER_FIXTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn browser_fixture_guard() -> std::sync::MutexGuard<'static, ()> {
+        BROWSER_FIXTURE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[cfg(unix)]
     fn startup_test_child(log: &Path, command: &str) -> std::process::Child {
         use std::os::unix::process::CommandExt;
@@ -5001,6 +5012,7 @@ mod tests {
 
     #[test]
     fn cross_origin_iframe_snapshot_fill_and_click_with_secret_ref() {
+        let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {
             return;
         }
@@ -5156,6 +5168,7 @@ mod tests {
 
     #[test]
     fn held_key_moves_raf_fixture_stops_on_release_and_isolates_profiles() {
+        let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {
             return;
         }
@@ -5412,6 +5425,7 @@ mod tests {
 
     #[test]
     fn human_takeover_captcha_detection_fencing_and_remote_solve() {
+        let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {
             return;
         }
@@ -5647,6 +5661,7 @@ mod tests {
     }
 
     fn run_takeover_ui_acceptance(clipboard_only: bool) {
+        let _browser = browser_fixture_guard();
         assert!(
             Path::new(&chromium_binary()).exists(),
             "Chromium is required"
@@ -5803,6 +5818,7 @@ mod tests {
 
     #[test]
     fn takeover_viewport_preserves_identity_and_restores_every_exit() {
+        let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {
             return;
         }
@@ -5953,6 +5969,7 @@ mod tests {
     #[test]
     #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md; fix owner: lyra-anyagents-takeover-test-race after #91"]
     fn takeover_focus_finds_cross_origin_input() {
+        let _browser = browser_fixture_guard();
         if !Path::new(&chromium_binary()).exists() {
             return;
         }

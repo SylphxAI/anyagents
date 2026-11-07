@@ -214,6 +214,21 @@ a TCP listener with incomplete/error responses before readiness, early exit,
 stalled HTTP, missing logs and non-UTF-8 log tails. These controls improve
 readiness and diagnosis; they do not establish the cause of those CI failures.
 Keep the quarantine until captured failure evidence supports a causal repair.
+
+The ordinary real-Chromium Rust fixtures share one in-process scenario guard,
+held through teardown; resource-free startup controls still run concurrently.
+This bounds browser-launch contention without changing the 12-second readiness
+ceiling, skipping assertions or retrying interactions. PR #129 run
+`42402630072`, Linux job `128493544529`, reported simultaneous startup timeouts
+in the iframe, held-key, CAPTCHA and viewport fixtures. Each browser was still
+alive before cleanup, with connection-refused as its last CDP readiness result.
+The same candidate tree passed the workspace and full Chromium takeover fixture
+in dispatch `42402639225`. This shows a nondeterministic startup failure, not its
+underlying cause; the guard limits fixture contention and does not justify
+removing the existing clipboard or OOPIF quarantine. Manual `ci` dispatch with
+`takeover=true` also runs those two ignored fixtures explicitly after the full
+mobile acceptance; any failed fixture fails the job without a retry.
+
 Run the fixture explicitly for takeover changes:
 
 ```sh
