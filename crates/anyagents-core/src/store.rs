@@ -6128,7 +6128,12 @@ mod tests {
         let (_dir, store) = setup();
         let alpha = agent(&store, "alpha");
         store.set_agent_launch_env(&alpha.id, &env).unwrap();
-        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, env);
+        let mut expected = env.clone();
+        expected.extend([
+            ("ANYAGENTS_SCOPE".to_string(), "public".to_string()),
+            ("ANYAGENTS_PUBLIC".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, expected);
 
         // A value with a quote, a backslash and a newline keeps its characters.
         let awkward = vec![("K".to_string(), "a\"b\\c\nd".to_string())];
