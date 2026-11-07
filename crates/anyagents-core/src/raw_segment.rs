@@ -442,33 +442,41 @@ fn scan_jsonl(
     file.seek(SeekFrom::Start(0))?;
     let mut records = Vec::new();
     let mut at = 0u64;
-    let mut line = Vec::new();
+    let mut length = 0u64;
+    let mut hash = Sha256::new();
     let mut reader = BufReader::with_capacity(64 * 1024, file);
     loop {
-        line.clear();
-        let n = reader.read_until(b'\n', &mut line)?;
-        if n == 0 {
-            break;
-        }
-        if !line.ends_with(b"\n") {
-            // Read-only indexing may stop before an active writer's tail.
-            if allow_partial_tail {
-                break;
+        let bytes = reader.fill_buf()?;
+        if bytes.is_empty() {
+            if length > 0 && !allow_partial_tail {
+                return Err(io::Error::other("incomplete legacy JSONL final line"));
             }
-            // A JSONL handoff must not acknowledge an incomplete native write.
-            return Err(io::Error::other("incomplete legacy JSONL final line"));
+            break; // read-only indexing leaves an active writer's tail untouched
         }
-        serde_json::from_slice::<serde_json::Value>(&line)
+        let newline = bytes.iter().position(|b| *b == b'\n');
+        let consumed = newline.map_or(bytes.len(), |end| end + 1);
+        hash.update(&bytes[..consumed]);
+        length += consumed as u64;
+        reader.consume(consumed);
+        if newline.is_none() {
+            continue;
+        }
+        // IgnoredAny validates JSON without allocating an arbitrarily large
+        // tool-output string. Use an independent descriptor, not try_clone
+        // (dup shares the reader's kernel offset on Unix).
+        let mut validation = File::open(path)?;
+        validation.seek(SeekFrom::Start(at))?;
+        serde_json::from_reader::<_, serde::de::IgnoredAny>(validation.take(length))
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        let hash = Sha256::digest(&line);
         records.push(RawCoordinate {
             segment: path.to_owned(),
             offset: at,
-            length: line.len() as u64,
-            sha256: format!("{hash:x}"),
+            length,
+            sha256: format!("{:x}", hash.finalize_reset()),
             seq: records.len() as u64 + 1,
         });
-        at += line.len() as u64;
+        at += length;
+        length = 0;
     }
     Ok(records)
 }

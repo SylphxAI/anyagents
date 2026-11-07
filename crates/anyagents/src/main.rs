@@ -19,6 +19,7 @@ mod fake_opencode;
 mod gateway;
 mod grok;
 mod harness_double;
+mod host_memory;
 mod install;
 mod mcp;
 mod mcp_config;

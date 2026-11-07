@@ -24,7 +24,6 @@ const NATIVE_STATE: &[&str] = &[
     "sylphx-sandbox-lease.json",
     "sylphx-sandbox-fallback.json",
     "sylphx-usage.jsonl",
-    ".config/sylphx/context.json",
 ];
 
 /// Supplied by the authoritative host registry. Aliases are reconciled current
@@ -283,9 +282,23 @@ impl HostMigration {
     /// Stopped IDs come from the daemon lifecycle lock, never tool arguments.
     /// Raw sources remain in place regardless: PR1 cannot activate their handoff.
     pub fn stage(&mut self, stopped_agents: &HashSet<String>) -> io::Result<()> {
+        self.stage_selected(stopped_agents, None)
+    }
+    /// A daemon pre-launch boundary stages only this agent; discovery still uses
+    /// the complete registry so aliases shared by other agents stay ambiguous.
+    pub fn stage_selected(
+        &mut self,
+        stopped_agents: &HashSet<String>,
+        selected: Option<&HashSet<String>>,
+    ) -> io::Result<()> {
         self.preflight_memory_bundles()?;
         for idx in 0..self.manifest.entries.len() {
             let entry = self.manifest.entries[idx].clone();
+            if selected
+                .is_some_and(|ids| !entry.agent_id.as_ref().is_some_and(|id| ids.contains(id)))
+            {
+                continue;
+            }
             if matches!(
                 entry.status,
                 MigrationStatus::Ambiguous

@@ -384,6 +384,8 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     // The supervisor owns the agent process lock. Allocate the host generation
     // before any vendor can consume its instructions, never from a late marker.
+    crate::host_memory::before_launch(&request.data_dir, &request.agent.id)
+        .map_err(|e| format!("host migration failed: {e}"))?;
     prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request);
@@ -441,6 +443,16 @@ fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     // Also render in contract-test mode, exercising the shipping launch boundary.
     crate::create::write_agent_instructions(&request.config_dir, &request.agent, None);
     Ok(())
+}
+
+/// Claude's native loader/writer would otherwise reopen a second project memory
+/// source and bypass the host's immutable session pin. Official memory.md
+/// (read 2026-11-07T03:04Z) documents this supported per-process opt-out.
+fn enforce_host_memory_env(harness: &str, env: &mut Vec<(String, String)>) {
+    if harness == "claude-code" {
+        env.retain(|(key, _)| key != "CLAUDE_CODE_DISABLE_AUTO_MEMORY");
+        env.push(("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "1".into()));
+    }
 }
 
 fn read_muse_exit_error(config_dir: &Path) -> Option<String> {
@@ -674,6 +686,7 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     if let Some((_, ref spec)) = seat_spec {
         env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec.clone()));
     }
+    enforce_host_memory_env(&request.agent.harness, &mut env);
     if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
         let program =
             std::env::var("ANYAGENTS_HARNESS_BIN").unwrap_or_else(|_| "anyagents-harness".into());
@@ -1395,6 +1408,24 @@ fn session_from_file(config_dir: &Path, file_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_native_memory_cannot_override_host_authority() {
+        let mut env = vec![
+            ("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "0".into()),
+            ("UNRELATED".into(), "kept".into()),
+        ];
+        enforce_host_memory_env("claude-code", &mut env);
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s:%s' \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \"$UNRELATED\"",
+            ])
+            .envs(env)
+            .output()
+            .unwrap();
+        assert_eq!(output.stdout, b"1:kept");
+    }
 
     #[test]
     fn shipping_launch_boundary_pins_before_marker_and_refreshes_only_on_cutover() {

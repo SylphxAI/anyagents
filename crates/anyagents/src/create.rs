@@ -841,6 +841,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
     // Only the host lifecycle allocates a generation. Describe/restart/render
     // consume its persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
+        doc.push_str(&format!("\n## Host Learned Memory and Skills\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. The section below is the immutable snapshot for this session.\n", root.display(), root.display()));
         match anyagents_core::host_session::active(root) {
             Ok(Some(session)) if session.harness == agent.harness => {
                 doc.push('\n');
