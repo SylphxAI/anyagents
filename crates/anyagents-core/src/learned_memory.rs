@@ -97,31 +97,40 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
+/// Read an existing pin without ever opening learned-memory source files.
+/// A known session with a missing pin must fail, not silently repin live facts.
+pub fn read_pin(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin> {
+    let path = agent_root
+        .join("sessions")
+        .join(sha256(session_id.as_bytes()))
+        .join("memory-pin.json");
+    let bytes = fs::read(&path)?;
+    let pin: MemoryPin = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    if pin.session_id != session_id
+        || pin.sha256 != sha256(pin.section.as_bytes())
+        || pin.section.len() > MAX_BYTES
+        || pin.section.lines().count() > MAX_LINES
+    {
+        return Err(io::Error::other("invalid persisted memory pin"));
+    }
+    Ok(pin)
+}
+
 /// Must run serialized with host session creation. Repeated calls/restarts for
 /// the same ID read only the persisted pin; they do not open MEMORY.md at all.
 pub fn pin_session(agent_root: &Path, session_id: &str) -> io::Result<MemoryPin> {
     if session_id.trim().is_empty() {
         return Err(io::Error::other("empty host session identity"));
     }
+    match read_pin(agent_root, session_id) {
+        Ok(pin) => return Ok(pin),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+        Err(e) => return Err(e),
+    }
     let path = agent_root
         .join("sessions")
         .join(sha256(session_id.as_bytes()))
         .join("memory-pin.json");
-    match fs::read(&path) {
-        Ok(bytes) => {
-            let pin: MemoryPin = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-            if pin.session_id != session_id
-                || pin.sha256 != sha256(pin.section.as_bytes())
-                || pin.section.len() > MAX_BYTES
-                || pin.section.lines().count() > MAX_LINES
-            {
-                return Err(io::Error::other("invalid persisted memory pin"));
-            }
-            return Ok(pin);
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-        Err(e) => return Err(e),
-    }
     fs::create_dir_all(agent_root.join("memory"))?;
     // Only enough input for the bounded prompt. Full raw bytes remain on disk.
     let input = match fs::File::open(agent_root.join("memory/MEMORY.md")) {
