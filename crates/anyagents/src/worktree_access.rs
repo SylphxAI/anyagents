@@ -292,7 +292,15 @@ if [ -e "$1/.git" ] || [ -L "$1/.git" ]; then
   git -c safe.directory="$1" -C "$1" status --porcelain >/dev/null
 fi
 "#;
+    // Vendor fixtures and deployments may intentionally narrow PATH. Keep their
+    // overrides first, then include the OS utilities used by this admission.
+    let mut paths: Vec<_> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    paths.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+    let path_env = std::env::join_paths(paths).map_err(|e| refusal(path, e))?;
     let out = command
+        .env("PATH", path_env)
         .env("HOME", "/nonexistent")
         .env("XDG_CONFIG_HOME", "/nonexistent")
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
