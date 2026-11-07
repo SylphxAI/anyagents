@@ -207,7 +207,7 @@ owners, native/fallback single paste, password paste, clipboard/undo/redo, IME,
 local HUD isolation, sign-in clicks, desktop/touch slider drag, mouse/two-finger
 scroll, delayed two-finger pinch, same-URL reconnect and 20 input-to-painted-JPEG
 latency samples with a 150 ms maximum. Touches resolve as a tap on lift, a drag
-at 8 CSS px, or a sustained press after 180 ms. A five-second stationary touch
+at 8 CSS px, or a sustained press after 150 ms, leaving 50 ms for remote delivery. A five-second stationary touch
 must press within 200 ms, remain held remotely for at least 4800 ms and release
 only at lift. Immediate two-finger gestures send no mouse events; pairs after
 250 or 600 ms cancel a committed press before scrolling or pinching, without

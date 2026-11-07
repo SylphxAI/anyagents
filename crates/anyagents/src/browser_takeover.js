@@ -184,14 +184,15 @@ if (typeof document !== 'undefined') {
       cancelTouchTimer(); cancelPointer();
       gesture = { kind: 'pair', ...pair(), last: pair(), view: { ...view } };
     } else if (pointers.size === 1) {
-      // Immediate pairs never press. A stationary hold commits after 180ms
-      // for press-and-hold challenges; a later pair explicitly cancels it.
+      // Immediate pairs never press. A stationary hold commits after 150ms
+      // for press-and-hold challenges, leaving delivery margin within 200ms.
+      // A later pair explicitly cancels it.
       const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
       const g = gesture = { kind: 'single', x: e.clientX, y: e.clientY, view: { ...view },
         point: point(e.clientX, e.clientY), button, buttons: e.pointerType === 'mouse' ? e.buttons : 1, pointerType: e.pointerType };
       if (e.pointerType !== 'mouse' && touchPan) return;
       if (e.pointerType === 'mouse') pressPointer(g);
-      else touchTimer = setTimeout(() => { if (gesture === g && pointers.size === 1) pressPointer(g); }, 180);
+      else touchTimer = setTimeout(() => { if (gesture === g && pointers.size === 1) pressPointer(g); }, 150);
     }
   });
   function flushPairMotion() {

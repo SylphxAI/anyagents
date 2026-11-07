@@ -126,12 +126,12 @@ test('late focus acknowledgement cannot undo a blur to the local document', asyn
   assert.equal(ui.document.activeElement.id, 'body');
 });
 
-test('a stationary held touch presses by 180ms and releases only on lift', async () => {
+test('a stationary held touch presses by 150ms and releases only on lift', async () => {
   const ui = await mount();
   ui.pointer('pointerdown', 1, 100, 400);
-  await ui.advance(179); assert.deepEqual(ui.inputs, []);
+  await ui.advance(149); assert.deepEqual(ui.inputs, []);
   await ui.advance(1); assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed']);
-  await ui.advance(4820); assert.equal(ui.inputs.length, 1, 'the remote button stays held for five seconds');
+  await ui.advance(4850); assert.equal(ui.inputs.length, 1, 'the remote button stays held for five seconds');
   ui.pointer('pointerup', 1, 100, 400); await ui.settle();
   assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed', 'mouseReleased']);
 });
