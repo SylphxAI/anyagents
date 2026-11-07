@@ -224,6 +224,15 @@ impl HostIndex {
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<IndexHit>, IndexError> {
+        self.search_in_segment(visible_agents, scope, query, None)
+    }
+    fn search_in_segment(
+        &self,
+        visible_agents: &[String],
+        scope: MemoryScope,
+        query: &HistorySearchQuery,
+        segment: Option<&Path>,
+    ) -> Result<Vec<IndexHit>, IndexError> {
         if visible_agents.is_empty() {
             return Ok(Vec::new());
         }
@@ -242,6 +251,9 @@ impl HostIndex {
             where_sql.push_str(clause);
             values.push(value);
         };
+        if let Some(segment) = segment {
+            push("d.segment=?", segment.to_string_lossy().to_string().into());
+        }
         if let Some(agent) = query.agent.as_deref().filter(|a| *a != "all") {
             push("d.agent_id=?", agent.to_owned().into());
         }
@@ -383,7 +395,12 @@ impl HostIndex {
                         .min(seq.saturating_add(radius)),
                 );
                 neighbors.limit = 21;
-                for neighbor in self.search(&[hit.metadata.agent_id.clone()], scope, &neighbors)? {
+                for neighbor in self.search_in_segment(
+                    &[hit.metadata.agent_id.clone()],
+                    scope,
+                    &neighbors,
+                    Some(&hit.raw.segment),
+                )? {
                     // Sequence coordinates are local to one segment.
                     if neighbor.raw.segment == hit.raw.segment && ids.insert(neighbor.id.clone()) {
                         expanded.push(neighbor);
@@ -509,18 +526,28 @@ fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<boo
     let mut reader = file.take(raw.length);
     let mut buffer = [0u8; WINDOW_BYTES];
     let mut carry = Vec::new();
+    let mut decoded_carry = Vec::new();
+    let mut json_state = JsonProjection::default();
     loop {
         let n = reader.read(&mut buffer)?;
         if n == 0 {
             break;
         }
         carry.extend_from_slice(&buffer[..n]);
+        decoded_carry.extend(json_state.feed(&buffer[..n]));
         let text = String::from_utf8_lossy(&carry).to_lowercase();
-        if terms.iter().any(|s| text.contains(s)) {
+        let decoded = String::from_utf8_lossy(&decoded_carry).to_lowercase();
+        if terms
+            .iter()
+            .any(|s| text.contains(s) || decoded.contains(s))
+        {
             return Ok(true);
         }
         if carry.len() > overlap {
             carry.drain(..carry.len() - overlap);
+        }
+        if decoded_carry.len() > overlap {
+            decoded_carry.drain(..decoded_carry.len() - overlap);
         }
     }
     Ok(false)
@@ -593,6 +620,63 @@ mod tests {
             String::from_utf8(decoded)
                 .unwrap()
                 .contains("繁體😀 suffix")
+        );
+    }
+    #[test]
+    fn decoded_exclusion_and_crowded_segment_neighbors_keep_same_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
+        for i in 0..25 {
+            let segment = RawSegment::open(&dir.path().join(format!("old-{i}.raw"))).unwrap();
+            index
+                .index(
+                    &format!("old-{i}"),
+                    &metadata("a", MemoryScope::Transcripts, i),
+                    &segment.append(b"other segment").unwrap(),
+                )
+                .unwrap();
+        }
+        let segment = RawSegment::open(&dir.path().join("wanted.raw")).unwrap();
+        for (id, text) in [
+            ("before", b"neighbor before".as_slice()),
+            ("match", br#"{"x":"\u7e41\u9ad4"}"#.as_slice()),
+            ("after", b"neighbor after".as_slice()),
+        ] {
+            index
+                .index(
+                    id,
+                    &metadata("a", MemoryScope::Transcripts, 100),
+                    &segment.append(text).unwrap(),
+                )
+                .unwrap();
+        }
+        let secret = segment.append(b"private neighbor").unwrap();
+        index
+            .index(
+                "secret",
+                &metadata("private", MemoryScope::Transcripts, 100),
+                &secret,
+            )
+            .unwrap();
+        let mut q = HistorySearchQuery {
+            query: Some("繁體".into()),
+            radius: 2,
+            limit: 1,
+            ..Default::default()
+        };
+        let hits = index
+            .search(&["a".into()], MemoryScope::Transcripts, &q)
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["before", "match", "after"]
+        );
+        q.exclude = vec!["繁體".into()];
+        assert!(
+            index
+                .search(&["a".into()], MemoryScope::Transcripts, &q)
+                .unwrap()
+                .is_empty()
         );
     }
     #[test]
