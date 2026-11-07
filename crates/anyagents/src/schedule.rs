@@ -830,6 +830,15 @@ fn deliver_scheduled_wake_with_prompt(
     source_key: &str,
     now: i64,
 ) {
+    // A timer/watch may have been selected before an archive completed. Keep
+    // its fresh lifecycle check and delivery serialized with archive/wake.
+    let Ok(_lifecycle) = store.lock_agent_lifecycle(&agent.id) else {
+        return;
+    };
+    let Ok(agent) = store.agent(&agent.id) else {
+        return;
+    };
+    let agent = &agent;
     if agent.state == "paused"
         || agent.state == "archived"
         || crate::server::is_explicitly_archived(store.data_dir(), agent)
@@ -1882,6 +1891,52 @@ mod tests {
         let _ = server.join();
         unsafe {
             std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+        }
+    }
+    #[test]
+    fn selected_timer_and_watch_cannot_overwrite_a_fresh_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        for kind in ["timer", "watch"] {
+            let agent = store
+                .create_agent(NewAgent::new(format!("owner-{kind}"), "opencode"))
+                .unwrap();
+            store.set_agent_state(&agent.id, "running").unwrap();
+            let stale_agent = store.agent(&agent.id).unwrap();
+            let watch = format!("file:{}", dir.path().join("ready").display());
+            create_agent_schedule(
+                &store,
+                &health,
+                &stale_agent,
+                None,
+                if kind == "timer" { Some("1m") } else { None },
+                if kind == "watch" {
+                    Some(watch.as_str())
+                } else {
+                    None
+                },
+                "follow-up",
+            )
+            .unwrap();
+            store.set_agent_state(&agent.id, "archived").unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join(".anyagents-archived"), "archived").unwrap();
+            let schedule = store
+                .list_schedules(Some(&agent.id), true)
+                .unwrap()
+                .remove(0);
+            deliver_scheduled_wake(
+                &store,
+                &stale_agent,
+                &schedule,
+                kind,
+                anyagents_core::now_ms(),
+            );
+            assert_eq!(store.agent(&agent.id).unwrap().state, "archived");
+            assert!(cfg.join(".anyagents-archived").exists());
+            assert!(store.inbox(&agent.id, None).unwrap().is_empty());
         }
     }
 }

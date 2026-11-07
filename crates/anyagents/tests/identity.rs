@@ -340,8 +340,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         "{root_archive_refused}"
     );
 
-    // Archiving gamma sets state = archived; ordinary sends do NOT wake an explicitly archived
-    // agent, and only an explicit `/wake` transitions it back to running.
+    // An intentional direct send wakes an explicitly archived agent.
     let archived = support::call_raw(
         &socket,
         "POST",
@@ -371,7 +370,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         .find(|row| row["name"] == "gamma")
         .unwrap();
     assert_eq!(
-        gamma_archived_row["state"], "archived",
+        gamma_archived_row["state"], "running",
         "{gamma_archived_row}"
     );
     let woke_explicit =

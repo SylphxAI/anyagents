@@ -7899,8 +7899,8 @@ mod tests {
         //    - L2's worktree is clean and unmodified -> reaping L2 removes `l2_wt` cleanly.
         crate::server::reap_subagent_ephemeral_dirs(data, &l2.id);
         assert!(
-            !l2_wt.join(".git").exists() && !l2_wt.join("README.md").exists() && l2_wt.is_dir(),
-            "clean unmodified worktree should be reaped on archive while keeping empty work/ dir"
+            !l2_wt.exists(),
+            "clean unmodified worktree should be reaped without recreating empty work/ dir"
         );
 
         //    - Dirty L1's worktree with an uncommitted file -> reaping L1 MUST preserve `l1_wt`!

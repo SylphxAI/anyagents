@@ -591,6 +591,8 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     }
     let store = open(data)?;
     let found = store.agent_by_name(name)?;
+    let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
+    let found = store.agent(&found.id)?;
     let deleted = store.delete_agent(&found.id)?;
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);
@@ -635,16 +637,12 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         .map_err(Error::Message)?;
         let view =
             answered.ok_or_else(|| Error::Message("the server answered nothing".to_string()))?;
-        if state == "archived"
-            && view.parent.is_some()
-            && let Ok(id) = AgentId::parse(&view.id)
-        {
-            server::reap_subagent_ephemeral_dirs(data, &id);
-        }
         return Ok(view);
     }
     let store = open(data)?;
     let found = store.agent_by_name(name)?;
+    let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
+    let found = store.agent(&found.id)?;
     if state == "running" {
         let cfg = anyagents_core::agent_config_dir(data, &found.id);
         let work_dir = found
@@ -652,6 +650,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &found.id));
+        std::fs::create_dir_all(&work_dir)?;
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
         {
@@ -671,9 +670,15 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
     } else if state == "archived" {
-        server::mark_explicitly_archived(&store, data, &agent);
-        if found.parent_id.is_some() {
-            server::reap_subagent_ephemeral_dirs(data, &found.id);
+        let archived = server::mark_explicitly_archived_locked(&store, data, &agent);
+        // The offline path has no daemon maintenance worker. Keep the parent's
+        // lifecycle lock, taking descendant locks only downward as above.
+        for id in archived {
+            if id == agent.id {
+                server::reap_archived_agent_locked(&store, data, &id);
+            } else if let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&id) {
+                server::reap_archived_agent_locked(&store, data, &id);
+            }
         }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
