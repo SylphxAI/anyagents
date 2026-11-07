@@ -98,11 +98,14 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
         common.join("config.worktree"),
         private.join("config.worktree"),
     ] {
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-        {
+        let file = match if path == common.join("config") {
+            open_common_config(common, None)
+        } else {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&path)
+        } {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(refusal(&path, e)),
@@ -322,6 +325,8 @@ struct Grant {
     inspection_paths: Option<Vec<InspectionPath>>,
     #[serde(default)]
     quarantined: bool,
+    #[serde(default)]
+    config: Option<ManagedConfig>,
 }
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -329,6 +334,258 @@ struct InspectionPath {
     path: PathBuf,
     dev: u64,
     ino: u64,
+}
+
+// Git resolves a config symlink before creating config.lock. Keep inheritance
+// confined to this single-purpose directory, never the mixed common gitdir.
+const CONFIG_DIRECTORY: &str = "anyagents-config";
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct ManagedConfig {
+    directory: InspectionPath,
+    link: InspectionPath,
+    // Retained during interrupted adoption: quarantine preserves both the old
+    // pathname and the new hard link, including the original config bytes.
+    adoption_source: Option<InspectionPath>,
+}
+
+fn identity(path: &Path) -> std::io::Result<InspectionPath> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::symlink_metadata(path)?;
+    Ok(InspectionPath {
+        path: path.to_path_buf(),
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
+fn open_common_config(
+    common: &Path,
+    pinned: Option<&ManagedConfig>,
+) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    let path = common.join("config");
+    let link = std::fs::symlink_metadata(&path)?;
+    let owners = [
+        open_nofollow(common)?.metadata()?.uid(),
+        crate::sandbox::server_uid(),
+    ];
+    let target = if link.file_type().is_symlink() {
+        let relative = Path::new(CONFIG_DIRECTORY).join("config");
+        if std::fs::read_link(&path)? != relative
+            || !owners.contains(&link.uid())
+            || link.nlink() != 1
+        {
+            return Err(std::io::Error::other("untrusted managed Git config link"));
+        }
+        let directory = common.join(CONFIG_DIRECTORY);
+        let opened = open_nofollow(&directory)?;
+        let meta = opened.metadata()?;
+        if !meta.is_dir()
+            || !owners.contains(&meta.uid())
+            || writable_file_by_untrusted(&opened, &owners)?
+        {
+            return Err(std::io::Error::other(
+                "untrusted managed Git config directory",
+            ));
+        }
+        if let Some(record) = pinned
+            && (record.directory.path != directory
+                || record.link.path != path
+                || record.directory.dev != meta.dev()
+                || record.directory.ino != meta.ino()
+                || record.link.dev != link.dev()
+                || record.link.ino != link.ino()
+                || record.adoption_source.is_some())
+        {
+            return Err(std::io::Error::other("managed Git config identity changed"));
+        }
+        directory.join("config")
+    } else {
+        if pinned.is_some() {
+            return Err(std::io::Error::other("managed Git config link replaced"));
+        }
+        path
+    };
+    let file = open_nofollow(&target)?;
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.nlink() != 1
+        || !owners.contains(&meta.uid())
+        || writable_file_by_untrusted(&file, &owners)?
+    {
+        return Err(std::io::Error::other("untrusted Git configuration"));
+    }
+    Ok(file)
+}
+
+// Serialize ACL/default transitions with Git's own lock+rename as well as
+// other lifecycle calls. A pre-existing writer is a bounded refusal, never a
+// stale lock to remove; otherwise an in-flight old lock could resurrect access.
+struct ConfigLock {
+    _file: std::fs::File,
+    path: PathBuf,
+}
+
+impl Drop for ConfigLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn lock_config(path: PathBuf) -> std::io::Result<ConfigLock> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)?;
+    Ok(ConfigLock { _file: file, path })
+}
+
+/// Caller holds the journal lock. Adoption also takes Git's original config.lock
+/// before touching the config. The old inode is hard-linked into the dedicated
+/// directory, then a symlink is renamed over the original pathname atomically.
+/// A durable quarantined intent precedes the hard link; interruption never loses
+/// config bytes or silently admits a partly migrated checkout.
+fn manage_config(grant: &mut Grant, journal: &Path, retained: &[Grant]) -> std::io::Result<()> {
+    manage_config_with_hook(grant, journal, retained, &|| Ok(()))
+}
+
+fn manage_config_with_hook(
+    grant: &mut Grant,
+    journal: &Path,
+    retained: &[Grant],
+    before_publish: &dyn Fn() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
+    };
+    let common = &grant.common;
+    let path = common.join("config");
+    let mut target_lock = None;
+    if grant.config.is_none() {
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(std::io::Error::other("unrecorded managed Git config"));
+        }
+        let _source_lock = lock_config(common.join("config.lock"))?;
+        struct Remove(PathBuf);
+        impl Drop for Remove {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+        let source = open_common_config(common, None)?;
+        let meta = source.metadata()?;
+        let directory = common.join(CONFIG_DIRECTORY);
+        std::fs::DirBuilder::new().mode(0o700).create(&directory)?;
+        let dir = open_nofollow(&directory)?;
+        clear_default_acl(&dir)?;
+        target_lock = Some(lock_config(directory.join("config.lock"))?);
+        dir.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+        if unsafe { libc::fchown(dir.as_raw_fd(), meta.uid(), meta.gid()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let temporary = common.join(format!(
+            ".config-link-{}",
+            anyagents_core::AgentId::generate()
+        ));
+        std::os::unix::fs::symlink(Path::new(CONFIG_DIRECTORY).join("config"), &temporary)?;
+        let _remove_temporary = Remove(temporary.clone());
+        grant.config = Some(ManagedConfig {
+            directory: identity(&directory)?,
+            link: identity(&temporary)?,
+            adoption_source: Some(identity(&path)?),
+        });
+        grant.quarantined = true;
+        write_grant(journal, grant)?;
+        let current = std::fs::symlink_metadata(&path)?;
+        if current.dev() != meta.dev() || current.ino() != meta.ino() || current.nlink() != 1 {
+            return Err(std::io::Error::other("Git config changed during adoption"));
+        }
+        // Common and destination directories are protected from every reader;
+        // neither path traverses a writable seat-controlled component.
+        std::fs::hard_link(&path, directory.join("config"))?;
+        source.sync_all()?;
+        dir.sync_all()?;
+        before_publish()?;
+        std::fs::rename(&temporary, &path)?;
+        open_nofollow(common)?.sync_all()?;
+        let record = grant.config.as_mut().unwrap();
+        record.link.path = path;
+        record.adoption_source = None;
+        grant.quarantined = false;
+        write_grant(journal, grant)?;
+    }
+    let _target_lock = match target_lock {
+        Some(lock) => lock,
+        None => lock_config(common.join(CONFIG_DIRECTORY).join("config.lock"))?,
+    };
+    let file = open_common_config(common, grant.config.as_ref())?;
+    let directory = grant.config.as_ref().unwrap().directory.open()?;
+    let readers: Vec<_> = std::iter::once(&*grant)
+        .chain(retained.iter())
+        .filter(|g| g.active && !g.quarantined && !g.inspection)
+        .map(|g| g.gid)
+        .collect();
+    for gid in &readers {
+        update_metadata_acl(&directory, *gid, Some(5), false, None)?;
+        update_metadata_acl(&file, *gid, Some(4), false, None)?;
+    }
+    config_default_readers(&directory, &readers)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn config_default_readers(directory: &std::fs::File, readers: &[u32]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let mut groups = readers.to_vec();
+    groups.sort_unstable();
+    groups.dedup();
+    // All future files are parent-owned rw, owning group/outsiders have no
+    // access, and only recorded reader groups inherit read (never write).
+    let mut entries = vec![(1u16, 6u16, u32::MAX), (4, 0, u32::MAX)];
+    entries.extend(groups.into_iter().map(|gid| (8, 4, gid)));
+    entries.extend([(16, 4, u32::MAX), (32, 0, u32::MAX)]);
+    let mut bytes = 2u32.to_le_bytes().to_vec();
+    for (tag, perm, id) in entries {
+        bytes.extend(tag.to_le_bytes());
+        bytes.extend(perm.to_le_bytes());
+        bytes.extend(id.to_le_bytes());
+    }
+    let name = c"system.posix_acl_default";
+    if unsafe {
+        libc::fsetxattr(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            bytes.as_ptr().cast(),
+            bytes.len(),
+            0,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut readback = vec![0u8; bytes.len() + 1];
+    let len = unsafe {
+        libc::fgetxattr(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            readback.as_mut_ptr().cast(),
+            readback.len(),
+        )
+    };
+    if len != bytes.len() as isize || readback[..bytes.len()] != bytes {
+        return Err(std::io::Error::other("config default ACL readback differs"));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn config_default_readers(_directory: &std::fs::File, _readers: &[u32]) -> std::io::Result<()> {
+    Ok(()) // cross-UID admission is already refused without Linux ACLs
 }
 
 pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
@@ -484,8 +741,8 @@ impl RecordedWorktree {
                 return Err(std::io::Error::other("untrusted Git metadata directory"));
             }
         }
+        open_common_config(&g.common, current.config.as_ref())?;
         for path in [
-            g.common.join("config"),
             g.common.join("config.worktree"),
             g.private.join("config.worktree"),
             g.private.join("commondir"),
@@ -515,41 +772,13 @@ impl RecordedWorktree {
         validate_config_files(&g.private, &g.common).map_err(std::io::Error::other)
     }
 
-    /// Git config/remote/push updates replace common/config through lock+rename.
-    /// Refresh its current inode at launch/wake/inspection, not through a default
-    /// ACL on the mixed common directory (which would expose future metadata).
-    /// The caller holds the journal transition lock.
+    /// Old journals are adopted once under the lifecycle lock. After adoption,
+    /// Git's own lock+rename inherits reader ACLs immediately, without a wake.
     fn refresh_config_readers(&self) -> std::io::Result<()> {
-        use std::os::unix::fs::MetadataExt;
         self.validate()?;
-        let g = &self.grant;
-        let config = g.common.join("config");
-        let file = open_nofollow(&config)?;
-        let before = file.metadata()?;
-        let owner = std::fs::symlink_metadata(&g.private)?.uid();
-        let owners = [owner, crate::sandbox::server_uid()];
-        if !before.is_file()
-            || before.nlink() != 1
-            || !owners.contains(&before.uid())
-            || writable_file_by_untrusted(&file, &owners)?
-        {
-            return Err(std::io::Error::other(
-                "untrusted replacement Git configuration",
-            ));
-        }
-        let retained = other_active_grants(&self.journal, g)?;
-        for reader in std::iter::once(g).chain(retained.iter()) {
-            if reader.active && !reader.quarantined && !reader.inspection {
-                update_metadata_acl(&file, reader.gid, Some(4), false, None)?;
-            }
-        }
-        let after = std::fs::symlink_metadata(&config)?;
-        if after.dev() != before.dev() || after.ino() != before.ino() {
-            return Err(std::io::Error::other(
-                "Git configuration changed during refresh",
-            ));
-        }
-        Ok(())
+        let mut current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
+        let retained = other_active_grants(&self.journal, &current)?;
+        manage_config(&mut current, &self.journal, &retained)
     }
 
     /// Archive revokes all metadata access before reaping. Temporarily grant
@@ -854,6 +1083,7 @@ fn retained_path(common: &Path, path: &Path, grant: &Grant) -> bool {
         || path == common.join("worktrees")
         || path == common.join("logs")
         || path == common.join("config")
+        || path.starts_with(common.join(CONFIG_DIRECTORY))
         || path == common.join("HEAD")
         || ["objects", "refs", "logs/refs", "packed-refs"]
             .iter()
@@ -888,6 +1118,18 @@ fn revoke_binding(
 }
 
 fn revoke_common(common: &Path, uid: u32, gid: u32, retained: &[Grant]) -> std::io::Result<()> {
+    let _config_lock = match std::fs::symlink_metadata(common.join("config")) {
+        Ok(meta) => {
+            open_common_config(common, None)?;
+            Some(lock_config(if meta.file_type().is_symlink() {
+                common.join(CONFIG_DIRECTORY).join("config.lock")
+            } else {
+                common.join("config.lock")
+            })?)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
     walk_tree(common, false, &|_| {}, &|file, path| {
         revoke_binding(file, path, common, uid, gid, retained)
     })
@@ -1076,7 +1318,7 @@ fn share_known_locked(
     journal: &Path,
 ) -> Result<(), Error> {
     validate_config_files(private, common)?;
-    let grant = Grant {
+    let mut grant = Grant {
         common: common.to_path_buf(),
         gid,
         uid,
@@ -1086,8 +1328,20 @@ fn share_known_locked(
         inspection: false,
         inspection_paths: None,
         quarantined: false,
+        config: None,
     };
     let retained = other_active_grants(journal, &grant).map_err(|e| refusal(journal, e))?;
+    // Never adopt a lookalike managed link from the checkout. Only an existing
+    // server-owned grant can witness this dedicated directory/link identity.
+    if let Ok(bytes) = std::fs::read(journal) {
+        let previous: Grant = serde_json::from_slice(&bytes).map_err(|e| refusal(journal, e))?;
+        if previous.common == grant.common {
+            grant.config = previous.config;
+        }
+    }
+    if grant.config.is_none() {
+        grant.config = retained.iter().find_map(|g| g.config.clone());
+    }
     write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
     // Clear any legacy broad grants/defaults for this seat before the allowlist.
     revoke_common(common, uid, gid, &retained).map_err(|e| refusal(common, e))?;
@@ -1117,16 +1371,15 @@ fn share_known_locked(
             .map_err(|e| refusal(&root, e))?;
         }
     }
-    // Config is readable but never writable. A common 0600 config must still
-    // work without granting write access or exposing it to unrelated seats.
-    for name in ["config", "HEAD"] {
-        let root = common.join(name);
-        if root.exists() {
-            walk_tree(&root, false, &|_| {}, &|file, _| {
-                update_metadata_acl(file, gid, Some(4), false, None)
-            })
-            .map_err(|e| refusal(&root, e))?;
-        }
+    // Only the dedicated config directory has read-only inheritance. The
+    // mixed common directory, hooks/info and siblings never receive defaults.
+    manage_config(&mut grant, journal, &retained).map_err(|e| refusal(common, e))?;
+    let head = common.join("HEAD");
+    if head.exists() {
+        walk_tree(&head, false, &|_| {}, &|file, _| {
+            update_metadata_acl(file, gid, Some(4), false, None)
+        })
+        .map_err(|e| refusal(&head, e))?;
     }
     protect_private_gitdir(private, uid, gid).map_err(|e| refusal(private, e))?;
     Ok(())
@@ -1436,7 +1689,13 @@ fn walk_tree_policy(
             let stat = unsafe { stat.assume_init() };
             let kind = stat.st_mode & libc::S_IFMT;
             if kind == libc::S_IFLNK {
-                if issues.is_some() {
+                if issues.is_some()
+                    && !(child_path == path.join("config")
+                        && std::fs::read_link(&child_path).is_ok_and(|target| {
+                            target == Path::new(CONFIG_DIRECTORY).join("config")
+                        })
+                        && open_common_config(path, None).is_ok())
+                {
                     record(
                         issues,
                         &child_path,
@@ -1650,11 +1909,13 @@ fn update_metadata_acl(
         if let Some(desired) = permissions.filter(|_| name == access_name || inherit) {
             entries.push((8, desired, gid));
             // On B-created descendants, A retains its previous effective access.
-            let owner_permissions = entries.iter().find(|e| e.0 == 1).map(|e| e.1).unwrap_or(0);
-            if let Some(entry) = entries.iter_mut().find(|e| e.0 == 2 && e.2 == meta.uid()) {
-                entry.1 |= owner_permissions;
-            } else {
-                entries.push((2, owner_permissions, meta.uid()));
+            if desired & 2 != 0 {
+                let owner_permissions = entries.iter().find(|e| e.0 == 1).map(|e| e.1).unwrap_or(0);
+                if let Some(entry) = entries.iter_mut().find(|e| e.0 == 2 && e.2 == meta.uid()) {
+                    entry.1 |= owner_permissions;
+                } else {
+                    entries.push((2, owner_permissions, meta.uid()));
+                }
             }
         }
         entries.retain(|e| e.0 != 16);
@@ -1863,6 +2124,7 @@ mod tests {
                 active: false,
                 inspection: true,
                 quarantined: false,
+                config: None,
                 inspection_paths: Some(vec![InspectionPath {
                     path,
                     dev: meta.dev(),
@@ -2085,6 +2347,7 @@ mod tests {
                     inspection: true,
                     inspection_paths: Some(vec![other_target]),
                     quarantined: false,
+                    config: None,
                 },
             )
             .unwrap();
@@ -2383,6 +2646,7 @@ mod tests {
                 inspection: false,
                 inspection_paths: None,
                 quarantined: false,
+                config: None,
             },
         )
         .unwrap();
@@ -2552,6 +2816,129 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn managed_config_adoption_preserves_original_and_pins_both_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("SylphxAI/demo", &target, "child", None)
+            .unwrap();
+        let dirs = git_dirs(&target).unwrap();
+        let common = dirs.last().unwrap();
+        let config = common.join("config");
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let original = std::fs::read(&config).unwrap();
+        let meta = std::fs::metadata(&config).unwrap();
+        let id = anyagents_core::AgentId::generate();
+        let journal = grant_path(dir.path(), &id);
+        let uid = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid().wrapping_add(100000);
+        std::fs::write(common.join("config.lock"), b"another Git writer").unwrap();
+        let err = share_known(&target, &dirs[0], common, uid, gid, &journal).unwrap_err();
+        assert!(err.to_string().contains("exists"), "{err}");
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert_eq!(std::fs::metadata(&config).unwrap().ino(), meta.ino());
+        assert!(!common.join(CONFIG_DIRECTORY).exists());
+        assert_eq!(
+            std::fs::read(common.join("config.lock")).unwrap(),
+            b"another Git writer"
+        );
+        std::fs::remove_file(common.join("config.lock")).unwrap();
+        share_known(&target, &dirs[0], common, uid, gid, &journal).unwrap();
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        let after = std::fs::metadata(&config).unwrap();
+        assert_eq!(
+            (
+                after.dev(),
+                after.ino(),
+                after.uid(),
+                after.gid(),
+                after.nlink()
+            ),
+            (meta.dev(), meta.ino(), meta.uid(), meta.gid(), 1)
+        );
+        ensure_launchable(dir.path(), &id).unwrap();
+        let managed = common.join(CONFIG_DIRECTORY);
+        let saved = common.join("config-directory-saved");
+        std::fs::rename(&managed, &saved).unwrap();
+        std::fs::create_dir(&managed).unwrap();
+        std::fs::set_permissions(&managed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(managed.join("config"), &original).unwrap();
+        let replacement = std::fs::metadata(managed.join("config")).unwrap();
+        let err = ensure_launchable(dir.path(), &id).unwrap_err();
+        assert!(err.to_string().contains("identity changed"), "{err}");
+        assert_eq!(
+            std::fs::metadata(managed.join("config")).unwrap().mode(),
+            replacement.mode()
+        );
+        std::fs::remove_dir_all(&managed).unwrap();
+        std::fs::rename(&saved, &managed).unwrap();
+        let saved_link = common.join("config-link-saved");
+        std::fs::rename(&config, &saved_link).unwrap();
+        std::os::unix::fs::symlink(Path::new(CONFIG_DIRECTORY).join("config"), &config).unwrap();
+        let err = ensure_launchable(dir.path(), &id).unwrap_err();
+        assert!(err.to_string().contains("identity changed"), "{err}");
+        std::fs::remove_file(&config).unwrap();
+        std::fs::rename(saved_link, config).unwrap();
+        ensure_launchable(dir.path(), &id).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interrupted_config_adoption_is_journalled_and_preserves_both_source_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("SylphxAI/demo", &target, "child", None)
+            .unwrap();
+        let dirs = git_dirs(&target).unwrap();
+        let common = dirs.last().unwrap();
+        let config = common.join("config");
+        let original = std::fs::read(&config).unwrap();
+        let original_inode = std::fs::metadata(&config).unwrap().ino();
+        let id = anyagents_core::AgentId::generate();
+        let journal = grant_path(dir.path(), &id);
+        let mut grant = Grant {
+            common: common.clone(),
+            private: dirs[0].clone(),
+            checkout: target.clone(),
+            uid: crate::sandbox::server_uid(),
+            gid: crate::sandbox::server_gid(),
+            active: true,
+            inspection: false,
+            inspection_paths: None,
+            quarantined: false,
+            config: None,
+        };
+        let lock = lock_journals(&journal).unwrap();
+        let err = manage_config_with_hook(&mut grant, &journal, &[], &|| {
+            Err(std::io::Error::other(
+                "injected config adoption interruption",
+            ))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "injected config adoption interruption");
+        drop(lock);
+        let pending: Grant = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        assert!(pending.quarantined && pending.config.unwrap().adoption_source.is_some());
+        for path in [&config, &common.join(CONFIG_DIRECTORY).join("config")] {
+            assert_eq!(std::fs::read(path).unwrap(), original);
+            let meta = std::fs::metadata(path).unwrap();
+            assert_eq!((meta.ino(), meta.nlink()), (original_inode, 2));
+        }
+        assert!(
+            ensure_launchable(dir.path(), &id)
+                .unwrap_err()
+                .to_string()
+                .contains("quarantined")
+        );
+        assert!(reaping_blocked(dir.path(), &id));
+        assert!(!common.join("config.lock").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn journalled_allowlist_has_no_ancestor_defaults_and_revokes_every_entry() {
         use std::os::fd::AsRawFd;
         fn acl(path: &Path, name: &std::ffi::CStr) -> Vec<(u16, u16, u32)> {
@@ -2648,32 +3035,27 @@ mod tests {
                 .iter()
                 .any(|e| e.0 == 8 && e.2 == gid)
         );
-        // Real Git lock+rename discards the old inode's named ACL. The two
-        // lifecycle entries and active cleanup must restore all live readers,
-        // without granting defaults, config writes or unrelated metadata.
+        // Real Git config lock+rename inherits readers immediately. These
+        // assertions deliberately precede every lifecycle or inspection call.
         let config = common.join("config");
-        for refresh in ["launch", "wake", "inspect"] {
-            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let managed = common.join(CONFIG_DIRECTORY);
+        assert_eq!(
+            std::fs::read_link(&config).unwrap(),
+            Path::new(CONFIG_DIRECTORY).join("config")
+        );
+        let config_link = std::fs::symlink_metadata(&config).unwrap().ino();
+        for edit in ["first", "second", "third"] {
             let before = std::fs::metadata(&config).unwrap().ino();
-            crate::worktree::tests::git(&f.source, &["config", "test.replacement", refresh]);
+            crate::worktree::tests::git(&f.source, &["config", "test.replacement", edit]);
             assert_ne!(std::fs::metadata(&config).unwrap().ino(), before);
-            assert!(
-                !acl(&config, c"system.posix_acl_access")
-                    .iter()
-                    .any(|e| e.0 == 8)
+            assert_eq!(
+                std::fs::symlink_metadata(&config).unwrap().ino(),
+                config_link
             );
-            match refresh {
-                "launch" => ensure_launchable(dir.path(), &id).unwrap(),
-                "wake" => restore_recorded(dir.path(), &id).unwrap(),
-                "inspect" => RecordedWorktree::load(dir.path(), &id, &target)
-                    .unwrap()
-                    .inspect(|| Ok(()))
-                    .unwrap(),
-                _ => unreachable!(),
+            for reader in [gid, gid + 1] {
+                assert!(acl(&config, c"system.posix_acl_access").contains(&(8, 4, reader)));
+                assert!(acl(&managed, c"system.posix_acl_default").contains(&(8, 4, reader)));
             }
-            let access = acl(&config, c"system.posix_acl_access");
-            assert!(access.contains(&(8, 4, gid)));
-            assert!(access.contains(&(8, 4, gid + 1)));
             for root in [
                 common.clone(),
                 common.join("worktrees"),
@@ -2726,8 +3108,21 @@ mod tests {
             );
             std::fs::remove_file(&config).unwrap();
         }
-        std::fs::rename(saved, config).unwrap();
+        std::fs::rename(saved, &config).unwrap();
         revoke_recorded(dir.path(), &id).unwrap();
+        crate::worktree::tests::git(&f.source, &["config", "test.after-revocation", "survivor"]);
+        assert!(
+            !acl(&config, c"system.posix_acl_access")
+                .iter()
+                .any(|e| e.0 == 8 && e.2 == gid)
+        );
+        assert!(acl(&config, c"system.posix_acl_access").contains(&(8, 4, gid + 1)));
+        assert!(
+            !acl(&managed, c"system.posix_acl_default")
+                .iter()
+                .any(|e| e.0 == 8 && e.2 == gid)
+        );
+        assert!(acl(&managed, c"system.posix_acl_default").contains(&(8, 4, gid + 1)));
         walk_tree(common, false, &|_| {}, &|_, path| {
             for name in [c"system.posix_acl_access", c"system.posix_acl_default"] {
                 assert!(
@@ -2807,9 +3202,30 @@ mod tests {
         assert_eq!(group_permission(&second[0], gid), Some(7));
         assert_eq!(group_permission(&objects, gid), Some(7));
         assert_eq!(group_permission(&config, gid), Some(4));
+        crate::worktree::tests::git(&f.source, &["config", "test.survivor", "active"]);
+        assert_eq!(group_permission(&config, gid), Some(4));
+        let writer_lock = first
+            .last()
+            .unwrap()
+            .join(CONFIG_DIRECTORY)
+            .join("config.lock");
+        std::fs::write(&writer_lock, b"in-flight Git writer").unwrap();
+        let error = revoke_recorded(dir.path(), b2).unwrap_err();
+        assert!(error.to_string().contains("exists"), "{error}");
+        assert_eq!(
+            std::fs::read(&writer_lock).unwrap(),
+            b"in-flight Git writer"
+        );
+        assert_eq!(group_permission(&config, gid), Some(4));
+        let still_active: Grant =
+            serde_json::from_slice(&std::fs::read(grant_path(dir.path(), b2)).unwrap()).unwrap();
+        assert!(still_active.active);
+        std::fs::remove_file(writer_lock).unwrap();
         revoke_recorded(dir.path(), b2).unwrap();
         assert_eq!(group_permission(&second[0], gid), None);
         assert_eq!(group_permission(&objects, gid), None);
+        assert_eq!(group_permission(&config, gid), None);
+        crate::worktree::tests::git(&f.source, &["config", "test.survivor", "retired"]);
         assert_eq!(group_permission(&config, gid), None);
     }
 

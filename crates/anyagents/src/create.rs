@@ -8128,27 +8128,18 @@ if rm "$2/logs/HEAD"; then exit 28; fi
             r#"set -eu; if cat "$1/HEAD"; then exit 23; fi"#,
             &[&c_private],
         );
-        // A's ordinary Git writes replace common/config with a fresh 0600
-        // inode. Launch and wake refresh every active reader, never an ancestor
-        // default ACL or a sibling's private metadata.
-        for (edit, wake) in [
-            (
-                r#"git -c safe.directory="$1" -C "$1" config test.replacement refreshed"#,
-                false,
-            ),
-            (
-                r#"git -c safe.directory="$1" -C "$1" remote add refresh-proof /nonexistent/refresh-proof"#,
-                true,
-            ),
+        // Parent config/remote/push-u lock+rename must preserve both active
+        // readers immediately. No launch, wake or inspecting read may repair
+        // the config between the parent's write and these real-UID probes.
+        let parent_push = dir.path().join("parent-push.git");
+        for edit in [
+            r#"git -c safe.directory="$1" -C "$1" config test.replacement inherited"#,
+            r#"git -c safe.directory="$1" -C "$1" remote add refresh-proof /nonexistent/refresh-proof"#,
+            r#"set -eu; git init --bare "$2"; git -c safe.directory="$1" -C "$1" push -u "$2" HEAD:refs/heads/parent-proof"#,
         ] {
             let before = std::fs::metadata(&common_config).unwrap().ino();
-            run_as(a_uid, a_gid, edit, &[&f.source]);
+            run_as(a_uid, a_gid, edit, &[&f.source, &parent_push]);
             assert_ne!(std::fs::metadata(&common_config).unwrap().ino(), before);
-            if wake {
-                crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
-            } else {
-                crate::worktree_access::ensure_launchable(&data, &agent.id).unwrap();
-            }
             for (uid, gid, checkout, sibling) in [
                 (b_uid, b_gid, target.as_path(), &c_private),
                 (
@@ -8161,7 +8152,7 @@ if rm "$2/logs/HEAD"; then exit 28; fi
                 run_as(
                     uid,
                     gid,
-                    r#"set -eu; test -r "$2/config"; git -c safe.directory="$1" -C "$1" status --porcelain; if printf evil >> "$2/config"; then exit 41; fi; if printf evil >> "$2/hooks/pre-commit"; then exit 42; fi; if printf evil > "$2/info/refresh-leak"; then exit 43; fi; if cat "$3/index"; then exit 44; fi"#,
+                    r#"set -eu; test -r "$2/config"; git -c safe.directory="$1" -C "$1" status --porcelain; if printf evil >> "$2/config"; then exit 41; fi; if printf evil > "$2/anyagents-config/config.lock"; then exit 45; fi; if rm "$2/config"; then exit 46; fi; if printf evil >> "$2/hooks/pre-commit"; then exit 42; fi; if printf evil > "$2/info/refresh-leak"; then exit 43; fi; if cat "$3/index"; then exit 44; fi"#,
                     &[checkout, common, sibling],
                 );
             }
@@ -8173,6 +8164,13 @@ if rm "$2/logs/HEAD"; then exit 28; fi
                 &[&common_config],
             );
         }
+        // A third, unrecorded principal cannot acquire the config's read grant.
+        run_as(
+            65534,
+            65534,
+            r#"if cat "$1/config"; then exit 47; fi"#,
+            &[common],
+        );
         // Vesta's same-size clean-filter payload: merely disabling hooks and
         // fsmonitor does not stop `status` executing a configured clean driver.
         let original_dotgit = std::fs::read(target.join(".git")).unwrap();
@@ -8531,7 +8529,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert!(crate::worktree_access::ensure_launchable(&data, &locked.id).is_err());
         drop(locker);
         eprintln!(
-            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, planted-filter cleanup/foreign-seat denial, trusted-config filter owner-UID execution, config/remote inode-replacement launch/wake refresh, SIGKILL inspection-grant recovery, and read-only HEAD-flock bounded quarantine passed"
+            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, planted-filter cleanup/foreign-seat denial, trusted-config filter owner-UID execution, config/remote/push-u mid-session inherited readers without launch/wake, SIGKILL inspection-grant recovery, and read-only HEAD-flock bounded quarantine passed"
         );
     }
 

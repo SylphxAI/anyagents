@@ -220,8 +220,19 @@ On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
 `logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
 The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
 the main worktree's `logs/HEAD` stays child-unwritable. Defaults
-exist only inside the shared content subtrees and the private gitdir, preserving
-both seats on future writes without admitting a child to sibling metadata.
+exist only inside the shared content subtrees, the private gitdir and a dedicated
+`anyagents-config/` directory, never on mixed metadata ancestors. Common `config`
+is an exact symlink to `anyagents-config/config`: the dedicated directory grants
+recorded active readers traversal and read-only inheritance, so the parent's
+ordinary `git config`, `git remote` and `git push -u` replacements remain readable
+immediately, without a launch or wake. Its defaults grant no owning-group or
+outsider access. Adoption holds Git's original `config.lock`, journals a
+quarantined intent, hard-links the original inode into the dedicated directory
+and atomically replaces the old pathname with the link, preserving config bytes
+and ownership. The journal pins the directory and symlink identities, while Git
+may replace only the target config inode. Interrupted adoption preserves the
+original bytes and refuses launch/reap pending operator recovery. Revocation
+removes access and default entries only when no active same-seat reader remains.
 Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
 `gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.

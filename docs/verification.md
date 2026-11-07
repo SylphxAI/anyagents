@@ -153,7 +153,16 @@ its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
 B's ordinary status, commit and local bare-remote push use its generated seat
 config, with no `-c user.*` or author/committer environment overrides; the commit
 records the exact Kyle author and committer. A's common config retains its owner,
-inode, content and owner read access. A same-size clean-filter positive control
+inode, content and owner read access during adoption. Parent config, remote-add
+and `git push -u` each replace the target inode while retaining the managed link;
+both active child UIDs must immediately read common config and run status, with
+no launch, wake or inspection call between the write and probe. They still cannot
+write/unlink config or create its lock, access sibling private metadata or write
+hooks/info; an unrecorded UID cannot read config. Default ACL readbacks remain
+confined to the dedicated config directory, and survivor/last-reader revocation
+is tested across another parent rewrite. Adoption regressions cover an existing
+Git config lock, interrupted publication with original bytes retained, and
+replacement of the journal-pinned directory or link. A same-size clean-filter positive control
 executes as B, then a forged `.git` pointer cannot execute that filter during
 journal-pinned server cleanup or A/C seat commands in the foreign checkout.
 A second payload selects a trusted common-config driver through B's checkout
