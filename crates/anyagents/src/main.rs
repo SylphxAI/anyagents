@@ -170,6 +170,8 @@ enum Command {
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
+        description: Option<String>,
+        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
         instructions: Option<String>,
         #[arg(long)]
         parent: Option<String>,
@@ -477,7 +479,10 @@ enum Command {
         agent: Option<String>,
         /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
         description: Option<String>,
-        /// Optional short role label (`Spiron`, `Design`, `Revenue`, `Growth`, `Lead`, `Standards`, ...).
+        /// Optional detailed private standing instructions (`instructions` / `SYSTEM_PROMPT.md`).
+        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
+        instructions: Option<String>,
+        /// Optional display-only role label; no effect on lifecycle or scope.
         #[arg(long)]
         role: Option<String>,
         /// Clear custom description.
@@ -495,7 +500,7 @@ enum Command {
     Role {
         /// Target agent name or `agt_...` ID.
         agent: String,
-        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Display-only role label; no effect on lifecycle or scope.
         role: Option<String>,
         /// Clear the role label.
         #[arg(long)]
@@ -680,7 +685,7 @@ enum AgentsCommand {
     Role {
         /// Target agent name or `agt_...` ID.
         agent: String,
-        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Display-only role label; no effect on lifecycle or scope.
         role: Option<String>,
         /// Clear the role label.
         #[arg(long)]
@@ -711,6 +716,8 @@ enum AgentsCommand {
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
+        description: Option<String>,
+        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
         instructions: Option<String>,
         #[arg(long)]
         parent: Option<String>,
@@ -924,6 +931,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             branch,
             base,
             workdir,
+            description,
             instructions,
             parent,
             prompt,
@@ -937,6 +945,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             branch,
             base,
             workdir,
+            description,
             instructions,
             parent,
             prompt,
@@ -1184,9 +1193,10 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Describe {
             agent,
             description,
+            instructions,
             role,
             clear,
-        } => agent::describe_cmd(&data, agent, description, role, clear),
+        } => agent::describe_cmd(&data, agent, description, instructions, role, clear),
         Command::Rename { agent, new_name } => agent::rename_cmd(&data, &agent, &new_name),
         Command::Role { agent, role, clear } => {
             agent::role_cmd(&data, &agent, role.as_deref(), clear)

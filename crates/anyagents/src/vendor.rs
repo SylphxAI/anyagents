@@ -450,6 +450,10 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         "ANYAGENTS_AGENT_ID".to_string(),
         request.agent.id.as_str().to_string(),
     ));
+    env.push((
+        "ANYAGENTS_AGENT_NAME".to_string(),
+        request.agent.name.clone(),
+    ));
     // The agent's own config directory. Its tool server reads the mailbox
     // capability from here and nothing else.
     env.push((

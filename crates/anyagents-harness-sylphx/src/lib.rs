@@ -22,6 +22,8 @@
 mod aci;
 mod auth;
 mod cloud;
+#[cfg(test)]
+mod masking_tests;
 mod memory;
 pub mod sdk;
 mod workspace;
@@ -898,6 +900,58 @@ pub fn save_persisted_cloud_session(config_dir: &Path, session: &PersistedCloudS
 
 pub fn clear_persisted_cloud_session(config_dir: &Path) {
     let _ = std::fs::remove_file(config_dir.join("sylphx-cloud-session.json"));
+    let _ = std::fs::remove_file(config_dir.join(".sylphx-cloud-instructions-fingerprint"));
+}
+
+pub fn resolve_agent_short_name(config_dir: &Path, env: &[(String, String)]) -> String {
+    if let Some(name) = env
+        .iter()
+        .find(|(k, v)| k == "ANYAGENTS_AGENT_NAME" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_string())
+    {
+        return name;
+    }
+    if let Ok(name) = std::env::var("ANYAGENTS_AGENT_NAME") {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(sys) = std::fs::read_to_string(config_dir.join("SYSTEM_PROMPT.md")) {
+        for line in sys.lines() {
+            if let Some(rest) = line.trim().strip_prefix("- **Agent Name**: `")
+                && let Some(end) = rest.find('`')
+            {
+                let parsed = rest[..end].trim();
+                if !parsed.is_empty() {
+                    return parsed.to_string();
+                }
+            }
+        }
+    }
+    config_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("anyagents-sylphx")
+        .to_string()
+}
+
+pub(crate) fn compute_instructions_fingerprint(
+    agent_short_name: &str,
+    system_prompt: &str,
+) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in agent_short_name
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0u8))
+        .chain(system_prompt.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}:{:x}", system_prompt.len())
 }
 
 /// Builds a bounded continuity digest from `sylphx-transcript.jsonl` when opening a new
@@ -1148,11 +1202,7 @@ pub(crate) fn run_cloud_session_turn(
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "google/gemini-3-flash".to_string());
-    let agent_short_name = config_dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("anyagents-sylphx");
+    let agent_short_name = resolve_agent_short_name(config_dir, env);
     let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
     let mut initial_session_context = String::new();
     if let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path) {
@@ -1189,6 +1239,28 @@ The local VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a C
 If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password CLI, `kubectl`/`talosctl`, or `desk-*` wrappers), call `sandbox` with `action: \"placement\"` and `placement: \"local\"` to switch this session seamlessly to the local Sylphx harness.\n\
 </cloud_workspace>"
     ));
+
+    let current_fp = compute_instructions_fingerprint(&agent_short_name, &system_prompt);
+    let fp_path = config_dir.join(".sylphx-cloud-instructions-fingerprint");
+    if let Ok(prev_raw) = std::fs::read_to_string(&fp_path) {
+        let prev_fp = prev_raw.trim();
+        if !prev_fp.is_empty() && prev_fp != current_fp {
+            if let Some(ref sid) = session_id {
+                let old_sess_path = cloud_session_resource_path(&canonical_env, sid);
+                let old_interrupt_url = format!("{base}/v1/{old_sess_path}:interrupt");
+                let _ = curl_post_json(&old_interrupt_url, Some(&api_key), &json!({}));
+            }
+            clear_persisted_cloud_session(config_dir);
+            agent_id = None;
+            session_id = None;
+            initial_last_seq = 0;
+            next_turn = 1;
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.cloud_agent_id = None;
+            g.cloud_session_id = None;
+        }
+    }
+    let _ = std::fs::write(&fp_path, format!("{current_fp}\n"));
 
     if agent_id.is_none() {
         let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
@@ -2721,7 +2793,7 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": output,
                     });
-                    append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
                 }
             } else {
@@ -2794,7 +2866,7 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": clean_output,
                     });
-                    append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
                     if let Some(data_url) = attached_image_data_url {
                         let image_item = json!({
@@ -3269,11 +3341,22 @@ fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
     None
 }
 
+fn find_continuity_header(after: &str) -> Option<usize> {
+    [
+        "\n## 4. Cross-Harness Session Continuity",
+        "\n## 5. Cross-Harness Session Continuity",
+        "\n# Cross-Harness Continuity",
+    ]
+    .into_iter()
+    .filter_map(|hdr| after.find(hdr))
+    .min()
+}
+
 fn extract_embedded_shared_agents_section(sys: &str) -> Option<String> {
     let marker = "\n## 4. Shared Instructions (AGENTS.md)\n";
     let start = sys.find(marker)?;
     let after = &sys[start + marker.len()..];
-    let body = match after.find("\n# Cross-Harness Continuity") {
+    let body = match find_continuity_header(after) {
         Some(cont_idx) => &after[..cont_idx],
         None => after,
     };
@@ -3319,7 +3402,7 @@ fn strip_embedded_shared_agents_section(sys: &str) -> String {
     };
     let prefix = sys[..start].trim_end();
     let after = &sys[start + marker.len()..];
-    if let Some(cont_idx) = after.find("\n# Cross-Harness Continuity") {
+    if let Some(cont_idx) = find_continuity_header(after) {
         let continuity = after[cont_idx..].trim_start_matches('\n');
         format!("{prefix}\n\n{continuity}")
     } else {
@@ -3623,7 +3706,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "agent": { "type": "string", "description": "`\"self\"` (default), `\"all\"`, or agent name/`agt_...` ID." },
                         "description": { "type": "string", "description": "Public role/capability summary." },
                         "instructions": { "type": "string", "description": "Private system prompt (`SYSTEM_PROMPT.md`)." },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "public": { "type": "boolean", "description": "Whether agents outside this agent's parent/children tree can message it directly." },
                         "clear": { "type": "boolean" }
                     }
@@ -3657,14 +3740,14 @@ fn build_tool_definitions() -> Vec<Value> {
                         "new_name": { "type": "string", "description": "Target name when `action` is `\"rename\"`." },
                         "parent": { "type": "string" },
                         "state": { "type": "string" },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "harness": { "type": "string" },
                         "model": { "type": "string" },
                         "profile": { "type": "string" },
                         "repo": { "type": "string" },
                         "branch": { "type": "string" },
                         "base": { "type": "string" },
-                        "workdir": { "type": "string" },
+                        "workdir": { "type": "string", "description": "Workspace path or mode: worktree, private, or inherit (explicit parent sharing). Omitting both repo and workdir gives a sub-agent its own private <data>/agents/<id>/work directory." },
                         "description": { "type": "string" },
                         "instructions": { "type": "string" },
                         "public": { "type": "boolean", "description": "Cross-tree reachability (`false` default for sub-agents)." },
@@ -4035,7 +4118,48 @@ fn build_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// The sole tool-result ingress: every execution route yields complete text here.
+/// Mask before any size projection, then expose only this value to local/cloud
+/// consumers. Producers must not truncate text before returning to this boundary.
 fn execute_sylphx_tool(
+    name: &str,
+    args: &Value,
+    config_dir: &Path,
+    work_dir: &Path,
+    env: &[(String, String)],
+    mcp_command: &Path,
+    mcp_args: &[String],
+) -> String {
+    let raw = execute_sylphx_tool_raw(name, args, config_dir, work_dir, env, mcp_command, mcp_args);
+    let masked = anyagents_core::masking::mask_known_secrets(&raw).into_owned();
+    let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
+    // Preserve the existing producer-specific observation bounds. Binary image
+    // attachments and native recall retain their own structured representations.
+    let limits = match normalized {
+        "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
+        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
+            Some((24_000, 11_000, 11_000))
+        }
+        "bash" | "shell" | "code_mode" | "grep" | "glob" => Some((30_000, 14_000, 14_000)),
+        "list_dir" if workspace::delegated(env) => Some((30_000, 14_000, 14_000)),
+        "read_file"
+            if args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(image_mime_for_path)
+                .is_none() =>
+        {
+            Some((64_000, 30_000, 30_000))
+        }
+        _ => None,
+    };
+    match limits {
+        Some((max, head, tail)) => truncate_tool_output_middle_utf8(masked, max, head, tail),
+        None => masked,
+    }
+}
+
+fn execute_sylphx_tool_raw(
     name: &str,
     args: &Value,
     config_dir: &Path,
@@ -4316,7 +4440,7 @@ fn execute_sylphx_tool(
             let script = format!(
                 "rg -n --max-count 100{glob_arg} -- '{escaped_pat}' '{escaped_path}' | head -n 200"
             );
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4334,7 +4458,7 @@ fn execute_sylphx_tool(
             let escaped_pat = pat.replace('\'', "'\\''");
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("rg --files -g '{escaped_pat}' '{escaped_path}' | head -n 200");
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4351,7 +4475,7 @@ fn execute_sylphx_tool(
             }
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("ls -la '{escaped_path}' | head -n 200");
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4370,7 +4494,7 @@ fn execute_sylphx_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(120_000);
             let wrapped = build_code_mode_command(code_str, config_dir, mcp_command, mcp_args);
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": wrapped, "timeout_ms": timeout_ms }),
                 config_dir,
@@ -4501,12 +4625,21 @@ fn resolve_workspace_path(work_dir: &Path, raw: &str) -> PathBuf {
 }
 
 fn normalize_mcp_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
-    if tool_name != "schedule" {
-        return arguments.clone();
-    }
     let Some(mut obj) = arguments.as_object().cloned() else {
         return arguments.clone();
     };
+    if matches!(tool_name, "agents" | "describe" | "spawn" | "subagents")
+        && !obj.contains_key("instructions")
+    {
+        if let Some(inst) = obj.remove("instruction") {
+            obj.insert("instructions".to_string(), inst);
+        } else if let Some(inst) = obj.remove("system_prompt") {
+            obj.insert("instructions".to_string(), inst);
+        }
+    }
+    if tool_name != "schedule" {
+        return Value::Object(obj);
+    }
     if obj.get("action").and_then(Value::as_str) == Some("create") {
         obj.insert("action".to_string(), json!("set"));
     }
@@ -4639,7 +4772,7 @@ fn call_anyagents_mcp_tool(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| value.to_string());
-                return truncate_tool_output_middle_utf8(output, 24_000, 11_000, 11_000);
+                return output;
             }
             Err(err) => {
                 last_err = err;
@@ -5235,9 +5368,98 @@ mod tests {
         assert!(b.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
 
+    // Both HTTP fakes consume a complete framed request before replying. One
+    // TCP read may return just part of a header or body; closing with unread
+    // bytes can reset the client and consume a scripted retry response.
+    fn read_gateway_request(reader: &mut impl std::io::Read) -> std::io::Result<Value> {
+        use std::io::{Error, ErrorKind};
+        const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, length) = loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "gateway HTTP headers truncated",
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+            if bytes.len() > MAX_REQUEST_BYTES {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "gateway HTTP request too large",
+                ));
+            }
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                if !headers.starts_with("post /v1/responses ") {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "unexpected gateway HTTP route",
+                    ));
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "gateway Content-Length missing")
+                    })?;
+                break (end + 4, length);
+            }
+        };
+        let total = header_end
+            .checked_add(length)
+            .filter(|total| *total <= MAX_REQUEST_BYTES)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "gateway HTTP request too large"))?;
+        if bytes.len() < total {
+            let received = bytes.len();
+            bytes.resize(total, 0);
+            reader.read_exact(&mut bytes[received..])?;
+        }
+        serde_json::from_slice(&bytes[header_end..total])
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))
+    }
+
+    #[test]
+    fn gateway_http_fixture_reads_fragmented_headers_and_large_bodies_completely() {
+        use std::io::{Cursor, Read as _};
+        let expected =
+            json!({"input": [{"role": "user", "content": "fragmented 中 payload ".repeat(1500)}]});
+        let body = serde_json::to_vec(&expected).unwrap();
+        assert!(body.len() > 8192);
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut fragments = Cursor::new(&headers.as_bytes()[..17])
+            .chain(Cursor::new(&headers.as_bytes()[17..headers.len() - 1]))
+            .chain(Cursor::new(&headers.as_bytes()[headers.len() - 1..]))
+            .chain(Cursor::new(&body[..13]))
+            .chain(Cursor::new(&body[13..]));
+        assert_eq!(read_gateway_request(&mut fragments).unwrap(), expected);
+    }
+
+    #[test]
+    fn gateway_http_fixture_refuses_truncated_or_oversized_bodies() {
+        let mut truncated = &b"POST /v1/responses HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}"[..];
+        assert_eq!(
+            read_gateway_request(&mut truncated).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let mut oversized = &b"POST /v1/responses HTTP/1.1\r\nContent-Length: 2097152\r\n\r\n"[..];
+        assert_eq!(
+            read_gateway_request(&mut oversized).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn context_preflight_guards_real_native_http_dispatch() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
@@ -5267,32 +5489,7 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            let (header_end, length) = loop {
-                let n = stream.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
-                    assert!(headers.starts_with("post /v1/responses "));
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    break (end + 4, length);
-                }
-            };
-            while bytes.len() < header_end + length {
-                let n = stream.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-            }
-            let request: Value =
-                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            let request = read_gateway_request(&mut stream).unwrap();
             assert!(
                 request["input"][0]["content"]
                     .as_str()
@@ -6017,7 +6214,7 @@ mod tests {
 
     #[test]
     fn transient_503_model_unavailable_retries_and_persistent_503_surfaces_fault() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         use std::sync::atomic::AtomicUsize;
 
@@ -6029,8 +6226,10 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let _request = read_gateway_request(&mut stream).unwrap();
                 let n = hits_cl.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     // 1st attempt: transient 503 model_unavailable
@@ -6750,5 +6949,39 @@ exec "$@"
         assert!(!assembled.contains("Shared rule v2."));
         assert!(assembled.contains("# Cross-Harness Continuity"));
         assert!(assembled.contains("Prior turn summary."));
+
+        // Also verify production `## 4. Cross-Harness Session Continuity` header is preserved
+        // and `resolve_agent_short_name` extracts `nova` instead of `agt_test`.
+        let sys_doc_v2 = "# AnyAgents Identity & Environment Awareness\n\n\
+                          ## 1. Your Identity (Who You Are)\n\n\
+                          - **Agent Name**: `nova` (addressable as `agent:nova`)\n\n\
+                          ## 4. Shared Instructions (AGENTS.md)\n\n\
+                          # SylphxAI/owner\n\n\
+                          Old stale rule v1.\n\n\
+                          ## 4. Cross-Harness Session Continuity (`codex` -> `sylphx`)\n\n\
+                          Recent completed turn digest.";
+        std::fs::write(cfg.join("SYSTEM_PROMPT.md"), sys_doc_v2).unwrap();
+        let assembled_v2 = assemble_system_prompt(&cfg, &work);
+        assert!(assembled_v2.contains("## 4. Cross-Harness Session Continuity"));
+        assert!(assembled_v2.contains("Recent completed turn digest."));
+        assert_eq!(resolve_agent_short_name(&cfg, &[]), "nova");
+        assert_eq!(
+            resolve_agent_short_name(
+                &cfg,
+                &[("ANYAGENTS_AGENT_NAME".to_string(), "chronos".to_string())]
+            ),
+            "chronos"
+        );
+
+        let norm1 = normalize_mcp_tool_arguments(
+            "describe",
+            &json!({ "agent": "self", "instruction": "New private SOP." }),
+        );
+        assert_eq!(norm1["instructions"], "New private SOP.");
+        let norm2 = normalize_mcp_tool_arguments(
+            "agents",
+            &json!({ "action": "spawn", "system_prompt": "Custom prompt." }),
+        );
+        assert_eq!(norm2["instructions"], "Custom prompt.");
     }
 }

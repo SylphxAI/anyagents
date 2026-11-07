@@ -14,23 +14,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub schedule watches can use rotating, owner-scoped installation credentials
   without consuming the interactive GitHub CLI token. Configured credentials fail
   closed, and one owner's authentication failure does not stop other owners.
-- Shared watch probes preserve conditional validators, back off on unchanged
-  responses, refresh newly registered watches, and stop polling settled targets.
+- Shared watch probes preserve conditional validators and cached page bodies,
+  back off on unchanged responses, refresh newly registered watches, and stop
+  polling settled targets. Paginated snapshots remain complete after HTTP 304.
 - Primary rate-limit reserves and secondary limits pause all probe pages until
   recovery, then spread target admission across a bounded recovery window.
 - Credential-file validation refuses symlinks, special files, unsafe permissions,
   and ambiguous owner names without blocking on a FIFO writer.
+- Role labels no longer determine agent lifecycle or scope. Roots and labelled
+  children can self-archive and release idle processes under the same rules.
+  Upgrades preserve legacy effective scopes; new children default to private,
+  and browser profiles remain available until deletion.
+- Recognized credentials are masked before tool output is persisted or exposed
+  through diagnostic results.
+- Spawn documentation and selection tests distinguish private default workspaces
+  from explicitly inherited workspaces.
+- Antigravity rules are deduplicated within the 24 KB limit, and instruction
+  synchronization uses the same content across supported paths.
+- Profile rebalancing and quota-load accounting include sub-agents.
 
 ### Release verification
 
-- The [release CI audit](docs/releases/v0.1.4-ci-audit.json) records the sole PR
-  merged after v0.1.3 through source `571738c133d15c2cf1533a428fbdb23991d5c13c`.
-- The release candidate still requires its own full Linux/macOS and exact-head
-  `ci-ok` gates; publication and daemon activation are separate receipts.
+- The [release CI audit](docs/releases/v0.1.4-ci-audit.json) records all eight PRs
+  merged after v0.1.3 through source `1dbc3740291b4ffac74ccb11058a3e9fb25076f0`.
+- Release publication reconciles incomplete version cuts from main's history,
+  binding each cut to its own successful push/main CI and exact source. Later
+  merges do not invalidate an eligible historical cut.
+- The release candidate still requires its own full Linux/macOS, exact-head
+  `ci-ok`, independent review and operations-security stamp; publication and
+  daemon activation are separate receipts. #108 and #124 remain outside this cut.
 
 ### Included pull requests
 
 - [#127](https://github.com/SylphxAI/anyagents/pull/127): Protect GitHub watch polling with dedicated credentials and quota holds.
+- [#121](https://github.com/SylphxAI/anyagents/pull/121): [review] fix: keep agent roles methodology-neutral.
+- [#125](https://github.com/SylphxAI/anyagents/pull/125): [review] fix: mask recognized credentials before tool-output persistence.
+- [#120](https://github.com/SylphxAI/anyagents/pull/120): fix(spawn): align workspace schemas with private defaults.
+- [#135](https://github.com/SylphxAI/anyagents/pull/135): fix(prompt): deduplicate agy rules under 24KB cap and unify instructions sync.
+- [#131](https://github.com/SylphxAI/anyagents/pull/131): [review] fix(profiles): include sub-agents in rebalancing and quota load.
+- [#136](https://github.com/SylphxAI/anyagents/pull/136): fix: restore GitHub watch pages from cached 304 bodies.
+- [#133](https://github.com/SylphxAI/anyagents/pull/133): [review] ci: reconcile releases from version-cut history.
 
 ## 0.1.3
 
