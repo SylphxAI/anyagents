@@ -1712,11 +1712,12 @@ mod tests {
         );
         let before = calls.load(Ordering::SeqCst);
         *stage.lock().unwrap() = 4;
-        for at in [240_001, 300_000, 359_999] {
+        for at in [240_001, 300_000, 359_999, 360_000, 361_000] {
             assert_eq!(tick_schedules_once(&store, &health, now + at), 0);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
-        assert_eq!(tick_schedules_once(&store, &health, now + 360_000), 1);
+        // Recovery is jittered across reset+60..300 seconds, not reset itself.
+        assert_eq!(tick_schedules_once(&store, &health, now + 660_000), 1);
         assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert!(inbox.last().unwrap().text.contains("transition=merged]"));

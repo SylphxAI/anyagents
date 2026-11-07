@@ -64,6 +64,8 @@ struct Target {
     changed: bool,
     next_at: i64,
     interval: i64,
+    resume_epoch: i64,
+    resume_at: i64,
     result: Option<Observation>,
     // Last successful observation survives transport/rate errors.
     successful: Option<Observation>,
@@ -192,6 +194,54 @@ impl Probes {
         }
     }
 
+    fn spread_recovery(&mut self) {
+        // Stratify the window, shuffling target order per reset. This avoids
+        // probabilistic collisions/clumps while keeping each target's ordinary
+        // next_at and adaptive interval intact.
+        let until = self.limited_until;
+        let mut keys: Vec<_> = self.targets.keys().cloned().collect();
+        keys.sort_by_cached_key(|key| (recovery_hash(key, until), key.clone()));
+        let count = keys.len().max(1) as i64;
+        let span = MAX_INTERVAL - MIN_INTERVAL;
+        for (rank, key) in keys.into_iter().enumerate() {
+            let start = MIN_INTERVAL + rank as i64 * span / count;
+            let width = (((rank + 1) as i64 * span / count) - (start - MIN_INTERVAL)).max(1);
+            let target = self.targets.get_mut(&key).unwrap();
+            target.resume_epoch = until;
+            target.resume_at =
+                until.saturating_add(start + (recovery_hash(&key, until) % width as u64) as i64);
+        }
+    }
+
+    fn ensure_recovery(&mut self, key: &str) {
+        let until = self.limited_until;
+        if until == 0
+            || self
+                .targets
+                .get(key)
+                .is_some_and(|t| t.resume_epoch == until)
+        {
+            return;
+        }
+        // A target first seen during/after a hold gets its own gate too. Do not
+        // move already assigned gates when a watcher arrives or is cancelled.
+        let span = MAX_INTERVAL - MIN_INTERVAL;
+        let seed = (recovery_hash(key, until) % span as u64) as i64;
+        let occupied: HashSet<_> = self
+            .targets
+            .values()
+            .filter(|t| t.resume_epoch == until)
+            .map(|t| t.resume_at)
+            .collect();
+        let offset = (0..span)
+            .map(|step| (seed + step) % span)
+            .find(|offset| !occupied.contains(&until.saturating_add(MIN_INTERVAL + offset)))
+            .unwrap_or(seed);
+        let target = self.targets.entry(key.to_string()).or_default();
+        target.resume_epoch = until;
+        target.resume_at = until.saturating_add(MIN_INTERVAL + offset);
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn probe(
         &mut self,
@@ -207,24 +257,22 @@ impl Probes {
         if now < self.auth_until.get(&auth_owner).copied().unwrap_or(0) {
             return Error::Auth.observation();
         }
-        if now < self.limited_until {
-            return Error::RateLimited(self.limited_until).observation();
-        }
-        self.targets
-            .retain(|_, target| now.saturating_sub(target.accessed_at) < 3_600_000);
+        self.ensure_recovery(key);
+        self.targets.retain(|_, target| {
+            now.saturating_sub(target.accessed_at) < 3_600_000 || now <= target.resume_at
+        });
         let target = self.targets.entry(key.to_string()).or_default();
         target.accessed_at = now;
+        if now < self.limited_until.max(target.resume_at) {
+            return Error::RateLimited(self.limited_until.max(target.resume_at)).observation();
+        }
         if target.settled
             && let Some(result) = &target.successful
         {
             return result.clone();
         }
         target.changed = false;
-        // A cooldown overrides the normal interval. Always re-read on recovery,
-        // even when the last ordinary observation had a five-minute TTL.
-        let recovering = self.limited_until != 0 && target.next_at <= self.limited_until;
-        if !recovering
-            && now < target.next_at
+        if now < target.next_at
             && let Some(result) = &target.result
         {
             return result.clone();
@@ -252,8 +300,9 @@ impl Probes {
         );
         // Consume the response that crossed the floor, but admit no next page or
         // target until reset. A terminal final page can still be delivered.
+        let previous_until = self.limited_until;
         self.limited_until = self.limited_until.max(pause_until);
-        match result {
+        let observation = match result {
             Ok(observation) => {
                 target.pages.retain(|_, page| page.used_at == now);
                 target.interval =
@@ -280,10 +329,6 @@ impl Probes {
                     self.limit_interval =
                         (self.limit_interval * 2).clamp(MIN_INTERVAL, MAX_INTERVAL);
                     self.limited_until = until.max(now.saturating_add(self.limit_interval));
-                    // All retained targets must re-read after the cooldown.
-                    for target in self.targets.values_mut() {
-                        target.next_at = self.limited_until;
-                    }
                 } else {
                     if matches!(error, Error::Auth) {
                         self.auth_until
@@ -294,8 +339,20 @@ impl Probes {
                 }
                 error.observation()
             }
+        };
+        if self.limited_until > previous_until {
+            self.spread_recovery();
         }
+        observation
     }
+}
+
+fn recovery_hash(key: &str, until: i64) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hash);
+    until.hash(&mut hash);
+    hash.finish()
 }
 
 fn read_target(
@@ -1003,15 +1060,23 @@ mod tests {
             "checks_in_progress"
         );
         assert_eq!(
-            probes.probe("pr", "o", "r", "42", true, 181_000, |path, etag, _| {
-                assert!(path.ends_with("/pulls/42"));
-                assert_eq!(etag, Some("before"));
-                Ok(response(
-                    200,
-                    pull("closed", true, "head"),
-                    &[("etag", "after")],
-                ))
-            }),
+            probes.probe(
+                "pr",
+                "o",
+                "r",
+                "42",
+                true,
+                probes.targets["pr"].resume_at,
+                |path, etag, _| {
+                    assert!(path.ends_with("/pulls/42"));
+                    assert_eq!(etag, Some("before"));
+                    Ok(response(
+                        200,
+                        pull("closed", true, "head"),
+                        &[("etag", "after")],
+                    ))
+                }
+            ),
             (true, "merged".to_string())
         );
         assert_eq!(probes.targets["pr"].pages.len(), 1);
@@ -1036,7 +1101,7 @@ mod tests {
                 "probe_error:rate_limited"
             );
             assert_eq!(probes.limited_until, now + delay);
-            now += delay;
+            now = probes.targets["a"].resume_at;
         }
         let mut probes = Probes::default();
         assert_eq!(
@@ -1152,7 +1217,8 @@ mod tests {
     #[test]
     fn secondary_limits_do_not_wait_for_an_unexhausted_primary_window() {
         let mut probes = Probes::default();
-        for (now, until) in [(0, 60_000), (60_000, 180_000)] {
+        let mut now = 0;
+        for delay in [60_000, 120_000] {
             assert_eq!(
                 probes
                     .probe("a", "o", "r", "sha", false, now, |_, _, _| {
@@ -1168,7 +1234,8 @@ mod tests {
                     .1,
                 "probe_error:rate_limited"
             );
-            assert_eq!(probes.limited_until, until);
+            assert_eq!(probes.limited_until, now + delay);
+            now = probes.targets["a"].resume_at;
         }
         let mut probes = Probes::default();
         assert_eq!(
@@ -1315,13 +1382,204 @@ mod tests {
             }
             assert_eq!(
                 probes
-                    .probe("a", "o", "r", "sha", false, 3_600_000, |_, _, _| Ok(
-                        response(200, completed(), &[])
-                    ))
+                    .probe(
+                        "a",
+                        "o",
+                        "r",
+                        "sha",
+                        false,
+                        probes.targets["a"].resume_at,
+                        |_, _, _| Ok(response(200, completed(), &[]))
+                    )
                     .1,
                 "checks_completed"
             );
         }
+    }
+
+    #[test]
+    fn paused_targets_resume_across_the_window_without_a_reset_herd() {
+        const N: usize = 96;
+        const RESET: i64 = 600_000;
+        for status in [200, 304, 403] {
+            let mut probes = Probes::default();
+            for i in 0..N {
+                let key = format!("target-{i}");
+                for now in [0, 60_000] {
+                    probes.probe(&key, "o", "r", "sha", false, now, |_, _, _| {
+                        Ok(response(200, pending(), &[("etag", "pending")]))
+                    });
+                }
+            }
+            let before: HashMap<_, _> = probes
+                .targets
+                .iter()
+                .map(|(key, target)| (key.clone(), (target.next_at, target.interval)))
+                .collect();
+            probes.probe("target-0", "o", "r", "sha", false, 180_000, |_, _, _| {
+                Ok(response(
+                    status,
+                    if status == 403 {
+                        json!({"message":"API rate limit exceeded"})
+                    } else {
+                        pending()
+                    },
+                    &[
+                        (
+                            "x-ratelimit-remaining",
+                            if status == 403 { "0" } else { "1499" },
+                        ),
+                        ("x-ratelimit-reset", "600"),
+                        ("etag", "pending"),
+                    ],
+                ))
+            });
+            assert_eq!(probes.limited_until, RESET);
+            let mut gates: Vec<_> = probes
+                .targets
+                .iter()
+                .map(|(key, target)| {
+                    assert_eq!(
+                        target.interval,
+                        if key == "target-0" && status != 403 {
+                            before[key].1 * 2
+                        } else {
+                            before[key].1
+                        }
+                    );
+                    // The crossing 200/304 is a successful poll, so it may advance
+                    // its own ordinary due time. Other targets retain theirs.
+                    if key != "target-0" || status == 403 {
+                        assert_eq!(target.next_at, before[key].0);
+                    }
+                    assert!(
+                        (RESET + MIN_INTERVAL..RESET + MAX_INTERVAL).contains(&target.resume_at)
+                    );
+                    (target.resume_at, key.clone())
+                })
+                .collect();
+            gates.sort();
+            assert_eq!(
+                gates.iter().map(|(at, _)| at).collect::<HashSet<_>>().len(),
+                N
+            );
+            // Stratification covers every quarter of the recovery window.
+            for quarter in 0..4 {
+                let start = RESET + MIN_INTERVAL + quarter * 60_000;
+                assert_eq!(
+                    gates
+                        .iter()
+                        .filter(|(at, _)| (start..start + 60_000).contains(at))
+                        .count(),
+                    N / 4
+                );
+            }
+            for now in [RESET - 1, RESET, RESET + 1, RESET + 1_000] {
+                for (_, key) in &gates {
+                    assert_eq!(
+                        probes
+                            .probe(key, "o", "r", "sha", false, now, |_, _, _| panic!(
+                                "reset herd"
+                            ))
+                            .1,
+                        "probe_error:rate_limited"
+                    );
+                }
+            }
+            let mut wire_times = Vec::new();
+            for (at, key) in gates {
+                let previous_interval = probes.targets[&key].interval;
+                assert_eq!(
+                    probes
+                        .probe(&key, "o", "r", "sha", false, at - 1, |_, _, _| panic!(
+                            "early recovery"
+                        ))
+                        .1,
+                    "probe_error:rate_limited"
+                );
+                assert_eq!(
+                    probes
+                        .probe(&key, "o", "r", "sha", false, at, |_, _, _| {
+                            wire_times.push(at);
+                            Ok(response(200, pending(), &[("etag", "pending")]))
+                        })
+                        .1,
+                    "checks_in_progress"
+                );
+                assert_eq!(
+                    probes.targets[&key].interval,
+                    (previous_interval * 2).clamp(MIN_INTERVAL, MAX_INTERVAL)
+                );
+            }
+            assert_eq!(wire_times.len(), N);
+            assert_eq!(wire_times.iter().collect::<HashSet<_>>().len(), N);
+        }
+    }
+
+    #[test]
+    fn new_watches_cannot_skip_recovery_gates_or_advance_a_future_due_time() {
+        let mut probes = Probes::default();
+        probes.probe("existing", "o", "r", "sha", false, 0, |_, _, _| {
+            Ok(response(200, pending(), &[]))
+        });
+        probes.targets.get_mut("existing").unwrap().next_at = 900_000;
+        probes.probe("limited", "o", "r", "sha", false, 0, |_, _, _| {
+            Ok(response(429, Value::Null, &[("retry-after", "60")]))
+        });
+        let existing_gate = probes.targets["existing"].resume_at;
+        assert_eq!(probes.targets["existing"].next_at, 900_000);
+        assert_eq!(
+            probes
+                .probe("late", "o", "r", "sha", false, 60_000, |_, _, _| panic!(
+                    "new target bypassed gate"
+                ))
+                .1,
+            "probe_error:rate_limited"
+        );
+        let late_gate = probes.targets["late"].resume_at;
+        probes.register(
+            HashMap::from([("late".into(), HashSet::from(["new-watch".into()]))]),
+            60_001,
+        );
+        assert_eq!(probes.targets["late"].resume_at, late_gate);
+        assert_eq!(probes.targets["existing"].resume_at, existing_gate);
+        assert_ne!(late_gate, existing_gate);
+        assert_eq!(
+            probes
+                .probe(
+                    "late",
+                    "o",
+                    "r",
+                    "sha",
+                    false,
+                    late_gate - 1,
+                    |_, _, _| panic!("new watch bypassed gate")
+                )
+                .1,
+            "probe_error:rate_limited"
+        );
+        assert_eq!(
+            probes
+                .probe("late", "o", "r", "sha", false, late_gate, |_, _, _| Ok(
+                    response(200, pending(), &[])
+                ))
+                .1,
+            "checks_in_progress"
+        );
+        assert_eq!(
+            probes
+                .probe(
+                    "existing",
+                    "o",
+                    "r",
+                    "sha",
+                    false,
+                    existing_gate,
+                    |_, _, _| panic!("ordinary due time advanced")
+                )
+                .1,
+            "checks_in_progress"
+        );
     }
 
     #[test]

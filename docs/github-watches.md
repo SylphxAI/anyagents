@@ -66,6 +66,18 @@ an observation. Other probes report `probe_error:rate_limited`, not `transport`.
 Missing/past reset metadata uses a 60-second cooldown. Secondary limits retain
 `Retry-After` and bounded exponential backoff. New watches cannot bypass holds.
 
+The reset is an admission barrier, not a common retry time. After either a
+reserve or rate-limit pause, retained targets resume across **reset + 60–300
+seconds**. The window is stratified across targets, with target order and the
+position within each slot hashed from the canonical key and reset. Existing
+adaptive intervals and ordinary due times survive the pause; a later ordinary
+due time still wins. Targets first seen during the hold receive a separate
+recovery gate, and a newly registered watcher cannot clear that gate. There are
+no requests at reset or during its first second. A 96-target regression checks
+200/304 reserve crossings and 403 exhaustion: distinct request times, exactly
+24 targets per quarter of the window, and no early requests. The scheduler's
+tick granularity can group nearby deadlines into the same tick.
+
 Each actual response emits `github_watch_probe kind=pull|check_runs|commit_status
 status=<HTTP code>` to daemon stderr. Count these records to distinguish wire
 200/304 responses by endpoint type; `gh-calls.log` counts child invocations, not
