@@ -562,9 +562,12 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     // Reachability and membership are never private-history grants. The same
     // boundary applies to isolated, private, sibling and public callers.
     for scope in ["isolated", "private", "siblings", "public"] {
-        store
-            .set_agent_launch_env(&aids[1], &[("ANYAGENTS_SCOPE".into(), scope.into())])
-            .unwrap();
+        store.set_agent_scope(&aids[1], scope).unwrap();
+        assert_eq!(
+            store.agent(&aids[1]).unwrap().scope(),
+            scope,
+            "effective scope must match the conversation visibility test case"
+        );
         for target in [
             "argus",
             "helios",
