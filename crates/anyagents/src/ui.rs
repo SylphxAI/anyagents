@@ -828,27 +828,12 @@ pub fn print_agents_table_with_options(
         roots.retain(|r| stats_memo.get(r.id.as_str()).is_some_and(|s| s.total > 0));
     }
 
-    // Sort roots: active Core Leads (with role) first, then active standalone roots, then archived containers.
+    // Sort by lifecycle and name, never by role labels.
     roots.sort_by(|a, b| {
         let a_archived = u8::from(a.state == "archived");
         let b_archived = u8::from(b.state == "archived");
-        let a_has_role = u8::from(
-            a.role
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none(),
-        );
-        let b_has_role = u8::from(
-            b.role
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none(),
-        );
         a_archived
             .cmp(&b_archived)
-            .then_with(|| a_has_role.cmp(&b_has_role))
             .then_with(|| {
                 state_rank(&a.state, &a.process, &a.turn_state).cmp(&state_rank(
                     &b.state,
@@ -1006,18 +991,8 @@ pub fn print_agents_table_with_options(
 
         let stop_here = max_depth.is_some_and(|m| depth >= m);
         if let Some(kids) = children_by_parent.get(node.id.as_str()) {
-            let visible_kids: Vec<&'a AgentView> = if stop_here {
-                if depth == 0 && max_depth == Some(0) {
-                    kids.iter()
-                        .copied()
-                        .filter(|k| k.role.as_deref().is_some_and(|r| !r.trim().is_empty()))
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                kids.clone()
-            };
+            let visible_kids: Vec<&'a AgentView> =
+                if stop_here { Vec::new() } else { kids.clone() };
             let count = visible_kids.len();
             let my_runtime = Some((node.harness.as_str(), node.model.as_deref()));
             for (idx, &kid) in visible_kids.iter().enumerate() {
@@ -1571,7 +1546,9 @@ pub fn print_conversation_pretty(
     };
     println!("\n  {}\n", bold_cyan(&header));
     for turn in turns {
-        let ts = dim(&format_timestamp_ms(turn.timestamp_ms));
+        let ts = dim(&turn
+            .timestamp_ms
+            .map_or_else(|| "unknown".into(), format_timestamp_ms));
         let dir = if turn.direction == "out" {
             bold_green("→ out")
         } else {

@@ -83,12 +83,13 @@ def prove_ci(run, workflow, run_id, sha):
                 f"ci proof mismatch: {key}")
 
 
-def cut_version(read, subject):
+def cut_version(read, subject, source="HEAD"):
     """Read both current and first-parent manifests from Git, not the worktree."""
-    current = json.loads(read("HEAD", "packages/anyagents/package.json"))
+    current = json.loads(read(source, "packages/anyagents/package.json"))
     version = current["version"]
     require(VERSION.fullmatch(version) is not None, "invalid stable release version")
-    parent = json.loads(read("HEAD^1", "packages/anyagents/package.json"))
+    parent_ref = f"{source}^1"
+    parent = json.loads(read(parent_ref, "packages/anyagents/package.json"))
     if parent["version"] == version:
         return None
     require(re.fullmatch(rf"release: v{re.escape(version)}(?: \(#[0-9]+\))?", subject)
@@ -96,7 +97,7 @@ def cut_version(read, subject):
     require(VERSION.fullmatch(parent["version"]) is not None, "invalid parent version")
     require(tuple(map(int, version.split("."))) > tuple(map(int, parent["version"].split("."))),
             "release version must increase")
-    for ref, wanted in (("HEAD", version), ("HEAD^1", parent["version"])):
+    for ref, wanted in ((source, version), (parent_ref, parent["version"])):
         cargo = tomllib.loads(read(ref, "Cargo.toml"))
         require(cargo["workspace"]["package"]["version"] == wanted,
                 "Cargo/npm version mismatch")
@@ -171,69 +172,121 @@ def publication(version, sha, get_api=api, get=request):
     return {"npm": all(packages), "github": assets_done}
 
 
+def source_ci(sha, get_api, workflow):
+    """Find a source's own proof; the triggering run cannot authorize other cuts."""
+    runs = get_api(f"actions/workflows/{CI['id']}/runs?event=push&branch=main&head_sha={sha}&per_page=100")
+    values = runs["workflow_runs"]
+    require(runs["total_count"] == len(values), "incomplete source CI inventory")
+    for run in sorted(values, key=lambda value: value["id"]):
+        if run.get("status") == "completed" and run.get("conclusion") == "success":
+            prove_ci(run, workflow, run["id"], sha)
+            return str(run["id"])
+    states = ", ".join(f"{run['id']}:{run.get('conclusion') or run.get('status')}" for run in values)
+    raise ValueError(f"no successful exact-source push/main ci ({states or 'no runs'})")
+
+
 def admit(event, env, get_api=api, inspect=publication):
     require(env["GITHUB_REPOSITORY"] == REPOSITORY, "unexpected repository")
     require(event.get("repository", {}).get("visibility") == "public", "public repository required")
     require(env["GITHUB_REF"] == "refs/heads/main", "main ref required")
-    sha = env["GITHUB_SHA"]
-    if env["GITHUB_EVENT_NAME"] == "workflow_run":
-        trigger = event["workflow_run"]
-        run_id = trigger["id"]
+    require(env["GITHUB_EVENT_NAME"] in ("workflow_run", "workflow_dispatch"), "unsupported release event")
+    require(git("rev-parse", "--is-shallow-repository") == "false", "complete main history required")
+    snapshot = git("rev-parse", "HEAD")
+    main = get_api("git/ref/heads/main")["object"]["sha"]
+    require(SHA.fullmatch(main) is not None, "invalid main SHA")
+    # A newer main may arrive after checkout. Reconcile this immutable ancestor
+    # snapshot; a successor run will discover any newer cuts without a merge hold.
+    ancestry = get_api(f"compare/{snapshot}...{main}")
+    require(ancestry.get("status") in ("ahead", "identical")
+            and ancestry.get("base_commit", {}).get("sha") == snapshot
+            and ancestry.get("merge_base_commit", {}).get("sha") == snapshot,
+            "checkout is not an ancestor of main")
+    result = {"publish": "false", "outcome": "no-op", "main": snapshot,
+              "releases": [], "complete": [], "refused": []}
+    read = lambda ref, path: git("show", f"{ref}:{path}")
+    workflow = None
+    seen = set()
+    sources = git("rev-list", "--first-parent", "--reverse", snapshot, "--",
+                  "packages/anyagents/package.json").splitlines()
+    for sha in sources:
+        # The initial repository/package version is not a version bump. This
+        # also handles the launcher being added after the repository's root.
+        if (len(git("rev-list", "--parents", "-n", "1", sha).split()) < 2
+                or not git("ls-tree", "--name-only", f"{sha}^1", "--", "packages/anyagents/package.json")):
+            continue
+        candidate = {"source": sha}
+        try:
+            version = json.loads(read(sha, "packages/anyagents/package.json"))["version"]
+            if json.loads(read(f"{sha}^1", "packages/anyagents/package.json"))["version"] == version:
+                continue
+            candidate["version"] = version
+            require(VERSION.fullmatch(version) is not None, "invalid stable release version")
+            require(version not in seen, "version introduced more than once on main")
+            seen.add(version)
+            # Completed versions need no new publication authority. Still verify
+            # their immutable source and digests instead of trusting tag presence.
+            done = inspect(version, sha)
+            if all(done.values()):
+                result["complete"].append(candidate)
+                continue
+            # Historical complete releases may predate the cut-title policy.
+            # New or partial publication still requires every current cut rule.
+            cut_version(read, git("show", "-s", "--format=%s", sha), source=sha)
+            if workflow is None:
+                workflow = get_api(f"actions/workflows/{CI['id']}")
+            candidate["ci_run_id"] = source_ci(sha, get_api, workflow)
+            result["releases"].append(candidate)
+        except Exception as error:
+            # A bad source never enters the publisher matrix. Independent green
+            # sources may finish; the final receipt makes every refusal loud.
+            result["refused"].append({**candidate, "reason": str(error)})
+    if result["releases"]:
+        result.update(publish="true", outcome="admitted", reason="incomplete cuts have their own exact green push/main CI")
+    elif result["refused"]:
+        result.update(outcome="unverified", reason="release sources refused; no publication authorized")
     else:
-        require(env["GITHUB_EVENT_NAME"] == "workflow_dispatch", "unsupported release event")
-        run_id = event.get("inputs", {}).get("ci_run_id", "")
-    require(re.fullmatch(r"[1-9][0-9]*", str(run_id)), "positive ci_run_id required")
-    run = get_api(f"actions/runs/{run_id}")
-    workflow = get_api(f"actions/workflows/{CI['id']}")
-    # Validate the triggering run before deciding whether its source is superseded.
-    prove_ci(run, workflow, run_id, run.get("head_sha", ""))
-    if env["GITHUB_EVENT_NAME"] == "workflow_run":
-        prove_ci(trigger, workflow, run_id, run["head_sha"])
-    if sha != run["head_sha"] or get_api("git/ref/heads/main")["object"]["sha"] != sha:
-        return {"publish": "false", "outcome": "no-op", "reason": "superseded green source; a fresh version cut is required",
-                "source": run["head_sha"], "ci_run_id": str(run_id)}
-    require(git("rev-parse", "HEAD") == sha, "checkout differs from green source")
-    version = cut_version(lambda ref, path: git("show", f"{ref}:{path}"), git("show", "-s", "--format=%s", "HEAD"))
-    result = {"publish": "false", "outcome": "no-op", "source": sha, "ci_run_id": str(run_id)}
-    if version is None:
-        return {**result, "reason": "ordinary commit; no committed version cut"}
-    done = inspect(version, sha)
-    if all(done.values()):
-        return {**result, "version": version, "reason": "already published from this exact green source"}
-    return {**result, "publish": "true", "outcome": "admitted", "version": version,
-            "reason": "exact green version cut; publication required"}
+        result["reason"] = "all committed release cuts are already published, or no cut exists"
+    return result
 
 
 def receipt(env, inspect=publication):
     result = json.loads(env.get("ADMISSION", "{}") or "{}")
     require(env["ADMISSION_RESULT"] == "success", "admission failed; publication not authorized")
-    if result.get("publish") != "true":
+    releases = result.get("releases", [])
+    if releases:
+        require(env["RELEASE_RESULT"] == "success",
+                "publisher failed or was cancelled; publication may be partial, reconcile the same sources only")
+        for candidate in releases:
+            done = inspect(candidate["version"], candidate["source"])
+            require(all(done.values()), f"publisher returned success without complete npm/GitHub publication: {candidate['version']}")
+    refused = result.get("refused", [])
+    require(not refused, "release sources refused: " + "; ".join(
+        f"{item.get('version', 'unknown version')} at {item['source']}: {item['reason']}" for item in refused))
+    if not releases:
         return result
-    require(env["RELEASE_RESULT"] == "success",
-            "publisher failed or was cancelled; publication may be partial, reconcile the same source only")
-    done = inspect(result["version"], result["source"])
-    require(all(done.values()), "publisher returned success without complete npm/GitHub publication")
-    return {**result, "outcome": "published", "reason": "npm packages and GitHub release verified at the admitted source"}
+    return {**result, "outcome": "published", "reason": "npm packages and GitHub releases verified at each admitted source"}
 
 
 def report(result, env):
-    text = f"## Release {result['outcome']}\n\n"
-    if result.get("version"):
-        text += f"Version: **{result['version']}**\n\n"
-    text += f"{result['reason']}\n\n"
-    if result.get("source"):
-        text += f"Source: `{result['source']}`\n\n"
-    if result.get("ci_run_id"):
-        text += (f"CI proof: [{result['ci_run_id']}](https://github.com/{REPOSITORY}/actions/runs/{result['ci_run_id']}) "
-                 f"— `{CI['path']}` (ID {CI['id']}, name ci), push/main, completed/success.\n")
+    text = f"## Release {result['outcome']}\n\n{result['reason']}\n\n"
+    if result.get("main"):
+        text += f"Main-history snapshot: `{result['main']}`\n\n"
+    for key, label in (("releases", "Publish"), ("complete", "Already complete"), ("refused", "REFUSED")):
+        for item in result.get(key, []):
+            text += f"- {label}: {item.get('version', 'unknown version')} at `{item['source']}`"
+            if item.get("ci_run_id"):
+                text += (f" — [push/main ci {item['ci_run_id']}](https://github.com/{REPOSITORY}/actions/runs/{item['ci_run_id']})")
+            if item.get("reason"):
+                text += f" — {item['reason']}"
+            text += "\n"
     print(text)
     if env.get("GITHUB_STEP_SUMMARY"):
         with open(env["GITHUB_STEP_SUMMARY"], "a") as stream:
             stream.write(text)
     if env.get("GITHUB_OUTPUT"):
         with open(env["GITHUB_OUTPUT"], "a") as stream:
-            for key in ("publish", "version"):
-                stream.write(f"{key}={result.get(key, '')}\n")
+            stream.write(f"publish={result.get('publish', 'false')}\n")
+            stream.write(f"matrix={json.dumps({'include': result.get('releases', [])})}\n")
             stream.write(f"admission={json.dumps(result)}\n")
 
 

@@ -229,14 +229,11 @@ struct Server {
 impl Server {
     /// Start the server on `data`, calling a fake Telegram at `api`.
     fn start(dir: &Path, api: &str) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
             .env("ANYAGENTS_FAKE_OPENCODE", "1")
             .env("ANYAGENTS_FAKE_LOG", dir.join("fake.log"))
             .env("ANYAGENTS_TELEGRAM_API", api)
-            .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-            .env("ANYAGENTS_AGENTS", support::agents_line())
-            .env("ANYAGENTS_TESTS", "own-seat")
             // The server reads its operator's token from this file, the one
             // every call in the test presents.
             .env(
@@ -405,6 +402,25 @@ fn wait_for(mut ready: impl FnMut() -> bool, why: &str) {
     }
 }
 
+/// Inbox rows commit before the batch's offset/chats checkpoint. Observing
+/// the rows alone does not mean the poll has finished storing its channel state.
+fn wait_for_checkpoint(data: &Path, channel_id: &str, offset: i64) {
+    wait_for(
+        || {
+            let store = Store::open(data.join("state.db")).unwrap();
+            let channel = store
+                .list_channels()
+                .unwrap()
+                .into_iter()
+                .find(|channel| channel.id.as_str() == channel_id)
+                .unwrap();
+            let state: Value = serde_json::from_str(&channel.state).unwrap();
+            state["offset"] == offset
+        },
+        "the Telegram batch checkpoint was never persisted",
+    );
+}
+
 #[test]
 fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
     let _env = support::lock();
@@ -444,6 +460,7 @@ fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
         },
         "the two messages never reached the mailbox",
     );
+    wait_for_checkpoint(&data, &channel_id, 12);
 
     let store = Store::open(data.join("state.db")).unwrap();
     let inbox = store.inbox(&agent_id, None).unwrap();
@@ -524,6 +541,79 @@ fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
     // The token is only in its own 0600 file, never in the channel row.
     let secret = secrets.read(&format!("channels/{channel_id}")).unwrap();
     assert_eq!(secret.as_str().unwrap(), "777:fake-token-not-real");
+}
+
+/// A crash after mailbox commits but before the offset commit must replay
+/// safely. The trigger holds that exact boundary without timing sleeps.
+#[test]
+fn a_restart_before_the_offset_checkpoint_replays_without_duplicate_mail() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_at(&data);
+    let agent = create(&data, "ada");
+    let agent_id = anyagents_core::AgentId::parse(&agent).unwrap();
+    let channel_id = add_channel(&data, "ada", "777:fake-token-not-real");
+    let updates = vec![
+        dm(10, 100, 5, "hello from a dm"),
+        topic(11, -1007, 55, 3, "and a topic"),
+    ];
+    let db = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    db.execute_batch(
+        "CREATE TRIGGER hold_telegram_checkpoint BEFORE UPDATE OF state ON channels
+         WHEN json_extract(NEW.state, '$.offset') > 0
+         BEGIN SELECT RAISE(ABORT, 'interrupted Telegram checkpoint'); END;",
+    )
+    .unwrap();
+    let fake = FakeTelegram::start(updates.clone());
+    let server = Server::start(&data, &fake.address);
+    wait_for(
+        || {
+            Store::open(data.join("state.db"))
+                .unwrap()
+                .inbox(&agent_id, None)
+                .unwrap()
+                .len()
+                == 2
+        },
+        "the mailbox commits never reached the held checkpoint",
+    );
+    drop(server);
+    drop(fake);
+
+    let store = Store::open(data.join("state.db")).unwrap();
+    let before = store.inbox(&agent_id, None).unwrap();
+    let state: Value = serde_json::from_str(&store.list_channels().unwrap()[0].state).unwrap();
+    assert_eq!(
+        state["offset"], 0,
+        "the checkpoint must still be uncommitted"
+    );
+    assert_eq!(before.len(), 2);
+    drop(store);
+    db.execute_batch("DROP TRIGGER hold_telegram_checkpoint;")
+        .unwrap();
+    drop(db);
+
+    // A fresh server has neither the old poll's in-memory seen set nor its
+    // advanced offset. Telegram offers the unconfirmed updates again.
+    let fake = FakeTelegram::start(updates);
+    let server = Server::start(&data, &fake.address);
+    wait_for_checkpoint(&data, &channel_id, 12);
+    assert!(fake.asked_for_updates(), "restart must re-fetch the batch");
+    let store = Store::open(data.join("state.db")).unwrap();
+    let after = store.inbox(&agent_id, None).unwrap();
+    assert_eq!(
+        after.len(),
+        2,
+        "replayed provider origins must not add mail"
+    );
+    for (original, replayed) in before.iter().zip(&after) {
+        assert_eq!(original.id, replayed.id);
+        assert_eq!(original.source_key, replayed.source_key);
+        assert_eq!(original.origin, replayed.origin);
+    }
+    drop(server);
 }
 
 #[test]
@@ -934,14 +1024,12 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
     let agent = create(&data, "ada");
     let channel_id = add_channel(&data, "ada", "777:fake-token-not-real");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let child = support::contract_server()
         .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
         .env("ANYAGENTS_FAKE_OPENCODE", "1")
         .env("ANYAGENTS_FAKE_LOG", data.join("fake.log"))
         .env("ANYAGENTS_TELEGRAM_API", &fake.address)
         .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
-        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(&data))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
             data.join(support::TOKEN_FILE),

@@ -510,8 +510,32 @@ fn include_after_context_edit(
     }
 }
 
+/// Project an anchor without writing it. Preflight must validate the exact same
+/// representation the persisted loader will use before committing a new window.
+pub(super) fn project_context_anchor(anchor: &Value) -> Vec<Value> {
+    let handoff = anchor
+        .get("handoff")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut items = vec![json!({
+        "role": "user",
+        "content": format!(
+            "<context-event kind=\"context.window_opened\">\n<handoff>\n{handoff}\n</handoff>\nPrior raw transcript entries remain indexed in full; call `memory_recall` with `query` or `range` (`transcript:<from>-<to>`) to inspect exact prior turns.\n</context-event>"
+        ),
+    })];
+    if let Some(retained) = anchor.get("retained_items").and_then(Value::as_array) {
+        items.extend(retained.iter().cloned());
+    }
+    items
+}
+
 /// Loads persisted transcript items along with their raw transcript line indices `(raw_idx, item)`.
 pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usize, Value)> {
+    load_transcript_indexed_items_before(transcript_path, usize::MAX)
+}
+
+fn load_transcript_indexed_items_before(transcript_path: &Path, end: usize) -> Vec<(usize, Value)> {
     let Ok(file) = std::fs::File::open(transcript_path) else {
         return Vec::new();
     };
@@ -523,30 +547,37 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
         .map_while(Result::ok)
         .enumerate()
     {
+        if raw_idx >= end {
+            break;
+        }
         let Ok(m) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
         if m.get("type").and_then(Value::as_str) == Some("context_window_open") {
-            let handoff = m
-                .get("handoff")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            history.clear();
+            // Retained items are copies of earlier active positions, not new
+            // tool results at the anchor's line. Match the ordered projection
+            // backwards so repeated identical items keep distinct raw origins.
+            let projected = project_context_anchor(&m);
+            let mut source_end = history.len();
+            let mut retained = Vec::with_capacity(projected.len());
+            for (index, item) in projected.into_iter().enumerate().rev() {
+                let source = (index != 0)
+                    .then(|| {
+                        history[..source_end]
+                            .iter()
+                            .rposition(|(_, prior)| prior == &item)
+                    })
+                    .flatten();
+                let origin = source.map_or(raw_idx, |position| {
+                    source_end = position;
+                    history[position].0
+                });
+                retained.push((origin, item));
+            }
+            retained.reverse();
+            history = retained;
             budget_managed_window = m.get("retained_items").is_some();
             pruned_open_calls.clear();
-            history.push((
-                raw_idx,
-                json!({
-                    "role": "user",
-                    "content": format!(
-                        "<context-event kind=\"context.window_opened\">\n<handoff>\n{handoff}\n</handoff>\nPrior raw transcript entries remain indexed in full; call `memory_recall` with `query` or `range` (`transcript:<from>-<to>`) to inspect exact prior turns.\n</context-event>"
-                    ),
-                }),
-            ));
-            if let Some(retained) = m.get("retained_items").and_then(Value::as_array) {
-                history.extend(retained.iter().cloned().map(|item| (raw_idx, item)));
-            }
             continue;
         }
         if m.get("type").and_then(Value::as_str) == Some("context_edit") {
@@ -805,9 +836,11 @@ pub(super) fn maybe_emit_context_watermark_event(
     }
 }
 
-pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) {
-    let Ok(line) = serde_json::to_string(msg) else {
-        return;
+pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) -> Value {
+    let mut msg = msg.clone();
+    anyagents_core::masking::mask_json_strings(&mut msg);
+    let Ok(line) = serde_json::to_string(&msg) else {
+        return msg;
     };
     match std::fs::OpenOptions::new()
         .create(true)
@@ -876,6 +909,7 @@ pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) {
         }
         Err(_) => {}
     }
+    msg
 }
 
 #[derive(Clone, Debug)]
@@ -886,6 +920,26 @@ struct RawTranscriptItem {
     is_tool: bool,
     tool_name: String,
     role: String,
+}
+
+fn recall_item_content(item: &RawTranscriptItem, active: &[(usize, Value)]) -> String {
+    let verbatim_active = active.iter().any(|(idx, value)| {
+        value == &item.raw
+            || (item.raw.get("type").and_then(Value::as_str) == Some("context_window_open")
+                && *idx == item.index)
+            || (value.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.raw.get("role").and_then(Value::as_str) == Some("tool")
+                && value.get("call_id") == item.raw.get("tool_call_id")
+                && value.get("output") == item.raw.get("content"))
+    });
+    if verbatim_active {
+        format!(
+            "[Already present in active context; verbatim replay omitted. Raw pointer: transcript:{0}-{0}. Evict this item before recalling its full contents.]",
+            item.index
+        )
+    } else {
+        item.rendered.clone()
+    }
 }
 
 fn read_all_raw_transcript_items(transcript_path: &Path) -> Vec<RawTranscriptItem> {
@@ -1248,8 +1302,66 @@ pub(super) fn execute_context_edit(transcript_path: &Path, args: &Value) -> Stri
 ///   toggles (`include_tools`, `only_tools`, `tool_name`), `role` filter, ordering (`sort`:
 ///   `"relevance"`, `"newest"`, `"oldest"`), exact range coordinates (`range`), and
 ///   contiguous episode expansion (`radius`).
+// Bound the final JSON bytes, including escaping and pagination metadata. A
+// page is a fragment of the original JSON document; concatenating `content`
+// across cursors recovers it exactly. Snapshot coordinates make later tool
+// receipts and compactions invisible to an in-flight continuation.
+pub(super) const MEMORY_RECALL_MAX_BYTES: usize = 32_768;
+
 pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> String {
     let all_items = read_all_raw_transcript_items(transcript_path);
+    let default_snapshot = all_items.last().map_or(0, |item| item.index + 1);
+    let (snapshot, offset) = match args.get("cursor").and_then(Value::as_str) {
+        None => (default_snapshot, 0),
+        Some(cursor) => match cursor.split_once(':').and_then(|(a, b)| Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))) {
+            Some((snapshot, offset)) if snapshot <= default_snapshot => (snapshot, offset),
+            _ => return "error: invalid memory_recall cursor; reuse next_cursor with the original arguments".into(),
+        },
+    };
+    let all_items: Vec<_> = all_items
+        .into_iter()
+        .take_while(|item| item.index < snapshot)
+        .collect();
+    let active = load_transcript_indexed_items_before(transcript_path, snapshot);
+    let output = render_memory_recall(&all_items, &active, args);
+    if offset == 0 && output.len() <= MEMORY_RECALL_MAX_BYTES {
+        return output;
+    }
+    if offset >= output.len() || !output.is_char_boundary(offset) {
+        return "error: memory_recall cursor offset is outside the result; reuse next_cursor with the original arguments".into();
+    }
+    let page = |end: usize| {
+        serde_json::to_string(&json!({
+            "mode": "page",
+            "format": "json_fragment",
+            "content": &output[offset..end],
+            "next_cursor": if end < output.len() { Some(format!("{snapshot}:{end}")) } else { None },
+            "continuation": "Repeat the original arguments with next_cursor. Concatenate content fragments to recover the JSON result.",
+        })).unwrap_or_default()
+    };
+    let mut end = offset
+        .saturating_add(MEMORY_RECALL_MAX_BYTES - 512)
+        .min(output.len());
+    loop {
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let result = page(end);
+        if result.len() <= MEMORY_RECALL_MAX_BYTES {
+            return result;
+        }
+        // Account for actual JSON escaping rather than sending tiny pages for
+        // ordinary text. Every retry strictly shrinks a bounded candidate.
+        let bytes = (end - offset) * (MEMORY_RECALL_MAX_BYTES - 512) / result.len();
+        end = offset + bytes.min(end - offset - 1);
+    }
+}
+
+fn render_memory_recall(
+    all_items: &[RawTranscriptItem],
+    active: &[(usize, Value)],
+    args: &Value,
+) -> String {
     if all_items.is_empty() {
         return serde_json::to_string_pretty(&json!({
             "mode": "empty",
@@ -1354,7 +1466,7 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
                     "index": item.index,
                     "role": item.role,
                     "tool_name": if item.tool_name.is_empty() { Value::Null } else { Value::String(item.tool_name.clone()) },
-                    "content": item.rendered,
+                    "content": recall_item_content(item, active),
                 })
             })
             .collect();
@@ -1422,7 +1534,7 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
                     "index": item.index,
                     "role": item.role,
                     "tool_name": if item.tool_name.is_empty() { Value::Null } else { Value::String(item.tool_name.clone()) },
-                    "content": item.rendered,
+                    "content": recall_item_content(item, active),
                 })
             })
             .collect();
@@ -1570,7 +1682,8 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
             .filter(|item| item_passes_filters(item))
             .map(|item| {
                 let idx = item.index;
-                let text = &item.rendered;
+                let content = recall_item_content(item, active);
+                let text = &content;
                 let clipped = if text.len() > 2400 {
                     let mut end_b = 2400;
                     while !text.is_char_boundary(end_b) {
@@ -1611,6 +1724,125 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+
+    #[test]
+    fn retained_identical_tool_occurrences_keep_distinct_raw_origins_across_anchors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sylphx-transcript.jsonl");
+        let call =
+            json!({"type":"function_call", "call_id":"reused", "name":"bash", "arguments":"{}"});
+        let output = json!({"type":"function_call_output", "call_id":"reused", "output":"same exact output"});
+        for item in [&call, &output, &call, &output] {
+            append_transcript_message(&path, item);
+        }
+        for _ in 0..3 {
+            let indexed = load_transcript_indexed_items(&path);
+            assert_eq!(
+                indexed
+                    .iter()
+                    .filter(|(_, item)| item == &output)
+                    .map(|(raw_idx, _)| *raw_idx)
+                    .collect::<Vec<_>>(),
+                [1, 3]
+            );
+            let retained: Vec<_> = indexed.into_iter().map(|(_, item)| item).collect();
+            append_transcript_message(
+                &path,
+                &json!({"type":"context_window_open", "handoff":"keep both occurrences", "retained_items":retained}),
+            );
+        }
+    }
+
+    fn recall_pages(path: &Path, mut args: Value) -> String {
+        let mut combined = String::new();
+        loop {
+            let page = execute_memory_recall(path, &args);
+            assert!(page.len() <= MEMORY_RECALL_MAX_BYTES);
+            let parsed: Value = serde_json::from_str(&page).unwrap();
+            if parsed["mode"] != "page" {
+                assert!(combined.is_empty());
+                return page;
+            }
+            combined.push_str(parsed["content"].as_str().unwrap());
+            let Some(cursor) = parsed["next_cursor"].as_str() else {
+                break;
+            };
+            // New receipts must not shift the result represented by a cursor.
+            append_transcript_message(path, &json!({"role":"user", "content":"later receipt"}));
+            args["cursor"] = json!(cursor);
+        }
+        combined
+    }
+
+    #[test]
+    fn recall_bounds_all_modes_and_recovers_evicted_utf8_output_losslessly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sylphx-transcript.jsonl");
+        let text = "large needle 中文\n\t\"\\".repeat(4_000);
+        let result = json!({"type":"function_call_output", "call_id":"huge", "output":text});
+        append_transcript_message(
+            &path,
+            &json!({"type":"function_call", "call_id":"huge", "name":"bash", "arguments":"{}"}),
+        );
+        append_transcript_message(&path, &result);
+        append_transcript_message(
+            &path,
+            &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[
+                {"type":"function_call", "call_id":"huge", "name":"bash", "arguments":"{}"}, result
+            ]}),
+        );
+        let active = execute_memory_recall(&path, &json!({"range":"transcript:1-1"}));
+        assert!(active.contains("Already present in active context"));
+        assert!(!active.contains("large needle"));
+        // An evicted result's original raw coordinate must remain recoverable,
+        // even when its call/output IDs are retained with a pointer instead.
+        append_transcript_message(
+            &path,
+            &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[
+                {"type":"function_call", "call_id":"huge", "name":"bash", "arguments":"{}"},
+                {"type":"function_call_output", "call_id":"huge", "output":"raw pointer transcript:1-1"}
+            ]}),
+        );
+        for args in [
+            json!({"range":"transcript:1-1"}),
+            json!({"only_tools":true, "sort":"oldest", "limit":2}),
+        ] {
+            let recovered: Value = serde_json::from_str(&recall_pages(&path, args)).unwrap();
+            let items = recovered
+                .get("items")
+                .or_else(|| recovered.get("hits"))
+                .unwrap()
+                .as_array()
+                .unwrap();
+            let output = items.iter().find(|item| item["index"] == 1).unwrap();
+            assert_eq!(output["content"], format!("[tool_output:bash:huge] {text}"));
+        }
+        // Many individually clipped query episodes must also share the same
+        // final-byte ceiling, including JSON escaping and cursor metadata.
+        for n in 0..20 {
+            append_transcript_message(
+                &path,
+                &json!({"role":"assistant", "content":format!("needle {n}: {}", "x".repeat(2500))}),
+            );
+        }
+        append_transcript_message(
+            &path,
+            &json!({"type":"context_window_open", "handoff":"done", "retained_items":[]}),
+        );
+        let query =
+            execute_memory_recall(&path, &json!({"query":"needle", "limit":50, "radius":10}));
+        assert!(query.len() <= MEMORY_RECALL_MAX_BYTES);
+        assert_eq!(
+            serde_json::from_str::<Value>(&query).unwrap()["mode"],
+            "page"
+        );
+        let recovered: Value = serde_json::from_str(&recall_pages(
+            &path,
+            json!({"query":"needle", "limit":50, "radius":10}),
+        ))
+        .unwrap();
+        assert!(!recovered["hits"].as_array().unwrap().is_empty());
+    }
 
     fn call(id: usize) -> Value {
         json!({"type": "function_call", "call_id": format!("call_{id}"),
@@ -1761,6 +1993,35 @@ mod projection_tests {
             validate_responses_input(&projected).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn append_masks_tool_output_and_nested_snapshots_before_disk_and_returns_safe_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sylphx-transcript.jsonl");
+        let raw = json!({"type":"function_call_output", "call_id":"fixture", "output":"password=fixturecanaryappend keep"});
+        let safe = append_transcript_message(&path, &raw);
+        assert_eq!(safe["output"], "password=[redacted] keep");
+        append_transcript_message(
+            &path,
+            &json!({"type":"native_turn_state", "pending_messages":[raw]}),
+        );
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("fixturecanaryappend"));
+        assert_eq!(stored.lines().count(), 2);
+        for line in stored.lines() {
+            serde_json::from_str::<Value>(line).unwrap();
+        }
+        let ordinary = json!({"type":"function_call_output", "call_id":"fixture-control", "output":"exit_code: 7\nnovel long actionable diagnostic 測試🙂"});
+        assert_eq!(append_transcript_message(&path, &ordinary), ordinary);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+            serde_json::to_string(&ordinary).unwrap()
+        );
     }
 
     #[test]

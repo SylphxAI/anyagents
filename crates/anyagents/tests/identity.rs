@@ -38,7 +38,8 @@ impl Drop for Serve {
 fn start_server(data: &Path) -> Serve {
     let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .env("PATH", support::machine_path(data))
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_TESTS", "1")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .arg("--data")
         .arg(data)
         .arg("serve")
@@ -93,7 +94,7 @@ fn create(data: &Path, name: &str) -> String {
 #[test]
 fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -212,7 +213,7 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
 #[test]
 fn a_session_acts_as_its_own_agent_and_nothing_else() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -325,18 +326,15 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(gamma_conv.contains("subagent task"), "{gamma_conv}");
 
-    // A root agent cannot be archived by an agent capability (prevents accidental self-archive).
-    let root_archive_refused = support::call_raw(
+    // Any root agent can intentionally archive itself.
+    let root_archived = support::call_raw(
         &socket,
         "POST",
         "/v1/agents/alpha/archive",
         "{}",
         &alpha_auth,
     );
-    assert!(
-        root_archive_refused.starts_with("HTTP/1.1 400"),
-        "{root_archive_refused}"
-    );
+    assert!(root_archived.starts_with("HTTP/1.1 200"), "{root_archived}");
 
     // An intentional direct send wakes an explicitly archived agent.
     let archived = support::call_raw(
@@ -408,7 +406,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
 #[test]
 fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -462,7 +460,7 @@ fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
 #[test]
 fn the_capability_file_of_one_agent_never_opens_another() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -519,7 +517,7 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     assert!(source.status.success());
     let expected_source = String::from_utf8(source.stdout).unwrap().trim().to_owned();
     assert_eq!(env!("ANYAGENTS_SOURCE_SHA"), expected_source);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir(&data).unwrap();
     let image = dir.path().join("anyagents");
@@ -654,7 +652,7 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
 fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     use anyagents_core::{AgentId, Incoming, Store};
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -834,10 +832,253 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     }
 }
 
+/// Exercise both executable entrypoints, not just a maintenance helper: neither
+/// corrupt recovery state nor a held global lock may prevent socket service.
+#[test]
+fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
+    use anyagents_core::{NewAgent, Store};
+    use std::fs;
+    let _env = support::lock();
+    for command in ["serve", "serve-admin"] {
+        for busy in [false, true] {
+            let dir = support::physical_tempdir();
+            let data = dir.path();
+            support::operator_with_configured_seat(data);
+            let store = Store::open(data.join("state.db")).unwrap();
+            let agent = store
+                .create_agent(NewAgent::new("maintenance-only", "sylphx"))
+                .unwrap();
+            store.set_agent_state(&agent.id, "archived").unwrap();
+            let memory = data
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("config/projects/known/memory");
+            fs::create_dir_all(&memory).unwrap();
+            fs::write(memory.join("MEMORY.md"), b"must survive failed maintenance").unwrap();
+            let migration = data.join("host-memory-migration");
+            fs::create_dir_all(&migration).unwrap();
+            let manifest = migration.join("manifest-v1.json");
+            let original = if busy {
+                b"{\"version\":1,\"entries\":[]}".as_slice()
+            } else {
+                b"corrupt manifest must not be replaced".as_slice()
+            };
+            fs::write(&manifest, original).unwrap();
+            let held = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(migration.join("migration.lock"))
+                .unwrap();
+            if busy {
+                held.lock().unwrap();
+            }
+            let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+                .env("PATH", support::machine_path(data))
+                .env("ANYAGENTS_TESTS", "1")
+                .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
+                .arg("--data")
+                .arg(data)
+                .arg(command)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(
+                    fs::File::create(data.join("server.stderr")).unwrap(),
+                ))
+                .spawn()
+                .unwrap();
+            let socket = data.join(if command == "serve" {
+                "anyagents.sock"
+            } else {
+                "admin.sock"
+            });
+            let server = Serve { child, socket };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{command}, busy={busy}: {}",
+                    fs::read_to_string(data.join("server.stderr")).unwrap_or_default()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let receipt_path = migration.join(if busy {
+                "deferred-startup-v1.json"
+            } else {
+                "startup-error-v1.json"
+            });
+            let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+            assert_eq!(
+                receipt["status"],
+                if busy {
+                    "deferred_busy_lock"
+                } else {
+                    "deferred_error"
+                }
+            );
+            assert_eq!(receipt["retryable"], true);
+            assert_eq!(fs::read(&manifest).unwrap(), original);
+            assert_eq!(
+                fs::read(memory.join("MEMORY.md")).unwrap(),
+                b"must survive failed maintenance"
+            );
+            drop(server);
+            drop(held);
+        }
+    }
+}
+
+#[test]
+fn contended_migration_publishes_wait_without_pin_or_dispatch_then_retries() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    use std::{fs, os::unix::fs::PermissionsExt};
+    // Complete salt residue classes and every distinct exponential shift,
+    // including saturation: the existing retry path never sleeps over 60 s.
+    let delays: Vec<_> = (0..=18)
+        .chain([u32::MAX])
+        .flat_map(|attempt| {
+            (0..40).map(move |salt| anyagents_supervisor::restart_delay_ms(attempt, salt))
+        })
+        .collect();
+    assert!(delays.iter().all(|delay| (1..=60_000).contains(delay)));
+    assert_eq!(delays.iter().max(), Some(&60_000));
+    assert_eq!(anyagents_supervisor::restart_delay_ms(1, 0), 200);
+    assert_eq!(anyagents_supervisor::restart_delay_ms(1, 39), 297);
+    let _env = support::lock();
+    let dir = support::physical_tempdir();
+    let data = dir.path();
+    support::operator(data);
+    let store = Store::open(data.join("state.db")).unwrap();
+    let parent = store
+        .create_agent(NewAgent::new("waiting-parent", "claude-code"))
+        .unwrap();
+    let agent = store
+        .create_agent(NewAgent {
+            parent_id: Some(parent.id.clone()),
+            ..NewAgent::new("launch-waits", "claude-code")
+        })
+        .unwrap();
+    store.set_agent_state(&agent.id, "running").unwrap();
+    let config = data.join("agents").join(agent.id.as_str()).join("config");
+    let root = config.parent().unwrap();
+    let vendor_memory = config.join("projects/known/memory");
+    fs::create_dir_all(&vendor_memory).unwrap();
+    fs::write(
+        vendor_memory.join("MEMORY.md"),
+        b"vendor-only authoritative facts",
+    )
+    .unwrap();
+    fs::write(config.join("adapter.json"), br#"{"harness":"claude-code"}"#).unwrap();
+    let adapter = data.join("adapter");
+    fs::write(
+        &adapter,
+        r#"#!/bin/sh
+printf dispatched > "$ANYAGENTS_AGENT_CONFIG/dispatch"
+exec /bin/cat
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    let migration = data.join("host-memory-migration");
+    fs::create_dir_all(&migration).unwrap();
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(migration.join("migration.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let child = support::contract_server()
+        .env("PATH", support::machine_path(data))
+        .env("ANYAGENTS_HARNESS_BIN", &adapter)
+        .env("ANYAGENTS_FAKE_MODE", "1")
+        .arg("--data")
+        .arg(data)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(data.join("server.stderr")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let server = Serve {
+        child,
+        socket: data.join("anyagents.sock"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&server.socket).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            fs::read_to_string(data.join("server.stderr")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    loop {
+        let (_, body) = support::call(&server.socket, "GET", "/v1/agents", "");
+        let row = body["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == agent.id.as_str())
+            .unwrap();
+        if row["block_reason"] == "memory_migration_wait" {
+            assert_eq!(row["turn_state"], "idle", "{row}");
+            assert!(
+                store.next_undelivered(&parent.id).unwrap().is_none(),
+                "wait emitted terminal alert"
+            );
+            assert!(
+                row["last_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("waiting_on=migration.lock"),
+                "{row}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing explicit migration wait: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!config.join("dispatch").exists());
+    assert!(host_session::active(root).unwrap().is_none());
+    assert!(!root.join("memory/MEMORY.md").exists());
+    drop(held); // flock's existing descriptor-close path releases the holder.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !config.join("dispatch").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "retry did not dispatch: stderr={}; agents={}",
+            fs::read_to_string(data.join("server.stderr")).unwrap(),
+            support::call(&server.socket, "GET", "/v1/agents", "").1
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let session = host_session::active(root).unwrap().unwrap();
+    assert!(
+        session
+            .memory
+            .section
+            .contains("vendor-only authoritative facts")
+    );
+    assert_eq!(
+        fs::read(root.join("memory/MEMORY.md")).unwrap(),
+        b"vendor-only authoritative facts"
+    );
+    assert!(!vendor_memory.join("MEMORY.md").exists());
+}
+
 #[test]
 fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -1065,7 +1306,7 @@ fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically
 #[test]
 fn agent_group_cli_mutations_refuse_offline_database_fallback() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
@@ -1121,4 +1362,92 @@ fn agent_group_cli_mutations_refuse_offline_database_fallback() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(store.group_members("offline-room").unwrap().is_empty());
+}
+
+#[test]
+fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    let _env = support::lock();
+    let dir = support::physical_tempdir();
+    let data = dir.path();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let own = store
+        .create_agent(NewAgent::new("offline-reset-own", "sylphx"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("offline-reset-peer", "sylphx"))
+        .unwrap();
+    for target in [&own, &peer] {
+        store.set_agent_state(&target.id, "paused").unwrap();
+        let root = data.join("agents").join(target.id.as_str());
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "old offline pin").unwrap();
+        let first = host_session::ensure_active(&root, "sylphx").unwrap();
+        std::fs::write(
+            root.join("config/sylphx-session-id"),
+            "old-offline-vendor\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config/sylphx-transcript.jsonl"),
+            "retained raw bytes",
+        )
+        .unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "new offline pin").unwrap();
+        let registry = std::fs::read(root.join("sessions/registry.json")).unwrap();
+        let pin_count = std::fs::read_dir(root.join("sessions")).unwrap().count();
+        assert!(!data.join("anyagents.sock").exists());
+        let refused = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .arg("--data")
+            .arg(data)
+            .args(["agents", "reset-session", &target.name])
+            .env("ANYAGENTS_AGENT_ID", own.id.as_str())
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "agent reset succeeded: {refused:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("session reset requires the authenticated server"),
+            "{refused:?}"
+        );
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert_eq!(
+            std::fs::read(root.join("sessions/registry.json")).unwrap(),
+            registry
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("sessions")).unwrap().count(),
+            pin_count
+        );
+        assert_eq!(
+            std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+            b"old-offline-vendor\n"
+        );
+        assert_eq!(host_session::active(&root).unwrap().unwrap(), first);
+
+        let accepted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .arg("--data")
+            .arg(data)
+            .args(["agents", "new-session", &target.name])
+            .env_remove("ANYAGENTS_AGENT_ID")
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .output()
+            .unwrap();
+        assert!(accepted.status.success(), "{accepted:?}");
+        let value: Value = serde_json::from_slice(&accepted.stdout).unwrap();
+        let next = host_session::active(&root).unwrap().unwrap();
+        assert_eq!(value["generation"], next.generation);
+        assert_ne!(next.generation, first.generation);
+        assert!(next.memory.section.contains("new offline pin"));
+        assert!(!root.join("config/sylphx-session-id").exists());
+        assert_eq!(
+            std::fs::read(root.join("config/sylphx-transcript.jsonl")).unwrap(),
+            b"retained raw bytes"
+        );
+    }
 }

@@ -653,6 +653,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
     let Ok(schedules) = store.list_schedules(None, true) else {
         return 0;
     };
+    github::begin_cycle(&schedules, now);
     let mut fired_count = 0;
     for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
@@ -1615,13 +1616,13 @@ mod tests {
                 } else if request.contains("/check-runs") {
                     match stage {
                         0 => {
-                            r#"{"check_runs":[{"name":"ci","status":"in_progress","conclusion":null}]}"#
+                            r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"in_progress","conclusion":null}]}"#
                         }
                         2 => {
-                            r#"{"check_runs":[{"name":"review","status":"completed","conclusion":"failure"}]}"#
+                            r#"{"total_count":1,"check_runs":[{"id":2,"name":"review","status":"completed","conclusion":"failure"}]}"#
                         }
                         _ => {
-                            r#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}"#
+                            r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"completed","conclusion":"success"}]}"#
                         }
                     }
                 } else if request.contains("/status?") {
@@ -1654,6 +1655,7 @@ mod tests {
         )
         .unwrap();
         let now = anyagents_core::now_ms();
+        github::begin_cycle(&store.list_schedules(None, true).unwrap(), now);
         let barrier = Arc::new(std::sync::Barrier::new(101));
         let handles: Vec<_> = (0..100)
             .map(|i| {
@@ -1710,11 +1712,12 @@ mod tests {
         );
         let before = calls.load(Ordering::SeqCst);
         *stage.lock().unwrap() = 4;
-        for at in [240_001, 300_000, 359_999] {
+        for at in [240_001, 300_000, 359_999, 360_000, 361_000] {
             assert_eq!(tick_schedules_once(&store, &health, now + at), 0);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
-        assert_eq!(tick_schedules_once(&store, &health, now + 360_000), 1);
+        // Recovery is jittered across reset+60..300 seconds, not reset itself.
+        assert_eq!(tick_schedules_once(&store, &health, now + 660_000), 1);
         assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert!(inbox.last().unwrap().text.contains("transition=merged]"));

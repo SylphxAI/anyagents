@@ -16,6 +16,32 @@ pub const DEFAULT_SYLPHX_API_URL: &str = "https://api.sylphx.com";
 pub const DEFAULT_SYLPHX_GATEWAY_URL: &str = "https://api.sylphx.com/v1";
 pub const DEFAULT_SYLPHX_MODEL: &str = "sylphx/openai/gpt-6.1-sol#medium";
 
+struct ProviderKeyEnvironment {
+    sylphx: [&'static str; 3],
+    external: &'static [(&'static str, &'static [&'static str])],
+}
+
+// Credential discovery and child sanitization share this alias declaration.
+const PROVIDER_KEY_ENVIRONMENT: ProviderKeyEnvironment = ProviderKeyEnvironment {
+    sylphx: ["SYLPHX_API_KEY", "SYLPHX_AI_KEY", "SYLPHX_GATEWAY_KEY"],
+    external: &[
+        (
+            "kimi-code-plan",
+            &["KIMI_CODE_PLAN_API_KEY", "KIMI_API_KEY"],
+        ),
+        (
+            "qwen-token-plan",
+            &["QWEN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
+        ),
+        ("glm-code-plan", &["GLM_CODE_PLAN_API_KEY", "ZAI_API_KEY"]),
+        (
+            "minimax-code-plan",
+            &["MINIMAX_CODE_PLAN_API_KEY", "MINIMAX_API_KEY"],
+        ),
+        ("openrouter", &["OPENROUTER_API_KEY"]),
+    ],
+};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SylphxOrgCredential {
     pub id: String,
@@ -460,12 +486,13 @@ pub fn write_sylphx_config(
 /// Resolves the Sylphx Cloud Platform API key (`https://api.sylphx.com/v1/...`),
 /// prioritizing `.config/sylphx/credentials.json` (`sylphx_sk_...`).
 pub fn resolve_sylphx_api_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
+    let [api_key_env, ai_key_env, _] = PROVIDER_KEY_ENVIRONMENT.sylphx;
     for (k, v) in env {
-        if (k == "SYLPHX_API_KEY" || k == "SYLPHX_AI_KEY") && !v.trim().is_empty() {
+        if (k == api_key_env || k == ai_key_env) && !v.trim().is_empty() {
             return Some(v.trim().to_string());
         }
     }
-    for k in ["SYLPHX_API_KEY", "SYLPHX_AI_KEY"] {
+    for k in [api_key_env, ai_key_env] {
         if let Ok(v) = std::env::var(k)
             && !v.trim().is_empty()
         {
@@ -495,14 +522,13 @@ pub fn resolve_sylphx_api_key(config_dir: &Path, env: &[(String, String)]) -> Op
 /// prioritizing project-environment keys (`sk-sx-...` in `.config/sylphx/key` or
 /// `.config/opencode/sylphx.key`) before falling back to `.config/sylphx/credentials.json`.
 pub fn resolve_sylphx_gateway_key(config_dir: &Path, env: &[(String, String)]) -> Option<String> {
+    let [api_key_env, ai_key_env, gateway_key_env] = PROVIDER_KEY_ENVIRONMENT.sylphx;
     for (k, v) in env {
-        if (k == "SYLPHX_AI_KEY" || k == "SYLPHX_API_KEY" || k == "SYLPHX_GATEWAY_KEY")
-            && !v.trim().is_empty()
-        {
+        if (k == ai_key_env || k == api_key_env || k == gateway_key_env) && !v.trim().is_empty() {
             return Some(v.trim().to_string());
         }
     }
-    for k in ["SYLPHX_AI_KEY", "SYLPHX_API_KEY", "SYLPHX_GATEWAY_KEY"] {
+    for k in [ai_key_env, api_key_env, gateway_key_env] {
         if let Ok(v) = std::env::var(k)
             && !v.trim().is_empty()
         {
@@ -688,13 +714,22 @@ fn read_provider_key_from_dir(base: &Path, key_filenames: &[&str]) -> Option<Str
     None
 }
 
+fn external_provider_key_environment(provider: &str) -> &'static [&'static str] {
+    PROVIDER_KEY_ENVIRONMENT
+        .external
+        .iter()
+        .find(|(name, _)| *name == provider)
+        .map(|(_, keys)| *keys)
+        .unwrap_or(&[])
+}
+
 fn resolve_external_provider_key(
     config_dir: &Path,
     env: &[(String, String)],
     provider: &str,
-    env_keys: &[&str],
     key_filenames: &[&str],
 ) -> Option<String> {
+    let env_keys = external_provider_key_environment(provider);
     for (k, v) in env {
         if env_keys.iter().any(|ek| k == ek) && !v.trim().is_empty() {
             return Some(v.trim().to_string());
@@ -778,7 +813,6 @@ pub fn resolve_upstream_endpoint(
                     config_dir,
                     env,
                     "kimi-code-plan",
-                    &["KIMI_CODE_PLAN_API_KEY", "KIMI_API_KEY"],
                     &[
                         ".config/opencode/kimi-code-plan.key",
                         ".config/opencode/kimi.key",
@@ -806,7 +840,6 @@ pub fn resolve_upstream_endpoint(
                     config_dir,
                     env,
                     "qwen-token-plan",
-                    &["QWEN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
                     &[
                         ".config/opencode/qwen-token-plan.key",
                         ".config/opencode/qwen-coding-plan.key",
@@ -835,7 +868,6 @@ pub fn resolve_upstream_endpoint(
                     config_dir,
                     env,
                     "glm-code-plan",
-                    &["GLM_CODE_PLAN_API_KEY", "ZAI_API_KEY"],
                     &[".config/opencode/glm-code-plan.key", "glm-code-plan.key"],
                 )
                 .ok_or_else(|| {
@@ -858,7 +890,6 @@ pub fn resolve_upstream_endpoint(
                     config_dir,
                     env,
                     "minimax-code-plan",
-                    &["MINIMAX_CODE_PLAN_API_KEY", "MINIMAX_API_KEY"],
                     &[
                         ".config/opencode/minimax-code-plan.key",
                         "minimax-code-plan.key",
@@ -884,7 +915,6 @@ pub fn resolve_upstream_endpoint(
                     config_dir,
                     env,
                     "openrouter",
-                    &["OPENROUTER_API_KEY"],
                     &[".config/opencode/openrouter.key", "openrouter.key"],
                 )
                 .ok_or_else(|| {
@@ -1077,23 +1107,14 @@ fn curl_post_json_fallback(
 }
 
 fn remove_provider_key_environment(cmd: &mut Command) {
-    // These are the process-environment aliases used by the key resolvers above.
     // Curl receives the selected key through its private header file instead;
     // preserve proxy, certificate and other operational configuration.
-    for key in [
-        "SYLPHX_API_KEY",
-        "SYLPHX_AI_KEY",
-        "SYLPHX_GATEWAY_KEY",
-        "KIMI_CODE_PLAN_API_KEY",
-        "KIMI_API_KEY",
-        "QWEN_TOKEN_PLAN_API_KEY",
-        "DASHSCOPE_API_KEY",
-        "GLM_CODE_PLAN_API_KEY",
-        "ZAI_API_KEY",
-        "MINIMAX_CODE_PLAN_API_KEY",
-        "MINIMAX_API_KEY",
-        "OPENROUTER_API_KEY",
-    ] {
+    for key in PROVIDER_KEY_ENVIRONMENT.sylphx.into_iter().chain(
+        PROVIDER_KEY_ENVIRONMENT
+            .external
+            .iter()
+            .flat_map(|(_, keys)| keys.iter().copied()),
+    ) {
         cmd.env_remove(key);
     }
 }

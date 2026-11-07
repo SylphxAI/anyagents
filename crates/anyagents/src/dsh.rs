@@ -76,15 +76,12 @@ impl DshHarness {
         args.push("--port".to_string());
         args.push("0".to_string());
 
-        let mut cmd = spawn_command(&program, &env_vec);
+        let mut cmd = spawn_command(&program, &env_vec)?;
         cmd.args(&args)
             .current_dir(work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
-        for (k, v) in &env_vec {
-            cmd.env(k, v);
-        }
         let mut child = cmd
             .spawn()
             .map_err(|err| HarnessError::Failed(format!("spawn dsh: {err}")))?;

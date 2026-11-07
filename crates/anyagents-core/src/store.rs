@@ -45,6 +45,19 @@ fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
 }
 
+/// Validate and normalize an agent scope without persisting any state.
+pub fn parse_agent_scope(scope: &str) -> Result<&'static str, Error> {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "isolated" | "none" => Ok("isolated"),
+        "private" | "false" | "0" => Ok("private"),
+        "siblings" | "sibling" | "team" => Ok("siblings"),
+        "public" | "org" | "all" | "true" | "1" => Ok("public"),
+        other => Err(Error::Message(format!(
+            "invalid scope `{other}`; expected `isolated`, `private`, `siblings`, or `public`"
+        ))),
+    }
+}
+
 fn scope_env(agent: &Agent, scope: &str) -> Vec<(String, String)> {
     let mut env = agent.launch_env.clone();
     env.retain(|(key, _)| !is_scope_env_key(key));
@@ -106,13 +119,17 @@ impl Agent {
     /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`):
     /// - `"isolated"`: strictly confined to direct `parent`, own `children`, and bound external channels;
     ///   cannot message or read siblings or other roots.
-    /// - `"private"` (default for task sub-agents without a standing `role`): only direct `parent`,
+    /// - `"private"` (default for all sub-agents): only direct `parent`,
     ///   own `children`, or shared `group:<name>` can message it; can message `public` agents.
-    /// - `"siblings"` (default for standing domain sub-agents with a `role` that are not `*-assistant`):
+    /// - `"siblings"` (explicit opt-in):
     ///   reachable by `parent`, `children`, and sibling sub-agents under the same `parent` with
     ///   `"siblings"` or `"public"` scope.
     /// - `"public"` (default for Root Agents, or sub-agents with `public: true`): reachable across the workspace.
     pub fn scope(&self) -> &'static str {
+        self.scope_or_default(self.default_scope())
+    }
+
+    fn scope_or_default(&self, default: &'static str) -> &'static str {
         if let Some((_, v)) = self.launch_env.iter().find(|(k, _)| k == "ANYAGENTS_SCOPE") {
             match v.trim().to_ascii_lowercase().as_str() {
                 "isolated" | "none" => return "isolated",
@@ -135,16 +152,12 @@ impl Agent {
                 _ => {}
             }
         }
-        self.default_scope()
+        default
     }
 
     fn default_scope(&self) -> &'static str {
         if self.parent_id.is_none() {
             "public"
-        } else if self.name.ends_with("-assistant") {
-            "isolated"
-        } else if self.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            "siblings"
         } else {
             "private"
         }
@@ -606,6 +619,45 @@ impl std::ops::Deref for ReadConn<'_> {
 /// A capability is 32 random bytes, written in hex.
 const CAPABILITY_BYTES: usize = 32;
 
+/// Freeze the old effective policy before removing implicit role/name defaults.
+/// New rows always have an explicit scope. This bounded, transactional upgrade
+/// touches only legacy environment metadata, never identities or work state.
+fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM agents WHERE NOT EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(launch_env) THEN launch_env ELSE '[]' END) entry
+                WHERE entry.key % 2 = 0 AND entry.value = 'ANYAGENTS_SCOPE'
+                  AND lower(trim(json_extract(launch_env, '$[' || (entry.key + 1) || ']'))) IN (
+                    'isolated','none','private','false','0','siblings','sibling','team',
+                    'public','org','all','true','1'))",
+        )?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    for id in ids {
+        let agent = agent_by_id(&tx, &AgentId::parse(&id)?)?;
+        // Compatibility only: role and name never select policy for new agents.
+        let legacy_default = if agent.parent_id.is_none() {
+            "public"
+        } else if agent.name.ends_with("-assistant") {
+            "isolated"
+        } else if agent.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            "siblings"
+        } else {
+            "private"
+        };
+        let scope = agent.scope_or_default(legacy_default);
+        tx.execute(
+            "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+            params![encode_env(&scope_env(&agent, scope)), id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     /// Open or create the database, turn on WAL, and apply pending migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -626,6 +678,7 @@ impl Store {
         }
         let mut conn = conn;
         migrate::migrate(&mut conn)?;
+        preserve_legacy_scopes(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
@@ -684,6 +737,10 @@ impl Store {
             .lock()
             .unwrap_or_else(|err| err.into_inner()) = Some(key.to_string());
         Ok(())
+    }
+
+    pub(crate) fn database_path(&self) -> &Path {
+        &self.db_path
     }
 
     pub fn data_dir(&self) -> &Path {
@@ -964,7 +1021,7 @@ impl Store {
                     .filter(|s| !s.is_empty())
                     .map(|line| line.chars().take(300).collect())
             });
-        let agent = Agent {
+        let mut agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
@@ -979,6 +1036,7 @@ impl Store {
             launch_env: Vec::new(),
             parent_id: new.parent_id,
         };
+        agent.launch_env = scope_env(&agent, agent.default_scope());
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let taken: i64 = tx.query_row(
@@ -991,8 +1049,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10, ?11)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -1004,6 +1062,7 @@ impl Store {
                 agent.parent_id.as_ref().map(|id| id.as_str()),
                 agent.role,
                 agent.description,
+                encode_env(&agent.launch_env),
             ],
         )?;
         tx.execute(
@@ -1696,9 +1755,31 @@ impl Store {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         agent_by_id(&tx, agent_id)?;
+        // Erasure is authoritative over provider retries/edits, including basic
+        // group relays and rows outside the normal bounded origin scan. Refuse
+        // resurrection before source dedup, quote/mention enrichment, baseline
+        // writes, mailbox allocation or indexing can retain the incoming text.
+        let ingress_origin = incoming.origin.map(|mut origin| {
+            origin.message_id = origin
+                .message_id
+                .or_else(|| parse_edited_message_text(&incoming.text).map(|(id, _)| id));
+            origin
+        });
+        if let Some(existing) =
+            redacted_message_by_ingress(&tx, agent_id, ingress_origin, source_key.as_deref())?
+        {
+            // A known alias can reveal another route (for example a new source
+            // key on a known origin). Retain that link without changing the
+            // canonical message or audit, so a source-only retry stays erased.
+            retain_message_aliases(&tx, &existing, ingress_origin, source_key.as_deref())?;
+            tx.commit()?;
+            return Ok(ReceiveOutcome::Duplicate(existing));
+        }
         if let Some(key) = &source_key
             && let Some(existing) = message_by_source(&tx, agent_id, key)?
         {
+            retain_message_aliases(&tx, &existing, ingress_origin, Some(key))?;
+            tx.commit()?;
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
         if let Some(ref mut quote) = incoming.quote {
@@ -1733,6 +1814,7 @@ impl Store {
                 body = crate::quote::compose(&incoming.text, Some(&synth_quote));
             }
         }
+        let mut redelivery_identity = None;
         if let Some(origin) = incoming.origin
             && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
             && !incoming.text.starts_with("[Edited ")
@@ -1746,6 +1828,7 @@ impl Store {
                 &body,
                 source_key.as_deref(),
                 reply_to_author.as_deref(),
+                &mut redelivery_identity,
             )?
         {
             tx.commit()?;
@@ -1757,26 +1840,45 @@ impl Store {
                 .and_then(|o| o.message_id)
                 .unwrap_or(edited_msg_id);
             if let Some(chat_id) = incoming.origin.and_then(|o| o.chat_id) {
-                let prev_text = resolve_previous_message_version(&tx, agent_id, chat_id, msg_id);
+                let prev_text = resolve_previous_message_version(
+                    &tx,
+                    agent_id,
+                    chat_id,
+                    msg_id,
+                    source_key.as_deref(),
+                );
                 let _ = tx.execute(
-                    "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5)
+                    "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms, origin_namespace)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                      ON CONFLICT (agent_id, chat_id, message_id) DO UPDATE SET
                          body = excluded.body,
-                         updated_at_ms = excluded.updated_at_ms",
+                         updated_at_ms = excluded.updated_at_ms
+                     WHERE message_versions.origin_namespace = excluded.origin_namespace",
                     params![
                         agent_id.as_str(),
                         chat_id,
                         msg_id,
                         new_raw_text.trim(),
-                        received_at_ms
+                        received_at_ms,
+                        origin_namespace(chat_id, source_key.as_deref())
                     ],
                 );
                 if let Some(prev) = prev_text {
                     if prev.trim() == new_raw_text.trim()
-                        && let Some(existing) =
-                            latest_message_for_origin(&tx, agent_id, chat_id, msg_id)?
+                        && let Some(existing) = latest_message_for_origin(
+                            &tx,
+                            agent_id,
+                            chat_id,
+                            msg_id,
+                            source_key.as_deref(),
+                        )?
                     {
+                        retain_message_aliases(
+                            &tx,
+                            &existing,
+                            ingress_origin,
+                            source_key.as_deref(),
+                        )?;
                         tx.commit()?;
                         return Ok(ReceiveOutcome::Duplicate(existing));
                     }
@@ -1797,15 +1899,16 @@ impl Store {
             && !incoming.text.starts_with("[Member ")
         {
             let _ = tx.execute(
-                "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)
+                "INSERT INTO message_versions (agent_id, chat_id, message_id, body, updated_at_ms, origin_namespace)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT (agent_id, chat_id, message_id) DO NOTHING",
                 params![
                     agent_id.as_str(),
                     chat_id,
                     message_id,
                     incoming.text.trim(),
-                    received_at_ms
+                    received_at_ms,
+                    origin_namespace(chat_id, source_key.as_deref())
                 ],
             );
         }
@@ -1951,6 +2054,13 @@ impl Store {
                 serde_json::to_string(&message.context).ok(),
             ],
         )?;
+        if let Some(identity_id) = redelivery_identity {
+            tx.execute(
+                "INSERT INTO message_identities (agent_id, target_id, identity_id) VALUES (?1, ?2, ?3)",
+                params![agent_id.as_str(), message.id.as_str(), identity_id],
+            )?;
+        }
+        retain_message_aliases(&tx, &message, ingress_origin, message.source_key.as_deref())?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
         let woke_agent = if wake_archived {
             tx.execute(
@@ -2115,16 +2225,16 @@ impl Store {
         Ok(changed)
     }
 
-    /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
+    /// Atomically transition any running agent to
     /// `idle` (process released / scaled to zero) when it has delivered every
     /// message in its mailbox, completed its latest turn
     /// (`completed_seq >= opened_seq >= max_seq > 0`), and has no active
     /// (`running`) child sub-agents of its own.
     ///
-    /// Returns `Ok(true)` when the sub-agent transitioned to `idle` (and
+    /// Returns `Ok(true)` when the agent transitioned to `idle` (and
     /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
     /// mail arrived, a turn is still open, or a child sub-agent is still running.
-    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+    pub fn complete_idle_agent(&self, id: &AgentId) -> Result<bool, Error> {
         let err_file =
             crate::agent_config_dir(self.data_dir(), id).join(".anyagents-last-error.json");
         if let Ok(raw) = std::fs::read_to_string(&err_file)
@@ -2141,7 +2251,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let parent_id_opt: Option<AgentId> = tx
                 .query_row(
-                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL AND (role IS NULL OR TRIM(role) = '')",
+                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
                     [id.as_str()],
                     |r| {
                         let pid: String = r.get(0)?;
@@ -2157,7 +2267,6 @@ impl Store {
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
-                       AND (a.role IS NULL OR TRIM(a.role) = '')
                        AND a.state = 'running'
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
@@ -2180,8 +2289,6 @@ impl Store {
                 "UPDATE agents
                  SET state = 'idle'
                  WHERE id = ?1
-                   AND parent_id IS NOT NULL
-                   AND (role IS NULL OR TRIM(role) = '')
                    AND state = 'running'
                    AND NOT EXISTS (
                        SELECT 1 FROM agents child
@@ -2238,6 +2345,11 @@ impl Store {
             }
         }
         Ok(transitioned)
+    }
+
+    /// Compatibility alias; idle release now applies to roots and children alike.
+    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+        self.complete_idle_agent(id)
     }
 
     /// Permanently delete an agent and its associated records from the store.
@@ -2352,6 +2464,7 @@ impl Store {
         let id = format!("tool_{}", MessageId::generate());
         let ts_ms = now_ms();
         let clean_tool = tool_name.trim().to_ascii_lowercase();
+        let summary = crate::masking::mask_known_secrets(summary);
         let text = if summary.trim().starts_with("[tool") {
             summary.trim().to_string()
         } else {
@@ -2608,6 +2721,93 @@ impl Store {
         Ok(turns)
     }
 
+    /// Upgrade only authorized derivative chunks, in bounded batches. Old
+    /// standalone tool summaries have no recoverable raw mailbox body: preserve
+    /// them exactly rather than inventing the clipped-away suffix. New tools use
+    /// the full-text policy. Redacted mailbox bodies are the authoritative input.
+    fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        loop {
+            let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
+            let mut select = tx.prepare(&format!(
+                "SELECT c.chunk_id,c.agent_id,c.agent_name,c.direction,c.sender,c.destination,
+                        c.timestamp_ms,COALESCE(m.body,o.body),c.kind,c.tool_name,c.seq
+                 FROM rag_chunks c
+                 LEFT JOIN messages m ON m.agent_id=c.agent_id AND m.id=c.chunk_id
+                 LEFT JOIN outbound_messages o ON o.agent_id=c.agent_id AND o.id=c.chunk_id
+                 WHERE c.text_format<2 AND COALESCE(m.body,o.body) IS NOT NULL{visibility}
+                 ORDER BY c.chunk_id LIMIT 32"
+            ))?;
+            struct Chunk {
+                id: String,
+                owner: String,
+                name: String,
+                direction: String,
+                sender: String,
+                destination: String,
+                timestamp: i64,
+                text: String,
+                kind: String,
+                tool: String,
+                seq: i64,
+            }
+            let chunks = select
+                .query_map(
+                    rusqlite::params_from_iter(scoped_params(&[], visible)),
+                    |r| {
+                        Ok(Chunk {
+                            id: r.get(0)?,
+                            owner: r.get(1)?,
+                            name: r.get(2)?,
+                            direction: r.get(3)?,
+                            sender: r.get(4)?,
+                            destination: r.get(5)?,
+                            timestamp: r.get(6)?,
+                            text: r.get(7)?,
+                            kind: r.get(8)?,
+                            tool: r.get(9)?,
+                            seq: r.get(10)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            if chunks.is_empty() {
+                break;
+            }
+            for chunk in chunks {
+                if clean_rag_text(&chunk.text).chars().count() < 2 {
+                    tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
+                    tx.execute(
+                        "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
+                        params![chunk.id, chunk.owner],
+                    )?;
+                    continue;
+                }
+                index_rag_chunk(
+                    &tx,
+                    &chunk.id,
+                    &chunk.owner,
+                    &chunk.name,
+                    &chunk.direction,
+                    &chunk.sender,
+                    &chunk.destination,
+                    chunk.timestamp,
+                    &chunk.text,
+                    Some(&chunk.kind),
+                    Some(&chunk.tool),
+                    chunk.seq,
+                )?;
+                tx.execute(
+                    "UPDATE rag_chunks SET text_format=2 WHERE chunk_id=?1 AND agent_id=?2",
+                    params![chunk.id, chunk.owner],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`).
     ///
     /// Searches `rag_chunks` and `rag_chunks_fts` across `req.agent` (`None` or `"all"` searches all agents)
@@ -2617,6 +2817,7 @@ impl Store {
     /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
+        self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
         let conn = self.read_conn();
         let limit = req.limit.clamp(1, 200);
         let radius = req.radius.min(10);
@@ -3013,7 +3214,7 @@ impl Store {
         let mut matched_hits: Vec<(ConversationTurn, String, i64)> = Vec::new();
         for (cid, score) in ranked {
             if let Some((mut turn, aname, seq)) = chunk_meta.remove(&cid) {
-                let sig: String = turn.text.chars().take(180).collect();
+                let sig = crate::learned_memory::sha256(turn.text.as_bytes());
                 if !seen_text_sig.insert(sig) {
                     continue;
                 }
@@ -3298,17 +3499,7 @@ impl Store {
         scope: &str,
         actor: &str,
     ) -> Result<Agent, Error> {
-        let normalized = match scope.trim().to_ascii_lowercase().as_str() {
-            "isolated" | "none" => "isolated",
-            "private" | "false" | "0" => "private",
-            "siblings" | "sibling" | "team" => "siblings",
-            "public" | "org" | "all" | "true" | "1" => "public",
-            other => {
-                return Err(Error::Message(format!(
-                    "invalid scope `{other}`; expected `isolated`, `private`, `siblings`, or `public`"
-                )));
-            }
-        };
+        let normalized = parse_agent_scope(scope)?;
         self.update_agent_launch_env(agent_id, Some((actor, "scope")), |current| {
             scope_env(current, normalized)
         })
@@ -3627,7 +3818,7 @@ impl Store {
         Ok(None)
     }
 
-    fn conn(&self) -> MutexGuard<'_, Connection> {
+    pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -4059,7 +4250,7 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
 }
 
 /// Reads the active direct child sub-agents `(name, role, public_description)` for `parent_id`
-/// that have a standing `role` label from `{data}/state.db` read-only.
+/// from `{data}/state.db` read-only, regardless of role label.
 pub fn read_children_roster(
     data_dir: &Path,
     parent_id: &str,
@@ -4076,7 +4267,7 @@ pub fn read_children_roster(
     let _ = conn.busy_timeout(Duration::from_millis(500));
     let query = "SELECT name, role, description, instructions
          FROM agents
-         WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != ''
+         WHERE parent_id = ?1 AND state != 'archived'
          ORDER BY name ASC";
     let mut roster = Vec::new();
     if let Ok(mut stmt) = conn.prepare(query)
@@ -4499,8 +4690,7 @@ pub fn clean_rag_text(text: &str) -> String {
     {
         t = after_hdr[idx + "-------------------".len()..].trim();
     }
-    let out: String = t.chars().take(2400).collect();
-    out
+    t.to_owned()
 }
 
 /// Deterministic 128-bit FNV-1a content hash (`32` hex chars) shared by Rust and Python indexers.
@@ -4718,8 +4908,8 @@ fn index_rag_chunk(
     conn.execute(
         "INSERT OR REPLACE INTO rag_chunks (
             chunk_id, agent_id, agent_name, direction, sender, destination,
-            timestamp_ms, content_hash, text, kind, tool_name, seq
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            timestamp_ms, content_hash, text, kind, tool_name, seq, text_format
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 2)",
         params![
             chunk_id,
             agent_id,
@@ -4858,6 +5048,167 @@ fn message_by_source(
     found.transpose()
 }
 
+/// Namespace of the ordinary numeric-origin matcher. Telegram basic-group
+/// ids are bot/account-local; a relay's receiver is NOT the target agent's bot.
+/// Unknown relay formats are scoped to their exact key, never guessed globally.
+/// Non-basic chats retain the ordinary matcher's shared chat-id semantics.
+pub(crate) fn origin_namespace(chat_id: i64, source_key: Option<&str>) -> String {
+    if !(chat_id < 0 && chat_id > -1_000_000_000_000) {
+        return "shared-chat".into();
+    }
+    let Some(key) = source_key.filter(|k| !k.is_empty()) else {
+        return "unscoped".into();
+    };
+    if let Some(rest) = key.strip_prefix("tg-in:") {
+        let parts: Vec<_> = rest.split(':').collect();
+        if let [chat, account, message] = parts.as_slice()
+            && chat.parse::<i64>() == Ok(chat_id)
+            && !account.is_empty()
+            && message.parse::<i64>().is_ok()
+        {
+            return format!("relay:{account}");
+        }
+        return format!("source:{key}");
+    }
+    if key.starts_with("room:") {
+        return format!("source:{key}");
+    }
+    // Direct adapter keys are <bot>:<update_id>. The explicit webhook fixture
+    // form also carries its account before the final event component.
+    if let Some((account, _event)) = key.rsplit_once(':') {
+        return format!("direct:{account}");
+    }
+    format!("source:{key}")
+}
+
+fn message_origin_namespace_matches(
+    conn: &Connection,
+    message: &Message,
+    chat: i64,
+    incoming_key: Option<&str>,
+) -> Result<bool, Error> {
+    let namespace = origin_namespace(chat, incoming_key);
+    if namespace == "unscoped" {
+        return Ok(false);
+    }
+    let (retained, matched): (i64, bool) = conn.query_row(
+        "SELECT count(*), coalesce(max(a.namespace=?3), 0) FROM message_origin_aliases a
+         JOIN message_identities i ON i.agent_id=a.agent_id AND i.identity_id=a.identity_id
+         WHERE i.agent_id=?1 AND i.target_id=?2 AND a.chat_id=?4 AND a.message_id=?5",
+        params![
+            message.agent_id.as_str(),
+            message.id.as_str(),
+            namespace,
+            chat,
+            message.origin.and_then(|o| o.message_id)
+        ],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(if retained != 0 {
+        matched
+    } else {
+        namespace == origin_namespace(chat, message.source_key.as_deref())
+    })
+}
+
+/// Retain both sides of every coalescence before an origin/source promotion.
+/// This also lazily seeds a pre-upgrade row's still-available canonical identity.
+/// Callers share ingress/redaction's IMMEDIATE transaction; errors roll it back.
+fn retain_message_aliases(
+    conn: &Connection,
+    message: &Message,
+    incoming_origin: Option<Origin>,
+    incoming_source_key: Option<&str>,
+) -> Result<String, Error> {
+    let seeded = conn.execute(
+        "INSERT INTO message_identities (agent_id, target_id, identity_id) VALUES (?1, ?2, ?2) ON CONFLICT DO NOTHING",
+        params![message.agent_id.as_str(), message.id.as_str()],
+    )?;
+    let identity_id: String = conn.query_row(
+        "SELECT identity_id FROM message_identities WHERE agent_id = ?1 AND target_id = ?2",
+        params![message.agent_id.as_str(), message.id.as_str()],
+        |r| r.get(0),
+    )?;
+    // Only seed the visible route once. After promotion source_key may be
+    // cleared; re-inferring its account then would manufacture a broad alias.
+    for (origin, key) in [
+        (
+            message.origin.filter(|_| seeded != 0),
+            message.source_key.as_deref(),
+        ),
+        (incoming_origin, incoming_source_key),
+    ] {
+        if let Some(Origin {
+            chat_id: Some(chat_id),
+            message_id: Some(message_id),
+            ..
+        }) = origin
+        {
+            conn.execute(
+                "INSERT INTO message_origin_aliases (agent_id, identity_id, namespace, chat_id, message_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING",
+                params![message.agent_id.as_str(), identity_id, origin_namespace(chat_id, key), chat_id, message_id],
+            )?;
+        }
+    }
+    for key in [message.source_key.as_deref(), incoming_source_key]
+        .into_iter()
+        .flatten()
+        .filter(|key| !key.is_empty())
+    {
+        conn.execute(
+            "INSERT INTO message_source_aliases (agent_id, identity_id, source_key)
+             VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+            params![message.agent_id.as_str(), identity_id, key],
+        )?;
+    }
+    Ok(identity_id)
+}
+
+/// Resolve every retained origin/source alias of an explicitly redacted row,
+/// before any ordinary writer. No bounded history scan or body matching. A
+/// missing canonical row is a storage error, not permission to append plaintext.
+fn redacted_message_by_ingress(
+    conn: &Connection,
+    agent_id: &AgentId,
+    origin: Option<Origin>,
+    source_key: Option<&str>,
+) -> Result<Option<Message>, Error> {
+    let target_id: Option<String> = conn
+        .query_row(
+            "SELECT r.target_id FROM message_origin_aliases a
+         JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
+         JOIN conversation_redactions r ON r.agent_id = i.agent_id AND r.target_id = i.target_id
+         WHERE a.agent_id = ?1 AND a.chat_id = ?2 AND a.message_id = ?3 AND a.namespace = ?5 AND a.namespace != 'unscoped'
+         UNION ALL
+         SELECT r.target_id FROM message_source_aliases a
+         JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
+         JOIN conversation_redactions r ON r.agent_id = i.agent_id AND r.target_id = i.target_id
+         WHERE a.agent_id = ?1 AND a.source_key = ?4
+         LIMIT 1",
+            params![
+                agent_id.as_str(),
+                origin.and_then(|o| o.chat_id),
+                origin.and_then(|o| o.message_id),
+                source_key,
+                origin
+                    .and_then(|o| o.chat_id)
+                    .map(|chat| origin_namespace(chat, source_key))
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(target_id) = target_id else {
+        return Ok(None);
+    };
+    let row = conn.query_row(
+        &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id = ?1 AND id = ?2"),
+        params![agent_id.as_str(), target_id],
+        |r| Ok(message_from_row(conn, r)),
+    )??;
+    Ok(Some(row))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn message_by_origin(
     conn: &Connection,
@@ -4869,6 +5220,7 @@ fn message_by_origin(
     incoming_body: &str,
     incoming_source_key: Option<&str>,
     incoming_reply_to_author: Option<&str>,
+    redelivery_identity: &mut Option<String>,
 ) -> Result<Option<Message>, Error> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {MESSAGE_COLS} FROM messages
@@ -4896,7 +5248,7 @@ fn message_by_origin(
         let stored_is_meta_event =
             msg.text.starts_with("[Reaction ") || msg.text.starts_with("[Deleted message #");
         let matched_by_id = origin.message_id == Some(message_id)
-            && (!is_basic_group || (!in_is_relay && !stored_is_relay))
+            && message_origin_namespace_matches(conn, &msg, chat_id, incoming_source_key)?
             && if incoming_is_meta_event || stored_is_meta_event {
                 strip_quoted_block(&msg.text) == strip_quoted_block(incoming_body)
                     && in_user == telegram_sender_user_key(msg.sender.as_deref())
@@ -4907,7 +5259,9 @@ fn message_by_origin(
         // assign each bot its own account-local `message_id` for the same human
         // message. Match by `(chat_id, sender user, source_time_ms, body)` so cross-bot
         // passive relay and direct webhook delivery coalesce into a single message.
-        let matched_by_group_relay = (in_is_relay || stored_is_relay)
+        let matched_by_group_relay = (in_is_relay
+            || stored_is_relay
+            || (is_basic_group && origin.message_id == Some(message_id)))
             && normalize_telegram_body_for_dedup(strip_quoted_block(&msg.text))
                 == normalize_telegram_body_for_dedup(strip_quoted_block(incoming_body))
             && in_user.is_some()
@@ -4917,6 +5271,40 @@ fn message_by_origin(
                 _ => (now_ms() - msg.received_at_ms).abs() <= 15_000,
             };
         if matched_by_id || matched_by_group_relay {
+            // Keep BOTH the old and incoming route before promotion clears the
+            // source key or replaces the canonical origin, even without a body
+            // change and before the late-quote redelivery branch returns None.
+            let identity_id = retain_message_aliases(
+                conn,
+                &msg,
+                Some(Origin {
+                    chat_id: Some(chat_id),
+                    message_id: Some(message_id),
+                    thread_id: origin.thread_id,
+                }),
+                incoming_source_key,
+            )?;
+            // This canonical identity (including intentional late-quote
+            // redeliveries) may have been redacted. Re-resolve after retaining
+            // the new alias and return the actual frozen row before either
+            // body UPDATE. This shares ingress/redaction's IMMEDIATE transaction.
+            let redacted_target: Option<String> = conn
+                .query_row(
+                    "SELECT r.target_id FROM conversation_redactions r
+                 JOIN message_identities i ON i.agent_id=r.agent_id AND i.target_id=r.target_id
+                 WHERE i.agent_id=?1 AND i.identity_id=?2 LIMIT 1",
+                    params![agent_id.as_str(), identity_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(target) = redacted_target {
+                let redacted = conn.query_row(
+                    &format!("SELECT {MESSAGE_COLS} FROM messages WHERE agent_id=?1 AND id=?2"),
+                    params![agent_id.as_str(), target],
+                    |r| Ok(message_from_row(conn, r)),
+                )??;
+                return Ok(Some(redacted));
+            }
             let was_unquoted = !has_quoted_block(&msg.text) && has_quoted_block(incoming_body);
             let best_body = if was_unquoted || incoming_body.len() > msg.text.len() {
                 Some(incoming_body.to_string())
@@ -4934,7 +5322,7 @@ fn message_by_origin(
                     updated_context.reply_to_author = Some(rta.to_string());
                 }
                 let new_body = best_body.as_deref().unwrap_or(&msg.text);
-                let _ = conn.execute(
+                conn.execute(
                     "UPDATE messages SET origin = ?1, context = ?2, source_key = NULL, body = ?3 WHERE id = ?4",
                     params![
                         serde_json::to_string(&updated_origin).unwrap_or_default(),
@@ -4942,7 +5330,7 @@ fn message_by_origin(
                         new_body,
                         msg.id.as_str(),
                     ],
-                );
+                )?;
                 msg.origin = Some(updated_origin);
                 msg.context = updated_context;
                 msg.source_key = None;
@@ -4959,20 +5347,21 @@ fn message_by_origin(
                     updated_context.reply_to_author = Some(rta.to_string());
                 }
                 let new_body = best_body.as_deref().unwrap_or(&msg.text);
-                let _ = conn.execute(
+                conn.execute(
                     "UPDATE messages SET body = ?1, context = ?2 WHERE id = ?3",
                     params![
                         new_body,
                         serde_json::to_string(&updated_context).ok(),
                         msg.id.as_str(),
                     ],
-                );
+                )?;
                 msg.context = updated_context;
                 if let Some(b) = best_body {
                     msg.text = b;
                 }
             }
             if was_unquoted && cursor(conn, agent_id).unwrap_or(0) >= msg.seq {
+                *redelivery_identity = Some(identity_id);
                 return Ok(None);
             }
             return Ok(Some(msg));
@@ -5160,12 +5549,18 @@ fn resolve_previous_message_version(
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
+    source_key: Option<&str>,
 ) -> Option<String> {
     if let Ok(Some(version)) = conn
         .query_row(
             "SELECT body FROM message_versions
-             WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3",
-            params![agent_id.as_str(), chat_id, message_id],
+             WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?4",
+            params![
+                agent_id.as_str(),
+                chat_id,
+                message_id,
+                origin_namespace(chat_id, source_key)
+            ],
             |row| row.get::<_, String>(0),
         )
         .optional()
@@ -5174,28 +5569,23 @@ fn resolve_previous_message_version(
     }
     let pattern = format!("%\"message_id\":{message_id}%");
     let mut stmt = conn
-        .prepare(
-            "SELECT agent_id, body, origin FROM messages
-             WHERE origin LIKE ?1
-               AND body NOT LIKE '[Edited message #%'
-               AND body NOT LIKE '[Reaction %'
-               AND body NOT LIKE '[Deleted message #%'
-             ORDER BY CASE WHEN agent_id = ?2 THEN 0 ELSE 1 END, rowid DESC
-             LIMIT 32",
-        )
+        .prepare(&format!(
+            "SELECT {MESSAGE_COLS} FROM messages WHERE origin LIKE ?1
+           AND body NOT LIKE '[Edited message #%'
+           AND body NOT LIKE '[Reaction %'
+           AND body NOT LIKE '[Deleted message #%'
+         ORDER BY CASE WHEN agent_id=?2 THEN 0 ELSE 1 END, rowid DESC LIMIT 32"
+        ))
         .ok()?;
     let mut rows = stmt.query(params![pattern, agent_id.as_str()]).ok()?;
     while let Some(row) = rows.next().ok()? {
-        let body: String = row.get(1).ok()?;
-        let origin_raw: Option<String> = row.get(2).ok()?;
-        let Some(origin_str) = origin_raw else {
-            continue;
-        };
-        let Ok(origin) = serde_json::from_str::<Origin>(&origin_str) else {
-            continue;
-        };
-        if origin.chat_id == Some(chat_id) && origin.message_id == Some(message_id) {
-            return Some(strip_quoted_block(&body).trim().to_string());
+        let message = message_from_row(conn, row).ok()?;
+        if let Some(origin) = message.origin
+            && origin.chat_id == Some(chat_id)
+            && origin.message_id == Some(message_id)
+            && message_origin_namespace_matches(conn, &message, chat_id, source_key).ok()?
+        {
+            return Some(strip_quoted_block(&message.text).trim().to_string());
         }
     }
     None
@@ -5206,6 +5596,7 @@ fn latest_message_for_origin(
     agent_id: &AgentId,
     chat_id: i64,
     message_id: i64,
+    source_key: Option<&str>,
 ) -> Result<Option<Message>, Error> {
     let pattern = format!("%\"message_id\":{message_id}%");
     let mut stmt = conn.prepare(&format!(
@@ -5219,6 +5610,7 @@ fn latest_message_for_origin(
         if let Some(origin) = msg.origin
             && origin.chat_id == Some(chat_id)
             && origin.message_id == Some(message_id)
+            && message_origin_namespace_matches(conn, &msg, chat_id, source_key)?
         {
             return Ok(Some(msg));
         }
@@ -5570,7 +5962,7 @@ fn compute_and_diff_topology_event(
     } else if rec.allows_sibling_messages()
         && let Some(ref pid) = rec.parent_id
         && let Ok(mut stmt) = conn.prepare(
-            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 ORDER BY name ASC",
         )
         && let Ok(rows) = stmt.query_map(params![pid.as_str(), rec.id.as_str()], |r| {
             r.get::<_, String>(0)
@@ -5588,14 +5980,17 @@ fn compute_and_diff_topology_event(
 
     let mut children = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' ORDER BY name ASC",
     ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
     {
         for id_str in rows.flatten() {
             if let Ok(aid) = AgentId::parse(&id_str)
                 && let Ok(child) = agent_by_id(conn, &aid)
             {
-                children.push(format_agent_topology_tag(&child.name, child.role.as_deref()));
+                children.push(format_agent_topology_tag(
+                    &child.name,
+                    child.role.as_deref(),
+                ));
             }
         }
     }
@@ -5984,7 +6379,7 @@ mod tests {
     use super::*;
 
     fn setup() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         (dir, store)
     }
@@ -5993,6 +6388,35 @@ mod tests {
         store
             .create_agent(NewAgent::new(name, "claude-code"))
             .unwrap()
+    }
+
+    #[test]
+    fn lexical_dedup_keeps_distinct_tails_but_collapses_identical_broadcasts() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "dedup-own");
+        let other = agent(&store, "dedup-other");
+        let prefix = "shared-prefix ".repeat(300);
+        let first = format!("{prefix} dedupneedle first-tail");
+        let second = format!("{prefix} dedupneedle second-tail");
+        store
+            .record_outbound(&own.id, "agent:peer", None, &first)
+            .unwrap();
+        store
+            .record_outbound(&other.id, "agent:peer", None, &second)
+            .unwrap();
+        store
+            .record_outbound(&other.id, "agent:peer", None, &first)
+            .unwrap();
+        let hits = store
+            .search_history(&HistorySearchQuery {
+                query: Some("dedupneedle".into()),
+                visible_agent_ids: Some(vec![own.id.to_string(), other.id.to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.text == first));
+        assert!(hits.iter().any(|h| h.text == second));
     }
 
     #[test]
@@ -6081,7 +6505,12 @@ mod tests {
         let (_dir, store) = setup();
         let alpha = agent(&store, "alpha");
         store.set_agent_launch_env(&alpha.id, &env).unwrap();
-        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, env);
+        let mut expected = env.clone();
+        expected.extend([
+            ("ANYAGENTS_SCOPE".to_string(), "public".to_string()),
+            ("ANYAGENTS_PUBLIC".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, expected);
 
         // A value with a quote, a backslash and a newline keeps its characters.
         let awkward = vec![("K".to_string(), "a\"b\\c\nd".to_string())];
@@ -6154,9 +6583,9 @@ mod tests {
         let (_dir, store) = setup();
         let parent = agent(&store, "parent");
         for (name, role, default) in [
-            ("mind", Some("Mind"), "siblings"),
+            ("labelled", Some("Researcher"), "private"),
             ("task", None, "private"),
-            ("liaison-assistant", Some("Liaison"), "isolated"),
+            ("liaison-assistant", Some("Liaison"), "private"),
         ] {
             let mut new = NewAgent::new(name, "codex");
             new.parent_id = Some(parent.id.clone());
@@ -6307,7 +6736,7 @@ mod tests {
     /// cursor that still points at a row that exists.
     #[test]
     fn upgrading_a_two_cursor_store_keeps_one_cursor_and_drops_the_answer_rows() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("state.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -6952,6 +7381,159 @@ mod tests {
     }
 
     #[test]
+    fn full_mailbox_tails_upgrade_only_authorized_chunks_and_survive_redaction_restart() {
+        let (dir, store) = setup();
+        let own = agent(&store, "tail-owner");
+        let hidden = agent(&store, "tail-hidden");
+        let prefix = "padding ".repeat(500);
+        let incoming = |text: String| Incoming {
+            text,
+            sender: Some("agent:peer".into()),
+            source_time_ms: None,
+            source_key: None,
+            reply_to: None,
+            quote: None,
+            origin: None,
+            received_at_ms: None,
+        };
+        store
+            .receive(&own.id, incoming(format!("{prefix} firsttailneedle")))
+            .unwrap();
+        store
+            .receive(&own.id, incoming(format!("{prefix} secondtailneedle")))
+            .unwrap();
+        store
+            .receive(&hidden.id, incoming(format!("{prefix} hiddentailneedle")))
+            .unwrap();
+        store
+            .record_outbound(
+                &own.id,
+                "agent:peer",
+                None,
+                &format!("{prefix} outboundtailneedle"),
+            )
+            .unwrap();
+        store
+            .record_tool_event(&own.id, "browser", &format!("{prefix} tooltailneedle"))
+            .unwrap();
+        let ids = [own.id.to_string()];
+        let query = |term: &str| HistorySearchQuery {
+            query: Some(term.into()),
+            visible_agent_ids: Some(ids.to_vec()),
+            ..Default::default()
+        };
+        for term in [
+            "firsttailneedle",
+            "secondtailneedle",
+            "outboundtailneedle",
+            "tooltailneedle",
+        ] {
+            assert_eq!(
+                store.search_history(&query(term)).unwrap().len(),
+                1,
+                "{term}"
+            );
+        }
+        let hashes: i64 = store.conn().query_row("SELECT count(DISTINCT content_hash) FROM rag_chunks WHERE agent_id=?1 AND direction='in'", [own.id.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(
+            hashes, 2,
+            "identical prefixes must not merge distinct tails"
+        );
+        // Simulate the already-present pre-upgrade population, including FTS.
+        // The real historical bodies remain untouched in the mailbox tables.
+        {
+            let conn = store.conn();
+            conn.execute("UPDATE rag_chunks SET text=substr(text,1,2400),text_format=1 WHERE chunk_id NOT LIKE 'tool_%'", []).unwrap();
+            conn.execute("DELETE FROM rag_chunks_fts", []).unwrap();
+            conn.execute("INSERT INTO rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,search_tokens) SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text FROM rag_chunks", []).unwrap();
+        }
+        assert_eq!(
+            store
+                .search_history(&query("firsttailneedle"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_history(&query("outboundtailneedle"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let hidden_format: i64 = store
+            .conn()
+            .query_row(
+                "SELECT text_format FROM rag_chunks WHERE agent_id=?1",
+                [hidden.id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hidden_format, 1,
+            "hidden bodies must not be read/backfilled"
+        );
+        let message = store
+            .inbox(&own.id, None)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.text.ends_with("firsttailneedle"))
+            .unwrap();
+        store.set_agent_state(&own.id, "archived").unwrap();
+        store
+            .redact_conversation(
+                crate::redaction::Actor::Operator,
+                &own.id,
+                &crate::redaction::Request {
+                    message_id: Some(message.id.to_string()),
+                    seq: None,
+                    span: Some(crate::redaction::Span {
+                        unit: crate::redaction::SpanUnit::Bytes,
+                        start: prefix.len() + 1,
+                        end: message.text.len(),
+                    }),
+                    reason: "remove tail".into(),
+                },
+            )
+            .unwrap();
+        // Retrying the upgrade must consume the redacted authoritative body,
+        // not resurrect text from an earlier derivative snapshot.
+        store
+            .conn()
+            .execute(
+                "UPDATE rag_chunks SET text_format=1 WHERE agent_id=?1",
+                [own.id.as_str()],
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        assert!(
+            store
+                .search_history(&query("firsttailneedle"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_history(&query("secondtailneedle"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_history(&HistorySearchQuery {
+                    query: Some("hiddentailneedle".into()),
+                    visible_agent_ids: Some(vec![hidden.id.to_string()]),
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn search_history_supports_lexical_cjk_multi_query_exclude_tools_range_ordering_and_radius() {
         let (_dir, store) = setup();
         let alice = agent(&store, "alice");
@@ -7103,6 +7685,206 @@ mod tests {
         assert_eq!(pushed_down.len(), 1);
         assert!(pushed_down[0].to.contains("alice") || pushed_down[0].from.contains("alice"));
         assert!(pushed_down[0].text.contains("Step 2"));
+    }
+
+    #[test]
+    fn idle_release_preserves_pending_work_and_role_independent_identity() {
+        let (_dir, store) = setup();
+        let parent = agent(&store, "parent");
+        for (name, parent_id, role) in [
+            ("root", None, Some("Researcher")),
+            ("labelled", Some(parent.id.clone()), Some("Researcher")),
+            ("plain", Some(parent.id.clone()), None),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = parent_id;
+            new.role = role.map(str::to_string);
+            new.instructions = Some("Keep serving future requests.".into());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
+            store.receive(&agent.id, Incoming::new("task")).unwrap();
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+            store.note_delivered(&agent.id, 1).unwrap();
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+            store.note_turn_completed(&agent.id).unwrap();
+            assert!(store.complete_idle_agent(&agent.id).unwrap());
+            let idle = store.agent(&agent.id).unwrap();
+            assert_eq!(idle.role, agent.role);
+            assert_eq!(idle.instructions, agent.instructions);
+            assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 1);
+            store
+                .receive(&agent.id, Incoming::new("follow-up"))
+                .unwrap();
+            assert_eq!(store.agent(&agent.id).unwrap().state, "running");
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn relationship_discovery_includes_children_and_siblings_without_roles() {
+        let (dir, store) = setup();
+        let parent = agent(&store, "parent");
+        let mut new = NewAgent::new("first", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let first = store.create_agent(new).unwrap();
+        let mut new = NewAgent::new("second", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let second = store.create_agent(new).unwrap();
+        store.set_agent_scope(&first.id, "siblings").unwrap();
+        store.set_agent_scope(&second.id, "siblings").unwrap();
+        let roster = read_children_roster(dir.path(), parent.id.as_str());
+        assert_eq!(
+            roster.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let ReceiveOutcome::New(parent_mail) =
+            store.receive(&parent.id, Incoming::new("check")).unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        let topology = parent_mail.context.topology.as_deref().unwrap();
+        assert!(topology.contains("agent:first"));
+        assert!(topology.contains("agent:second"));
+        let ReceiveOutcome::New(child_mail) =
+            store.receive(&first.id, Incoming::new("check")).unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        assert!(
+            child_mail
+                .context
+                .topology
+                .as_deref()
+                .unwrap()
+                .contains("agent:second")
+        );
+        // A private sibling remains hidden even though it has a label.
+        store
+            .set_agent_role(&second.id, Some("Researcher"))
+            .unwrap();
+        store.set_agent_scope(&second.id, "private").unwrap();
+        let ReceiveOutcome::New(changed) = store
+            .receive(&first.id, Incoming::new("check again"))
+            .unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        assert!(
+            changed
+                .context
+                .topology
+                .as_deref()
+                .unwrap()
+                .contains("-sibling: agent:second")
+        );
+    }
+
+    #[test]
+    fn upgrade_materializes_legacy_effective_scopes_without_changing_work() {
+        let (dir, store) = setup();
+        let root = agent(&store, "root");
+        let mut expected = Vec::new();
+        let mut schedules = Vec::new();
+        for (name, role, env, scope) in [
+            ("labelled", Some("Researcher"), vec![], "siblings"),
+            ("plain", None, vec![], "private"),
+            ("liaison-assistant", Some("Liaison"), vec![], "isolated"),
+            (
+                "explicit",
+                Some("Researcher"),
+                vec![("ANYAGENTS_SCOPE".into(), "private".into())],
+                "private",
+            ),
+            (
+                "legacy-public",
+                Some("Researcher"),
+                vec![("ANYAGENTS_PUBLIC".into(), "1".into())],
+                "public",
+            ),
+            (
+                "invalid-scope",
+                Some("Researcher"),
+                vec![("ANYAGENTS_SCOPE".into(), "unknown".into())],
+                "siblings",
+            ),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = Some(root.id.clone());
+            new.role = role.map(str::to_string);
+            new.instructions = Some("User-authored instructions".into());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
+            store
+                .receive(&agent.id, Incoming::new("completed"))
+                .unwrap();
+            store.note_delivered(&agent.id, 1).unwrap();
+            store.note_turn_completed(&agent.id).unwrap();
+            store.receive(&agent.id, Incoming::new("pending")).unwrap();
+            schedules.push(
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: agent.id.clone(),
+                        kind: "at".into(),
+                        spec: "1h".into(),
+                        prompt: "Future work".into(),
+                        interval_ms: None,
+                        next_fire_at_ms: Some(now_ms() + 3_600_000),
+                        watch_baseline: None,
+                    })
+                    .unwrap(),
+            );
+            let mut env = env;
+            env.push(("CUSTOM".into(), "preserve".into()));
+            // Write the exact pre-upgrade flat-array representation.
+            store
+                .conn()
+                .execute(
+                    "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+                    params![encode_env(&env), agent.id.as_str()],
+                )
+                .unwrap();
+            expected.push((store.agent(&agent.id).unwrap(), scope));
+        }
+        for _ in 0..2 {
+            let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            for schedule in &schedules {
+                assert_eq!(
+                    reopened.get_schedule(&schedule.id).unwrap().as_ref(),
+                    Some(schedule)
+                );
+            }
+            for (before, scope) in &expected {
+                let after = reopened.agent(&before.id).unwrap();
+                assert_eq!(after.scope(), *scope);
+                assert!(
+                    after
+                        .launch_env
+                        .contains(&("ANYAGENTS_SCOPE".into(), scope.to_string()))
+                );
+                assert!(
+                    after
+                        .launch_env
+                        .contains(&("CUSTOM".into(), "preserve".into()))
+                );
+                let mut normalized = after.clone();
+                normalized.launch_env = before.launch_env.clone();
+                assert_eq!(&normalized, before);
+                assert_eq!(reopened.delivered_cursor(&before.id).unwrap(), 1);
+                assert_eq!(
+                    reopened.next_undelivered(&before.id).unwrap().unwrap().text,
+                    "pending"
+                );
+            }
+        }
+        let new = store
+            .create_agent(NewAgent {
+                name: "new-child".into(),
+                parent_id: Some(root.id),
+                role: Some("Researcher".into()),
+                ..NewAgent::new("unused", "codex")
+            })
+            .unwrap();
+        assert_eq!(new.scope(), "private");
     }
 
     #[test]
@@ -7302,6 +8084,7 @@ mod tests {
         let mut initial = Incoming::new(v0);
         initial.sender = Some("agent:helios".to_string());
         initial.origin = Some(origin);
+        initial.source_key = Some("bot-a:1".into());
         let ReceiveOutcome::New(msg0) = store.receive(&argus.id, initial).unwrap() else {
             panic!("initial message must be stored");
         };
@@ -7312,6 +8095,7 @@ mod tests {
         let mut edit1 = Incoming::new(format!("[Edited message #88]: {v1}"));
         edit1.sender = Some("agent:helios".to_string());
         edit1.origin = Some(origin);
+        edit1.source_key = Some("bot-a:2".into());
         let ReceiveOutcome::New(msg1) = store.receive(&argus.id, edit1).unwrap() else {
             panic!("first edit must deliver a new edited event");
         };
@@ -7326,6 +8110,7 @@ mod tests {
         let mut edit2 = Incoming::new(format!("[Edited message #88]: {v2}"));
         edit2.sender = Some("agent:helios".to_string());
         edit2.origin = Some(origin);
+        edit2.source_key = Some("bot-a:3".into());
         let ReceiveOutcome::New(msg2) = store.receive(&argus.id, edit2).unwrap() else {
             panic!("second edit must deliver a new edited event");
         };
@@ -7338,6 +8123,7 @@ mod tests {
         let mut edit3 = Incoming::new(format!("[Edited message #88]: {v2}"));
         edit3.sender = Some("agent:helios".to_string());
         edit3.origin = Some(origin);
+        edit3.source_key = Some("bot-a:4".into());
         let out3 = store.receive(&argus.id, edit3).unwrap();
         assert!(matches!(out3, ReceiveOutcome::Duplicate(_)));
     }
@@ -7470,8 +8256,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(argus.scope(), "public");
-        assert_eq!(helios.scope(), "siblings");
-        assert_eq!(plutus.scope(), "siblings");
+        store.set_agent_scope(&helios.id, "siblings").unwrap();
+        store.set_agent_scope(&plutus.id, "siblings").unwrap();
 
         // 1. First message to helios from argus -> emits `<topology event="initial" ... />`
         let mut m1 = Incoming::new("Start sprint");
@@ -7518,6 +8304,7 @@ mod tests {
                 parent_id: Some(argus.id.clone()),
             })
             .unwrap();
+        store.set_agent_scope(&sage.id, "siblings").unwrap();
         let mut m3 = Incoming::new("Design sync");
         m3.sender = Some("agent:argus".to_string());
         let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
@@ -7551,7 +8338,7 @@ mod tests {
             "topo4={topo4}"
         );
 
-        // 5. External liaison `stanley-assistant` defaults to `scope = "isolated"` and sees no siblings
+        // 5. Explicitly isolated agents see no siblings regardless of name or role
         let stanley = store
             .create_agent(NewAgent {
                 name: "stanley-assistant".to_string(),
@@ -7564,7 +8351,7 @@ mod tests {
                 parent_id: Some(argus.id.clone()),
             })
             .unwrap();
-        assert_eq!(stanley.scope(), "isolated");
+        store.set_agent_scope(&stanley.id, "isolated").unwrap();
         let mut m5 = Incoming::new("Hello Stanley");
         m5.sender = Some("agent:argus".to_string());
         let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {

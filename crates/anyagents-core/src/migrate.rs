@@ -45,6 +45,14 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
     (21, include_str!("../migrations/022_agent_description.sql")),
     (22, include_str!("../migrations/023_scope_audit.sql")),
     (23, include_str!("../migrations/024_group_owner.sql")),
+    (
+        24,
+        include_str!("../migrations/025_conversation_redactions.sql"),
+    ),
+    (
+        25,
+        include_str!("../migrations/026_full_mailbox_history.sql"),
+    ),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
@@ -95,4 +103,46 @@ pub fn current_version(conn: &Connection) -> Result<i64, Error> {
         |row| row.get(0),
     )?;
     Ok(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redaction_migration_upgrades_scope_audit_and_group_owner_without_replacing_them() {
+        for baseline in [22, 23, 24] {
+            let mut conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        )
+        .unwrap();
+            for (version, sql) in MIGRATIONS
+                .iter()
+                .filter(|(version, _)| *version <= baseline)
+            {
+                conn.execute_batch(sql).unwrap();
+                conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                    .unwrap();
+            }
+            migrate(&mut conn).unwrap();
+            assert_eq!(current_version(&conn).unwrap(), 25);
+            conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
+                .unwrap();
+            conn.prepare("SELECT owner_agent_id FROM groups").unwrap();
+            conn.prepare("SELECT text_format FROM rag_chunks").unwrap();
+            conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
+                .unwrap();
+            conn.prepare(
+            "SELECT agent_id, identity_id, namespace, chat_id, message_id FROM message_origin_aliases",
+        )
+        .unwrap();
+            conn.prepare("SELECT agent_id, identity_id, source_key FROM message_source_aliases")
+                .unwrap();
+            conn.prepare("SELECT agent_id, target_id, identity_id FROM message_identities")
+                .unwrap();
+            migrate(&mut conn).unwrap();
+            assert_eq!(current_version(&conn).unwrap(), 25);
+        }
+    }
 }

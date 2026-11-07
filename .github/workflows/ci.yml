@@ -122,6 +122,33 @@ jobs:
           path: ${{ runner.temp }}/takeover-evidence
           if-no-files-found: error
 
+      # Same public Linux sudo lane as the cross-UID worktree acceptance.
+      # This is required: missing privilege, identity change or setpriv fails.
+      - name: Host memory managed-UID admission
+        run: |
+          set -euo pipefail
+          cargo build -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/host-memory-build.json"
+          binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/host-memory-build.json")
+          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/host-memory-test-build.json"
+          vendor_test=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/host-memory-test-build.json")
+          # RUNNER_TEMP is below the runner's private home, inaccessible to the
+          # distinct UID. Only a new owned leaf under public /var/tmp is used;
+          # the script verifies ancestry and never changes existing ancestors.
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$binary" --vendor-test-binary "$vendor_test" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base /var/tmp --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
+      - name: Host memory managed-UID receipt
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/host-memory-seat-receipt.json" ]; then
+            cat "$RUNNER_TEMP/host-memory-seat-receipt.json"
+          fi
+
+      - name: Cross-seat worktree writes
+        run: |
+          set -euo pipefail
+          cargo test -p anyagents --bin anyagents --locked --no-run --message-format=json > "$RUNNER_TEMP/worktree-test-build.json"
+          test_binary=$(python3 -c 'import json,sys; artifacts=[a for line in open(sys.argv[1]) if (a:=json.loads(line)).get("reason")=="compiler-artifact" and a.get("target",{}).get("name")=="anyagents" and a.get("profile",{}).get("test") and a.get("executable")]; assert len(artifacts)==1; print(artifacts[0]["executable"])' "$RUNNER_TEMP/worktree-test-build.json")
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 "$test_binary" --exact create::tests::privileged_cross_uid_spawn_can_create_commit_and_status --nocapture
+
   # The macOS lane: the same gate on a second platform. macOS is a supported
   # host for a long-lived agent, so its build is checked before merge.
   macos:
