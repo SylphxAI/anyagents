@@ -132,12 +132,10 @@ impl RawSegment {
         match self.format {
             SegmentFormat::Jsonl => append_jsonl(&mut file.0, &self.path, payload),
             SegmentFormat::FramedV1 | SegmentFormat::FramedV2 => {
-                {
-                    self.recover(&mut file.0)?;
-                    let coordinate = append_framed(&mut file.0, &self.path, self.format, payload)?;
-                    write_frontier(&self.path, file.0.metadata()?.len())?;
-                    Ok(coordinate)
-                }
+                self.recover(&mut file.0)?;
+                let coordinate = append_framed(&mut file.0, &self.path, self.format, payload)?;
+                write_frontier(&self.path, file.0.metadata()?.len())?;
+                Ok(coordinate)
             }
         }
     }
@@ -168,7 +166,9 @@ fn read_frontier(path: &Path, size: u64) -> io::Result<u64> {
         Err(e) => return Err(e),
     };
     if bytes.len() != 40 || Sha256::digest(&bytes[..8])[..] != bytes[8..] {
-        return Err(io::Error::other("raw acknowledgement frontier integrity mismatch"));
+        return Err(io::Error::other(
+            "raw acknowledgement frontier integrity mismatch",
+        ));
     }
     Ok(u64::from_le_bytes(bytes[..8].try_into().unwrap()))
 }
