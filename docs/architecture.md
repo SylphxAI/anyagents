@@ -97,6 +97,32 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### GitHub event watches
+
+`github:pr:owner/repo#number` and `github:check:owner/repo@ref` use REST
+through the authenticated `gh api` adapter, never a GraphQL check rollup.
+PR observations combine the pull's state/head with every page of Check Runs
+and legacy commit-status contexts. A numeric check reference shares the PR
+watch's target cache. Watch syntax and wake transitions are unchanged.
+
+All agents in one daemon share a serial, single-flight probe cache. Each target
+starts at 60 seconds; unchanged observations double its interval to at most
+300 seconds, and a state transition resets it to 60 seconds. Each REST page
+retains its ETag and a compact observation summary; subsequent reads send
+`If-None-Match`, including unchanged pages after a changed first page. A
+3,000-check PR requires 30 Check Run pages, plus the pull and commit statuses,
+not one expanded GraphQL query per watching agent. Inactive targets expire
+after one hour, and obsolete head/page summaries are discarded.
+
+A 403/429 secondary-limit response or `Retry-After` pauses every GitHub watch
+request until the cooldown expires. Each watch records `probe_error:rate_limited`
+once while preserving its last successful baseline; repeated scheduler ticks
+neither repeat the observation write nor wake an agent. The first eligible
+probe after cooldown rereads REST state, so a merge or check completion during
+the pause is delivered after recovery. Rate-limit responses without a stated
+retry time use exponential cooldowns from 60 to 300 seconds. Permission and
+payload errors remain distinct and never masquerade as completed checks.
+
 ### Archived sub-agent cleanup
 
 An explicit archive creates a fresh `.anyagents-archived` generation in the
@@ -301,6 +327,7 @@ A message from Telegram keeps the message it quotes: the quoted author, as Teleg
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
+  - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
   - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
