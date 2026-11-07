@@ -125,6 +125,7 @@ async fn serve(
     identity: Arc<ServingIdentity>,
 ) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
+    crate::worktree_access::recover_inspections(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     crate::host_memory::on_start(&store);
     let key = capability_key()?;
@@ -494,11 +495,9 @@ fn spawn_admin_sylphx_delivery(
             },
         );
         {
-            create::ensure_seat_environment(&cfg);
             let _ = std::fs::create_dir_all(&work_dir);
-            if let Some((_, gid, _)) = detect_seat_ids(&cfg) {
-                crate::sandbox::share_worktree_with_seat(&work_dir, gid);
-            }
+            // Creation and explicit wakes own grants; never follow a child's
+            // editable .git pointer to expand them during a harness launch.
             let req = anyagents_supervisor::LaunchRequest {
                 agent: agent.clone(),
                 data_dir: data.clone(),
@@ -939,7 +938,8 @@ pub(crate) fn mark_explicitly_archived_locked(
     store: &Store,
     data_dir: &Path,
     agent: &Agent,
-) -> Vec<anyagents_core::AgentId> {
+) -> Result<Vec<anyagents_core::AgentId>, anyagents_core::Error> {
+    crate::worktree_access::revoke_recorded(data_dir, &agent.id)?;
     let mut archived = vec![agent.id.clone()];
     mark_archive_generation_locked(store, data_dir, agent);
     if let Ok(all_agents) = store.list_agents() {
@@ -960,13 +960,14 @@ pub(crate) fn mark_explicitly_archived_locked(
                     let Ok(child) = store.set_agent_state(&child.id, "archived") else {
                         continue;
                     };
+                    crate::worktree_access::revoke_recorded(data_dir, &child.id)?;
                     mark_archive_generation_locked(store, data_dir, &child);
                     archived.push(child.id.clone());
                 }
             }
         }
     }
-    archived
+    Ok(archived)
 }
 
 /// Reconciliation marks only this row: no descendant locks or filesystem reap
@@ -1421,6 +1422,7 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
 pub fn run_admin(data: &Path) -> Result<(), Error> {
     let identity = Arc::new(ServingIdentity::capture());
     let _admin_lock = acquire_admin_lock(data)?;
+    crate::worktree_access::recover_inspections(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     crate::host_memory::on_start(&store);
@@ -2758,7 +2760,7 @@ async fn set_subagent_defaults_route(
 struct DescriptionRequest {
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     #[serde(default)]
     role: Option<String>,
@@ -3783,7 +3785,6 @@ async fn create_agent_route(
             body.model,
             body.profile,
         );
-        let explicit_description = body.description.clone();
         let mut agent = create::create(
             &state.store,
             state.store.data_dir(),
@@ -3798,39 +3799,39 @@ async fn create_agent_route(
                 base: body.base,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
-                instructions: body.instructions.or(body.description),
+                description: body.description,
+                instructions: body.instructions,
                 parent_id,
             },
         )
         .map_err(ApiError::from_store)?;
-        if let Some(ref desc) = explicit_description {
-            let trimmed = desc.trim();
-            if !trimmed.is_empty() {
-                agent = state
-                    .store
-                    .set_agent_description(&agent.id, Some(trimmed))
-                    .map_err(ApiError::from_store)?;
-            }
-        }
         let actor = match &principal {
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
+        let mut scope_changed = false;
         if let Some(ref scope_val) = body.scope {
             agent = state
                 .store
                 .set_agent_scope_as(&agent.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         } else if body.public == Some(true) {
             agent = state
                 .store
                 .set_agent_public_as(&agent.id, true, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         } else if body.public == Some(false) {
             agent = state
                 .store
                 .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
+        }
+        if scope_changed {
+            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+            create::sync_agent_description_files(&state.store, &agent, &cfg);
         }
         if !requested_group_names.is_empty() {
             let mut targets = vec![agent.id.clone()];
@@ -3937,7 +3938,8 @@ async fn archive_agent_route(
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        mark_explicitly_archived_locked(&state.store, state.store.data_dir(), &agent);
+        mark_explicitly_archived_locked(&state.store, state.store.data_dir(), &agent)
+            .map_err(ApiError::from_store)?;
         if !is_self {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -3982,6 +3984,17 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let config_dir = agent_root.join("config");
     let seat_ids =
         detect_seat_ids(&config_dir).or_else(|| detect_seat_ids(&agent_root.join("work")));
+    // Quarantine protects recovery evidence, including build-output paths that
+    // would otherwise be removed after a failed Git cleanliness check.
+    if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+        return false;
+    }
+    // Revoke before any deletion, including dirty/externally located checkouts.
+    // A failed revoke retains the journal and makes the reap incomplete.
+    if let Err(error) = crate::worktree_access::revoke_recorded(data_dir, agent_id) {
+        eprintln!("agent {agent_id}: worktree grant revocation failed: {error}");
+        return false;
+    }
     for rel in [
         "cache-home",
         "cache",
@@ -4031,11 +4044,6 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let marker_val = std::fs::read_to_string(&marker_path)
         .ok()
         .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
-    let initial_head = marker_val
-        .as_ref()
-        .and_then(|v| v.get("initial_head"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
     let recorded_wt = marker_val
         .as_ref()
         .and_then(|v| v.get("path"))
@@ -4049,11 +4057,29 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     // that a parent or operator created and lent to a child agent. Only reap the agent's own
     // ephemeral `agent_root/work` directory when not shared with another agent.
     if !shared_workdirs.contains(&work_dir) {
-        if work_dir.join(".git").exists() {
-            if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
-                complete &= reap_git_worktree_cleanly(&work_dir, seat_ids);
+        let journaled = crate::worktree_access::grant_path(data_dir, agent_id)
+            .symlink_metadata()
+            .is_ok();
+        if journaled
+            && crate::worktree_access::RecordedWorktree::load(data_dir, agent_id, &work_dir)
+                .is_none_or(|record| !record.checkout_pointer_matches())
+        {
+            eprintln!(
+                "agent {agent_id}: preserving entire journaled checkout {}: missing or changed .git pointer",
+                work_dir.display()
+            );
+            return complete;
+        }
+        if work_dir.join(".git").exists() || journaled {
+            // A missing/broken child-owned pointer cannot turn a journaled
+            // checkout into a disposable non-Git directory.
+            if is_git_worktree_safe_to_reap(data_dir, agent_id, &work_dir) {
+                complete &= reap_git_worktree_cleanly(data_dir, agent_id, &work_dir, seat_ids);
                 let _ = std::fs::remove_file(&marker_path);
             } else {
+                if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+                    return false;
+                }
                 complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
             }
         } else {
@@ -4062,9 +4088,17 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
                 for entry in entries.flatten() {
                     let child_path = entry.path();
                     if child_path.is_dir() && child_path.join(".git").exists() {
-                        if is_git_worktree_safe_to_reap(&child_path, None) {
-                            complete &= reap_git_worktree_cleanly(&child_path, seat_ids);
+                        if is_git_worktree_safe_to_reap(data_dir, agent_id, &child_path) {
+                            complete &= reap_git_worktree_cleanly(
+                                data_dir,
+                                agent_id,
+                                &child_path,
+                                seat_ids,
+                            );
                         } else {
+                            if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+                                return false;
+                            }
                             complete &= reap_build_outputs_in_worktree(&child_path, seat_ids);
                             preserved_dirty_child = true;
                         }
@@ -4113,89 +4147,67 @@ fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u3
     complete
 }
 
-pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, initial_head: Option<&str>) -> bool {
-    let Ok(status_out) = std::process::Command::new("git")
-        .args(["-c", "safe.directory=*", "-C"])
-        .arg(wt_path)
-        .args(["status", "--porcelain", "--untracked-files=normal"])
-        .output()
-    else {
+pub(crate) fn is_git_worktree_safe_to_reap(
+    data: &Path,
+    id: &anyagents_core::AgentId,
+    wt_path: &Path,
+) -> bool {
+    let Some(record) = crate::worktree_access::RecordedWorktree::load(data, id, wt_path) else {
+        // Legacy or arbitrary repositories lack trusted metadata provenance.
+        // Preserve them instead of letting Git follow a child-owned .git file.
         return false;
     };
-    if !status_out.status.success() || !status_out.stdout.is_empty() {
+    if !record.checkout_pointer_matches() {
+        eprintln!(
+            "agent {id}: preserving journaled checkout {}: missing or changed .git pointer",
+            wt_path.display()
+        );
         return false;
     }
-    let Ok(head_out) = std::process::Command::new("git")
-        .args(["-c", "safe.directory=*", "-C"])
-        .arg(wt_path)
-        .args(["rev-parse", "HEAD"])
-        .output()
-    else {
-        return false;
-    };
-    if !head_out.status.success() {
-        return false;
-    }
-    let current_head = String::from_utf8_lossy(&head_out.stdout).trim().to_string();
-    if current_head.is_empty() {
-        return false;
-    }
-    if initial_head.map(str::trim) == Some(current_head.as_str()) {
-        return true;
-    }
-    let Ok(remote_out) = std::process::Command::new("git")
-        .args(["-c", "safe.directory=*", "-C"])
-        .arg(wt_path)
-        .args(["branch", "-r", "--contains", &current_head])
-        .output()
-    else {
-        return false;
-    };
-    if remote_out.status.success()
-        && !String::from_utf8_lossy(&remote_out.stdout)
-            .trim()
-            .is_empty()
-    {
-        return true;
-    }
-    for base_ref in ["origin/main", "origin/master"] {
-        if std::process::Command::new("git")
-            .args(["-c", "safe.directory=*", "-C"])
-            .arg(wt_path)
-            .args(["merge-base", "--is-ancestor", &current_head, base_ref])
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return true;
-        }
-    }
-    false
+    record
+        .inspect(|| {
+            let output = |args: &[&str]| record.command()?.args(args).output();
+            let status_out = output(&["status", "--porcelain", "--untracked-files=normal"])?;
+            if !status_out.status.success() || !status_out.stdout.is_empty() {
+                return Ok(false);
+            }
+            // No seat-owned initial-head marker can waive the pushed-history check.
+            // Require HEAD and every local branch history to be covered by at least
+            // one recorded remote-tracking ref, including detached HEAD and branches
+            // not currently checked out. Shared refs remain the documented same-repo
+            // integrity boundary; this is not protection from forged remote refs.
+            let unpushed = output(&[
+                "rev-list",
+                "HEAD",
+                "--branches",
+                "--not",
+                "--remotes",
+                "--count",
+            ])?;
+            Ok(unpushed.status.success() && unpushed.stdout == b"0\n")
+        })
+        .unwrap_or(false)
 }
 
-fn reap_git_worktree_cleanly(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
-    let git_dir = std::process::Command::new("git")
-        .args(["-c", "safe.directory=*", "-C"])
-        .arg(wt_path)
-        .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()));
-    let _ = std::process::Command::new("git")
-        .args(["-c", "safe.directory=*", "-C"])
-        .arg(wt_path)
-        .args(["worktree", "remove", "--force"])
-        .arg(wt_path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status();
-    let mut complete = remove_path_with_seat(wt_path, seat_ids);
-    if let Some(gd) = git_dir
-        && gd.components().any(|c| c.as_os_str() == "worktrees")
-        && gd.exists()
-    {
-        complete &= remove_path_with_seat(&gd, seat_ids);
+fn reap_git_worktree_cleanly(
+    data: &Path,
+    id: &anyagents_core::AgentId,
+    wt_path: &Path,
+    seat_ids: Option<(u32, u32, u32)>,
+) -> bool {
+    let Some(record) = crate::worktree_access::RecordedWorktree::load(data, id, wt_path) else {
+        return false;
+    };
+    if record.validate().is_err() {
+        return false;
     }
+    // Git has no separate worktree registry: these two directories are the
+    // checkout and registration. Avoid `git worktree remove`, which can launch
+    // its own Git subprocesses inside the seat-controlled checkout.
+    let mut complete = remove_path_with_seat(wt_path, seat_ids);
+    // Only the journal's validated private dir is eligible, never a path read
+    // back from a child-edited pointer after the check above.
+    complete &= remove_path_with_seat(record.private(), seat_ids);
     complete
 }
 
@@ -4396,6 +4408,8 @@ async fn delete_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        crate::worktree_access::revoke_recorded(state.store.data_dir(), &found.id)
+            .map_err(ApiError::from_store)?;
         let deleted = state
             .store
             .delete_agent(&found.id)
@@ -4491,6 +4505,8 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
         cfg.join(".anyagents-profile-rotated-ms"),
         format!("{}\n", now_ms()),
     );
+    crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
+        .map_err(ApiError::from_store)?;
     clear_explicitly_archived(store.data_dir(), &found.id);
     Ok(())
 }
@@ -6710,7 +6726,11 @@ impl ApiError {
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
             Error::GroupForbidden { .. } => StatusCode::FORBIDDEN,
             Error::AgentExists(_) => StatusCode::CONFLICT,
-            Error::InvalidAddress(_) | Error::Message(_) => StatusCode::BAD_REQUEST,
+            Error::InvalidAddress(_)
+            | Error::Message(_)
+            | Error::WorktreeSourceUnpublished { .. } => StatusCode::BAD_REQUEST,
+            Error::WorktreeProvisioning { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Error::WorkdirPermission { .. } => StatusCode::FORBIDDEN,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -7041,6 +7061,27 @@ pub(crate) mod tests {
     /// server started by one never reads another's settings.
     pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    /// Process-local environment locks do not isolate forked children or
+    /// process-global PATH. Keep one-tick lifecycle assertions in one worker.
+    fn single_test_worker(name: &str) -> bool {
+        let name = format!("server::tests::{name}");
+        if std::env::var("ANYAGENTS_SINGLE_TEST_WORKER").as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("ANYAGENTS_SINGLE_TEST_WORKER", &name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "{name} worker failed or did not execute: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
     }
 
     #[test]
@@ -7498,6 +7539,11 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive() {
+        if single_test_worker(
+            "archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive",
+        ) {
+            return;
+        }
         let _env = env_lock();
         unsafe {
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
@@ -7663,6 +7709,9 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_waits_for_self_archived_process_to_stop() {
+        if single_test_worker("archive_reap_waits_for_self_archived_process_to_stop") {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let parent = store
@@ -7733,6 +7782,113 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn recorded_cleanup_preserves_unpushed_head_and_other_branch_then_removes_pushed() {
+        use crate::worktree::tests::git;
+        fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+            fn walk(
+                root: &Path,
+                path: &Path,
+                out: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+            ) {
+                for entry in std::fs::read_dir(path).unwrap() {
+                    let path = entry.unwrap().path();
+                    let meta = std::fs::symlink_metadata(&path).unwrap();
+                    if meta.is_dir() {
+                        walk(root, &path, out);
+                    } else if meta.is_file() {
+                        out.insert(
+                            path.strip_prefix(root).unwrap().to_path_buf(),
+                            std::fs::read(&path).unwrap(),
+                        );
+                    } else {
+                        panic!("unexpected fixture object: {}", path.display());
+                    }
+                }
+            }
+            let mut out = std::collections::BTreeMap::new();
+            walk(root, root, &mut out);
+            out
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        let fixture = crate::worktree::tests::Fixture::new(&dir.path().join("fixture"));
+        fixture
+            .consumer
+            .remote("SylphxAI/demo", &work, "worker", None)
+            .unwrap();
+        crate::worktree_access::set_worktree_identity(&work).unwrap();
+        crate::worktree_access::share(
+            &work,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &crate::worktree_access::grant_path(dir.path(), &child.id),
+        )
+        .unwrap();
+        let recorded =
+            crate::worktree_access::RecordedWorktree::load(dir.path(), &child.id, &work).unwrap();
+        assert!(
+            is_git_worktree_safe_to_reap(dir.path(), &child.id, &work),
+            "published baseline must be eligible"
+        );
+        std::fs::write(work.join("src/unique"), b"unique committed source\n").unwrap();
+        git(&work, &["add", "src/unique"]);
+        git(&work, &["commit", "-m", "Unpushed source"]);
+        // A child-controlled marker must not turn an unpushed HEAD into a GC proof.
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::write(cfg.join(".anyagents-managed-worktree.json"), serde_json::to_vec(&serde_json::json!({"path": work, "initial_head": git(&work, &["rev-parse", "HEAD"])})).unwrap()).unwrap();
+        let before_work = snapshot(&work);
+        let before_private = snapshot(recorded.private());
+        assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert_eq!(snapshot(&work), before_work);
+        assert_eq!(snapshot(recorded.private()), before_private);
+        let dotgit = std::fs::read(work.join(".git")).unwrap();
+        for pointer in [None, Some(b"gitdir: /nonexistent/broken\n".as_slice())] {
+            match pointer {
+                None => std::fs::remove_file(work.join(".git")).unwrap(),
+                Some(bytes) => std::fs::write(work.join(".git"), bytes).unwrap(),
+            }
+            std::fs::create_dir_all(work.join("target")).unwrap();
+            std::fs::write(work.join("target/uncertain-report"), b"retain every byte\n").unwrap();
+            let missing_work = snapshot(&work);
+            assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+            assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+            assert_eq!(snapshot(&work), missing_work, "lost pointer deleted source");
+            assert_eq!(snapshot(recorded.private()), before_private);
+            std::fs::remove_dir_all(work.join("target")).unwrap();
+            std::fs::write(work.join(".git"), &dotgit).unwrap();
+        }
+        git(&work, &["push", "origin", "HEAD:refs/heads/worker"]);
+        assert!(is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+        let pushed_head = git(&work, &["rev-parse", "HEAD"]);
+        git(&work, &["checkout", "-b", "unpublished-side"]);
+        git(
+            &work,
+            &["commit", "--allow-empty", "-m", "Side branch only"],
+        );
+        git(&work, &["checkout", "--detach", &pushed_head]);
+        let before_work = snapshot(&work);
+        let before_private = snapshot(recorded.private());
+        assert!(
+            !is_git_worktree_safe_to_reap(dir.path(), &child.id, &work),
+            "published HEAD does not cover another unpushed local branch"
+        );
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert_eq!(snapshot(&work), before_work);
+        assert_eq!(snapshot(recorded.private()), before_private);
+        git(&work, &["push", "origin", "refs/heads/unpublished-side"]);
+        assert!(is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(!work.exists());
+        assert!(!recorded.private().exists());
+    }
+
+    #[test]
     fn archive_reap_preserves_unpushed_and_external_worktrees() {
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
@@ -7771,7 +7927,7 @@ pub(crate) mod tests {
         git(&["commit", "-qm", "Initial source"]);
         std::fs::create_dir_all(work.join("target/debug")).unwrap();
         // A clean commit with no remote is not safe to delete.
-        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work,));
         reap_archived_agents(&store, dir.path(), &HealthBoard::default());
         assert!(work.join("source.rs").exists());
         assert!(work.join(".git").exists());
@@ -7796,6 +7952,11 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants() {
+        if single_test_worker(
+            "archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("state.db");
         let store = Store::open(&db).unwrap();
@@ -7852,7 +8013,11 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail() {
-        use std::os::unix::fs::PermissionsExt;
+        if single_test_worker(
+            "archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail",
+        ) {
+            return;
+        }
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("state.db");
@@ -7862,7 +8027,19 @@ pub(crate) mod tests {
             .unwrap();
         let child = archived_reap_fixture(&store, "slow-worker", &parent);
         let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
-        std::fs::create_dir_all(work.join(".git")).unwrap();
+        let fixture = crate::worktree::tests::Fixture::new(&dir.path().join("fixture"));
+        fixture
+            .consumer
+            .remote("SylphxAI/demo", &work, "worker", None)
+            .unwrap();
+        crate::worktree_access::set_worktree_identity(&work).unwrap();
+        crate::worktree_access::share(
+            &work,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &crate::worktree_access::grant_path(dir.path(), &child.id),
+        )
+        .unwrap();
         let recipient = store
             .create_agent(anyagents_core::NewAgent::new("recipient", "opencode"))
             .unwrap();
@@ -7874,32 +8051,58 @@ pub(crate) mod tests {
         let release = dir.path().join("git-release");
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
+        // Delegate to the same Git that prepared the fixture (Homebrew on
+        // macOS), preserving all arguments and stdin for validation probes.
+        let real_git = std::process::Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let real_git = String::from_utf8(real_git.stdout).unwrap();
+        let real_git = real_git.trim();
+        assert!(Path::new(real_git).is_absolute());
         let git = bin.join("git");
-        std::fs::write(
+        crate::worktree::tests::write_executable(
             &git,
-            format!(
+            &format!(
                 r#"#!/bin/sh
-if [ "$4" = '{}' ] && [ "$5" = status ]; then
+# Parse in a subshell so non-barrier calls retain the original argv.
+if (
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -c|--git-dir) shift 2 ;;
+            --no-optional-locks) shift ;;
+            --work-tree|-C) cwd="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    [ "$cwd" = '{}' ] && [ "$1" = status ]
+); then
     touch '{}'
     n=0
     while [ ! -e '{}' ] && [ "$n" -lt 1000 ]; do sleep 0.01; n=$((n+1)); done
     exit 1
 fi
-exec /usr/bin/git "$@"
+exec '{}' "$@"
 "#,
                 work.display(),
                 entered.display(),
-                release.display()
+                release.display(),
+                real_git
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let previous_path = std::env::var_os("PATH");
         let path =
             std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
         unsafe {
             std::env::set_var("PATH", path);
         }
+        // Calibration must reach the production validator through the fake
+        // Git, not silently refuse before the status barrier under test.
+        crate::worktree_access::RecordedWorktree::load(dir.path(), &child.id, &work)
+            .unwrap()
+            .validate()
+            .expect("barrier Git cannot validate the prepared checkout");
         let worker_store = Store::open(&db).unwrap();
         let worker_data = dir.path().to_path_buf();
         let worker = std::thread::spawn(move || {
@@ -7990,7 +8193,7 @@ exec /usr/bin/git "$@"
             return;
         };
         let _ = store.set_agent_state(&agent.id, "archived");
-        mark_explicitly_archived_locked(store, data_dir, agent);
+        mark_explicitly_archived_locked(store, data_dir, agent).unwrap();
     }
 
     fn authored_send(
@@ -8220,7 +8423,7 @@ exec /usr/bin/git "$@"
                 .is_err()
         );
         store.set_agent_state(&recipient.id, "archived").unwrap();
-        mark_explicitly_archived_locked(&store, dir.path(), &recipient);
+        mark_explicitly_archived_locked(&store, dir.path(), &recipient).unwrap();
         drop(guard);
         let receipt = done_rx
             .recv_timeout(std::time::Duration::from_secs(2))

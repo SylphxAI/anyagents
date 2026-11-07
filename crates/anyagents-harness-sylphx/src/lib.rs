@@ -945,6 +945,58 @@ pub fn save_persisted_cloud_session(config_dir: &Path, session: &PersistedCloudS
 
 pub fn clear_persisted_cloud_session(config_dir: &Path) {
     let _ = std::fs::remove_file(config_dir.join("sylphx-cloud-session.json"));
+    let _ = std::fs::remove_file(config_dir.join(".sylphx-cloud-instructions-fingerprint"));
+}
+
+pub fn resolve_agent_short_name(config_dir: &Path, env: &[(String, String)]) -> String {
+    if let Some(name) = env
+        .iter()
+        .find(|(k, v)| k == "ANYAGENTS_AGENT_NAME" && !v.trim().is_empty())
+        .map(|(_, v)| v.trim().to_string())
+    {
+        return name;
+    }
+    if let Ok(name) = std::env::var("ANYAGENTS_AGENT_NAME") {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    if let Ok(sys) = std::fs::read_to_string(config_dir.join("SYSTEM_PROMPT.md")) {
+        for line in sys.lines() {
+            if let Some(rest) = line.trim().strip_prefix("- **Agent Name**: `")
+                && let Some(end) = rest.find('`')
+            {
+                let parsed = rest[..end].trim();
+                if !parsed.is_empty() {
+                    return parsed.to_string();
+                }
+            }
+        }
+    }
+    config_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("anyagents-sylphx")
+        .to_string()
+}
+
+pub(crate) fn compute_instructions_fingerprint(
+    agent_short_name: &str,
+    system_prompt: &str,
+) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in agent_short_name
+        .as_bytes()
+        .iter()
+        .chain(std::iter::once(&0u8))
+        .chain(system_prompt.as_bytes().iter())
+    {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}:{:x}", system_prompt.len())
 }
 
 /// Builds a bounded continuity digest from `sylphx-transcript.jsonl` when opening a new
@@ -1195,11 +1247,7 @@ pub(crate) fn run_cloud_session_turn(
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "google/gemini-3-flash".to_string());
-    let agent_short_name = config_dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("anyagents-sylphx");
+    let agent_short_name = resolve_agent_short_name(config_dir, env);
     let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
     let mut initial_session_context = String::new();
     if let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path) {
@@ -1236,6 +1284,28 @@ The local VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a C
 If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password CLI, `kubectl`/`talosctl`, or `desk-*` wrappers), call `sandbox` with `action: \"placement\"` and `placement: \"local\"` to switch this session seamlessly to the local Sylphx harness.\n\
 </cloud_workspace>"
     ));
+
+    let current_fp = compute_instructions_fingerprint(&agent_short_name, &system_prompt);
+    let fp_path = config_dir.join(".sylphx-cloud-instructions-fingerprint");
+    if let Ok(prev_raw) = std::fs::read_to_string(&fp_path) {
+        let prev_fp = prev_raw.trim();
+        if !prev_fp.is_empty() && prev_fp != current_fp {
+            if let Some(ref sid) = session_id {
+                let old_sess_path = cloud_session_resource_path(&canonical_env, sid);
+                let old_interrupt_url = format!("{base}/v1/{old_sess_path}:interrupt");
+                let _ = curl_post_json(&old_interrupt_url, Some(&api_key), &json!({}));
+            }
+            clear_persisted_cloud_session(config_dir);
+            agent_id = None;
+            session_id = None;
+            initial_last_seq = 0;
+            next_turn = 1;
+            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+            g.cloud_agent_id = None;
+            g.cloud_session_id = None;
+        }
+    }
+    let _ = std::fs::write(&fp_path, format!("{current_fp}\n"));
 
     if agent_id.is_none() {
         let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
@@ -3316,11 +3386,22 @@ fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
     None
 }
 
+fn find_continuity_header(after: &str) -> Option<usize> {
+    [
+        "\n## 4. Cross-Harness Session Continuity",
+        "\n## 5. Cross-Harness Session Continuity",
+        "\n# Cross-Harness Continuity",
+    ]
+    .into_iter()
+    .filter_map(|hdr| after.find(hdr))
+    .min()
+}
+
 fn extract_embedded_shared_agents_section(sys: &str) -> Option<String> {
     let marker = "\n## 4. Shared Instructions (AGENTS.md)\n";
     let start = sys.find(marker)?;
     let after = &sys[start + marker.len()..];
-    let body = match after.find("\n# Cross-Harness Continuity") {
+    let body = match find_continuity_header(after) {
         Some(cont_idx) => &after[..cont_idx],
         None => after,
     };
@@ -3366,7 +3447,7 @@ fn strip_embedded_shared_agents_section(sys: &str) -> String {
     };
     let prefix = sys[..start].trim_end();
     let after = &sys[start + marker.len()..];
-    if let Some(cont_idx) = after.find("\n# Cross-Harness Continuity") {
+    if let Some(cont_idx) = find_continuity_header(after) {
         let continuity = after[cont_idx..].trim_start_matches('\n');
         format!("{prefix}\n\n{continuity}")
     } else {
@@ -3711,7 +3792,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "repo": { "type": "string" },
                         "branch": { "type": "string" },
                         "base": { "type": "string" },
-                        "workdir": { "type": "string" },
+                        "workdir": { "type": "string", "description": "Workspace path or mode: worktree, private, or inherit (explicit parent sharing). Omitting both repo and workdir gives a sub-agent its own private <data>/agents/<id>/work directory." },
                         "description": { "type": "string" },
                         "instructions": { "type": "string" },
                         "public": { "type": "boolean", "description": "Cross-tree reachability (`false` default for sub-agents)." },
@@ -4589,12 +4670,21 @@ fn resolve_workspace_path(work_dir: &Path, raw: &str) -> PathBuf {
 }
 
 fn normalize_mcp_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
-    if tool_name != "schedule" {
-        return arguments.clone();
-    }
     let Some(mut obj) = arguments.as_object().cloned() else {
         return arguments.clone();
     };
+    if matches!(tool_name, "agents" | "describe" | "spawn" | "subagents")
+        && !obj.contains_key("instructions")
+    {
+        if let Some(inst) = obj.remove("instruction") {
+            obj.insert("instructions".to_string(), inst);
+        } else if let Some(inst) = obj.remove("system_prompt") {
+            obj.insert("instructions".to_string(), inst);
+        }
+    }
+    if tool_name != "schedule" {
+        return Value::Object(obj);
+    }
     if obj.get("action").and_then(Value::as_str) == Some("create") {
         obj.insert("action".to_string(), json!("set"));
     }
@@ -6901,5 +6991,39 @@ exec "$@"
         assert!(!assembled.contains("Shared rule v2."));
         assert!(assembled.contains("# Cross-Harness Continuity"));
         assert!(assembled.contains("Prior turn summary."));
+
+        // Also verify production `## 4. Cross-Harness Session Continuity` header is preserved
+        // and `resolve_agent_short_name` extracts `nova` instead of `agt_test`.
+        let sys_doc_v2 = "# AnyAgents Identity & Environment Awareness\n\n\
+                          ## 1. Your Identity (Who You Are)\n\n\
+                          - **Agent Name**: `nova` (addressable as `agent:nova`)\n\n\
+                          ## 4. Shared Instructions (AGENTS.md)\n\n\
+                          # SylphxAI/owner\n\n\
+                          Old stale rule v1.\n\n\
+                          ## 4. Cross-Harness Session Continuity (`codex` -> `sylphx`)\n\n\
+                          Recent completed turn digest.";
+        std::fs::write(cfg.join("SYSTEM_PROMPT.md"), sys_doc_v2).unwrap();
+        let assembled_v2 = assemble_system_prompt(&cfg, &work);
+        assert!(assembled_v2.contains("## 4. Cross-Harness Session Continuity"));
+        assert!(assembled_v2.contains("Recent completed turn digest."));
+        assert_eq!(resolve_agent_short_name(&cfg, &[]), "nova");
+        assert_eq!(
+            resolve_agent_short_name(
+                &cfg,
+                &[("ANYAGENTS_AGENT_NAME".to_string(), "chronos".to_string())]
+            ),
+            "chronos"
+        );
+
+        let norm1 = normalize_mcp_tool_arguments(
+            "describe",
+            &json!({ "agent": "self", "instruction": "New private SOP." }),
+        );
+        assert_eq!(norm1["instructions"], "New private SOP.");
+        let norm2 = normalize_mcp_tool_arguments(
+            "agents",
+            &json!({ "action": "spawn", "system_prompt": "Custom prompt." }),
+        );
+        assert_eq!(norm2["instructions"], "Custom prompt.");
     }
 }

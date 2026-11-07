@@ -43,6 +43,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             branch,
             base,
             workdir,
+            description,
             instructions,
             parent,
             prompt,
@@ -57,6 +58,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
                 "branch": branch,
                 "base": base,
                 "workdir": workdir.map(|path| path.display().to_string()),
+                "description": description,
                 "instructions": instructions,
                 "parent": parent,
                 "prompt": prompt,
@@ -104,7 +106,7 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             instructions,
             clear,
         } => {
-            describe_cmd(data, Some(name), instructions, None, clear)?;
+            describe_cmd(data, Some(name), None, instructions, None, clear)?;
         }
         AgentsCommand::Harness {
             name,
@@ -342,6 +344,7 @@ pub fn describe_cmd(
     data: &Path,
     agent_or_text: Option<String>,
     description: Option<String>,
+    instructions: Option<String>,
     role: Option<String>,
     clear: bool,
 ) -> Result<(), Error> {
@@ -349,7 +352,11 @@ pub fn describe_cmd(
     let (target_name, new_desc) = match (agent_or_text, description) {
         (Some(a), Some(d)) => (a, Some(d)),
         (Some(a), None) => {
-            if caller_id.is_some() && role.is_none() && (a.contains(' ') || a.len() > 28) && !clear
+            if caller_id.is_some()
+                && role.is_none()
+                && instructions.is_none()
+                && (a.contains(' ') || a.len() > 28)
+                && !clear
             {
                 ("self".to_string(), Some(a))
             } else {
@@ -357,10 +364,20 @@ pub fn describe_cmd(
             }
         }
         (None, Some(d)) => (caller_id.unwrap_or_else(|| "self".to_string()), Some(d)),
-        (None, None) => (caller_id.unwrap_or_else(|| "all".to_string()), None),
+        (None, None) => {
+            if instructions.is_some() || role.is_some() || clear {
+                (caller_id.unwrap_or_else(|| "self".to_string()), None)
+            } else {
+                (caller_id.unwrap_or_else(|| "all".to_string()), None)
+            }
+        }
     };
     if client::can_call_server(data) {
-        if target_name.eq_ignore_ascii_case("all") && new_desc.is_none() && role.is_none() && !clear
+        if target_name.eq_ignore_ascii_case("all")
+            && new_desc.is_none()
+            && instructions.is_none()
+            && role.is_none()
+            && !clear
         {
             if let Ok(store) = Store::open(data.join("state.db")) {
                 crate::create::sync_all_agent_instructions(&store, data);
@@ -389,9 +406,10 @@ pub fn describe_cmd(
                 return Ok(());
             }
         }
-        if new_desc.is_some() || role.is_some() || clear {
+        if new_desc.is_some() || instructions.is_some() || role.is_some() || clear {
             let body = serde_json::json!({
                 "description": new_desc,
+                "instructions": instructions,
                 "role": role,
                 "clear": clear,
             });
@@ -462,12 +480,25 @@ pub fn describe_cmd(
     if clear {
         rec = store.set_agent_description(&rec.id, None)?;
         rec = store.set_agent_instructions(&rec.id, None)?;
-    } else if let Some(ref text) = new_desc {
-        rec = store.set_agent_description(&rec.id, Some(text))?;
-        if rec.instructions.is_none() {
-            rec = store.set_agent_instructions(&rec.id, Some(text))?;
+    } else {
+        if let Some(ref text) = new_desc {
+            rec = store.set_agent_description(&rec.id, Some(text))?;
+            if instructions.is_none() && rec.instructions.is_none() {
+                rec = store.set_agent_instructions(&rec.id, Some(text))?;
+            }
+            crate::telegram::sync_agent_telegram_bot_name(&store, data, &rec);
         }
-        crate::telegram::sync_agent_telegram_bot_name(&store, data, &rec);
+        if let Some(ref inst) = instructions {
+            let trimmed = inst.trim();
+            rec = store.set_agent_instructions(
+                &rec.id,
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                },
+            )?;
+        }
     }
     if rec.parent_id.is_none() {
         crate::create::sync_all_agent_instructions(&store, data);
@@ -476,7 +507,7 @@ pub fn describe_cmd(
         crate::create::sync_agent_description_files(&store, &rec, &cfg);
     }
     let pub_desc = rec.public_description();
-    if new_desc.is_some() || role.is_some() || clear {
+    if new_desc.is_some() || instructions.is_some() || role.is_some() || clear {
         println!(
             "updated\t{}\t{}",
             crate::create::format_agent_display(&rec.name, rec.role.as_deref()),
@@ -503,6 +534,7 @@ pub fn spawn(
     branch: Option<String>,
     base: Option<String>,
     workdir: Option<std::path::PathBuf>,
+    description: Option<String>,
     instructions: Option<String>,
     parent: Option<String>,
     prompt: Option<String>,
@@ -534,6 +566,7 @@ pub fn spawn(
         "branch": branch,
         "base": base,
         "workdir": workdir.map(|path| path.display().to_string()),
+        "description": description,
         "instructions": instructions,
         "parent": parent,
         "prompt": prompt,
@@ -694,13 +727,14 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         );
     }
     if state == "running" {
+        crate::worktree_access::restore_recorded(data, &found.id)?;
         server::clear_explicitly_archived(data, &found.id);
     }
     let agent = store.set_agent_state(&found.id, state)?;
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
     } else if state == "archived" {
-        let archived = server::mark_explicitly_archived_locked(&store, data, &agent);
+        let archived = server::mark_explicitly_archived_locked(&store, data, &agent)?;
         // The offline path has no daemon maintenance worker. Keep the parent's
         // lifecycle lock, taking descendant locks only downward as above.
         for id in archived {
@@ -792,7 +826,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
-    let agent = crate::create::create(
+    let mut agent = crate::create::create(
         &store,
         data,
         crate::create::CreateRequest {
@@ -806,11 +840,25 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             base: parsed.base,
             workdir: parsed.workdir.map(std::path::PathBuf::from),
             workdir_default: server::owner_workdir(),
+            description: parsed.description,
             instructions: parsed.instructions,
             parent_id,
         },
     )
     .map_err(|err| err.to_string())?;
+    if let Some(ref scope_val) = parsed.scope {
+        agent = store
+            .set_agent_scope_as(&agent.id, scope_val, "operator")
+            .map_err(|err| err.to_string())?;
+        let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+        crate::create::sync_agent_description_files(&store, &agent, &cfg);
+    } else if let Some(pub_val) = parsed.public {
+        agent = store
+            .set_agent_public_as(&agent.id, pub_val, "operator")
+            .map_err(|err| err.to_string())?;
+        let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+        crate::create::sync_agent_description_files(&store, &agent, &cfg);
+    }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.
     crate::operator::mint(&store, &agent.id).map_err(|err| err.to_string())?;

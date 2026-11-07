@@ -4,7 +4,11 @@ use anyagents_core::{
     AgentId, Error, Store,
     host_migration::{AgentOwnership, HostMigration},
 };
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 /// Expected launch admission wait, not a failed vendor turn. Retain this reason
 /// for diagnostics/retry without projecting a terminal error to the parent.
@@ -15,10 +19,25 @@ pub(crate) fn is_migration_wait(error: &str) -> bool {
         .starts_with("memory_migration_wait:")
 }
 
+// A disposable registry must never claim a real host page merely because a
+// synthetic agent has the same name. Only explicit fixture mode changes this
+// input; production executable overrides do not select test isolation.
+fn explicit_test_mode() -> bool {
+    std::env::var_os("ANYAGENTS_TESTS").is_some()
+}
+
+fn owner_pages(data: &Path, test_mode: bool) -> PathBuf {
+    if test_mode {
+        data.join("legacy-owner-pages")
+    } else {
+        PathBuf::from("/scratch/tmp/owners")
+    }
+}
+
 /// The caller owns this agent's process lock and has not started a vendor yet.
 /// The global migration lock serializes receipt publication across agents.
 pub(crate) fn before_launch(data: &Path, agent: &AgentId) -> Result<(), Error> {
-    before_launch_from(data, agent, Path::new("/scratch/tmp/owners"))
+    before_launch_from(data, agent, &owner_pages(data, explicit_test_mode()))
 }
 fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Result<(), Error> {
     let store = Store::open(data.join("state.db"))?;
@@ -62,7 +81,7 @@ pub(crate) fn on_start(store: &Store) {
     // Migration is maintenance, never a prerequisite for binding host sockets.
     // Failed integrity checks preserve their sources; keep a retryable receipt
     // and allow authorized non-migration operations to remain available.
-    if let Err(error) = on_start_from(store, Path::new("/scratch/tmp/owners")) {
+    if let Err(error) = on_start_from(store, &owner_pages(store.data_dir(), explicit_test_mode())) {
         let receipt = serde_json::json!({"version":1,"timestamp_ms":anyagents_core::now_ms(),
             "status":"deferred_error","retryable":true,"error":error.to_string()});
         let path = store
@@ -197,6 +216,42 @@ mod tests {
         host_migration::{MigrationKind, MigrationStatus},
         learned_memory::sha256,
     };
+    #[test]
+    fn fixture_owner_pages_are_scoped_without_changing_production_discovery() {
+        let dir = crate::test_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir(&data).unwrap();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("lyra", "claude-code"))
+            .unwrap();
+        let selected = owner_pages(&data, true);
+        let outside = dir.path().join("other-host-owners");
+        fs::create_dir(&selected).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(selected.join("lyra.md"), b"synthetic selected page").unwrap();
+        fs::write(outside.join("lyra.md"), b"unrelated host page").unwrap();
+        on_start_from(&store, &selected).unwrap();
+        let migration = HostMigration::open(&data).unwrap();
+        let pages: Vec<_> = migration
+            .manifest
+            .entries
+            .iter()
+            .filter(|entry| entry.kind == MigrationKind::History)
+            .collect();
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].agent_id.as_deref(), Some(agent.id.as_str()));
+        assert_eq!(
+            fs::read(pages[0].destination.as_ref().unwrap()).unwrap(),
+            b"synthetic selected page"
+        );
+        assert_eq!(
+            fs::read(outside.join("lyra.md")).unwrap(),
+            b"unrelated host page"
+        );
+        assert_eq!(owner_pages(&data, false), Path::new("/scratch/tmp/owners"));
+    }
+
     #[test]
     fn deploy_population_migrates_archived_and_defers_active_writer() {
         let dir = crate::test_tempdir();

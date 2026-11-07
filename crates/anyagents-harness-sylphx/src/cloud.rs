@@ -157,6 +157,12 @@ fn normalize_github_repo_url_and_slug(raw: &str) -> Option<(String, String)> {
 
 fn git_origin_url(dir: &Path) -> Option<String> {
     let out = Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(["config", "--get", "remote.origin.url"])
@@ -174,6 +180,12 @@ fn git_origin_url(dir: &Path) -> Option<String> {
 
 fn git_current_branch(dir: &Path) -> Option<String> {
     let out = Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -191,6 +203,12 @@ fn git_current_branch(dir: &Path) -> Option<String> {
 
 fn git_current_head_sha(dir: &Path) -> Option<String> {
     let out = Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+        ])
         .arg("-C")
         .arg(dir)
         .args(["rev-parse", "HEAD"])

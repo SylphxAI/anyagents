@@ -33,7 +33,7 @@ impl Server {
             .arg("serve")
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(dir.join("shared.log")).unwrap())
-            .env("ANYAGENTS_FAKE_LOG", dir.join("shared.log"))
+            .env("ANYAGENTS_SHARED_LOG", dir.join("shared.log"))
             .spawn()
             .expect("server");
         let socket = dir.join("anyagents.sock");
@@ -137,6 +137,27 @@ fn create_asker(dir: &Path) {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // This agent is a mailbox, not another model. Keep it out of the
+    // supervisor's eager launch population: only responders have an adapter.
+    let paused = bin()
+        .arg("--data")
+        .arg(dir)
+        .args(["agents", "pause", "kind"])
+        .output()
+        .unwrap();
+    assert!(
+        paused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&paused.stderr)
+    );
+    assert_eq!(
+        Store::open(dir.join("state.db"))
+            .unwrap()
+            .agent_by_name("kind")
+            .unwrap()
+            .state,
+        "paused"
+    );
 }
 
 fn call(socket: &Path, request: &str) -> Value {
@@ -187,6 +208,7 @@ fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
             "duplicate replies to {sent_id}: {answers:?}"
         );
         if !answers.is_empty() {
+            assert_eq!(store.agent_by_name("kind").unwrap().state, "paused");
             break;
         }
         assert!(
