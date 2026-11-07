@@ -163,18 +163,20 @@ export function main() {
   const changed = git('diff', '--name-only', head).split('\n').filter(Boolean);
   if (changed.some((path) => !VERSION_FILES.includes(path))) throw new Error('release generation changed an unexpected path');
   git('add', '--', ...VERSION_FILES);
-  git('-c', 'user.name=Kyle Tse', '-c', 'user.email=hi@kylet.se', 'commit', '-m', `release: v${version}`);
+  const updated = Boolean(git('diff', '--cached', '--name-only'));
+  if (updated) git('-c', 'user.name=Kyle Tse', '-c', 'user.email=hi@kylet.se', 'commit', '-m', `release: v${version}`);
   const cut = git('rev-parse', 'HEAD');
   // Main may move while Cargo resolves; publish only a cut of the state read.
   if (api(`repos/${repo}/git/ref/heads/main`).object.sha !== head) throw new Error('main moved before release PR publication; the pending reconciler will collect it');
   git('push', 'origin', `HEAD:refs/heads/${BRANCH}`);
   const body = `Bumps Cargo and all five npm packages to ${version}.\n\nCollects shipped changes since ${published.tag_name}; version increment: ${bump}. Publication waits for successful main CI at the exact merged version-cut SHA.\n\nGenerated version files only; normal ci-ok and merge queue remain required.`;
-  if (open.length) gh('pr', 'edit', String(open[0].number), '-R', repo, '--title', `release: v${version}`, '--body', body);
-  else gh('pr', 'create', '-R', repo, '--base', 'main', '--head', BRANCH, '--title', `release: v${version}`, '--body', body);
+  if (open.length) {
+    if (updated || open[0].title !== `release: v${version}`) gh('pr', 'edit', String(open[0].number), '-R', repo, '--title', `release: v${version}`, '--body', body);
+  } else gh('pr', 'create', '-R', repo, '--base', 'main', '--head', BRANCH, '--title', `release: v${version}`, '--body', body);
   const pr = JSON.parse(gh('pr', 'view', BRANCH, '-R', repo, '--json', 'number,headRefOid,title,autoMergeRequest,state'));
   if (pr.headRefOid !== cut || pr.title !== `release: v${version}` || pr.state !== 'OPEN') throw new Error('release PR read-back mismatch');
   if (!pr.autoMergeRequest) gh('pr', 'merge', String(pr.number), '-R', repo, '--auto', '--squash', '--match-head-commit', cut);
-  summary(`cut v${version}: PR #${pr.number}, head ${cut}, base ${head}; normal merge queue requested`);
+  summary(`${updated ? 'cut' : 'no-op: rolling cut'} v${version}: PR #${pr.number}, head ${cut}, base ${head}; normal merge queue requested`);
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) main();
