@@ -2224,7 +2224,7 @@ impl Store {
 
     /// Record an outbound message sent by `agent_id` to `destination` (a user,
     /// a channel chat/topic, a group, or another agent) so the agent's full
-    /// two-way conversation can be read by any peer agent.
+    /// two-way conversation can be read by authorized supervising agents.
     pub fn record_outbound(
         &self,
         agent_id: &AgentId,
@@ -2964,18 +2964,21 @@ impl Store {
         let mut out: Vec<ConversationTurn> = Vec::new();
         let mut seen_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let rad_i64 = i64::try_from(radius).unwrap_or(2);
-        for (hit_turn, aname, hit_seq) in matched_hits {
+        for (hit_turn, aname, _) in matched_hits {
             let hit_ts = hit_turn.timestamp_ms;
             let mut before: Vec<ConversationTurn> = Vec::new();
-            if let Ok(mut bstmt) = conn.prepare(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq
+            if let Ok(mut bstmt) = conn.prepare(&format!(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq, tool_name
                  FROM rag_chunks
                  WHERE LOWER(agent_name) = LOWER(?1)
                    AND (timestamp_ms < ?2 OR (timestamp_ms = ?2 AND chunk_id != ?3))
+                   AND timestamp_ms > ?5 AND timestamp_ms <= ?6{}
                  ORDER BY timestamp_ms DESC, seq DESC
                  LIMIT ?4",
-            ) && let Ok(mut brows) =
-                bstmt.query(params![aname, hit_ts, hit_turn.id, rad_i64 * 2])
+                visible_agent_ids_sql("agent_id", visible_agent_ids, 7),
+            )) && let Ok(mut brows) =
+                bstmt.query(rusqlite::params_from_iter(scoped_params(
+                    params![aname, hit_ts, hit_turn.id, rad_i64 * 2, since, until], visible_agent_ids)))
             {
                 while let Ok(Some(r)) = brows.next() {
                     let kind: String = r.get(6)?;
@@ -2986,7 +2989,7 @@ impl Store {
                         continue;
                     }
                     let seq: i64 = r.get(7)?;
-                    before.push(ConversationTurn {
+                    let turn = ConversationTurn {
                         id: r.get(0)?,
                         direction: r.get(1)?,
                         from: r.get(2)?,
@@ -2997,7 +3000,12 @@ impl Store {
                         )),
                         text: r.get(4)?,
                         timestamp_ms: r.get(5)?,
-                    });
+                    };
+                    let tool_name: String = r.get(8)?;
+                    if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
+                        continue;
+                    }
+                    before.push(turn);
                     if before.len() >= radius {
                         break;
                     }
@@ -3013,15 +3021,18 @@ impl Store {
             if seen_ids.insert(hit_id.clone()) {
                 out.push(hit_turn);
             }
-            if let Ok(mut astmt) = conn.prepare(
-                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq
+            if let Ok(mut astmt) = conn.prepare(&format!(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms, kind, seq, tool_name
                  FROM rag_chunks
                  WHERE LOWER(agent_name) = LOWER(?1)
                    AND timestamp_ms >= ?2
                    AND chunk_id != ?3
+                   AND timestamp_ms > ?5 AND timestamp_ms <= ?6{}
                  ORDER BY timestamp_ms ASC, seq ASC
                  LIMIT ?4",
-            ) && let Ok(mut arows) = astmt.query(params![aname, hit_ts, hit_id, rad_i64 * 2])
+                visible_agent_ids_sql("agent_id", visible_agent_ids, 7),
+            )) && let Ok(mut arows) = astmt.query(rusqlite::params_from_iter(scoped_params(
+                params![aname, hit_ts, hit_id, rad_i64 * 2, since, until], visible_agent_ids)))
             {
                 let mut added_after = 0usize;
                 while let Ok(Some(r)) = arows.next() {
@@ -3033,7 +3044,6 @@ impl Store {
                         continue;
                     }
                     let seq: i64 = r.get(7)?;
-                    let _ = hit_seq;
                     let turn = ConversationTurn {
                         id: r.get(0)?,
                         direction: r.get(1)?,
@@ -3043,6 +3053,10 @@ impl Store {
                         text: r.get(4)?,
                         timestamp_ms: r.get(5)?,
                     };
+                    let tool_name: String = r.get(8)?;
+                    if !passes_filters(&turn, &aname, &kind, &tool_name, seq) {
+                        continue;
+                    }
                     if seen_ids.insert(turn.id.clone()) {
                         out.push(turn);
                         added_after += 1;
@@ -6533,6 +6547,165 @@ mod tests {
             .unwrap();
         assert!(matches!(dup, ReceiveOutcome::Duplicate(_)));
         assert_eq!(store.inbox(&alice.id, None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scoped_history_limits_every_candidate_path_before_limits() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "own");
+        let hidden = agent(&store, "hidden");
+        let receive = |id: &AgentId, text: String, timestamp| {
+            store
+                .receive(
+                    id,
+                    Incoming {
+                        text,
+                        sender: Some("agent:peer".into()),
+                        source_time_ms: None,
+                        source_key: None,
+                        reply_to: None,
+                        quote: None,
+                        origin: None,
+                        received_at_ms: Some(timestamp),
+                    },
+                )
+                .unwrap();
+        };
+        receive(
+            &own.id,
+            "scopeword fragmentpartial authorized".into(),
+            1_000,
+        );
+        // More hidden rows than either the FTS, substring, structured or recent
+        // candidate cap: filtering only the final result would lose the hit.
+        for n in 0..2_010 {
+            receive(
+                &hidden.id,
+                format!("scopeword fragmentpartial hidden {n}"),
+                2_000 + n,
+            );
+        }
+        let visible = vec![own.id.to_string()];
+        for query in [Some("scopeword"), Some("gmentpart"), None] {
+            let hits = store
+                .search_history(&HistorySearchQuery {
+                    agent: Some("all".into()),
+                    query: query.map(str::to_string),
+                    visible_agent_ids: Some(visible.clone()),
+                    limit: 1,
+                    ..HistorySearchQuery::default()
+                })
+                .unwrap();
+            assert_eq!(hits.len(), 1, "{query:?}");
+            assert!(hits[0].text.ends_with("authorized"), "{hits:?}");
+        }
+        let recent = store
+            .conversation_all_scoped(None, None, Some(1), Some(&visible))
+            .unwrap();
+        assert_eq!(recent.len(), 1);
+        assert!(recent[0].text.ends_with("authorized"));
+        assert!(
+            store
+                .conversation_all_scoped(None, None, Some(1), Some(&[]))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .search_history(&HistorySearchQuery {
+                    query: Some("scopeword".into()),
+                    visible_agent_ids: Some(vec![]),
+                    ..HistorySearchQuery::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .conversation_scoped(&hidden.id, None, None, None, Some(&visible))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn history_radius_preserves_visibility_and_all_structured_filters() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "own");
+        let hidden = agent(&store, "hidden");
+        for (id, sender, text, timestamp) in [
+            (&own.id, "agent:peer", "outside time", 1_000),
+            (&own.id, "agent:peer", "outside seq", 2_000),
+            (&own.id, "agent:peer", "radiusneedle authorized", 3_000),
+            (&hidden.id, "agent:peer", "hidden neighbor", 3_001),
+            (&own.id, "agent:other", "outside peer", 4_000),
+            (&own.id, "agent:peer", "excluded neighbor", 5_000),
+        ] {
+            store
+                .receive(
+                    id,
+                    Incoming {
+                        text: text.into(),
+                        sender: Some(sender.into()),
+                        source_time_ms: None,
+                        source_key: None,
+                        reply_to: None,
+                        quote: None,
+                        origin: None,
+                        received_at_ms: Some(timestamp),
+                    },
+                )
+                .unwrap();
+        }
+        store
+            .record_outbound(&own.id, "agent:peer", None, "outside direction")
+            .unwrap();
+        store
+            .record_tool_event(&own.id, "browser", "radiusneedle own browser")
+            .unwrap();
+        store
+            .record_tool_event(&hidden.id, "browser", "radiusneedle hidden browser")
+            .unwrap();
+        // Historical names are not a permission boundary (e.g. after rename).
+        store
+            .conn()
+            .execute(
+                "UPDATE rag_chunks SET agent_name = 'own' WHERE agent_id = ?1",
+                [hidden.id.as_str()],
+            )
+            .unwrap();
+        let visible = Some(vec![own.id.to_string()]);
+        let hits = store
+            .search_history(&HistorySearchQuery {
+                query: Some("radiusneedle".into()),
+                agent: Some("all".into()),
+                visible_agent_ids: visible.clone(),
+                with_peer: Some("peer".into()),
+                sender: Some("peer".into()),
+                direction: Some("in".into()),
+                include_tools: false,
+                since_ms: Some(1_500),
+                until_ms: Some(5_000),
+                from_seq: Some(3),
+                to_seq: Some(5),
+                exclude: vec!["excluded".into()],
+                radius: 10,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert_eq!(hits[0].text, "radiusneedle authorized");
+        let tools = store
+            .search_history(&HistorySearchQuery {
+                only_tools: true,
+                tool_name: Some("browser".into()),
+                radius: 10,
+                visible_agent_ids: visible,
+                ..HistorySearchQuery::default()
+            })
+            .unwrap();
+        assert_eq!(tools.len(), 1, "{tools:?}");
+        assert!(tools[0].text.ends_with("own browser"));
     }
 
     #[test]

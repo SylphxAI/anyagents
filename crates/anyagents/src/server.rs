@@ -3024,6 +3024,11 @@ fn conversation_visibility(
             let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
             let admin = caller.parent_id.is_none() && caller.is_admin;
             if admin {
+                let requested = if requested.eq_ignore_ascii_case("self") {
+                    caller.name.as_str()
+                } else {
+                    requested
+                };
                 store
                     .record_admin_audit(
                         &format!("agent:{}", caller.name),
@@ -3051,18 +3056,11 @@ fn conversation_visibility(
             let visible_agent_ids: Vec<String> =
                 visible_ids.iter().map(ToString::to_string).collect();
 
-            let is_all = requested.eq_ignore_ascii_case("all")
-                || requested == "*"
-                || requested.eq_ignore_ascii_case("self");
-            if is_all {
-                return Ok((
-                    if requested.eq_ignore_ascii_case("self") {
-                        caller.name
-                    } else {
-                        "all".to_string()
-                    },
-                    Some(visible_agent_ids),
-                ));
+            if requested.eq_ignore_ascii_case("self") {
+                return Ok((caller.name, Some(vec![caller.id.to_string()])));
+            }
+            if requested.eq_ignore_ascii_case("all") || requested == "*" {
+                return Ok(("all".to_string(), Some(visible_agent_ids)));
             }
 
             let target = store
@@ -3074,7 +3072,7 @@ fn conversation_visibility(
                     caller.name, target.name
                 )));
             }
-            Ok((target.name, Some(visible_agent_ids)))
+            Ok((target.name, Some(vec![target.id.to_string()])))
         }
     }
 }
