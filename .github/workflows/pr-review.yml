@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22.14.0'
-      - uses: SylphxAI/.github/.github/actions/pr-review@73b53784d7838dfe65841152f71d97911e7a365c
+      - uses: SylphxAI/.github/.github/actions/pr-review@8d24b052bf3b7269b519ee9ba7a005ef237a2a7c
         with:
           ci-name: pr-review-anyagents
           trust-policy: ${{ vars.SYLPHX_REVIEW_TRUST_POLICY }}
