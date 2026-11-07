@@ -691,7 +691,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Role**: Root Agent\n");
     }
 
-    doc.push_str("- **Lifecycle**: Your role is a label, not a lifecycle policy. Follow your own instructions for when to archive. Any agent may call `agents({ \"action\": \"archive\" })` to archive itself. After a completed turn, an idle agent releases its process when its mailbox is drained and no child or background work is active; its identity and session are preserved.\n");
+    doc.push_str("- **Lifecycle**: Role labels do not set lifecycle policy; follow your instructions. Any agent may call `agents` with `action: \"archive\"`. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -705,55 +705,21 @@ pub(crate) fn write_agent_instructions_with_continuity(
     }
 
     doc.push_str(
-        "\n## 2.1 Hierarchy, Event-Driven Topology & Scope Encapsulation\n\n\
-         - **Two-Layer Identity (`description` vs. `instructions`)**:\n\
-           - **Layer 1 (`description`)**: Concise public routing card visible in `agents({ \"action\": \"describe\", \"name\": \"all\" })` and group rosters without leaking private instructions.\n\
-           - **Layer 2 (`instructions`)**: Detailed private operating instructions in Section 2 above (visible only to you and ancestor supervisors).\n\
-         - **Event-Driven Topology (Cache-Stable System Prompt + `<topology>` Events)**:\n\
-           - Dynamic peer/sibling/sub-agent rosters are never injected into this static System Prompt.\n\
-           - Relationship snapshots arrive inline via `<topology event=\"initial\" ... />` and `<topology event=\"delta\" ... />`, and each `<message ...>` carries `sender_rel` and `sender_role`.\n\
-         - **Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`)**:\n\
-           - **`\"isolated\"`**: Confined to direct `parent`, own `children`, and bound external channels.\n\
-           - **`\"private\"` *(Sub-agent default)*:** Reachable by direct `parent`, own `children`, or shared `group:<name>`; reports via `to: [\"parent\"]`.\n\
-           - **`\"siblings\"`**: Also collaborates with sibling sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`).\n\
-           - **`\"public\"`**: Reachable across the workspace.\n\
-           - **Downward-Only Supervision**: Ancestors can inspect descendants' `instructions` and `conversation`, never the reverse.\n\
-           - **Group Chat Discipline**: In shared Telegram groups, only the single matching domain agent answers; all others stay silent (`NO_REPLY`).\n",
+        "\n## 3. Hierarchy, Topology & Communication Rules\n\
+         \n\
+         - `description` is a public routing card; `instructions` are private to you and ancestors. Supervision is downward-only.\n\
+         - Live rosters arrive via `<topology event=\"initial|delta\" ... />`; inline `<message ...>` routing carries `sender_rel`, `sender_role`, `reply_to`, `answer_to`.\n\
+         - `scope`: \"isolated\" = parent/children/bound channels; \"private\" (sub-agent default) adds shared groups; \"siblings\" adds siblings; \"public\" = workspace-wide. In group chats only the matching domain agent replies; otherwise `NO_REPLY`.\n\
+         - Stdout never reaches peers/parents/channels. Always call `send` to reply/report (`to`, `reply_to: \"anyagents:reply:msg_...\"`, `text`, etc.); use the envelope's `answer_to`.\n\
+         - Never poll an inbox: messages, sub-agent completions and watches wake you reactively.\n\
+         - Vendor sub-agent/timer tools are disabled by default. Use `agents` for lifecycle: isolated `<data>/agents/<id>/work` by default, or `repo` worktrees; `archive` reaps clean/pushed worktrees, preserves dirty/unpushed ones. Use `conversation` for history/search, `groups` for groups, `schedule` for wakes/event watches.\n\
+         - `browser` provides persistent Chromium; fill secrets with `secret_ref: \"op://...\"` / `\"op-otp://...\"` without reading them. On `captcha_detected: true`, use `action: \"takeover\"` and send the takeover URL to the user.\n",
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
-            "         - **Your Direct Parent Agent**: `agent:{parent}` (send upward via `to: [\"parent\"]` or `to: [\"agent:{parent}\"]`)\n"
+            "- Direct parent: `agent:{parent}`; report via `send` to `parent`.\n"
         ));
     }
-
-    doc.push_str(
-        "\n## 3. Runtime Awareness & the 6 Canonical MCP Tools (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`)\n\n\
-         - **Cache-Stable Routing & Native Tools**:\n\
-           - Live routing context arrives per message in `<message ...>` (`id`, `from`, `sender_name`, `to`, `participants`, `channel`, `chat`, `topic`, `reply_to`, `answer_to`).\n\
-           - Call your **AnyAgents MCP tools** (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`) directly (or via `await tools.anyagents.<tool>({...})` in OpenCode Code Mode).\n\
-         - **1. Unified Agent & Sub-Agent Manager (`agents`)**:\n\
-           - Vendor sub-agent tools are disabled by default; always use `agents`:\n\
-             - **List / Inspect**: `agents({ \"action\": \"list\", \"parent\": \"self\" | \"root\", \"state\": \"running\" | \"all\" })`, `agents({ \"action\": \"inspect\", \"name\": \"<name-or-id>\", \"limit\": 10 })`.\n\
-             - **Spawn**: `agents({ \"action\": \"spawn\", \"name\": \"<opt>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<opt>\", \"base\": \"<opt>\", \"workdir\": \"<opt>\", \"description\": \"...\", \"instructions\": \"...\", \"prompt\": \"...\" })`.\n\
-             - **Describe**: `agents({ \"action\": \"describe\", \"name\": \"self\" | \"all\", \"description\": \"...\", \"instructions\": \"...\" })`.\n\
-             - **Steer & Lifecycle**: `agents({ \"action\": \"steer\" | \"wake\" | \"pause\" | \"archive\" | \"delete\" | \"create\" | \"rename\" | \"role\" | \"harness\" | \"models\", ... })`.\n\
-           - **Workspaces & Managed Git Worktrees**:\n\
-             - **Default When `repo` and `workdir` Are Omitted**: Every sub-agent defaults to its own isolated `<data>/agents/<id>/work`; roots do too unless the operator configures a root working directory. Pass `workdir: \"inherit\"` only when explicitly sharing your parent directory.\n\
-             - `repo: \"<org>/<repo>\"` or `repo: \"inherit\"` provisions an isolated Git worktree automatically; on `archive`, clean/pushed worktrees are reaped while dirty/unpushed worktrees are preserved.\n\
-             - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global `<data>/AGENTS.md` and `<data>/skills` are mounted in every agent's `config/` home, with `<workdir>/AGENTS.md` and `.agents/skills` layered on top.\n\
-         - **2. Outbound Messages & Interactions (`send`)**:\n\
-           - Stdout is never delivered to peers/parents/channels; always call `send` (`to`: `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to`; `reply_to`: `anyagents:reply:msg_...`; `text`, `media`, `poll`, `checklist`, `article`, or `action`: `\"react\"` | `\"vote\"` | `\"edit\"` | `\"delete\"` | `\"pin\"`).\n\
-         - **3. Lossless History & Lexical Search (`conversation` & `search`)**:\n\
-           - Never poll an inbox. Query history via `conversation({ \"query\": \"...\", \"queries\": [...], \"agent\": \"all\" | \"self\", \"include_tools\": true, \"range\": \"seq:10-25\", \"limit\": 20 })` or omit `query` for chronological turns.\n\
-         - **4. Internal Multi-Agent Groups (`groups`)**:\n\
-           - `groups({ \"action\": \"list\" })`, `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
-         - **5. Self-Wakes & Event Watches (`schedule`)**:\n\
-           - `schedule({ \"every\": \"15m\" | \"at\": \"1m\", \"prompt\": \"...\" })`, `schedule({ \"watch\": \"github:pr:<owner>/<repo>#<num>\" | \"github:check:<owner>/<repo>@<ref>\" | \"agent:idle:<name>\" | \"pid:<pid>\" | \"file:<path>\", \"prompt\": \"...\" })`, `schedule({ \"action\": \"list\" | \"cancel\" })`.\n\
-         - **6. Anti-Detect Browser & Persistent Profiles (`browser`)**:\n\
-           - Headed Chromium with persistent `--user-data-dir` profiles (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `profiles`, `close`).\n\
-           - **Zero-Knowledge Secret/OTP Fill**: Pass `secret_ref: \"op://Vault/Item/password\"` or `\"op-otp://Vault/Item\"` on `fill` without reading secrets into LLM context.\n\
-           - **Human Takeover**: On `captcha_detected: true`, call `browser({ \"action\": \"takeover\", \"reason\": \"Solve CAPTCHA\" })`, send `takeover_url` to the user, and resume via `wait_for_user` / `release_takeover`.\n",
-    );
 
     // Only the host lifecycle allocates a generation. Describe/restart/render
     // consume its persisted pin without opening live learned-memory files.
@@ -781,12 +747,6 @@ pub(crate) fn write_agent_instructions_with_continuity(
                 return;
             }
         }
-    }
-
-    if let Some(shared) = read_shared_agents_md(config) {
-        doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
-        doc.push_str(&shared);
-        doc.push('\n');
     }
 
     if let Some(cont) = continuity.map(str::trim).filter(|s| !s.is_empty()) {
@@ -844,42 +804,12 @@ pub(crate) fn write_agent_instructions_with_continuity(
         }
         let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
     }
-    // Antigravity (`agy`) deduplicates global rules by resolved file path (`EvalSymlinks`),
-    // not by content. Point `.gemini/config/AGENTS.md` and `.gemini/config/rules/AGENTS.md`
-    // at `.gemini/config/GEMINI.md` via relative symlinks so `agy` loads the rule once
-    // instead of 3 times while callers reading any of the three paths still get `doc`.
+    // agy identifies GEMINI.md as "user_global", but rules by file path: even
+    // symlinks inject the prompt twice. Keep only the canonical global rule and
+    // remove both legacy aliases on every refresh of existing configurations.
     let gemini_cfg = config.join(".gemini").join("config");
-    let gemini_agents = gemini_cfg.join("AGENTS.md");
-    let gemini_rules_dir = gemini_cfg.join("rules");
-    let _ = std::fs::create_dir_all(&gemini_rules_dir);
-    let gemini_rules_agents = gemini_rules_dir.join("AGENTS.md");
-    #[cfg(unix)]
-    {
-        for (link_path, rel_target) in [
-            (&gemini_agents, "GEMINI.md"),
-            (&gemini_rules_agents, "../GEMINI.md"),
-        ] {
-            let already_linked = std::fs::symlink_metadata(link_path)
-                .ok()
-                .is_some_and(|m| m.file_type().is_symlink())
-                && std::fs::read_link(link_path).ok().as_deref()
-                    == Some(std::path::Path::new(rel_target));
-            if !already_linked {
-                let _ = std::fs::remove_file(link_path);
-                if std::os::unix::fs::symlink(rel_target, link_path).is_err() {
-                    let _ = write_seat_shared_file(link_path, doc.as_bytes(), 0o664);
-                }
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        for path in [&gemini_agents, &gemini_rules_agents] {
-            if std::fs::read(path).ok().as_deref() != Some(doc.as_bytes()) {
-                let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
-            }
-        }
-    }
+    let _ = std::fs::remove_file(gemini_cfg.join("AGENTS.md"));
+    let _ = std::fs::remove_file(gemini_cfg.join("rules").join("AGENTS.md"));
 }
 
 /// Fast, non-intrusive instruction sync used by `describe()`: updates the
@@ -1047,15 +977,6 @@ pub(crate) fn data_dir_from_config(config: &Path) -> Option<PathBuf> {
     } else {
         Some(parent1.to_path_buf())
     }
-}
-
-pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
-    let data_dir = data_dir_from_config(config)?;
-    let path = data_dir.join("AGENTS.md");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 #[cfg(unix)]
@@ -9826,25 +9747,42 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             2
         );
 
-        // 6. Verify L0, L1, and L2 all receive the shared AGENTS.md in their config/AGENTS.md
-        // AND their own role description in `## 2. Role, Responsibilities & Standing Description`
+        // 6. Identity mirrors stay compact at every depth; the harness owns
+        // loading shared company instructions independently.
         for (ag, expected_desc) in [
             (&root, "Root owner role description."),
             (&l1, "L1 worker role description."),
             (&l2, "L2 nested worker role description."),
         ] {
             let cfg = anyagents_core::agent_config_dir(data, &ag.id);
-            let prompt = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+            let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap(),
+                prompt
+            );
+            assert!(prompt.len() < 3_500, "{}: {} bytes", ag.name, prompt.len());
             assert!(
                 prompt.contains(expected_desc),
                 "missing role description for {}",
                 ag.name
             );
             assert!(
-                prompt.contains("## 4. Shared Instructions (AGENTS.md)")
-                    && prompt.contains("# SylphxAI Shared Constitution"),
-                "missing shared AGENTS.md for {}",
+                !prompt.contains("## 4. Shared Instructions (AGENTS.md)")
+                    && !prompt.contains("# SylphxAI Shared Constitution"),
+                "shared AGENTS.md must be loaded by the harness for {}",
                 ag.name
+            );
+            if let Some(parent_id) = ag.parent_id.as_deref() {
+                let parent = store.agent(parent_id).unwrap();
+                assert!(prompt.contains(&format!("Direct parent: `agent:{}`", parent.name)));
+            }
+            let assembled = anyagents_harness_sylphx::assemble_system_prompt(
+                &cfg,
+                Path::new(ag.workdir.as_deref().unwrap()),
+            );
+            assert_eq!(
+                assembled.matches("# SylphxAI Shared Constitution").count(),
+                1
             );
             let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
             assert!(toml.contains("project_doc_max_bytes = 131072"));
@@ -10156,7 +10094,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
-    fn create_and_gemini_rules_deduplicate_and_stay_under_agy_24kb_limit() {
+    fn create_compact_prompt_removes_legacy_gemini_rules_and_bounds_continuity() {
         let dir = tempfile::TempDir::new().unwrap();
         let data = dir.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10198,12 +10136,50 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         );
 
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+        let base_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(base_prompt.len() < 3_500, "{} bytes", base_prompt.len());
+        assert!(!base_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(!base_prompt.contains(&shared_constitution));
+        assert!(!base_prompt.contains("Cross-Harness Session Continuity"));
+        assert!(!base_prompt.contains("\n<learned_memory>\n"));
+        assert!(
+            base_prompt.contains("Host File Operating Instructions (fixed; not learned memory)")
+        );
+        assert!(base_prompt.contains("## 3. Hierarchy, Topology & Communication Rules"));
+        assert!(!base_prompt.contains("Runtime Awareness & the 6 Canonical MCP Tools"));
+        assert!(!base_prompt.contains("## 2.1"));
+
+        let gemini_md = cfg.join(".gemini/config/GEMINI.md");
+        let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
+        let gemini_rules_agents = cfg.join(".gemini/config/rules/AGENTS.md");
+        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), base_prompt);
+        assert!(!gemini_agents.exists());
+        assert!(!gemini_rules_agents.exists());
+
+        // Refresh cleans up old copies without disturbing unrelated rules.
+        std::fs::create_dir_all(gemini_rules_agents.parent().unwrap()).unwrap();
+        std::fs::write(&gemini_agents, &base_prompt).unwrap();
+        std::fs::write(&gemini_rules_agents, &base_prompt).unwrap();
+        let other_rule = cfg.join(".gemini/config/rules/custom.md");
+        std::fs::write(&other_rule, "Keep this caller-owned rule.\n").unwrap();
+        write_agent_instructions_with_continuity(&cfg, &agent, None, None);
+        assert!(!gemini_agents.exists());
+        assert!(!gemini_rules_agents.exists());
+        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), base_prompt);
         std::fs::write(cfg.join("sylphx-cloud-session.json"), "{}").unwrap();
+
+        // The previous symlink deduplication did not work: agy identifies the
+        // global rule as user_global and scanned rules by file path.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("GEMINI.md", &gemini_agents).unwrap();
+            std::os::unix::fs::symlink("../GEMINI.md", &gemini_rules_agents).unwrap();
+        }
 
         let huge_continuity = format!(
             "## 4. Cross-Harness Session Continuity (`claude-code` -> `agy`)\n\n{}",
-            "- `[OUT (already sent/completed)]` `msg_1`: Completed verification step.\n"
-                .repeat(150)
+            "- `[OUT (already sent/completed)]` `msg_1`: Completed verification 繁體.\n"
+                .repeat(1500)
         );
         write_agent_instructions_with_continuity(&cfg, &agent, None, Some(&huge_continuity));
 
@@ -10212,7 +10188,10 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert!(sys_prompt.contains("- **Role Label**: `Growth Mind`"));
         assert!(sys_prompt.contains("Public Layer 1 charter for Hermes."));
         assert!(sys_prompt.contains("Private Layer 2 execution SOP for Hermes."));
-        assert!(sys_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(!sys_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(!sys_prompt.contains(&shared_constitution));
+        assert!(sys_prompt.starts_with(&base_prompt));
+        assert!(sys_prompt.len() < base_prompt.len() + huge_continuity.len());
         assert!(sys_prompt.contains("## 4. Cross-Harness Session Continuity"));
         assert!(
             sys_prompt.len() < 24_000,
@@ -10224,24 +10203,25 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "stale\n"
         );
 
-        let gemini_md = cfg.join(".gemini/config/GEMINI.md");
-        let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
-        let gemini_rules_agents = cfg.join(".gemini/config/rules/AGENTS.md");
         assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
-        assert_eq!(std::fs::read_to_string(&gemini_agents).unwrap(), sys_prompt);
+        assert!(!gemini_agents.exists());
+        assert!(!gemini_rules_agents.exists());
+        // exists() alone also accepts dangling symlinks; neither alias may remain.
+        assert!(std::fs::symlink_metadata(&gemini_agents).is_err());
+        assert!(std::fs::symlink_metadata(&gemini_rules_agents).is_err());
         assert_eq!(
-            std::fs::read_to_string(&gemini_rules_agents).unwrap(),
-            sys_prompt
+            std::fs::read_to_string(&other_rule).unwrap(),
+            "Keep this caller-owned rule.\n"
         );
         #[cfg(unix)]
         {
-            let canon_base = std::fs::canonicalize(&gemini_md).unwrap();
-            assert_eq!(std::fs::canonicalize(&gemini_agents).unwrap(), canon_base);
-            assert_eq!(
-                std::fs::canonicalize(&gemini_rules_agents).unwrap(),
-                canon_base
-            );
+            std::os::unix::fs::symlink("missing.md", &gemini_agents).unwrap();
+            std::os::unix::fs::symlink("missing.md", &gemini_rules_agents).unwrap();
         }
+        write_agent_instructions_with_continuity(&cfg, &agent, None, Some(&huge_continuity));
+        assert!(std::fs::symlink_metadata(&gemini_agents).is_err());
+        assert!(std::fs::symlink_metadata(&gemini_rules_agents).is_err());
+        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
     }
 }
 
