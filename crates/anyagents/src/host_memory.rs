@@ -216,6 +216,29 @@ mod tests {
         host_migration::{MigrationKind, MigrationStatus},
         learned_memory::sha256,
     };
+    // Lock-lifetime fixtures must create their files after exec. Otherwise an
+    // unrelated test's concurrent fork can retain a flock until its own exec,
+    // making immediate reacquisition legitimately return WouldBlock.
+    // Return true after the parent has verified the single-test child.
+    fn run_lock_fixture_child(test_name: &str) -> bool {
+        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_LOCK_FIXTURE_CHILD";
+        if std::env::var(CHILD).ok().as_deref() == Some(test_name) {
+            return false;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, test_name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "lock fixture {test_name}: stdout={stdout} stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
+    }
+
     #[test]
     fn fixture_owner_pages_are_scoped_without_changing_production_discovery() {
         let dir = crate::test_tempdir();
@@ -306,6 +329,11 @@ mod tests {
 
     #[test]
     fn active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches() {
+        if run_lock_fixture_child(
+            "host_memory::tests::active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches",
+        ) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         use std::{
             io::Write,
@@ -399,31 +427,12 @@ mod tests {
 
     #[test]
     fn discovery_failure_is_deferred_per_stopped_owner_and_retried() {
-        use std::os::unix::fs::PermissionsExt;
-        // A concurrent test can fork while this fixture owns a flock. CLOEXEC
-        // closes its inherited descriptor only at exec, so a nonblocking retry
-        // can legitimately defer after the owning guard has been dropped. Make
-        // this fixture's data/locks only after exec in a single-test process.
-        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_RETRY_FIXTURE_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            let output = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "host_memory::tests::discovery_failure_is_deferred_per_stopped_owner_and_retried",
-                    "--nocapture",
-                    "--test-threads=1",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "retry fixture: stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+        if run_lock_fixture_child(
+            "host_memory::tests::discovery_failure_is_deferred_per_stopped_owner_and_retried",
+        ) {
             return;
         }
+        use std::os::unix::fs::PermissionsExt;
         for block_page in [false, true] {
             let dir = crate::test_tempdir();
             let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -501,6 +510,11 @@ mod tests {
 
     #[test]
     fn busy_global_lock_defers_launch_and_startup_without_moving_sources() {
+        if run_lock_fixture_child(
+            "host_memory::tests::busy_global_lock_defers_launch_and_startup_without_moving_sources",
+        ) {
+            return;
+        }
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
@@ -569,6 +583,11 @@ mod tests {
 
     #[test]
     fn daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw() {
+        if run_lock_fixture_child(
+            "host_memory::tests::daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw",
+        ) {
+            return;
+        }
         let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store

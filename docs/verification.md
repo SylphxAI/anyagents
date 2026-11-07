@@ -312,6 +312,21 @@ certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
 
 ## Host memory under a managed UID
 
+The active-writer, discovery-retry, busy-global-lock and daemon-launch Rust
+fixtures run once in fresh single-test subprocesses before creating their
+disposable lock files.
+Unrelated parallel tests can fork while a fixture holds a flock; closing the
+parent descriptor does not release an inherited open-file-description lock
+until that fork executes. Isolation preserves immediate-reacquisition assertions
+without treating a permitted `WouldBlock` as a product failure. The active-writer
+case exposed the missing isolation in macOS jobs `128496005441` (main run
+`42403446504`) and `128498340368` (PR #129 run `42404211626`). The daemon-launch
+case failed at its second launch in macOS job `128500482068` (PR #122 run
+`42404927262`). These four cover every same-file lock reacquisition in the six
+`host_memory::tests` fixtures; the other two acquire the migration lock only once.
+Child exit status and exactly one passed test are required; no assertion,
+production lock behaviour or retry policy is changed.
+
 The required public Linux CI lane builds the shipping `anyagents` binary and
 runs `scripts/verify-host-memory-seat.py` with native `/usr/bin/setpriv`. The
 entrypoints are `anyagents --data <synthetic-data> agent-run --config
