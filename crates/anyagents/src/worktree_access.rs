@@ -316,6 +316,8 @@ struct Grant {
     private: PathBuf,
     checkout: PathBuf,
     active: bool,
+    #[serde(default)]
+    inspection: bool,
 }
 
 pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
@@ -385,18 +387,24 @@ fn writable_by_untrusted(path: &Path, owners: &[u32]) -> std::io::Result<bool> {
 /// The checkout's .git file is seat-writable. Maintenance may only use this
 /// server-owned record, including after revocation; it must never rediscover a
 /// gitdir through the checkout or the seat-owned marker.
-pub(crate) struct RecordedWorktree(Grant);
+pub(crate) struct RecordedWorktree {
+    grant: Grant,
+    journal: PathBuf,
+}
 
 impl RecordedWorktree {
     pub(crate) fn load(data: &Path, id: &anyagents_core::AgentId, checkout: &Path) -> Option<Self> {
         let bytes = std::fs::read(grant_path(data, id)).ok()?;
         let grant: Grant = serde_json::from_slice(&bytes).ok()?;
-        (grant.checkout == checkout).then_some(Self(grant))
+        (grant.checkout == checkout).then_some(Self {
+            grant,
+            journal: grant_path(data, id),
+        })
     }
 
     pub(crate) fn validate(&self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
-        let g = &self.0;
+        let g = &self.grant;
         if g.private.parent() != Some(g.common.join("worktrees").as_path()) {
             return Err(std::io::Error::other("unrecorded private gitdir layout"));
         }
@@ -446,15 +454,107 @@ impl RecordedWorktree {
         validate_config_files(&g.private, &g.common).map_err(std::io::Error::other)
     }
 
+    /// Archive revokes all metadata access before reaping. Temporarily grant
+    /// only read/traverse, never write or inheritance, while the owner's Git
+    /// inspects its recorded checkout. Serialize ACL changes, not the Git
+    /// process: a slow filter must not block other agents' lifecycle work.
+    pub(crate) fn inspect<T>(
+        &self,
+        read: impl FnOnce() -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let lock = lock_journals(&self.journal)?;
+        self.validate()?;
+        let g = &self.grant;
+        let mut current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
+        if current.common != g.common
+            || current.private != g.private
+            || current.checkout != g.checkout
+            || current.uid != g.uid
+            || current.gid != g.gid
+        {
+            return Err(std::io::Error::other("worktree journal changed"));
+        }
+        if current.active || g.uid == crate::sandbox::server_uid() {
+            drop(lock);
+            return read();
+        }
+        let retained = other_active_grants(&self.journal, g)?;
+        current.inspection = true;
+        write_grant(&self.journal, &current)?;
+        let granted = walk_tree(&g.common, false, &|_| {}, &|file, path| {
+            if !retained_path(&g.common, path, g) {
+                return Ok(());
+            }
+            let permissions = if [
+                g.common.clone(),
+                g.common.join("worktrees"),
+                g.common.join("logs"),
+            ]
+            .contains(&path.to_path_buf())
+            {
+                1
+            } else if file.metadata()?.is_dir() {
+                5
+            } else {
+                4
+            };
+            // An active same-seat sibling may already have rw access here.
+            // Do not replace its stronger grant with the inspection grant.
+            if retained
+                .iter()
+                .any(|other| other.gid == g.gid && retained_path(&g.common, path, other))
+            {
+                return Ok(());
+            }
+            update_metadata_acl(file, g.gid, Some(permissions), false, None)
+        });
+        drop(lock);
+        let result = granted.and_then(|()| read());
+        // Re-read active bindings after Git: another seat may have been
+        // admitted meanwhile. Also revoke partial grants on setup failure.
+        let _lock = lock_journals(&self.journal)?;
+        let mut current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
+        let retained = other_active_grants(&self.journal, g)?;
+        if !current.active {
+            revoke_common(&g.common, g.uid, g.gid, &retained)?;
+        }
+        current.inspection = false;
+        write_grant(&self.journal, &current)?;
+        result
+    }
+
     pub(crate) fn command(&self) -> std::io::Result<std::process::Command> {
         self.validate()?;
-        let mut cmd = std::process::Command::new("git");
-        cmd.env_remove("GIT_CONFIG_COUNT")
-            .env_remove("GIT_CONFIG_PARAMETERS")
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            .env_remove("GIT_INDEX_FILE")
+        let g = &self.grant;
+        let mut cmd = if unsafe { libc::geteuid() } == g.uid && unsafe { libc::getegid() } == g.gid
+        {
+            std::process::Command::new("git")
+        } else {
+            // Attributes (including index attributes) can select any driver in
+            // trusted config. Pinning metadata alone cannot make parent-UID Git
+            // safe: every worktree-reading command runs with the journaled UID.
+            let mut cmd = std::process::Command::new(crate::sandbox::launcher());
+            cmd.args([
+                "--reuid",
+                &g.uid.to_string(),
+                "--regid",
+                &g.gid.to_string(),
+                "--groups",
+                &g.gid.to_string(),
+                "--no-new-privs",
+                "--",
+                "git",
+            ]);
+            cmd
+        };
+        cmd.env_clear()
+            .current_dir("/")
+            .env(
+                "PATH",
+                std::env::var_os("PATH").unwrap_or_else(|| "/usr/bin:/bin".into()),
+            )
+            .env("HOME", "/nonexistent")
+            .env("XDG_CONFIG_HOME", "/nonexistent")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_ATTR_NOSYSTEM", "1")
@@ -470,14 +570,39 @@ impl RecordedWorktree {
                 "core.attributesFile=/dev/null",
             ])
             .arg("--git-dir")
-            .arg(&self.0.private)
+            .arg(&self.grant.private)
             .arg("--work-tree")
-            .arg(&self.0.checkout);
+            .arg(&self.grant.checkout);
         Ok(cmd)
     }
 
+    pub(crate) fn checkout_pointer_matches(&self) -> bool {
+        use std::io::Read;
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = self.grant.checkout.join(".git");
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        else {
+            return false;
+        };
+        if !file.metadata().is_ok_and(|meta| meta.is_file()) {
+            return false;
+        }
+        let mut text = String::new();
+        if file.take(8193).read_to_string(&mut text).is_err() || text.len() > 8192 {
+            return false;
+        }
+        let Some(pointer) = text.trim().strip_prefix("gitdir: ") else {
+            return false;
+        };
+        let pointer = self.grant.checkout.join(pointer);
+        std::fs::canonicalize(pointer).is_ok_and(|path| path == self.grant.private)
+    }
+
     pub(crate) fn private(&self) -> &Path {
-        &self.0.private
+        &self.grant.private
     }
 }
 
@@ -490,14 +615,47 @@ pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Resu
         Err(e) => return Err(refusal(&journal, e)),
     };
     let mut grant: Grant = serde_json::from_slice(&bytes).map_err(|e| refusal(&journal, e))?;
-    if !grant.active {
+    if !grant.active && !grant.inspection {
         return Ok(());
     }
     let retained = other_active_grants(&journal, &grant).map_err(|e| refusal(&journal, e))?;
     revoke_common(&grant.common, grant.uid, grant.gid, &retained)
         .map_err(|e| refusal(&grant.common, e))?;
     grant.active = false;
+    grant.inspection = false;
     write_grant(&journal, &grant).map_err(|e| refusal(&journal, e))
+}
+
+/// Run before either server mode starts consumers. An inspection intent is
+/// durable before its first ACL change, so even SIGKILL leaves enough evidence
+/// to remove temporary read access and read the resulting ACLs back.
+pub(crate) fn recover_inspections(data: &Path) -> Result<(), Error> {
+    let directory = data.join("worktree-grants");
+    match std::fs::read_dir(&directory) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    let _lock = lock_journals(&directory.join("recovery.json"))?;
+    for entry in std::fs::read_dir(&directory)? {
+        let journal = entry?.path();
+        if journal.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let mut grant: Grant =
+            serde_json::from_slice(&std::fs::read(&journal)?).map_err(|e| refusal(&journal, e))?;
+        if !grant.inspection {
+            continue;
+        }
+        if grant.active {
+            return Err(refusal(&journal, "active grant has an open inspection"));
+        }
+        let retained = other_active_grants(&journal, &grant)?;
+        revoke_common(&grant.common, grant.uid, grant.gid, &retained)?;
+        grant.inspection = false;
+        write_grant(&journal, &grant)?;
+    }
+    Ok(())
 }
 
 fn write_grant(journal: &Path, grant: &Grant) -> std::io::Result<()> {
@@ -667,6 +825,7 @@ fn share_known_locked(
         private: private.to_path_buf(),
         checkout: path.to_path_buf(),
         active: true,
+        inspection: false,
     };
     let retained = other_active_grants(journal, &grant).map_err(|e| refusal(journal, e))?;
     write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
@@ -1514,6 +1673,7 @@ mod tests {
                 uid: crate::sandbox::server_uid(),
                 gid: crate::sandbox::server_gid(),
                 active: true,
+                inspection: false,
             },
         )
         .unwrap();

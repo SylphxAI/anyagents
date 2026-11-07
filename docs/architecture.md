@@ -241,9 +241,21 @@ configuration resets legacy wildcard trust and lists only the seat's exact
 checkout and recorded common gitdir, preserving other settings. Cleanup loads
 its gitdir/worktree pair from the server journal, verifies the protected metadata
 ownership and effective ACLs, and passes both paths explicitly: a child-edited
-`.git` pointer is never consulted. It excludes global/system config and attribute
-files and keeps default dubious-ownership checks; unrecorded legacy or arbitrary
-repositories are preserved rather than inspected through their `.git` pointer.
+`.git` pointer never selects metadata. A missing, broken or changed pointer on a
+journaled checkout preserves its entire workdir (including build-named output)
+and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
+runs as the journaled seat UID/GID, with no inherited secret environment or socket
+group, because checkout and index attributes can select drivers from trusted
+configuration. It excludes global/system config and attribute files and keeps
+default dubious-ownership checks; unrecorded legacy or arbitrary repositories
+are preserved rather than inspected through their `.git` pointer. After archive
+revokes access, inspection adds only temporary read/traverse ACL entries to the
+journaled metadata allowlist, never write or default entries, and retains active
+same-seat bindings. Inspection intent is synced before granting; ACL changes are
+serialized without holding the global journal lock during Git. Success and
+failure both revoke and read back temporary access. Both server modes recover
+any open inspection intent before starting consumers; failed recovery refuses
+startup. A completed check never stands in for a fresh deletion eligibility check.
 Deletion additionally requires an empty pinned status and zero commits in HEAD
 or any local branch outside the recorded remote-tracking refs. A seat-owned
 initial-head marker cannot waive that test. Dirty or unpushed checkouts and their

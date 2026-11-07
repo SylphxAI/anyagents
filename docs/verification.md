@@ -156,11 +156,21 @@ records the exact Kyle author and committer. A's common config retains its owner
 inode, content and owner read access. A same-size clean-filter positive control
 executes as B, then a forged `.git` pointer cannot execute that filter during
 journal-pinned server cleanup or A/C seat commands in the foreign checkout.
+A second payload selects a trusted common-config driver through B's checkout
+and staged attributes after archive revocation. Cleanup must execute the driver
+only as B; a B-readable execution receipt records that UID while a root-only
+marker remains absent. An inspection worker is SIGKILLed mid-check without unwinding;
+the durable open intent and read-only ACL are observed before startup recovery
+removes the grant, reads it back and preserves the dirty checkout on a fresh check.
+The temporary grant cannot write parent-owned common config or create objects.
 A non-privileged counterpart requires pinned status to execute successfully,
 checks the marker stays absent and rejects included or writable metadata config.
 A cleanup regression snapshots every checkout and private-registration file and
 requires byte-for-byte retention for an unpushed HEAD and for another unpushed
 local branch beside a published detached HEAD; publishing both permits removal.
+The same snapshot case removes or breaks the journaled checkout's `.git` pointer
+with an unpushed HEAD and a report under `target/`: every checkout and private
+registration byte must survive, without falling back to non-Git deletion.
 Archive immediately revokes B's common-store access while preserving its external
 checkout bytes; reap is idempotent and C remains admitted. A separate post-sharing
 admission failure verifies rollback revocation. ACL readbacks cover every changed

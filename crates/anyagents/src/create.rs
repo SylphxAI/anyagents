@@ -7750,7 +7750,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn privileged_cross_uid_spawn_can_create_commit_and_status() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
         use std::process::Command;
         let caps = std::fs::read_to_string("/proc/self/status").unwrap();
         let effective = caps
@@ -7789,6 +7789,30 @@ mod tests {
             );
             assert!(out.status.success(), "privileged worktree worker failed");
             return;
+        }
+        unsafe { std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv") };
+        if let Ok(data) = std::env::var("ANYAGENTS_INSPECTION_ABORT_DATA") {
+            let id = anyagents_core::AgentId::parse(
+                &std::env::var("ANYAGENTS_INSPECTION_ABORT_ID").unwrap(),
+            )
+            .unwrap();
+            let checkout =
+                PathBuf::from(std::env::var("ANYAGENTS_INSPECTION_ABORT_CHECKOUT").unwrap());
+            let record =
+                crate::worktree_access::RecordedWorktree::load(Path::new(&data), &id, &checkout)
+                    .unwrap();
+            let _: std::io::Result<()> = record.inspect(|| {
+                let status = record.command()?.args(["status", "--porcelain"]).output()?;
+                assert!(
+                    status.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                // No Drop or unwind cleanup may run before restart recovery.
+                unsafe { libc::raise(libc::SIGKILL) };
+                std::process::abort();
+            });
+            panic!("inspection did not reach its abort barrier");
         }
         struct Users(Vec<String>);
         impl Drop for Users {
@@ -8116,7 +8140,7 @@ if rm "$2/logs/HEAD"; then exit 28; fi
             r#"
 set -eu
 umask 022
-git init -b main --separate-git-dir="$2" "$1"
+git -C "$5/.." init -b main --separate-git-dir="$2" "$1"
 mkdir "$1/src"
 printf 'included\n' > "$1/src/keep"
 printf 'src/keep filter=x\n' > "$1/.gitattributes"
@@ -8204,6 +8228,112 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         std::fs::write(target.join(".git"), original_dotgit).unwrap();
         std::fs::write(target.join("src/keep"), "included\n").unwrap();
         std::fs::remove_file(target.join(".gitattributes")).unwrap();
+        // A trusted filter definition is still executable when B selects it
+        // through checkout or index attributes. It may run only with B's rights.
+        let parent_only = dir.path().join("parent-only");
+        std::fs::create_dir(&parent_only).unwrap();
+        std::fs::set_permissions(&parent_only, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent_marker = parent_only.join("filter-ran");
+        std::fs::write(
+            &filter,
+            format!(
+                "#!/bin/sh\nid -u >> '{}'\nprintf hit > '{}' 2>/dev/null || :\ncat\n",
+                filter_marker.display(),
+                parent_marker.display()
+            ),
+        )
+        .unwrap();
+        crate::worktree::tests::git(
+            &f.source,
+            &["config", "filter.trusted.clean", filter.to_str().unwrap()],
+        );
+        crate::worktree::tests::git(&f.source, &["config", "filter.trusted.required", "true"]);
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; printf 'src/keep filter=trusted\n' > "$1/.gitattributes"; printf 'changed!\n' > "$1/src/keep"; git -c safe.directory="$1" -C "$1" add .gitattributes"#,
+            &[&target],
+        );
+        std::fs::remove_file(&filter_marker).ok();
+        crate::worktree_access::revoke_recorded(&data, &agent.id).unwrap();
+        assert!(!crate::server::is_git_worktree_safe_to_reap(
+            &data, &agent.id, &target
+        ));
+        let executions = std::fs::read_to_string(&filter_marker).unwrap();
+        assert!(!executions.is_empty(), "trusted filter was not exercised");
+        assert!(
+            executions.lines().all(|line| line == b_uid.to_string()),
+            "filter ran as another UID: {executions}"
+        );
+        assert!(
+            !parent_marker.exists(),
+            "cleanup filter retained parent rights"
+        );
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; if cat "$1/index"; then exit 31; fi; if mkdir "$2/revoked-check"; then exit 32; fi"#,
+            &[&private, &objects],
+        );
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "create::tests::privileged_cross_uid_spawn_can_create_commit_and_status",
+                "--nocapture",
+            ])
+            .env("ANYAGENTS_INSPECTION_ABORT_DATA", &data)
+            .env("ANYAGENTS_INSPECTION_ABORT_ID", agent.id.as_str())
+            .env("ANYAGENTS_INSPECTION_ABORT_CHECKOUT", &target)
+            .output()
+            .unwrap();
+        assert_eq!(
+            status.status.signal(),
+            Some(libc::SIGKILL),
+            "abort worker: {}{}",
+            String::from_utf8_lossy(&status.stdout),
+            String::from_utf8_lossy(&status.stderr)
+        );
+        let receipt = || -> serde_json::Value {
+            serde_json::from_slice(
+                &std::fs::read(crate::worktree_access::grant_path(&data, &agent.id)).unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(receipt()["active"], false);
+        assert_eq!(receipt()["inspection"], true);
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; test -r "$1/index"; if printf evil >> "$2/../config"; then exit 33; fi; if mkdir "$2/read-only-check"; then exit 34; fi"#,
+            &[&private, &objects],
+        );
+        crate::worktree_access::recover_inspections(&data).unwrap();
+        assert_eq!(receipt()["inspection"], false);
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; if cat "$1/index"; then exit 35; fi; if mkdir "$2/recovery-check"; then exit 36; fi"#,
+            &[&private, &objects],
+        );
+        assert!(!crate::server::is_git_worktree_safe_to_reap(
+            &data, &agent.id, &target
+        ));
+        assert!(
+            target.join("src/child").is_file(),
+            "recovery lost the dirty checkout"
+        );
+        assert_eq!(receipt()["inspection"], false);
+        assert!(!parent_marker.exists());
+        crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; git -c safe.directory="$1" -C "$1" reset HEAD -- .gitattributes; rm "$1/.gitattributes"; printf 'included\n' > "$1/src/keep""#,
+            &[&target],
+        );
+        // Keep both the trusted config and driver unchanged through the checks;
+        // remove them only after the owner-UID and interrupted-check proofs.
+        crate::worktree::tests::git(&f.source, &["config", "--remove-section", "filter.trusted"]);
         // Concurrent agents commonly share one OS seat. B2 admission and B1
         // archive must not revoke either live workspace's effective bindings.
         let b2_target = dir.path().join("checkout-b2");
@@ -8287,7 +8417,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             &[&objects],
         );
         eprintln!(
-            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, and planted-filter cleanup/foreign-seat denial passed"
+            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, planted-filter cleanup/foreign-seat denial, trusted-config filter owner-UID execution, and SIGKILL inspection-grant recovery passed"
         );
     }
 

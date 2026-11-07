@@ -31,7 +31,7 @@ use anyagents_core::boundary::{self, Boundary};
 const SETPRIV: &str = "/usr/local/bin/anyagents-setpriv";
 
 /// The launcher this deployment starts agents with.
-fn launcher() -> PathBuf {
+pub(crate) fn launcher() -> PathBuf {
     for name in ["ANYAGENTS_LAUNCHER", "ANYAGENTS_SETPRIV"] {
         if let Some(path) = std::env::var_os(name)
             && !path.is_empty()

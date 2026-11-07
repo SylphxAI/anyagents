@@ -110,6 +110,7 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
 
 async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
+    crate::worktree_access::recover_inspections(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
@@ -1393,6 +1394,7 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
 
 pub fn run_admin(data: &Path) -> Result<(), Error> {
     let _admin_lock = acquire_admin_lock(data)?;
+    crate::worktree_access::recover_inspections(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let res = runtime.block_on(async move {
@@ -3882,7 +3884,22 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     // that a parent or operator created and lent to a child agent. Only reap the agent's own
     // ephemeral `agent_root/work` directory when not shared with another agent.
     if !shared_workdirs.contains(&work_dir) {
-        if work_dir.join(".git").exists() {
+        let journaled = crate::worktree_access::grant_path(data_dir, agent_id)
+            .symlink_metadata()
+            .is_ok();
+        if journaled
+            && crate::worktree_access::RecordedWorktree::load(data_dir, agent_id, &work_dir)
+                .is_none_or(|record| !record.checkout_pointer_matches())
+        {
+            eprintln!(
+                "agent {agent_id}: preserving entire journaled checkout {}: missing or changed .git pointer",
+                work_dir.display()
+            );
+            return complete;
+        }
+        if work_dir.join(".git").exists() || journaled {
+            // A missing/broken child-owned pointer cannot turn a journaled
+            // checkout into a disposable non-Git directory.
             if is_git_worktree_safe_to_reap(data_dir, agent_id, &work_dir) {
                 complete &= reap_git_worktree_cleanly(data_dir, agent_id, &work_dir, seat_ids);
                 let _ = std::fs::remove_file(&marker_path);
@@ -3961,29 +3978,36 @@ pub(crate) fn is_git_worktree_safe_to_reap(
         // Preserve them instead of letting Git follow a child-owned .git file.
         return false;
     };
-    let output = |args: &[&str]| record.command()?.args(args).output();
-    let Ok(status_out) = output(&["status", "--porcelain", "--untracked-files=normal"]) else {
-        return false;
-    };
-    if !status_out.status.success() || !status_out.stdout.is_empty() {
+    if !record.checkout_pointer_matches() {
+        eprintln!(
+            "agent {id}: preserving journaled checkout {}: missing or changed .git pointer",
+            wt_path.display()
+        );
         return false;
     }
-    // No seat-owned initial-head marker can waive the pushed-history check.
-    // Require HEAD and every local branch history to be covered by at least
-    // one recorded remote-tracking ref, including detached HEAD and branches
-    // not currently checked out. Shared refs remain the documented same-repo
-    // integrity boundary; this is not protection from forged remote refs.
-    let Ok(unpushed) = output(&[
-        "rev-list",
-        "HEAD",
-        "--branches",
-        "--not",
-        "--remotes",
-        "--count",
-    ]) else {
-        return false;
-    };
-    unpushed.status.success() && unpushed.stdout == b"0\n"
+    record
+        .inspect(|| {
+            let output = |args: &[&str]| record.command()?.args(args).output();
+            let status_out = output(&["status", "--porcelain", "--untracked-files=normal"])?;
+            if !status_out.status.success() || !status_out.stdout.is_empty() {
+                return Ok(false);
+            }
+            // No seat-owned initial-head marker can waive the pushed-history check.
+            // Require HEAD and every local branch history to be covered by at least
+            // one recorded remote-tracking ref, including detached HEAD and branches
+            // not currently checked out. Shared refs remain the documented same-repo
+            // integrity boundary; this is not protection from forged remote refs.
+            let unpushed = output(&[
+                "rev-list",
+                "HEAD",
+                "--branches",
+                "--not",
+                "--remotes",
+                "--count",
+            ])?;
+            Ok(unpushed.status.success() && unpushed.stdout == b"0\n")
+        })
+        .unwrap_or(false)
 }
 
 fn reap_git_worktree_cleanly(
@@ -7041,6 +7065,22 @@ pub(crate) mod tests {
         assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
         assert_eq!(snapshot(&work), before_work);
         assert_eq!(snapshot(recorded.private()), before_private);
+        let dotgit = std::fs::read(work.join(".git")).unwrap();
+        for pointer in [None, Some(b"gitdir: /nonexistent/broken\n".as_slice())] {
+            match pointer {
+                None => std::fs::remove_file(work.join(".git")).unwrap(),
+                Some(bytes) => std::fs::write(work.join(".git"), bytes).unwrap(),
+            }
+            std::fs::create_dir_all(work.join("target")).unwrap();
+            std::fs::write(work.join("target/uncertain-report"), b"retain every byte\n").unwrap();
+            let missing_work = snapshot(&work);
+            assert!(!is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
+            assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+            assert_eq!(snapshot(&work), missing_work, "lost pointer deleted source");
+            assert_eq!(snapshot(recorded.private()), before_private);
+            std::fs::remove_dir_all(work.join("target")).unwrap();
+            std::fs::write(work.join(".git"), &dotgit).unwrap();
+        }
         git(&work, &["push", "origin", "HEAD:refs/heads/worker"]);
         assert!(is_git_worktree_safe_to_reap(dir.path(), &child.id, &work));
         let pushed_head = git(&work, &["rev-parse", "HEAD"]);
