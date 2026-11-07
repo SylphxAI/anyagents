@@ -19,9 +19,11 @@ pub const WINDOW_STRIDE_ITEMS: usize = 1_000;
 
 type RemoteModelLimitsMap = HashMap<String, (usize, usize, Option<usize>)>;
 
-fn remote_models_cache() -> &'static Mutex<Option<(Instant, RemoteModelLimitsMap)>> {
-    static CACHE: OnceLock<Mutex<Option<(Instant, RemoteModelLimitsMap)>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
+type RemoteModelsCache = HashMap<(std::path::PathBuf, String), (Instant, RemoteModelLimitsMap)>;
+
+fn remote_models_cache() -> &'static Mutex<RemoteModelsCache> {
+    static CACHE: OnceLock<Mutex<RemoteModelsCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn parse_models_catalog_json(val: &Value, map: &mut RemoteModelLimitsMap) {
@@ -153,10 +155,29 @@ pub(super) fn resolve_model_context_limits(
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
     let lookup_keys = canonicalize_model_lookup_key(raw_model);
+    let env_gateway = env
+        .iter()
+        .find(|(k, _)| k == "SYLPHX_GATEWAY_URL")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("SYLPHX_GATEWAY_URL").ok());
+    let gw_url = env_gateway
+        .as_deref()
+        .or_else(|| {
+            agent_json
+                .as_ref()
+                .and_then(|v| v.get("gateway_base_url"))
+                .and_then(Value::as_str)
+        })
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(super::auth::DEFAULT_SYLPHX_GATEWAY_URL);
+    // Catalogs from another gateway or agent/profile are not authoritative for
+    // this dispatch, even when model IDs happen to match.
+    let cache_scope = (config_dir.to_path_buf(), gw_url.to_string());
 
     // 1. Check process-wide remote `/v1/models` cache (TTL 10 minutes).
     if let Ok(guard) = remote_models_cache().lock()
-        && let Some((fetched_at, ref map)) = *guard
+        && let Some((fetched_at, map)) = guard.get(&cache_scope)
         && fetched_at.elapsed() < Duration::from_secs(600)
     {
         for k in &lookup_keys {
@@ -175,47 +196,44 @@ pub(super) fn resolve_model_context_limits(
     let mut map = remote_models_cache()
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().map(|(_, map)| map.clone()))
+        .and_then(|g| g.get(&cache_scope).map(|(_, map)| map.clone()))
         .unwrap_or_default();
     for local_file in [".sylphx-remote-models.json", "model-catalog-direct.json"] {
         if let Ok(raw) = std::fs::read_to_string(config_dir.join(local_file))
             && let Ok(val) = serde_json::from_str::<Value>(&raw)
         {
-            parse_models_catalog_json(&val, &mut map);
+            if local_file == ".sylphx-remote-models.json" {
+                // A persisted response from another gateway (or an old cache
+                // with no provenance) is not evidence for this endpoint.
+                if val.get("gateway_base_url").and_then(Value::as_str) == Some(gw_url)
+                    && let Some(catalog) = val.get("catalog")
+                {
+                    parse_models_catalog_json(catalog, &mut map);
+                }
+            } else {
+                parse_models_catalog_json(&val, &mut map);
+            }
         }
     }
     if !super::sandbox::is_isolated_test_env()
         && let Some(api_key) = super::auth::resolve_sylphx_gateway_key(config_dir, env)
     {
-        let env_gateway = env
-            .iter()
-            .find(|(k, _)| k == "SYLPHX_GATEWAY_URL")
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var("SYLPHX_GATEWAY_URL").ok());
-        let gw_url = env_gateway
-            .as_deref()
-            .or_else(|| {
-                agent_json
-                    .as_ref()
-                    .and_then(|v| v.get("gateway_base_url"))
-                    .and_then(Value::as_str)
-            })
-            .map(|s| s.trim().trim_end_matches('/'))
-            .filter(|s| !s.is_empty())
-            .unwrap_or(super::auth::DEFAULT_SYLPHX_GATEWAY_URL);
         let models_url = format!("{gw_url}/models");
         if let Ok((status, raw)) = super::curl_get(&models_url, Some(&api_key))
             && (200..300).contains(&status)
             && let Ok(val) = serde_json::from_str::<Value>(&raw)
         {
             parse_models_catalog_json(&val, &mut map);
-            let _ = std::fs::write(config_dir.join(".sylphx-remote-models.json"), &raw);
+            let cache = json!({"gateway_base_url": gw_url, "catalog": val});
+            if let Ok(serialized) = serde_json::to_vec(&cache) {
+                let _ = std::fs::write(config_dir.join(".sylphx-remote-models.json"), serialized);
+            }
         }
     }
     if !map.is_empty()
         && let Ok(mut guard) = remote_models_cache().lock()
     {
-        *guard = Some((Instant::now(), map.clone()));
+        guard.insert(cache_scope, (Instant::now(), map.clone()));
     }
     for k in &lookup_keys {
         if let Some(&(cw, eff_pct, max_output_tokens)) = map.get(k) {
@@ -536,6 +554,9 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             // call's result is appended. Carry pairing through those later
             // results, without applying keep_only to future unrelated messages.
             pruned_open_calls.extend(apply_context_edit_to_history(&mut history, &m));
+            continue;
+        }
+        if m.get("type").and_then(Value::as_str) == Some("native_turn_state") {
             continue;
         }
         if m.get("type").is_some() {
