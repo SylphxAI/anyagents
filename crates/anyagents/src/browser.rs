@@ -252,9 +252,70 @@ pub fn profile_dir(data: &Path, profile: &str) -> PathBuf {
     profiles_root(data).join(profile)
 }
 
-fn detect_chromium_version() -> (String, String) {
+// Disposable experiment instrumentation, gated off unless explicitly selected.
+fn startup_trace(event: &str, detail: serde_json::Value) {
+    let Some(path) = std::env::var_os("ANYAGENTS_STARTUP_TRACE_FILE") else {
+        return;
+    };
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let started = START.get_or_init(std::time::Instant::now);
+    let thread = std::thread::current();
+    let row = serde_json::json!({
+        "event": event, "utc_ms": now_ms(), "monotonic_us": started.elapsed().as_micros(),
+        "process_pid": std::process::id(), "thread": thread.name(),
+        "thread_id": format!("{:?}", thread.id()),
+        "available_parallelism": std::thread::available_parallelism().map(|n| n.get()).ok(),
+        "detail": detail,
+    });
+    if let Ok(_guard) = LOCK.lock()
+        && let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        && let Ok(mut bytes) = serde_json::to_vec(&row)
+    {
+        bytes.push(b'\n');
+        let _ = file.write_all(&bytes);
+    }
+}
+
+fn startup_snapshot(pid: u32) -> serde_json::Value {
+    let read = |path: String| std::fs::read_to_string(path).ok();
+    let proc = |pid: u32| {
+        serde_json::json!({
+            "pid": pid,
+            "status": read(format!("/proc/{pid}/status")),
+            "stat": read(format!("/proc/{pid}/stat")),
+            "wchan": read(format!("/proc/{pid}/wchan")),
+            "schedstat": read(format!("/proc/{pid}/schedstat")),
+            "cgroup": read(format!("/proc/{pid}/cgroup")),
+        })
+    };
+    serde_json::json!({"child": proc(pid), "parent": proc(std::process::id()),
+        "loadavg": read("/proc/loadavg".into()),
+        "cpu_pressure": read("/proc/pressure/cpu".into()),
+        "memory_pressure": read("/proc/pressure/memory".into()),
+        "io_pressure": read("/proc/pressure/io".into()),
+        "cpu_max": read("/sys/fs/cgroup/cpu.max".into()),
+        "cpu_stat": read("/sys/fs/cgroup/cpu.stat".into()),
+        "memory_events": read("/sys/fs/cgroup/memory.events".into()),
+        "pids_current": read("/sys/fs/cgroup/pids.current".into()),
+    })
+}
+
+fn detect_chromium_version(data: &Path, profile: &str) -> (String, String) {
     let bin = chromium_binary();
-    if let Ok(out) = Command::new(&bin).arg("--version").output() {
+    startup_trace(
+        "profile_version_start",
+        serde_json::json!({"data": data, "profile": profile, "binary": bin}),
+    );
+    let output = Command::new(&bin).arg("--version").output();
+    startup_trace(
+        "profile_version_end",
+        serde_json::json!({"data": data, "profile": profile, "ok": output.is_ok(), "exit": output.as_ref().ok().and_then(|o| o.status.code())}),
+    );
+    if let Ok(out) = output {
         let text = String::from_utf8_lossy(&out.stdout);
         for token in text.split_whitespace() {
             if token.chars().next().is_some_and(|c| c.is_ascii_digit()) && token.contains('.') {
@@ -281,15 +342,11 @@ fn chromium_binary() -> String {
                 "/usr/bin/chromium",
                 "/usr/bin/chromium-browser",
             ] {
-                if Path::new(candidate).is_file()
-                    && Command::new(candidate)
-                        .arg("--version")
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success())
-                {
-                    return candidate.to_string();
+                if Path::new(candidate).is_file() {
+                    startup_trace("discovery_version_start", serde_json::json!({"binary": candidate}));
+                    let result = Command::new(candidate).arg("--version").stdout(Stdio::null()).stderr(Stdio::null()).status();
+                    startup_trace("discovery_version_end", serde_json::json!({"binary": candidate, "ok": result.as_ref().is_ok_and(|s| s.success())}));
+                    if result.is_ok_and(|s| s.success()) { return candidate.to_string(); }
                 }
             }
             "chromium".to_string()
@@ -308,7 +365,7 @@ pub fn ensure_fingerprint(data: &Path, profile: &str) -> Result<BrowserFingerpri
     }
     let seed = deterministic_profile_seed(profile);
 
-    let (major, full) = detect_chromium_version();
+    let (major, full) = detect_chromium_version(data, profile);
     let gpu_pool = [
         (
             "Google Inc. (Intel)",
@@ -519,6 +576,12 @@ fn ensure_browser_running(
     profile: &str,
     headless_override: Option<bool>,
 ) -> Result<(BrowserRuntimeState, BrowserFingerprint), Error> {
+    startup_trace(
+        "ensure_start",
+        serde_json::json!({"data": data, "profile": profile,
+            "environment": (["HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS", "DBUS_SYSTEM_BUS_ADDRESS", "DISPLAY", "ANYAGENTS_CHROMIUM_BIN", "RUST_TEST_THREADS", "TMPDIR"].into_iter().map(|k| (k, std::env::var(k).ok())).collect::<std::collections::BTreeMap<_, _>>())
+        }),
+    );
     let fp = ensure_fingerprint(data, profile)?;
     if let Some(mut running) = load_runtime(data, profile) {
         touch_runtime(data, &mut running);
@@ -605,10 +668,18 @@ fn ensure_browser_running(
         }
     }
 
+    startup_trace(
+        "spawn_start",
+        serde_json::json!({"data": data, "profile": profile, "port": port, "binary": bin, "display_mode": display_mode, "log": dir.join("browser.log")}),
+    );
     let mut child = cmd
         .spawn()
         .map_err(|err| Error::Message(format!("failed to launch chromium: {err}")))?;
     let pid = child.id();
+    startup_trace(
+        "spawn_end",
+        serde_json::json!({"data": data, "profile": profile, "port": port, "child_pid": pid, "log": dir.join("browser.log")}),
+    );
 
     wait_for_chromium_cdp(
         &mut child,
@@ -692,6 +763,8 @@ fn wait_for_chromium_cdp(
 ) -> Result<(), Error> {
     let started = std::time::Instant::now();
     let deadline = started + timeout;
+    let tracing = std::env::var_os("ANYAGENTS_STARTUP_TRACE_FILE").is_some();
+    let mut first_tcp = false;
     let mut last_probe = "not attempted".to_string();
     let reason = loop {
         match child.try_wait() {
@@ -706,8 +779,28 @@ fn wait_for_chromium_cdp(
                 timeout.as_millis()
             );
         }
+        if tracing
+            && !first_tcp
+            && TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(1),
+            )
+            .is_ok()
+        {
+            first_tcp = true;
+            startup_trace(
+                "first_tcp",
+                serde_json::json!({"port": port, "child_pid": child.id(), "log": log_path, "elapsed_us": started.elapsed().as_micros()}),
+            );
+        }
         match chromium_cdp_ready(port, remaining.min(Duration::from_millis(250))) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                startup_trace(
+                    "cdp_ready",
+                    serde_json::json!({"port": port, "child_pid": child.id(), "log": log_path, "elapsed_us": started.elapsed().as_micros(), "first_tcp_observed": first_tcp}),
+                );
+                return Ok(());
+            }
             Err(err) => last_probe = err,
         }
         std::thread::sleep(
@@ -718,13 +811,25 @@ fn wait_for_chromium_cdp(
     };
     // Read the exit before cleanup so our termination signal cannot be mistaken
     // for the cause of a startup failure. Reap the launched child after cleanup.
+    startup_trace(
+        "startup_refusal",
+        serde_json::json!({"port": port, "child_pid": child.id(), "log": log_path, "elapsed_us": started.elapsed().as_micros(), "reason": reason, "last_probe": last_probe, "snapshot": if tracing { startup_snapshot(child.id()) } else { serde_json::Value::Null }}),
+    );
     let before_cleanup = format!("{:?}", child.try_wait());
+    startup_trace(
+        "cleanup_start",
+        serde_json::json!({"port": port, "child_pid": child.id(), "log": log_path, "before_cleanup": before_cleanup}),
+    );
     stop_process_group(child.id());
     // `process_alive` is /proc-based; on hosts without /proc the group helper
     // may return before a TERM-ignoring launcher exits. Never wait for that
     // child indefinitely on the startup failure path.
     let _ = child.kill();
     let after_cleanup = format!("{:?}", child.wait());
+    startup_trace(
+        "cleanup_end",
+        serde_json::json!({"port": port, "child_pid": child.id(), "log": log_path, "after_cleanup": after_cleanup, "elapsed_us": started.elapsed().as_micros()}),
+    );
     Err(Error::Message(format!(
         "{reason}; port={port}; elapsed={}ms; before_cleanup={before_cleanup}; \
          after_cleanup={after_cleanup}; last_probe={last_probe}; browser.log tail:\n{}",
