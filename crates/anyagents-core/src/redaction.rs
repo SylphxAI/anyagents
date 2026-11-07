@@ -425,11 +425,11 @@ impl Store {
             .ok_or_else(|| invalid("redaction target not found"))?
         };
         let key = serde_json::to_string(&request.span).map_err(|_| invalid("invalid span"))?;
-        if let Some(raw) = tx.query_row(
+        let replay = tx.query_row(
             "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND request_key = ?3",
-            params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()? {
-            return serde_json::from_str(&raw).map_err(|_| invalid("unreadable redaction receipt"));
-        }
+            params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()?
+            .map(|raw| serde_json::from_str::<Receipt>(&raw).map_err(|_| invalid("unreadable redaction receipt")))
+            .transpose()?;
         let state: String = tx.query_row(
             "SELECT state FROM agents WHERE id = ?1",
             [target.as_str()],
@@ -484,6 +484,25 @@ impl Store {
             tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT text FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2 LIMIT 1",
                 params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?.ok_or_else(|| invalid("redaction target not found"))?
         };
+        if let Some(receipt) = replay {
+            // A historical receipt is not evidence about today's body. Verify
+            // the replacement at the original selector before returning it;
+            // refuse drift rather than falsely repeat full_scrub=true. No old
+            // content or digest is retained to perform this verification.
+            let still_redacted = if request.span.is_none() {
+                original == TOMBSTONE
+            } else {
+                let start = match receipt.span.unit {
+                    SpanUnit::Bytes => Some(receipt.span.start),
+                    SpanUnit::Chars => original.char_indices().nth(receipt.span.start).map(|(i, _)| i),
+                };
+                start.and_then(|i| i.checked_add(TOMBSTONE.len()).and_then(|end| original.get(i..end))) == Some(TOMBSTONE)
+            };
+            if !still_redacted {
+                return Err(invalid("redaction target changed; existing receipt does not verify the current body"));
+            }
+            return Ok(receipt);
+        }
         let (span, start, end) = bounds(&original, request.span.as_ref())?;
         if original[start..end] == *TOMBSTONE
             && let Some(raw) = tx.query_row(

@@ -62,7 +62,10 @@ checkpointed/truncated. The audit records actor, time, permission, reason, targe
 span, removed byte/character counts and copy outcomes—**never original text or a
 hash of it**. Replay of the original target/span, including equivalent mailbox
 id/seq selectors, returns the existing audit id and receipt without a second edit.
-Coordinates are otherwise relative to the body's current version.
+A replay verifies the current canonical tombstone before returning that receipt;
+if it has drifted, the operation refuses instead of presenting a stale receipt as
+proof of erasure. Replays still require a quiescent target. Coordinates are
+otherwise relative to the body's current version.
 
 An inbound redaction also binds its recipient and provider `(chat_id, message_id)`
 when present. Later deliveries or edits with those coordinates return the existing
