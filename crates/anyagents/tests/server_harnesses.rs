@@ -26,7 +26,7 @@ struct Server {
 
 impl Server {
     fn start(dir: &Path, harness_bin: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             .env("ANYAGENTS_HARNESS_BIN", harness_bin)
             .arg("--data")
             .arg(dir)

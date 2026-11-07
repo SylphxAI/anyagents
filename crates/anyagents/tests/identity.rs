@@ -948,7 +948,7 @@ fn contended_migration_publishes_wait_without_pin_or_dispatch_then_retries() {
     let _env = support::lock();
     let dir = support::physical_tempdir();
     let data = dir.path();
-    support::operator_with_configured_seat(data);
+    support::operator(data);
     let store = Store::open(data.join("state.db")).unwrap();
     let parent = store
         .create_agent(NewAgent::new("waiting-parent", "claude-code"))
@@ -990,7 +990,7 @@ exec /bin/cat
         .open(migration.join("migration.lock"))
         .unwrap();
     held.lock().unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let child = support::contract_server()
         .env("PATH", support::machine_path(data))
         .env("ANYAGENTS_HARNESS_BIN", &adapter)
         .env("ANYAGENTS_FAKE_MODE", "1")
@@ -1056,8 +1056,9 @@ exec /bin/cat
     while !config.join("dispatch").exists() {
         assert!(
             Instant::now() < deadline,
-            "retry did not dispatch: {}",
-            fs::read_to_string(data.join("server.stderr")).unwrap()
+            "retry did not dispatch: stderr={}; agents={}",
+            fs::read_to_string(data.join("server.stderr")).unwrap(),
+            support::call(&server.socket, "GET", "/v1/agents", "").1
         );
         std::thread::sleep(Duration::from_millis(20));
     }

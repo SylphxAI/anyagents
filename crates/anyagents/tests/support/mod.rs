@@ -158,6 +158,31 @@ pub fn fake_launcher(data: &Path) -> std::path::PathBuf {
     launcher
 }
 
+/// A server for protocol/contract fixtures, not a claim of OS isolation.
+/// Preserve the selected harness double while removing inherited agent authority
+/// and managed-seat declarations. Real cross-UID admission has a required,
+/// separately privileged acceptance fixture.
+pub fn contract_server() -> std::process::Command {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    for name in [
+        "ANYAGENTS_AGENT_ID",
+        "ANYAGENTS_AGENT_CONFIG",
+        "ANYAGENTS_DATA",
+        "ANYAGENTS_PARENT_NAME",
+        "ANYAGENTS_AGENT_UID",
+        "ANYAGENTS_AGENT_GID",
+        "ANYAGENTS_SOCKET_GID",
+        "ANYAGENTS_AGENTS",
+        "ANYAGENTS_LAUNCHER",
+        "ANYAGENTS_SEAT_LAUNCH",
+        "ANYAGENTS_SEAT_PEERS",
+    ] {
+        command.env_remove(name);
+    }
+    command.env("ANYAGENTS_TESTS", "contract-double");
+    command
+}
+
 /// Take the operator's environment back out of this process.
 pub fn clear() {
     // SAFETY: under `lock()`, as `operator` is.

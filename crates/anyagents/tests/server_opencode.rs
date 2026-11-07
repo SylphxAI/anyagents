@@ -58,7 +58,7 @@ struct Server {
 
 impl Server {
     fn start(dir: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             // The scripted CLI, which speaks `serve` and `api` as the real one does.
             .env("ANYAGENTS_OPENCODE_BIN", scripted_opencode())
             .env("ANYAGENTS_FAKE_LOG", dir.join("fake.log"))
