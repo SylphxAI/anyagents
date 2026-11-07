@@ -53,6 +53,7 @@ struct Page {
     etag: Option<String>,
     last_modified: Option<String>,
     next: bool,
+    total_count: Option<u64>,
     summary: Summary,
     used_at: i64,
 }
@@ -414,6 +415,7 @@ fn read_checks(
     request: &mut impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
 ) -> Result<Checks, Error> {
     let mut checks = Checks::default();
+    let mut total_count = 0;
     for n in 1..=MAX_PAGES {
         let path = format!("{endpoint}?per_page=100&page={n}");
         let page = read_page(target, &path, now, request)?;
@@ -421,8 +423,16 @@ fn read_checks(
             return Err(Error::Payload);
         };
         checks.add(&summary);
-        if !page.next {
+        // A cold 304 can restore a body without the original Link header.
+        // Retain the largest declared population across all pages, including
+        // warm cached ones, so a later smaller/missing total cannot truncate it.
+        total_count = total_count.max(page.total_count.unwrap_or(0));
+        let next = page.next || (checks.count as u64) < total_count;
+        if !next {
             return Ok(checks);
+        }
+        if summary.count == 0 {
+            return Err(Error::Payload); // No progress toward a known next page.
         }
     }
     Err(Error::Payload) // Never report completion from a truncated population.
@@ -496,6 +506,11 @@ fn read_page(
         return Err(Error::Http(response.status));
     }
     let json: Value = serde_json::from_str(&response.body).map_err(|_| Error::Payload)?;
+    let mut total_count = None;
+    let mut next = response
+        .headers
+        .get("link")
+        .is_some_and(|v| v.split(',').any(|link| link.contains("rel=\"next\"")));
     let summary = if path.contains("/pulls/") {
         let state = json
             .get("state")
@@ -521,6 +536,13 @@ fn read_page(
             .or_else(|| json.get("statuses"))
             .and_then(Value::as_array)
             .ok_or(Error::Payload)?;
+        total_count = json
+            .get("total_count")
+            .map(|value| value.as_u64().ok_or(Error::Payload))
+            .transpose()?;
+        // Legacy status envelopes need not declare a total. A full page can
+        // never prove exhaustion when an adapter omitted pagination headers.
+        next |= json.get("statuses").is_some() && runs.len() == 100;
         let mut checks = Checks {
             count: runs.len(),
             ..Checks::default()
@@ -548,10 +570,8 @@ fn read_page(
     let page = Page {
         etag: response.headers.get("etag").cloned(),
         last_modified: response.headers.get("last-modified").cloned(),
-        next: response
-            .headers
-            .get("link")
-            .is_some_and(|v| v.split(',').any(|link| link.contains("rel=\"next\""))),
+        next,
+        total_count,
         summary,
         used_at: now,
     };
@@ -866,6 +886,215 @@ mod tests {
         json!({"state": state, "merged": merged, "merged_at": null, "head": {"sha": sha}})
     }
 
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const COLD_PAGE1: &str = include_str!("fixtures/cold-304-check-runs-page1.http");
+
+    fn pending_page2() -> Response {
+        response(
+            200,
+            json!({"total_count":101,"check_runs":[{"id":101,"name":"ci-last","status":"in_progress","conclusion":null}]}),
+            &[("etag", "\"page2-v1\"")],
+        )
+    }
+
+    // Acceptance assertion, deliberately not should_panic: an unsafe terminal is a failure.
+    #[test]
+    fn cold_304_missing_link_must_not_complete_partial_population() {
+        let mut probes = Probes::default();
+        let mut seen = vec![];
+        let result = probes.probe("cold", "o", "r", SHA, false, 0, |path, etag, _| {
+            seen.push(path.to_string());
+            assert_eq!(etag, None);
+            if path.ends_with("page=1") {
+                parse_response(COLD_PAGE1.as_bytes())
+            } else {
+                assert!(path.ends_with("page=2"));
+                Ok(pending_page2())
+            }
+        });
+        eprintln!(
+            "cold result={result:?}; requested={seen:?}; settled={}",
+            probes.targets["cold"].settled
+        );
+        // The full known population contains pending page 2; failing closed is also safe.
+        assert!(
+            !result.0,
+            "completed page 1 is not the whole population of 101 checks"
+        );
+    }
+
+    #[test]
+    fn missing_links_use_cumulative_totals_on_cold_and_warm_pages() {
+        for cold_status in [200, 304] {
+            let mut probes = Probes::default();
+            for now in [0, 60_000] {
+                let mut seen = vec![];
+                let result = probes.probe("pages", "o", "r", "sha", false, now, |path, etag, _| {
+                    let n: usize = path.rsplit_once("page=").unwrap().1.parse().unwrap();
+                    assert!((1..=3).contains(&n), "all 201 checks were already observed");
+                    seen.push(n);
+                    if now != 0 {
+                        assert_eq!(etag, Some("page"));
+                        return Ok(response_body(304, "", &[]));
+                    }
+                    assert_eq!(etag, None);
+                    let count = if n == 3 { 1 } else { 100 };
+                    Ok(response(
+                        cold_status,
+                        json!({"total_count":201,"check_runs":vec![json!({"status":"completed"});count]}),
+                        &[("etag", "page")],
+                    ))
+                });
+                assert_eq!(result, (true, "checks_completed".to_string()));
+                assert_eq!(seen, [1, 2, 3]);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_total_fails_closed_and_can_recover_after_an_empty_page() {
+        for later_total in [None, Some(0), Some(101)] {
+            let mut probes = Probes::default();
+            for now in [0, 60_000] {
+                let mut calls = 0;
+                let result = probes.probe("partial", "o", "r", SHA, false, now, |path, etag, _| {
+                    calls += 1;
+                    if path.ends_with("page=1") {
+                        if now == 0 {
+                            assert_eq!(etag, None);
+                            return parse_response(COLD_PAGE1.as_bytes());
+                        }
+                        assert_eq!(etag, Some("\"page1-v1\""));
+                        return Ok(response_body(304, "", &[]));
+                    }
+                    assert!(path.ends_with("page=2"));
+                    if now == 0 {
+                        let mut body = json!({"check_runs":[]});
+                        if let Some(total) = later_total {
+                            body["total_count"] = json!(total);
+                        }
+                        Ok(response(200, body, &[]))
+                    } else {
+                        Ok(response(
+                            200,
+                            json!({"total_count":101,"check_runs":[{"status":"completed"}]}),
+                            &[],
+                        ))
+                    }
+                });
+                assert_eq!(calls, 2);
+                if now == 0 {
+                    assert_eq!(result, (false, "probe_error:payload".to_string()));
+                    assert!(!probes.targets["partial"].settled);
+                } else {
+                    assert_eq!(result, (true, "checks_completed".to_string()));
+                    assert!(probes.targets["partial"].settled);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_legacy_status_page_without_link_reads_the_next_page() {
+        for cold_status in [200, 304] {
+            for pending in [true, false] {
+                let mut probes = Probes::default();
+                let mut status_pages = vec![];
+                let result = probes.probe("pr", "o", "r", "42", true, 0, |path, etag, _| {
+                    assert_eq!(etag, None);
+                    let body = if path.ends_with("/pulls/42") {
+                        pull("open", false, SHA)
+                    } else if path.contains("/check-runs?") {
+                        json!({"total_count":0,"check_runs":[]})
+                    } else {
+                        let n: usize = path.rsplit_once("page=").unwrap().1.parse().unwrap();
+                        status_pages.push(n);
+                        match n {
+                            1 | 2 => json!({"statuses":vec![json!({"state":"success"});100]}),
+                            3 if pending => json!({"statuses":[{"state":"pending"}]}),
+                            3 => json!({"statuses":[]}),
+                            _ => panic!("legacy status pagination did not stop"),
+                        }
+                    };
+                    Ok(response(cold_status, body, &[]))
+                });
+                assert_eq!(status_pages, [1, 2, 3]);
+                assert_eq!(
+                    result,
+                    (
+                        !pending,
+                        if pending {
+                            "checks_in_progress"
+                        } else {
+                            "checks_completed"
+                        }
+                        .to_string()
+                    )
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_total_count_is_a_payload_error() {
+        for status in [200, 304] {
+            for total in [json!(null), json!(-1), json!(1.5), json!("101")] {
+                let mut probes = Probes::default();
+                let result = probes.probe("bad-count", "o", "r", SHA, false, 0, |_, _, _| {
+                    Ok(response(
+                        status,
+                        json!({"total_count":total,"check_runs":[{"status":"completed"}]}),
+                        &[],
+                    ))
+                });
+                assert_eq!(result, (false, "probe_error:payload".to_string()));
+                assert!(!probes.targets["bad-count"].settled);
+            }
+        }
+    }
+
+    #[test]
+    fn next_link_is_honored_even_when_declared_total_is_already_observed() {
+        let mut probes = Probes::default();
+        let mut calls = 0;
+        let result = probes.probe("link", "o", "r", SHA, false, 0, |path, _, _| {
+            calls += 1;
+            Ok(if path.ends_with("page=1") {
+                response(
+                    304,
+                    json!({"total_count":1,"check_runs":[{"status":"completed"}]}),
+                    &[("link", "<page2>; rel=\"next\"")],
+                )
+            } else {
+                assert!(path.ends_with("page=2"));
+                response(
+                    200,
+                    json!({"total_count":2,"check_runs":[{"status":"in_progress"}]}),
+                    &[],
+                )
+            })
+        });
+        assert_eq!(result, (false, "checks_in_progress".to_string()));
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn unsatisfied_total_count_is_bounded_by_the_page_limit() {
+        let mut probes = Probes::default();
+        let mut calls = 0;
+        let result = probes.probe("bounded", "o", "r", SHA, false, 0, |_, _, _| {
+            calls += 1;
+            Ok(response(
+                304,
+                json!({"total_count":u64::MAX,"check_runs":[{"status":"completed"}]}),
+                &[],
+            ))
+        });
+        assert_eq!(calls, MAX_PAGES);
+        assert_eq!(result, (false, "probe_error:payload".to_string()));
+        assert!(!probes.targets["bounded"].settled);
+    }
+
     #[test]
     fn not_modified_with_cached_page_uses_cache_when_body_is_empty() {
         let path = "repos/o/r/commits/sha/check-runs?per_page=100&page=1";
@@ -876,6 +1105,7 @@ mod tests {
                 etag: Some("old".to_string()),
                 last_modified: None,
                 next: false,
+                total_count: None,
                 summary: Summary::Checks(Checks {
                     count: 1,
                     pending: true,
