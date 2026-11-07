@@ -4364,12 +4364,10 @@ fn rebalance_provider_profiles(
         for p in prof_rem.keys() {
             bound.insert(p.clone(), Vec::new());
         }
-        let mut root_agents: Vec<&Agent> = agents
-            .iter()
-            .filter(|a| a.parent_id.is_none() && a.state != "archived")
-            .collect();
-        root_agents.sort_by(|a, b| a.name.cmp(&b.name));
-        for a in root_agents {
+        let mut active_agents: Vec<&Agent> =
+            agents.iter().filter(|a| a.state != "archived").collect();
+        active_agents.sort_by(|a, b| a.name.cmp(&b.name));
+        for a in active_agents {
             let exp_prov = upstream_provider_of(&a.harness, a.model.as_deref());
             if exp_prov != provider {
                 continue;
@@ -6983,29 +6981,12 @@ pub(crate) fn try_rotate_exhausted_profile(
         return Some(format!("{provider}/{current_prof}"));
     }
     if has_active_quota_hold && cur_pct.unwrap_or(0) <= 0 {
-        let mut bound_counts: std::collections::HashMap<String, i64> =
-            std::collections::HashMap::new();
-        if let Ok(all_agents) = store.list_agents() {
-            for a in all_agents {
-                if a.parent_id.is_none() && a.state != "archived" && a.id != agent.id {
-                    let acfg = agent_config_dir(data, &a.id);
-                    if let Some(b) = bound_profile_name(&acfg) {
-                        let (bp, bprof) = b
-                            .split_once('/')
-                            .map(|(p, n)| (p.to_string(), n.to_string()))
-                            .unwrap_or_else(|| {
-                                (
-                                    upstream_provider_of(&a.harness, a.model.as_deref()),
-                                    b.clone(),
-                                )
-                            });
-                        if bp == provider {
-                            *bound_counts.entry(bprof).or_insert(0) += 1;
-                        }
-                    }
-                }
-            }
-        }
+        let bound_counts = count_bound_profile_agents(
+            data,
+            &store.list_agents().unwrap_or_default(),
+            &provider,
+            &agent.id,
+        );
         let mut best: Option<(String, i64, i64)> = None;
         for (cand_prof, _) in list_harness_profiles(data, &provider) {
             if cand_prof == current_prof {
@@ -7042,6 +7023,35 @@ pub(crate) fn try_rotate_exhausted_profile(
         }
     }
     None
+}
+
+fn count_bound_profile_agents(
+    data: &Path,
+    agents: &[Agent],
+    provider: &str,
+    excluded_agent: &AgentId,
+) -> std::collections::HashMap<String, i64> {
+    let mut counts = std::collections::HashMap::new();
+    for agent in agents {
+        if agent.state != "archived" && &agent.id != excluded_agent {
+            let cfg = agent_config_dir(data, &agent.id);
+            if let Some(bound) = bound_profile_name(&cfg) {
+                let (bound_provider, profile) = bound
+                    .split_once('/')
+                    .map(|(p, n)| (p.to_string(), n.to_string()))
+                    .unwrap_or_else(|| {
+                        (
+                            upstream_provider_of(&agent.harness, agent.model.as_deref()),
+                            bound.clone(),
+                        )
+                    });
+                if bound_provider == provider {
+                    *counts.entry(profile).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+    counts
 }
 
 /// Lists all available Master Profiles for `provider_or_harness` under `<data>/profiles/<provider>/<profile>`.
@@ -7335,6 +7345,161 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rebalance_test_profiles(data: &Path, busy_pct: i64) -> Vec<ProviderProfileEntry> {
+        [("busy", busy_pct), ("healthy", 80)]
+            .into_iter()
+            .map(|(profile, pct)| {
+                ensure_provider_profile_meta(
+                    &data.join("profiles/openai").join(profile),
+                    "openai",
+                    None,
+                );
+                ProviderProfileEntry {
+                    provider: "openai".to_string(),
+                    profile: profile.to_string(),
+                    account: None,
+                    kind: "subscription".to_string(),
+                    compatible_harnesses: vec!["codex".to_string()],
+                    assigned_agents: Vec::new(),
+                    subagent_count: 0,
+                    usage: Some(format!("5h: {pct}% left · 7d: {pct}% left")),
+                }
+            })
+            .collect()
+    }
+
+    fn rebalance_test_agent(store: &Store, name: &str, parent: Option<&Agent>) -> Agent {
+        let mut new = NewAgent::new(name, "codex");
+        new.parent_id = parent.map(|a| a.id.clone());
+        let agent = store.create_agent(new).unwrap();
+        let cfg = agent_config_dir(store.data_dir(), &agent.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n");
+        agent
+    }
+
+    #[test]
+    fn rebalance_provider_profiles_balances_overloaded_roots_and_nested_subagents() {
+        for depth in 0..=2 {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path();
+            let store = Store::open(data.join("state.db")).unwrap();
+            let entries = rebalance_test_profiles(data, 50);
+            let mut parent = None;
+            for level in 0..depth {
+                let mut new = NewAgent::new(format!("ancestor-{level}"), "claude-code");
+                new.parent_id = parent.as_ref().map(|a: &Agent| a.id.clone());
+                parent = Some(store.create_agent(new).unwrap());
+            }
+            let stay = rebalance_test_agent(&store, "a-stay", parent.as_ref());
+            let moved = rebalance_test_agent(&store, "z-move", parent.as_ref());
+
+            rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+            assert_eq!(
+                bound_profile_name(&agent_config_dir(data, &stay.id)).as_deref(),
+                Some("openai/busy"),
+                "depth {depth}"
+            );
+            assert_eq!(
+                bound_profile_name(&agent_config_dir(data, &moved.id)).as_deref(),
+                Some("openai/healthy"),
+                "depth {depth}"
+            );
+            let after = store.agent(&moved.id).unwrap();
+            assert_eq!(after.parent_id, moved.parent_id);
+            assert_eq!(after.harness, moved.harness);
+            assert_eq!(after.model, moved.model);
+            assert_eq!(after.state, moved.state);
+        }
+    }
+
+    #[test]
+    fn rebalance_provider_profiles_evacuates_exhausted_roots_and_subagents() {
+        for is_child in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path();
+            let store = Store::open(data.join("state.db")).unwrap();
+            let entries = rebalance_test_profiles(data, 0);
+            let parent = store
+                .create_agent(NewAgent::new("parent", "claude-code"))
+                .unwrap();
+            let agent = rebalance_test_agent(&store, "worker", is_child.then_some(&parent));
+
+            rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+            assert_eq!(
+                bound_profile_name(&agent_config_dir(data, &agent.id)).as_deref(),
+                Some("openai/healthy"),
+                "is_child={is_child}"
+            );
+        }
+    }
+
+    #[test]
+    fn rebalance_provider_profiles_preserves_archived_and_other_provider_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let entries = rebalance_test_profiles(data, 0);
+        let root = rebalance_test_agent(&store, "archived-root", None);
+        let child = rebalance_test_agent(&store, "archived-child", Some(&root));
+        for agent in [&root, &child] {
+            store.set_agent_state(&agent.id, "archived").unwrap();
+        }
+        let foreign = rebalance_test_agent(&store, "foreign-provider", Some(&root));
+        store
+            .set_agent_model(&foreign.id, "sylphx/openai/gpt-6.1-sol#xhigh")
+            .unwrap();
+
+        rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+        for agent in [&root, &child, &foreign] {
+            assert_eq!(
+                bound_profile_name(&agent_config_dir(data, &agent.id)).as_deref(),
+                Some("openai/busy"),
+                "{}",
+                agent.name
+            );
+        }
+    }
+
+    #[test]
+    fn quota_rotation_counts_subagent_load_and_preserves_exclusions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let root = rebalance_test_agent(&store, "root", None);
+        let rotating = rebalance_test_agent(&store, "rotating", Some(&root));
+        let child = rebalance_test_agent(&store, "child", Some(&root));
+        let nested = rebalance_test_agent(&store, "nested", Some(&child));
+        // Legacy unqualified bindings still use the agent's upstream provider.
+        write_profile_marker(
+            &agent_config_dir(data, &nested.id),
+            ".anyagents-profile",
+            "busy\n",
+        );
+        let archived = rebalance_test_agent(&store, "archived", Some(&root));
+        store.set_agent_state(&archived.id, "archived").unwrap();
+        let foreign = rebalance_test_agent(&store, "foreign", Some(&root));
+        write_profile_marker(
+            &agent_config_dir(data, &foreign.id),
+            ".anyagents-profile",
+            "anthropic/busy\n",
+        );
+        let missing = rebalance_test_agent(&store, "missing", Some(&root));
+        std::fs::remove_file(agent_config_dir(data, &missing.id).join(".anyagents-profile"))
+            .unwrap();
+
+        let counts =
+            count_bound_profile_agents(data, &store.list_agents().unwrap(), "openai", &rotating.id);
+
+        assert_eq!(
+            counts,
+            std::collections::HashMap::from([("busy".to_string(), 3)])
+        );
+    }
 
     #[test]
     fn parse_remaining_pct_from_usage_handles_agy_5h_and_7d_windows() {
