@@ -485,6 +485,7 @@ struct AgentsArgs {
     /// - `"describe"` (read or update an agent's role & responsibility `description` / `instructions` and short `role` label; defaults `name` to `"self"`)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
+    /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
     /// - `"pause"` (pause an agent)
     /// - `"archive"` (archive an agent or yourself to scale to zero; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
@@ -1418,6 +1419,25 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(
                     serde_json::to_value(woke).map_err(|e| e.to_string())?,
                 ))
+            }
+            "reset_session" | "new_session" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "`agents reset_session` requires `name` (or `agent`)".to_string()
+                    })?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let result: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/session/reset"),
+                        Some(b"{}".to_vec()),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(result))
             }
             "pause" => {
                 let target = args

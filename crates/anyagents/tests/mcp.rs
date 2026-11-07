@@ -1114,6 +1114,109 @@ async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
 }
 
 #[tokio::test]
+async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let parent = store
+        .create_agent(NewAgent::new("session-parent", "sylphx"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("session-peer", "sylphx"))
+        .unwrap();
+    let mut input = NewAgent::new("session-child", "sylphx");
+    input.parent_id = Some(parent.id.clone());
+    let child = store.create_agent(input).unwrap();
+    for agent in [&parent, &peer, &child] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let root = dir.path().join("agents").join(child.id.as_str());
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::create_dir_all(root.join("memory")).unwrap();
+    std::fs::write(root.join("memory/MEMORY.md"), "first pin").unwrap();
+    let old = host_session::ensure_active(&root, "sylphx").unwrap();
+    std::fs::write(root.join("config/sylphx-session-id"), "old-vendor\n").unwrap();
+    std::fs::write(
+        root.join("config/sylphx-transcript.jsonl"),
+        "retained raw bytes",
+    )
+    .unwrap();
+    std::fs::write(root.join("memory/MEMORY.md"), "second pin").unwrap();
+    let server = start_server(dir.path());
+    let parent_mcp = connect(dir.path(), &parent.name).await;
+    let peer_mcp = connect(dir.path(), &peer.name).await;
+    let before = std::fs::read(root.join("sessions/registry.json")).unwrap();
+    let denied = call(
+        &peer_mcp,
+        "agents",
+        serde_json::json!({"action":"reset_session","name":child.name}),
+    )
+    .await;
+    assert_eq!(denied.is_error, Some(true));
+    assert_eq!(
+        std::fs::read(root.join("sessions/registry.json")).unwrap(),
+        before
+    );
+    let process = store.try_lock_agent(&child.id).unwrap();
+    let busy = call(
+        &parent_mcp,
+        "agents",
+        serde_json::json!({"action":"new_session","name":child.name}),
+    )
+    .await;
+    assert_eq!(busy.is_error, Some(true));
+    assert_eq!(
+        std::fs::read(root.join("sessions/registry.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+        b"old-vendor\n"
+    );
+    drop(process);
+    let result: serde_json::Value = ok_json(
+        call(
+            &parent_mcp,
+            "agents",
+            serde_json::json!({"action":"reset_session","name":child.name}),
+        )
+        .await,
+    );
+    let second = host_session::active(&root).unwrap().unwrap();
+    assert_eq!(result["generation"], second.generation);
+    assert_ne!(second.generation, old.generation);
+    assert!(second.memory.section.contains("second pin"));
+    std::fs::write(root.join("memory/MEMORY.md"), "third pin").unwrap();
+    let cli = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "new-session", &child.name])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    let third = host_session::active(&root).unwrap().unwrap();
+    assert_eq!(result["generation"], third.generation);
+    assert_ne!(third.generation, second.generation);
+    assert!(third.memory.section.contains("third pin"));
+    assert_eq!(
+        std::fs::read(root.join("config/sylphx-transcript.jsonl")).unwrap(),
+        b"retained raw bytes"
+    );
+    assert_eq!(
+        host_session::resume_vendor(&root, "sylphx", "old-vendor").unwrap(),
+        old
+    );
+    parent_mcp.cancel().await.unwrap();
+    peer_mcp.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
 async fn describe_preserves_config_permissions_without_vendor_restart_writers() {
     let dir = tempfile::tempdir().unwrap();
     let created = bin()

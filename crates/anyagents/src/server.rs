@@ -293,6 +293,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/agents/{name}/transfer", post(transfer_agent_route))
         .route("/v1/agents/{name}/model", post(model_route))
         .route("/v1/agents/{name}/harness", post(harness_route))
+        .route("/v1/agents/{name}/session/reset", post(reset_session_route))
         .route(
             "/v1/agents/{name}/schedules",
             get(list_schedules_route).post(schedules_action_route),
@@ -1528,6 +1529,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             .route("/v1/agents/{name}/role", post(role_agent_route))
             .route("/v1/agents/{name}/model", post(model_route))
             .route("/v1/agents/{name}/harness", post(harness_route))
+            .route("/v1/agents/{name}/session/reset", post(reset_session_route))
             .route(
                 "/v1/agents/{name}/schedules",
                 get(list_schedules_route).post(schedules_action_route),
@@ -1888,6 +1890,39 @@ struct HarnessRequest {
     model: Option<String>,
     #[serde(default)]
     profile: Option<String>,
+}
+
+async fn reset_session_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    spawn_store(move || {
+        let found = state
+            .store
+            .agent_by_name(&name)
+            .map_err(ApiError::from_store)?;
+        let _lifecycle = state
+            .store
+            .try_lock_agent_lifecycle(&found.id)
+            .map_err(ApiError::from_store)?;
+        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+        match &principal {
+            Principal::Agent { agent_id, .. } if found.parent_id.as_ref() == Some(agent_id) => (),
+            _ => {
+                require_admin_or_operator(
+                    &state.store,
+                    &principal,
+                    "agents.reset_session",
+                    &found.name,
+                )?;
+            }
+        }
+        create::reset_agent_session_locked(&state.store, &found)
+            .map(Json)
+            .map_err(ApiError::from_store)
+    })
+    .await
 }
 
 async fn harness_route(
@@ -6824,6 +6859,120 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    #[test]
+    fn reset_session_requires_management_authority_and_quiescence_before_any_pin_change() {
+        use anyagents_core::host_session;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("reset-parent", "opencode"))
+            .unwrap();
+        let mut new_child = anyagents_core::NewAgent::new("reset-child", "opencode");
+        new_child.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new_child).unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("reset-peer", "opencode"))
+            .unwrap();
+        store.set_agent_state(&child.id, "paused").unwrap();
+        let root = dir.path().join("agents").join(child.id.as_str());
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "before reset").unwrap();
+        let old = host_session::ensure_active(&root, "opencode").unwrap();
+        std::fs::write(root.join("config/opencode-session-id"), "old-id\n").unwrap();
+        std::fs::write(root.join("config/raw.jsonl"), "raw retained").unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "after reset").unwrap();
+        let before = std::fs::read(root.join("sessions/registry.json")).unwrap();
+        let pins = || std::fs::read_dir(root.join("sessions")).unwrap().count();
+        let before_pins = pins();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let principal = |a: &Agent| Principal::Agent {
+                agent_id: a.id.clone(),
+                name: a.name.clone(),
+            };
+            let unchanged = || {
+                assert_eq!(
+                    std::fs::read(root.join("sessions/registry.json")).unwrap(),
+                    before
+                );
+                assert_eq!(
+                    std::fs::read(root.join("config/opencode-session-id")).unwrap(),
+                    b"old-id\n"
+                );
+                assert_eq!(pins(), before_pins);
+            };
+            let denied = reset_session_route(
+                principal(&peer),
+                State(state.clone()),
+                AxumPath(child.name.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(denied.status, StatusCode::FORBIDDEN);
+            unchanged();
+            let process = store.try_lock_agent(&child.id).unwrap();
+            let busy = reset_session_route(
+                principal(&parent),
+                State(state.clone()),
+                AxumPath(child.name.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(busy.status, StatusCode::CONFLICT);
+            unchanged();
+            drop(process);
+            let lifecycle = store.lock_agent_lifecycle(&child.id).unwrap();
+            let busy = reset_session_route(
+                principal(&parent),
+                State(state.clone()),
+                AxumPath(child.name.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(busy.status, StatusCode::CONFLICT);
+            unchanged();
+            drop(lifecycle);
+            store.set_agent_state(&child.id, "running").unwrap();
+            let busy = reset_session_route(
+                principal(&parent),
+                State(state.clone()),
+                AxumPath(child.name.clone()),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(busy.status, StatusCode::CONFLICT);
+            unchanged();
+            store.set_agent_state(&child.id, "paused").unwrap();
+            let Json(result) = reset_session_route(
+                principal(&parent),
+                State(state),
+                AxumPath(child.name.clone()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.message));
+            let active = host_session::active(&root).unwrap().unwrap();
+            assert_eq!(result["generation"], active.generation);
+            assert_ne!(active.generation, old.generation);
+            assert!(active.memory.section.contains("after reset"));
+            assert_eq!(
+                std::fs::read(root.join("config/raw.jsonl")).unwrap(),
+                b"raw retained"
+            );
+            assert_eq!(
+                host_session::resume_vendor(&root, "opencode", "old-id").unwrap(),
+                old
+            );
+        });
+    }
 
     #[test]
     fn canonical_raw_ranges_bind_owned_digest_and_return_bounded_exact_bytes() {

@@ -723,6 +723,9 @@ enum AgentsCommand {
     Pause { name: String },
     /// Wake and resume an archived or paused agent (`state = running`).
     Wake { name: String },
+    /// Start a new logical session for a quiescent agent; retain all old history and pins.
+    #[command(alias = "new-session")]
+    ResetSession { name: String },
     /// Permanently delete an agent and its on-disk directory.
     Delete { name: String },
     /// List agents.

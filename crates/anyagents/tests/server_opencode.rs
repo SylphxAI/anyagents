@@ -169,13 +169,30 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         assert!(Instant::now() < deadline, "messages not delivered");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The shipping wrapper persists OpenCode's late native ID and binds it to
+    // the host generation already pinned before dispatch (scripted runtime).
+    let marker = std::fs::read_to_string(config_dir.join("opencode-session-id")).unwrap();
+    let pin = anyagents_core::host_session::active(config_dir.parent().unwrap())
+        .unwrap()
+        .unwrap();
+    let registry: Value = serde_json::from_slice(
+        &std::fs::read(config_dir.parent().unwrap().join("sessions/registry.json")).unwrap(),
+    )
+    .unwrap();
+    let alias = serde_json::to_string(&("opencode", marker.trim())).unwrap();
+    assert_eq!(registry["aliases"][alias]["generation"], pin.generation);
+    assert!(!marker.trim().is_empty());
     // The agent replies with its own MCP `send`, not through anything the
     // session printed: the adapter scrapes no answer and writes no reply row.
     // To a second agent, so the reply is the switchboard's routing of the
     // agent's own tool call.
     let other = create(&data, "owner");
     assert!(other.status.success(), "{other:?}");
+    let mcp_stderr = data.join("mcp.stderr");
     let answered = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .env_remove("ANYAGENTS_AGENT_ROUTE")
+        .env_remove("ANYAGENTS_DATA")
+        .env_remove("ANYAGENTS_AGENT_ID")
         .args([
             "--data",
             data.to_str().unwrap(),
@@ -185,10 +202,15 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&mcp_stderr).unwrap()))
         .spawn()
         .and_then(mcp_send_once)
-        .expect("the agent's tool server runs");
+        .unwrap_or_else(|error| {
+            panic!(
+                "the agent's tool server failed: {error}: {}",
+                std::fs::read_to_string(&mcp_stderr).unwrap_or_default()
+            )
+        });
     assert!(answered.status.success(), "{answered:?}");
     // The reply is the agent's own `send`, routed by the switchboard: the
     // owner's mailbox holds it, and nothing was read from the session.

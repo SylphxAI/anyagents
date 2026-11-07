@@ -76,6 +76,9 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             let view = set_state(data, &name, "running")?;
             println!("{}\t{}\t{}", view.id, view.name, view.state);
         }
+        AgentsCommand::ResetSession { name } => {
+            reset_session_cmd(data, &name)?;
+        }
         AgentsCommand::Delete { name } => {
             delete_cmd(data, &name)?;
         }
@@ -597,6 +600,28 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);
     println!("{}\t{}\tdeleted", deleted.id, deleted.name);
+    Ok(())
+}
+
+pub fn reset_session_cmd(data: &Path, name: &str) -> Result<(), Error> {
+    let result = if client::can_call_server(data) {
+        client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/agents/{name}/session/reset"),
+            Some(b"{}".to_vec()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?
+        .ok_or_else(|| Error::Message("the server answered nothing".into()))?
+    } else {
+        let store = open(data)?;
+        let found = store.agent_by_name(name)?;
+        let _lifecycle = store.try_lock_agent_lifecycle(&found.id)?;
+        let found = store.agent(&found.id)?;
+        crate::create::reset_agent_session_locked(&store, &found)?
+    };
+    println!("{result}");
     Ok(())
 }
 

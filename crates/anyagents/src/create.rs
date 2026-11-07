@@ -1712,6 +1712,29 @@ pub(crate) struct ProviderProfileEntry {
     pub usage: Option<String>,
 }
 
+/// Caller holds the lifecycle lock and has re-read management authority.
+/// Process admission is checked before touching any host pin or native pointer.
+pub(crate) fn reset_agent_session_locked(
+    store: &Store,
+    agent: &Agent,
+) -> Result<serde_json::Value, Error> {
+    if agent.state == "running" {
+        return Err(Error::AgentBusy);
+    }
+    let _process = store.try_lock_agent(&agent.id)?;
+    let root = store.data_dir().join("agents").join(agent.id.as_str());
+    let session = anyagents_core::host_session::reset_session(
+        &root,
+        &agent.harness,
+        harness_session_filename(&agent.harness),
+    )?;
+    Ok(serde_json::json!({
+        "agent_id": agent.id, "name": agent.name, "state": agent.state,
+        "generation": session.generation, "harness": session.harness,
+        "memory_sha256": session.memory.sha256,
+    }))
+}
+
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
     match harness {
         "codex" => Some("codex-session-id"),

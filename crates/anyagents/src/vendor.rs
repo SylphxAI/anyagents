@@ -25,7 +25,7 @@ use crate::sylphx::SylphxHarness;
 pub enum VendorHarness {
     Claude(Box<ClaudeHarness>, PathBuf),
     Codex(Box<CodexHarness>, PathBuf),
-    OpenCode(Box<OpenCodeHarness>),
+    OpenCode(Box<OpenCodeHarness>, PathBuf),
     Agy(Box<AgyHarness>, PathBuf),
     Muse(Box<MuseHarness>, PathBuf),
     Omp(Box<OmpHarness>, PathBuf),
@@ -52,7 +52,8 @@ impl VendorHarness {
             Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
             Self::Grok(harness, path) => (harness.session_id(), Some(path)),
             Self::Sylphx(harness, path) => (harness.session_id(), Some(path)),
-            Self::OpenCode(_) | Self::Contract(_) => (None, None),
+            Self::OpenCode(harness, path) => (harness.session_id(), Some(path)),
+            Self::Contract(_) => (None, None),
         };
         if let (Some(id), Some(path)) = (session, path) {
             let trimmed = id.trim();
@@ -62,6 +63,7 @@ impl VendorHarness {
                     let harness = match self {
                         Self::Claude(..) => "claude-code",
                         Self::Codex(..) => "codex",
+                        Self::OpenCode(..) => "opencode",
                         Self::Agy(..) => "agy",
                         Self::Muse(..) => "muse",
                         Self::Omp(..) => "omp",
@@ -423,6 +425,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
 
 fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     let root = request.config_dir.parent().ok_or("agent root missing")?;
+    anyagents_core::host_session::recover_pending(root).map_err(|e| e.to_string())?;
     let previous = anyagents_core::host_session::active(root).map_err(|e| e.to_string())?;
     let switched = previous
         .as_ref()
@@ -944,7 +947,12 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         .map_err(|err| {
             read_opencode_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
         })?;
-        Ok(VendorHarness::OpenCode(Box::new(harness)))
+        let vh = VendorHarness::OpenCode(
+            Box::new(harness),
+            request.config_dir.join("opencode-session-id"),
+        );
+        vh.sync_session();
+        Ok(vh)
     } else if request.agent.harness == "codex" {
         env.push((
             "CODEX_HOME".to_string(),
@@ -1208,7 +1216,7 @@ impl Harness for VendorHarness {
         let out = match self {
             Self::Claude(harness, _) => harness.deliver(message),
             Self::Codex(harness, _) => harness.deliver(message),
-            Self::OpenCode(harness) => harness.deliver(message),
+            Self::OpenCode(harness, _) => harness.deliver(message),
             Self::Agy(harness, _) => harness.deliver(message),
             Self::Muse(harness, _) => harness.deliver(message),
             Self::Omp(harness, _) => harness.deliver(message),
@@ -1225,7 +1233,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.background(),
             Self::Codex(harness, _) => harness.background(),
-            Self::OpenCode(harness) => harness.background(),
+            Self::OpenCode(harness, _) => harness.background(),
             Self::Agy(harness, _) => harness.background(),
             Self::Muse(harness, _) => harness.background(),
             Self::Omp(harness, _) => harness.background(),
@@ -1240,7 +1248,7 @@ impl Harness for VendorHarness {
         let out = match self {
             Self::Claude(harness, _) => harness.resume(session),
             Self::Codex(harness, _) => harness.resume(session),
-            Self::OpenCode(harness) => harness.resume(session),
+            Self::OpenCode(harness, _) => harness.resume(session),
             Self::Agy(harness, _) => harness.resume(session),
             Self::Muse(harness, _) => harness.resume(session),
             Self::Omp(harness, _) => harness.resume(session),
@@ -1257,7 +1265,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.cancel(),
             Self::Codex(harness, _) => harness.cancel(),
-            Self::OpenCode(harness) => harness.cancel(),
+            Self::OpenCode(harness, _) => harness.cancel(),
             Self::Agy(harness, _) => harness.cancel(),
             Self::Muse(harness, _) => harness.cancel(),
             Self::Omp(harness, _) => harness.cancel(),
@@ -1273,7 +1281,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.health(),
             Self::Codex(harness, _) => harness.health(),
-            Self::OpenCode(harness) => harness.health(),
+            Self::OpenCode(harness, _) => harness.health(),
             Self::Agy(harness, _) => harness.health(),
             Self::Muse(harness, _) => harness.health(),
             Self::Omp(harness, _) => harness.health(),
@@ -1288,7 +1296,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.input_ready(),
             Self::Codex(harness, _) => harness.input_ready(),
-            Self::OpenCode(harness) => harness.input_ready(),
+            Self::OpenCode(harness, _) => harness.input_ready(),
             Self::Agy(harness, _) => harness.input_ready(),
             Self::Muse(harness, _) => harness.input_ready(),
             Self::Omp(harness, _) => harness.input_ready(),
@@ -1304,7 +1312,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.last_usage(),
             Self::Codex(harness, _) => harness.last_usage(),
-            Self::OpenCode(harness) => harness.last_usage(),
+            Self::OpenCode(harness, _) => harness.last_usage(),
             Self::Agy(harness, _) => harness.last_usage(),
             Self::Muse(harness, _) => harness.last_usage(),
             Self::Omp(harness, _) => harness.last_usage(),
@@ -1319,7 +1327,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.turns_served(),
             Self::Codex(harness, _) => harness.turns_served(),
-            Self::OpenCode(harness) => harness.turns_served(),
+            Self::OpenCode(harness, _) => harness.turns_served(),
             Self::Agy(harness, _) => harness.turns_served(),
             Self::Muse(harness, _) => harness.turns_served(),
             Self::Omp(harness, _) => harness.turns_served(),
@@ -1334,7 +1342,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Codex(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::OpenCode(harness) => harness.quiet_for(id, quiet, patience),
+            Self::OpenCode(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Agy(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Muse(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
@@ -1349,7 +1357,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.ends_on_quiet(),
             Self::Codex(harness, _) => harness.ends_on_quiet(),
-            Self::OpenCode(harness) => harness.ends_on_quiet(),
+            Self::OpenCode(harness, _) => harness.ends_on_quiet(),
             Self::Agy(harness, _) => harness.ends_on_quiet(),
             Self::Muse(harness, _) => harness.ends_on_quiet(),
             Self::Omp(harness, _) => harness.ends_on_quiet(),
@@ -1364,7 +1372,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.clear_quota(),
             Self::Codex(harness, _) => harness.clear_quota(),
-            Self::OpenCode(harness) => harness.clear_quota(),
+            Self::OpenCode(harness, _) => harness.clear_quota(),
             Self::Agy(harness, _) => harness.clear_quota(),
             Self::Muse(harness, _) => harness.clear_quota(),
             Self::Omp(harness, _) => harness.clear_quota(),
@@ -1379,7 +1387,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.process_id(),
             Self::Codex(harness, _) => harness.process_id(),
-            Self::OpenCode(harness) => harness.process_id(),
+            Self::OpenCode(harness, _) => harness.process_id(),
             Self::Agy(harness, _) => harness.process_id(),
             Self::Muse(harness, _) => harness.process_id(),
             Self::Omp(harness, _) => harness.process_id(),
@@ -1394,7 +1402,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.watch_activity(notify),
             Self::Codex(harness, _) => harness.watch_activity(notify),
-            Self::OpenCode(harness) => harness.watch_activity(notify),
+            Self::OpenCode(harness, _) => harness.watch_activity(notify),
             Self::Agy(harness, _) => harness.watch_activity(notify),
             Self::Muse(harness, _) => harness.watch_activity(notify),
             Self::Omp(harness, _) => harness.watch_activity(notify),
