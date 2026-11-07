@@ -106,6 +106,30 @@ the viewport regression advances the reaper's explicit clock without writing
 expired deadlines or stale heartbeats that race its background loop. Neither
 regression needs timing sleeps or retries.
 
+Desktop takeover accepts native modifier chords, including select-all, copy,
+cut, paste and undo. Paste inserts local clipboard text into the remote focus;
+copy and cut export the remote selection only after checking that the focus is
+not a password field. The viewer keeps new-tab, close-tab and address-bar
+shortcuts local. The floating pill also exposes Paste, Copy, Select all, Tab and Esc;
+clipboard permission refusal displays a prompt instead of silently losing input.
+On touch devices the native keyboard input overlays the remote field and tracks
+its position through zoom and pan, so the device's Paste menu works in place.
+No typed or pasted text is returned in input acknowledgements.
+
+`takeover_clipboard_ui_acceptance` runs the Chromium viewer clipboard and
+keyboard regressions in the ordinary native suite when Chromium is available.
+The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
+copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
+export denial. Viewer teardown retries only recursive deletion of its disposable
+profile (five retries, 100 ms linear backoff), because Chromium helpers can finish
+profile writes after the browser parent exits. An exhausted cleanup retry still
+fails the fixture; interaction assertions are never retried. This addresses the
+Linux `ENOTEMPTY` cleanup failure in CI run 42334433646 after all clipboard
+assertions passed.
+
+Actual iPhone Safari keyboard and long-press menus require a
+post-deployment device check; Chromium emulation does not certify those OS menus.
+
 Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
 and reported DPR. A screenshot captured by a fresh CDP session can be 1920×1080
 while the document reports DPR 2; dividing image coordinates by DPR alone is
@@ -122,6 +146,30 @@ The geometry suite covers DPR 1/2/3, zoom anchors and pan limits. The native
 browser tests exercise trusted input, byte-identical browser identity, restored
 metrics on every exit, and expiry before a queued toggle or Done. They require
 Chromium; the existing browser suites skip when it is unavailable.
+
+`takeover_focus_finds_cross_origin_input` is separately quarantined for two
+intermittent Chromium failures: a CDP startup timeout and a post-startup
+`focus.editable = false` assertion. On 2026-11-07, the latter also reproduced in
+the unmodified `52c4432b362ac548434ab30cead122c5e2e244ed` test binary, before
+the clipboard changes, using the same Chromium 156.0.8078.47. A bounded cohort
+restricted eight concurrent fixture processes to one CPU to expose the race;
+this is reproduction evidence, not a retry policy or a supported latency bound.
+Failure-only diagnostics on both revisions found a focused parent iframe but
+an unfocused child `BODY`, with the input present and both documents complete.
+The cause remains unresolved; capturing a screenshot before the click did not
+remove it. The focus detector and click dispatch were unchanged by the clipboard
+feature. Run this test explicitly when reviewing takeover changes, so its
+quarantine cannot hide a new regression:
+
+```sh
+cargo test -p anyagents --bin anyagents --locked \
+  browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
+```
+
+A green ordinary suite does not establish this ignored test passed. Its focused
+assertions still require the first click to find the child input at offset
+(60, 80); there is no interaction retry. Remove the quarantine only after both
+failure modes have deterministic fixes.
 
 The full UI acceptance test additionally requires Node.js 22 or newer (native
 WebSocket support). It launches its own headless Chromium viewer and remote test
