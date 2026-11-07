@@ -84,6 +84,29 @@ requires a configured runtime boundary and a separate execution check on that
 runtime. This script does not certify Docker, Kubernetes, cross-user isolation,
 or live authentication. See [ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md).
 
+## Telegram batch checkpoints and replay
+
+```sh
+cargo test -p anyagents --test telegram --locked
+```
+
+Telegram ingestion commits mailbox rows before saving the batch's channel
+checkpoint (`offset` and `chats`). A reader can therefore see the entire inbox
+while the persisted offset still names the previous batch. The DM/topic
+acceptance test waits for both the mailbox rows and the completed checkpoint
+before asserting channel state; it does not assume those separate commits are
+atomic. A disposable two-second pause immediately before the checkpoint write
+reproduced CI run 42335689725's `offset = 0` versus `12` failure in the original
+test. No pause or test retry belongs in the shipped ingestion path.
+
+`a_restart_before_the_offset_checkpoint_replays_without_duplicate_mail` uses a
+fixture-only SQLite trigger to reject the offset write while allowing inbox
+commits. It kills the server with two messages stored and offset zero, removes
+the trigger, and starts a fresh server with the same Telegram updates. The
+checkpoint must advance to 12 without changing the two mailbox IDs or provider
+origins. This verifies replay after an interrupted checkpoint without relying
+on a sleep to hit the crash window.
+
 ## Browser takeover on phones
 
 Takeover starts with the original desktop page, fitted to a full-viewport canvas.
