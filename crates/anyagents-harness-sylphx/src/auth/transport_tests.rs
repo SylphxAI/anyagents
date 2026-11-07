@@ -5,8 +5,37 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{
-    curl_command, curl_post_json_fallback, remove_provider_key_environment, run_json_post_command,
+    PROVIDER_KEY_ENVIRONMENT, curl_command, curl_post_json_fallback,
+    external_provider_key_environment, remove_provider_key_environment, run_json_post_command,
 };
+
+#[test]
+fn provider_key_environment_lookup_preserves_alias_names_and_order() {
+    assert_eq!(
+        PROVIDER_KEY_ENVIRONMENT.sylphx,
+        ["SYLPHX_API_KEY", "SYLPHX_AI_KEY", "SYLPHX_GATEWAY_KEY"]
+    );
+    let external: &[(&str, &[&str])] = &[
+        (
+            "kimi-code-plan",
+            &["KIMI_CODE_PLAN_API_KEY", "KIMI_API_KEY"],
+        ),
+        (
+            "qwen-token-plan",
+            &["QWEN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
+        ),
+        ("glm-code-plan", &["GLM_CODE_PLAN_API_KEY", "ZAI_API_KEY"]),
+        (
+            "minimax-code-plan",
+            &["MINIMAX_CODE_PLAN_API_KEY", "MINIMAX_API_KEY"],
+        ),
+        ("openrouter", &["OPENROUTER_API_KEY"]),
+    ];
+    for (provider, expected) in external {
+        assert_eq!(external_provider_key_environment(provider), *expected);
+    }
+    assert!(external_provider_key_environment("unsupported-provider").is_empty());
+}
 
 fn assert_large_post(status: u16, response_body: &str) {
     let payload = serde_json::json!({
