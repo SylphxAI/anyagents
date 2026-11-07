@@ -814,7 +814,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
              - **Target a Specific Repository (`repo: \"<org>/<repo>\"` or git path/URL)**: Automatically provisions an isolated Git worktree for that agent at `<data>/agents/<id>/work` on branch `agent/<name>` (or custom `branch` from `base`).\n\
              - **Isolated Branch of Your Current Repository (`repo: \"inherit\"` or `workdir: \"worktree\"`)**: Branches a new isolated Git worktree at `<data>/agents/<id>/work` from your current Git repo and `HEAD` — use this whenever spawning parallel coding sub-agents on the same repo so they never collide on `.git/index.lock` or uncommitted edits.\n\
              - **Private Empty Sandbox (`workdir: \"private\"`)**: Gives the agent its own clean directory at `<data>/agents/<id>/work`.\n\
-             - **Default When `repo` and `workdir` Are Omitted**: Every agent and sub-agent defaults to its own isolated `<data>/agents/<id>/work` (pass `workdir: \"inherit\"` only when explicitly sharing your parent directory).\n\
+             - **Default When `repo` and `workdir` Are Omitted**: Every sub-agent defaults to its own isolated `<data>/agents/<id>/work`; roots do too unless the operator configures a root working directory. Pass `workdir: \"inherit\"` only when explicitly sharing your parent directory.\n\
            - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
            - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
@@ -7548,6 +7548,83 @@ mod tests {
             reconcile_agent_runtime_config(&store, data, &updated_desc, &cfg, &work_dir).unwrap();
             let healed_reconcile = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777;
             assert_eq!(healed_reconcile & 0o0700, 0o0700);
+        }
+    }
+
+    #[test]
+    fn spawn_workspace_default_is_private_and_explicit_modes_are_preserved() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = dir.path();
+        let db = data.join("state.db");
+        let store = Store::open(&db).unwrap();
+        let parent_workdir = data.join("parent-worktree");
+        std::fs::create_dir_all(&parent_workdir).unwrap();
+        std::fs::write(parent_workdir.join("parent-only.txt"), "preserve me").unwrap();
+        let parent = store
+            .create_agent(NewAgent::new("parent", "codex"))
+            .unwrap();
+        let parent = store
+            .set_agent_running(&parent.id, parent_workdir.to_str().unwrap())
+            .unwrap();
+        let custom_workdir = data.join("explicit-child-path");
+        let mut stored_workdirs = vec![(parent.id.clone(), parent.workdir.clone())];
+        let mut private_workdirs = Vec::new();
+
+        for (name, workdir) in [
+            ("default-first", None),
+            ("default-second", None),
+            ("private-child", Some(PathBuf::from("private"))),
+            ("inherited-child", Some(PathBuf::from("inherit"))),
+            ("explicit-child", Some(custom_workdir.clone())),
+        ] {
+            let child = create(
+                &store,
+                data,
+                CreateRequest {
+                    name: name.to_string(),
+                    role: None,
+                    harness: "codex".to_string(),
+                    model: Some("test-model".to_string()),
+                    profile: None,
+                    repo: None,
+                    branch: None,
+                    base: None,
+                    workdir,
+                    // A root override must never become a child default.
+                    workdir_default: Some(parent_workdir.clone()),
+                    instructions: None,
+                    parent_id: Some(parent.id.clone()),
+                },
+            )
+            .unwrap();
+            let actual = PathBuf::from(child.workdir.as_deref().unwrap());
+            let expected = match name {
+                "inherited-child" => parent_workdir.clone(),
+                "explicit-child" => custom_workdir.clone(),
+                _ => agent_work_dir(data, &child.id),
+            };
+            assert_eq!(actual, expected, "workspace selection for {name}");
+            assert!(actual.is_dir());
+            if name.starts_with("default-") || name == "private-child" {
+                assert_ne!(actual, parent_workdir);
+                assert!(!actual.join("parent-only.txt").exists());
+                assert_eq!(std::fs::read_dir(&actual).unwrap().count(), 0);
+                assert!(!private_workdirs.contains(&actual));
+                private_workdirs.push(actual);
+            }
+            stored_workdirs.push((child.id.clone(), child.workdir));
+            for (id, expected) in &stored_workdirs {
+                assert_eq!(&store.agent(id).unwrap().workdir, expected);
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(parent_workdir.join("parent-only.txt")).unwrap(),
+            "preserve me"
+        );
+        drop(store);
+        let reopened = Store::open(&db).unwrap();
+        for (id, expected) in stored_workdirs {
+            assert_eq!(reopened.agent(&id).unwrap().workdir, expected);
         }
     }
 
