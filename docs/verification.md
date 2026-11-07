@@ -55,7 +55,9 @@ cargo test -p anyagents --test cli archive_reap --locked
 The unit cases verify mail progress while cleanup is blocked in a git probe,
 nonblocking descendant reconciliation, durable completion across restart,
 wake/rearchive invalidation, failed cleanup retry, and preservation of shared,
-external and unpushed work. The CLI cases execute the production binary with a
+external and unpushed work. Worktree admission also retains managed-config
+provenance after the last reader retires and its private gitdir is removed,
+without restoring retired access or accepting a replacement config link. The CLI cases execute the production binary with a
 cleared environment and synthetic host home. They verify archive cleanup does
 not recreate seat skill directories and real `serve-admin` maintenance reaps a
 legacy archive only once across restart. Unit-test isolation disables host-home
@@ -223,3 +225,58 @@ Set `TAKEOVER_GOOGLE_ACCEPTANCE=1` for the additional network-dependent,
 unauthenticated `accounts.google.com` phone-layout captures. No credentials are
 entered. This is separate from the deterministic local fixture and does not
 certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
+
+### Cross-seat worktree permission boundary
+
+The Linux CI `Cross-seat worktree writes` step runs
+`create::tests::privileged_cross_uid_spawn_can_create_commit_and_status` with
+`ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1`. It creates three real OS users:
+A provisions B, B commits, A still writes B-created Git content and commits using
+an explicit protected hooks path. B cannot write common config/hooks/info,
+write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
+its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
+B's ordinary status, commit and local bare-remote push use its generated seat
+config, with no `-c user.*` or author/committer environment overrides; the commit
+records the exact Kyle author and committer. A's common config retains its owner,
+inode, content and owner read access during adoption. Parent config, remote-add
+and `git push -u` each replace the target inode while retaining the managed link;
+both active child UIDs must immediately read common config and run status, with
+no launch, wake or inspection call between the write and probe. They still cannot
+write/unlink config or create its lock, access sibling private metadata or write
+hooks/info; an unrecorded UID cannot read config. Default ACL readbacks remain
+confined to the dedicated config directory, and survivor/last-reader revocation
+is tested across another parent rewrite. Adoption regressions cover an existing
+Git config lock, interrupted publication with original bytes retained, and
+replacement of the journal-pinned directory or link. A same-size clean-filter positive control
+executes as B, then a forged `.git` pointer cannot execute that filter during
+journal-pinned server cleanup or A/C seat commands in the foreign checkout.
+A second payload selects a trusted common-config driver through B's checkout
+and staged attributes after archive revocation. Cleanup must execute the driver
+only as B; a B-readable execution receipt records that UID while a root-only
+marker remains absent. An inspection worker is SIGKILLed mid-check without unwinding;
+the durable open intent and read-only ACL are observed before startup recovery
+removes the grant, reads it back and preserves the dirty checkout on a fresh check.
+The temporary grant cannot write parent-owned common config or create objects.
+A non-privileged counterpart requires pinned status to execute successfully,
+checks the marker stays absent and rejects included or writable metadata config.
+A cleanup regression snapshots every checkout and private-registration file and
+requires byte-for-byte retention for an unpushed HEAD and for another unpushed
+local branch beside a published detached HEAD; publishing both permits removal.
+The same snapshot case removes or breaks the journaled checkout's `.git` pointer
+with an unpushed HEAD and a report under `target/`: every checkout and private
+registration byte must survive, without falling back to non-Git deletion.
+Archive immediately revokes B's common-store access while preserving its external
+checkout bytes; reap is idempotent and C remains admitted. A separate post-sharing
+admission failure verifies rollback revocation. ACL readbacks cover every changed
+object. A missing privilege is an explicit local skip, never the CI acceptance:
+the required environment flag makes a privilege skip fail.
+
+Three Linux recovery regressions plant a FIFO, a hard link or an outside-target
+symlink during a durably open inspection. Each covers legacy and exact-object
+journals through both primary and admin HTTP servers: the affected worktree is
+quarantined, wake/reap/automatic harness launch refuse it, remaining targets and
+an independent interrupted inspection are revoked, an active same-common seat's
+ACLs remain unchanged, and outside-link contents and ACLs are preserved.
+
+Shared refs are intentionally writable within one repository. These checks do not
+claim branch-tip integrity for arbitrary agent shell commits or pushes.

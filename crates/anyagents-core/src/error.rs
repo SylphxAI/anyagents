@@ -31,6 +31,17 @@ pub enum Error {
     GroupForbidden { group: String, reason: &'static str },
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
+    #[error("failed to provision worktree for `{repo}`: {message}")]
+    WorktreeProvisioning { repo: String, message: String },
+    #[error(
+        "cannot provision worktree from `{source_repo}`: {message}; push to a GitHub remote before spawning"
+    )]
+    WorktreeSourceUnpublished {
+        source_repo: String,
+        message: String,
+    },
+    #[error("workdir `{path}` is not writable by its seat: {message}")]
+    WorkdirPermission { path: String, message: String },
     #[error("{0}")]
     Message(String),
 }

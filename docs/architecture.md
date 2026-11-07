@@ -244,6 +244,113 @@ this adapter does not invoke a setter or edit shared service configuration.
 - **Antigravity (`agy`).** The installed CLI documents a turn per stream-json input line and `--conversation <id>` for resume. The adapter reports followup/unproven. Its hook helpers are not wired to a confirmed customization root and have no vendor consumption acknowledgement. AGY 1.4.5's embedded lifecycle documentation specifies `hooks.json` in a customization root (for example `.agents/hooks.json`), with a named hook's flat `PreInvocation` command array and output `{"injectSteps":[{"userMessage":"..."}]}`. It does not specify the durable acceptance/replay contract needed to commit the mailbox cursor across hook abort or process restart. The existing `agy-hook` helper only offers `received` rows, while stream pipe writes already mark rows delivered; it cannot establish native mid-turn delivery. Do not advertise steer support or install a hook bound to a seat in a shared workspace until isolated hook discovery and consumption/recovery semantics are verified.
 - **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Delivery mode is steer: `turn/start` when no turn is open, and `turn/start` with `ifBusy: "steer"` during one. `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
 
+### Managed local checkouts
+
+Repository-backed local agents require `desk-git-hub`; set
+`ANYAGENTS_GIT_HUB_BIN` to its executable when it is not installed under the
+host user's `~/.local/bin` or on `PATH`. Repository slugs and GitHub URLs,
+`repo: "inherit"`, and local repository paths all use that consumer for fetching
+and checkout. Sparse-checkout and hook policy belong to the consumer, not the
+agent manager. Fetch, checkout, and executable-launch failures refuse the spawn
+with the consumer's diagnostic; there is no automatic clone, direct-worktree,
+or non-desk fallback.
+
+Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
+honoured or refused, never replaced by the default directory. Before an agent
+becomes running, its execution seat must be able to write and traverse its
+working tree, the per-worktree Git directory and the common objects/refs
+storage, and create lock files. New worktrees are shared with that seat's group.
+On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
+`logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
+The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
+the main worktree's `logs/HEAD` stays child-unwritable. Defaults
+exist only inside the shared content subtrees, the private gitdir and a dedicated
+`anyagents-config/` directory, never on mixed metadata ancestors. Common `config`
+is an exact symlink to `anyagents-config/config`: the dedicated directory grants
+recorded active readers traversal and read-only inheritance, so the parent's
+ordinary `git config`, `git remote` and `git push -u` replacements remain readable
+immediately, without a launch or wake. Its defaults grant no owning-group or
+outsider access. Adoption holds Git's original `config.lock`, journals a
+quarantined intent, hard-links the original inode into the dedicated directory
+and atomically replaces the old pathname with the link, preserving config bytes
+and ownership. The journal pins the directory and symlink identities, while Git
+may replace only the target config inode. Interrupted adoption preserves the
+original bytes and refuses launch/reap pending operator recovery. Revocation
+removes access and default entries only when no active same-seat reader remains.
+Retired server-owned journals retain the dedicated directory/link provenance for
+later admission, even after their private gitdirs are reaped; that provenance
+never restores a retired reader's access.
+Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
+private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
+`gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
+Temporary cleanup inspections persist each ACL target's exact path, device and
+inode before granting read/traverse access. Startup recovers those objects through
+no-follow descriptors; legacy intents use a best-effort no-follow tree walk.
+An unsafe recovery target or failed revocation quarantines only the recorded
+worktree and emits a warning, never aborting unrelated server startup.
+Quarantine preserves checkout data and refuses automatic harness launch, wake and
+reap until the operator repairs the recorded recovery state; it does not assert
+that an unreachable or hard-linked object's residual ACL was removed.
+Shared refs remain a same-repository integrity boundary: a child can move another
+branch ref. This is not hostile-repository isolation, and AnyAgents does not
+intercept arbitrary harness commit/push commands or provide a branch-tip guard.
+AnyAgents production code never runs `git commit` or `git push`; the supported
+source-publication path uses desk-git-hub and desk-publish. Its Git metadata reads, skill sync and cleanup
+commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
+and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
+Shared common and worktree configs refuse `include`/`includeIf` rather than
+following a potentially child-controlled configuration graph.
+Commit identity is set to `Kyle Tse <hi@kylet.se>` in the protected private
+`config.worktree`, never by replacing the parent's common config. The consumer
+must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
+configuration resets legacy wildcard trust and lists only the seat's exact
+checkout and recorded common gitdir, preserving other settings. Cleanup loads
+its gitdir/worktree pair from the server journal, verifies the protected metadata
+ownership and effective ACLs, and passes both paths explicitly: a child-edited
+`.git` pointer never selects metadata. A missing, broken or changed pointer on a
+journaled checkout preserves its entire workdir (including build-named output)
+and emits a diagnostic; it cannot select non-Git directory deletion. Cleanup Git
+runs as the journaled seat UID/GID, with no inherited secret environment or socket
+group, because checkout and index attributes can select drivers from trusted
+configuration. It excludes global/system config and attribute files and keeps
+default dubious-ownership checks; unrecorded legacy or arbitrary repositories
+are preserved rather than inspected through their `.git` pointer. After archive
+revokes access, inspection adds only temporary read/traverse ACL entries to the
+journaled metadata allowlist, never write or default entries, and retains active
+same-seat bindings. Inspection intent is synced before granting; ACL changes are
+serialized without holding the global journal lock during Git. Success and
+failure both revoke and read back temporary access. Both server modes recover
+any open inspection intent before starting consumers; failed recovery refuses
+startup. A completed check never stands in for a fresh deletion eligibility check.
+Deletion additionally requires an empty pinned status and zero commits in HEAD
+or any local branch outside the recorded remote-tracking refs. A seat-owned
+initial-head marker cannot waive that test. Dirty or unpushed checkouts and their
+private registration remain; clean, pushed pairs are removed without invoking
+`git worktree remove` or its nested Git subprocesses. Remote-tracking refs remain
+within the documented shared-ref integrity boundary, not a live publication proof.
+A server-owned grant journal is file- and directory-synced before sharing. Its
+serialized transitions preserve bindings needed by another active agent on the
+same OS seat; retiring one agent revokes its private metadata without removing
+the surviving agent's shared-store access. Archive, reap and failed
+admission revoke the seat's named group/user ACL entries and defaults through
+opened descriptors, read the result back, and retain the journal on failure.
+Revocation runs even when dirty or external checkout bytes must be retained.
+An ACL write or readback failure is a typed permission error; non-Linux hosts
+accept only already-permitted metadata access. Existing explicit directories are
+validated without rewriting their permissions. Sharing does not follow symlinks
+or alter hard-linked files that require permission changes.
+
+For inherit/local sources, AnyAgents selects a GitHub remote (preferring
+`origin`), reads its live advertised branches and tags, and requires both the
+source HEAD and requested base to be reachable from them. Push unpublished
+commits before spawning. If a remote tip is not available in local history,
+fetch that remote before trying again. The consumer fetches the verified ref
+and checks out the exact selected commit, including a published feature-branch
+commit that is not on the default branch. Sources without a GitHub remote are
+refused. Existing nonempty checkout targets are not silently adopted by
+repository provisioning. `workdir: "private"` remains an empty directory and
+needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
+
 ## Mailbox: one log per agent
 
 Every input to an agent (a Telegram message, another agent's `send`, a CLI or TUI message) is appended to that agent's mailbox. The mailbox is the only path into a harness.

@@ -697,13 +697,14 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         );
     }
     if state == "running" {
+        crate::worktree_access::restore_recorded(data, &found.id)?;
         server::clear_explicitly_archived(data, &found.id);
     }
     let agent = store.set_agent_state(&found.id, state)?;
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
     } else if state == "archived" {
-        let archived = server::mark_explicitly_archived_locked(&store, data, &agent);
+        let archived = server::mark_explicitly_archived_locked(&store, data, &agent)?;
         // The offline path has no daemon maintenance worker. Keep the parent's
         // lifecycle lock, taking descendant locks only downward as above.
         for id in archived {
