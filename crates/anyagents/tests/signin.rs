@@ -47,7 +47,7 @@ fn create(data: &Path, name: &str, harness: &str) {
             "--harness",
             harness,
         ])
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
         .output()
         .unwrap();

@@ -38,7 +38,7 @@ impl Drop for Serve {
 fn start_server(data: &Path) -> Serve {
     let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .env("PATH", support::machine_path(data))
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .arg("--data")
         .arg(data)
         .arg("serve")
@@ -875,7 +875,7 @@ fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
             }
             let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
                 .env("PATH", support::machine_path(data))
-                .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+                .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
                 .arg("--data")
                 .arg(data)
                 .arg(command)

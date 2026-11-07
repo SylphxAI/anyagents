@@ -116,6 +116,19 @@ impl Drop for Serve {
     }
 }
 
+/// A live stdin-consuming Claude fixture: an exited no-op is a real process
+/// failure and must not be hidden by the production error-reporting path.
+fn claude_double(data: &std::path::Path) -> std::path::PathBuf {
+    let probe = data.join("bin").join("fixture-claude");
+    std::fs::write(
+        &probe,
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" > \"$CLAUDE_CONFIG_DIR/fixture-claude-started\"\nwhile IFS= read -r line; do :; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    probe
+}
+
 fn start_server(data: &std::path::Path) -> Serve {
     start_server_mode(data, "serve")
 }
@@ -126,7 +139,7 @@ fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
         .arg(data)
         .arg(mode)
         .env("PATH", machine_path(data))
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", claude_double(data))
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -566,6 +579,39 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(spawned.name, "worker-1");
     assert_eq!(spawned.parent.as_deref(), Some(alpha_id.as_str()));
     assert_eq!(spawned.state, "running");
+
+    // Prove the canonical override selected the live fixture through the actual
+    // server launch path, rather than an inherited override or PATH fallback.
+    let marker = dir
+        .path()
+        .join("agents")
+        .join(&spawned.id)
+        .join("config")
+        .join("fixture-claude-started");
+    support::wait_for(
+        || marker.is_file(),
+        "canonical Claude fixture was not launched",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        dir.path().join("bin/fixture-claude").to_str().unwrap()
+    );
+    let live: AgentsResponse = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action":"list", "state":"all"}),
+        )
+        .await,
+    );
+    assert_eq!(
+        live.agents
+            .iter()
+            .find(|row| row.id == spawned.id)
+            .unwrap()
+            .process,
+        "alive"
+    );
 
     // Parent can read sub-agent's conversation by `agt_...` ID.
     let worker_conv: ConversationResponse = ok_json(

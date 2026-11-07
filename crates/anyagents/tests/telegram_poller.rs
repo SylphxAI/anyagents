@@ -263,7 +263,7 @@ fn create(dir: &Path, name: &str) -> String {
         .arg(dir)
         .args(["agents", "create", name, "--harness", "claude-code"])
         .env("PATH", machine_path(dir))
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")

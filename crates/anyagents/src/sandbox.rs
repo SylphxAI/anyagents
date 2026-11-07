@@ -95,6 +95,7 @@ pub fn is_isolated_test_env() -> bool {
         || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
         || std::env::var_os("ANYAGENTS_HARNESS_BIN").is_some()
         || std::env::var_os("ANYAGENTS_CLAUDE_BIN").is_some()
+        || std::env::var_os("ANYAGENTS_CLAUDE_CODE_BIN").is_some()
         || std::env::var_os("ANYAGENTS_CODEX_BIN").is_some()
         || std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_some()
         || std::env::var_os("CARGO_TARGET_TMPDIR").is_some()
