@@ -560,9 +560,12 @@ A Spiron `steer_ack` proves socket acceptance, not journal commit. AnyAgents
 keeps that message in its durable mailbox until the owner's terminal `result`
 confirms completion without `undelivered_steers`. A terminal nonempty or malformed
 `undelivered_steers` receipt retains steering custody, records a reconciliation
-fault, and writes an ID-only `spiron-unconfirmed-steers.json` hold in the agent's
-config directory. The hold survives child/coordinator restart; the adapter neither
-marks the steer finished nor silently replays potentially side-effecting work.
+fault, and retains the ID-only `spiron-unconfirmed-steers.json` hold written in
+its config directory before any input bytes are dispatched. A returned hold-write
+error refuses the unsent input without advancing its mailbox cursor; confirmed
+terminal completion clears the hold. The hold survives child/coordinator restart;
+the adapter neither marks the steer finished nor silently replays potentially
+side-effecting work.
 The original message remains in the mailbox. Reconcile the named turn/input
 against the external session journal and any completed effects before removing
 the hold and resuming; removing it without reconciliation can duplicate effects.

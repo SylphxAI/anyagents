@@ -214,6 +214,10 @@ for line in sys.stdin:
                 turn_finished: true
             }
         );
+        assert!(
+            !config.join("spiron-unconfirmed-steers.json").exists(),
+            "confirmed terminal completion releases the pre-dispatch hold"
+        );
         assert_eq!(vendor.served_usage().input_tokens, 11);
         assert_eq!(vendor.served_usage().cache_read_tokens, 3);
         assert_eq!(vendor.served_usage().cache_write_tokens, 2);
@@ -478,6 +482,119 @@ for line in sys.stdin:
             .sign_in_fault
             .unwrap()
             .contains("Reconcile")
+    );
+}
+
+#[test]
+fn spiron_external_hold_write_failure_refuses_unsent_steer_and_restart_keeps_custody() {
+    use anyagents_agent::DeliveryLoop;
+    let temp = tempfile::tempdir().unwrap();
+    let script = r#"
+import sys,json,pathlib
+for line in sys.stdin:
+ m=json.loads(line)
+ with pathlib.Path(__file__).with_name('wire.jsonl').open('a') as out:
+  out.write(json.dumps(m)+'\n')
+ print(json.dumps({'type':'accepted','request_id':m['request_id']}),flush=True)
+"#;
+    let (store, agent, harness) = external_probe(temp.path(), script);
+    let ReceiveOutcome::New(first) = store.receive(&agent.id, Incoming::new("first")).unwrap()
+    else {
+        panic!("fresh mailbox message expected")
+    };
+    let mut delivery = DeliveryLoop::start(
+        store,
+        agent.id.clone(),
+        VendorHarness::Spiron(
+            Box::new(harness),
+            temp.path().join("config/spiron-session-id"),
+        ),
+    )
+    .unwrap();
+    eventually(|| {
+        delivery.run_once().unwrap();
+        delivery.store().delivered_cursor(&agent.id).unwrap() == first.seq
+    });
+    let ReceiveOutcome::New(steer) = delivery
+        .store()
+        .receive(&agent.id, Incoming::new("steering work"))
+        .unwrap()
+    else {
+        panic!("fresh mailbox message expected")
+    };
+    // A missing configured directory deterministically returns NotFound even
+    // under root. Existing accepted work and its hold remain in the moved dir;
+    // only the hold write for the new input fails (no chmod/ENOSPC assumptions).
+    let config = temp.path().join("config");
+    let offline = temp.path().join("offline-config");
+    std::fs::rename(&config, &offline).unwrap();
+    let error = delivery.run_once().unwrap_err();
+    assert!(
+        matches!(error, anyagents_agent::Error::HarnessFailed(ref reason)
+        if reason.contains("cannot persist Spiron input hold before dispatch")),
+        "{error}"
+    );
+    assert_eq!(
+        delivery.store().delivered_cursor(&agent.id).unwrap(),
+        first.seq
+    );
+    assert!(
+        delivery
+            .store()
+            .message(&agent.id, steer.id.as_str())
+            .unwrap()
+            .unwrap()
+            .delivered_at_ms
+            .is_none()
+    );
+    let wire = temp.path().join("wire.jsonl");
+    assert_eq!(std::fs::read_to_string(&wire).unwrap().lines().count(), 1);
+    assert!(offline.join("spiron-unconfirmed-steers.json").exists());
+    drop(delivery);
+    std::fs::rename(&offline, &config).unwrap();
+
+    let store = Store::open(temp.path().join("state.db")).unwrap();
+    let restarted = start_spiron(
+        &temp.path().join("peer"),
+        &config,
+        &temp.path().join("work"),
+        &agent,
+        None,
+        &[],
+    )
+    .unwrap();
+    let mut restarted = DeliveryLoop::start(
+        store,
+        agent.id.clone(),
+        VendorHarness::Spiron(Box::new(restarted), config.join("spiron-session-id")),
+    )
+    .unwrap();
+    restarted.run_once().unwrap();
+    assert_eq!(
+        restarted.store().delivered_cursor(&agent.id).unwrap(),
+        first.seq
+    );
+    assert_eq!(
+        restarted
+            .store()
+            .next_undelivered(&agent.id)
+            .unwrap()
+            .unwrap()
+            .id,
+        steer.id
+    );
+    assert!(
+        restarted
+            .harness()
+            .health()
+            .sign_in_fault
+            .unwrap()
+            .contains("Reconcile")
+    );
+    assert_eq!(
+        std::fs::read_to_string(wire).unwrap().lines().count(),
+        1,
+        "fresh real delivery loop cannot resend unreconciled input"
     );
 }
 

@@ -675,6 +675,25 @@ impl StreamHarness {
                         generation,
                     ));
                 } else {
+                    if self.spec.protocol == LineProtocol::AcknowledgedResult
+                        && let Some(dir) = &state.state_dir
+                    {
+                        // Record uncertainty BEFORE exposing any bytes. If this
+                        // fails, the mailbox still owns a provably unsent input.
+                        let turn = state.open.first().unwrap_or(&message.id);
+                        let mut ids: Vec<_> = state.open.iter().collect();
+                        ids.push(&message.id);
+                        if let Err(error) = std::fs::write(
+                            dir.join("spiron-unconfirmed-steers.json"),
+                            json!({"turn_id": turn, "request_ids": ids}).to_string(),
+                        ) {
+                            let reason = format!(
+                                "cannot persist Spiron input hold before dispatch: {error}"
+                            );
+                            state.sign_in_fault = Some(reason.clone());
+                            return Err(HarnessError::Failed(reason));
+                        }
+                    }
                     // Associate even an immediate result with its owner before the
                     // first byte is visible to the child. This is not acceptance.
                     if state.open.is_empty() {
@@ -1585,12 +1604,8 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
         .collect();
     if unconfirmed {
         state.unconfirmed = true;
-        if let Some(dir) = &state.state_dir {
-            // IDs only: the original messages stay in the durable mailbox.
-            // Conservatively hold every steer if the peer supplies no IDs.
-            let _ = std::fs::write(dir.join("spiron-unconfirmed-steers.json"),
-                json!({"turn_id": turn, "request_ids": ids.iter().filter(|id| id.as_str() != turn).collect::<Vec<_>>()}).to_string());
-        }
+        // The pre-dispatch hold already exists. No terminal write (which could
+        // fail after effects became uncertain) is required to retain custody.
     }
     for id in ids {
         if unconfirmed && id != turn {
@@ -1607,6 +1622,16 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirme
                 TurnUsage::default()
             },
         ));
+    }
+    if !state.unconfirmed
+        && state.open.is_empty()
+        && state.followups.is_empty()
+        && let Some(dir) = &state.state_dir
+        && let Err(error) = std::fs::remove_file(dir.join("spiron-unconfirmed-steers.json"))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        state.unconfirmed = true;
+        state.sign_in_fault = Some(format!("cannot clear confirmed Spiron input hold: {error}"));
     }
 }
 
