@@ -272,9 +272,12 @@ if (typeof document !== 'undefined') {
   document.addEventListener('paste', e => {
     if (!remoteTarget(e.target) || completed) return;
     e.preventDefault();
-    if (e.isTrusted && pendingPaste && performance.now() - pendingPaste.at < 500) {
-      if (pendingPaste.inserted) return;
-      pendingPaste.inserted = true;
+    // One native paste consumes one shortcut turn, regardless of trust.
+    // Later Paste-menu actions must not be swallowed by a timing window.
+    const attempt = pendingPaste; pendingPaste = null;
+    if (attempt) {
+      if (attempt.inserted) return;
+      attempt.inserted = true;
     }
     pasteText(e.clipboardData?.getData('text/plain') || '').catch(reconnect);
   });
@@ -290,7 +293,7 @@ if (typeof document !== 'undefined') {
     // The paste event carries the real local clipboard. Forwarding keydown
     // as well would insert twice or type a literal 'v'.
     if (shortcut && key === 'v') {
-      const attempt = pendingPaste = { inserted: false, at: performance.now() };
+      const attempt = pendingPaste = { inserted: false };
       // Begin the permission-sensitive read inside the gesture, but let the
       // native paste event win. Neither path may insert a second time.
       const read = navigator.clipboard?.readText?.().then(text => ({ text }), error => ({ error }));
@@ -311,6 +314,10 @@ if (typeof document !== 'undefined') {
     sendWithFocus({ type: 'key', key: e.key, modifiers: modifiers(e), commands: shortcut && key === 'a' ? ['selectAll'] : [] }).catch(reconnect);
   }
   window.addEventListener('keydown', remoteKey);
+  // Native shortcut paste fires before keyup. End an unmatched fallback turn
+  // here too, so a later OS/menu paste remains an independent action.
+  window.addEventListener('keyup', e => { if (e.key.toLowerCase() === 'v') pendingPaste = null; });
+  window.addEventListener('blur', () => { pendingPaste = null; });
   canvas.focus({ preventScroll: true });
   proxy.addEventListener('compositionstart', () => { composing = true; });
   function commit() {

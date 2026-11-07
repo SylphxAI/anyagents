@@ -189,6 +189,7 @@ try {
     await writeFile(path.join(output,'clipboard-result.json'),JSON.stringify({passed:true,viewports:2,nativePaste:true,copy:true,cut:true,tab:true,overlay:true,passwordGuard:true}));
     console.log(JSON.stringify({passed:true,clipboard:true,screenshots:output}));
   } else {
+  await remote.eval(`window.geometryReleases=0;document.addEventListener('mouseup',()=>window.geometryReleases++)`);
   for (const [width, height] of [[390, 844], [588, 1280], [1280, 800], [1440, 900]]) {
     await viewer.call('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width < 700 });
     await viewer.call('Emulation.setTouchEmulationEnabled', { enabled: width < 700 });
@@ -212,9 +213,13 @@ try {
         await touch('touchStart', [[width/2-40,height/2],[width/2+40,height/2]]);
         await touch('touchMove', [[width/2-100,height/2],[width/2+100,height/2]]);
         await touch('touchEnd', []);
+        const releases = await remote.eval('window.geometryReleases');
         await touch('touchStart', [[width/2,height/2]]);
         await touch('touchMove', [[width/2-25,height/2-30]]);
         await touch('touchEnd', []);
+        // Viewer CDP delivery precedes the queued remote release/click. Drain
+        // this drag before taking the next tap's click-log baseline.
+        await until(() => remote.eval(`window.geometryReleases === ${releases+1}`), 'remote drag release');
       } else {
         // Desktop trackpad zoom retains remote mouse input and wheel scroll.
         await viewer.call('Input.dispatchMouseEvent', { type: 'mouseWheel', x: width/2, y: height/2, deltaX: 0, deltaY: -100, modifiers: 2 });
@@ -226,7 +231,7 @@ try {
       else { await viewer.call('Input.dispatchMouseEvent', { type: 'mousePressed', button: 'left', buttons: 1, clickCount: 1, ...local }); await viewer.call('Input.dispatchMouseEvent', { type: 'mouseReleased', button: 'left', buttons: 0, clickCount: 1, ...local }); }
       await until(async () => (await remote.eval('window.clicks.length')) > before, 'remote click log');
       const actual = await remote.eval('window.clicks.at(-1)');
-      assert.equal(actual.target, 'target'); assert.equal(actual.trusted, true);
+      assert.equal(actual.target, 'target', JSON.stringify({width,height,dpr,actual,expected})); assert.equal(actual.trusted, true);
       assert.ok(Math.abs(actual.x - expected.x) <= 2 && Math.abs(actual.y - expected.y) <= 2, JSON.stringify({actual,expected}));
       const frameState = await api('/state');
       logs.push({width,height,dpr,naturalWidth:frameState.natural_width,naturalHeight:frameState.natural_height,remoteViewport:frameState.viewport,expected,actual});
@@ -330,7 +335,7 @@ try {
       return 'failure.png';
     });
   }
-  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,trajectory:window.trajectory,wheelHistory:window.wheelHistory,scrollTop:document.querySelector('#scrollbox')?.scrollTop})`));
+  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,clicks:window.clicks,trajectory:window.trajectory,wheelHistory:window.wheelHistory,scrollTop:document.querySelector('#scrollbox')?.scrollTop})`));
   try { await writeFile(path.join(output,'failure.json'),JSON.stringify(evidence,null,2)); }
   catch (failure) { console.error('could not retain failure evidence',failure); }
   console.error('acceptance failure evidence',JSON.stringify(evidence));

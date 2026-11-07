@@ -138,3 +138,39 @@ test('a second finger disarms the undecided single-touch timer', async () => {
   ui.pointer('pointerup', 1); ui.pointer('pointerup', 2);
   await ui.settle(); assert.deepEqual(ui.inputs, []);
 });
+
+for (const isTrusted of [true, false]) test(`two independent paste events each insert once (trusted=${isTrusted})`, async () => {
+  const ui = await mount();
+  const target = ui.element('keyboard-proxy'); target.focus();
+  ui.window.emit('keydown', { target, key: 'v', ctrlKey: true });
+  ui.document.emit('paste', { target, isTrusted, clipboardData: { getData: () => 'first paste' } });
+  await ui.settle();
+  ui.document.emit('paste', { target, isTrusted, clipboardData: { getData: () => 'second paste' } });
+  await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p => p.type === 'paste').map(p => p.text), ['first paste', 'second paste']);
+});
+
+for (const nativeFirst of [true, false]) test(`one shortcut turn pairs native paste and fallback (native first=${nativeFirst})`, async () => {
+  const ui = await mount();
+  const target = ui.element('keyboard-proxy'); target.focus();
+  ui.window.emit('keydown', { target, key: 'v', ctrlKey: true });
+  const fallback = [...ui.timers.values()].find(timer => timer.ms === 0);
+  const native = () => ui.document.emit('paste', { target, isTrusted: true, clipboardData: { getData: () => 'native paste' } });
+  if (nativeFirst) { native(); await fallback.fn(); } else { await fallback.fn(); native(); }
+  await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p => p.type === 'paste').map(p => p.text), ['native paste']);
+  ui.document.emit('paste', { target, isTrusted: true, clipboardData: { getData: () => 'next paste' } });
+  await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p => p.type === 'paste').map(p => p.text), ['native paste', 'next paste']);
+});
+
+test('keyup ends a shortcut turn when only its clipboard fallback ran', async () => {
+  const ui = await mount();
+  const target = ui.element('keyboard-proxy'); target.focus();
+  ui.window.emit('keydown', { target, key: 'v', metaKey: true });
+  await [...ui.timers.values()].find(timer => timer.ms === 0).fn();
+  ui.window.emit('keyup', { target, key: 'v', metaKey: true });
+  ui.document.emit('paste', { target, isTrusted: true, clipboardData: { getData: () => 'menu paste' } });
+  await ui.settle();
+  assert.deepEqual(ui.inputs.filter(p => p.type === 'paste').map(p => p.text), ['native paste', 'menu paste']);
+});
