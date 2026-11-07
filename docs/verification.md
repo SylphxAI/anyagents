@@ -116,8 +116,26 @@ On touch devices the native keyboard input overlays the remote field and tracks
 its position through zoom and pan, so the device's Paste menu works in place.
 No typed or pasted text is returned in input acknowledgements.
 
-`takeover_clipboard_ui_acceptance` runs the Chromium viewer clipboard and
-keyboard regressions in the ordinary native suite when Chromium is available.
+`takeover_clipboard_ui_acceptance` covers the Chromium viewer clipboard and
+keyboard regressions. It is temporarily quarantined by #118: Linux jobs
+128295856130 (PR #114, run 42336924651) and 128298493004 (PR #115, run
+42337744143) failed before the driver ran because the CDP port did not open
+within the existing 12-second startup budget. Their discarded Chromium logs
+cannot distinguish delayed startup from a crash. The startup path now waits
+for a valid `/json/version` response under that same 12-second ceiling and
+reports the last readiness failure, original child exit status, cleanup status,
+and the final 8192 bytes of Chromium stdout/stderr. Deterministic controls cover
+a TCP listener with incomplete/error responses before readiness, early exit,
+stalled HTTP, missing logs and non-UTF-8 log tails. These controls improve
+readiness and diagnosis; they do not establish the cause of those CI failures.
+Keep the quarantine until captured failure evidence supports a causal repair.
+Run the fixture explicitly for takeover changes:
+
+```sh
+cargo test -p anyagents --bin anyagents --locked \
+  browser::tests::takeover_clipboard_ui_acceptance -- --ignored --exact --nocapture
+```
+
 The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
 copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
 export denial. The viewer starts in a dedicated process group. Teardown signals

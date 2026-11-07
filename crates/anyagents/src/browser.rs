@@ -605,24 +605,17 @@ fn ensure_browser_running(
         }
     }
 
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|err| Error::Message(format!("failed to launch chromium: {err}")))?;
     let pid = child.id();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(12);
-    while std::time::Instant::now() < deadline {
-        if cdp_port_alive(port) {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(80));
-    }
-    if !cdp_port_alive(port) {
-        stop_process_group(pid);
-        return Err(Error::Message(format!(
-            "chromium did not open CDP port {port} within 12s"
-        )));
-    }
+    wait_for_chromium_cdp(
+        &mut child,
+        port,
+        &dir.join("browser.log"),
+        Duration::from_secs(12),
+    )?;
 
     let now = now_ms();
     let state = BrowserRuntimeState {
@@ -637,6 +630,103 @@ fn ensure_browser_running(
     };
     save_runtime(data, &state);
     Ok((state, fp))
+}
+
+/// A TCP listener alone can precede DevTools initialization. Probe the actual
+/// endpoint under the remaining startup budget, never an unbounded HTTP read.
+fn chromium_cdp_ready(port: u16, timeout: Duration) -> Result<(), String> {
+    let agent = ureq::Agent::config_builder()
+        .proxy(None)
+        .timeout_global(Some(timeout))
+        .max_redirects(0)
+        .build()
+        .new_agent();
+    let mut response = agent
+        .get(format!("http://127.0.0.1:{port}/json/version"))
+        .call()
+        .map_err(|err| err.to_string())?;
+    if response.status().as_u16() != 200 {
+        return Err(format!(
+            "DevTools version HTTP status {}",
+            response.status()
+        ));
+    }
+    let text = response
+        .body_mut()
+        .with_config()
+        .limit(16_384)
+        .read_to_string()
+        .map_err(|err| err.to_string())?;
+    let version: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "invalid DevTools version JSON".to_string())?;
+    if version["Browser"].as_str().is_some_and(|v| !v.is_empty())
+        && version["webSocketDebuggerUrl"]
+            .as_str()
+            .is_some_and(|url| url.starts_with(&format!("ws://127.0.0.1:{port}/devtools/browser/")))
+    {
+        Ok(())
+    } else {
+        Err("DevTools version response is not ready".to_string())
+    }
+}
+
+fn browser_startup_log_tail(path: &Path) -> String {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return "<browser log unavailable>".to_string();
+    };
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let _ = file.seek(SeekFrom::Start(length.saturating_sub(8192)));
+    let mut bytes = Vec::new();
+    match file.take(8192).read_to_end(&mut bytes) {
+        Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(err) => format!("<browser log unreadable: {err}>"),
+    }
+}
+
+fn wait_for_chromium_cdp(
+    child: &mut std::process::Child,
+    port: u16,
+    log_path: &Path,
+    timeout: Duration,
+) -> Result<(), Error> {
+    let started = std::time::Instant::now();
+    let deadline = started + timeout;
+    let mut last_probe = "not attempted".to_string();
+    let reason = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break format!("Chromium exited before CDP readiness: {status}"),
+            Err(err) => break format!("could not inspect Chromium exit status: {err}"),
+            Ok(None) => {}
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break format!(
+                "Chromium CDP startup timed out after {}ms",
+                timeout.as_millis()
+            );
+        }
+        match chromium_cdp_ready(port, remaining.min(Duration::from_millis(250))) {
+            Ok(()) => return Ok(()),
+            Err(err) => last_probe = err,
+        }
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(std::time::Instant::now())
+                .min(Duration::from_millis(80)),
+        );
+    };
+    // Read the exit before cleanup so our termination signal cannot be mistaken
+    // for the cause of a startup failure. Reap the launched child after cleanup.
+    let before_cleanup = format!("{:?}", child.try_wait());
+    stop_process_group(child.id());
+    let after_cleanup = format!("{:?}", child.wait());
+    Err(Error::Message(format!(
+        "{reason}; port={port}; elapsed={}ms; before_cleanup={before_cleanup}; \
+         after_cleanup={after_cleanup}; last_probe={last_probe}; browser.log tail:\n{}",
+        started.elapsed().as_millis(),
+        browser_startup_log_tail(log_path)
+    )))
 }
 
 fn stop_process_group(pid: u32) {
@@ -4624,6 +4714,131 @@ mod tests {
     use anyagents_core::{CredentialStore, FileCredentialStore};
     use std::io::{Read, Write};
     use std::net::TcpListener;
+
+    #[cfg(unix)]
+    fn startup_test_child(log: &Path, command: &str) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        Command::new("sh")
+            .args(["-c", command])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(log).unwrap()))
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chromium_startup_waits_for_version_endpoint_and_preserves_live_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("browser.log");
+        let mut child = startup_test_child(&log, "exec sleep 30");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = std::thread::spawn(move || {
+            for attempt in 0..3 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                let mut request = [0; 1024];
+                let size = stream.read(&mut request).unwrap();
+                assert!(
+                    String::from_utf8_lossy(&request[..size]).starts_with("GET /json/version ")
+                );
+                // TCP is already open; neither a valid but incomplete response
+                // nor an HTTP error with otherwise valid JSON means ready.
+                let body = if attempt == 0 {
+                    "{}".to_string()
+                } else {
+                    format!(
+                        r#"{{"Browser":"Chrome/test","webSocketDebuggerUrl":"ws://127.0.0.1:{port}/devtools/browser/test"}}"#
+                    )
+                };
+                let status = if attempt == 1 {
+                    "503 Not Ready"
+                } else {
+                    "200 OK"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            }
+        });
+        let result = wait_for_chromium_cdp(&mut child, port, &log, Duration::from_secs(3));
+        let running = child.try_wait().unwrap().is_none();
+        stop_process_group(child.id());
+        child.wait().unwrap();
+        result.unwrap();
+        assert!(running, "successful readiness must not terminate Chromium");
+        endpoint.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chromium_startup_reports_original_exit_and_stderr_without_waiting_for_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("browser.log");
+        let mut child = startup_test_child(&log, "echo startup-crash-sentinel >&2; exit 23");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let started = std::time::Instant::now();
+        let err = wait_for_chromium_cdp(&mut child, port, &log, Duration::from_secs(10))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("exited before CDP readiness: exit status: 23"),
+            "{err}"
+        );
+        assert!(err.contains("startup-crash-sentinel"), "{err}");
+        assert!(err.contains("before_cleanup=Ok(Some("), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn chromium_startup_bounds_stalled_http_and_distinguishes_our_cleanup_signal() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("browser.log");
+        let mut child = startup_test_child(&log, "echo startup-stall-sentinel >&2; exec sleep 30");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let endpoint = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(500));
+            drop(stream);
+        });
+        let started = std::time::Instant::now();
+        let err = wait_for_chromium_cdp(&mut child, port, &log, Duration::from_millis(100))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("startup timed out after 100ms"), "{err}");
+        assert!(err.contains("before_cleanup=Ok(None)"), "{err}");
+        assert!(err.contains("startup-stall-sentinel"), "{err}");
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "timed-out child must be reaped"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        endpoint.join().unwrap();
+    }
+
+    #[test]
+    fn chromium_startup_log_tail_is_bounded_and_handles_missing_or_non_utf8_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("browser.log");
+        assert_eq!(browser_startup_log_tail(&log), "<browser log unavailable>");
+        let mut bytes = vec![b'x'; 20_000];
+        bytes.extend_from_slice(b"tail-sentinel\xff");
+        std::fs::write(&log, bytes).unwrap();
+        let tail = browser_startup_log_tail(&log);
+        assert!(tail.ends_with("tail-sentinel\u{fffd}"));
+        assert!(tail.len() <= 8194);
+    }
 
     fn spawn_html_server(bind_ip: &str, html: String) -> u16 {
         let listener = TcpListener::bind(format!("{bind_ip}:0")).expect("bind local test server");
