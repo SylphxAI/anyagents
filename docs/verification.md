@@ -140,3 +140,21 @@ Set `TAKEOVER_GOOGLE_ACCEPTANCE=1` for the additional network-dependent,
 unauthenticated `accounts.google.com` phone-layout captures. No credentials are
 entered. This is separate from the deterministic local fixture and does not
 certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
+
+### Cross-seat worktree permission boundary
+
+The Linux CI `Cross-seat worktree writes` step runs
+`create::tests::privileged_cross_uid_spawn_can_create_commit_and_status` with
+`ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1`. It creates three real OS users:
+A provisions B, B commits, A still writes B-created Git content and commits using
+an explicit protected hooks path. B cannot write common config/hooks/info,
+write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
+its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
+Archive immediately revokes B's common-store access while preserving its external
+checkout bytes; reap is idempotent and C remains admitted. A separate post-sharing
+admission failure verifies rollback revocation. ACL readbacks cover every changed
+object. A missing privilege is an explicit local skip, never the CI acceptance:
+the required environment flag makes a privilege skip fail.
+
+Shared refs are intentionally writable within one repository. These checks do not
+claim branch-tip integrity for arbitrary agent shell commits or pushes.

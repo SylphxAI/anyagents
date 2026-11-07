@@ -216,11 +216,23 @@ honoured or refused, never replaced by the default directory. Before an agent
 becomes running, its execution seat must be able to write and traverse its
 working tree, the per-worktree Git directory and the common objects/refs
 storage, and create lock files. New worktrees are shared with that seat's group.
-Git metadata uses additive named POSIX ACLs and matching default ACLs on Linux,
-so granting another child access does not replace existing owners or group grants.
-New objects inherit access for both seats. An ACL write or readback failure refuses
-the spawn with a typed permission error; non-Linux hosts accept only already-permitted
-metadata access. Existing explicit directories are
+On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
+`logs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
+The common root and `worktrees/` are traversal-only with no default ACLs; defaults
+exist only inside the shared content subtrees and the private gitdir, preserving
+both seats on future writes without admitting a child to sibling metadata.
+Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
+private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
+`gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
+Shared refs remain a same-repository integrity boundary: a child can move another
+branch ref. This is not hostile-repository isolation, and AnyAgents does not
+intercept arbitrary harness commit/push commands or provide a branch-tip guard.
+A server-owned grant journal is written before sharing. Archive, reap and failed
+admission revoke the seat's named group/user ACL entries and defaults through
+opened descriptors, read the result back, and retain the journal on failure.
+Revocation runs even when dirty or external checkout bytes must be retained.
+An ACL write or readback failure is a typed permission error; non-Linux hosts
+accept only already-permitted metadata access. Existing explicit directories are
 validated without rewriting their permissions. Sharing does not follow symlinks
 or alter hard-linked files that require permission changes.
 

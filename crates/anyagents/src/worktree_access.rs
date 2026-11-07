@@ -17,7 +17,13 @@ fn git_dirs(path: &Path) -> Result<Vec<PathBuf>, Error> {
     let mut dirs = Vec::new();
     for flag in ["--git-dir", "--git-common-dir"] {
         let out = std::process::Command::new("git")
-            .arg("-C")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-C",
+            ])
             .arg(path)
             .args(["rev-parse", "--path-format=absolute", flag])
             .output()
@@ -33,17 +39,295 @@ fn git_dirs(path: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(dirs)
 }
 
-/// Change only opened objects, never a symlink's target. Hard-linked files that
-/// need changes are refused rather than changing an object outside this tree.
-pub(crate) fn share(path: &Path, gid: u32) -> Result<(), Error> {
+/// The journal lives under the server-owned data directory, outside the seat's
+/// config/worktree. Persist it before granting anything so partial admission can
+/// always revoke, even if the checkout or its .git pointer later disappears.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Grant {
+    common: PathBuf,
+    gid: u32,
+    uid: u32,
+    private: PathBuf,
+    checkout: PathBuf,
+    active: bool,
+}
+
+pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
+    data.join("worktree-grants").join(format!("{id}.json"))
+}
+
+pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
+    let journal = grant_path(data, id);
+    let bytes = match std::fs::read(&journal) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(refusal(&journal, e)),
+    };
+    let mut grant: Grant = serde_json::from_slice(&bytes).map_err(|e| refusal(&journal, e))?;
+    if !grant.active {
+        return Ok(());
+    }
+    revoke_common(&grant.common, grant.uid, grant.gid).map_err(|e| refusal(&grant.common, e))?;
+    grant.active = false;
+    write_grant(&journal, &grant).map_err(|e| refusal(&journal, e))
+}
+
+fn write_grant(journal: &Path, grant: &Grant) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::create_dir_all(journal.parent().unwrap())?;
+    let temporary = journal.with_extension(format!("{}.tmp", anyagents_core::AgentId::generate()));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temporary)?;
+    file.write_all(&serde_json::to_vec(grant)?)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, journal)
+}
+
+fn revoke_common(common: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    walk_tree(common, false, &|_| {}, &|file, _| {
+        update_metadata_acl(file, gid, None, false, Some(uid))
+    })
+}
+
+/// Change only opened objects, never a symlink's target. Metadata sharing is an
+/// allowlist: the common store and worktrees/ are traversal-only, never writable
+/// or default-ACL parents. Only shared content and this seat's private gitdir
+/// receive write grants; sibling metadata, config, hooks and info stay protected.
+pub(crate) fn share(path: &Path, uid: u32, gid: u32, journal: &Path) -> Result<(), Error> {
     let dirs = git_dirs(path)?;
     share_tree(path, gid).map_err(|e| refusal(path, e))?;
-    for root in &dirs {
-        // The common store can serve other agents. Never replace a distinct
-        // group's existing grant just to make the newest child writable.
-        share_tree_with_hook(root, gid, true, &|_| {}).map_err(|e| refusal(root, e))?;
+    let Some(common) = dirs.last() else {
+        return Ok(());
+    };
+    let private = &dirs[0];
+    // A single-principal ordinary checkout needs no cross-seat metadata grant.
+    // Cross-seat sharing is supported only for linked worktrees.
+    if private == common {
+        if uid == crate::sandbox::server_uid() && gid == crate::sandbox::server_gid() {
+            return Ok(());
+        }
+        return Err(refusal(
+            path,
+            "cross-seat sharing requires a linked Git worktree",
+        ));
+    }
+    if private.parent() != Some(common.join("worktrees").as_path()) {
+        return Err(refusal(
+            path,
+            "private gitdir is not a direct common/worktrees child",
+        ));
+    }
+    share_known(path, private, common, uid, gid, journal)
+}
+
+/// A direct wake can restore a retained dirty checkout's grant, but only from
+/// the server's recorded metadata paths, never a child-editable .git pointer.
+pub(crate) fn restore_recorded(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
+    let journal = grant_path(data, id);
+    let bytes = match std::fs::read(&journal) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(refusal(&journal, e)),
+    };
+    let grant: Grant = serde_json::from_slice(&bytes).map_err(|e| refusal(&journal, e))?;
+    if grant.active || !grant.checkout.join(".git").exists() {
+        return Ok(());
+    }
+    share_known(
+        &grant.checkout,
+        &grant.private,
+        &grant.common,
+        grant.uid,
+        grant.gid,
+        &journal,
+    )
+}
+
+fn share_known(
+    path: &Path,
+    private: &Path,
+    common: &Path,
+    uid: u32,
+    gid: u32,
+    journal: &Path,
+) -> Result<(), Error> {
+    write_grant(
+        journal,
+        &Grant {
+            common: common.to_path_buf(),
+            gid,
+            uid,
+            private: private.to_path_buf(),
+            checkout: path.to_path_buf(),
+            active: true,
+        },
+    )
+    .map_err(|e| refusal(journal, e))?;
+    // Clear any legacy broad grants/defaults for this seat before the allowlist.
+    revoke_common(common, uid, gid).map_err(|e| refusal(common, e))?;
+    for root in [common.to_path_buf(), common.join("worktrees")] {
+        with_directory(&root, &|file| {
+            restrict_others(file)?;
+            clear_default_acl(file)?;
+            update_metadata_acl(file, gid, Some(1), false, None)
+        })
+        .map_err(|e| refusal(&root, e))?;
+    }
+    for name in ["objects", "refs", "logs", "packed-refs"] {
+        let root = common.join(name);
+        if root.exists() {
+            walk_tree(&root, false, &|_| {}, &|file, _| {
+                grant_metadata_acl(file, gid)
+            })
+            .map_err(|e| refusal(&root, e))?;
+        }
+    }
+    // Config is readable but never writable. A common 0600 config must still
+    // work without granting write access or exposing it to unrelated seats.
+    for name in ["config", "HEAD"] {
+        let root = common.join(name);
+        if root.exists() {
+            walk_tree(&root, false, &|_| {}, &|file, _| {
+                update_metadata_acl(file, gid, Some(4), false, None)
+            })
+            .map_err(|e| refusal(&root, e))?;
+        }
+    }
+    protect_private_gitdir(private, uid, gid).map_err(|e| refusal(private, e))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn with_directory(
+    path: &Path,
+    apply: &dyn Fn(&std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    // walk_tree binds its callback to no-follow descriptors. Do not descend.
+    walk_tree_depth(path, false, &|_| {}, &|f, _| apply(f), false)
+}
+
+#[cfg(target_os = "linux")]
+fn clear_default_acl(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::fremovexattr(file.as_raw_fd(), c"system.posix_acl_default".as_ptr()) } != 0
+        && std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA)
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    if unsafe {
+        libc::fgetxattr(
+            file.as_raw_fd(),
+            c"system.posix_acl_default".as_ptr(),
+            std::ptr::null_mut(),
+            0,
+        )
+    } >= 0
+        || std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA)
+    {
+        return Err(std::io::Error::other(
+            "default ACL removal readback differs",
+        ));
     }
     Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn clear_default_acl(_file: &std::fs::File) -> std::io::Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_others(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+    let meta = file.metadata()?;
+    if !meta.is_dir() && meta.nlink() != 1 {
+        return Err(std::io::Error::other(
+            "refusing permission changes to a hard-linked file",
+        ));
+    }
+    let mode = meta.mode() & 0o7777 & !0o007;
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if file.metadata()?.mode() & 7 != 0 {
+        return Err(std::io::Error::other("other-permission readback differs"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn protect_private_gitdir(private: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    use std::os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    // Sticky + a parent-owned sentinel prevents unlink/rename as well as direct
+    // writes. Merely chmod-ing config.worktree read-only would be insufficient.
+    let config = private.join("config.worktree");
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&config)?;
+    if f.metadata()?.nlink() != 1
+        || f.metadata()?.uid() == uid && uid != crate::sandbox::server_uid()
+    {
+        return Err(std::io::Error::other(
+            "untrusted config.worktree owner or links",
+        ));
+    }
+    update_metadata_acl(&f, gid, Some(4), false, None)?;
+    walk_tree(private, false, &|_| {}, &|file, path| {
+        restrict_others(file)?;
+        if path == config
+            || path.parent() == Some(private)
+                && matches!(
+                    path.file_name().and_then(|n| n.to_str()),
+                    Some("commondir" | "gitdir")
+                )
+        {
+            return update_metadata_acl(file, gid, Some(4), false, None);
+        }
+        grant_metadata_acl(file, gid)?;
+        let meta = file.metadata()?;
+        if path == private {
+            if meta.uid() == uid && uid != crate::sandbox::server_uid() {
+                return Err(std::io::Error::other(
+                    "private gitdir must remain parent-owned",
+                ));
+            }
+            if unsafe { libc::fchmod(file.as_raw_fd(), (meta.mode() & 0o7777) | 0o1000) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if file.metadata()?.mode() & 0o1000 == 0 {
+                return Err(std::io::Error::other("sticky readback differs"));
+            }
+        } else if path.parent() == Some(private)
+            && !meta.is_dir()
+            && !matches!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some("commondir" | "gitdir")
+            )
+        {
+            // Git replaces HEAD/index through lock+rename. They must belong to
+            // B in a sticky parent; A retains its additive named-user ACL.
+            if meta.uid() != uid && unsafe { libc::fchown(file.as_raw_fd(), uid, u32::MAX) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if file.metadata()?.uid() != uid {
+                return Err(std::io::Error::other(
+                    "private metadata owner readback differs",
+                ));
+            }
+        }
+        Ok(())
+    })
 }
 
 #[cfg(unix)]
@@ -58,6 +342,61 @@ fn share_tree_with_hook(
     preserve_group_grants: bool,
     before_open: &dyn Fn(&Path),
 ) -> std::io::Result<()> {
+    walk_tree(path, !preserve_group_grants, before_open, &|file, path| {
+        if preserve_group_grants {
+            return grant_metadata_acl(file, gid);
+        }
+        use std::os::{fd::AsRawFd, unix::fs::MetadataExt};
+        let meta = file.metadata()?;
+        let fd = file.as_raw_fd();
+        let mode = meta.mode() & 0o7777;
+        let desired = if meta.is_dir() {
+            mode | 0o2770
+        } else {
+            mode | 0o0660
+        };
+        if !meta.is_dir() && meta.nlink() > 1 && (meta.gid() != gid || mode != desired) {
+            return Err(std::io::Error::other(format!(
+                "{}: refusing permission changes to a hard-linked file",
+                path.display()
+            )));
+        }
+        if meta.gid() != gid && unsafe { libc::fchown(fd, u32::MAX, gid) } != 0 {
+            return Err(std::io::Error::other(format!(
+                "{}: chgrp to {gid}: {}",
+                path.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        if mode != desired && unsafe { libc::fchmod(fd, desired as libc::mode_t) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let after = file.metadata()?;
+        if after.gid() != gid || after.mode() & 0o7777 != desired {
+            return Err(std::io::Error::other("permission readback differs"));
+        }
+        Ok(())
+    })
+}
+
+#[cfg(unix)]
+fn walk_tree(
+    path: &Path,
+    skip_git: bool,
+    before_open: &dyn Fn(&Path),
+    apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    walk_tree_depth(path, skip_git, before_open, apply, true)
+}
+
+#[cfg(unix)]
+fn walk_tree_depth(
+    path: &Path,
+    skip_git: bool,
+    before_open: &dyn Fn(&Path),
+    apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
+    descend: bool,
+) -> std::io::Result<()> {
     use std::os::fd::{AsRawFd, FromRawFd};
     let canonical = std::fs::canonicalize(path)?;
     let mut file = std::fs::File::open("/")?;
@@ -68,7 +407,7 @@ fn share_tree_with_hook(
                 libc::openat(
                     file.as_raw_fd(),
                     name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
                 )
             };
             if fd < 0 {
@@ -80,58 +419,17 @@ fn share_tree_with_hook(
     fn visit(
         file: &std::fs::File,
         path: &Path,
-        gid: u32,
-        preserve_group_grants: bool,
+        skip_git: bool,
         before_open: &dyn Fn(&Path),
+        apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
+        descend: bool,
     ) -> std::io::Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
         let fd = file.as_raw_fd();
-        let mode = meta.mode() & 0o7777;
-        if preserve_group_grants {
-            grant_metadata_acl(file, gid).map_err(|e| {
-                std::io::Error::other(format!(
-                    "{}: Git metadata ACL for group {gid}: {e}",
-                    path.display()
-                ))
-            })?;
-        } else {
-            let desired = if meta.is_dir() {
-                mode | 0o2770
-            } else {
-                mode | 0o0660
-            };
-            if !meta.is_dir() && meta.nlink() > 1 && (meta.gid() != gid || mode != desired) {
-                return Err(std::io::Error::other(format!(
-                    "{}: refusing permission changes to a hard-linked file",
-                    path.display()
-                )));
-            }
-            // SAFETY: fd is owned and remains open throughout changes/readback.
-            if meta.gid() != gid && unsafe { libc::fchown(fd, u32::MAX, gid) } != 0 {
-                return Err(std::io::Error::other(format!(
-                    "{}: chgrp to {gid}: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                )));
-            }
-            if mode != desired && unsafe { libc::fchmod(fd, desired as libc::mode_t) } != 0 {
-                return Err(std::io::Error::other(format!(
-                    "{}: chmod to {desired:o}: {}",
-                    path.display(),
-                    std::io::Error::last_os_error()
-                )));
-            }
-            let after = file.metadata()?;
-            if after.gid() != gid || after.mode() & 0o7777 != desired {
-                return Err(std::io::Error::other(format!(
-                    "{}: permission readback differs",
-                    path.display()
-                )));
-            }
-        }
-        if !meta.is_dir() {
+        apply(file, path)?;
+        if !meta.is_dir() || !descend {
             return Ok(());
         }
         // fdopendir owns only the duplicate; closing it does not close file.
@@ -189,7 +487,7 @@ fn share_tree_with_hook(
             if kind == libc::S_IFLNK {
                 continue;
             }
-            if !preserve_group_grants && kind == libc::S_IFDIR && name.to_bytes() == b".git" {
+            if skip_git && name.to_bytes() == b".git" {
                 // The common store gets additive ACLs, never a group replacement.
                 continue;
             }
@@ -225,11 +523,11 @@ fn share_tree_with_hook(
                     child_path.display()
                 )));
             }
-            visit(&child, &child_path, gid, preserve_group_grants, before_open)?;
+            visit(&child, &child_path, skip_git, before_open, apply, descend)?;
         }
         Ok(())
     }
-    visit(&file, path, gid, preserve_group_grants, before_open)
+    visit(&file, path, skip_git, before_open, apply, descend)
 }
 
 #[cfg(not(unix))]
@@ -241,6 +539,29 @@ fn share_tree(_path: &Path, _gid: u32) -> std::io::Result<()> {
 // The descriptor-based API keeps every mutation bound to the opened object.
 #[cfg(target_os = "linux")]
 fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = file.metadata()?;
+    update_metadata_acl(
+        file,
+        gid,
+        Some(if meta.is_dir() || meta.mode() & 0o111 != 0 {
+            7
+        } else {
+            6
+        }),
+        meta.is_dir(),
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn update_metadata_acl(
+    file: &std::fs::File,
+    gid: u32,
+    permissions: Option<u16>,
+    inherit: bool,
+    revoke_uid: Option<u32>,
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     // Serialize read/modify/write ACL grants across simultaneous spawns.
@@ -255,7 +576,7 @@ fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
     }
     let _unlock = Unlock(file.as_raw_fd());
     let meta = file.metadata()?;
-    if !meta.is_dir() && meta.nlink() > 1 {
+    if permissions.is_some() && !meta.is_dir() && meta.nlink() > 1 {
         return Err(std::io::Error::other(
             "refusing ACL changes to a hard-linked file",
         ));
@@ -312,10 +633,34 @@ fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
                 .collect(),
         ))
     }
-    let access = read(file, access_name)?.unwrap_or(base);
+    let old_access = read(file, access_name)?;
+    let old_default = if meta.is_dir() {
+        read(file, default_name)?
+    } else {
+        None
+    };
+    if permissions.is_none()
+        && !old_access
+            .iter()
+            .chain(old_default.iter())
+            .flatten()
+            .any(|e| e.0 == 8 && e.2 == gid || e.0 == 2 && Some(e.2) == revoke_uid)
+    {
+        return Ok(());
+    }
+    if !meta.is_dir() && meta.nlink() > 1 {
+        return Err(std::io::Error::other(
+            "refusing ACL changes to a hard-linked file",
+        ));
+    }
+    let access = old_access.unwrap_or(base);
     let mut acls = vec![(access_name, access.clone())];
     if meta.is_dir() {
-        acls.push((default_name, read(file, default_name)?.unwrap_or(access)));
+        if inherit {
+            acls.push((default_name, read(file, default_name)?.unwrap_or(access)));
+        } else if let Some(existing) = read(file, default_name)? {
+            acls.push((default_name, existing));
+        }
     }
     for (name, mut entries) in acls {
         let old_mask = entries.iter().find(|e| e.0 == 16).map(|e| e.1).unwrap_or(7);
@@ -326,23 +671,16 @@ fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
                 entry.1 &= old_mask;
             }
         }
-        let desired = if meta.is_dir() || mode & 0o111 != 0 {
-            7
-        } else {
-            6
-        };
-        if let Some(entry) = entries.iter_mut().find(|e| e.0 == 8 && e.2 == gid) {
-            entry.1 |= desired;
-        } else {
+        entries.retain(|e| !(e.0 == 8 && e.2 == gid || e.0 == 2 && Some(e.2) == revoke_uid));
+        if let Some(desired) = permissions.filter(|_| name == access_name || inherit) {
             entries.push((8, desired, gid));
-        }
-        // A new object may be owned by B. Retain the previous owner A as
-        // a named user too, so default ACLs preserve A on B's descendants.
-        let owner_permissions = entries.iter().find(|e| e.0 == 1).map(|e| e.1).unwrap_or(0);
-        if let Some(entry) = entries.iter_mut().find(|e| e.0 == 2 && e.2 == meta.uid()) {
-            entry.1 |= owner_permissions;
-        } else {
-            entries.push((2, owner_permissions, meta.uid()));
+            // On B-created descendants, A retains its previous effective access.
+            let owner_permissions = entries.iter().find(|e| e.0 == 1).map(|e| e.1).unwrap_or(0);
+            if let Some(entry) = entries.iter_mut().find(|e| e.0 == 2 && e.2 == meta.uid()) {
+                entry.1 |= owner_permissions;
+            } else {
+                entries.push((2, owner_permissions, meta.uid()));
+            }
         }
         entries.retain(|e| e.0 != 16);
         let mask = entries
@@ -395,6 +733,21 @@ fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
         Err(std::io::Error::other(
             "cross-seat Git metadata requires Linux POSIX ACL support",
         ))
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn update_metadata_acl(
+    file: &std::fs::File,
+    gid: u32,
+    permissions: Option<u16>,
+    _inherit: bool,
+    _revoke_uid: Option<u32>,
+) -> std::io::Result<()> {
+    if permissions.is_none() {
+        Ok(())
+    } else {
+        grant_metadata_acl(file, gid)
     }
 }
 
@@ -458,17 +811,9 @@ probe() {
 check_tree "$1"
 probe "$1"
 if [ -e "$1/.git" ] || [ -L "$1/.git" ]; then
-  for flag in --git-dir --git-common-dir; do
-    d=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute "$flag")
-    # Git objects/packs are intentionally immutable; commits require writable
-    # directories (objects/refs/logs/index lock), not rewriting old objects.
-    find "$d" -type d -exec sh -c '
-      for p do
-        if [ ! -w "$p" ] || [ ! -x "$p" ]; then
-          printf "%s: seat cannot write/traverse Git metadata\n" "$p" >&2; exit 1
-        fi
-      done
-    ' sh {} +
+  private=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute --git-dir)
+  common=$(git -c safe.directory="$1" -C "$1" rev-parse --path-format=absolute --git-common-dir)
+  for d in "$private" "$common/objects" "$common/refs"; do
     probe "$d"
   done
   git -c safe.directory="$1" -C "$1" status --porcelain >/dev/null
@@ -517,7 +862,13 @@ mod tests {
         f.consumer
             .remote("SylphxAI/demo", &target, "child", None)
             .unwrap();
-        share(&target, crate::sandbox::server_gid()).unwrap();
+        share(
+            &target,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &dir.path().join("grant.json"),
+        )
+        .unwrap();
         let meta = std::fs::metadata(&target).unwrap();
         assert_eq!(meta.gid(), crate::sandbox::server_gid());
         assert_eq!(meta.permissions().mode() & 0o2070, 0o2070);
@@ -626,6 +977,111 @@ mod tests {
         assert!(acl.contains(&(8, 7, new_gid + 1)), "{acl:?}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn journalled_allowlist_has_no_ancestor_defaults_and_revokes_every_entry() {
+        use std::os::fd::AsRawFd;
+        fn acl(path: &Path, name: &std::ffi::CStr) -> Vec<(u16, u16, u32)> {
+            let file = std::fs::File::open(path).unwrap();
+            let mut bytes = [0u8; 65536];
+            let len = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if len < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENODATA)
+                );
+                return Vec::new();
+            }
+            bytes[4..len as usize]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| {
+                    (
+                        u16::from_le_bytes(b[..2].try_into().unwrap()),
+                        u16::from_le_bytes(b[2..4].try_into().unwrap()),
+                        u32::from_le_bytes(b[4..].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("SylphxAI/demo", &target, "child", None)
+            .unwrap();
+        let dirs = git_dirs(&target).unwrap();
+        let private = &dirs[0];
+        let common = dirs.last().unwrap();
+        let uid = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid().wrapping_add(100000);
+        let id = anyagents_core::AgentId::generate();
+        let journal = grant_path(dir.path(), &id);
+        share_known(&target, private, common, uid, gid, &journal).unwrap();
+        for root in [common.clone(), common.join("worktrees")] {
+            assert!(acl(&root, c"system.posix_acl_default").is_empty());
+            assert!(acl(&root, c"system.posix_acl_access").contains(&(8, 1, gid)));
+        }
+        for config in [
+            common.join("config"),
+            private.join("config.worktree"),
+            private.join("commondir"),
+        ] {
+            assert!(
+                acl(&config, c"system.posix_acl_access").contains(&(8, 4, gid)),
+                "{}",
+                config.display()
+            );
+        }
+        assert!(
+            !acl(&common.join("hooks/pre-commit"), c"system.posix_acl_access")
+                .iter()
+                .any(|e| e.0 == 8 && e.2 == gid)
+        );
+        let sibling = dir.path().join("sibling");
+        f.consumer
+            .remote("SylphxAI/demo", &sibling, "sibling", None)
+            .unwrap();
+        let sibling_dirs = git_dirs(&sibling).unwrap();
+        share_known(
+            &sibling,
+            &sibling_dirs[0],
+            common,
+            uid,
+            gid + 1,
+            &grant_path(dir.path(), &anyagents_core::AgentId::generate()),
+        )
+        .unwrap();
+        assert!(
+            !acl(&sibling_dirs[0], c"system.posix_acl_access")
+                .iter()
+                .any(|e| e.0 == 8 && e.2 == gid)
+        );
+        revoke_recorded(dir.path(), &id).unwrap();
+        walk_tree(common, false, &|_| {}, &|_, path| {
+            for name in [c"system.posix_acl_access", c"system.posix_acl_default"] {
+                assert!(
+                    !acl(path, name).iter().any(|e| e.0 == 8 && e.2 == gid),
+                    "{}",
+                    path.display()
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+        restore_recorded(dir.path(), &id).unwrap();
+        assert!(acl(private, c"system.posix_acl_access").contains(&(8, 7, gid)));
+        revoke_recorded(dir.path(), &id).unwrap();
+    }
+
     #[test]
     fn admission_refuses_broken_or_unwritable_git_metadata() {
         let dir = tempfile::tempdir().unwrap();
@@ -662,7 +1118,13 @@ mod tests {
                 .unwrap_or(crate::sandbox::server_gid())
         };
         std::fs::write(dir.path().join("file"), "data").unwrap();
-        share(dir.path(), gid).unwrap();
+        share(
+            dir.path(),
+            crate::sandbox::server_uid(),
+            gid,
+            &dir.path().join("grant.json"),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::metadata(dir.path().join("file")).unwrap().gid(),
             gid
@@ -675,7 +1137,13 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let err = share(dir.path(), u32::MAX - 1).unwrap_err();
+        let err = share(
+            dir.path(),
+            crate::sandbox::server_uid(),
+            u32::MAX - 1,
+            &dir.path().join("grant.json"),
+        )
+        .unwrap_err();
         assert!(matches!(err, Error::WorkdirPermission { .. }));
         assert!(err.to_string().contains("chgrp"), "{err}");
     }
@@ -710,10 +1178,22 @@ mod tests {
         let tree = dir.path().join("tree");
         std::fs::create_dir(&tree).unwrap();
         std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
-        share(&tree, crate::sandbox::server_gid()).unwrap();
+        share(
+            &tree,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &dir.path().join("grant.json"),
+        )
+        .unwrap();
         assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o777, 0o600);
         std::fs::hard_link(&outside, tree.join("hardlink")).unwrap();
-        let err = share(&tree, crate::sandbox::server_gid()).unwrap_err();
+        let err = share(
+            &tree,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &dir.path().join("grant.json"),
+        )
+        .unwrap_err();
         assert!(err.to_string().contains("hard-linked"), "{err}");
         assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o777, 0o600);
     }

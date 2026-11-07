@@ -278,12 +278,22 @@ fn create_with_seat(
             .or_else(|| resolved_agent_seat_info(store, &agent))
         {
             if workdir_created || cwd == managed_abs {
-                crate::sandbox::share_worktree_with_seat(&cwd, gid)?;
+                crate::sandbox::share_worktree_with_seat(
+                    &cwd,
+                    uid,
+                    gid,
+                    &crate::worktree_access::grant_path(&data, &agent.id),
+                )?;
             }
             crate::worktree_access::verify(&cwd, uid, gid, launch.as_deref())?;
         } else {
             if workdir_created || cwd == managed_abs {
-                crate::sandbox::share_worktree_with_seat(&cwd, crate::sandbox::server_gid())?;
+                crate::sandbox::share_worktree_with_seat(
+                    &cwd,
+                    crate::sandbox::server_uid(),
+                    crate::sandbox::server_gid(),
+                    &crate::worktree_access::grant_path(&data, &agent.id),
+                )?;
             }
             crate::worktree_access::verify(
                 &cwd,
@@ -301,6 +311,12 @@ fn create_with_seat(
         Ok(running)
     })();
     if finish.is_err() {
+        // Keep the row and recovery journal if revocation fails; otherwise no
+        // later maintenance could find and remove a partial admission's grant.
+        if let Err(error) = crate::worktree_access::revoke_recorded(&data, &agent.id) {
+            let _ = store.set_agent_state(&agent.id, "archived");
+            return Err(error);
+        }
         let _ = store.delete_agent(&agent.id);
         let _ = std::fs::remove_dir_all(data.join("agents").join(agent.id.as_str()));
     }
@@ -7745,7 +7761,7 @@ mod tests {
         }
         let mut users = Users(Vec::new());
         let mut ids = Vec::new();
-        for suffix in ["a", "b"] {
+        for suffix in ["a", "b", "c"] {
             let name = format!("aa-wt-{}-{suffix}", std::process::id());
             assert!(
                 Command::new("useradd")
@@ -7841,16 +7857,76 @@ mod tests {
             std::fs::read_to_string(target.join("src/child")).unwrap(),
             "child"
         );
+        let common = objects.parent().unwrap();
+        let private = PathBuf::from(crate::worktree::tests::git(
+            &target,
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ));
+        let run_as = |uid: u32, gid: u32, script: &str, paths: &[&Path]| {
+            let mut command = Command::new("/usr/bin/setpriv");
+            command
+                .env("HOME", "/nonexistent")
+                .env("XDG_CONFIG_HOME", "/nonexistent")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .args([
+                    "--reuid",
+                    &uid.to_string(),
+                    "--regid",
+                    &gid.to_string(),
+                    "--clear-groups",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    script,
+                    "seat-proof",
+                ]);
+            for path in paths {
+                command.arg(path);
+            }
+            let out = command.output().unwrap();
+            assert!(
+                out.status.success(),
+                "uid={uid}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        // Each forbidden operation must fail as B, including rename/unlink (a
+        // read-only file alone would not stop either in a writable directory).
+        run_as(
+            b_uid,
+            b_gid,
+            r#"
+set -eu
+mkdir "$1/evil-hooks"
+printf '#!/bin/sh\nprintf compromised > "%s"\n' "$1/hook-executed" > "$1/evil-hooks/pre-commit"
+chmod +x "$1/evil-hooks/pre-commit"
+if printf evil >> "$2/config"; then exit 11; fi
+if printf evil >> "$2/hooks/pre-commit"; then exit 12; fi
+if printf evil > "$2/hooks/child-hook"; then exit 13; fi
+if printf evil > "$2/info/child-info"; then exit 14; fi
+if git -c safe.directory="$1" -C "$1" config --worktree core.hooksPath "$1/evil-hooks"; then exit 15; fi
+if printf evil >> "$3/config.worktree"; then exit 16; fi
+if rm "$3/config.worktree"; then exit 17; fi
+printf evil > "$3/child-config"
+if mv "$3/child-config" "$3/config.worktree"; then exit 18; fi
+if printf evil >> "$3/commondir"; then exit 19; fi
+"#,
+            &[&target, common, &private],
+        );
+        assert!(!target.join("hook-executed").exists());
         // B's ACL grant and new Git objects must not revoke sibling A.
         use std::os::unix::fs::MetadataExt;
         assert_eq!(std::fs::metadata(&new_object_dir).unwrap().uid(), b_uid);
         let out = Command::new("/usr/bin/setpriv")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", target.join("evil-hooks"))
             .env("HOME", "/nonexistent")
             .env("XDG_CONFIG_HOME", "/nonexistent")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["--reuid", &a_uid.to_string(), "--regid", &a_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                "set -eu; : > \"$2/sibling-write\"; rm \"$2/sibling-write\"; cd \"$1\"; printf sibling > src/sibling; git -c safe.directory=\"$1\" add src/sibling; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Sibling commit'; git -c safe.directory=\"$1\" status --porcelain", "sibling-seat"])
-            .arg(&f.source).arg(&new_object_dir).output().unwrap();
+                "set -eu; : > \"$2/sibling-write\"; rm \"$2/sibling-write\"; cd \"$1\"; printf sibling > src/sibling; git -c safe.directory=\"$1\" add src/sibling; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se -c core.hooksPath=\"$3/hooks\" commit -m 'Sibling commit' ; git -c safe.directory=\"$1\" status --porcelain", "sibling-seat"])
+            .arg(&f.source).arg(&new_object_dir).arg(objects.parent().unwrap()).output().unwrap();
         assert!(
             out.status.success(),
             "A still creates/commits/status after B: {}",
@@ -7896,8 +7972,92 @@ mod tests {
             std::fs::metadata(&blocked).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert!(
+            !target.join("hook-executed").exists(),
+            "parent must ignore B's planted hook"
+        );
+        let (c_uid, c_gid) = ids[2];
+        let mut request = worktree_request("child-c", Some("SylphxAI/demo".into()));
+        request.workdir = Some(dir.path().join("checkout-c"));
+        request.parent_id = Some(agent.id.clone());
+        let c = create_with_seat(
+            &store,
+            &data,
+            request,
+            &f.consumer,
+            Some((users.0[2].clone(), c_uid, c_gid, None)),
+        )
+        .unwrap();
+        run_as(
+            c_uid,
+            c_gid,
+            r#"set -eu; test -x "$1"; if cat "$2/HEAD"; then exit 21; fi; if cat "$2/index"; then exit 22; fi"#,
+            &[common, &private],
+        );
+        let c_private = PathBuf::from(crate::worktree::tests::git(
+            Path::new(c.workdir.as_deref().unwrap()),
+            &["rev-parse", "--path-format=absolute", "--git-dir"],
+        ));
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; if cat "$1/HEAD"; then exit 23; fi"#,
+            &[&c_private],
+        );
+        // Archive a dirty external checkout: preserve its bytes but revoke the
+        // common-store grant before any clean-worktree deletion decision.
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        assert!(crate::server::reap_subagent_ephemeral_dirs(
+            &data, &agent.id
+        ));
+        assert!(target.join("src/child").is_file());
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; if cat "$1/HEAD"; then exit 24; fi; if mkdir "$2/revoked"; then exit 25; fi"#,
+            &[&private, &objects],
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::worktree_access::grant_path(&data, &agent.id)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["active"], false);
+        // A deliberate wake restores only the original allowlisted metadata.
+        crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
+        crate::worktree_access::verify(&target, b_uid, b_gid, None).unwrap();
+        crate::worktree_access::revoke_recorded(&data, &agent.id).unwrap();
+        // C still works after B's revocation (separate principals, same store).
+        crate::worktree_access::verify(
+            Path::new(c.workdir.as_deref().unwrap()),
+            c_uid,
+            c_gid,
+            None,
+        )
+        .unwrap();
+        store.set_agent_state(&c.id, "archived").unwrap();
+        assert!(crate::server::reap_subagent_ephemeral_dirs(&data, &c.id));
+        // An admission refusal AFTER sharing must revoke, read back, and only
+        // then discard the child row and its private state.
+        let mut request = worktree_request("rollback-b", Some("SylphxAI/demo".into()));
+        request.workdir = Some(dir.path().join("rollback-b"));
+        let err = create_with_seat(
+            &store,
+            &data,
+            request,
+            &f.consumer,
+            Some((users.0[1].clone(), b_uid, b_gid, Some("invalid".into()))),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid seat launcher"), "{err}");
+        assert!(store.agent_by_name("rollback-b").is_err());
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; if mkdir "$1/rollback-leak"; then exit 26; fi"#,
+            &[&objects],
+        );
         eprintln!(
-            "A→B worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}; create, commit, status and sibling A preservation passed"
+            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree, sticky rename denial, sibling metadata denial, archive/reap/rollback revocation and parent hook pin passed"
         );
     }
 

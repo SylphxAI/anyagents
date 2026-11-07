@@ -640,7 +640,12 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
 
 /// Share a working directory and both per-worktree and common Git metadata.
 /// A protected shared root or failed permission change is a typed refusal.
-pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
+pub fn share_worktree_with_seat(
+    path: &Path,
+    uid: u32,
+    gid: u32,
+    journal: &Path,
+) -> Result<(), Error> {
     let canon = std::fs::canonicalize(path).map_err(|error| Error::WorkdirPermission {
         path: path.display().to_string(),
         message: error.to_string(),
@@ -667,7 +672,7 @@ pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
             message: "refusing recursive permission changes to a shared root".into(),
         });
     }
-    crate::worktree_access::share(path, gid)
+    crate::worktree_access::share(path, uid, gid, journal)
 }
 
 /// Share a Unix socket (`anyagents.sock` or `wake.sock`) with the deployment's
