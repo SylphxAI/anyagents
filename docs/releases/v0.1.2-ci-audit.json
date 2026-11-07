@@ -1,0 +1,558 @@
+{
+  "read_at_utc": "2026-11-07T03:50:28.408671+00:00",
+  "base_tag": "v0.1.1",
+  "cut_source_sha": "7a44952c42afc0a5d89cf1b29421109c6b6f5541",
+  "cut_deadline_utc": "2026-11-07T03:50:00Z",
+  "release_candidate_pr": "https://github.com/SylphxAI/anyagents/pull/90",
+  "release_gate": "Full Linux, macOS and exact-head ci-ok must pass on the release candidate before the normal merge queue.",
+  "pull_requests": [
+    {
+      "number": 59,
+      "merge_sha": "837f91e3157a4d25c418f96531f86874c388d758",
+      "title": "fix(profiles): centralize anthropic oauth refresh and strip seat refresh tokens (#59)",
+      "head_sha": "675d3bf8eb7113fed6f57b0970ecfd2278e2ede9",
+      "merged_at": "2026-11-02T09:36:55Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 60,
+      "merge_sha": "47f73bb3cbb2817b72bfe26e94d981d89cc5c41d",
+      "title": "fix(sylphx): persist workspace placement and preserve delegated execution (#60)",
+      "head_sha": "7e3665954714600a079769d212913dd0c0c002be",
+      "merged_at": "2026-11-02T09:47:15Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 61,
+      "merge_sha": "790f797ab4c5fb76b6efb548f3dd379da056e7d1",
+      "title": "fix(sylphx): preserve function pairs across context boundaries (#61)",
+      "head_sha": "7baf134fe96afe47646fe60b1111bf694a074ff4",
+      "merged_at": "2026-11-02T10:08:29Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 62,
+      "merge_sha": "1edae310fa9e54cfae99d4ee1ab60b47b3d83d87",
+      "title": "fix(sylphx): sanitize orphaned tool call outputs after window stride and recover transient gateway errors (#62)",
+      "head_sha": "0b4ac28dff15b126f8c701a9bfae9d938fc19f17",
+      "merged_at": "2026-11-02T10:19:05Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 63,
+      "merge_sha": "7174dda02d332a9c8cf53c1038a3e8f473d05a18",
+      "title": "fix(sylphx): fix cloud sandbox exec idempotency, exit-0 sentinel, and lease lifecycle (#63)",
+      "head_sha": "608236645b40311ff4ff8f4de18f4a6771e0b36c",
+      "merged_at": "2026-11-02T11:15:10Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 64,
+      "merge_sha": "0c96233cbefe442cd33f029c0f83e350f2869862",
+      "title": "fix(sylphx): drop raw orphan tool outputs in window projection without mutating transcript (#64)",
+      "head_sha": "0b8c903abff64e01f823402d485b83f97a606c7c",
+      "merged_at": "2026-11-02T11:27:21Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 65,
+      "merge_sha": "8cd1741e71c2ec21e24d0e59e127aec0932cd224",
+      "title": "fix(sandbox): hydrate operator seat groups and include both seat gids on migration (#65)",
+      "head_sha": "7bfcabe3429bc9b974c07f1a7bb20e81c13f298f",
+      "merged_at": "2026-11-02T11:44:23Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 66,
+      "merge_sha": "5593468484d27b1258d35c826fec92d5f36d7abd",
+      "title": "fix(sylphx,signin): single-writer admin delivery, gateway pacing, and agy sign-in completion (#66)",
+      "head_sha": "6b3424eb0967eb4a1214b643c3417236ccbd4499",
+      "merged_at": "2026-11-04T01:43:25Z",
+      "ci_ok": null,
+      "disposition": "merged before the ci-ok gate; verified by the release candidate run"
+    },
+    {
+      "number": 67,
+      "merge_sha": "f99a5fc652dde10d7a1cf76f38885e10e0b39e23",
+      "title": "fix(profiles): balance agents evenly across healthy profiles with blended 5h/7d quota (#67)",
+      "head_sha": "95d1a4e3aba20768590a3faba27596f3b51f6298",
+      "merged_at": "2026-11-04T12:53:51Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41832786163/job/126585228944"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 68,
+      "merge_sha": "455a5126991c2a87cf16fb78b3a7b37776dc9523",
+      "title": "fix(telegram,store): preserve group quote context and media attachments across multi-bot relays (#68)",
+      "head_sha": "cabf6d9aeee0b9767b2e2d0e3879ffd7f63db376",
+      "merged_at": "2026-11-04T13:57:57Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41842242385/job/126618197028"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 69,
+      "merge_sha": "f7c83e5aae3804ddc019925ce4be26a05d23c628",
+      "title": "fix(schedule): keep github:pr watches active across check/queue transitions until merged or closed (#69)",
+      "head_sha": "95d76e6710eac10242e796f0bbd32d1e5755d09e",
+      "merged_at": "2026-11-04T14:09:05Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41843756171/job/126623374306"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 70,
+      "merge_sha": "6031b35d45f34ce63a0d8f2ce11feaee76d58efa",
+      "title": "fix(mcp): keep async tools alive and separate spawn instructions (#70)",
+      "head_sha": "a7ea67d47ead99114603d9ff09435dddab496abf",
+      "merged_at": "2026-11-04T15:45:32Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41860121990/job/126681584391"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 71,
+      "merge_sha": "ed061f4fb9e3788c77476fce77e60a13a217862d",
+      "title": "feat: remove cloud-sandbox hybrid mode and enforce scoped agent hierarchy messaging (#71)",
+      "head_sha": "fdacc784fdfcd0a2765a128f2acea60c99bd223a",
+      "merged_at": "2026-11-04T17:10:24Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41873977346/job/126730537726"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 72,
+      "merge_sha": "bacb7d0cef3bcf2188ba5f5a9f9bc688ed49989a",
+      "title": "fix(sylphx,server): honor local workspace placement and allow multi-level hierarchy messaging (#72)",
+      "head_sha": "15747729da6c600feed048b613ff82663508641b",
+      "merged_at": "2026-11-04T18:43:48Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41889497542/job/126784418919"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 73,
+      "merge_sha": "2f7a6525a95277c93db182be70fd37f486ec5cb1",
+      "title": "fix(server): reap subagent .gemini/tmp caches, safe.directory git worktrees, and dirty build outputs (#73)",
+      "head_sha": "25814dea6eca2332bfdc69ddd985ac7c2062c278",
+      "merged_at": "2026-11-04T20:40:14Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41908181467/job/126850047552"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 74,
+      "merge_sha": "984412c463f8742dad61508baed28d97a31b8d01",
+      "title": "feat(workspace): enforce per-agent isolated workdir lifecycle and full archive reaping (#74)",
+      "head_sha": "81b61c496b00244a9aa7914c6cd830fc35762a9b",
+      "merged_at": "2026-11-04T22:54:06Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/41928813360/job/126921555302"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 75,
+      "merge_sha": "cd03118a761895ffea81e1b796b791636531a244",
+      "title": "fix: allow idle local harnesses to receive scheduled wakes (#75)",
+      "head_sha": "f2aa95e8c497ea5c584827a57d14cb127388e897",
+      "merged_at": "2026-11-05T17:03:37Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42070199297/job/127397472050"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 79,
+      "merge_sha": "b320905ebd5b8ab7944e226ebcc49471b9393e3f",
+      "title": "feat(browser): make takeover usable on phones (#79)",
+      "head_sha": "4351c349f84f5efb63311e4ab24cff5243e2a38e",
+      "merged_at": "2026-11-07T00:38:48Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42319190765/job/128240120991"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 76,
+      "merge_sha": "611603f6be42deae5e863b1646b1ead7596500d4",
+      "title": "feat(sylphx,telegram): sync local MoE topology, XML message envelope, and remote model context window updates (#76)",
+      "head_sha": "32b976a365556e1f3c777cd82cd1223da43d23eb",
+      "merged_at": "2026-11-07T00:41:41Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42319365375/job/128240881915"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 80,
+      "merge_sha": "497b76add047974cfb1fc10a8c501a879e01ae41",
+      "title": "fix(send): resume archived agents only for intentional direct sends (#80)",
+      "head_sha": "f1a20c6a584d0da44031ac41eafd3e834331dc9b",
+      "merged_at": "2026-11-07T01:00:18Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42321092565/job/128246675534"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 77,
+      "merge_sha": "d25e590ccd3da6cc29c63db1a0151e701847edf2",
+      "title": "fix(sylphx): compact against active model limits before dispatch (#77)",
+      "head_sha": "ebf6726c80f9db492c41b91d93f066689fa5c9d4",
+      "merged_at": "2026-11-07T01:07:24Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42321845613/job/128249304654"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 81,
+      "merge_sha": "c71c5d20ce638c0de3c8f99ff4358cee6715d241",
+      "title": "fix(archive): keep cleanup out of mailbox reconciliation (#81)",
+      "head_sha": "6c66a03f0b1fd1215ef344a6eee28b1f7af792f4",
+      "merged_at": "2026-11-07T01:44:11Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42324669492/job/128258407289"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 82,
+      "merge_sha": "87d3f8d04bcfe09a8bd921939dd25de686a250a7",
+      "title": "fix(agents): preserve scope across metadata and runtime refreshes (#82)",
+      "head_sha": "c3f5c48456c7f1bd8a8cfe1b143aabdb175a3396",
+      "merged_at": "2026-11-07T01:56:52Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42325737391/job/128261505187"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 84,
+      "merge_sha": "96c3afa9f7aecccd7286f2571880525ad7f8d353",
+      "title": "fix(supervisor): apply pending runtime switches to faulted turns (#84)",
+      "head_sha": "efe3b41470b5d06c673491ce69b1f283d11db0df",
+      "merged_at": "2026-11-07T02:07:51Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42326799475/job/128264679700"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 85,
+      "merge_sha": "622593d95f5427b5f2d6e175eb5787678e5cfaf3",
+      "title": "fix(opencode): reserve stable private service ports per agent (#85)",
+      "head_sha": "5ff3ac971b3a4413465fe144a7987dd9217d2ebe",
+      "merged_at": "2026-11-07T02:09:44Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42326840404/job/128264900440"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 83,
+      "merge_sha": "da15d1b2ab3bd14c97cc9b062b54b4ff6c64a766",
+      "title": "fix(browser): preserve takeover sessions during state publication (#83)",
+      "head_sha": "2c6a4e5edafbe22788f9518c1b202fc027688444",
+      "merged_at": "2026-11-07T02:14:27Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42326277645/job/128262942465"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 86,
+      "merge_sha": "57625cd7e7fc152c2e0ece8b97aeefea74dc9cbd",
+      "title": "fix(opencode): preserve transient bind collision evidence (#86)",
+      "head_sha": "3656831ad1444106f5d9ae57b2d524dd7f553096",
+      "merged_at": "2026-11-07T02:29:48Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42328280425/job/128269581082"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 89,
+      "merge_sha": "d6c8d95773a9bd675a58f053728f32098511fb97",
+      "title": "feat(agents): add archetype templates, list query/pagination, idle cache dehydration, and domain mind archive guard (#89)",
+      "head_sha": "8a1f987f25fdf71cf4137f9eff6254e703832711",
+      "merged_at": "2026-11-07T02:43:56Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42330322101/job/128275979364"
+      },
+      "disposition": "reverted by #98; not shipped"
+    },
+    {
+      "number": 93,
+      "merge_sha": "35cb56f215ad90464ebdc1b77f7429be1abb4ce4",
+      "title": "fix(test): isolate archive maintenance startup from reconciliation (#93)",
+      "head_sha": "2c72b96b1346f7633dac087727a8b7bcd4c08604",
+      "merged_at": "2026-11-07T02:51:14Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42330855791/job/128277766550"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 88,
+      "merge_sha": "69333cd45b0ae314b870ef056b826602f748049c",
+      "title": "Release agent flock explicitly when its guard drops (#88)",
+      "head_sha": "1ce80f37047095a5e60e9494074fb98d11b21294",
+      "merged_at": "2026-11-07T02:57:29Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42331417336/job/128279439051"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 97,
+      "merge_sha": "64f0f696a539943b0ed899baa275bc7f2d51face",
+      "title": "fix(test): complete the runtime switch replay control (#97)",
+      "head_sha": "44b81404f1abefc9f8a0a619792c1ffe25dda50c",
+      "merged_at": "2026-11-07T02:59:45Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42331197043/job/128278917518"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 98,
+      "merge_sha": "b2b0e55a8960509c2a1fe80d251b96de1ff53e7d",
+      "title": "Revert \"feat(agents): add archetype templates, list query/pagination, idle cache dehydration, and domain mind archive guard (#89)\" (#98)",
+      "head_sha": "52c2b838023f1fcbf5d7a29500130138a3e09ad0",
+      "merged_at": "2026-11-07T03:05:01Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42331735387/job/128280462153"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 96,
+      "merge_sha": "52c4432b362ac548434ab30cead122c5e2e244ed",
+      "title": "test: quarantine nondeterministic archive partial-cleanup fixture (#96)",
+      "head_sha": "31e321308c20b49612035ae9e1aa612a388044de",
+      "merged_at": "2026-11-07T03:08:52Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42332304345/job/128282164683"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 102,
+      "merge_sha": "9ff55feb01baa2b063ec11cbb1c0883e2d780162",
+      "title": "fix(core): release lifecycle flock when its guard drops (#102)",
+      "head_sha": "2a1674a580a3eda5eedd451d55b1afe34ea62b9c",
+      "merged_at": "2026-11-07T03:14:25Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42332786105/job/128283728952"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 104,
+      "merge_sha": "7a2178e1745e4bd72f2ef0d7cdf1f91e05e539ca",
+      "title": "test: quarantine Chromium focus startup race (#104)",
+      "head_sha": "6950b453ffa36750a3623aa5656ef5606c418f2f",
+      "merged_at": "2026-11-07T03:18:08Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333030254/job/128284482313"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 87,
+      "merge_sha": "b85b77419d15229d53ef63dc3caccf76de3b6261",
+      "title": "[review] Restrict conversation history to the caller\u2019s supervised tree (#87)",
+      "head_sha": "6a71e96a48f2a9076e4f850c65c244344680d2b5",
+      "merged_at": "2026-11-07T03:28:40Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333289766/job/128285279493"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 105,
+      "merge_sha": "09017e0b807fbc01bf37c58b6ad91976ec01569a",
+      "title": "fix(supervisor): keep recovery behind undelivered mail (#105)",
+      "head_sha": "1c7aa235a981689ce6f815ff63aa93b729ab5904",
+      "merged_at": "2026-11-07T03:31:24Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333560014/job/128286185281"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 99,
+      "merge_sha": "9b5a8ce1e8a9879b72574aaa0374de7b4b320378",
+      "title": "fix(schedule): share conditional REST probes for GitHub watches (#99)",
+      "head_sha": "71a5e5468f9ed04db66a0bda4fca5da0bc54482a",
+      "merged_at": "2026-11-07T03:32:36Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333787628/job/128286865612"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 100,
+      "merge_sha": "c900a560dd0fb7fea9a8194f5ac5237fa525eed5",
+      "title": "fix(test): control rollout freshness in error notification fixture (#100)",
+      "head_sha": "643183933c119325fb737a404f6cfba5f8ca6f34",
+      "merged_at": "2026-11-07T03:32:37Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333486586/job/128286072013"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 107,
+      "merge_sha": "e5118b0f583f9d8c995c47cd6e7a842586d0b932",
+      "title": "docs: describe the required merge queue (#107)",
+      "head_sha": "659805d05812a75c50b8d1155fd18e1e47dbd280",
+      "merged_at": "2026-11-07T03:32:38Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42334229954/job/128287450060"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 101,
+      "merge_sha": "c926b48c198d237b98508e44b4e36c06b53cd0a2",
+      "title": "fix(auth): keep HTTP fallback credentials out of argv (#101)",
+      "head_sha": "2c6b596d45aef16446919e0661342fe59e820b3e",
+      "merged_at": "2026-11-07T03:42:36Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42332731362/job/128283538778"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 91,
+      "merge_sha": "7a44952c42afc0a5d89cf1b29421109c6b6f5541",
+      "title": "feat(browser): support native takeover clipboard and keyboard shortcuts (#91)",
+      "head_sha": "3b7401298a2bc171827d16734986ff11961646de",
+      "merged_at": "2026-11-07T03:46:58Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42334878508/job/128290125998"
+      },
+      "disposition": "included"
+    }
+  ]
+}
