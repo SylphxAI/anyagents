@@ -279,6 +279,378 @@ fn promoted_basic_group_alias_retry_cannot_resurrect_redacted_message() {
     }
 }
 
+// Vesta's local_id_collision.rs: bot-local numbers are not global identities.
+#[test]
+fn local_id_collision_preserves_independent_bot_message_after_redaction() {
+    for redact in [false, true] {
+        let f = Fixture::new();
+        let mut first = Incoming::new("selected private message from bot A's namespace");
+        first.sender = Some("telegram:user:1".into());
+        first.source_key = Some("webhook:bot-a:initial".into());
+        first.source_time_ms = Some(123);
+        first.origin = Some(crate::Origin {
+            chat_id: Some(-1234),
+            message_id: Some(43),
+            thread_id: None,
+        });
+        let ReceiveOutcome::New(original) = f.store.receive(&f.target.id, first).unwrap() else {
+            panic!("initial message must be new")
+        };
+        if redact {
+            assert!(
+                f.redact(&request(original.id.as_str(), None))
+                    .unwrap()
+                    .full_scrub
+            );
+        }
+        for (key, sender, time, body) in [
+            (
+                "tg-in:-1234:bot-b:43",
+                "telegram:user:2",
+                60_123,
+                "independent relay message",
+            ),
+            (
+                "webhook:bot-c:later",
+                "telegram:user:3",
+                120_123,
+                "independent direct message",
+            ),
+        ] {
+            let mut other = Incoming::new(body);
+            other.sender = Some(sender.into());
+            other.source_key = Some(key.into());
+            other.source_time_ms = Some(time);
+            other.origin = Some(crate::Origin {
+                chat_id: Some(-1234),
+                message_id: Some(43),
+                thread_id: None,
+            });
+            let ReceiveOutcome::New(stored) = f.store.receive(&f.target.id, other).unwrap() else {
+                panic!("independent bot-local number must not coalesce")
+            };
+            assert_eq!(stored.text, body);
+            assert_eq!(
+                f.store
+                    .receive(&f.target.id, {
+                        let mut retry = Incoming::new(body);
+                        retry.source_key = Some(key.into());
+                        retry
+                    })
+                    .unwrap(),
+                ReceiveOutcome::Duplicate(stored.clone())
+            );
+            let owner: String = f.store.conn().query_row("SELECT identity_id FROM message_source_aliases WHERE agent_id=?1 AND source_key=?2", params![f.target.id.as_str(), key], |r| r.get(0)).unwrap();
+            assert_eq!(owner, stored.id.as_str());
+        }
+        let mailbox = f.store.inbox(&f.target.id, None).unwrap();
+        assert_eq!(mailbox.len(), 3);
+        assert_eq!(
+            mailbox[0].text,
+            if redact {
+                TOMBSTONE
+            } else {
+                original.text.as_str()
+            }
+        );
+    }
+}
+
+// Vesta's public baseline_alias.rs: the canonical body gains a quote after
+// promotion, so its whole text is no longer contained in the old raw baseline.
+#[test]
+fn baseline_alias_full_erasure_scrubs_quote_enriched_old_origin_and_db_wal() {
+    for explicit_span in [false, true] {
+        let f = Fixture::new();
+        let canary = "synthetic-basic-group-old-alias-baseline-private-capture";
+        let make = |key: &str, id: i64| {
+            let mut input = Incoming::new(canary);
+            input.sender = Some("telegram:user:1".into());
+            input.source_key = Some(key.into());
+            input.source_time_ms = Some(123);
+            input.origin = Some(crate::Origin {
+                chat_id: Some(-1234),
+                message_id: Some(id),
+                thread_id: None,
+            });
+            input
+        };
+        let ReceiveOutcome::New(message) = f
+            .store
+            .receive(&f.target.id, make("tg-in:initial", 42))
+            .unwrap()
+        else {
+            panic!("initial relay must be new");
+        };
+        let mut direct = make("webhook:direct", 43);
+        direct.quote = Some(crate::Quote {
+            author: "external:quote-author".into(),
+            author_is_bot: false,
+            sender_id: None,
+            text: "benign quoted context".into(),
+            reference: None,
+            mentions: Vec::new(),
+        });
+        let ReceiveOutcome::Duplicate(promoted) = f.store.receive(&f.target.id, direct).unwrap()
+        else {
+            panic!("direct webhook must coalesce before erasure");
+        };
+        assert_eq!(
+            (promoted.id.clone(), promoted.seq),
+            (message.id, message.seq)
+        );
+        assert!(promoted.text.contains(canary));
+        assert!(promoted.text.contains("benign quoted context"));
+        let baseline = || -> String {
+            f.store.conn().query_row(
+                "SELECT body FROM message_versions WHERE agent_id=?1 AND chat_id=-1234 AND message_id=42",
+                [f.target.id.as_str()], |r| r.get(0)).unwrap()
+        };
+        assert_eq!(baseline(), canary);
+        let req = request(
+            promoted.id.as_str(),
+            explicit_span.then(|| chars(0, promoted.text.chars().count())),
+        );
+        let receipt = f.redact(&req).unwrap();
+        assert!(receipt.full_scrub, "{receipt:?}");
+        assert!(receipt.unscrubbed.is_empty());
+        assert_eq!(baseline(), TOMBSTONE);
+        let aliases: i64 = f.store.conn().query_row(
+            "SELECT count(*) FROM message_origin_aliases WHERE agent_id=?1 AND message_id IN (42,43)",
+            [f.target.id.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(aliases, 2);
+        assert_eq!(
+            f.store.inbox(&f.target.id, None).unwrap()[0].text,
+            TOMBSTONE
+        );
+        assert!(
+            f.store
+                .search_conversation(Some("child"), None, None, None, canary)
+                .unwrap()
+                .is_empty()
+        );
+        for suffix in ["state.db", "state.db-wal"] {
+            let path = f.dir.path().join(suffix);
+            let bytes = if suffix == "state.db" {
+                std::fs::read(&path).unwrap()
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(e) => panic!("cannot inspect {}: {e}", path.display()),
+                }
+            };
+            assert!(
+                !bytes.windows(canary.len()).any(|w| w == canary.as_bytes()),
+                "residual canary in {suffix}"
+            );
+        }
+        assert_eq!(f.redact(&req).unwrap(), receipt);
+    }
+}
+
+#[test]
+fn bound_baseline_verification_reports_ignored_writes_and_refuses_stale_replay() {
+    for ignore_write in [false, true] {
+        let f = Fixture::new();
+        let mut incoming = Incoming::new("synthetic baseline verification canary");
+        incoming.source_key = Some("bot-a:100".into());
+        incoming.origin = Some(crate::Origin {
+            chat_id: Some(-1234),
+            message_id: Some(42),
+            thread_id: None,
+        });
+        let ReceiveOutcome::New(m) = f.store.receive(&f.target.id, incoming).unwrap() else {
+            panic!("new")
+        };
+        if ignore_write {
+            f.store.conn().execute_batch("CREATE TRIGGER ignore_baseline BEFORE UPDATE ON message_versions BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        }
+        let req = request(m.id.as_str(), None);
+        let receipt = f.redact(&req).unwrap();
+        if ignore_write {
+            assert!(!receipt.full_scrub);
+            assert!(receipt.unscrubbed.iter().any(
+                |f| f.path.contains("#message_versions/") && f.error.contains("not tombstoned")
+            ));
+            let saved: String = f
+                .store
+                .conn()
+                .query_row(
+                    "SELECT receipt FROM conversation_redactions WHERE id=?1",
+                    [&receipt.audit_id],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(serde_json::from_str::<Receipt>(&saved).unwrap(), receipt);
+        } else {
+            assert!(receipt.full_scrub);
+            assert_eq!(f.redact(&req).unwrap(), receipt);
+            f.store
+                .conn()
+                .execute(
+                    "UPDATE message_versions SET body='synthetic out-of-band baseline drift'",
+                    [],
+                )
+                .unwrap();
+        }
+        let err = f.redact(&req).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("existing receipt does not verify bound versions"),
+            "{err}"
+        );
+    }
+}
+
+#[test]
+fn local_id_collision_cannot_erase_an_independent_accounts_baseline() {
+    let f = Fixture::new();
+    let make = |key: &str, text: &str, sender: &str, time: i64| {
+        let mut input = Incoming::new(text);
+        input.sender = Some(sender.into());
+        input.source_key = Some(key.into());
+        input.source_time_ms = Some(time);
+        input.origin = Some(crate::Origin {
+            chat_id: Some(-1234),
+            message_id: Some(43),
+            thread_id: None,
+        });
+        input
+    };
+    let independent = "independent bot B baseline must survive bot A erasure";
+    assert!(matches!(
+        f.store
+            .receive(
+                &f.target.id,
+                make("bot-b:1", independent, "telegram:user:2", 123)
+            )
+            .unwrap(),
+        ReceiveOutcome::New(_)
+    ));
+    let ReceiveOutcome::New(selected) = f
+        .store
+        .receive(
+            &f.target.id,
+            make(
+                "bot-a:2",
+                "selected private bot A body",
+                "telegram:user:1",
+                60_123,
+            ),
+        )
+        .unwrap()
+    else {
+        panic!("independent accounts")
+    };
+    assert!(
+        f.redact(&request(selected.id.as_str(), None))
+            .unwrap()
+            .full_scrub
+    );
+    let baseline: (String, String) = f.store.conn().query_row("SELECT body, origin_namespace FROM message_versions WHERE agent_id=?1 AND chat_id=-1234 AND message_id=43", [f.target.id.as_str()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(baseline, (independent.into(), "direct:bot-b".into()));
+    // A changed update key within bot A stays erased, but cannot poison bot B.
+    assert!(matches!(
+        f.store
+            .receive(
+                &f.target.id,
+                make(
+                    "bot-a:3",
+                    "selected private bot A body",
+                    "telegram:user:1",
+                    60_123
+                )
+            )
+            .unwrap(),
+        ReceiveOutcome::Duplicate(_)
+    ));
+    assert_eq!(
+        f.store.inbox(&f.target.id, None).unwrap()[0].text,
+        independent
+    );
+}
+
+#[test]
+fn busy_wal_reader_reports_residual_window_instead_of_full_scrub() {
+    let f = Fixture::new();
+    let canary = "synthetic-busy-reader-physical-residual-canary";
+    let m = f.message(canary);
+    f.store
+        .conn()
+        .busy_timeout(std::time::Duration::from_millis(20))
+        .unwrap();
+    let reader = rusqlite::Connection::open(f.dir.path().join("state.db")).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    assert_eq!(
+        reader
+            .query_row(
+                "SELECT body FROM messages WHERE id=?1",
+                [m.id.as_str()],
+                |r| r.get::<_, String>(0)
+            )
+            .unwrap(),
+        canary
+    );
+    let receipt = f.redact(&request(m.id.as_str(), None)).unwrap();
+    assert!(!receipt.full_scrub);
+    assert!(receipt.unscrubbed.iter().any(|f| f.path.ends_with("state.db-wal") && f.error.contains("until the reader exits")));
+    let stored: String = f
+        .store
+        .conn()
+        .query_row(
+            "SELECT receipt FROM conversation_redactions WHERE id=?1",
+            [&receipt.audit_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(serde_json::from_str::<Receipt>(&stored).unwrap(), receipt);
+    assert_eq!(
+        f.store.inbox(&f.target.id, None).unwrap()[0].text,
+        TOMBSTONE
+    );
+    reader.execute_batch("ROLLBACK").unwrap();
+    let checkpoint: (i64, i64, i64) = f
+        .store
+        .conn()
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(checkpoint, (0, 0, 0));
+    for suffix in ["state.db", "state.db-wal"] {
+        let bytes = std::fs::read(f.dir.path().join(suffix)).unwrap();
+        assert!(!bytes.windows(canary.len()).any(|w| w == canary.as_bytes()));
+    }
+}
+
+#[test]
+fn legacy_baseline_without_account_is_preserved_and_reported() {
+    let f = Fixture::new();
+    let mut input = Incoming::new("synthetic old baseline capture");
+    input.source_key = Some("bot-a:1".into());
+    input.origin = Some(crate::Origin {
+        chat_id: Some(-1234),
+        message_id: Some(42),
+        thread_id: None,
+    });
+    let ReceiveOutcome::New(m) = f.store.receive(&f.target.id, input).unwrap() else {
+        panic!("new")
+    };
+    f.store
+        .conn()
+        .execute("UPDATE message_versions SET origin_namespace=NULL", [])
+        .unwrap();
+    let receipt = f.redact(&request(m.id.as_str(), None)).unwrap();
+    assert!(!receipt.full_scrub);
+    assert!(
+        receipt
+            .unscrubbed
+            .iter()
+            .any(|f| f.error.contains("account is unknown"))
+    );
+}
+
 #[test]
 fn all_coalescence_paths_retain_aliases_across_redaction_reopen_and_aged_history() {
     let f = Fixture::new();
@@ -321,7 +693,7 @@ fn all_coalescence_paths_retain_aliases_across_redaction_reopen_and_aged_history
     }
     // The identical edit returns through a different duplicate path after the
     // edit-baseline lookup. Its source identity must also survive erasure.
-    let mut edit = make("edit:source", 43);
+    let mut edit = make("webhook:edit-source", 43);
     edit.text = format!("[Edited message #43]: {canary}");
     assert!(matches!(
         f.store.receive(&f.target.id, edit).unwrap(),
@@ -351,7 +723,7 @@ fn all_coalescence_paths_retain_aliases_across_redaction_reopen_and_aged_history
         "webhook:direct",
         "webhook:other-source",
         "room:relay",
-        "edit:source",
+        "webhook:edit-source",
     ] {
         let mut retry = Incoming::new(canary);
         retry.source_key = Some(key.into());
@@ -360,21 +732,27 @@ fn all_coalescence_paths_retain_aliases_across_redaction_reopen_and_aged_history
             ReceiveOutcome::Duplicate(expected.clone())
         );
     }
-    for id in [41, 42, 43, 44] {
-        let mut retry = make("new-source-on-known-origin", id);
-        retry.source_key = Some(format!("later-source:{id}"));
+    // Unknown relay formats only prove their exact source key. A new source
+    // may be learned from a known ACCOUNT+origin, never a bare local number.
+    for (id, key) in [
+        (41, "tg-in:initial"),
+        (42, "tg-in:initial"),
+        (43, "webhook:learned-source"),
+        (44, "room:relay"),
+    ] {
+        let retry = make(key, id);
         assert_eq!(
             store.receive(&f.target.id, retry).unwrap(),
             ReceiveOutcome::Duplicate(expected.clone())
         );
         // Chained identity learned AFTER redaction is retained as well.
         let mut source_only = Incoming::new(canary);
-        source_only.source_key = Some(format!("later-source:{id}"));
+        source_only.source_key = Some(key.into());
         assert_eq!(
             store.receive(&f.target.id, source_only).unwrap(),
             ReceiveOutcome::Duplicate(expected.clone())
         );
-        let mut edit_retry = make("edit-retry", id);
+        let mut edit_retry = make(key, id);
         edit_retry.origin.as_mut().unwrap().message_id = None;
         edit_retry.text = format!("[Edited message #{id}]: {canary}");
         assert_eq!(
@@ -485,9 +863,9 @@ fn late_quote_redelivery_inherits_the_complete_alias_set() {
             ReceiveOutcome::Duplicate(expected.clone())
         );
     }
-    for id in [42, 43] {
+    for (id, key) in [(42, "tg-in:initial"), (43, "webhook:new-source")] {
         assert_eq!(
-            store.receive(&f.target.id, make("new-source", id)).unwrap(),
+            store.receive(&f.target.id, make(key, id)).unwrap(),
             ReceiveOutcome::Duplicate(expected.clone())
         );
     }
@@ -600,6 +978,19 @@ fn redacted_provider_redelivery_and_edits_preserve_body_index_and_audit() {
                 else {
                     panic!("initial message must be new");
                 };
+                for alias in ["webhook:retry", "tg-in:retry", "room:retry"] {
+                    let mut equivalent = incoming.clone();
+                    equivalent.source_key = Some(alias.into());
+                    assert!(matches!(
+                        f.store.receive(&f.target.id, equivalent).unwrap(),
+                        ReceiveOutcome::Duplicate(_)
+                    ));
+                }
+                let m = f
+                    .store
+                    .message(&f.target.id, m.id.as_str())
+                    .unwrap()
+                    .unwrap();
                 let span = partial.then(|| chars(7, original.chars().count() - 7));
                 let req = request(m.id.as_str(), span);
                 let receipt = f.redact(&req).unwrap();
