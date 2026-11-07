@@ -49,7 +49,7 @@ fn start(dir: &TempDir, mode: &str) -> OpenCodeHarness {
             ("ANYAGENTS_FAKE_STATE", dir.path().to_str().unwrap()),
         ],
     )
-    .expect("start")
+    .unwrap_or_else(|error| panic!("{error}: {}", log_of(dir)))
 }
 
 /// The same scripted CLI, with the agent's config directory for its id.
@@ -66,7 +66,7 @@ fn start_with_config(dir: &TempDir, mode: &str, config: &Path) -> OpenCodeHarnes
         None,
         config,
     )
-    .expect("start")
+    .unwrap_or_else(|error| panic!("{error}: {}", log_of(dir)))
 }
 
 /// What a line the prompt API took is reported as.
@@ -335,4 +335,218 @@ fn a_retried_line_does_not_hold_the_turn_open() {
             turn_finished: false
         }
     );
+}
+
+fn port_of(config: &Path) -> u16 {
+    std::fs::read_to_string(config.join("opencode-service-port"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn concurrent_agents_bind_distinct_private_ports_and_restart_reuses_them() {
+    let alpha = TempDir::new().unwrap();
+    let beta = TempDir::new().unwrap();
+    let a_config = alpha.path().join("config");
+    let b_config = beta.path().join("config");
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| start_with_config(&alpha, "finish", &a_config));
+        let b = scope.spawn(|| start_with_config(&beta, "finish", &b_config));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let a_port = port_of(&a_config);
+    let b_port = port_of(&b_config);
+    assert_ne!(a_port, b_port);
+    assert!((20_000..30_000).contains(&a_port));
+    for port in [a_port, b_port] {
+        assert!(std::net::TcpListener::bind(("127.0.0.1", port)).is_err());
+    }
+    drop(a);
+    let restarted = start_with_config(&alpha, "finish", &a_config);
+    assert_eq!(port_of(&a_config), a_port);
+    assert!(log_of(&alpha).contains(&format!("server:http://127.0.0.1:{a_port}")));
+    drop(restarted);
+    drop(b);
+    assert!(std::net::TcpListener::bind(("127.0.0.1", a_port)).is_ok());
+    assert!(std::net::TcpListener::bind(("127.0.0.1", b_port)).is_ok());
+}
+
+#[test]
+fn an_occupied_stored_port_is_replaced_and_persisted() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    let first = start_with_config(&dir, "finish", &config);
+    let previous = port_of(&config);
+    drop(first);
+    let occupied = std::net::TcpListener::bind(("127.0.0.1", previous)).unwrap();
+    let second = start_with_config(&dir, "finish", &config);
+    let replacement = port_of(&config);
+    assert_ne!(replacement, previous);
+    assert!(log_of(&dir).contains(&format!("server:http://127.0.0.1:{replacement}")));
+    drop(second);
+    let third = start_with_config(&dir, "finish", &config);
+    assert_eq!(port_of(&config), replacement);
+    drop(third);
+    drop(occupied);
+}
+
+#[test]
+fn startup_without_an_endpoint_never_calls_api_or_discovers_a_managed_service() {
+    let dir = TempDir::new().unwrap();
+    let log = dir.path().join("log");
+    let result = OpenCodeHarness::start_in_config(
+        scripted_opencode(),
+        None,
+        &[
+            ("ANYAGENTS_FAKE_MODE", "no-announcement"),
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("OPENCODE_PASSWORD", "inherited-test-value"),
+            ("OPENCODE_SERVER_PASSWORD", "inherited-test-value"),
+        ],
+        None,
+        &dir.path().join("config"),
+    );
+    let error = result.err().expect("startup must fail").to_string();
+    assert!(
+        error.contains("did not announce its private endpoint"),
+        "{error}"
+    );
+    assert!(!log_of(&dir).contains("api:"));
+}
+
+#[test]
+fn a_collision_during_socket_handoff_retries_and_persists_the_new_port() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::thread::scope(|scope| {
+        let launch = scope.spawn(|| start_with_config(&dir, "bind-race", &config));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let first = dir.path().join("first-serve-port");
+        let port: u16 = loop {
+            if let Ok(text) = std::fs::read_to_string(&first)
+                && let Ok(port) = text.parse()
+            {
+                break port;
+            }
+            assert!(std::time::Instant::now() < deadline, "first launch barrier");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
+        let harness = launch.join().unwrap();
+        assert_ne!(port_of(&config), port);
+        assert!(log_of(&dir).matches("serve:").count() >= 2);
+        drop(harness);
+        drop(occupied);
+    });
+}
+
+#[test]
+fn inherited_host_roots_and_credentials_do_not_select_the_service() {
+    let dir = TempDir::new().unwrap();
+    let host = dir.path().join("host-config");
+    let config = dir.path().join("agent-config");
+    std::fs::create_dir(&host).unwrap();
+    std::fs::write(host.join("sentinel"), "unchanged").unwrap();
+    let log = dir.path().join("log");
+    let mut harness = OpenCodeHarness::start_in_config(
+        scripted_opencode(),
+        Some("ses_fake"),
+        &[
+            ("ANYAGENTS_FAKE_LOG", log.to_str().unwrap()),
+            ("OPENCODE_CONFIG_DIR", host.to_str().unwrap()),
+            ("XDG_CONFIG_HOME", host.to_str().unwrap()),
+            ("OPENCODE_PASSWORD", "inherited-test-value"),
+            ("OPENCODE_SERVER_PASSWORD", "inherited-test-value"),
+        ],
+        None,
+        &config,
+    )
+    .unwrap_or_else(|error| panic!("{error}: {}", log_of(&dir)));
+    harness.deliver(&msg("isolated")).unwrap();
+    assert!(port_of(&config) > 0);
+    assert!(log_of(&dir).contains(&format!(
+        "config-root:{}",
+        config.join("opencode").display()
+    )));
+    assert_eq!(std::fs::read_dir(&host).unwrap().count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(host.join("sentinel")).unwrap(),
+        "unchanged"
+    );
+}
+
+/// Optional vendor acceptance: starts only disposable private services, without
+/// a provider call. Set ANYAGENTS_REAL_OPENCODE to the installed executable.
+#[test]
+#[ignore = "requires an installed OpenCode v2 CLI"]
+fn real_opencode_services_use_private_ports_and_reuse_them_after_restart() {
+    let program = std::env::var_os("ANYAGENTS_REAL_OPENCODE")
+        .expect("set ANYAGENTS_REAL_OPENCODE to the installed executable");
+    let alpha = TempDir::new().unwrap();
+    let beta = TempDir::new().unwrap();
+    let launch = |dir: &TempDir| {
+        OpenCodeHarness::start_in_config(
+            std::path::PathBuf::from(&program),
+            None,
+            &[
+                ("OPENCODE_DISABLE_MODELS_FETCH", "1"),
+                ("OPENCODE_CONFIG_PROJECT_DISABLE", "1"),
+            ],
+            Some(dir.path()),
+            &dir.path().join("config"),
+        )
+        .unwrap()
+    };
+    let (a, b) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| launch(&alpha));
+        let b = scope.spawn(|| launch(&beta));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    let a_port = port_of(&alpha.path().join("config"));
+    let b_port = port_of(&beta.path().join("config"));
+    assert_ne!(a_port, b_port);
+    assert!(a.session_id().is_some());
+    assert!(b.session_id().is_some());
+    drop(a);
+    let restarted = launch(&alpha);
+    assert_eq!(port_of(&alpha.path().join("config")), a_port);
+    drop(restarted);
+    drop(b);
+}
+
+#[test]
+fn a_transient_bind_collision_is_retried_even_after_the_holder_releases_it() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::thread::scope(|scope| {
+        let launch = scope.spawn(|| start_with_config(&dir, "transient-bind-race", &config));
+        let wait = |path: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "barrier {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let first = dir.path().join("first-serve-port");
+        wait(&first);
+        let port: u16 = std::fs::read_to_string(&first).unwrap().parse().unwrap();
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
+        wait(&dir.path().join("collision-reported"));
+        drop(occupied);
+        // The fixture cannot exit until the holder is gone. A later bind probe
+        // alone therefore cannot diagnose the collision that actually occurred.
+        std::fs::write(dir.path().join("collision-released"), "released").unwrap();
+        let harness = launch.join().unwrap();
+        assert_ne!(port_of(&config), port);
+        assert_eq!(log_of(&dir).matches("serve:").count(), 2);
+        drop(harness);
+    });
 }

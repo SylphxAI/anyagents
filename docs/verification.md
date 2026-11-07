@@ -93,7 +93,18 @@ zoomed and scrolls the remote page at fit. Mouse dragging continues to operate
 the remote page. Phone layout resizes only the browser window, leaving its
 User-Agent, Client Hints, screen and DPR unchanged. The original window bounds
 and state are restored on Done, agent release, expiry, navigation away, or a
-lost viewer heartbeat (10 seconds).
+lost viewer heartbeat (more than 10 seconds). The viewer polls state 800 ms
+after each response. A lost heartbeat restores phone layout only; it does not
+return control to the agent. Human control ends on Done/release, the absolute
+takeover deadline (10 minutes by default), or a dead takeover listener. Viewer
+heartbeats do not extend that deadline.
+
+Takeover state is published by atomic replacement so concurrent listener reads
+see a complete snapshot, never a truncated JSON file mistaken for an ended
+session. The publication regression holds a reader open across replacement;
+the viewport regression advances the reaper's explicit clock without writing
+expired deadlines or stale heartbeats that race its background loop. Neither
+regression needs timing sleeps or retries.
 
 Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
 and reported DPR. A screenshot captured by a fresh CDP session can be 1920×1080

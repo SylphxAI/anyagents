@@ -910,3 +910,253 @@ fn a_model_or_harness_change_drains_and_cuts_over_even_when_turn_never_ends_and_
     }));
     drop(supervisor);
 }
+
+/// A controllable adapter keeps replacement and delivery as separate observable
+/// boundaries. A replacement starts empty; only the mailbox supplies its input.
+struct SwitchHarness {
+    probe: Arc<std::sync::Mutex<SwitchProbe>>,
+}
+
+struct SwitchProbe {
+    health: anyagents_harness::HarnessHealth,
+    accept: bool,
+    given: Vec<String>,
+    health_reads: usize,
+}
+
+impl Default for SwitchProbe {
+    fn default() -> Self {
+        Self {
+            health: anyagents_harness::HarnessHealth {
+                process_alive: true,
+                turn_state: anyagents_harness::TurnState::Idle,
+                delivery_mode: DeliveryMode::Steer,
+                steer_support: anyagents_harness::SteerSupport::Yes,
+                quota_reset_at_ms: None,
+                sign_in_fault: None,
+            },
+            accept: false,
+            given: Vec::new(),
+            health_reads: 0,
+        }
+    }
+}
+
+impl anyagents_harness::Harness for SwitchHarness {
+    fn deliver(
+        &mut self,
+        message: &anyagents_harness::OutboundMessage,
+    ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
+        let mut probe = self.probe.lock().unwrap();
+        if !probe.accept {
+            return Ok(anyagents_harness::DeliverOutcome::Deferred);
+        }
+        probe.given.push(message.id.clone());
+        Ok(anyagents_harness::DeliverOutcome::Accepted {
+            turn_finished: true,
+        })
+    }
+    fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+        Ok(())
+    }
+    fn resume(&mut self, _: &str) -> Result<(), anyagents_harness::HarnessError> {
+        panic!("a switch must not resume the retiring harness session")
+    }
+    fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+        Ok(())
+    }
+    fn health(&self) -> anyagents_harness::HarnessHealth {
+        let mut probe = self.probe.lock().unwrap();
+        probe.health_reads += 1;
+        probe.health.clone()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetiringTurn {
+    Healthy,
+    Faulted,
+    FaultedIdle,
+    QuotaBlocked,
+    Dead,
+}
+
+fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
+    use anyagents_harness::TurnState;
+    use std::sync::Mutex;
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut spec = NewAgent::new("switch-target", "sylphx");
+    spec.model = Some("old-model".into());
+    spec.instructions = Some("preserve these instructions".into());
+    let agent = store.create_agent(spec).unwrap();
+    let work = dir.path().join("work");
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    store
+        .receive(&agent.id, Incoming::new("already delivered"))
+        .unwrap();
+    let first = store.next_undelivered(&agent.id).unwrap().unwrap();
+    store.note_delivered(&agent.id, first.seq).unwrap();
+    assert!(store.has_open_turn(&agent.id).unwrap());
+    // The no-replay control is completed work, not an interrupted turn that
+    // legitimately needs a synthetic recovery prompt after replacement.
+    store.note_turn_completed(&agent.id).unwrap();
+    assert!(!store.has_open_turn(&agent.id).unwrap());
+    store
+        .receive(&agent.id, Incoming::new("pending delivery"))
+        .unwrap();
+    let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
+    let before_cursor = store.delivered_cursor(&agent.id).unwrap();
+    let schedule = store
+        .create_schedule(anyagents_core::NewSchedule {
+            agent_id: agent.id.clone(),
+            kind: "watch".into(),
+            spec: "file:/synthetic/event".into(),
+            prompt: "preserve the existing wake".into(),
+            interval_ms: None,
+            next_fire_at_ms: None,
+            watch_baseline: Some("original-baseline".into()),
+        })
+        .unwrap();
+    let launches = Arc::new(Mutex::new(Vec::new()));
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let clock = ManualClock::new(1_700_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()),
+        {
+            let launches = Arc::clone(&launches);
+            let probes = Arc::clone(&probes);
+            Arc::new(move |request: LaunchRequest| {
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                probes.lock().unwrap().push(Arc::clone(&probe));
+                launches.lock().unwrap().push(request.agent);
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some()));
+    let old = Arc::clone(&probes.lock().unwrap()[0]);
+    {
+        let mut probe = old.lock().unwrap();
+        probe.health.turn_state = if retiring == RetiringTurn::FaultedIdle {
+            TurnState::Idle
+        } else {
+            TurnState::InTurn
+        };
+        if matches!(
+            retiring,
+            RetiringTurn::Faulted | RetiringTurn::FaultedIdle | RetiringTurn::QuotaBlocked
+        ) {
+            probe.health.sign_in_fault = Some("HTTP 400: context limit exceeded".into());
+        }
+        if retiring == RetiringTurn::QuotaBlocked {
+            // A pending switch must not inherit the retiring process's hold.
+            probe.health.quota_reset_at_ms = Some(clock.now_ms() + 60_000);
+        }
+        probe.health.process_alive = retiring != RetiringTurn::Dead;
+    }
+    if state != "running" {
+        store.set_agent_state(&agent.id, state).unwrap();
+        assert!(wait_until(|| supervisor
+            .live(&agent.id)
+            .is_some_and(|l| !l.process_alive)));
+    }
+    if !model_only {
+        store.set_agent_harness(&agent.id, "codex").unwrap();
+    }
+    store.set_agent_model(&agent.id, "new-model").unwrap();
+    store.set_agent_state(&agent.id, "running").unwrap();
+    let reads = old.lock().unwrap().health_reads;
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    if state == "running" && retiring == RetiringTurn::Healthy {
+        assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
+        assert_eq!(
+            launches.lock().unwrap().len(),
+            1,
+            "a healthy turn must drain first"
+        );
+        old.lock().unwrap().health.turn_state = TurnState::Idle;
+        store.poke(Wake::Agent {
+            agent_id: agent.id.clone(),
+        });
+    }
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some_and(|l| {
+        l.live_model.as_deref() == Some("new-model")
+            && l.live_harness.as_deref() == Some(if model_only { "sylphx" } else { "codex" })
+    })));
+    // No manual-clock advance: an errored turn must not wait for the drain.
+    assert_eq!(clock.now_ms(), 1_700_000_000_000);
+    assert_eq!(store.delivered_cursor(&agent.id).unwrap(), before_cursor);
+    let after_pending = store.next_undelivered(&agent.id).unwrap().unwrap();
+    assert_eq!(
+        (after_pending.id, after_pending.seq),
+        (pending.id.clone(), pending.seq)
+    );
+    let updated = store.agent(&agent.id).unwrap();
+    assert_eq!(updated.id, agent.id);
+    assert_eq!(updated.instructions, agent.instructions);
+    assert_eq!(store.get_schedule(&schedule.id).unwrap(), Some(schedule));
+    assert!(old.lock().unwrap().given.is_empty());
+    let replacement = Arc::clone(probes.lock().unwrap().last().unwrap());
+    assert!(replacement.lock().unwrap().given.is_empty());
+    replacement.lock().unwrap().accept = true;
+    store.poke(Wake::Mail {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(
+        || store.delivered_cursor(&agent.id).unwrap() == pending.seq
+    ));
+    assert_eq!(
+        replacement.lock().unwrap().given,
+        vec![pending.id.to_string()]
+    );
+    assert!(store.next_undelivered(&agent.id).unwrap().is_none());
+}
+
+#[test]
+fn an_errored_turn_switches_harness_on_wake_without_draining_or_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::Faulted, false);
+}
+
+#[test]
+fn an_errored_turn_switches_model_on_wake_without_draining_or_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::Faulted, true);
+}
+
+#[test]
+fn a_paused_agent_switches_on_wake_without_replaying_mail() {
+    switch_at_dispatch("paused", RetiringTurn::Healthy, false);
+}
+
+#[test]
+fn an_archived_agent_switches_on_wake_without_replaying_mail() {
+    switch_at_dispatch("archived", RetiringTurn::Healthy, false);
+}
+
+#[test]
+fn a_healthy_turn_defers_switch_until_the_boundary_without_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::Healthy, false);
+}
+
+#[test]
+fn a_faulted_idle_process_switches_without_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::FaultedIdle, false);
+}
+
+#[test]
+fn a_faulted_quota_blocked_process_switches_without_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::QuotaBlocked, false);
+}
+
+#[test]
+fn a_dead_process_switches_without_waiting_for_restart_backoff() {
+    switch_at_dispatch("running", RetiringTurn::Dead, false);
+}

@@ -201,6 +201,21 @@ fn an_api_key_agent_gets_the_gateway_and_its_turn_reaches_the_provider() {
     let server = Server::start(&data);
 
     let id = create(&data, "alpha");
+    let described = post(
+        &data.join("anyagents.sock"),
+        "/v1/agents/alpha/description",
+        r#"{"description":"Persistent charter","scope":"siblings"}"#,
+    );
+    assert!(described.contains("200 OK"), "{described}");
+    let read_policy = || {
+        let agent = Store::open(data.join("state.db"))
+            .unwrap()
+            .agent_by_name("alpha")
+            .unwrap();
+        assert_eq!(agent.scope(), "siblings");
+        assert_eq!(agent.description.as_deref(), Some("Persistent charter"));
+    };
+    read_policy();
     let key_file = dir.path().join("key");
     std::fs::write(&key_file, "sk-provider-secret\n").unwrap();
     let stored = bin()
@@ -257,8 +272,11 @@ fn an_api_key_agent_gets_the_gateway_and_its_turn_reaches_the_provider() {
                 && value.starts_with("http://127.0.0.1:")),
         "{launch:?}"
     );
+    // Storing the key refreshes the provider route through gateway::add_route.
+    read_policy();
     drop(server);
     let _server = Server::start(&data);
+    read_policy();
 
     // The restarted server binds a new port and repoints every agent at it, so
     // the origin is read from the running server, not from before the restart.

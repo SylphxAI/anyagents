@@ -690,8 +690,12 @@ fn spawn_admin_sylphx_delivery(
                         }
                     }
                     flush_harness_usage(&harness, &mut recorded_usage);
-                    if completed_any && !had_err && agent.parent_id.is_some() {
-                        let _ = store.complete_idle_subagent(&agent.id);
+                    if completed_any
+                        && !had_err
+                        && agent.parent_id.is_some()
+                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                    {
+                        reap_idle_subagent_caches(&data, &agent.id);
                     }
                 }
                 Err(reason) => {
@@ -1003,7 +1007,16 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
         return;
     };
     for agent in agents {
-        if agent.state != "archived" || agent.parent_id.is_none() {
+        if agent.parent_id.is_none() {
+            continue;
+        }
+        if agent.state == "idle" {
+            if !health.get(&agent.id).is_some_and(|live| live.process_alive) {
+                reap_idle_subagent_caches(data_dir, &agent.id);
+            }
+            continue;
+        }
+        if agent.state != "archived" {
             continue;
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
@@ -1194,6 +1207,12 @@ fn reconcile_agent_snapshot(
                     }
                 }
             } else {
+                if agent.state == "idle"
+                    && agent.parent_id.is_some()
+                    && !health.get(&agent.id).is_some_and(|l| l.process_alive)
+                {
+                    reap_idle_subagent_caches(data, &agent.id);
+                }
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
             }
         } else if agent.state == "running" {
@@ -1209,6 +1228,7 @@ fn reconcile_agent_snapshot(
                         && agent.parent_id.is_some()
                         && store.complete_idle_subagent(&agent.id).unwrap_or(false)
                     {
+                        reap_idle_subagent_caches(data, &agent.id);
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
                             &agent.id,
@@ -1887,6 +1907,10 @@ async fn harness_route(
             body.profile.as_deref(),
         )
         .map_err(ApiError::from_store)?;
+        if let Some(mut live) = state.health.get(&found.id) {
+            live.last_error = None;
+            state.health.publish(&found.id, live);
+        }
         Ok(Json(out))
     })
     .await
@@ -2418,6 +2442,10 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
+            if let Some(mut live) = state.health.get(&agent.id) {
+                live.last_error = None;
+                state.health.publish(&agent.id, live);
+            }
             Ok(Json(out))
         })
         .await;
@@ -2792,6 +2820,10 @@ async fn set_description_route(
                 &target.name,
             )?;
         }
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { name, .. } => format!("agent:{name}"),
+        };
         let mut rec = target;
         let is_ancestor = match &principal {
             Principal::Agent { agent_id, .. } => {
@@ -2805,7 +2837,7 @@ async fn set_description_route(
             }
             rec = state
                 .store
-                .set_agent_scope(&rec.id, scope_val)
+                .set_agent_scope_as(&rec.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
         } else if let Some(pub_val) = body.public {
             if !is_ancestor {
@@ -2813,7 +2845,7 @@ async fn set_description_route(
             }
             rec = state
                 .store
-                .set_agent_public(&rec.id, pub_val)
+                .set_agent_public_as(&rec.id, pub_val, &actor)
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref role_str) = body.role {
@@ -3471,7 +3503,16 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     ) = match health.get(&agent.id) {
         Some(live) if agent.harness != "sylphx" || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
-            let effective_err = live.last_error.clone().or(session_error);
+            let live_err = if live
+                .live_harness
+                .as_deref()
+                .is_some_and(|h| h != agent.harness)
+            {
+                None
+            } else {
+                live.last_error.clone()
+            };
+            let effective_err = live_err.or(session_error);
             let working = live.process_alive
                 && effective_quota.is_none()
                 && effective_err.is_none()
@@ -3635,7 +3676,7 @@ fn install_state(store: &Store, agent: &Agent) -> String {
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(body): Json<CreateAgentRequest>,
+    Json(mut body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
     let caller_agent = match &principal {
         Principal::Operator => None,
@@ -3663,6 +3704,7 @@ async fn create_agent_route(
             }
             (None, None) => None,
         };
+        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body);
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
@@ -3700,20 +3742,24 @@ async fn create_agent_route(
                     .map_err(ApiError::from_store)?;
             }
         }
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { name, .. } => format!("agent:{name}"),
+        };
         if let Some(ref scope_val) = body.scope {
             agent = state
                 .store
-                .set_agent_scope(&agent.id, scope_val)
+                .set_agent_scope_as(&agent.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
         } else if body.public == Some(true) {
             agent = state
                 .store
-                .set_agent_public(&agent.id, true)
+                .set_agent_public_as(&agent.id, true, &actor)
                 .map_err(ApiError::from_store)?;
         } else if body.public == Some(false) {
             agent = state
                 .store
-                .set_agent_public(&agent.id, false)
+                .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref grp_raw) = body.group {
@@ -3801,6 +3847,12 @@ async fn archive_agent_route(
         };
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
+        if found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a standing domain mind (with a role) cannot be archived; clear its role first or use pause/harness instead",
+            ));
+        }
         if found.parent_id.is_none() {
             if is_self {
                 return Err(ApiError::new(
@@ -3814,11 +3866,6 @@ async fn archive_agent_route(
                 "agents.archive_root",
                 &found.name,
             )?;
-        } else if is_self && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a standing domain sub-agent (with a role) cannot archive itself; report completion to `parent` instead",
-            ));
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -3854,6 +3901,40 @@ async fn archive_agent_route(
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
+}
+
+pub(crate) fn reap_idle_subagent_caches(
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
+    const IDLE_EPHEMERAL_CACHE_DIRS: &[&str] = &[
+        "cache-home",
+        "cache",
+        ".cache",
+        ".npm",
+        ".bun",
+        ".cargo",
+        ".rustup",
+        ".tmp",
+        "tmp",
+        "shell-snapshots",
+    ];
+    let agent_root = data_dir.join("agents").join(agent_id.as_str());
+    let config_dir = agent_root.join("config");
+    let any_exists = IDLE_EPHEMERAL_CACHE_DIRS
+        .iter()
+        .any(|rel| std::fs::symlink_metadata(config_dir.join(rel)).is_ok());
+    if !any_exists {
+        return true;
+    }
+    let seat_ids =
+        detect_seat_ids(&config_dir).or_else(|| detect_seat_ids(&agent_root.join("work")));
+    let mut complete = true;
+    for rel in IDLE_EPHEMERAL_CACHE_DIRS {
+        let target = config_dir.join(rel);
+        complete &= remove_path_with_seat(&target, seat_ids);
+    }
+    complete
 }
 
 pub(crate) fn reap_subagent_ephemeral_dirs(
@@ -6498,6 +6579,127 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn describe_preserves_scope_and_audits_authorized_policy_updates() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("mind", "codex");
+        new.parent_id = Some(parent.id.clone());
+        new.role = Some("Mind".into());
+        let mind = store.create_agent(new).unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let caller = |agent: &Agent| Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut expected_audit = Vec::new();
+            for (body, before, after, source) in [
+                (serde_json::json!({"scope":"siblings"}), "siblings", "siblings", "scope"),
+                (serde_json::json!({"description":"Public charter", "public":false}), "siblings", "siblings", "public"),
+                (serde_json::json!({"instructions":"Private instructions"}), "siblings", "siblings", ""),
+                (serde_json::json!({"role":"Updated Mind"}), "siblings", "siblings", ""),
+                (serde_json::json!({"public":true}), "siblings", "public", "public"),
+                (serde_json::json!({"public":false}), "public", "siblings", "public"),
+                (serde_json::json!({"scope":"isolated", "public":true}), "siblings", "isolated", "scope"),
+                (serde_json::json!({"public":false}), "isolated", "isolated", "public"),
+                (serde_json::json!({"scope":"private"}), "isolated", "private", "scope"),
+                (serde_json::json!({"public":false}), "private", "private", "public"),
+                (serde_json::json!({"scope":"siblings"}), "private", "siblings", "scope"),
+            ] {
+                let Json(updated) = set_description_route(
+                    caller(&parent), State(state.clone()), AxumPath("mind".into()),
+                    Json(serde_json::from_value(body).unwrap()),
+                ).await.unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert_eq!(updated["scope"], after);
+                if !source.is_empty() {
+                    expected_audit.push(("agent:parent".to_string(), before.to_string(), after.to_string(), source.to_string()));
+                }
+            }
+            let before = store.agent(&mind.id).unwrap();
+            let outsider = store.create_agent(anyagents_core::NewAgent::new("outsider", "codex")).unwrap();
+            let mut sibling_new = anyagents_core::NewAgent::new("sibling", "codex");
+            sibling_new.parent_id = Some(parent.id.clone());
+            let sibling = store.create_agent(sibling_new).unwrap();
+            for agent in [&outsider, &sibling] {
+                for body in [serde_json::json!({"scope":"public"}), serde_json::json!({"description":"Overwrite", "instructions":"Overwrite"})] {
+                    let err = set_description_route(caller(agent), State(state.clone()), AxumPath("mind".into()), Json(serde_json::from_value(body).unwrap()))
+                        .await.expect_err("unrelated caller must be refused");
+                    assert_eq!(err.status, StatusCode::FORBIDDEN);
+                    assert_eq!(store.agent(&mind.id).unwrap(), before);
+                }
+            }
+            let err = set_description_route(caller(&mind), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"public"})).unwrap()))
+                .await.expect_err("self cannot widen scope");
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+            // An admin's self update is allowed and has the same atomic audit.
+            store.set_agent_admin(&parent.id, true).unwrap();
+            let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated"})).unwrap()))
+                .await.unwrap_or_else(|e| panic!("{}", e.message));
+            let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+            let mut stmt = conn.prepare("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='mind' AND source IS NOT NULL ORDER BY id").unwrap();
+            let rows: Vec<(String,String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(rows, expected_audit);
+            let self_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(self_audit, ("agent:parent".into(),"public".into(),"isolated".into(),"scope".into()));
+            assert_eq!(store.agent(&mind.id).unwrap().description.as_deref(), Some("Public charter"));
+            // Every runtime-config pass reads the store's policy; none owns it.
+            for _ in 0..2 {
+                let current = store.agent(&mind.id).unwrap();
+                let config = anyagents_core::agent_config_dir(dir.path(), &mind.id);
+                let work = anyagents_core::agent_work_dir(dir.path(), &mind.id);
+                create::reconcile_agent_runtime_config(&store, dir.path(), &current, &config, &work).unwrap();
+                let reloaded = Store::open(dir.path().join("state.db")).unwrap().agent(&mind.id).unwrap();
+                assert_eq!(reloaded.scope(), "siblings");
+                assert_eq!(reloaded.description, current.description);
+            }
+        });
+    }
+
+    #[test]
+    fn role_spawn_defaults_to_siblings_and_task_spawn_defaults_to_private() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {
+                let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
+                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
+                assert_eq!(created.scope, scope);
+                let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":true})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
+                let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":false})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
+                assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
+            }
+        });
+    }
+
+    #[test]
     fn a_sign_in_streams_the_link_before_the_outcome() {
         let _env = env_lock();
         let data = tempfile::tempdir().unwrap();
@@ -7441,5 +7643,243 @@ exec /usr/bin/git "$@"
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
+    }
+
+    #[test]
+    fn standing_domain_mind_cannot_be_archived_and_harness_switch_clears_stale_error() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let hub = store
+            .create_agent(anyagents_core::NewAgent::new("argus", "codex"))
+            .unwrap();
+        store.set_agent_admin(&hub.id, true).unwrap();
+        let mut new_mind = anyagents_core::NewAgent::new("calliope", "sylphx");
+        new_mind.parent_id = Some(hub.id.clone());
+        new_mind.role = Some("Game Studio".into());
+        let mind = store.create_agent(new_mind).unwrap();
+        store.set_agent_state(&mind.id, "running").unwrap();
+        let mut new_runner = anyagents_core::NewAgent::new("calliope-sub-1", "opencode");
+        new_runner.parent_id = Some(mind.id.clone());
+        let runner = store.create_agent(new_runner).unwrap();
+        store.set_agent_state(&runner.id, "running").unwrap();
+
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Neither self, parent hub (`argus`), nor operator can archive `calliope` while its role is set.
+            for caller in [
+                Principal::Agent {
+                    agent_id: mind.id.clone(),
+                    name: mind.name.clone(),
+                },
+                Principal::Agent {
+                    agent_id: hub.id.clone(),
+                    name: hub.name.clone(),
+                },
+                Principal::Operator,
+            ] {
+                let err =
+                    archive_agent_route(caller, State(state.clone()), AxumPath("calliope".into()))
+                        .await
+                        .expect_err("standing domain mind with role must reject archive");
+                assert_eq!(err.status, StatusCode::BAD_REQUEST);
+                assert!(
+                    err.message
+                        .contains("a standing domain mind (with a role) cannot be archived"),
+                    "unexpected error: {}",
+                    err.message
+                );
+            }
+            assert_eq!(store.agent(&mind.id).unwrap().state, "running");
+            assert_eq!(store.agent(&runner.id).unwrap().state, "running");
+        });
+
+        // Offline CLI path also blocks archiving a standing domain mind with a role.
+        let cli_err = crate::agent::agents(
+            dir.path(),
+            crate::AgentsCommand::Archive {
+                name: "calliope".into(),
+            },
+        )
+        .expect_err("offline archive must also block standing domain mind");
+        assert!(
+            cli_err
+                .to_string()
+                .contains("a standing domain mind (with a role) cannot be archived")
+        );
+
+        // Persist a stale sylphx error and parent-error notification marker, then switch harness.
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &mind.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        crate::vendor::persist_last_error(&cfg, Some("sylphx stream error 502"), None);
+        std::fs::write(cfg.join(".anyagents-notified-parent-error.json"), "{}").unwrap();
+        assert!(cfg.join(".anyagents-last-error.json").is_file());
+        assert!(cfg.join(".anyagents-notified-parent-error.json").is_file());
+
+        create::set_agent_harness(
+            &store,
+            dir.path(),
+            "agent:argus",
+            "calliope",
+            "codex",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!cfg.join(".anyagents-last-error.json").is_file());
+        assert!(!cfg.join(".anyagents-notified-parent-error.json").is_file());
+        let updated_mind = store.agent(&mind.id).unwrap();
+        let view = agent_view(&store, &state.health, &updated_mind)
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+        assert_eq!(view.harness, "codex");
+        assert_eq!(view.turn_state, "idle");
+        assert!(view.last_error.is_none());
+
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parent_workdir = dir.path().join("repo");
+        let agents_dir = parent_workdir.join(".agents").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("writer.md"),
+            "---\ndescription: \"Ephemeral worktree PR writer\"\nscope: isolated\nworkdir: private\nharness: codex\nmodel: gpt-5.4\n---\n# Writer Archetype\nAlways run cargo test before opening a PR.\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::agent::open_with_key(dir.path()).unwrap());
+        let mut new_parent = anyagents_core::NewAgent::new("lyra", "opencode");
+        new_parent.workdir = Some(parent_workdir.to_string_lossy().to_string());
+        let parent = store.create_agent(new_parent).unwrap();
+
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+                "name": "lyra-writer-1",
+                "type": "writer",
+                "instructions": "Fix issue #42."
+            }))
+            .unwrap();
+            let (status, Json(created)) = create_agent_route(
+                Principal::Agent {
+                    agent_id: parent.id.clone(),
+                    name: parent.name.clone(),
+                },
+                State(state.clone()),
+                Json(req),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(
+                created.description.as_deref(),
+                Some("Ephemeral worktree PR writer")
+            );
+            assert_eq!(created.scope, "isolated");
+            assert_eq!(created.harness, "codex");
+            assert_eq!(created.model.as_deref(), Some("gpt-5.4"));
+            let inst = created.instructions.as_deref().unwrap_or("");
+            assert!(
+                inst.starts_with("# Writer Archetype\nAlways run cargo test before opening a PR.")
+            );
+            assert!(inst.ends_with("Fix issue #42."));
+        });
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn reap_idle_subagent_caches_removes_ephemeral_caches_preserving_sessions_and_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let mut new_child = anyagents_core::NewAgent::new("sub-worker", "opencode");
+        new_child.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new_child).unwrap();
+
+        let agent_root = dir.path().join("agents").join(child.id.as_str());
+        let config_dir = agent_root.join("config");
+        let work_dir = agent_root.join("work");
+        for cache_rel in [
+            "cache-home",
+            "cache",
+            ".cache",
+            ".npm",
+            ".bun",
+            ".cargo",
+            ".rustup",
+            ".tmp",
+            "tmp",
+            "shell-snapshots",
+        ] {
+            let p = config_dir.join(cache_rel);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("blob.bin"), b"ephemeral").unwrap();
+        }
+        for keep_rel in [".claude", ".codex", ".gemini", "opencode", ".config"] {
+            let p = config_dir.join(keep_rel);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("session.json"), b"{}").unwrap();
+        }
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("lib.rs"), b"pub fn ok() {}\n").unwrap();
+
+        assert!(reap_idle_subagent_caches(dir.path(), &child.id));
+
+        for cache_rel in [
+            "cache-home",
+            "cache",
+            ".cache",
+            ".npm",
+            ".bun",
+            ".cargo",
+            ".rustup",
+            ".tmp",
+            "tmp",
+            "shell-snapshots",
+        ] {
+            assert!(
+                !config_dir.join(cache_rel).exists(),
+                "expected ephemeral cache {cache_rel} to be removed"
+            );
+        }
+        for keep_rel in [".claude", ".codex", ".gemini", "opencode", ".config"] {
+            assert!(
+                config_dir.join(keep_rel).join("session.json").is_file(),
+                "expected session state {keep_rel} to be preserved"
+            );
+        }
+        assert!(work_dir.join("lib.rs").is_file());
     }
 }
