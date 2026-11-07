@@ -97,6 +97,20 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### New-agent workspace selection
+
+`create::create` resolves workspace defaults for every spawn route. A new
+sub-agent with neither `repo` nor `workdir` gets a private
+`<data>/agents/<id>/work` directory, not its parent's directory. Each sibling
+gets a different directory. `workdir: "private"` selects this explicitly;
+`workdir: "inherit"` shares an existing parent directory only when requested.
+An explicit path is honoured. `repo: "inherit"` or `workdir: "worktree"`
+creates an isolated Git worktree instead of sharing the parent's worktree.
+
+Root creation can receive the operator's `workdir_default`; without that
+operator override it also uses its own managed directory. These defaults apply
+only to newly created agents: stored workdirs are not migrated or rewritten.
+
 ### GitHub event watches
 
 `github:pr:owner/repo#number` and `github:check:owner/repo@ref` use REST

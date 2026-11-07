@@ -3609,7 +3609,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "repo": { "type": "string" },
                         "branch": { "type": "string" },
                         "base": { "type": "string" },
-                        "workdir": { "type": "string" },
+                        "workdir": { "type": "string", "description": "Workspace path or mode: worktree, private, or inherit (explicit parent sharing). Omitting both repo and workdir gives a sub-agent its own private <data>/agents/<id>/work directory." },
                         "description": { "type": "string" },
                         "instructions": { "type": "string" },
                         "public": { "type": "boolean", "description": "Cross-tree reachability (`false` default for sub-agents)." },
