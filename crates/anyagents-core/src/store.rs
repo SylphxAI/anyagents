@@ -400,6 +400,12 @@ pub struct HistorySearchQuery {
     pub radius: usize,
     /// Maximum turns to return (`1..=200`).
     pub limit: usize,
+    /// Caller-authorized immutable agent IDs. `None` is the unrestricted operator view;
+    /// `Some` is the visibility boundary resolved by the API before this query
+    /// reaches the Raw-RAG reader. This is deliberately separate from `agent`,
+    /// which is a caller-supplied narrowing selector.
+    #[serde(default)]
+    pub visible_agent_ids: Option<Vec<String>>,
 }
 
 impl Default for HistorySearchQuery {
@@ -422,6 +428,7 @@ impl Default for HistorySearchQuery {
             sort: HistorySort::Relevance,
             radius: 0,
             limit: 20,
+            visible_agent_ids: None,
         }
     }
 }
@@ -2311,8 +2318,28 @@ impl Store {
         since_ms: Option<i64>,
         limit: Option<usize>,
     ) -> Result<Vec<ConversationTurn>, Error> {
+        self.conversation_scoped(agent_id, with_peer, since_ms, limit, None)
+    }
+
+    /// Read one agent's conversation after applying the caller's authorized
+    /// agent set. The optional set is an authorization boundary, not a result
+    /// filter: a target outside it is an empty internal result and is rejected
+    /// by the API before this method is called.
+    pub fn conversation_scoped(
+        &self,
+        agent_id: &AgentId,
+        with_peer: Option<&str>,
+        since_ms: Option<i64>,
+        limit: Option<usize>,
+        visible_agent_ids: Option<&[String]>,
+    ) -> Result<Vec<ConversationTurn>, Error> {
         let conn = self.conn();
         let agent = agent_by_id(&conn, agent_id)?;
+        if let Some(visible) = visible_agent_ids
+            && !visible.iter().any(|name| name == agent.id.as_str())
+        {
+            return Ok(Vec::new());
+        }
         let delivered = cursor(&conn, agent_id)?;
         let self_addr = format!("agent:{}", agent.name);
         let since = since_ms.unwrap_or(0);
@@ -2432,6 +2459,20 @@ impl Store {
         since_ms: Option<i64>,
         limit: Option<usize>,
     ) -> Result<Vec<ConversationTurn>, Error> {
+        self.conversation_all_scoped(with_peer, since_ms, limit, None)
+    }
+
+    /// Read recent turns across an authorized set of agents. `visible_agent_ids`
+    /// is pushed into SQLite so a limited caller never relies on a post-query
+    /// truncation that could omit an authorized hit behind another agent's
+    /// rows.
+    pub fn conversation_all_scoped(
+        &self,
+        with_peer: Option<&str>,
+        since_ms: Option<i64>,
+        limit: Option<usize>,
+        visible_agent_ids: Option<&[String]>,
+    ) -> Result<Vec<ConversationTurn>, Error> {
         let conn = self.conn();
         let since = since_ms.unwrap_or(0);
         let lim = i64::try_from(limit.unwrap_or(50).max(1)).unwrap_or(50);
@@ -2441,22 +2482,30 @@ impl Store {
         } else {
             lim
         };
+        let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 3);
         let sql = if since_ms.is_some() {
-            "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
-             FROM rag_chunks
-             WHERE timestamp_ms > ?1
-             ORDER BY timestamp_ms ASC, chunk_id ASC
-             LIMIT ?2"
+            format!(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+                 FROM rag_chunks
+                 WHERE timestamp_ms > ?1 {visibility_sql}
+                 ORDER BY timestamp_ms ASC, chunk_id ASC
+                 LIMIT ?2"
+            )
         } else {
-            "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
-             FROM rag_chunks
-             WHERE timestamp_ms > ?1
-             ORDER BY timestamp_ms DESC, chunk_id DESC
-             LIMIT ?2"
+            format!(
+                "SELECT chunk_id, direction, sender, destination, text, timestamp_ms
+                 FROM rag_chunks
+                 WHERE timestamp_ms > ?1 {visibility_sql}
+                 ORDER BY timestamp_ms DESC, chunk_id DESC
+                 LIMIT ?2"
+            )
         };
         let mut turns = Vec::new();
-        let mut stmt = conn.prepare(sql)?;
-        let mut rows = stmt.query(params![since, fetch_limit])?;
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(scoped_params(
+            params![since, fetch_limit],
+            visible_agent_ids,
+        )))?;
         while let Some(row) = rows.next()? {
             turns.push(ConversationTurn {
                 id: row.get(0)?,
@@ -2515,6 +2564,7 @@ impl Store {
                 }
                 stripped.to_lowercase()
             });
+        let visible_agent_ids = req.visible_agent_ids.as_deref();
         let peer_filter = req
             .with_peer
             .as_deref()
@@ -2654,27 +2704,29 @@ impl Store {
                 kind_sql_filter,
                 tool_filter.as_deref(),
             );
+            let visibility_sql = visible_agent_ids_sql("agent_id", visible_agent_ids, 5);
             if !fts_query.is_empty()
-                && let Ok(mut fstmt) = conn.prepare(
+                && let Ok(mut fstmt) = conn.prepare(&format!(
                     "SELECT c.chunk_id, c.direction, c.sender, c.destination, c.text, c.timestamp_ms,
                             c.agent_name, c.kind, c.tool_name, c.seq, f.score
                      FROM (
                          SELECT chunk_id, bm25(rag_chunks_fts, 0.5, 1.0, 1.0, 1.0, 0.5, 2.0, 3.0, 2.5) as score
                          FROM rag_chunks_fts
                          WHERE rag_chunks_fts MATCH ?1
+                           AND chunk_id IN (
+                               SELECT chunk_id FROM rag_chunks WHERE 1=1{visibility_sql}
+                           )
                          ORDER BY score ASC
                          LIMIT ?4
                      ) f
                      JOIN rag_chunks c ON c.chunk_id = f.chunk_id
                      WHERE c.timestamp_ms > ?2 AND c.timestamp_ms <= ?3
                      ORDER BY f.score ASC",
-                )
-                && let Ok(mut frows) = fstmt.query(params![
-                    fts_query,
-                    since,
-                    until,
-                    i64::try_from((limit * 8).max(120)).unwrap_or(120)
-                ])
+                ))
+                && let Ok(mut frows) = fstmt.query(rusqlite::params_from_iter(scoped_params(
+                    params![fts_query, since, until, i64::try_from((limit * 8).max(120)).unwrap_or(120)],
+                    visible_agent_ids,
+                )))
             {
                 let mut rank = 0usize;
                 while let Ok(Some(row)) = frows.next() {
@@ -2734,7 +2786,7 @@ impl Store {
                         continue;
                     }
                     let like_pat = format!("%{}%", q_trim.replace('%', "\\%").replace('_', "\\_"));
-                    let mut lstmt = conn.prepare(
+                    let mut lstmt = conn.prepare(&format!(
                         "SELECT chunk_id, direction, sender, destination, text, timestamp_ms,
                                 agent_name, kind, tool_name, seq
                          FROM (
@@ -2745,24 +2797,28 @@ impl Store {
                                AND (?5 IS NULL OR LOWER(agent_name) = ?5)
                                AND (?6 IS NULL OR kind = ?6)
                                AND (?7 IS NULL OR seq >= ?7)
-                               AND (?8 IS NULL OR seq <= ?8)
+                               AND (?8 IS NULL OR seq <= ?8){}
                              ORDER BY timestamp_ms DESC
                              LIMIT 2000
                          )
                          WHERE text LIKE ?3 ESCAPE '\\'
                          ORDER BY timestamp_ms DESC
                          LIMIT ?4",
-                    )?;
-                    let mut lrows = lstmt.query(params![
-                        since,
-                        until,
-                        like_pat,
-                        i64::try_from((limit * 4).max(80)).unwrap_or(80),
-                        agent_name_filter.as_deref(),
-                        kind_sql_filter,
-                        req.from_seq,
-                        req.to_seq,
-                    ])?;
+                        visible_agent_ids_sql("agent_id", visible_agent_ids, 9)
+                    ))?;
+                    let mut lrows = lstmt.query(rusqlite::params_from_iter(scoped_params(
+                        params![
+                            since,
+                            until,
+                            like_pat,
+                            i64::try_from((limit * 4).max(80)).unwrap_or(80),
+                            agent_name_filter.as_deref(),
+                            kind_sql_filter,
+                            req.from_seq,
+                            req.to_seq,
+                        ],
+                        visible_agent_ids,
+                    )))?;
                     let mut rank = 0usize;
                     while let Some(row) = lrows.next()? {
                         let cid: String = row.get(0)?;
@@ -2806,21 +2862,25 @@ impl Store {
                    AND (?5 IS NULL OR kind = ?5)
                    AND (?6 IS NULL OR LOWER(direction) = ?6)
                    AND (?7 IS NULL OR seq >= ?7)
-                   AND (?8 IS NULL OR seq <= ?8)
+                   AND (?8 IS NULL OR seq <= ?8){}
                  {order_sql}
-                 LIMIT ?3"
+                 LIMIT ?3",
+                visible_agent_ids_sql("agent_id", visible_agent_ids, 9)
             );
             let mut bstmt = conn.prepare(&sql)?;
-            let mut brows = bstmt.query(params![
-                since,
-                until,
-                i64::try_from((limit * 8).max(200)).unwrap_or(200),
-                agent_name_filter.as_deref(),
-                kind_sql_filter,
-                dir_filter.as_deref(),
-                req.from_seq,
-                req.to_seq,
-            ])?;
+            let mut brows = bstmt.query(rusqlite::params_from_iter(scoped_params(
+                params![
+                    since,
+                    until,
+                    i64::try_from((limit * 8).max(200)).unwrap_or(200),
+                    agent_name_filter.as_deref(),
+                    kind_sql_filter,
+                    dir_filter.as_deref(),
+                    req.from_seq,
+                    req.to_seq,
+                ],
+                visible_agent_ids,
+            )))?;
             let mut rank = 0usize;
             while let Some(row) = brows.next()? {
                 let cid: String = row.get(0)?;
@@ -4639,6 +4699,37 @@ fn build_fts5_query_with_filters(
         }
     }
     clauses.join(" AND ")
+}
+
+/// SQL fragment for the visibility predicate shared by recent and Raw-RAG
+/// reads. Immutable IDs are exact matches; an empty set fails closed.
+fn visible_agent_ids_sql(
+    column: &str,
+    visible_agent_ids: Option<&[String]>,
+    first_param: usize,
+) -> String {
+    let Some(agents) = visible_agent_ids else {
+        return String::new();
+    };
+    if agents.is_empty() {
+        return " AND 0".to_string();
+    }
+    let placeholders = (0..agents.len())
+        .map(|offset| format!("?{}", first_param + offset))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" AND {column} IN ({placeholders})")
+}
+
+fn scoped_params<'a>(
+    bind: &[&'a dyn rusqlite::ToSql],
+    visible_agent_ids: Option<&'a [String]>,
+) -> Vec<&'a dyn rusqlite::ToSql> {
+    let mut bind = bind.to_vec();
+    if let Some(agents) = visible_agent_ids {
+        bind.extend(agents.iter().map(|agent| agent as &dyn rusqlite::ToSql));
+    }
+    bind
 }
 
 fn message_by_source(
