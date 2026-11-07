@@ -1249,7 +1249,7 @@ mod tests {
         let _env = crate::server::tests::env_lock();
         // SAFETY: under the server test lock, restored before releasing it.
         let names = ["ANYAGENTS_TESTS", "ANYAGENTS_AGENTS", "ANYAGENTS_FAKE_MODE"];
-        let previous = names.map(|name| std::env::var_os(name));
+        let previous = names.map(std::env::var_os);
         unsafe {
             std::env::set_var("ANYAGENTS_TESTS", "own-seat");
             std::env::set_var("ANYAGENTS_AGENTS", "own-seat=2101");
