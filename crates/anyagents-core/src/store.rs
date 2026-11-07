@@ -38,6 +38,10 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
      created_at_ms, launch_env, parent_id, is_admin, role, description";
 
+fn is_scope_env_key(key: &str) -> bool {
+    matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
+}
+
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
@@ -1880,19 +1884,41 @@ impl Store {
         Ok(ReceiveOutcome::New(message))
     }
 
-    /// Store the environment the agent's harness is started with, and wake it
-    /// so the next start reads it. Never called with a provider key.
+    /// Replace the harness launch environment, preserving communication policy.
+    /// Only `set_agent_scope` owns `ANYAGENTS_SCOPE` / `ANYAGENTS_PUBLIC`;
+    /// gateway refreshes and stale environment snapshots must not overwrite them.
+    /// Never called with a provider key.
     pub fn set_agent_launch_env(
         &self,
         id: &AgentId,
         env: &[(String, String)],
     ) -> Result<Agent, Error> {
-        let json = encode_env(env);
+        self.update_agent_launch_env(id, |current| {
+            let mut refreshed: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| !is_scope_env_key(key))
+                .cloned()
+                .collect();
+            refreshed.extend(current.into_iter().filter(|(key, _)| is_scope_env_key(key)));
+            refreshed
+        })
+    }
+
+    fn update_agent_launch_env(
+        &self,
+        id: &AgentId,
+        update: impl FnOnce(Vec<(String, String)>) -> Vec<(String, String)>,
+    ) -> Result<Agent, Error> {
         let changed = {
-            let conn = self.conn();
+            let mut conn = self.conn();
+            // Read and merge under the same write transaction, including when
+            // serve and serve-admin use separate Store connections.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = agent_by_id(&tx, id)?;
+            let json = encode_env(&update(current.launch_env));
             // A database written before this column existed still reads: the
             // harness then keeps whatever sign-in it already has.
-            let updated = conn
+            let updated = tx
                 .execute(
                     "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
                     params![json, id.as_str()],
@@ -1910,7 +1936,9 @@ impl Store {
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
             }
-            agent_by_id(&conn, id)?
+            let changed = agent_by_id(&tx, id)?;
+            tx.commit()?;
+            changed
         };
         self.notify(Wake::Agent {
             agent_id: id.clone(),
@@ -3074,17 +3102,14 @@ impl Store {
                 )));
             }
         };
-        let agent = self.agent(agent_id)?;
-        let mut env: Vec<(String, String)> = agent
-            .launch_env
-            .into_iter()
-            .filter(|(k, _)| k != "ANYAGENTS_PUBLIC" && k != "ANYAGENTS_SCOPE")
-            .collect();
-        env.push(("ANYAGENTS_SCOPE".to_string(), normalized.to_string()));
-        if normalized == "public" {
-            env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
-        }
-        self.set_agent_launch_env(agent_id, &env)
+        self.update_agent_launch_env(agent_id, |mut env| {
+            env.retain(|(key, _)| !is_scope_env_key(key));
+            env.push(("ANYAGENTS_SCOPE".to_string(), normalized.to_string()));
+            if normalized == "public" {
+                env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
+            }
+            env
+        })
     }
 
     /// Set whether a sub-agent accepts external messages from agents outside its
@@ -5809,6 +5834,43 @@ mod tests {
         // A value with a quote, a backslash and a newline keeps its characters.
         let awkward = vec![("K".to_string(), "a\"b\\c\nd".to_string())];
         assert_eq!(decode_env(&encode_env(&awkward)), awkward);
+    }
+
+    #[test]
+    fn explicit_scope_and_description_survive_launch_env_refresh_and_reopen() {
+        let (dir, store) = setup();
+        let root = agent(&store, "root");
+        let mut new = NewAgent::new("worker", "claude-code");
+        new.parent_id = Some(root.id);
+        let worker = store.create_agent(new).unwrap();
+        let db = dir.path().join("state.db");
+        store
+            .set_agent_description(&worker.id, Some("Public charter"))
+            .unwrap();
+        for scope in ["siblings", "isolated", "public", "private"] {
+            store.set_agent_scope(&worker.id, scope).unwrap();
+            assert_eq!(store.agent(&worker.id).unwrap().scope(), scope);
+            // These are the gateway-only environments written at startup and
+            // provider refresh; none owns communication policy.
+            for port in [41001, 41002] {
+                let refreshed = store
+                    .set_agent_launch_env(
+                        &worker.id,
+                        &[("OPENAI_BASE_URL".into(), format!("http://127.0.0.1:{port}"))],
+                    )
+                    .unwrap();
+                assert_eq!(refreshed.scope(), scope);
+                assert_eq!(refreshed.description.as_deref(), Some("Public charter"));
+                let reopened = Store::open(&db).unwrap().agent(&worker.id).unwrap();
+                assert_eq!(reopened.scope(), scope);
+                assert_eq!(reopened.description, refreshed.description);
+                assert!(
+                    reopened
+                        .launch_env
+                        .contains(&("OPENAI_BASE_URL".into(), format!("http://127.0.0.1:{port}"),))
+                );
+            }
+        }
     }
 
     #[test]
