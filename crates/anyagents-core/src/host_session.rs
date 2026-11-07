@@ -50,6 +50,15 @@ fn alias(harness: &str, vendor_id: &str) -> io::Result<String> {
     serde_json::to_string(&(harness, vendor_id)).map_err(io::Error::other)
 }
 
+/// Read-only renderer path. No session allocation, MEMORY.md read, or repin.
+pub fn active(root: &Path) -> io::Result<Option<HostSession>> {
+    read(root)?
+        .active
+        .as_ref()
+        .map(|session| materialize(root, session))
+        .transpose()
+}
+
 /// Allocate before first dispatch only when there is no host session yet.
 /// A different configured harness alone cannot silently discard the saved pin.
 pub fn ensure_active(root: &Path, harness: &str) -> io::Result<HostSession> {

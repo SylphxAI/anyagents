@@ -848,6 +848,33 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - Actions: `browser({ \"action\": \"open\", \"url\": \"https://...\", \"profile\": \"<optional-profile>\" })` (launches on demand and returns visible text + `@e1`, `@e2` interactive element refs), `browser({ \"action\": \"snapshot\" })`, `browser({ \"action\": \"click\", \"selector\": \"@e1\" })`, `browser({ \"action\": \"fill\", \"selector\": \"@e2\", \"text\": \"...\", \"submit\": true })`, `browser({ \"action\": \"press\", \"key\": \"Enter\" })`, `browser({ \"action\": \"eval\", \"script\": \"...\" })`, `browser({ \"action\": \"screenshot\" })` (returns PNG path ready to inspect or send via `send` media), `browser({ \"action\": \"takeover\", \"reason\": \"...\" })`, `browser({ \"action\": \"takeover_status\" })`, `browser({ \"action\": \"wait_for_user\" })`, `browser({ \"action\": \"release_takeover\" })`, `browser({ \"action\": \"cookies\" })`, `browser({ \"action\": \"tabs\" })`, `browser({ \"action\": \"profiles\" })`, and `browser({ \"action\": \"close\" })` (scales the browser process to zero while keeping the profile logged in on disk).\n",
     );
 
+    // Only the host lifecycle allocates a generation. Describe/restart/render
+    // consume its persisted pin without opening live learned-memory files.
+    if let Some(root) = config.parent() {
+        match anyagents_core::host_session::active(root) {
+            Ok(Some(session)) if session.harness == agent.harness => {
+                doc.push('\n');
+                doc.push_str(&session.memory.section);
+                doc.push('\n');
+            }
+            Ok(None) => (), // First dispatch pins and rerenders before launch.
+            Ok(Some(_)) => {
+                eprintln!(
+                    "refusing instruction refresh for {}: host session harness mismatch",
+                    agent.id
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "refusing instruction refresh for {}: invalid host memory pin: {error}",
+                    agent.id
+                );
+                return;
+            }
+        }
+    }
+
     if let Some(shared) = read_shared_agents_md(config) {
         doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
         doc.push_str(&shared);
@@ -7316,6 +7343,61 @@ pub(crate) fn resolve_subagent_defaults(
 mod tests {
     use super::*;
 
+    #[test]
+    fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {
+        use anyagents_core::host_session;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "memory-renderer",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(data, &agent.id);
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "PINNED_FIRST_FACT 繁體\n").unwrap();
+        let first = host_session::new_session(root, &agent.harness).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        let paths = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "SYSTEM_PROMPT.md",
+            ".claude/CLAUDE.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/config/GEMINI.md",
+        ];
+        for path in paths {
+            let text = std::fs::read_to_string(config.join(path)).unwrap();
+            assert!(text.contains(&first.memory.section), "{path}");
+        }
+        std::fs::write(root.join("memory/MEMORY.md"), "EDITED_SECOND_FACT\n").unwrap();
+        agent.description = Some("ordinary describe update".into());
+        write_agent_instructions(&config, &agent, None);
+        let rerender = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(rerender.contains("PINNED_FIRST_FACT"));
+        assert!(!rerender.contains("EDITED_SECOND_FACT"));
+        // Launch assembly consumes the actual mirror, not an isolated formatter.
+        let assembled =
+            anyagents_harness_sylphx::assemble_system_prompt(&config, &data.join("workspace"));
+        assert!(assembled.contains(&first.memory.section));
+        assert!(!assembled.contains("EDITED_SECOND_FACT"));
+        agent.harness = "sylphx".into();
+        let switched = host_session::new_session(root, &agent.harness).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        for path in paths {
+            let text = std::fs::read_to_string(config.join(path)).unwrap();
+            assert!(text.contains(&switched.memory.section));
+            assert!(!text.contains("PINNED_FIRST_FACT"));
+            assert!(text.contains("EDITED_SECOND_FACT"));
+        }
+        std::fs::remove_file(root.join("memory/MEMORY.md")).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        assert_eq!(host_session::active(root).unwrap().unwrap(), switched);
+    }
     #[test]
     fn parse_remaining_pct_from_usage_handles_agy_5h_and_7d_windows() {
         let usage = "gemini: 84% left (5h: 100%, 7d: 84%) · opus: 0% left (5h: 0%, 7d: 0%)";
