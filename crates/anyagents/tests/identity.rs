@@ -255,8 +255,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &alpha_auth,
     );
     assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
-    // An agent's inbox is strictly its own incoming queue; peers read each
-    // other's full two-way conversation via `/v1/agents/{name}/conversation`.
+    // Messaging a peer does not grant access to that peer's private history.
     let other_inbox = support::call_raw(
         &socket,
         "GET",
@@ -272,8 +271,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         "",
         &beta_auth,
     );
-    assert!(other_conv.starts_with("HTTP/1.1 200"), "{other_conv}");
-    assert!(other_conv.contains("hello"), "{other_conv}");
+    assert!(other_conv.starts_with("HTTP/1.1 403"), "{other_conv}");
     // No capability at all is refused.
     let none = support::call_raw(&socket, "GET", "/v1/agents", "", "");
     assert!(none.starts_with("HTTP/1.1 401"), "{none}");
@@ -408,7 +406,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
 
 /// Each agent's capability can read its own and peer mailboxes, while operator routes stay restricted.
 #[test]
-fn each_agents_capability_reads_own_and_peer_mailboxes() {
+fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
     let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
@@ -446,7 +444,7 @@ fn each_agents_capability_reads_own_and_peer_mailboxes() {
         "",
         &as_beta,
     );
-    assert!(peer_conv.starts_with("HTTP/1.1 200"), "{peer_conv}");
+    assert!(peer_conv.starts_with("HTTP/1.1 403"), "{peer_conv}");
     let op_route = support::call_raw(
         &socket,
         "GET",
@@ -635,4 +633,188 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
             >= administering["process_started_at_ms"].as_i64().unwrap()
     );
     assert_eq!(health(&serve.socket), serving);
+}
+
+#[test]
+fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
+    use anyagents_core::{AgentId, Incoming, Store};
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let server = start_server(&data);
+    let ids: Vec<_> = ["argus", "lyra", "helios", "runner", "outsider"]
+        .into_iter()
+        .map(|name| create(&data, name))
+        .collect();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let aids: Vec<_> = ids.iter().map(|id| AgentId::parse(id).unwrap()).collect();
+    store.set_agent_parent(&aids[1], Some(&aids[0])).unwrap();
+    store.set_agent_parent(&aids[2], Some(&aids[0])).unwrap();
+    store.set_agent_parent(&aids[3], Some(&aids[1])).unwrap();
+    for id in &aids {
+        store.join_group("shared", id).unwrap();
+        let name = store.agent(id).unwrap().name;
+        store
+            .receive(
+                id,
+                Incoming {
+                    text: format!("C private fixture {name}"),
+                    sender: Some("agent:argus".into()),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: Some(1_000),
+                },
+            )
+            .unwrap();
+        store
+            .record_outbound(
+                id,
+                "telegram:chat:-100",
+                None,
+                &format!("C outbound fixture {name}"),
+            )
+            .unwrap();
+        store
+            .record_tool_event(id, "browser", &format!("C tool fixture {name}"))
+            .unwrap();
+    }
+    let as_agent = |index: usize, target: &str, suffix: &str| {
+        support::call_raw(
+            &server.socket,
+            "GET",
+            &format!("/v1/agents/{target}/conversation{suffix}"),
+            "",
+            &format!("x-anyagents-agent: {}\r\n", capability(&data, &ids[index])),
+        )
+    };
+    // Reachability and membership are never private-history grants. The same
+    // boundary applies to isolated, private, sibling and public callers.
+    for scope in ["isolated", "private", "siblings", "public"] {
+        store.set_agent_scope(&aids[1], scope).unwrap();
+        assert_eq!(
+            store.agent(&aids[1]).unwrap().scope(),
+            scope,
+            "effective scope must match the conversation visibility test case"
+        );
+        for target in [
+            "argus",
+            "helios",
+            "outsider",
+            ids[0].as_str(),
+            ids[2].as_str(),
+        ] {
+            for suffix in [
+                "",
+                "?query=C",
+                "?only_tools=true",
+                "?from_seq=1&to_seq=2&radius=10",
+            ] {
+                let response = as_agent(1, target, suffix);
+                assert!(
+                    response.starts_with("HTTP/1.1 403"),
+                    "{scope} {target} {suffix}: {response}"
+                );
+            }
+        }
+        for target in [
+            "all",
+            "*",
+            "self",
+            "lyra",
+            ids[1].as_str(),
+            "runner",
+            ids[3].as_str(),
+        ] {
+            for suffix in [
+                "",
+                "?query=C&radius=10",
+                "?only_tools=true&tool_name=browser",
+                "?from_seq=1&to_seq=1&direction=in",
+                "?query=C&with=argus&sender=argus&direction=in",
+            ] {
+                let response = as_agent(1, target, suffix);
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "{scope} {target} {suffix}: {response}"
+                );
+                for hidden in ["fixture argus", "fixture helios", "fixture outsider"] {
+                    assert!(
+                        !response.contains(hidden),
+                        "{scope} {target} {suffix}: {response}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(as_agent(1, "missing", "?query=C").starts_with("HTTP/1.1 404"));
+    // Grandchildren are visible to ancestors, but neither ancestors nor
+    // siblings are visible in the opposite direction.
+    assert!(as_agent(0, "runner", "?query=C").contains("private fixture runner"));
+    assert!(as_agent(3, "lyra", "").starts_with("HTTP/1.1 403"));
+    assert!(as_agent(2, "lyra", "").starts_with("HTTP/1.1 403"));
+    assert!(!as_agent(4, "all", "?query=C").contains("fixture lyra"));
+    // Party copies in the caller's own mailbox remain readable.
+    assert!(as_agent(1, "self", "?query=C&with=argus").contains("private fixture lyra"));
+    assert!(!as_agent(1, "all", "?query=C&with=outsider").contains("fixture"));
+
+    let cli = |target: &str| {
+        Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .arg("--data")
+            .arg(&data)
+            .args(["conversation", target, "--query", "C"])
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .env("ANYAGENTS_AGENT_ID", &ids[1])
+            .env(
+                "ANYAGENTS_AGENT_CONFIG",
+                data.join("agents").join(&ids[1]).join("config"),
+            )
+            .output()
+            .unwrap()
+    };
+    let denied = cli("argus");
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty(), "{denied:?}");
+    let allowed = cli("all");
+    assert!(allowed.status.success(), "{allowed:?}");
+    let text = String::from_utf8(allowed.stdout).unwrap();
+    assert!(
+        text.contains("fixture lyra") && text.contains("fixture runner"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("fixture argus") && !text.contains("fixture helios"),
+        "{text}"
+    );
+
+    // Explicit root-admin and operator reads are broad and auditable; a
+    // non-admin root is not privileged merely because it is a root.
+    assert!(!as_agent(0, "all", "?query=C").contains("fixture outsider"));
+    store.set_agent_admin(&aids[0], true).unwrap();
+    assert!(as_agent(0, "all", "?query=C").contains("fixture outsider"));
+    assert!(as_agent(0, "self", "?query=C").contains("fixture argus"));
+    let (status, body) = support::call(
+        &server.socket,
+        "GET",
+        "/v1/agents/all/conversation?query=C",
+        "",
+    );
+    assert!(status.contains("200"), "{status} {body}");
+    assert!(body.to_string().contains("fixture outsider"));
+    let db = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    for actor in ["operator", "agent:argus"] {
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM admin_audit WHERE action = 'conversation.read' AND target = 'all' AND actor = ?1", [actor], |row| row.get(0)).unwrap();
+        assert!(count > 0, "{actor} read must have an audit row");
+    }
+    drop(server);
+    // Existing fixture SQLite data must not make a failed socket read succeed.
+    for target in ["all", "argus", "lyra"] {
+        let offline = cli(target);
+        assert!(!offline.status.success(), "{offline:?}");
+        assert!(offline.stdout.is_empty(), "{offline:?}");
+    }
 }
