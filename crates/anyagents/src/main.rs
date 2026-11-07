@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyagents_core::Error;
 use clap::{Parser, Subcommand};
 
 mod agent;
@@ -18,6 +19,7 @@ mod fake_opencode;
 mod gateway;
 mod grok;
 mod harness_double;
+mod identity;
 mod install;
 mod mcp;
 mod mcp_config;
@@ -170,6 +172,8 @@ enum Command {
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
+        description: Option<String>,
+        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
         instructions: Option<String>,
         #[arg(long)]
         parent: Option<String>,
@@ -351,7 +355,7 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Read or search (`--query`) any agent's full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
+    /// Read or search (`--query`) authorized agents' full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
     Conversation {
         /// Agent name (`sage`, `volt`, `xenon`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
         agent: Option<String>,
@@ -367,6 +371,26 @@ enum Command {
         /// Maximum number of turns to return (default 50, or 20 with `--query`).
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Audited erasure (conversation.redact): ancestors/admin only; target must be quiescent.
+    Redact {
+        agent: String,
+        /// Inbound/outbound/tool id or transcript:<zero-based-line>.
+        #[arg(long, required_unless_present = "seq", conflicts_with = "seq")]
+        message_id: Option<String>,
+        /// Mailbox sequence (not a transcript line).
+        #[arg(long)]
+        seq: Option<i64>,
+        /// End-exclusive span start; omit the span to redact the whole body.
+        #[arg(long, requires_all = ["end", "unit"])]
+        start: Option<usize>,
+        #[arg(long, requires_all = ["start", "unit"])]
+        end: Option<usize>,
+        #[arg(long, value_parser = ["bytes", "chars"], requires_all = ["start", "end"])]
+        unit: Option<String>,
+        /// Audit reason; must not contain the sensitive text.
+        #[arg(long)]
+        reason: String,
     },
     /// Zero-Embedding Lexical + Structured search across historical and live conversations.
     Search {
@@ -457,7 +481,10 @@ enum Command {
         agent: Option<String>,
         /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
         description: Option<String>,
-        /// Optional short role label (`Spiron`, `Design`, `Revenue`, `Growth`, `Lead`, `Standards`, ...).
+        /// Optional detailed private standing instructions (`instructions` / `SYSTEM_PROMPT.md`).
+        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
+        instructions: Option<String>,
+        /// Optional display-only role label; no effect on lifecycle or scope.
         #[arg(long)]
         role: Option<String>,
         /// Clear custom description.
@@ -475,7 +502,7 @@ enum Command {
     Role {
         /// Target agent name or `agt_...` ID.
         agent: String,
-        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Display-only role label; no effect on lifecycle or scope.
         role: Option<String>,
         /// Clear the role label.
         #[arg(long)]
@@ -660,7 +687,7 @@ enum AgentsCommand {
     Role {
         /// Target agent name or `agt_...` ID.
         agent: String,
-        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Display-only role label; no effect on lifecycle or scope.
         role: Option<String>,
         /// Clear the role label.
         #[arg(long)]
@@ -691,6 +718,8 @@ enum AgentsCommand {
         #[arg(long)]
         workdir: Option<PathBuf>,
         #[arg(long)]
+        description: Option<String>,
+        #[arg(long, visible_alias = "instruction", visible_alias = "system-prompt")]
         instructions: Option<String>,
         #[arg(long)]
         parent: Option<String>,
@@ -752,6 +781,7 @@ enum AgentsCommand {
 }
 
 fn main() -> ExitCode {
+    identity::mark_process_start();
     sandbox::hydrate_operator_groups_if_needed();
     let cli = Cli::parse();
     match run(cli) {
@@ -903,6 +933,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             branch,
             base,
             workdir,
+            description,
             instructions,
             parent,
             prompt,
@@ -916,6 +947,7 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             branch,
             base,
             workdir,
+            description,
             instructions,
             parent,
             prompt,
@@ -1100,6 +1132,45 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             limit,
             query.as_deref(),
         ),
+        Command::Redact {
+            agent,
+            message_id,
+            seq,
+            start,
+            end,
+            unit,
+            reason,
+        } => {
+            let span = match (start, end, unit) {
+                (Some(start), Some(end), Some(unit)) => {
+                    Some(api::RedactionSpan { start, end, unit }.try_into()?)
+                }
+                (None, None, None) => None,
+                _ => return Err(Error::Message("span needs start, end and unit".into())),
+            };
+            let request = anyagents_core::redaction::Request {
+                message_id,
+                seq,
+                span,
+                reason,
+            };
+            let body = serde_json::to_vec(&request).map_err(|e| Error::Message(e.to_string()))?;
+            let path = format!("/v1/agents/{agent}/conversation/redact");
+            let receipt: anyagents_core::redaction::Receipt =
+                client::call(&data, "POST", &path, Some(body), &client::authority(&data))
+                    .map_err(Error::Message)?
+                    .ok_or_else(|| {
+                        Error::Message(
+                            "redaction requires a running admin API; no offline bypass".into(),
+                        )
+                    })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt)
+                    .map_err(|e| Error::Message(e.to_string()))?
+            );
+            Ok(())
+        }
         Command::Search {
             query,
             agent,
@@ -1124,9 +1195,10 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
         Command::Describe {
             agent,
             description,
+            instructions,
             role,
             clear,
-        } => agent::describe_cmd(&data, agent, description, role, clear),
+        } => agent::describe_cmd(&data, agent, description, instructions, role, clear),
         Command::Rename { agent, new_name } => agent::rename_cmd(&data, &agent, &new_name),
         Command::Role { agent, role, clear } => {
             agent::role_cmd(&data, &agent, role.as_deref(), clear)

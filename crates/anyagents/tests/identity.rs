@@ -255,8 +255,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         &alpha_auth,
     );
     assert!(forged.starts_with("HTTP/1.1 403"), "{forged}");
-    // An agent's inbox is strictly its own incoming queue; peers read each
-    // other's full two-way conversation via `/v1/agents/{name}/conversation`.
+    // Messaging a peer does not grant access to that peer's private history.
     let other_inbox = support::call_raw(
         &socket,
         "GET",
@@ -272,8 +271,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
         "",
         &beta_auth,
     );
-    assert!(other_conv.starts_with("HTTP/1.1 200"), "{other_conv}");
-    assert!(other_conv.contains("hello"), "{other_conv}");
+    assert!(other_conv.starts_with("HTTP/1.1 403"), "{other_conv}");
     // No capability at all is refused.
     let none = support::call_raw(&socket, "GET", "/v1/agents", "", "");
     assert!(none.starts_with("HTTP/1.1 401"), "{none}");
@@ -327,18 +325,15 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(gamma_conv.contains("subagent task"), "{gamma_conv}");
 
-    // A root agent cannot be archived by an agent capability (prevents accidental self-archive).
-    let root_archive_refused = support::call_raw(
+    // Any root agent can intentionally archive itself.
+    let root_archived = support::call_raw(
         &socket,
         "POST",
         "/v1/agents/alpha/archive",
         "{}",
         &alpha_auth,
     );
-    assert!(
-        root_archive_refused.starts_with("HTTP/1.1 400"),
-        "{root_archive_refused}"
-    );
+    assert!(root_archived.starts_with("HTTP/1.1 200"), "{root_archived}");
 
     // An intentional direct send wakes an explicitly archived agent.
     let archived = support::call_raw(
@@ -408,7 +403,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
 
 /// Each agent's capability can read its own and peer mailboxes, while operator routes stay restricted.
 #[test]
-fn each_agents_capability_reads_own_and_peer_mailboxes() {
+fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
     let _env = support::lock();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
@@ -446,7 +441,7 @@ fn each_agents_capability_reads_own_and_peer_mailboxes() {
         "",
         &as_beta,
     );
-    assert!(peer_conv.starts_with("HTTP/1.1 200"), "{peer_conv}");
+    assert!(peer_conv.starts_with("HTTP/1.1 403"), "{peer_conv}");
     let op_route = support::call_raw(
         &socket,
         "GET",
@@ -502,4 +497,625 @@ fn the_capability_file_of_one_agent_never_opens_another() {
         &alpha_auth,
     );
     assert!(op_only.starts_with("HTTP/1.1 403"), "{op_only}");
+}
+
+/// The health response describes each serving process even when the installed
+/// pathname is replaced while both processes remain alive.
+#[test]
+fn health_reports_each_running_image_and_survives_atomic_install() {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env = support::lock();
+    let source = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(source.status.success());
+    let expected_source = String::from_utf8(source.stdout).unwrap().trim().to_owned();
+    assert_eq!(env!("ANYAGENTS_SOURCE_SHA"), expected_source);
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let image = dir.path().join("anyagents");
+    std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
+    let expected_hash = format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap()));
+    let earliest_start = anyagents_core::now_ms();
+    let start = |verb: &str, socket: &str| {
+        let child = Command::new(&image)
+            .arg("--data")
+            .arg(&data)
+            .arg(verb)
+            .env("ANYAGENTS_FAKE_MODE", "1")
+            .env("ANYAGENTS_TESTS", "own-seat")
+            .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
+            // Build provenance must never be supplied by the runtime environment.
+            .env("ANYAGENTS_SOURCE_SHA", "not-the-built-source")
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .env_remove("ANYAGENTS_AGENT_UID")
+            .env_remove("ANYAGENTS_AGENT_GID")
+            .env_remove("ANYAGENTS_SOCKET_GID")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let server = Serve {
+            child,
+            socket: data.join(socket),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
+            assert!(Instant::now() < deadline, "{verb} did not bind");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server
+    };
+    let health = |socket: &Path| {
+        let raw = support::call_raw(socket, "GET", "/v1/webhooks/healthz", "", "");
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(
+            raw.to_ascii_lowercase().contains("cache-control: no-store"),
+            "{raw}"
+        );
+        serde_json::from_str::<Value>(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
+    };
+    let complete = |socket: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let value = health(socket);
+            if value["binary_sha256_state"] == "ready" {
+                return value;
+            }
+            assert_eq!(value["binary_sha256_state"], "computing", "{value}");
+            assert!(value["binary_sha256"].is_null(), "{value}");
+            assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(value["source_sha"], expected_source);
+            assert!(Instant::now() < deadline, "hash did not complete: {value}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    let serve = start("serve", "anyagents.sock");
+    let admin = start("serve-admin", "admin.sock");
+    let serving = complete(&serve.socket);
+    let administering = complete(&admin.socket);
+    for value in [&serving, &administering] {
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["source_sha"], expected_source);
+        assert_eq!(value["binary_sha256"], expected_hash);
+    }
+    assert!(serving.get("pid").is_none());
+    assert!(serving.get("process_started_at_ms").is_none());
+    assert_eq!(serving.as_object().unwrap().len(), 5);
+    assert_eq!(administering["pid"], admin.child.id());
+    assert_ne!(administering["pid"], serve.child.id());
+    let started = administering["process_started_at_ms"].as_i64().unwrap();
+    assert!(started >= earliest_start && started <= anyagents_core::now_ms());
+    assert_eq!(
+        administering.as_object().unwrap().len(),
+        7,
+        "no private state in health"
+    );
+
+    // Public health aliases report the same image with no process-local details.
+    let addr = std::fs::read_to_string(data.join("webhook.addr")).unwrap();
+    for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
+        let mut stream = std::net::TcpStream::connect(addr.trim()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        let value: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(value, serving);
+    }
+
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&replacement, b"different bytes installed after startup").unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(replacement, &image).unwrap();
+    assert_ne!(
+        format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap())),
+        expected_hash
+    );
+    assert_eq!(health(&serve.socket), serving);
+    assert_eq!(health(&admin.socket), administering);
+
+    // Restarting just the sidecar gets a new process identity; serve is stable.
+    let old_pid = admin.child.id();
+    drop(admin);
+    std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
+    // The old sidecar leaves its socket file, so remove only this test's file.
+    std::fs::remove_file(data.join("admin.sock")).unwrap();
+    let restarted = start("serve-admin", "admin.sock");
+    let identity = complete(&restarted.socket);
+    assert_ne!(identity["pid"], old_pid);
+    assert_eq!(identity["pid"], restarted.child.id());
+    assert_eq!(identity["binary_sha256"], expected_hash);
+    assert!(
+        identity["process_started_at_ms"].as_i64().unwrap()
+            >= administering["process_started_at_ms"].as_i64().unwrap()
+    );
+    assert_eq!(health(&serve.socket), serving);
+}
+
+#[test]
+fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
+    use anyagents_core::{AgentId, Incoming, Store};
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let server = start_server(&data);
+    let ids: Vec<_> = ["argus", "lyra", "helios", "runner", "outsider"]
+        .into_iter()
+        .map(|name| create(&data, name))
+        .collect();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let aids: Vec<_> = ids.iter().map(|id| AgentId::parse(id).unwrap()).collect();
+    store.set_agent_parent(&aids[1], Some(&aids[0])).unwrap();
+    store.set_agent_parent(&aids[2], Some(&aids[0])).unwrap();
+    store.set_agent_parent(&aids[3], Some(&aids[1])).unwrap();
+    for id in &aids {
+        store.join_group("shared", id).unwrap();
+        let name = store.agent(id).unwrap().name;
+        store
+            .receive(
+                id,
+                Incoming {
+                    text: format!("C private fixture {name}"),
+                    sender: Some("agent:argus".into()),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: Some(1_000),
+                },
+            )
+            .unwrap();
+        store
+            .record_outbound(
+                id,
+                "telegram:chat:-100",
+                None,
+                &format!("C outbound fixture {name}"),
+            )
+            .unwrap();
+        store
+            .record_tool_event(id, "browser", &format!("C tool fixture {name}"))
+            .unwrap();
+    }
+    let as_agent = |index: usize, target: &str, suffix: &str| {
+        support::call_raw(
+            &server.socket,
+            "GET",
+            &format!("/v1/agents/{target}/conversation{suffix}"),
+            "",
+            &format!("x-anyagents-agent: {}\r\n", capability(&data, &ids[index])),
+        )
+    };
+    // Reachability and membership are never private-history grants. The same
+    // boundary applies to isolated, private, sibling and public callers.
+    for scope in ["isolated", "private", "siblings", "public"] {
+        store.set_agent_scope(&aids[1], scope).unwrap();
+        assert_eq!(
+            store.agent(&aids[1]).unwrap().scope(),
+            scope,
+            "effective scope must match the conversation visibility test case"
+        );
+        for target in [
+            "argus",
+            "helios",
+            "outsider",
+            ids[0].as_str(),
+            ids[2].as_str(),
+        ] {
+            for suffix in [
+                "",
+                "?query=C",
+                "?only_tools=true",
+                "?from_seq=1&to_seq=2&radius=10",
+            ] {
+                let response = as_agent(1, target, suffix);
+                assert!(
+                    response.starts_with("HTTP/1.1 403"),
+                    "{scope} {target} {suffix}: {response}"
+                );
+            }
+        }
+        for target in [
+            "all",
+            "*",
+            "self",
+            "lyra",
+            ids[1].as_str(),
+            "runner",
+            ids[3].as_str(),
+        ] {
+            for suffix in [
+                "",
+                "?query=C&radius=10",
+                "?only_tools=true&tool_name=browser",
+                "?from_seq=1&to_seq=1&direction=in",
+                "?query=C&with=argus&sender=argus&direction=in",
+            ] {
+                let response = as_agent(1, target, suffix);
+                assert!(
+                    response.starts_with("HTTP/1.1 200"),
+                    "{scope} {target} {suffix}: {response}"
+                );
+                for hidden in ["fixture argus", "fixture helios", "fixture outsider"] {
+                    assert!(
+                        !response.contains(hidden),
+                        "{scope} {target} {suffix}: {response}"
+                    );
+                }
+            }
+        }
+    }
+    assert!(as_agent(1, "missing", "?query=C").starts_with("HTTP/1.1 404"));
+    // Grandchildren are visible to ancestors, but neither ancestors nor
+    // siblings are visible in the opposite direction.
+    assert!(as_agent(0, "runner", "?query=C").contains("private fixture runner"));
+    assert!(as_agent(3, "lyra", "").starts_with("HTTP/1.1 403"));
+    assert!(as_agent(2, "lyra", "").starts_with("HTTP/1.1 403"));
+    assert!(!as_agent(4, "all", "?query=C").contains("fixture lyra"));
+    // Party copies in the caller's own mailbox remain readable.
+    assert!(as_agent(1, "self", "?query=C&with=argus").contains("private fixture lyra"));
+    assert!(!as_agent(1, "all", "?query=C&with=outsider").contains("fixture"));
+
+    let cli = |target: &str| {
+        Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .arg("--data")
+            .arg(&data)
+            .args(["conversation", target, "--query", "C"])
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .env("ANYAGENTS_AGENT_ID", &ids[1])
+            .env(
+                "ANYAGENTS_AGENT_CONFIG",
+                data.join("agents").join(&ids[1]).join("config"),
+            )
+            .output()
+            .unwrap()
+    };
+    let denied = cli("argus");
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty(), "{denied:?}");
+    let allowed = cli("all");
+    assert!(allowed.status.success(), "{allowed:?}");
+    let text = String::from_utf8(allowed.stdout).unwrap();
+    assert!(
+        text.contains("fixture lyra") && text.contains("fixture runner"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("fixture argus") && !text.contains("fixture helios"),
+        "{text}"
+    );
+
+    // Explicit root-admin and operator reads are broad and auditable; a
+    // non-admin root is not privileged merely because it is a root.
+    assert!(!as_agent(0, "all", "?query=C").contains("fixture outsider"));
+    store.set_agent_admin(&aids[0], true).unwrap();
+    assert!(as_agent(0, "all", "?query=C").contains("fixture outsider"));
+    assert!(as_agent(0, "self", "?query=C").contains("fixture argus"));
+    let (status, body) = support::call(
+        &server.socket,
+        "GET",
+        "/v1/agents/all/conversation?query=C",
+        "",
+    );
+    assert!(status.contains("200"), "{status} {body}");
+    assert!(body.to_string().contains("fixture outsider"));
+    let db = rusqlite::Connection::open(data.join("state.db")).unwrap();
+    for actor in ["operator", "agent:argus"] {
+        let count: i64 = db.query_row("SELECT COUNT(*) FROM admin_audit WHERE action = 'conversation.read' AND target = 'all' AND actor = ?1", [actor], |row| row.get(0)).unwrap();
+        assert!(count > 0, "{actor} read must have an audit row");
+    }
+    drop(server);
+    // Existing fixture SQLite data must not make a failed socket read succeed.
+    for target in ["all", "argus", "lyra"] {
+        let offline = cli(target);
+        assert!(!offline.status.success(), "{offline:?}");
+        assert!(offline.stdout.is_empty(), "{offline:?}");
+    }
+}
+
+#[test]
+fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let server = start_server(&data);
+    let owner = create(&data, "group-owner");
+    let member = create(&data, "other-agent");
+    let outsider = create(&data, "outsider");
+    create(&data, "invited");
+    let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
+    let request = |id: &str, payload: Value| {
+        let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, id));
+        support::call_raw(
+            &server.socket,
+            "POST",
+            "/v1/groups",
+            &payload.to_string(),
+            &auth,
+        )
+    };
+    let good = |id: &str, payload: Value| {
+        let response = request(id, payload);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        response
+    };
+    let forbidden = |id: &str, payload: Value, reason: &str| {
+        let response = request(id, payload);
+        assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        let body: Value = serde_json::from_str(response.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(body["error"].as_str().unwrap().contains(reason), "{body}");
+    };
+    let created = good(
+        &owner,
+        json!({"action":"join", "group":"private-room", "agent":"other-agent"}),
+    );
+    let body: Value = serde_json::from_str(created.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+    assert_eq!(body["owner_agent_id"], owner);
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "other-agent"]
+    );
+
+    // Vesta's exact P1: public input neither authorizes the outsider nor flips visibility.
+    forbidden(
+        &outsider,
+        json!({"action":"join","group":"private-room","agent":"self","public":true}),
+        "is private",
+    );
+    assert!(!store.is_group_public("private-room"));
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "other-agent"]
+    );
+    // Vesta's exact P2: a caller cannot remove another agent's membership.
+    forbidden(
+        &outsider,
+        json!({"action":"leave","group":"private-room","agent":"other-agent"}),
+        "removing another member",
+    );
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "other-agent"]
+    );
+
+    // Non-owner members may invite, but cannot change visibility or evict peers.
+    good(
+        &member,
+        json!({"action":"join","group":"private-room","agent":"invited","public":true}),
+    );
+    assert!(!store.is_group_public("private-room"));
+    forbidden(
+        &member,
+        json!({"action":"members","group":"private-room","public":true}),
+        "changing visibility",
+    );
+    forbidden(
+        &member,
+        json!({"action":"leave","group":"private-room","agent":"self,invited"}),
+        "removing another member",
+    );
+    forbidden(
+        &member,
+        json!({"action":"leave","group":"private-room","agent":"self","public":true}),
+        "changing visibility",
+    );
+    assert_eq!(
+        store.group_members("private-room").unwrap(),
+        ["group-owner", "invited", "other-agent"]
+    );
+    good(
+        &member,
+        json!({"action":"leave","group":"private-room","agent":"self"}),
+    );
+
+    // Creation's `group` option is not an alternate invitation bypass. The
+    // refusal happens before creating an agent or joining any earlier group.
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &outsider));
+    let rejected = support::call_raw(
+        &server.socket,
+        "POST",
+        "/v1/agents",
+        &json!({"name":"uninvited-child","group":"would-be-new,private-room"}).to_string(),
+        &auth,
+    );
+    assert!(
+        rejected.starts_with("HTTP/1.1 403") && rejected.contains("is private"),
+        "{rejected}"
+    );
+    assert!(store.agent_by_name("uninvited-child").is_err());
+    assert!(store.group("would-be-new").unwrap().is_none());
+    let auth = format!("x-anyagents-agent: {}\r\n", capability(&data, &owner));
+    let child = support::call_raw(
+        &server.socket,
+        "POST",
+        "/v1/agents",
+        &json!({"name":"invited-child","group":"private-room"}).to_string(),
+        &auth,
+    );
+    assert!(child.starts_with("HTTP/1.1 201"), "{child}");
+    assert!(
+        store
+            .group_members("private-room")
+            .unwrap()
+            .contains(&"invited-child".to_string())
+    );
+    // The group's creator may remove members; a parent may remove its child.
+    good(
+        &owner,
+        json!({"action":"leave","group":"private-room","agent":"invited"}),
+    );
+    let child = store.agent_by_name("invited-child").unwrap();
+    good(
+        child.id.as_str(),
+        json!({"action":"join","group":"child-owned","agent":"self"}),
+    );
+    good(
+        &owner,
+        json!({"action":"members","group":"child-owned","public":true}),
+    );
+    good(
+        &owner,
+        json!({"action":"leave","group":"child-owned","agent":"invited-child"}),
+    );
+
+    // Ownership is not inferred from remaining members or an empty roster.
+    good(
+        &owner,
+        json!({"action":"leave","group":"private-room","agent":"self,invited-child"}),
+    );
+    assert!(store.group_members("private-room").unwrap().is_empty());
+    forbidden(
+        &outsider,
+        json!({"action":"join","group":"private-room","agent":"self"}),
+        "is private",
+    );
+    good(
+        &owner,
+        json!({"action":"join","group":"private-room","agent":"self"}),
+    );
+    assert_eq!(
+        store
+            .group("private-room")
+            .unwrap()
+            .unwrap()
+            .owner_agent_id
+            .unwrap()
+            .as_str(),
+        owner
+    );
+    // A root admin has explicit visibility authority; revocation is immediate.
+    let outsider_id = store.agent_by_name("outsider").unwrap().id;
+    store.set_agent_admin(&outsider_id, true).unwrap();
+    good(
+        &outsider,
+        json!({"action":"members","group":"private-room","public":true}),
+    );
+    store.set_agent_admin(&outsider_id, false).unwrap();
+    forbidden(
+        &outsider,
+        json!({"action":"members","group":"private-room","public":false}),
+        "changing visibility",
+    );
+    good(
+        &outsider,
+        json!({"action":"join","group":"private-room","agent":"self"}),
+    );
+    good(
+        &owner,
+        json!({"action":"members","group":"private-room","public":false}),
+    );
+    forbidden(
+        &outsider,
+        json!({"action":"members","group":"private-room","public":true}),
+        "changing visibility",
+    );
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/groups",
+        &json!({"action":"leave","group":"private-room","agent":"outsider"}).to_string(),
+    );
+    assert!(status.contains("200"), "{status}");
+    // Operator-created groups have NULL ownership, not their first member's ID.
+    let (status, _) = support::call(
+        &server.socket,
+        "POST",
+        "/v1/groups",
+        &json!({"action":"join","group":"operator-room","agent":"other-agent"}).to_string(),
+    );
+    assert!(status.contains("200"), "{status}");
+    assert_eq!(
+        store
+            .group("operator-room")
+            .unwrap()
+            .unwrap()
+            .owner_agent_id,
+        None
+    );
+    forbidden(
+        &member,
+        json!({"action":"members","group":"operator-room","public":true}),
+        "changing visibility",
+    );
+}
+
+#[test]
+fn agent_group_cli_mutations_refuse_offline_database_fallback() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
+    let agent = store
+        .create_agent(anyagents_core::NewAgent::new(
+            "offline-agent",
+            "claude-code",
+        ))
+        .unwrap();
+    store.join_group("offline-room", &agent.id).unwrap();
+    for action in ["join", "leave"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .args([
+                "--data",
+                data.to_str().unwrap(),
+                "groups",
+                action,
+                "offline-room",
+                "offline-agent",
+            ])
+            .env("ANYAGENTS_AGENT_ID", agent.id.as_str())
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "unexpected {action} success");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("authenticated server"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            store.group_members("offline-room").unwrap(),
+            ["offline-agent"]
+        );
+    }
+    // The supported offline operator path remains available.
+    let output = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .args([
+            "--data",
+            data.to_str().unwrap(),
+            "groups",
+            "leave",
+            "offline-room",
+            "offline-agent",
+        ])
+        .env_remove("ANYAGENTS_AGENT_ID")
+        .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(store.group_members("offline-room").unwrap().is_empty());
 }

@@ -31,6 +31,7 @@ use crate::api::{
 };
 use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
+use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
@@ -52,12 +53,21 @@ pub fn run(data: &Path) -> Result<(), Error> {
 pub fn run_with(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), Error> {
+    run_with_identity(data, runner, stop, Arc::new(ServingIdentity::capture()))
+}
+
+fn run_with_identity(
+    data: &Path,
+    runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    identity: Arc<ServingIdentity>,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner) => result,
+            result = serve(data, runner, identity) => result,
             _ = &mut stop => Ok(()),
         }
     })
@@ -69,6 +79,7 @@ pub(crate) struct AppState {
     pub(crate) health: HealthBoard,
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
+    pub(crate) identity: Arc<ServingIdentity>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -108,7 +119,11 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
-async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
+async fn serve(
+    data: &Path,
+    sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
+    identity: Arc<ServingIdentity>,
+) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     crate::worktree_access::recover_inspections(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
@@ -173,6 +188,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     prepare_socket(&path)?;
     let api_listener = tokio::net::UnixListener::bind(&path)?;
     set_socket_mode(&path)?;
+    identity.start_hash();
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&path);
     }
@@ -191,6 +207,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         health: supervisor.board(),
         sign_in,
         auth,
+        identity,
     };
     let _ = boundary;
     let listener = api_listener;
@@ -314,6 +331,10 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
+        .route(
+            "/v1/agents/{name}/conversation/redact",
+            post(redact_conversation_route),
+        )
         .route("/v1/agents/{name}/archive", post(archive_agent_route))
         .route("/v1/agents/{name}/pause", post(pause_agent_route))
         .route("/v1/agents/{name}/wake", post(wake_agent_route))
@@ -689,8 +710,8 @@ fn spawn_admin_sylphx_delivery(
                         }
                     }
                     flush_harness_usage(&harness, &mut recorded_usage);
-                    if completed_any && !had_err && agent.parent_id.is_some() {
-                        let _ = store.complete_idle_subagent(&agent.id);
+                    if completed_any && !had_err {
+                        let _ = store.complete_idle_agent(&agent.id);
                     }
                 }
                 Err(reason) => {
@@ -1207,8 +1228,7 @@ fn reconcile_agent_snapshot(
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
                     if !has_pending_work
                         && persisted_err.is_none()
-                        && agent.parent_id.is_some()
-                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                        && store.complete_idle_agent(&agent.id).unwrap_or(false)
                     {
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
@@ -1393,6 +1413,7 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
 }
 
 pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let identity = Arc::new(ServingIdentity::capture());
     let _admin_lock = acquire_admin_lock(data)?;
     crate::worktree_access::recover_inspections(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
@@ -1408,6 +1429,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         prepare_socket(&path)?;
         let listener = tokio::net::UnixListener::bind(&path)?;
         set_socket_mode(&path)?;
+        identity.start_hash();
         if auth.is_confined() {
             crate::sandbox::share_socket_with_seats(&path);
         }
@@ -1491,6 +1513,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
             auth,
+            identity,
         };
         let app = Router::new()
             .route("/v1/agents", get(list_agents).post(create_agent_route))
@@ -1525,6 +1548,10 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             .route("/v1/channels", get(channels_route).post(add_channel_route))
             .route("/v1/agents/{name}/inbox", get(inbox))
             .route("/v1/agents/{name}/conversation", get(conversation_route))
+            .route(
+                "/v1/agents/{name}/conversation/redact",
+                post(redact_conversation_route),
+            )
             .route("/v1/agents/{name}/archive", post(archive_agent_route))
             .route("/v1/agents/{name}/pause", post(pause_agent_route))
             .route("/v1/agents/{name}/wake", post(wake_agent_route))
@@ -1544,6 +1571,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             )
             .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
             .route("/v1/whoami", get(whoami))
+            .route("/v1/webhooks/healthz", get(admin_healthz))
             .with_state(state);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1636,8 +1664,21 @@ async fn mint_capability(
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
 /// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
-async fn webhook_healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.identity.status(false)),
+    )
+}
+
+/// Process-local details are available only on the admin Unix socket, never
+/// through the internet-reachable webhook listener or its primary API aliases.
+async fn admin_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.identity.status(true)),
+    )
+        .into_response()
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
@@ -2677,7 +2718,7 @@ async fn set_subagent_defaults_route(
 struct DescriptionRequest {
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     #[serde(default)]
     role: Option<String>,
@@ -3007,6 +3048,80 @@ fn is_self_or_ancestor(
         }
     }
     false
+}
+
+/// Resolve the caller's conversation visibility once, before selecting a
+/// recent or Raw-RAG read path. Non-admin agents see only themselves and their
+/// descendants; `all` is an alias for exactly that set. Administrative reads
+/// are intentionally unrestricted and leave an audit row.
+fn conversation_visibility(
+    store: &Store,
+    principal: &Principal,
+    requested: &str,
+) -> Result<(String, Option<Vec<String>>), ApiError> {
+    let requested = requested.trim();
+    match principal {
+        Principal::Operator => {
+            store
+                .record_admin_audit("operator", "conversation.read", requested)
+                .map_err(ApiError::from_store)?;
+            Ok((requested.to_string(), None))
+        }
+        Principal::Agent { agent_id, .. } => {
+            let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
+            let admin = caller.parent_id.is_none() && caller.is_admin;
+            if admin {
+                let requested = if requested.eq_ignore_ascii_case("self") {
+                    caller.name.as_str()
+                } else {
+                    requested
+                };
+                store
+                    .record_admin_audit(
+                        &format!("agent:{}", caller.name),
+                        "conversation.read",
+                        requested,
+                    )
+                    .map_err(ApiError::from_store)?;
+                return Ok((requested.to_string(), None));
+            }
+
+            let agents = store.list_agents().map_err(ApiError::from_store)?;
+            let mut visible_ids = std::collections::HashSet::from([caller.id.clone()]);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for agent in &agents {
+                    if let Some(parent) = &agent.parent_id
+                        && visible_ids.contains(parent)
+                        && visible_ids.insert(agent.id.clone())
+                    {
+                        changed = true;
+                    }
+                }
+            }
+            let visible_agent_ids: Vec<String> =
+                visible_ids.iter().map(ToString::to_string).collect();
+
+            if requested.eq_ignore_ascii_case("self") {
+                return Ok((caller.name, Some(vec![caller.id.to_string()])));
+            }
+            if requested.eq_ignore_ascii_case("all") || requested == "*" {
+                return Ok(("all".to_string(), Some(visible_agent_ids)));
+            }
+
+            let target = store
+                .agent_by_name(requested)
+                .map_err(ApiError::from_store)?;
+            if !visible_ids.contains(&target.id) {
+                return Err(ApiError::forbidden(format!(
+                    "agent `{}` cannot read private conversation history of `{}`",
+                    caller.name, target.name
+                )));
+            }
+            Ok((target.name, Some(vec![target.id.to_string()])))
+        }
+    }
 }
 
 async fn add_channel_route(
@@ -3574,6 +3689,23 @@ async fn create_agent_route(
         Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
     };
     spawn_store(move || {
+        let requested_groups: Vec<String> = body
+            .group
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .map(|s| s.strip_prefix("group:").unwrap_or(s))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let requested_group_names: Vec<&str> =
+            requested_groups.iter().map(String::as_str).collect();
+        let group_actor = group_actor(&principal);
+        state
+            .store
+            .check_group_joins(&group_actor, &requested_group_names)
+            .map_err(ApiError::from_store)?;
         let parent_agent = match (&caller_agent, body.parent.as_deref()) {
             (_, Some("root" | "")) => {
                 require_admin_or_operator(
@@ -3603,7 +3735,6 @@ async fn create_agent_route(
             body.model,
             body.profile,
         );
-        let explicit_description = body.description.clone();
         let mut agent = create::create(
             &state.store,
             state.store.data_dir(),
@@ -3618,51 +3749,49 @@ async fn create_agent_route(
                 base: body.base,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
-                instructions: body.instructions.or(body.description),
+                description: body.description,
+                instructions: body.instructions,
                 parent_id,
             },
         )
         .map_err(ApiError::from_store)?;
-        if let Some(ref desc) = explicit_description {
-            let trimmed = desc.trim();
-            if !trimmed.is_empty() {
-                agent = state
-                    .store
-                    .set_agent_description(&agent.id, Some(trimmed))
-                    .map_err(ApiError::from_store)?;
-            }
-        }
         let actor = match &principal {
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
+        let mut scope_changed = false;
         if let Some(ref scope_val) = body.scope {
             agent = state
                 .store
                 .set_agent_scope_as(&agent.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         } else if body.public == Some(true) {
             agent = state
                 .store
                 .set_agent_public_as(&agent.id, true, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         } else if body.public == Some(false) {
             agent = state
                 .store
                 .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         }
-        if let Some(ref grp_raw) = body.group {
-            for g in grp_raw
-                .split(',')
-                .map(|s| s.trim().strip_prefix("group:").unwrap_or(s.trim()))
-                .filter(|s| !s.is_empty())
-            {
-                if let Some((ref caller_id, _)) = caller_agent {
-                    let _ = state.store.join_group(g, caller_id);
-                }
-                let _ = state.store.join_group(g, &agent.id);
+        if scope_changed {
+            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+            create::sync_agent_description_files(&state.store, &agent, &cfg);
+        }
+        if !requested_group_names.is_empty() {
+            let mut targets = vec![agent.id.clone()];
+            if let Some((caller_id, _)) = &caller_agent {
+                targets.push(caller_id.clone());
             }
+            state
+                .store
+                .join_groups_as(&group_actor, &requested_group_names, &targets)
+                .map_err(ApiError::from_store)?;
         }
         if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
             .join("mcp-capability")
@@ -3737,24 +3866,13 @@ async fn archive_agent_route(
         };
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
-        if found.parent_id.is_none() {
-            if is_self {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "a root agent cannot archive itself; pass a target agent name or id in `agent`",
-                ));
-            }
+        if found.parent_id.is_none() && !is_self {
             require_admin_or_operator(
                 &state.store,
                 &principal,
                 "agents.archive_root",
                 &found.name,
             )?;
-        } else if is_self && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a standing domain sub-agent (with a role) cannot archive itself; report completion to `parent` instead",
-            ));
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -3785,7 +3903,11 @@ async fn archive_agent_route(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        if state.health.get(&found.id).is_none_or(|live| !live.process_alive) {
+        if state
+            .health
+            .get(&found.id)
+            .is_none_or(|live| !live.process_alive)
+        {
             reap_archived_agent_locked(&state.store, state.store.data_dir(), &found.id);
         }
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
@@ -3856,10 +3978,6 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Some(agent) = agent {
         let _ = crate::browser::stop_profile(data_dir, &agent.name);
-        if parent_id.is_some() && agent.role.as_deref().is_none_or(|r| r.trim().is_empty()) {
-            let bp = data_dir.join("browser-profiles").join(&agent.name);
-            complete &= remove_path_with_seat(&bp, seat_ids);
-        }
     }
     for other in &agents {
         let keep_protected =
@@ -4252,6 +4370,15 @@ async fn delete_agent_route(
             .join("agents")
             .join(deleted.id.as_str());
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
+        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
+        remove_path_with_seat(
+            &state
+                .store
+                .data_dir()
+                .join("browser-profiles")
+                .join(&deleted.name),
+            seat_ids,
+        );
         reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
         remove_path_with_seat(&agent_dir.join("config"), seat_ids);
         if !agent_dir.join("work").exists() {
@@ -4364,17 +4491,30 @@ async fn list_groups_route(
             .map(|(name, members)| {
                 let public = state.store.is_group_public(&name);
                 let roster = build_group_roster(&state.store, &members);
-                GroupView {
+                Ok(GroupView {
+                    owner_agent_id: state
+                        .store
+                        .group(&name)
+                        .map_err(ApiError::from_store)?
+                        .and_then(|g| g.owner_agent_id)
+                        .map(|id| id.to_string()),
                     name,
                     public,
                     members,
                     roster,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ApiError>>()?;
         Ok(Json(GroupsResponse { groups }))
     })
     .await
+}
+
+fn group_actor(principal: &Principal) -> anyagents_core::GroupActor {
+    match principal {
+        Principal::Operator => anyagents_core::GroupActor::Operator,
+        Principal::Agent { agent_id, .. } => anyagents_core::GroupActor::Agent(agent_id.clone()),
+    }
 }
 
 async fn group_action_route(
@@ -4399,174 +4539,58 @@ async fn group_action_route(
                 "group name is empty",
             ));
         }
-        let existing_members = state
-            .store
-            .room_members(&group)
-            .map_err(ApiError::from_store)?
-            .unwrap_or_default();
-        let is_group_pub = body
-            .public
-            .unwrap_or_else(|| state.store.is_group_public(&group));
-        let caller_is_insider = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { agent_id, name } => {
-                if existing_members.is_empty() || existing_members.iter().any(|m| m == name) {
-                    true
-                } else {
-                    existing_members.iter().any(|m| {
-                        state
-                            .store
-                            .agent_by_name(m)
-                            .ok()
-                            .and_then(|ma| ma.parent_id)
-                            .as_ref()
-                            == Some(agent_id)
-                    })
-                }
-            }
-        };
-        let caller_authorized_for_private_group = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { name, .. } => {
-                if caller_is_insider || is_group_pub {
-                    true
-                } else {
-                    let actor = Actor::Agent(name.clone());
-                    existing_members.iter().all(|m| {
-                        state
-                            .store
-                            .agent_by_name(m)
-                            .ok()
-                            .is_none_or(|ma| can_actor_message_agent(&state.store, &actor, &ma).is_ok())
-                    })
-                }
-            }
-        };
-        let target_name = body
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or(default_agent);
-        match body.action.trim() {
-            "join" => {
-                if !caller_authorized_for_private_group {
-                    return Err(ApiError::forbidden(format!(
-                        "group `{group}` is private (`public: false`); only existing group members or their parent agent can add members"
-                    )));
-                }
-                let who_raw = target_name.ok_or_else(|| {
-                    ApiError::new(StatusCode::BAD_REQUEST, "join needs an agent name")
-                })?;
-                let targets: Vec<&str> = who_raw
-                    .split(',')
-                    .map(str::trim)
-                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if targets.is_empty() {
-                    return Err(ApiError::new(
-                        StatusCode::BAD_REQUEST,
-                        "join needs an agent name",
-                    ));
-                }
-                let mut resolved_agents = Vec::with_capacity(targets.len());
-                for who in targets {
-                    let agent = if who.eq_ignore_ascii_case("self")
-                        && let Principal::Agent { ref agent_id, .. } = principal
-                    {
-                        state.store.agent(agent_id).map_err(ApiError::from_store)?
-                    } else {
-                        state
-                            .store
-                            .agent_by_name(who)
-                            .map_err(ApiError::from_store)?
-                    };
-                    if let Principal::Agent { ref name, .. } = principal {
-                        can_actor_message_agent(
-                            &state.store,
-                            &Actor::Agent(name.clone()),
-                            &agent,
-                        )?;
-                    }
-                    resolved_agents.push(agent);
-                }
-                // When an agent creates a brand-new group and adds another agent,
-                // automatically include the creator in the group as well so they immediately share it.
-                if existing_members.is_empty()
-                    && let Principal::Agent { ref agent_id, .. } = principal
-                    && resolved_agents.iter().any(|a| &a.id != agent_id)
-                {
-                    state
-                        .store
-                        .join_group(&group, agent_id)
-                        .map_err(ApiError::from_store)?;
-                }
-                for agent in resolved_agents {
-                    state
-                        .store
-                        .join_group(&group, &agent.id)
-                        .map_err(ApiError::from_store)?;
-                }
-                if let Some(pub_val) = body.public {
-                    state
-                        .store
-                        .set_group_public(&group, pub_val)
-                        .map_err(ApiError::from_store)?;
-                }
-            }
-            "leave" => {
-                let who_raw = target_name.ok_or_else(|| {
-                    ApiError::new(StatusCode::BAD_REQUEST, "leave needs an agent name")
-                })?;
-                for who in who_raw
-                    .split(',')
-                    .map(str::trim)
-                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
-                    .filter(|s| !s.is_empty())
-                {
-                    let agent = if who.eq_ignore_ascii_case("self")
-                        && let Principal::Agent { ref agent_id, .. } = principal
-                    {
-                        state.store.agent(agent_id).map_err(ApiError::from_store)?
-                    } else {
-                        state
-                            .store
-                            .agent_by_name(who)
-                            .map_err(ApiError::from_store)?
-                    };
-                    state
-                        .store
-                        .leave_group(&group, &agent.id)
-                        .map_err(ApiError::from_store)?;
-                }
-                if let Some(pub_val) = body.public
-                    && caller_authorized_for_private_group
-                {
-                    let _ = state.store.set_group_public(&group, pub_val);
-                }
-            }
-            "members" => {
-                if let Some(pub_val) = body.public {
-                    if !caller_authorized_for_private_group {
-                        return Err(ApiError::forbidden(format!(
-                            "group `{group}` is private (`public: false`); only existing group members or their parent agent can change visibility"
-                        )));
-                    }
-                    state
-                        .store
-                        .set_group_public(&group, pub_val)
-                        .map_err(ApiError::from_store)?;
-                }
-            }
+        let action = match body.action.trim() {
+            "join" => anyagents_core::GroupAction::Join,
+            "leave" => anyagents_core::GroupAction::Leave,
+            "members" => anyagents_core::GroupAction::Members,
             other => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     format!("unknown group action: {other}"),
                 ));
             }
+        };
+        let actor = group_actor(&principal);
+        let mut targets = Vec::new();
+        if action != anyagents_core::GroupAction::Members {
+            let who_raw = body
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(default_agent)
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "group action needs an agent name")
+                })?;
+            for who in who_raw
+                .split(',')
+                .map(str::trim)
+                .map(|s| s.strip_prefix("agent:").unwrap_or(s))
+                .filter(|s| !s.is_empty())
+            {
+                let agent = if who.eq_ignore_ascii_case("self")
+                    && let Principal::Agent { ref agent_id, .. } = principal
+                {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                } else {
+                    state
+                        .store
+                        .agent_by_name(who)
+                        .map_err(ApiError::from_store)?
+                };
+                if action == anyagents_core::GroupAction::Join
+                    && let Principal::Agent { ref name, .. } = principal
+                {
+                    can_actor_message_agent(&state.store, &Actor::Agent(name.clone()), &agent)?;
+                }
+                targets.push(agent.id);
+            }
         }
+        state
+            .store
+            .group_action_as(&actor, &group, action, &targets, body.public)
+            .map_err(ApiError::from_store)?;
         let public = state.store.is_group_public(&group);
         let members = state
             .store
@@ -4575,6 +4599,12 @@ async fn group_action_route(
             .unwrap_or_default();
         let roster = build_group_roster(&state.store, &members);
         Ok(Json(GroupView {
+            owner_agent_id: state
+                .store
+                .group(&group)
+                .map_err(ApiError::from_store)?
+                .and_then(|g| g.owner_agent_id)
+                .map(|id| id.to_string()),
             name: group,
             public,
             members,
@@ -4651,6 +4681,32 @@ async fn inbox(
     spawn_store(move || inbox_of(&state.store, &agent_id, query.since, query.limit)).await
 }
 
+/// `conversation.redact`: authenticated ancestors and admins only. The store
+/// repeats authorization inside the write transaction; peers and self are denied.
+async fn redact_conversation_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<anyagents_core::redaction::Request>,
+) -> Result<Json<anyagents_core::redaction::Receipt>, ApiError> {
+    spawn_store(move || {
+        let target = state
+            .store
+            .agent_by_name(name.strip_prefix("agent:").unwrap_or(&name))
+            .map_err(ApiError::from_store)?;
+        let actor = match principal {
+            Principal::Operator => anyagents_core::redaction::Actor::Operator,
+            Principal::Agent { agent_id, .. } => anyagents_core::redaction::Actor::Agent(agent_id),
+        };
+        state
+            .store
+            .redact_conversation(actor, &target.id, &request)
+            .map(Json)
+            .map_err(ApiError::from_store)
+    })
+    .await
+}
+
 async fn conversation_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -4658,47 +4714,7 @@ async fn conversation_route(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
-        let mut effective_name = name.clone();
-        if let Principal::Agent { ref agent_id, .. } = principal
-            && let Ok(caller) = state.store.agent(agent_id)
-        {
-            if caller.is_isolated() {
-                if effective_name.eq_ignore_ascii_case("all")
-                    || effective_name == "*"
-                    || effective_name.eq_ignore_ascii_case("self")
-                {
-                    effective_name = caller.name.clone();
-                } else if let Ok(target) = state.store.agent_by_name(&effective_name)
-                    && !is_self_or_ancestor(&state.store, &caller.id, &target)
-                {
-                    return Err(ApiError::forbidden(format!(
-                        "isolated agent `{}` (`scope: isolated`) can only read its own or its descendants' conversation history",
-                        caller.name
-                    )));
-                }
-            } else if !effective_name.eq_ignore_ascii_case("all")
-                && effective_name != "*"
-                && !effective_name.eq_ignore_ascii_case("self")
-                && let Ok(target) = state.store.agent_by_name(&effective_name)
-                && !is_self_or_ancestor(&state.store, &caller.id, &target)
-            {
-                let allowed = !target.is_isolated()
-                    && (caller.parent_id.is_none()
-                        || (caller.allows_sibling_messages()
-                            && caller.parent_id == target.parent_id)
-                        || target.is_public()
-                        || state.store.share_any_group_or_chat(&caller.id, &target.id));
-                if !allowed {
-                    return Err(ApiError::forbidden(format!(
-                        "agent `{}` cannot read private conversation history of `{}` (`scope: {}`)",
-                        caller.name,
-                        target.name,
-                        target.scope()
-                    )));
-                }
-            }
-        }
-        let name = effective_name;
+        let (name, visible_agent_ids) = conversation_visibility(&state.store, &principal, &name)?;
         let clean_q = query
             .query
             .as_deref()
@@ -4757,6 +4773,7 @@ async fn conversation_route(
                 sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
                 radius: query.radius.unwrap_or(0),
                 limit: query.limit.unwrap_or(20),
+                visible_agent_ids: visible_agent_ids.clone(),
             };
             let turns = state
                 .store
@@ -4773,7 +4790,12 @@ async fn conversation_route(
         } else if is_all {
             let turns = state
                 .store
-                .conversation_all(query.with.as_deref(), query.since_ms, query.limit)
+                .conversation_all_scoped(
+                    query.with.as_deref(),
+                    query.since_ms,
+                    query.limit,
+                    visible_agent_ids.as_deref(),
+                )
                 .map_err(ApiError::from_store)?;
             ("all".to_string(), "all".to_string(), turns)
         } else {
@@ -4783,11 +4805,12 @@ async fn conversation_route(
                 .map_err(ApiError::from_store)?;
             let turns = state
                 .store
-                .conversation(
+                .conversation_scoped(
                     &agent.id,
                     query.with.as_deref(),
                     query.since_ms,
                     query.limit,
+                    visible_agent_ids.as_deref(),
                 )
                 .map_err(ApiError::from_store)?;
             (agent.name, agent.id.to_string(), turns)
@@ -6419,7 +6442,10 @@ impl ApiError {
 
     fn from_store(err: Error) -> Self {
         let status = match &err {
+            Error::PermissionDenied(_) => StatusCode::FORBIDDEN,
+            Error::AgentBusy => StatusCode::CONFLICT,
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            Error::GroupForbidden { .. } => StatusCode::FORBIDDEN,
             Error::AgentExists(_) => StatusCode::CONFLICT,
             Error::InvalidAddress(_)
             | Error::Message(_)
@@ -6522,6 +6548,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -6534,13 +6561,13 @@ pub(crate) mod tests {
         runtime.block_on(async {
             let mut expected_audit = Vec::new();
             for (body, before, after, source) in [
-                (serde_json::json!({"scope":"siblings"}), "siblings", "siblings", "scope"),
+                (serde_json::json!({"scope":"siblings"}), "private", "siblings", "scope"),
                 (serde_json::json!({"description":"Public charter", "public":false}), "siblings", "siblings", "public"),
                 (serde_json::json!({"instructions":"Private instructions"}), "siblings", "siblings", ""),
                 (serde_json::json!({"role":"Updated Mind"}), "siblings", "siblings", ""),
                 (serde_json::json!({"public":true}), "siblings", "public", "public"),
-                (serde_json::json!({"public":false}), "public", "siblings", "public"),
-                (serde_json::json!({"scope":"isolated", "public":true}), "siblings", "isolated", "scope"),
+                (serde_json::json!({"public":false}), "public", "private", "public"),
+                (serde_json::json!({"scope":"isolated", "public":true}), "private", "isolated", "scope"),
                 (serde_json::json!({"public":false}), "isolated", "isolated", "public"),
                 (serde_json::json!({"scope":"private"}), "isolated", "private", "scope"),
                 (serde_json::json!({"public":false}), "private", "private", "public"),
@@ -6597,7 +6624,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn role_spawn_defaults_to_siblings_and_task_spawn_defaults_to_private() {
+    fn spawn_defaults_to_private_regardless_of_role() {
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -6611,12 +6638,13 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {
+            for (name, role, scope) in [("labelled", Some("Researcher"), "private"), ("task", None, "private")] {
                 let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
                 let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
                 assert_eq!(created.scope, scope);
@@ -6625,6 +6653,138 @@ pub(crate) mod tests {
                 assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
             }
         });
+    }
+
+    #[test]
+    fn readiness_answers_while_the_once_only_image_hash_is_blocked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let _env = env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let token = data.path().join("operator-token");
+        std::fs::write(&token, "an-operator-token-0123456789abcdef\n").unwrap();
+        let settings = [
+            (
+                "ANYAGENTS_OPERATOR_TOKEN_FILE",
+                token.to_string_lossy().into_owned(),
+            ),
+            ("ANYAGENTS_AGENT_UID", unsafe { libc::getuid() }.to_string()),
+            ("ANYAGENTS_AGENT_GID", unsafe { libc::getgid() }.to_string()),
+            (
+                "ANYAGENTS_SOCKET_GID",
+                unsafe { libc::getgid() }.to_string(),
+            ),
+            ("ANYAGENTS_FAKE_MODE", "1".into()),
+        ];
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: this fixture holds env_lock until its server stops.
+                    unsafe {
+                        if let Some(value) = value {
+                            std::env::set_var(key, value);
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            settings
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in settings {
+            // SAFETY: every server fixture uses env_lock.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        let image = data.path().join("image");
+        std::fs::write(&image, b"abc").unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, running) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let identity = Arc::new(ServingIdentity::with_hasher(move || {
+            use sha2::{Digest, Sha256};
+            observed.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+            Ok(format!("{:x}", Sha256::digest(std::fs::read(image)?)))
+        }));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let path = data.path().to_path_buf();
+        let serving = Arc::clone(&identity);
+        let server = std::thread::spawn(move || {
+            run_with_identity(&path, Arc::new(Mutex::new(ProcessRunner)), stopped, serving)
+        });
+        struct Stop(
+            Option<tokio::sync::oneshot::Sender<()>>,
+            Option<std::thread::JoinHandle<Result<(), Error>>>,
+        );
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+                self.1.take().unwrap().join().unwrap().unwrap();
+            }
+        }
+        let _server = Stop(Some(stop), Some(server));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let socket = socket_path(data.path());
+        loop {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readiness waited for the image hash"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        let health = || {
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "GET /v1/webhooks/healthz HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            serde_json::from_str::<serde_json::Value>(response.split_once("\r\n\r\n").unwrap().1)
+                .unwrap()
+        };
+        let computing = health();
+        assert_eq!(computing["binary_sha256_state"], "computing");
+        assert!(computing["binary_sha256"].is_null());
+        assert_eq!(computing["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(computing["source_sha"], env!("ANYAGENTS_SOURCE_SHA"));
+        identity.start_hash();
+        identity.clone().start_hash();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = health();
+            if ready["binary_sha256_state"] == "ready" {
+                // SHA-256 of the exact bytes written to the fixture image.
+                assert_eq!(
+                    ready["binary_sha256"],
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "{ready}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -6895,7 +7055,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    #[ignore = "Linux cleanup race; deterministic archive fixture repair tracked in https://github.com/SylphxAI/anyagents/issues/94"]
     fn archive_reap_repairs_empty_legacy_marker_and_retries_partial_failure() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
@@ -6934,6 +7093,66 @@ pub(crate) mod tests {
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn roots_and_role_bearing_children_can_self_archive_without_losing_browser_profiles() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, parent_id, role) in [
+                ("root", None, Some("Researcher")),
+                (
+                    "labelled-child",
+                    Some(parent.id.clone()),
+                    Some("Researcher"),
+                ),
+                ("plain-child", Some(parent.id.clone()), None),
+            ] {
+                let mut new = anyagents_core::NewAgent::new(name, "codex");
+                new.parent_id = parent_id;
+                new.role = role.map(str::to_string);
+                let agent = store.create_agent(new).unwrap();
+                let profile = dir.path().join("browser-profiles").join(name);
+                std::fs::create_dir_all(&profile).unwrap();
+                std::fs::write(profile.join("login"), b"preserved session").unwrap();
+                let caller = Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: name.into(),
+                };
+                let Json(archived) =
+                    archive_agent_route(caller, State(state.clone()), AxumPath("self".into()))
+                        .await
+                        .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert_eq!(archived.state, "archived");
+                assert_eq!(store.agent(&agent.id).unwrap().role, agent.role);
+                assert_eq!(
+                    std::fs::read(profile.join("login")).unwrap(),
+                    b"preserved session"
+                );
+                let _ = delete_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    AxumPath(name.into()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert!(!profile.exists(), "delete must remove the profile");
+            }
+        });
     }
 
     #[test]

@@ -394,7 +394,7 @@ struct SendArgs {
 struct ConversationArgs {
     /// Optional lexical + structured search query (`Raw-RAG`: SQLite FTS5 BM25 with hybrid
     /// ASCII identifier + CJK bigram tokenization, exact phrase boost, and substring fallback).
-    /// When set, searches across all historical and live turns without loading the
+    /// When set, searches authorized historical and live turns without loading the
     /// full history. Omit `query` to read recent chronological turns or filter by tool/range.
     #[serde(default, alias = "q", alias = "search")]
     query: Option<String>,
@@ -407,7 +407,8 @@ struct ConversationArgs {
     exclude: Vec<String>,
     /// Agent name (`sage`, `volt`, `xenon`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
-    /// searching, or this agent when reading recent chronological turns.
+    /// searching, or this agent when reading recent chronological turns. Non-admin
+    /// callers can read only self and descendants; `all` means that authorized set.
     #[serde(default)]
     agent: Option<String>,
     /// Optional peer filter (e.g. `alice`, `telegram:user:42`, `telegram:chat:-1001234567890`,
@@ -470,7 +471,7 @@ struct AgentsArgs {
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"pause"` (pause an agent)
-    /// - `"archive"` (archive an agent or yourself to scale to zero; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
+    /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
     /// - `"rename"` (admin-only: rename an agent in place while keeping its `agt_...` ID and old name as an alias)
     /// - `"role"` (set or clear an agent's short role label)
@@ -478,6 +479,19 @@ struct AgentsArgs {
     /// - `"models"` (list upstream provider profile model catalogs)
     #[serde(default)]
     action: Option<String>,
+    /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
+    /// a Sylphx output/content string in config/sylphx-transcript.jsonl.
+    #[serde(default)]
+    message_id: Option<String>,
+    /// Mailbox sequence instead of message_id when action = "redact".
+    #[serde(default)]
+    seq: Option<i64>,
+    /// Optional end-exclusive decoded-text span. Omit to tombstone the whole body.
+    #[serde(default)]
+    span: Option<crate::api::RedactionSpan>,
+    /// Required audit reason for redact. Never repeat sensitive text in this field.
+    #[serde(default)]
+    reason: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     state: Option<String>,
@@ -497,7 +511,7 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...)
+    /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
     /// when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
     #[serde(default)]
     role: Option<String>,
@@ -522,14 +536,14 @@ struct AgentsArgs {
     /// Optional starting Git ref/branch when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
-    /// Optional working directory or workspace mode when `action` is `"spawn"` or `"create"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default for sub-agents when `repo` is omitted: shares parent's `workdir`).
+    /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
     #[serde(default)]
     workdir: Option<String>,
     /// Concise public role/mission summary (`description`, Layer 1 — visible to all peers and group rosters) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
     description: Option<String>,
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt) when `action` is `"spawn"`, `"create"`, or `"describe"`.
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
@@ -574,7 +588,7 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional short role label for the spawned agent.
+    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
     #[serde(default)]
     role: Option<String>,
     /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
@@ -596,14 +610,14 @@ struct SpawnArgs {
     /// Optional starting Git ref/branch for the managed worktree when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
-    /// Optional working directory or workspace mode: an explicit path, `"worktree"` / `"branch"` (provisions an isolated Git worktree branched from the parent's repo at `<data>/agents/<id>/work`), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default when `repo` is omitted: inherits the parent agent's `workdir`).
+    /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
     #[serde(default)]
     workdir: Option<String>,
     /// Optional concise public description (`description`, Layer 1) for the spawned agent.
     #[serde(default)]
     description: Option<String>,
     /// Optional detailed private standing instructions (`instructions`, Layer 2) for the spawned agent.
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
@@ -629,9 +643,9 @@ struct DescribeArgs {
     #[serde(default, alias = "text")]
     description: Option<String>,
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
-    /// Optional short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...).
+    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
     #[serde(default)]
     role: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
@@ -689,14 +703,19 @@ struct SubagentsArgs {
     /// Optional starting Git ref/branch when `action = "spawn"` and `repo` is set (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
-    /// Optional working directory or workspace mode when `action = "spawn"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory), or `"inherit"` (default when `repo` is omitted: shares parent's `workdir`).
+    /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
     #[serde(default)]
     workdir: Option<String>,
     /// Optional concise public description when `action = "spawn"`.
     #[serde(default)]
     description: Option<String>,
     /// Optional private system/role instructions when `action = "spawn"`.
-    #[serde(default, alias = "role")]
+    #[serde(
+        default,
+        alias = "role",
+        alias = "instruction",
+        alias = "system_prompt"
+    )]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
@@ -773,7 +792,7 @@ struct GroupsArgs {
         deserialize_with = "crate::api::deserialize_string_or_vec"
     )]
     agents: Vec<String>,
-    /// Optional group visibility toggle: `false` (default = Private / Invite-Only group where only existing members or their parent can add members or post) or `true` (Public / Open group).
+    /// Optional group visibility toggle: `false` (default = Private / Invite-Only group; participation requires membership or an invitation) or `true` (Public / Open group).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
 }
@@ -932,7 +951,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified two-way (`in` + `out`) conversation reader and Zero-Embedding Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search across all agents' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns."
+        description = "Unified two-way (`in` + `out`) conversation reader and Zero-Embedding Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search the caller's and descendants' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns. Non-admin agents read only self and descendants; `all` never grants peer, sibling or parent history access."
     )]
     async fn conversation(
         &self,
@@ -1066,7 +1085,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Zero-Embedding Lossless Lexical + Structured History Search across all agents' conversations and tool history (`query`, `queries`, `exclude`, `agent`, `with`, `direction`, `sender`, `include_tools`, `only_tools`, `tool_name`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Combines SQLite FTS5 BM25 (ASCII identifiers + CJK bigrams), exact phrase boost, and contiguous episode context expansion."
+        description = "Zero-Embedding Lossless Lexical + Structured History Search across authorized conversations and tool history (`query`, `queries`, `exclude`, `agent`, `with`, `direction`, `sender`, `include_tools`, `only_tools`, `tool_name`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Combines SQLite FTS5 BM25 (ASCII identifiers + CJK bigrams), exact phrase boost, and contiguous episode context expansion."
     )]
     async fn search(
         &self,
@@ -1076,7 +1095,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -1106,6 +1125,37 @@ impl AgentMcp {
                 }
             });
         match action.as_str() {
+            "redact" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| "redact requires a target agent".to_string())?;
+                let request = anyagents_core::redaction::Request {
+                    message_id: args.message_id,
+                    seq: args.seq,
+                    span: args
+                        .span
+                        .map(TryInto::try_into)
+                        .transpose()
+                        .map_err(|e: Error| e.to_string())?,
+                    reason: args.reason.ok_or_else(|| {
+                        "redact requires a reason (without sensitive text)".to_string()
+                    })?,
+                };
+                let path = format!(
+                    "/v1/agents/{}/conversation/redact",
+                    urlencoding_simple(target.strip_prefix("agent:").unwrap_or(target))
+                );
+                let response = self
+                    .client
+                    .get(
+                        &path,
+                        Some(serde_json::to_vec(&request).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
             "list" | "ls" => {
                 let mut response: AgentsResponse = self.client.get_agents().await?;
                 let state_trimmed = args
@@ -1649,7 +1699,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git worktree at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or default `\"inherit\"`); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
+        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git worktree at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or `\"inherit\"` for explicit parent sharing; omitting both `repo` and `workdir` gives a private directory); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
     )]
     async fn subagents(
         &self,
@@ -2431,5 +2481,36 @@ mod spawn_args_tests {
         .unwrap();
         assert_eq!(args.description.as_deref(), Some("Public role"));
         assert!(args.instructions.is_none());
+    }
+
+    #[test]
+    fn mcp_and_api_accept_singular_instruction_and_system_prompt_aliases() {
+        for key in ["instruction", "system_prompt"] {
+            let input = json!({
+                "action": "spawn",
+                "name": "worker",
+                "description": "Public summary",
+                key: "Private standing SOP"
+            });
+            let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+            let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+            let describe: DescribeArgs = serde_json::from_value(input.clone()).unwrap();
+            let subagents: SubagentsArgs = serde_json::from_value(input.clone()).unwrap();
+            let api_req: crate::api::CreateAgentRequest = serde_json::from_value(input).unwrap();
+            assert_eq!(agents.instructions.as_deref(), Some("Private standing SOP"));
+            assert_eq!(spawn.instructions.as_deref(), Some("Private standing SOP"));
+            assert_eq!(
+                describe.instructions.as_deref(),
+                Some("Private standing SOP")
+            );
+            assert_eq!(
+                subagents.instructions.as_deref(),
+                Some("Private standing SOP")
+            );
+            assert_eq!(
+                api_req.instructions.as_deref(),
+                Some("Private standing SOP")
+            );
+        }
     }
 }

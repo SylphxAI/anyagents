@@ -7,6 +7,142 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Keep role labels methodology-neutral: roots and labelled children can self-archive
+  and release idle processes under the same rules. Preserve legacy effective scopes
+  on upgrade, default all new children to private, and retain browser profiles until
+  deletion. Discovery and generated lifecycle instructions no longer depend on roles.
+
+## 0.1.3
+
+### Added
+
+- Serving-process image identity in health probes: embedded version and source
+  SHA, a once-computed executable hash, and admin-only PID and start time.
+- Permissioned, audited conversation redaction through the API, CLI and MCP,
+  preserving transcript sequence numbers and recording each erasure operation.
+
+### Fixed
+
+- Native context compaction stays within the active model budget, including
+  tool-output overhead, so oversized requests do not wedge agent turns.
+- Group ownership and membership permissions are enforced consistently.
+- HTTP fallback provider keys stay out of child-process environments. Provider
+  key environment aliases share one implementation.
+- OpenCode port handoff and Telegram batch checkpoint fixtures use deterministic
+  synchronization; an intermittent browser clipboard startup fixture is
+  quarantined rather than retried.
+- The completed-turn restart fixture waits for durable turn completion before
+  killing the vendor process; usage accounting alone is not completion.
+- The native retry fixture waits for completed turns before checking success or
+  persistent failure, preserving exact retry-request and error assertions.
+
+### Release verification
+
+- Publication is bound to the release commit's exact successful push/main CI;
+  package metadata and all platform identity files are read back after publish.
+- The [release CI audit](docs/releases/v0.1.3-ci-audit.json) records all twelve PRs
+  merged after v0.1.2 through source `648de67161412e2bda27b70f6f2239b57d23ef77`.
+- #113 already shipped in v0.1.2's merge-queue base. #108, #115, #120, #121 and
+  #122 were not merged at this cut and are not included.
+
+### Included pull requests
+
+- [#110](https://github.com/SylphxAI/anyagents/pull/110): fix: bind releases to exact successful main CI.
+- [#111](https://github.com/SylphxAI/anyagents/pull/111): Enforce group ownership and membership permissions.
+- [#112](https://github.com/SylphxAI/anyagents/pull/112): fix(auth): remove provider keys from curl environment.
+- [#106](https://github.com/SylphxAI/anyagents/pull/106): feat: expose serving process identity in health probes.
+- [#116](https://github.com/SylphxAI/anyagents/pull/116): Test OpenCode handoff collisions with owned sockets.
+- [#118](https://github.com/SylphxAI/anyagents/pull/118): test(browser): quarantine intermittent clipboard fixture startup.
+- [#119](https://github.com/SylphxAI/anyagents/pull/119): refactor(auth): share provider key environment aliases.
+- [#117](https://github.com/SylphxAI/anyagents/pull/117): Keep native context compaction within the model budget.
+- [#92](https://github.com/SylphxAI/anyagents/pull/92): feat: add audited conversation redaction.
+- [#114](https://github.com/SylphxAI/anyagents/pull/114): fix(test): wait for the Telegram batch checkpoint.
+- [#126](https://github.com/SylphxAI/anyagents/pull/126): test(supervisor): synchronize the completed-turn restart fixture.
+- [#128](https://github.com/SylphxAI/anyagents/pull/128): test(sylphx): await retry turn completion before assertions.
+
+## 0.1.2
+
+### Added
+
+- Explicit local or cloud workspace placement, isolated worktree lifecycles,
+  and nested agent collaboration within supervised scopes.
+- Mobile browser takeover controls, persistent takeover sessions, and native
+  clipboard and keyboard shortcuts.
+- Conditional GitHub REST probes shared across schedule watches.
+
+### Fixed
+
+- Conversation-history reads remain within the caller's supervised tree.
+- Recovery stays behind undelivered mailbox entries. Error notification fixtures
+  control rollout freshness, and HTTP fallback credentials stay out of argv.
+- OpenCode agents keep independent service ports across restarts, replace
+  occupied ports, and retry transient bind collisions without discovering a
+  shared managed service.
+- Agent metadata and runtime refreshes preserve scope. Archived agents resume
+  only for intentional direct messages; scheduled messages wake idle harnesses.
+- Pending harness, model and profile switches recover faulted turns. Agent and
+  lifecycle locks are explicitly released even while a harness child is alive.
+- Sylphx context compaction respects active model limits, preserves tool pairs,
+  and recovers from transient transport failures. Profile refresh, quota
+  balancing, execution placement and sandbox lease handling are corrected.
+- Telegram messages retain group quote context and media attachments.
+- Archive cleanup stays outside mailbox reconciliation. Archive and runtime
+  switch fixtures now control their startup and replay ordering; one
+  nondeterministic partial-cleanup fixture is quarantined.
+
+### Included pull requests
+
+- [#59](https://github.com/SylphxAI/anyagents/pull/59): fix(profiles): centralize anthropic oauth refresh and strip seat refresh tokens.
+- [#60](https://github.com/SylphxAI/anyagents/pull/60): fix(sylphx): persist workspace placement and preserve delegated execution.
+- [#61](https://github.com/SylphxAI/anyagents/pull/61): fix(sylphx): preserve function pairs across context boundaries.
+- [#62](https://github.com/SylphxAI/anyagents/pull/62): fix(sylphx): sanitize orphaned tool call outputs after window stride and recover transient gateway errors.
+- [#63](https://github.com/SylphxAI/anyagents/pull/63): fix(sylphx): fix cloud sandbox exec idempotency, exit-0 sentinel, and lease lifecycle.
+- [#64](https://github.com/SylphxAI/anyagents/pull/64): fix(sylphx): drop raw orphan tool outputs in window projection without mutating transcript.
+- [#65](https://github.com/SylphxAI/anyagents/pull/65): fix(sandbox): hydrate operator seat groups and include both seat gids on migration.
+- [#66](https://github.com/SylphxAI/anyagents/pull/66): fix(sylphx,signin): single-writer admin delivery, gateway pacing, and agy sign-in completion.
+- [#67](https://github.com/SylphxAI/anyagents/pull/67): fix(profiles): balance agents evenly across healthy profiles with blended 5h/7d quota.
+- [#68](https://github.com/SylphxAI/anyagents/pull/68): fix(telegram,store): preserve group quote context and media attachments across multi-bot relays.
+- [#69](https://github.com/SylphxAI/anyagents/pull/69): fix(schedule): keep github:pr watches active across check/queue transitions until merged or closed.
+- [#70](https://github.com/SylphxAI/anyagents/pull/70): fix(mcp): keep async tools alive and separate spawn instructions.
+- [#71](https://github.com/SylphxAI/anyagents/pull/71): feat: remove cloud-sandbox hybrid mode and enforce scoped agent hierarchy messaging.
+- [#72](https://github.com/SylphxAI/anyagents/pull/72): fix(sylphx,server): honor local workspace placement and allow multi-level hierarchy messaging.
+- [#73](https://github.com/SylphxAI/anyagents/pull/73): fix(server): reap subagent .gemini/tmp caches, safe.directory git worktrees, and dirty build outputs.
+- [#74](https://github.com/SylphxAI/anyagents/pull/74): feat(workspace): enforce per-agent isolated workdir lifecycle and full archive reaping.
+- [#75](https://github.com/SylphxAI/anyagents/pull/75): fix: allow idle local harnesses to receive scheduled wakes.
+- [#79](https://github.com/SylphxAI/anyagents/pull/79): feat(browser): make takeover usable on phones.
+- [#76](https://github.com/SylphxAI/anyagents/pull/76): feat(sylphx,telegram): sync local MoE topology, XML message envelope, and remote model context window updates.
+- [#80](https://github.com/SylphxAI/anyagents/pull/80): fix(send): resume archived agents only for intentional direct sends.
+- [#77](https://github.com/SylphxAI/anyagents/pull/77): fix(sylphx): compact against active model limits before dispatch.
+- [#81](https://github.com/SylphxAI/anyagents/pull/81): fix(archive): keep cleanup out of mailbox reconciliation.
+- [#82](https://github.com/SylphxAI/anyagents/pull/82): fix(agents): preserve scope across metadata and runtime refreshes.
+- [#84](https://github.com/SylphxAI/anyagents/pull/84): fix(supervisor): apply pending runtime switches to faulted turns.
+- [#85](https://github.com/SylphxAI/anyagents/pull/85): fix(opencode): reserve stable private service ports per agent.
+- [#83](https://github.com/SylphxAI/anyagents/pull/83): fix(browser): preserve takeover sessions during state publication.
+- [#86](https://github.com/SylphxAI/anyagents/pull/86): fix(opencode): preserve transient bind collision evidence.
+- [#93](https://github.com/SylphxAI/anyagents/pull/93): fix(test): isolate archive maintenance startup from reconciliation.
+- [#88](https://github.com/SylphxAI/anyagents/pull/88): Release agent flock explicitly when its guard drops.
+- [#97](https://github.com/SylphxAI/anyagents/pull/97): fix(test): complete the runtime switch replay control.
+- [#96](https://github.com/SylphxAI/anyagents/pull/96): test: quarantine nondeterministic archive partial-cleanup fixture.
+- [#102](https://github.com/SylphxAI/anyagents/pull/102): fix(core): release lifecycle flock when its guard drops.
+- [#104](https://github.com/SylphxAI/anyagents/pull/104): test: quarantine Chromium focus startup race.
+- [#87](https://github.com/SylphxAI/anyagents/pull/87): Restrict conversation history to the caller’s supervised tree.
+- [#105](https://github.com/SylphxAI/anyagents/pull/105): fix(supervisor): keep recovery behind undelivered mail.
+- [#99](https://github.com/SylphxAI/anyagents/pull/99): fix(schedule): share conditional REST probes for GitHub watches.
+- [#100](https://github.com/SylphxAI/anyagents/pull/100): fix(test): control rollout freshness in error notification fixture.
+- [#107](https://github.com/SylphxAI/anyagents/pull/107): docs: describe the required merge queue.
+- [#101](https://github.com/SylphxAI/anyagents/pull/101): fix(auth): keep HTTP fallback credentials out of argv.
+- [#91](https://github.com/SylphxAI/anyagents/pull/91): feat(browser): support native takeover clipboard and keyboard shortcuts.
+- [#113](https://github.com/SylphxAI/anyagents/pull/113): Test OpenCode port reuse with owned reservations (merge-queue base).
+
+### Verification and exclusions
+
+- #59–#66 merged before the ci-ok gate; verified by the release candidate run.
+  The [release CI audit](docs/releases/v0.1.2-ci-audit.json) records each final
+  PR head, merge SHA, merge time and available exact-head ci-ok receipt.
+- #89's idle cache reaper, archetypes, list query/pagination and archive guard
+  are not shipped: #98 reverts #89 after independent review reproduced three
+  data-deletion defects. Subsequent unrelated changes remain included.
+
 ## 0.1.1
 
 ### Added

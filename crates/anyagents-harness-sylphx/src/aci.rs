@@ -15,8 +15,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::auth::truncate_tool_output_middle_utf8;
-
 /// Determines whether a batch of `function_call` items emitted in a single
 /// `/v1/responses` step can be safely executed in parallel via `std::thread::scope`.
 pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> bool {
@@ -74,7 +72,8 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
 }
 
 /// Executes a local `bash -c` command in its own process group with enforced
-/// `timeout_ms` (default 120,000 ms) and UTF-8-safe head+tail middle truncation.
+/// `timeout_ms` (default 120,000 ms). Return complete output to the common
+/// masking boundary, which applies the UTF-8-safe observation cap afterward.
 pub(super) fn execute_bash_with_timeout(
     cmd_str: &str,
     work_dir: &Path,
@@ -197,7 +196,7 @@ pub(super) fn execute_bash_with_timeout(
             "[command timed out after {bounded_timeout_ms}ms and was terminated]"
         ));
     }
-    truncate_tool_output_middle_utf8(combined, 30_000, 14_000, 14_000)
+    combined
 }
 
 /// Formats `read_file` output with a metadata header, 1-based line numbers, and
@@ -240,7 +239,7 @@ pub(super) fn format_read_file_output(
             end + 1
         ));
     }
-    truncate_tool_output_middle_utf8(out, 64_000, 30_000, 30_000)
+    out
 }
 
 /// Native directory listing for local workspaces without spawning a `bash` subprocess.

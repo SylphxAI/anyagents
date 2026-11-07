@@ -653,6 +653,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
     let Ok(schedules) = store.list_schedules(None, true) else {
         return 0;
     };
+    github::begin_cycle(&schedules, now);
     let mut fired_count = 0;
     for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
@@ -756,7 +757,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if block.is_some() {
                     // Record latest observation while the owning agent is busy/paused without
                     // consuming a terminal transition or mutating the baseline.
-                    if eval.observed.is_some() {
+                    if eval.observed.is_some() && eval.observed != sched.last_observed {
                         let _ = store.update_schedule_watch_observation(
                             &sched.id,
                             sched.watch_baseline.as_deref(),
@@ -766,7 +767,16 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                     continue;
                 }
                 if !eval.triggered {
-                    if eval.baseline.is_some() || eval.observed.is_some() {
+                    if (eval.baseline.is_some() || eval.observed.is_some())
+                        && (eval
+                            .baseline
+                            .as_ref()
+                            .is_some_and(|b| Some(b) != sched.watch_baseline.as_ref())
+                            || eval
+                                .observed
+                                .as_ref()
+                                .is_some_and(|o| Some(o) != sched.last_observed.as_ref()))
+                    {
                         let _ = store.update_schedule_watch_observation(
                             &sched.id,
                             eval.baseline.as_deref(),
@@ -952,47 +962,7 @@ fn evaluate_watch(
             else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
-            if state_desc.starts_with("probe_error:") {
-                return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
-            }
-            let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
-            if state_desc == "merged" || state_desc == "closed" {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "fired",
-                    transition: Some(state_desc.clone()),
-                    observed: Some(state_desc.clone()),
-                    baseline: Some(state_desc),
-                };
-            }
-            if prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "active",
-                    transition: Some("evicted".to_string()),
-                    observed: Some(format!("evicted:{state_desc}")),
-                    baseline: Some(state_desc),
-                };
-            }
-            if state_desc == "review_failed" && prev != "review_failed" {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "active",
-                    transition: Some("review_failed".to_string()),
-                    observed: Some("review_failed".to_string()),
-                    baseline: Some("review_failed".to_string()),
-                };
-            }
-            if state_desc == "checks_completed" && prev != "checks_completed" {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "active",
-                    transition: Some("checks_completed".to_string()),
-                    observed: Some("checks_completed".to_string()),
-                    baseline: Some("checks_completed".to_string()),
-                };
-            }
-            WatchEval::pending(Some(state_desc.clone()), Some(state_desc))
+            evaluate_pr_observation(sched, state_desc)
         }
         WatchTarget::GitHubCheck {
             owner,
@@ -1044,6 +1014,50 @@ fn evaluate_watch(
             }
         }
     }
+}
+
+fn evaluate_pr_observation(sched: &AgentSchedule, state_desc: String) -> WatchEval {
+    if state_desc.starts_with("probe_error:") {
+        return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
+    }
+    let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
+    if state_desc == "merged" || state_desc == "closed" {
+        return WatchEval {
+            triggered: true,
+            next_state: "fired",
+            transition: Some(state_desc.clone()),
+            observed: Some(state_desc.clone()),
+            baseline: Some(state_desc),
+        };
+    }
+    if prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
+        return WatchEval {
+            triggered: true,
+            next_state: "active",
+            transition: Some("evicted".to_string()),
+            observed: Some(format!("evicted:{state_desc}")),
+            baseline: Some(state_desc),
+        };
+    }
+    if state_desc == "review_failed" && prev != "review_failed" {
+        return WatchEval {
+            triggered: true,
+            next_state: "active",
+            transition: Some("review_failed".to_string()),
+            observed: Some("review_failed".to_string()),
+            baseline: Some("review_failed".to_string()),
+        };
+    }
+    if state_desc == "checks_completed" && prev != "checks_completed" {
+        return WatchEval {
+            triggered: true,
+            next_state: "active",
+            transition: Some("checks_completed".to_string()),
+            observed: Some("checks_completed".to_string()),
+            baseline: Some("checks_completed".to_string()),
+        };
+    }
+    WatchEval::pending(Some(state_desc.clone()), Some(state_desc))
 }
 
 fn probe_process_alive(pid: u32) -> bool {
@@ -1168,12 +1182,7 @@ pub fn probe_spiron_state(id: &str, kind: &str) -> Option<String> {
     None
 }
 
-#[allow(clippy::type_complexity)]
-static GH_PROBE_CACHE: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, (i64, Option<(bool, String)>)>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-const GH_CLI_PROBE_TTL_MS: i64 = 15_000;
+mod github;
 
 fn probe_github_pr_terminal(
     owner: &str,
@@ -1182,129 +1191,7 @@ fn probe_github_pr_terminal(
     agent_id: &str,
     now_ms: i64,
 ) -> Option<(bool, String)> {
-    if let Ok(base) = std::env::var("ANYAGENTS_GITHUB_API_BASE")
-        && !base.trim().is_empty()
-    {
-        let url = format!(
-            "{}/repos/{owner}/{repo}/pulls/{number}",
-            base.trim_end_matches('/')
-        );
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .build()
-            .new_agent();
-        if let Ok(resp) = agent.get(&url).header("accept", "application/json").call()
-            && let Ok(body) = resp.into_body().read_to_string()
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
-        {
-            return evaluate_pr_json(&val);
-        }
-        return None;
-    }
-
-    let cache_key = format!("pr:{owner}/{repo}#{number}");
-    if let Ok(guard) = GH_PROBE_CACHE.lock()
-        && let Some((ts, cached)) = guard.get(&cache_key)
-        && now_ms.saturating_sub(*ts) < GH_CLI_PROBE_TTL_MS
-    {
-        return cached.clone();
-    }
-
-    let out = std::process::Command::new("timeout")
-        .env("ANYAGENTS_AGENT_ID", agent_id)
-        .args([
-            "10s",
-            "gh",
-            "pr",
-            "view",
-            &number.to_string(),
-            "--repo",
-            &format!("{owner}/{repo}"),
-            "--json",
-            "state,mergedAt,headRefOid,reviewDecision,statusCheckRollup",
-        ])
-        .output()
-        .ok()?;
-    let res = if out.status.success() {
-        serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            .ok()
-            .and_then(|val| evaluate_pr_json(&val))
-    } else {
-        Some((
-            false,
-            format!("probe_error:gh_exit:{}", out.status.code().unwrap_or(-1)),
-        ))
-    };
-    if let Ok(mut guard) = GH_PROBE_CACHE.lock() {
-        guard.insert(cache_key, (now_ms, res.clone()));
-    }
-    res
-}
-
-fn evaluate_pr_json(val: &serde_json::Value) -> Option<(bool, String)> {
-    let state = val
-        .get("state")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_ascii_uppercase();
-    let merged = val
-        .get("merged")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-        || val
-            .get("mergedAt")
-            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
-        || val
-            .get("merged_at")
-            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
-    if merged || state == "MERGED" {
-        return Some((true, "merged".to_string()));
-    }
-    if state == "CLOSED" {
-        return Some((true, "closed".to_string()));
-    }
-    if let Some(mq) = val.get("mergeQueueEntry")
-        && !mq.is_null()
-    {
-        let mq_state = mq
-            .get("state")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("QUEUED")
-            .to_ascii_lowercase();
-        return Some((false, format!("merge_queue:{mq_state}")));
-    }
-    if let Some(rollup) = val
-        .get("statusCheckRollup")
-        .and_then(serde_json::Value::as_array)
-        && !rollup.is_empty()
-    {
-        let review_failed = rollup.iter().any(|item| {
-            let name = item
-                .get("name")
-                .or_else(|| item.get("context"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            let conc = item
-                .get("conclusion")
-                .or_else(|| item.get("state"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
-            name.to_ascii_lowercase().contains("review")
-                && matches!(
-                    conc.to_ascii_uppercase().as_str(),
-                    "FAILURE" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED"
-                )
-        });
-        if review_failed {
-            return Some((false, "review_failed".to_string()));
-        }
-        let all_done = rollup.iter().all(check_item_is_terminal);
-        if all_done {
-            return Some((true, "checks_completed".to_string()));
-        }
-        return Some((false, "checks_in_progress".to_string()));
-    }
-    Some((false, state.to_ascii_lowercase()))
+    github::probe(owner, repo, &number.to_string(), true, agent_id, now_ms)
 }
 
 fn check_item_is_terminal(item: &serde_json::Value) -> bool {
@@ -1333,78 +1220,7 @@ fn probe_github_check_terminal(
     {
         return probe_github_pr_terminal(owner, repo, pr_num, agent_id, now_ms);
     }
-    if let Ok(base) = std::env::var("ANYAGENTS_GITHUB_API_BASE")
-        && !base.trim().is_empty()
-    {
-        let url = format!(
-            "{}/repos/{owner}/{repo}/commits/{clean_ref}/check-runs",
-            base.trim_end_matches('/')
-        );
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(5)))
-            .build()
-            .new_agent();
-        if let Ok(resp) = agent.get(&url).header("accept", "application/json").call()
-            && let Ok(body) = resp.into_body().read_to_string()
-            && let Ok(val) = serde_json::from_str::<serde_json::Value>(&body)
-        {
-            return evaluate_check_runs_json(&val);
-        }
-        return None;
-    }
-
-    let cache_key = format!("check:{owner}/{repo}@{clean_ref}");
-    if let Ok(guard) = GH_PROBE_CACHE.lock()
-        && let Some((ts, cached)) = guard.get(&cache_key)
-        && now_ms.saturating_sub(*ts) < GH_CLI_PROBE_TTL_MS
-    {
-        return cached.clone();
-    }
-
-    let out = std::process::Command::new("timeout")
-        .env("ANYAGENTS_AGENT_ID", agent_id)
-        .args([
-            "10s",
-            "gh",
-            "api",
-            &format!("repos/{owner}/{repo}/commits/{clean_ref}/check-runs"),
-        ])
-        .output()
-        .ok()?;
-    let res = if out.status.success() {
-        serde_json::from_slice::<serde_json::Value>(&out.stdout)
-            .ok()
-            .and_then(|val| evaluate_check_runs_json(&val))
-    } else {
-        None
-    };
-    if let Ok(mut guard) = GH_PROBE_CACHE.lock() {
-        guard.insert(cache_key, (now_ms, res.clone()));
-    }
-    res
-}
-
-fn evaluate_check_runs_json(val: &serde_json::Value) -> Option<(bool, String)> {
-    if let Some(status) = val.get("status").and_then(serde_json::Value::as_str) {
-        let done = status.eq_ignore_ascii_case("completed");
-        return Some((done, status.to_ascii_lowercase()));
-    }
-    let runs = val
-        .get("check_runs")
-        .and_then(serde_json::Value::as_array)?;
-    if runs.is_empty() {
-        return Some((false, "no_checks_yet".to_string()));
-    }
-    let all_done = runs.iter().all(|r| {
-        r.get("status")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|s| s.eq_ignore_ascii_case("completed"))
-    });
-    if all_done {
-        Some((true, "checks_completed".to_string()))
-    } else {
-        Some((false, "checks_in_progress".to_string()))
-    }
+    github::probe(owner, repo, clean_ref, false, agent_id, now_ms)
 }
 
 #[cfg(test)]
@@ -1736,42 +1552,91 @@ mod tests {
     }
 
     #[test]
-    fn github_pr_watch_stays_active_across_checks_and_eviction_until_merged() {
+    fn legacy_queue_eviction_and_rate_errors_keep_existing_wake_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("legacy-pr-watch", "codex"))
+            .unwrap();
+        let mut sched = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id,
+                kind: "watch".to_string(),
+                spec: "github:pr:o/r#42".to_string(),
+                prompt: "verify".to_string(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("merge_queue:queued".to_string()),
+            })
+            .unwrap();
+        let error = evaluate_pr_observation(&sched, "probe_error:rate_limited".to_string());
+        assert!(!error.triggered);
+        assert_eq!(error.baseline, sched.watch_baseline);
+        let evicted = evaluate_pr_observation(&sched, "checks_completed".to_string());
+        assert!(evicted.triggered);
+        assert_eq!(evicted.transition.as_deref(), Some("evicted"));
+        assert_eq!(evicted.next_state, "active");
+        sched.watch_baseline = evicted.baseline;
+        assert!(!evaluate_pr_observation(&sched, "checks_completed".to_string()).triggered);
+    }
+
+    #[test]
+    fn github_pr_watch_stays_active_across_checks_and_review_failure_until_merged() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
-
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let payload = Arc::new(Mutex::new(
-            r#"{"state":"OPEN","merged":false,"statusCheckRollup":[{"status":"IN_PROGRESS"}]}"#
-                .to_string(),
-        ));
-        let server_payload = Arc::clone(&payload);
+        let stage = Arc::new(Mutex::new(0));
+        let server_stage = Arc::clone(&stage);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
         let server = std::thread::spawn(move || {
-            for stream in listener.incoming().flatten() {
-                let mut stream = stream;
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let body = server_payload.lock().unwrap().clone();
-                if body == "STOP" {
+            for mut stream in listener.incoming().flatten() {
+                let mut buf = [0u8; 2048];
+                let len = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..len]);
+                let stage = *server_stage.lock().unwrap();
+                if stage == 99 {
                     break;
                 }
-                let resp = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(resp.as_bytes());
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                if stage == 5 {
+                    let body = r#"{"message":"You have exceeded a secondary rate limit."}"#;
+                    write!(stream, "HTTP/1.1 403 Forbidden\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                    continue;
+                }
+                let body = if request.contains("/pulls/") {
+                    if stage == 4 {
+                        r#"{"state":"closed","merged":true,"head":{"sha":"abc"}}"#
+                    } else {
+                        r#"{"state":"open","merged":false,"head":{"sha":"abc"}}"#
+                    }
+                } else if request.contains("/check-runs") {
+                    match stage {
+                        0 => {
+                            r#"{"check_runs":[{"name":"ci","status":"in_progress","conclusion":null}]}"#
+                        }
+                        2 => {
+                            r#"{"check_runs":[{"name":"review","status":"completed","conclusion":"failure"}]}"#
+                        }
+                        _ => {
+                            r#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}"#
+                        }
+                    }
+                } else if request.contains("/status?") {
+                    r#"{"statuses":[]}"#
+                } else {
+                    panic!("unexpected REST request: {request}");
+                };
+                write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
             }
         });
-
-        // Point GitHub PR probes at our local mock server.
-        // SAFETY: serialized within this test process for ANYAGENTS_GITHUB_API_BASE.
+        // This is the only test using this process-wide override.
         unsafe {
             std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{addr}"));
         }
-
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let health = HealthBoard::default();
@@ -1779,7 +1644,6 @@ mod tests {
             .create_agent(NewAgent::new("owner-pr-watch", "codex"))
             .unwrap();
         store.set_agent_running(&owner.id, "/work").unwrap();
-
         let sched = create_agent_schedule(
             &store,
             &health,
@@ -1790,109 +1654,91 @@ mod tests {
             "verify PR 452",
         )
         .unwrap();
-
         let now = anyagents_core::now_ms();
-        // 1. Checks in progress -> no wake, baseline recorded as checks_in_progress, watch stays active.
+        github::begin_cycle(&store.list_schedules(None, true).unwrap(), now);
+        let barrier = Arc::new(std::sync::Barrier::new(101));
+        let handles: Vec<_> = (0..100)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // Agent identity must not fragment the single-flight cache.
+                    probe_github_check_terminal(
+                        "Cubeage",
+                        "hk-mahjong-tycoon",
+                        "#452",
+                        &format!("agent{i}"),
+                        now,
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap().1, "checks_in_progress");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        for (stage_num, transition) in [
+            (1, "checks_completed"),
+            (2, "review_failed"),
+            (3, "checks_completed"),
+        ] {
+            *stage.lock().unwrap() = stage_num;
+            let at = now + i64::from(stage_num) * 60_000;
+            assert_eq!(tick_schedules_once(&store, &health, at), 1);
+            let inbox = store.inbox(&owner.id, None).unwrap();
+            let last = inbox.last().unwrap();
+            assert!(last.text.starts_with(&format!("[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition={transition}]\nverify PR 452")), "{}", last.text);
+            store.note_delivered(&owner.id, last.seq).unwrap();
+            store.note_turn_completed(&owner.id).unwrap();
+            assert_eq!(tick_schedules_once(&store, &health, at + 1_000), 0);
+            let active = store.list_schedules(Some(&owner.id), true).unwrap();
+            assert_eq!(active.len(), 1);
+        }
+        // A shared secondary-limit window records one typed error, retains
+        // the successful baseline, and rereads the terminal state on recovery.
+        *stage.lock().unwrap() = 5;
+        assert_eq!(tick_schedules_once(&store, &health, now + 240_000), 0);
         let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(active.len(), 1);
-        assert_eq!(
-            active[0].watch_baseline.as_deref(),
-            Some("checks_in_progress")
-        );
-
-        // 2. Checks complete while PR is still OPEN -> wakes once with transition=checks_completed,
-        // and the watch STAYS active (not consumed as `fired`)!
-        *payload.lock().unwrap() =
-            r#"{"state":"OPEN","merged":false,"statusCheckRollup":[{"status":"COMPLETED","state":"SUCCESS"}]}"#
-                .to_string();
-        assert_eq!(tick_schedules_once(&store, &health, now + 1_000), 1);
-        let inbox = store.inbox(&owner.id, None).unwrap();
-        assert_eq!(inbox.len(), 1);
-        assert!(
-            inbox[0]
-                .text
-                .starts_with("[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=checks_completed]\nverify PR 452"),
-            "unexpected wake text: {}",
-            inbox[0].text
-        );
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(
-            active.len(),
-            1,
-            "PR watch must stay active after checks_completed"
-        );
         assert_eq!(
             active[0].watch_baseline.as_deref(),
             Some("checks_completed")
         );
-        store.note_delivered(&owner.id, inbox[0].seq).unwrap();
-        store.note_turn_completed(&owner.id).unwrap();
-
-        // Repeated checks_completed poll does NOT re-fire.
-        assert_eq!(tick_schedules_once(&store, &health, now + 2_000), 0);
-
-        // 3. PR enters the merge queue -> baseline updates to merge_queue:queued without waking.
-        *payload.lock().unwrap() =
-            r#"{"state":"OPEN","merged":false,"mergeQueueEntry":{"state":"QUEUED"},"statusCheckRollup":[{"status":"COMPLETED","state":"SUCCESS"}]}"#
-                .to_string();
-        assert_eq!(tick_schedules_once(&store, &health, now + 3_000), 0);
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
         assert_eq!(
-            active[0].watch_baseline.as_deref(),
-            Some("merge_queue:queued")
+            active[0].last_observed.as_deref(),
+            Some("probe_error:rate_limited")
         );
-
-        // 4. PR is evicted from the merge queue back to OPEN with completed checks ->
-        // wakes once with transition=evicted and STILL stays active!
-        *payload.lock().unwrap() =
-            r#"{"state":"OPEN","merged":false,"mergeQueueEntry":null,"statusCheckRollup":[{"status":"COMPLETED","state":"SUCCESS"}]}"#
-                .to_string();
-        assert_eq!(tick_schedules_once(&store, &health, now + 4_000), 1);
+        let before = calls.load(Ordering::SeqCst);
+        *stage.lock().unwrap() = 4;
+        for at in [240_001, 300_000, 359_999, 360_000, 361_000] {
+            assert_eq!(tick_schedules_once(&store, &health, now + at), 0);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        // Recovery is jittered across reset+60..300 seconds, not reset itself.
+        assert_eq!(tick_schedules_once(&store, &health, now + 660_000), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
-        assert_eq!(inbox.len(), 2);
+        assert!(inbox.last().unwrap().text.contains("transition=merged]"));
         assert!(
-            inbox[1].text.starts_with(
-                "[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=evicted]\nverify PR 452"
-            ),
-            "unexpected eviction wake text: {}",
-            inbox[1].text
+            store
+                .list_schedules(Some(&owner.id), true)
+                .unwrap()
+                .is_empty()
         );
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
-        assert_eq!(active.len(), 1, "PR watch must stay active after eviction");
-        store.note_delivered(&owner.id, inbox[1].seq).unwrap();
-        store.note_turn_completed(&owner.id).unwrap();
-
-        // 5. PR merges -> wakes with transition=merged and transitions schedule state to `fired`.
-        *payload.lock().unwrap() =
-            r#"{"state":"MERGED","merged":true,"mergedAt":"2026-11-04T13:55:00Z"}"#.to_string();
-        assert_eq!(tick_schedules_once(&store, &health, now + 5_000), 1);
-        let inbox = store.inbox(&owner.id, None).unwrap();
-        assert_eq!(inbox.len(), 3);
-        assert!(
-            inbox[2].text.starts_with(
-                "[watch: github:pr:Cubeage/hk-mahjong-tycoon#452 transition=merged]\nverify PR 452"
-            ),
-            "unexpected merge wake text: {}",
-            inbox[2].text
-        );
-        let active = store.list_schedules(Some(&owner.id), true).unwrap();
         assert_eq!(
-            active.len(),
-            0,
-            "PR watch must retire (`fired`) once PR is merged"
+            store.list_schedules(Some(&owner.id), false).unwrap()[0].id,
+            sched.id
         );
-        let all = store.list_schedules(Some(&owner.id), false).unwrap();
-        assert_eq!(all[0].id, sched.id);
-        assert_eq!(all[0].state, "fired");
-
-        *payload.lock().unwrap() = "STOP".to_string();
+        *stage.lock().unwrap() = 99;
         let _ = std::net::TcpStream::connect(addr);
-        let _ = server.join();
+        server.join().unwrap();
         unsafe {
             std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
         }
     }
+
     #[test]
     fn selected_timer_and_watch_cannot_overwrite_a_fresh_archive() {
         let dir = tempfile::tempdir().unwrap();

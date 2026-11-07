@@ -97,6 +97,46 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### New-agent workspace selection
+
+`create::create` resolves workspace defaults for every spawn route. A new
+sub-agent with neither `repo` nor `workdir` gets a private
+`<data>/agents/<id>/work` directory, not its parent's directory. Each sibling
+gets a different directory. `workdir: "private"` selects this explicitly;
+`workdir: "inherit"` shares an existing parent directory only when requested.
+An explicit path is honoured. `repo: "inherit"` or `workdir: "worktree"`
+creates an isolated Git worktree instead of sharing the parent's worktree.
+
+Root creation can receive the operator's `workdir_default`; without that
+operator override it also uses its own managed directory. These defaults apply
+only to newly created agents: stored workdirs are not migrated or rewritten.
+
+### GitHub event watches
+
+`github:pr:owner/repo#number` and `github:check:owner/repo@ref` use REST
+through the authenticated `gh api` adapter, never a GraphQL check rollup.
+PR observations combine the pull's state/head with every page of Check Runs
+and legacy commit-status contexts. A numeric check reference shares the PR
+watch's target cache. Watch syntax and wake transitions are unchanged.
+
+All agents in one daemon share a serial, single-flight probe cache. Each target
+starts at 60 seconds; unchanged observations double its interval to at most
+300 seconds, and a state transition resets it to 60 seconds. Each REST page
+retains its ETag and a compact observation summary; subsequent reads send
+`If-None-Match`, including unchanged pages after a changed first page. A
+3,000-check PR requires 30 Check Run pages, plus the pull and commit statuses,
+not one expanded GraphQL query per watching agent. Inactive targets expire
+after one hour, and obsolete head/page summaries are discarded.
+
+A 403/429 secondary-limit response or `Retry-After` pauses every GitHub watch
+request until the cooldown expires. Each watch records `probe_error:rate_limited`
+once while preserving its last successful baseline; repeated scheduler ticks
+neither repeat the observation write nor wake an agent. The first eligible
+probe after cooldown rereads REST state, so a merge or check completion during
+the pause is delivered after recovery. Rate-limit responses without a stated
+retry time use exponential cooldowns from 60 to 300 seconds. Permission and
+payload errors remain distinct and never masquerade as completed checks.
+
 ### Archived sub-agent cleanup
 
 An explicit archive creates a fresh `.anyagents-archived` generation in the
@@ -405,14 +445,30 @@ Each stored message carries the context the server authenticated for it: the aut
 
 A message from Telegram keeps the message it quotes: the quoted author, as Telegram marked it (bot or person), its text or caption, and the ids that name it. The quoted text is fenced and neutralised, so a modelled line cannot forge a quoted author.
 
+Named virtual groups store an immutable creator `owner_agent_id`, independent
+of membership. Legacy groups retain NULL ownership (operator-owned), even when
+their roster is empty. Existing members may invite agents to private groups;
+nonmembers need the owner's or operator's invitation. `public` on `join` only
+configures a newly created group and is ignored for existing groups. Visibility
+changes through `members` or `leave` require the owner, an ancestor supervising
+the owner, the operator or an explicitly privileged root admin. Removing another
+agent requires authority over that target (self or ancestor), the group owner or
+the operator. Batch authorization and all membership/visibility writes commit in
+one SQLite transaction; refusals return HTTP 403 without partial group changes.
+Agent creation's `group` option uses the same checks, and agent CLI mutations
+require an authenticated server rather than an offline database fallback.
+
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
-  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation.
+  - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
+  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary recall/compaction remains lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
   - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
-  - **Range reads & contiguous episode windows:** Read verbatim transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
+  - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
+  - **Bounded native transcript recall:** Native `memory_recall` returns at most 32,768 serialized UTF-8 bytes per call. Large range, filter and query results return `mode: "page"`, `format: "json_fragment"`, `content` and `next_cursor`. Repeat the original arguments with that cursor and concatenate `content` fragments to recover the result document; later transcript appends do not change its snapshot. Items already present verbatim in active context return raw pointers instead of replaying their contents. Once evicted, their original ranges remain recoverable. Native `read_file` reads of the current session's transcript, including filesystem aliases, use this same boundary; its line coordinates remain 1-based.
+  - **Budgeted native compaction:** Before dispatch, the native harness budgets the complete serialized request, output reserve and framing margin. It tests in-memory candidates that retain the latest completed tool batch, replace bulky results with original raw-range pointers, or evict completed context while preserving exact pending inbound. Only a candidate that fits commits a new window. If fixed instructions/tools and pending inbound alone cannot fit, preflight refuses without dispatch or a new compaction anchor; repeating the same attempt does not grow its context.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 
 ## Usage and cost
@@ -437,16 +493,17 @@ provider-route refreshes and unrelated metadata updates. SQLite is authoritative
 marker); only the scope setter owns these keys. Harness-environment replacement
 merges them from the current row in the same write transaction.
 
-Without an explicit policy, roots are `public`, `*-assistant` children are
-`isolated`, other children with a nonempty `role` are `siblings`, and task
-children without a role are `private`. Description, instructions and role
-updates that omit both `scope` and `public` preserve the explicit policy.
+New roots default to `public`; all new children default to `private`, regardless
+of name or role. The store upgrade materializes each existing agent's effective
+scope explicitly, including legacy name/role defaults and legacy public markers.
+Description, instructions and role updates that omit both `scope` and `public`
+preserve that explicit policy.
 
 The legacy `public` boolean describes cross-tree reachability, not sibling
 access. `true` selects `public`. `false` preserves an existing nonpublic scope;
 for a public agent it restores the default above. An explicit `scope` takes
-precedence when both fields are supplied. To restrict a standing child to
-`private`, send `scope: "private"` explicitly.
+precedence when both fields are supplied. To enable sibling collaboration, send
+`scope: "siblings"` explicitly.
 
 Agents may edit their own description and instructions. Changing scope or role
 requires an ancestor, a root admin or the operator; updating another agent's
@@ -470,3 +527,26 @@ ORDER BY id;
 ## Storage
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
+
+## Methodology-neutral roles and lifecycle
+
+`role` is an optional display label. It does not select a prompt, communication
+policy, discovery membership or process lifetime. Private `instructions` define
+an agent's responsibilities, reporting conventions and decision to archive.
+AnyAgents ships no company hierarchy, standing-agent policy or role templates.
+Role labels are not interpreted as template names; callers that manage templates
+supply their contents through `instructions`.
+
+Every agent, including a root or role-bearing child, may archive itself.
+Archive is reversible: an intentional direct message wakes the identity again;
+passive notifications do not. Archive preserves the browser profile and login
+state; only `delete` removes the agent's browser profile. Existing clean/pushed
+managed-worktree cleanup still applies, while dirty or unpushed work is retained.
+
+After a completed turn, any agent releases its process to `idle` when its mailbox
+is drained, its latest accepted turn is complete, it has no running children or
+in-flight background commands, and it has no active error. An idle agent wakes
+on new mail. Its ID, role, instructions, scope, session, mailbox cursor, pending
+deliveries and schedules remain intact. There is no role-based residency flag.
+Topology and child discovery follow relationships and explicit scope, never the
+presence of a role label. The default CLI depth limit applies equally to all roles.

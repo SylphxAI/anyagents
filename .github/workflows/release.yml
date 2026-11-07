@@ -1,20 +1,53 @@
 name: release
 
 on:
-  push:
+  workflow_run:
+    workflows: [ci]
     branches: [main]
+    types: [completed]
   workflow_dispatch:
+    inputs:
+      ci_run_id:
+        description: Successful push/main ci run for this exact current main SHA
+        required: true
+        type: string
 
 permissions:
   contents: read
 
+# Serialize publishers, including manual completion of a partial publication.
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
+  admit:
+    if: >-
+      github.event.repository.visibility == 'public' && github.ref == 'refs/heads/main' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      publish: ${{ steps.admit.outputs.publish }}
+      admission: ${{ steps.admit.outputs.admission }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+      - id: admit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/release_admission.py admit
+
   release:
-    if: github.event.repository.private == false && github.ref == 'refs/heads/main'
+    needs: admit
+    if: github.event.repository.visibility == 'public' && needs.admit.outputs.publish == 'true'
     uses: SylphxAI/mcp-kit/.github/workflows/release.yml@ef675524e619fe3dde5b88213e8598046f0aaff6
     permissions:
       contents: write
@@ -32,3 +65,23 @@ jobs:
       smoke: |
         npx -y "@sylphx/anyagents@$V" --version
         npx -y "@sylphx/anyagents@$V" --help
+
+  receipt:
+    needs: [admit, release]
+    if: >-
+      always() && github.event.repository.visibility == 'public' &&
+      github.ref == 'refs/heads/main' && needs.admit.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify publication or record no-op
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ADMISSION: ${{ needs.admit.outputs.admission }}
+          ADMISSION_RESULT: ${{ needs.admit.result }}
+          RELEASE_RESULT: ${{ needs.release.result }}
+        run: python3 scripts/release_admission.py receipt

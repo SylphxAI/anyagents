@@ -362,33 +362,6 @@ pub fn conversation(
             }
         }
     };
-    if let Ok(store) = open(data) {
-        let turns_res = if let Some(q) = clean_query {
-            store.search_conversation(Some(&target), with, since_ms, limit, q)
-        } else if target.eq_ignore_ascii_case("all") || target == "*" {
-            store.conversation_all(with, since_ms, limit)
-        } else {
-            store
-                .agent_by_name(&target)
-                .and_then(|found| store.conversation(&found.id, with, since_ms, limit))
-        };
-        if let Ok(turns) = turns_res {
-            let views = turns
-                .into_iter()
-                .map(|t| crate::api::ConversationTurnView {
-                    id: t.id,
-                    direction: t.direction,
-                    from: t.from,
-                    to: t.to,
-                    text: t.text,
-                    reply_to: t.reply_to,
-                    timestamp_ms: t.timestamp_ms,
-                })
-                .collect();
-            emit_turns(&target, clean_query, views);
-            return Ok(());
-        }
-    }
     if client::can_call_server(data) {
         let mut params = Vec::new();
         if let Some(w) = with.map(str::trim).filter(|s| !s.is_empty()) {
@@ -420,6 +393,13 @@ pub fn conversation(
             emit_turns(&target, clean_query, read.turns);
             return Ok(());
         }
+    }
+    // An agent never bypasses server authorization by opening SQLite, even
+    // when the socket is unavailable. Offline reads are an operator path only.
+    if client::agent_identity().is_some() {
+        return Err(Error::Message(
+            "agent conversation reads require the authenticated server".to_string(),
+        ));
     }
     let store = open(data)?;
     let turns = if let Some(q) = clean_query {
