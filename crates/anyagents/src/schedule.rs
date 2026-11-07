@@ -653,6 +653,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
     let Ok(schedules) = store.list_schedules(None, true) else {
         return 0;
     };
+    github::begin_cycle(&schedules, now);
     let mut fired_count = 0;
     for sched in schedules {
         if (sched.kind == "at" || sched.kind == "every")
@@ -1654,6 +1655,7 @@ mod tests {
         )
         .unwrap();
         let now = anyagents_core::now_ms();
+        github::begin_cycle(&store.list_schedules(None, true).unwrap(), now);
         let barrier = Arc::new(std::sync::Barrier::new(101));
         let handles: Vec<_> = (0..100)
             .map(|i| {

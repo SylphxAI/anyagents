@@ -2,7 +2,7 @@
 //! single-flight/serial request gate (not a database lock): GitHub recommends
 //! serial requests to avoid secondary limits. Cached pages retain summaries, not
 //! thousands of full Check Run objects.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -42,7 +42,7 @@ impl Checks {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 enum Summary {
     Pull { state: String, head: String },
     Checks(Checks),
@@ -51,6 +51,7 @@ enum Summary {
 #[derive(Clone)]
 struct Page {
     etag: Option<String>,
+    last_modified: Option<String>,
     next: bool,
     summary: Summary,
     used_at: i64,
@@ -58,6 +59,9 @@ struct Page {
 
 #[derive(Default)]
 struct Target {
+    watchers: HashSet<String>,
+    settled: bool,
+    changed: bool,
     next_at: i64,
     interval: i64,
     result: Option<Observation>,
@@ -73,6 +77,7 @@ struct Probes {
     targets: HashMap<String, Target>,
     limited_until: i64,
     limit_interval: i64,
+    auth_until: HashMap<String, i64>,
 }
 
 static PROBES: LazyLock<Mutex<Probes>> = LazyLock::new(|| Mutex::new(Probes::default()));
@@ -86,6 +91,7 @@ struct Response {
 #[derive(Debug)]
 enum Error {
     RateLimited(i64),
+    Auth,
     Transport,
     Http(u16),
     Payload,
@@ -95,6 +101,7 @@ impl Error {
     fn observation(&self) -> Observation {
         let reason = match self {
             Self::RateLimited(_) => "rate_limited".to_string(),
+            Self::Auth => "auth".to_string(),
             Self::Transport => "transport".to_string(),
             Self::Http(code) => format!("http:{code}"),
             Self::Payload => "payload".to_string(),
@@ -112,21 +119,79 @@ pub(super) fn probe(
     now: i64,
 ) -> Option<Observation> {
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
-    let key = format!(
+    let key = target_key(&base, owner, repo, reference, pr);
+    let mut probes = PROBES.lock().ok()?;
+    Some(probes.probe(
+        &key,
+        owner,
+        repo,
+        reference,
+        pr,
+        now,
+        |path, etag, modified| request(&base, path, etag, modified, agent_id, owner),
+    ))
+}
+
+fn target_key(base: &str, owner: &str, repo: &str, reference: &str, pr: bool) -> String {
+    format!(
         "{base}:{}:{}/{}:{reference}",
         if pr { "pr" } else { "check" },
         owner.to_ascii_lowercase(),
         repo.to_ascii_lowercase()
-    );
-    let mut probes = PROBES.lock().ok()?;
-    Some(
-        probes.probe(&key, owner, repo, reference, pr, now, |path, etag| {
-            request(&base, path, etag, agent_id)
-        }),
     )
 }
 
+pub(super) fn begin_cycle(schedules: &[anyagents_core::AgentSchedule], now: i64) {
+    let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
+    let mut watchers: HashMap<String, HashSet<String>> = HashMap::new();
+    for schedule in schedules.iter().filter(|s| s.kind == "watch") {
+        let Ok(target) = super::parse_watch_spec(&schedule.spec) else {
+            continue;
+        };
+        let (owner, repo, reference, pr) = match target {
+            super::WatchTarget::GitHubPr {
+                owner,
+                repo,
+                number,
+            } => (owner, repo, number.to_string(), true),
+            super::WatchTarget::GitHubCheck {
+                owner,
+                repo,
+                reference,
+            } => {
+                let clean = reference.strip_prefix('#').unwrap_or(&reference);
+                match clean.parse::<u64>() {
+                    Ok(number) => (owner, repo, number.to_string(), true),
+                    Err(_) => (owner, repo, clean.to_string(), false),
+                }
+            }
+            _ => continue,
+        };
+        watchers
+            .entry(target_key(&base, &owner, &repo, &reference, pr))
+            .or_default()
+            .insert(schedule.id.to_string());
+    }
+    if let Ok(mut probes) = PROBES.lock() {
+        probes.register(watchers, now);
+    }
+}
+
 impl Probes {
+    fn register(&mut self, watchers: HashMap<String, HashSet<String>>, now: i64) {
+        for (key, current) in watchers {
+            let target = self.targets.entry(key).or_default();
+            if !current.is_subset(&target.watchers) {
+                target.next_at = 0;
+                target.interval = MIN_INTERVAL;
+                target.settled = false;
+                target.successful = None;
+            }
+            target.watchers = current;
+            target.accessed_at = now;
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn probe(
         &mut self,
@@ -136,8 +201,12 @@ impl Probes {
         reference: &str,
         pr: bool,
         now: i64,
-        mut request: impl FnMut(&str, Option<&str>) -> Result<Response, Error>,
+        mut request: impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
     ) -> Observation {
+        let auth_owner = owner.to_ascii_lowercase();
+        if now < self.auth_until.get(&auth_owner).copied().unwrap_or(0) {
+            return Error::Auth.observation();
+        }
         if now < self.limited_until {
             return Error::RateLimited(self.limited_until).observation();
         }
@@ -145,6 +214,12 @@ impl Probes {
             .retain(|_, target| now.saturating_sub(target.accessed_at) < 3_600_000);
         let target = self.targets.entry(key.to_string()).or_default();
         target.accessed_at = now;
+        if target.settled {
+            if let Some(result) = &target.successful {
+                return result.clone();
+            }
+        }
+        target.changed = false;
         // A cooldown overrides the normal interval. Always re-read on recovery,
         // even when the last ordinary observation had a five-minute TTL.
         let recovering = self.limited_until != 0 && target.next_at <= self.limited_until;
@@ -155,14 +230,44 @@ impl Probes {
             return result.clone();
         }
         let root = format!("repos/{}/{}", encode(owner), encode(repo));
-        let result = read_target(target, &root, reference, pr, now, &mut request);
+        let mut pause_until = 0;
+        let floor = std::env::var("ANYAGENTS_GITHUB_RATE_LIMIT_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(1500);
+        let result = read_target(
+            target,
+            &root,
+            reference,
+            pr,
+            now,
+            &mut |path, etag, modified| {
+                if pause_until > now {
+                    return Err(Error::RateLimited(pause_until));
+                }
+                let response = request(path, etag, modified)?;
+                pause_until = reserve_pause(&response, floor, now);
+                Ok(response)
+            },
+        );
+        // Consume the response that crossed the floor, but admit no next page or
+        // target until reset. A terminal final page can still be delivered.
+        self.limited_until = self.limited_until.max(pause_until);
         match result {
             Ok(observation) => {
                 target.pages.retain(|_, page| page.used_at == now);
-                target.interval = if target.successful.as_ref() == Some(&observation) {
-                    (target.interval * 2).clamp(MIN_INTERVAL, MAX_INTERVAL)
+                target.interval =
+                    if !target.changed && target.successful.as_ref() == Some(&observation) {
+                        (target.interval * 2).clamp(MIN_INTERVAL, MAX_INTERVAL)
+                    } else {
+                        MIN_INTERVAL
+                    };
+                target.settled = if pr {
+                    matches!(observation.1.as_str(), "merged" | "closed")
                 } else {
-                    MIN_INTERVAL
+                    observation.0
+                        && reference.len() == 40
+                        && reference.bytes().all(|b| b.is_ascii_hexdigit())
                 };
                 target.successful = Some(observation.clone());
                 target.result = Some(observation.clone());
@@ -180,6 +285,10 @@ impl Probes {
                         target.next_at = self.limited_until;
                     }
                 } else {
+                    if matches!(error, Error::Auth) {
+                        self.auth_until
+                            .insert(auth_owner, now.saturating_add(MIN_INTERVAL));
+                    }
                     target.next_at = now.saturating_add(MIN_INTERVAL);
                     target.result = Some(error.observation());
                 }
@@ -195,7 +304,7 @@ fn read_target(
     reference: &str,
     pr: bool,
     now: i64,
-    request: &mut impl FnMut(&str, Option<&str>) -> Result<Response, Error>,
+    request: &mut impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
 ) -> Result<Observation, Error> {
     let head = if pr {
         let path = format!("{root}/pulls/{reference}");
@@ -242,7 +351,7 @@ fn read_checks(
     target: &mut Target,
     endpoint: &str,
     now: i64,
-    request: &mut impl FnMut(&str, Option<&str>) -> Result<Response, Error>,
+    request: &mut impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
 ) -> Result<Checks, Error> {
     let mut checks = Checks::default();
     for n in 1..=MAX_PAGES {
@@ -263,10 +372,17 @@ fn read_page(
     target: &mut Target,
     path: &str,
     now: i64,
-    request: &mut impl FnMut(&str, Option<&str>) -> Result<Response, Error>,
+    request: &mut impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
 ) -> Result<Page, Error> {
     let cached = target.pages.get(path);
-    let response = request(path, cached.and_then(|page| page.etag.as_deref()))?;
+    let response = request(
+        path,
+        cached.and_then(|page| page.etag.as_deref()),
+        cached.and_then(|page| page.last_modified.as_deref()),
+    )?;
+    if response.status == 401 {
+        return Err(Error::Auth);
+    }
     if response.status == 304 {
         let mut page = cached.cloned().ok_or(Error::Payload)?;
         page.used_at = now;
@@ -285,25 +401,24 @@ fn read_page(
                 .get("x-ratelimit-remaining")
                 .is_some_and(|v| v == "0")
         {
+            let primary_reset = if response
+                .headers
+                .get("x-ratelimit-remaining")
+                .is_some_and(|v| v == "0")
+            {
+                response
+                    .headers
+                    .get("x-ratelimit-reset")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .map(|s| s.saturating_mul(1_000))
+            } else {
+                None
+            };
             let until = retry
                 .and_then(|v| retry_after(v, now))
-                .or_else(|| {
-                    // Secondary limits have an independent primary reset
-                    // header, often an hour away. Use it only for primary
-                    // exhaustion, never as the secondary cooldown.
-                    if response
-                        .headers
-                        .get("x-ratelimit-remaining")
-                        .is_none_or(|v| v != "0")
-                    {
-                        return None;
-                    }
-                    response
-                        .headers
-                        .get("x-ratelimit-reset")
-                        .and_then(|v| v.parse::<i64>().ok())
-                        .map(|s| s.saturating_mul(1_000))
-                })
+                .into_iter()
+                .chain(primary_reset)
+                .max()
                 .unwrap_or_else(|| now.saturating_add(MIN_INTERVAL));
             return Err(Error::RateLimited(until));
         }
@@ -363,6 +478,7 @@ fn read_page(
     };
     let page = Page {
         etag: response.headers.get("etag").cloned(),
+        last_modified: response.headers.get("last-modified").cloned(),
         next: response
             .headers
             .get("link")
@@ -370,6 +486,7 @@ fn read_page(
         summary,
         used_at: now,
     };
+    target.changed |= cached.is_none_or(|old| old.etag != page.etag || old.summary != page.summary);
     target.pages.insert(path.to_string(), page.clone());
     Ok(page)
 }
@@ -408,51 +525,176 @@ fn encode(value: &str) -> String {
         .collect()
 }
 
-fn request(base: &str, path: &str, etag: Option<&str>, agent_id: &str) -> Result<Response, Error> {
-    if !base.is_empty() {
-        let agent = ureq::Agent::config_builder()
-            .timeout_global(Some(Duration::from_secs(10)))
-            .max_redirects(0)
-            .http_status_as_error(false)
-            .build()
-            .new_agent();
-        let mut req = agent
-            .get(format!("{}/{path}", base.trim_end_matches('/')))
-            .header("accept", "application/vnd.github+json");
-        if let Some(etag) = etag {
-            req = req.header("if-none-match", etag);
-        }
-        let mut response = req.call().map_err(|_| Error::Transport)?;
-        let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(k, v)| {
-                Some((
-                    k.as_str().to_ascii_lowercase(),
-                    v.to_str().ok()?.to_string(),
-                ))
-            })
-            .collect();
-        let body = response
-            .body_mut()
-            .read_to_string()
-            .map_err(|_| Error::Transport)?;
-        return Ok(Response {
-            status,
-            headers,
-            body,
-        });
+fn reserve_pause(response: &Response, floor: u64, now: i64) -> i64 {
+    if response
+        .headers
+        .get("x-ratelimit-remaining")
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|remaining| remaining < floor)
+    {
+        return response
+            .headers
+            .get("x-ratelimit-reset")
+            .and_then(|v| v.parse::<i64>().ok())
+            .map(|s| s.saturating_mul(1000))
+            .filter(|reset| *reset > now)
+            .unwrap_or_else(|| now.saturating_add(MIN_INTERVAL));
     }
-    // Keep authentication in gh's authorized credential adapter; never read a
-    // token into arguments, retained output, or the watch cache. No GraphQL.
-    gh_command(path, etag, agent_id)
+    0
+}
+
+fn token_for_owner(dir: &std::path::Path, owner: &str) -> Result<String, Error> {
+    let expected = format!("{owner}.token");
+    let mut found = None;
+    for entry in std::fs::read_dir(dir).map_err(|_| Error::Auth)? {
+        let entry = entry.map_err(|_| Error::Auth)?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.eq_ignore_ascii_case(&expected))
+        {
+            if found.is_some() {
+                return Err(Error::Auth);
+            }
+            found = Some(entry.path());
+        }
+    }
+    token_from_file(&found.ok_or(Error::Auth)?)
+}
+
+fn token_from_file(path: &std::path::Path) -> Result<String, Error> {
+    use std::io::Read;
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(|_| Error::Auth)?;
+    let metadata = file.metadata().map_err(|_| Error::Auth)?;
+    if !metadata.is_file() {
+        return Err(Error::Auth);
+    }
+    #[cfg(unix)]
+    if metadata.mode() & 0o7777 != 0o600 || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(Error::Auth);
+    }
+    let mut raw = String::new();
+    file.take(16_385)
+        .read_to_string(&mut raw)
+        .map_err(|_| Error::Auth)?;
+    let token = raw.trim();
+    if raw.len() > 16_384
+        || token.is_empty()
+        || token
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(Error::Auth);
+    }
+    Ok(token.to_string())
+}
+
+static HTTP: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(10)))
+        .max_redirects(0)
+        .http_status_as_error(false)
+        .build()
+        .new_agent()
+});
+
+fn request(
+    base: &str,
+    path: &str,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    agent_id: &str,
+    owner: &str,
+) -> Result<Response, Error> {
+    // Presence, not readability, selects dedicated mode. Rotation is an atomic
+    // file replacement; re-read for every wire request and never fall back.
+    let token = std::env::var_os("ANYAGENTS_GITHUB_TOKEN_DIR")
+        .map(|path| token_for_owner(std::path::Path::new(&path), owner))
+        .transpose()?;
+    if !base.is_empty() || token.is_some() {
+        let base = if base.is_empty() {
+            "https://api.github.com"
+        } else {
+            base
+        };
+        let response = http_request(base, path, etag, modified, token.as_deref())?;
+        record_response(path, &response);
+        return Ok(response);
+    }
+    gh_command(path, etag, modified, agent_id)
         .output()
         .map_err(|_| Error::Transport)
         .and_then(|output| parse_response(&output.stdout))
+        .inspect(|response| record_response(path, response))
 }
 
-fn gh_command(path: &str, etag: Option<&str>, agent_id: &str) -> std::process::Command {
+fn record_response(path: &str, response: &Response) {
+    let kind = if path.contains("/pulls/") {
+        "pull"
+    } else if path.contains("/check-runs") {
+        "check_runs"
+    } else {
+        "commit_status"
+    };
+    // Status/type only: no body, credential, validator or response headers.
+    eprintln!("github_watch_probe kind={kind} status={}", response.status);
+}
+
+fn http_request(
+    base: &str,
+    path: &str,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    token: Option<&str>,
+) -> Result<Response, Error> {
+    let mut req = HTTP
+        .get(format!("{}/{path}", base.trim_end_matches('/')))
+        .header("accept", "application/vnd.github+json")
+        .header("user-agent", "anyagents-github-watch")
+        .header("x-github-api-version", "2022-11-28");
+    if let Some(token) = token {
+        req = req.header("authorization", &format!("Bearer {token}"));
+    }
+    if let Some(etag) = etag {
+        req = req.header("if-none-match", etag);
+    } else if let Some(modified) = modified {
+        req = req.header("if-modified-since", modified);
+    }
+    let mut response = req.call().map_err(|_| Error::Transport)?;
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(k, v)| {
+            Some((
+                k.as_str().to_ascii_lowercase(),
+                v.to_str().ok()?.to_string(),
+            ))
+        })
+        .collect();
+    let body = response
+        .body_mut()
+        .read_to_string()
+        .map_err(|_| Error::Transport)?;
+    Ok(Response {
+        status,
+        headers,
+        body,
+    })
+}
+
+fn gh_command(
+    path: &str,
+    etag: Option<&str>,
+    modified: Option<&str>,
+    agent_id: &str,
+) -> std::process::Command {
     let mut command = std::process::Command::new("timeout");
     command.env("ANYAGENTS_AGENT_ID", agent_id).args([
         "15s",
@@ -465,17 +707,13 @@ fn gh_command(path: &str, etag: Option<&str>, agent_id: &str) -> std::process::C
         "Accept: application/vnd.github+json",
         "-H",
         "X-GitHub-Api-Version: 2022-11-28",
-        // Own revalidation at this boundary, including cold starts. An outer
-        // gh cache may otherwise restore a body under 304 headers without our
-        // pagination metadata. Custom headers keep gh adapters in passthrough.
-        "-H",
-        "Cache-Control: no-cache",
     ]);
     if let Some(etag) = etag {
         command.args(["-H", &format!("If-None-Match: {etag}")]);
+    } else if let Some(modified) = modified {
+        command.args(["-H", &format!("If-Modified-Since: {modified}")]);
     }
     command.arg(path);
-    // gh exits nonzero for 403/429; stdout still carries HTTP headers + body.
     command
 }
 
@@ -544,7 +782,7 @@ mod tests {
             (720_000, 300_000),
         ];
         for (now, interval) in expected {
-            let result = probes.probe("target", "o", "r", "sha", false, now, |path, etag| {
+            let result = probes.probe("target", "o", "r", "sha", false, now, |path, etag, _| {
                 assert_eq!(path, "repos/o/r/commits/sha/check-runs?per_page=100&page=1");
                 calls += 1;
                 if now == 0 {
@@ -566,7 +804,7 @@ mod tests {
                         "sha",
                         false,
                         now + offset,
-                        |_, _| panic!("duplicate request")
+                        |_, _, _| panic!("duplicate request")
                     ),
                     result
                 );
@@ -574,7 +812,7 @@ mod tests {
         }
         assert_eq!(calls, 5);
         assert_eq!(
-            probes.probe("target", "o", "r", "sha", false, 1_020_000, |_, etag| {
+            probes.probe("target", "o", "r", "sha", false, 1_020_000, |_, etag, _| {
                 assert_eq!(etag, Some("\"pending\""));
                 Ok(response(200, completed(), &[("etag", "\"done\"")]))
             }),
@@ -597,7 +835,7 @@ mod tests {
             let changed = now == 0 || now == 720_000;
             let mut calls = 0;
             assert_eq!(
-                probes.probe("pr", "o", "r", "42", true, now, |path, etag| {
+                probes.probe("pr", "o", "r", "42", true, now, |path, etag, _| {
                     calls += 1;
                     if path.contains("/pulls/") {
                         return Ok(response(200, pull("open", false, head), &[("etag", head)]));
@@ -635,7 +873,7 @@ mod tests {
         let template = completed()["check_runs"][0].clone();
         for (now, done) in [(0, false), (60_000, false), (180_000, true)] {
             let mut pages = 0;
-            let result = probes.probe("pr", "o", "r", "42", true, now, |path, etag| {
+            let result = probes.probe("pr", "o", "r", "42", true, now, |path, etag, _| {
                 pages += 1;
                 if path.ends_with("/pulls/42") {
                     return Ok(if now == 0 {
@@ -700,7 +938,7 @@ mod tests {
     #[test]
     fn rate_limit_is_global_and_recovery_rereads_without_losing_the_baseline() {
         let mut probes = Probes::default();
-        let first = probes.probe("pr", "o", "r", "42", true, 0, |path, _| {
+        let first = probes.probe("pr", "o", "r", "42", true, 0, |path, _, _| {
             Ok(response(
                 200,
                 if path.contains("/pulls/") {
@@ -716,7 +954,7 @@ mod tests {
         assert_eq!(first.1, "checks_in_progress");
         assert_eq!(
             probes
-                .probe("other", "o", "r", "sha", false, 1_000, |_, _| {
+                .probe("other", "o", "r", "sha", false, 1_000, |_, _, _| {
                     Ok(response(
                         403,
                         json!({"message":"You have exceeded a secondary rate limit."}),
@@ -731,7 +969,7 @@ mod tests {
             for key in ["pr", "other", "new-target"] {
                 assert_eq!(
                     probes
-                        .probe(key, "o", "r", "42", true, now, |_, _| panic!(
+                        .probe(key, "o", "r", "42", true, now, |_, _, _| panic!(
                             "global cooldown bypassed"
                         ))
                         .1,
@@ -744,7 +982,7 @@ mod tests {
             "checks_in_progress"
         );
         assert_eq!(
-            probes.probe("pr", "o", "r", "42", true, 181_000, |path, etag| {
+            probes.probe("pr", "o", "r", "42", true, 181_000, |path, etag, _| {
                 assert!(path.ends_with("/pulls/42"));
                 assert_eq!(etag, Some("before"));
                 Ok(response(
@@ -766,7 +1004,7 @@ mod tests {
         for delay in [60_000, 120_000, 240_000, 300_000, 300_000] {
             assert_eq!(
                 probes
-                    .probe("a", "o", "r", "sha", false, now, |_, _| {
+                    .probe("a", "o", "r", "sha", false, now, |_, _, _| {
                         Ok(response(
                             429,
                             json!({"message":"secondary rate limit"}),
@@ -782,7 +1020,7 @@ mod tests {
         let mut probes = Probes::default();
         assert_eq!(
             probes
-                .probe("a", "o", "r", "sha", false, 0, |_, _| {
+                .probe("a", "o", "r", "sha", false, 0, |_, _, _| {
                     Ok(response(
                         403,
                         json!({"message":"Resource not accessible by integration"}),
@@ -795,7 +1033,7 @@ mod tests {
         assert_eq!(probes.limited_until, 0);
         assert_eq!(
             probes
-                .probe("b", "o", "r", "sha", false, 0, |_, _| Ok(response(
+                .probe("b", "o", "r", "sha", false, 0, |_, _, _| Ok(response(
                     200,
                     completed(),
                     &[]
@@ -833,7 +1071,7 @@ mod tests {
             let mut probes = Probes::default();
             assert_eq!(
                 probes
-                    .probe("pr", "o", "r", "42", true, 0, |path, _| Ok(response(
+                    .probe("pr", "o", "r", "42", true, 0, |path, _, _| Ok(response(
                         200,
                         if path.contains("/pulls/") {
                             pull("open", false, "head")
@@ -852,7 +1090,7 @@ mod tests {
             let mut probes = Probes::default();
             let mut calls = 0;
             assert_eq!(
-                probes.probe("pr", "o", "r", "42", true, 0, |path, _| {
+                probes.probe("pr", "o", "r", "42", true, 0, |path, _, _| {
                     calls += 1;
                     assert!(path.contains("/pulls/"));
                     Ok(response(200, pull(state, merged, "head"), &[]))
@@ -868,7 +1106,7 @@ mod tests {
         let mut probes = Probes::default();
         assert_eq!(
             probes
-                .probe("a", "o", "r", "sha", false, 0, |_, _| Ok(response(
+                .probe("a", "o", "r", "sha", false, 0, |_, _, _| Ok(response(
                     304,
                     Value::Null,
                     &[]
@@ -878,7 +1116,7 @@ mod tests {
         );
         assert_eq!(
             probes
-                .probe("b", "o", "r", "sha", false, 0, |path, _| {
+                .probe("b", "o", "r", "sha", false, 0, |path, _, _| {
                     Ok(if path.ends_with("page=1") {
                         response(200, completed(), &[("link", "<x>; rel=\"next\"")])
                     } else {
@@ -896,7 +1134,7 @@ mod tests {
         for (now, until) in [(0, 60_000), (60_000, 180_000)] {
             assert_eq!(
                 probes
-                    .probe("a", "o", "r", "sha", false, now, |_, _| {
+                    .probe("a", "o", "r", "sha", false, now, |_, _, _| {
                         Ok(response(
                             403,
                             json!({"message":"You have exceeded a secondary rate limit."}),
@@ -914,7 +1152,7 @@ mod tests {
         let mut probes = Probes::default();
         assert_eq!(
             probes
-                .probe("a", "o", "r", "sha", false, 0, |_, _| {
+                .probe("a", "o", "r", "sha", false, 0, |_, _, _| {
                     Ok(response(
                         403,
                         json!({"message":"API rate limit exceeded"}),
@@ -931,6 +1169,261 @@ mod tests {
     }
 
     #[test]
+    fn fifty_watches_share_three_requests_per_cycle_and_new_watch_resets_once() {
+        let mut probes = Probes::default();
+        let population = |extra: bool| {
+            let mut watchers: HashMap<String, HashSet<String>> = HashMap::new();
+            for i in 0..50 {
+                watchers
+                    .entry(format!("target{}", i % 3))
+                    .or_default()
+                    .insert(format!("watch{i}"));
+            }
+            if extra {
+                watchers
+                    .get_mut("target0")
+                    .unwrap()
+                    .insert("new".to_string());
+            }
+            watchers
+        };
+        for now in [0, 60_000, 180_000] {
+            probes.register(population(false), now);
+            let mut count = 0;
+            for i in 0..50 {
+                let result = probes.probe(
+                    &format!("target{}", i % 3),
+                    "o",
+                    "r",
+                    "sha",
+                    false,
+                    now,
+                    |_, etag, _| {
+                        count += 1;
+                        Ok(if etag.is_some() {
+                            response(304, Value::Null, &[])
+                        } else {
+                            response(200, pending(), &[("etag", "pending")])
+                        })
+                    },
+                );
+                assert_eq!(result.1, "checks_in_progress");
+            }
+            assert_eq!(count, 3);
+        }
+        probes.register(population(true), 180_001);
+        assert_eq!(probes.targets["target0"].next_at, 0);
+        assert_eq!(probes.targets["target1"].next_at, 420_000);
+        let mut count = 0;
+        for i in 0..51 {
+            probes.probe(
+                &format!("target{}", i % 3),
+                "o",
+                "r",
+                "sha",
+                false,
+                180_001,
+                |_, _, _| {
+                    count += 1;
+                    Ok(response(304, Value::Null, &[]))
+                },
+            );
+        }
+        assert_eq!(count, 1);
+        assert_eq!(probes.targets["target0"].interval, MIN_INTERVAL);
+        probes.register(population(true), 180_002);
+        assert!(probes.targets["target0"].next_at > 180_002);
+    }
+
+    #[test]
+    fn terminal_pr_and_pinned_sha_stop_requests_while_delivery_is_deferred() {
+        for (pr, reference) in [
+            (true, "42"),
+            (false, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ] {
+            let mut probes = Probes::default();
+            let expected = probes.probe("target", "o", "r", reference, pr, 0, |_, _, _| {
+                Ok(response(
+                    200,
+                    if pr {
+                        pull("closed", true, "head")
+                    } else {
+                        completed()
+                    },
+                    &[],
+                ))
+            });
+            for now in [60_000, 600_000, 3_500_000] {
+                assert_eq!(
+                    probes.probe("target", "o", "r", reference, pr, now, |_, _, _| panic!(
+                        "settled target polled"
+                    )),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primary_reserve_stops_all_targets_until_reset_including_after_304() {
+        for status in [200, 304] {
+            let mut probes = Probes::default();
+            probes.probe("a", "o", "r", "sha", false, 0, |_, _, _| {
+                Ok(response(200, pending(), &[("etag", "a")]))
+            });
+            probes.probe("a", "o", "r", "sha", false, 60_000, |_, _, _| {
+                Ok(response(
+                    status,
+                    pending(),
+                    &[
+                        ("x-ratelimit-remaining", "1499"),
+                        ("x-ratelimit-reset", "3600"),
+                    ],
+                ))
+            });
+            assert_eq!(probes.limited_until, 3_600_000);
+            for key in ["a", "b"] {
+                assert_eq!(
+                    probes
+                        .probe(key, "o", "r", "sha", false, 3_599_999, |_, _, _| panic!(
+                            "reserve bypassed"
+                        ))
+                        .1,
+                    "probe_error:rate_limited"
+                );
+            }
+            assert_eq!(
+                probes
+                    .probe("a", "o", "r", "sha", false, 3_600_000, |_, _, _| Ok(
+                        response(200, completed(), &[])
+                    ))
+                    .1,
+                "checks_completed"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_failure_pauses_owner_and_recovers_without_losing_validators() {
+        let mut probes = Probes::default();
+        probes.probe("a", "o", "r", "sha", false, 0, |_, _, _| {
+            Ok(response(
+                200,
+                pending(),
+                &[("etag", "a"), ("last-modified", "date")],
+            ))
+        });
+        assert_eq!(
+            probes
+                .probe("a", "o", "r", "sha", false, 60_000, |_, etag, modified| {
+                    assert_eq!(etag, Some("a"));
+                    assert_eq!(modified, Some("date"));
+                    Ok(response(401, Value::Null, &[]))
+                })
+                .1,
+            "probe_error:auth"
+        );
+        assert_eq!(
+            probes
+                .probe("b", "o", "r", "sha", false, 119_999, |_, _, _| panic!(
+                    "auth cooldown bypassed"
+                ))
+                .1,
+            "probe_error:auth"
+        );
+        assert_eq!(
+            probes
+                .probe("a", "o", "r", "sha", false, 120_000, |_, etag, modified| {
+                    assert_eq!(etag, Some("a"));
+                    assert_eq!(modified, Some("date"));
+                    Ok(response(200, completed(), &[]))
+                })
+                .1,
+            "checks_completed"
+        );
+    }
+
+    #[test]
+    fn owner_tokens_are_case_insensitive_private_and_auth_holds_are_isolated() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        for (owner, token) in [
+            ("SylphxAI", "fixture-sylphx"),
+            ("Cubeage", "fixture-cubeage"),
+        ] {
+            let path = dir.path().join(format!("{owner}.token"));
+            std::fs::write(&path, token).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(
+                token_for_owner(dir.path(), &owner.to_ascii_lowercase()).unwrap(),
+                token
+            );
+        }
+        assert!(matches!(
+            token_for_owner(dir.path(), "missing"),
+            Err(Error::Auth)
+        ));
+        let path = dir.path().join("Cubeage.token");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            token_for_owner(dir.path(), "Cubeage"),
+            Err(Error::Auth)
+        ));
+        assert!(token_for_owner(dir.path(), "SylphxAI").is_ok());
+        let mut probes = Probes::default();
+        assert_eq!(
+            probes
+                .probe("bad", "Cubeage", "r", "sha", false, 0, |_, _, _| Err(
+                    Error::Auth
+                ))
+                .1,
+            "probe_error:auth"
+        );
+        assert_eq!(
+            probes
+                .probe(
+                    "same-owner",
+                    "cubeage",
+                    "r",
+                    "sha",
+                    false,
+                    1,
+                    |_, _, _| panic!("auth hold bypassed")
+                )
+                .1,
+            "probe_error:auth"
+        );
+        assert_eq!(
+            probes
+                .probe("good", "SylphxAI", "r", "sha", false, 1, |_, _, _| Ok(
+                    response(200, pending(), &[])
+                ))
+                .1,
+            "checks_in_progress"
+        );
+    }
+
+    #[test]
+    fn token_file_is_reread_and_missing_or_empty_never_becomes_anonymous() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        assert!(matches!(token_from_file(&path), Err(Error::Auth)));
+        for token in ["fixture-first", "fixture-rotated"] {
+            std::fs::write(&path, format!("{token}\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            assert_eq!(token_from_file(&path).unwrap(), token);
+        }
+        for token in ["", " \n", "bad\nheader", "bad token"] {
+            std::fs::write(&path, token).unwrap();
+            assert!(matches!(token_from_file(&path), Err(Error::Auth)));
+        }
+    }
+
+    #[test]
     fn retry_after_accepts_delta_seconds_and_http_date() {
         assert_eq!(retry_after("120", 1_000), Some(121_000));
         assert_eq!(
@@ -943,12 +1436,9 @@ mod tests {
     #[test]
     fn gh_adapter_owns_cold_and_warm_conditional_requests() {
         for etag in [None, Some("W/\"v1\"")] {
-            let command = gh_command("repos/o/r/pulls/42", etag, "agent");
+            let command = gh_command("repos/o/r/pulls/42", etag, None, "agent");
             let args: Vec<_> = command.get_args().map(|v| v.to_str().unwrap()).collect();
-            assert!(
-                args.windows(2)
-                    .any(|pair| pair == ["-H", "Cache-Control: no-cache"])
-            );
+            assert!(!args.iter().any(|arg| arg.starts_with("Cache-Control:")));
             assert!(args.windows(2).any(|pair| pair == ["--method", "GET"]));
             assert!(args.contains(&"--include"));
             assert_eq!(
