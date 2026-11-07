@@ -1,136 +1,85 @@
 name: ci
+run-name: Chromium startup factorial (native and 1 CPU, 8 workers)
 
-# Continuous integration for a public repository: format, clippy and the
-# workspace tests on Linux and macOS.
-#
-# GitHub-hosted standard runners are free only on a public repository, so a
-# private one must never reach them: every job here carries
-# `github.event.repository.private == false`, and a private repository runs no
-# hosted minute. The same rule keeps a self-hosted runner, which a public
-# repository could reach with a fork pull request's code, out of this workflow:
-# `runs-on` names GitHub-hosted labels only.
-#
-# `ci-ok` is the one required check. It runs no repository code - it reads the
-# other jobs' results and writes a summary - so it stays on the reserved gate
-# pool and a superseded run cannot hold its concurrency group.
-
+# Disposable diagnostic branch only. This replaces a registered manual workflow,
+# runs no product tests, publishes no release and never retries the failed group.
 on:
-  pull_request:
-    branches: [main]
-    types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# A newer push replaces its pull request's run; a merge-group or trunk run is
-# never cancelled.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: '0'
+  group: chromium-startup-factorial-${{ github.run_id }}
+  cancel-in-progress: false
 
 jobs:
-  # Whether the change reaches more than documentation, so a docs-only pull
-  # request skips the compile and lint jobs. Everything except Markdown under
-  # docs/, the root notices and the issue templates counts as code; a run with
-  # no diff (main, manual) reports everything changed.
-  changes:
-    if: github.event.repository.private == false
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      code: ${{ steps.scope.outputs.code }}
+  startup-factorial:
+    if: github.event.repository.visibility == 'public' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          fetch-depth: 0
-      - id: scope
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          persist-credentials: false
+      - name: Identify exact image and source
         run: |
           set -euo pipefail
-          case "$EVENT" in
-            pull_request | merge_group) ;;
-            *) echo "code=true" >> "$GITHUB_OUTPUT"; exit 0 ;;
-          esac
-          if git diff --name-only --no-renames "$BASE" HEAD > "$RUNNER_TEMP/scope.txt"; then
-            docs='^(docs/.+\.md|[^/]+\.md|LICENSE[^/]*|\.github/ISSUE_TEMPLATE/.+)$'
-            if grep -qvE "$docs" "$RUNNER_TEMP/scope.txt"; then
-              echo "code=true" >> "$GITHUB_OUTPUT"
-            else
-              echo "code=false" >> "$GITHUB_OUTPUT"
-            fi
-            echo "$(wc -l < "$RUNNER_TEMP/scope.txt") changed paths" >&2
-          else
-            # A diff that cannot be computed runs everything rather than skipping.
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          fi
-
-  # The Linux lane: format, clippy and the whole workspace test suite.
-  test:
-    needs: changes
-    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+          printf 'ImageOS=%s ImageVersion=%s\n' "$ImageOS" "$ImageVersion"
+          test "$ImageVersion" = '20261101.360.1'
+          git rev-parse HEAD
+          sha256sum scripts/startup_factorial.py
+          python3 -m py_compile scripts/startup_factorial.py
+      - name: Native VM affinity, 80 observations
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 600s python3 scripts/startup_factorial.py \
+            --out "$RUNNER_TEMP/startup-native" --workers 8 --pairs-per-arm 10 \
+            --cpu-count 0 --deadline 30 --mode headless
+      - name: Contended 1 CPU, 80 observations
+        run: |
+          set -euo pipefail
+          timeout --signal=TERM --kill-after=10s 600s python3 scripts/startup_factorial.py \
+            --out "$RUNNER_TEMP/startup-cpu1" --workers 8 --pairs-per-arm 10 \
+            --cpu-count 1 --deadline 30 --mode headless
+      - name: Report measured outcomes, independent of job success
+        if: always()
+        shell: python
+        run: |
+          import json, os, pathlib
+          root = pathlib.Path(os.environ['RUNNER_TEMP'])
+          for phase in ['startup-native', 'startup-cpu1']:
+              path = root / phase / 'summary.json'
+              if not path.exists():
+                  print(f'{phase}: no complete summary; inspect retained partial records')
+                  continue
+              result = json.loads(path.read_text())
+              assert result['observations'] == 80, result['observations']
+              assert result['owned_active_children'] == [], result['owned_active_children']
+              print(json.dumps({'phase': phase, 'observations': 80, 'arms': {
+                  arm: {k: v for k, v in data.items() if k != 'phase'}
+                  for arm, data in result['arms'].items()}}, indent=2))
+      - name: Preserve diagnostics without browser profiles
+        if: always()
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          python3 - <<'PY'
+          import pathlib, tarfile
+          with tarfile.open('startup-evidence.tgz', 'w:gz') as archive:
+              for name in ['startup-native', 'startup-cpu1']:
+                  root = pathlib.Path(name)
+                  if not root.exists():
+                      continue
+                  for path in root.rglob('*'):
+                      if path.is_file() and 'user-data' not in path.parts and path.suffix in ['.json', '.jsonl', '.log', '.conf']:
+                          archive.add(path, recursive=False)
+          PY
+          ls -lh startup-evidence.tgz
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
         with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Release admission policy
-        run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
-      - name: Browser fixture tests
-        run: npm test
-      - name: Test
-        run: cargo test --workspace --locked
-
-  # The macOS lane: the same gate on a second platform. macOS is a supported
-  # host for a long-lived agent, so its build is checked before merge.
-  macos:
-    needs: changes
-    if: github.event.repository.private == false && needs.changes.outputs.code == 'true'
-    runs-on: macos-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
-        with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - name: Format
-        run: cargo fmt --all -- --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Browser fixture cleanup
-        run: node --test tests/browser-process-group.test.mjs
-      - name: Test
-        run: cargo test --workspace --locked
-
-  # The required check name. Skipped lanes pass; a failed or cancelled lane
-  # fails. It reads results only and runs no repository code.
-  ci-ok:
-    if: always() && !cancelled() && github.event.repository.private == false
-    needs: [changes, test, macos]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: SylphxAI/.github/.github/actions/needs-pass@b33f1acf5ac75cd568268d46ae00b0132e1ad67a # main
-        with:
-          needs: ${{ toJSON(needs) }}
+          name: chromium-startup-factorial-${{ github.run_id }}
+          path: ${{ runner.temp }}/startup-evidence.tgz
+          retention-days: 1
+          if-no-files-found: error
