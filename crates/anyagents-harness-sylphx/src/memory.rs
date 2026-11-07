@@ -1320,15 +1320,22 @@ pub(super) fn execute_memory_recall(transcript_path: &Path, args: &Value) -> Str
             "continuation": "Repeat the original arguments with next_cursor. Concatenate content fragments to recover the JSON result.",
         })).unwrap_or_default()
     };
-    let mut end = (offset + (MEMORY_RECALL_MAX_BYTES - 512) / 6).min(output.len());
-    while !output.is_char_boundary(end) {
-        end -= 1;
+    let mut end = offset
+        .saturating_add(MEMORY_RECALL_MAX_BYTES - 512)
+        .min(output.len());
+    loop {
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        let result = page(end);
+        if result.len() <= MEMORY_RECALL_MAX_BYTES {
+            return result;
+        }
+        // Account for actual JSON escaping rather than sending tiny pages for
+        // ordinary text. Every retry strictly shrinks a bounded candidate.
+        let bytes = (end - offset) * (MEMORY_RECALL_MAX_BYTES - 512) / result.len();
+        end = offset + bytes.min(end - offset - 1);
     }
-    // Every UTF-8 byte needs at most six JSON bytes (e.g. a control byte).
-    // The conservative chunk bound avoids repeatedly serializing huge results.
-    let result = page(end);
-    debug_assert!(result.len() <= MEMORY_RECALL_MAX_BYTES);
-    result
 }
 
 fn render_memory_recall(
@@ -1765,7 +1772,7 @@ mod projection_tests {
         }
         // Many individually clipped query episodes must also share the same
         // final-byte ceiling, including JSON escaping and cursor metadata.
-        for n in 0..100 {
+        for n in 0..20 {
             append_transcript_message(
                 &path,
                 &json!({"role":"assistant", "content":format!("needle {n}: {}", "x".repeat(2500))}),

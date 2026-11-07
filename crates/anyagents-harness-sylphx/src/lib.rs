@@ -5303,7 +5303,12 @@ mod tests {
             context_preflight_build,
         )
         .unwrap();
-        assert_eq!(&restarted[1..], &[failed, next]);
+        // The newly enlarged fixture also retains its completed tool pair
+        // when it fits. Only the failed/new inbound remains pending; completed
+        // context may remain visible without being revived as pending work.
+        assert!(&restarted[restarted.len() - 2..] == &[failed, next]);
+        assert!(load_pending_native_messages(&transcript, &restarted) == pending);
+        validate_responses_input(&restarted).unwrap();
     }
 
     #[test]
