@@ -7242,7 +7242,6 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail() {
-        use std::os::unix::fs::PermissionsExt;
         if single_test_worker(
             "archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail",
         ) {
@@ -7281,42 +7280,58 @@ pub(crate) mod tests {
         let release = dir.path().join("git-release");
         let bin = dir.path().join("bin");
         std::fs::create_dir(&bin).unwrap();
+        // Delegate to the same Git that prepared the fixture (Homebrew on
+        // macOS), preserving all arguments and stdin for validation probes.
+        let real_git = std::process::Command::new("/bin/sh")
+            .args(["-c", "command -v git"])
+            .output()
+            .unwrap();
+        assert!(real_git.status.success());
+        let real_git = String::from_utf8(real_git.stdout).unwrap();
+        let real_git = real_git.trim();
+        assert!(Path::new(real_git).is_absolute());
         let git = bin.join("git");
-        std::fs::write(
+        crate::worktree::tests::write_executable(
             &git,
-            format!(
+            &format!(
                 r#"#!/bin/sh
-# Parse Git's option boundary, not incidental -c argument offsets.
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        -c) shift 2 ;;
-        --no-optional-locks) shift ;;
-        --git-dir) gd="$2"; shift 2 ;;
-        --work-tree|-C) cwd="$2"; shift 2 ;;
-        *) break ;;
-    esac
-done
-if [ "$cwd" = '{}' ] && [ "$1" = status ]; then
+# Parse in a subshell so non-barrier calls retain the original argv.
+if (
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -c|--git-dir) shift 2 ;;
+            --no-optional-locks) shift ;;
+            --work-tree|-C) cwd="$2"; shift 2 ;;
+            *) break ;;
+        esac
+    done
+    [ "$cwd" = '{}' ] && [ "$1" = status ]
+); then
     touch '{}'
     n=0
     while [ ! -e '{}' ] && [ "$n" -lt 1000 ]; do sleep 0.01; n=$((n+1)); done
     exit 1
 fi
-exec /usr/bin/git -C "$cwd" "$@"
+exec '{}' "$@"
 "#,
                 work.display(),
                 entered.display(),
-                release.display()
+                release.display(),
+                real_git
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let previous_path = std::env::var_os("PATH");
         let path =
             std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
         unsafe {
             std::env::set_var("PATH", path);
         }
+        // Calibration must reach the production validator through the fake
+        // Git, not silently refuse before the status barrier under test.
+        crate::worktree_access::RecordedWorktree::load(dir.path(), &child.id, &work)
+            .unwrap()
+            .validate()
+            .expect("barrier Git cannot validate the prepared checkout");
         let worker_store = Store::open(&db).unwrap();
         let worker_data = dir.path().to_path_buf();
         let worker = std::thread::spawn(move || {

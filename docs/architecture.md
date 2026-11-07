@@ -233,6 +233,9 @@ and ownership. The journal pins the directory and symlink identities, while Git
 may replace only the target config inode. Interrupted adoption preserves the
 original bytes and refuses launch/reap pending operator recovery. Revocation
 removes access and default entries only when no active same-seat reader remains.
+Retired server-owned journals retain the dedicated directory/link provenance for
+later admission, even after their private gitdirs are reaped; that provenance
+never restores a retired reader's access.
 Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
 `gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.

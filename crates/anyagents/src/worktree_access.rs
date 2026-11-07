@@ -1078,6 +1078,36 @@ fn other_active_grants(journal: &Path, grant: &Grant) -> std::io::Result<Vec<Gra
     Ok(retained)
 }
 
+// Common configuration outlives any individual checkout. A clean reaper may
+// already have removed a retired journal's private gitdir; validate only the
+// recorded common directory/link identity here, independently of ACL membership.
+fn recorded_config(journal: &Path, common: &Path) -> std::io::Result<Option<ManagedConfig>> {
+    let mut config = None;
+    for entry in std::fs::read_dir(journal.parent().unwrap())? {
+        let path = entry?.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let grant: Grant = serde_json::from_slice(&std::fs::read(&path)?)?;
+        if grant.common != common {
+            continue;
+        }
+        if path == journal && (grant.quarantined || grant.inspection) {
+            return Err(std::io::Error::other(
+                "worktree has incomplete ACL recovery",
+            ));
+        }
+        if grant.quarantined || grant.inspection {
+            continue;
+        }
+        if let Some(record) = grant.config {
+            open_common_config(common, Some(&record))?;
+            config = Some(record);
+        }
+    }
+    Ok(config)
+}
+
 fn retained_path(common: &Path, path: &Path, grant: &Grant) -> bool {
     path == common
         || path == common.join("worktrees")
@@ -1331,17 +1361,9 @@ fn share_known_locked(
         config: None,
     };
     let retained = other_active_grants(journal, &grant).map_err(|e| refusal(journal, e))?;
-    // Never adopt a lookalike managed link from the checkout. Only an existing
-    // server-owned grant can witness this dedicated directory/link identity.
-    if let Ok(bytes) = std::fs::read(journal) {
-        let previous: Grant = serde_json::from_slice(&bytes).map_err(|e| refusal(journal, e))?;
-        if previous.common == grant.common {
-            grant.config = previous.config;
-        }
-    }
-    if grant.config.is_none() {
-        grant.config = retained.iter().find_map(|g| g.config.clone());
-    }
+    // Provenance survives the last reader's retirement. Inactive journals may
+    // witness only the exact managed objects, never restore their old grants.
+    grant.config = recorded_config(journal, common).map_err(|e| refusal(journal, e))?;
     write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
     // Clear any legacy broad grants/defaults for this seat before the allowlist.
     revoke_common(common, uid, gid, &retained).map_err(|e| refusal(common, e))?;
@@ -2935,6 +2957,73 @@ mod tests {
         );
         assert!(reaping_blocked(dir.path(), &id));
         assert!(!common.join("config.lock").exists());
+    }
+
+    #[test]
+    fn admission_recovers_config_provenance_after_the_last_reader_retires() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let first = dir.path().join("first");
+        f.consumer
+            .remote("SylphxAI/demo", &first, "first", None)
+            .unwrap();
+        let id = anyagents_core::AgentId::generate();
+        let journal = grant_path(dir.path(), &id);
+        let uid = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid();
+        share(&first, uid, gid, &journal).unwrap();
+        let dirs = git_dirs(&first).unwrap();
+        let common = dirs.last().unwrap();
+        let retired: Grant = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        let config = retired.config.unwrap();
+        revoke_recorded(dir.path(), &id).unwrap();
+        std::fs::remove_dir_all(&dirs[0]).unwrap();
+        assert!(
+            other_active_grants(
+                &journal,
+                &serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap()
+            )
+            .unwrap()
+            .is_empty()
+        );
+
+        let second = dir.path().join("second");
+        f.consumer
+            .remote("SylphxAI/demo", &second, "second", None)
+            .unwrap();
+        let second_id = anyagents_core::AgentId::generate();
+        share(&second, uid, gid, &grant_path(dir.path(), &second_id)).unwrap();
+        let current: Grant =
+            serde_json::from_slice(&std::fs::read(grant_path(dir.path(), &second_id)).unwrap())
+                .unwrap();
+        assert_eq!(current.config.unwrap().directory.ino, config.directory.ino);
+        let retired: Grant = serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+        assert!(
+            !retired.active,
+            "provenance recovery revived a retired grant"
+        );
+        revoke_recorded(dir.path(), &second_id).unwrap();
+
+        // A same-target replacement is still a different, unrecorded symlink.
+        // Retain the original link so its inode cannot be recycled for the fake.
+        let link = common.join("config");
+        let saved = common.join("config.saved");
+        std::fs::rename(&link, &saved).unwrap();
+        std::os::unix::fs::symlink(Path::new(CONFIG_DIRECTORY).join("config"), &link).unwrap();
+        let error = share(&second, uid, gid, &grant_path(dir.path(), &second_id)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("managed Git config identity changed"),
+            "{error}"
+        );
+        let current: Grant =
+            serde_json::from_slice(&std::fs::read(grant_path(dir.path(), &second_id)).unwrap())
+                .unwrap();
+        assert!(!current.active, "identity refusal revived a retired grant");
+        std::fs::remove_file(link).unwrap();
+        std::fs::rename(saved, common.join("config")).unwrap();
+        assert!(recorded_config(&journal, common).unwrap().is_some());
     }
 
     #[cfg(target_os = "linux")]
