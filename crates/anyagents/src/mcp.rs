@@ -392,6 +392,21 @@ struct SendArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ConversationArgs {
+    /// Opaque indexed result ID for exact raw readback, never a file path.
+    #[serde(default)]
+    raw_id: Option<String>,
+    /// Expected whole-event SHA-256 from the result's `raw.sha256`; required with raw_id.
+    #[serde(default)]
+    raw_sha256: Option<String>,
+    /// Byte offset relative to the selected whole raw event/document (default 0).
+    #[serde(default)]
+    raw_offset: Option<u64>,
+    /// Requested bytes 1..=65536 (default 65536), clipped at the event end.
+    #[serde(default)]
+    raw_length: Option<u64>,
+    /// Search both sources (default), only learned memory, or only transcripts.
+    #[serde(default)]
+    scope: Option<String>,
     /// Optional lexical + structured search query (`Raw-RAG`: SQLite FTS5 BM25 with hybrid
     /// ASCII identifier + CJK bigram tokenization, exact phrase boost, and substring fallback).
     /// When set, searches authorized historical and live turns without loading the
@@ -470,6 +485,7 @@ struct AgentsArgs {
     /// - `"describe"` (read or update an agent's role & responsibility `description` / `instructions` and short `role` label; defaults `name` to `"self"`)
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
+    /// - `"reset_session"` / `"new_session"` (new session for a quiescent managed agent; preserves old pins and raw state)
     /// - `"pause"` (pause an agent)
     /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
@@ -974,7 +990,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified two-way (`in` + `out`) conversation reader and Zero-Embedding Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search the caller's and descendants' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns. Non-admin agents read only self and descendants; `all` never grants peer, sibling or parent history access."
+        description = "Unified two-way (`in` + `out`) conversation reader and host memory search (`scope`: all|memory|transcripts; default all). Exact bounded raw readback uses `raw_id` and `raw_sha256` from a result plus optional `raw_offset`/`raw_length` (bytes, max65536); it returns exact `raw_bytes`, full raw coordinates and the requested window. Paths are never accepted. Native historical events without source time return timestamp_ms:null (CLI: unknown); missing time is never inferred from file mtime, and timestamp bounds exclude unknown times. Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search the caller's and descendants' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns. Non-admin agents read only self and descendants; `all` never grants peer, sibling or parent history access."
     )]
     async fn conversation(
         &self,
@@ -1003,7 +1019,8 @@ impl AgentMcp {
         };
         let from_seq = args.from_seq.or(range_from);
         let to_seq = args.to_seq.or(range_to);
-        let is_search_mode = clean_q.is_some()
+        let is_search_mode = args.raw_id.is_some()
+            || clean_q.is_some()
             || !args.queries.is_empty()
             || !args.exclude.is_empty()
             || args.only_tools == Some(true)
@@ -1024,6 +1041,24 @@ impl AgentMcp {
             .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
             .unwrap_or(default_agent);
         let mut query = Vec::new();
+        if let Some(id) = args.raw_id {
+            query.push(format!("raw_id={}", urlencoding_simple(&id)));
+        }
+        if let Some(digest) = args.raw_sha256 {
+            query.push(format!("raw_sha256={}", urlencoding_simple(&digest)));
+        }
+        if let Some(offset) = args.raw_offset {
+            query.push(format!("raw_offset={offset}"));
+        }
+        if let Some(length) = args.raw_length {
+            query.push(format!("raw_length={length}"));
+        }
+        if let Some(scope) = args.scope {
+            if !["all", "memory", "transcripts"].contains(&scope.as_str()) {
+                return Err("scope must be all, memory or transcripts".into());
+            }
+            query.push(format!("scope={scope}"));
+        }
         if let Some(q) = clean_q {
             query.push(format!("query={}", urlencoding_simple(q)));
         }
@@ -1397,6 +1432,25 @@ impl AgentMcp {
                 Ok(rmcp::handler::server::wrapper::Json(
                     serde_json::to_value(woke).map_err(|e| e.to_string())?,
                 ))
+            }
+            "reset_session" | "new_session" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| {
+                        "`agents reset_session` requires `name` (or `agent`)".to_string()
+                    })?;
+                let clean = target.strip_prefix("agent:").unwrap_or(target);
+                let result: serde_json::Value = self
+                    .client
+                    .get(
+                        &format!("/v1/agents/{clean}/session/reset"),
+                        Some(b"{}".to_vec()),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(result))
             }
             "pause" => {
                 let target = args

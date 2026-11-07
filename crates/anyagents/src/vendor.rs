@@ -25,7 +25,7 @@ use crate::sylphx::SylphxHarness;
 pub enum VendorHarness {
     Claude(Box<ClaudeHarness>, PathBuf),
     Codex(Box<CodexHarness>, PathBuf),
-    OpenCode(Box<OpenCodeHarness>),
+    OpenCode(Box<OpenCodeHarness>, PathBuf),
     Agy(Box<AgyHarness>, PathBuf),
     Muse(Box<MuseHarness>, PathBuf),
     Omp(Box<OmpHarness>, PathBuf),
@@ -52,12 +52,33 @@ impl VendorHarness {
             Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
             Self::Grok(harness, path) => (harness.session_id(), Some(path)),
             Self::Sylphx(harness, path) => (harness.session_id(), Some(path)),
-            Self::OpenCode(_) | Self::Contract(_) => (None, None),
+            Self::OpenCode(harness, path) => (harness.session_id(), Some(path)),
+            Self::Contract(_) => (None, None),
         };
         if let (Some(id), Some(path)) = (session, path) {
             let trimmed = id.trim();
             if !trimmed.is_empty() {
                 let existing = std::fs::read_to_string(path).ok();
+                if let Some(root) = path.parent().and_then(Path::parent) {
+                    let harness = match self {
+                        Self::Claude(..) => "claude-code",
+                        Self::Codex(..) => "codex",
+                        Self::OpenCode(..) => "opencode",
+                        Self::Agy(..) => "agy",
+                        Self::Muse(..) => "muse",
+                        Self::Omp(..) => "omp",
+                        Self::Dsh(..) => "dsh",
+                        Self::Grok(..) => "grok",
+                        Self::Sylphx(..) => "sylphx",
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) =
+                        anyagents_core::host_session::bind_vendor(root, harness, trimmed)
+                    {
+                        eprintln!("host session alias refused: {error}");
+                        return;
+                    }
+                }
                 if existing.as_deref().map(str::trim) != Some(trimmed) {
                     let _ = std::fs::write(path, format!("{trimmed}\n"));
                 }
@@ -363,6 +384,19 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 }
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    // The supervisor owns the agent process lock. Allocate the host generation
+    // before any vendor can consume its instructions, never from a late marker.
+    crate::host_memory::before_launch(&request.data_dir, &request.agent.id).map_err(|error| {
+        match error {
+            anyagents_core::Error::Io(ref cause)
+                if cause.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                "memory_migration_wait: waiting_on=migration.lock; retryable=true".to_owned()
+            }
+            _ => format!("host migration failed: {error}"),
+        }
+    })?;
+    prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
@@ -387,6 +421,49 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         }
     }
     res
+}
+
+fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
+    let root = request.config_dir.parent().ok_or("agent root missing")?;
+    anyagents_core::host_session::recover_pending(root).map_err(|e| e.to_string())?;
+    let previous = anyagents_core::host_session::active(root).map_err(|e| e.to_string())?;
+    let switched = previous
+        .as_ref()
+        .is_some_and(|s| s.harness != request.agent.harness);
+    if switched {
+        // Deliberate harness cutover starts a native session too. Keep its raw
+        // history in place; only retire the pointer, not its transcript/state.
+        if let Some(file) = crate::create::harness_session_filename(&request.agent.harness) {
+            match std::fs::remove_file(request.config_dir.join(file)) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        anyagents_core::host_session::new_session(root, &request.agent.harness)
+    } else {
+        anyagents_core::host_session::ensure_active(root, &request.agent.harness)
+    }
+    .map_err(|e| format!("host session pin failed: {e}"))?;
+    if let Some(file) = crate::create::harness_session_filename(&request.agent.harness)
+        && let Some(id) = session_from_file(&request.config_dir, file)
+    {
+        anyagents_core::host_session::bind_vendor(root, &request.agent.harness, &id)
+            .map_err(|e| format!("host session alias failed: {e}"))?;
+    }
+    // Also render in contract-test mode, exercising the shipping launch boundary.
+    crate::create::write_agent_instructions(&request.config_dir, &request.agent, None);
+    Ok(())
+}
+
+/// Claude's native loader/writer would otherwise reopen a second project memory
+/// source and bypass the host's immutable session pin. Official memory.md
+/// (read 2026-11-07T03:04Z) documents this supported per-process opt-out.
+fn enforce_host_memory_env(harness: &str, env: &mut Vec<(String, String)>) {
+    if harness == "claude-code" {
+        env.retain(|(key, _)| key != "CLAUDE_CODE_DISABLE_AUTO_MEMORY");
+        env.push(("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "1".into()));
+    }
 }
 
 fn read_muse_exit_error(config_dir: &Path) -> Option<String> {
@@ -433,6 +510,9 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             !matches!(
                 k.as_str(),
                 anyagents_harness::SEAT_LAUNCH_ENV
+                    | anyagents_harness::SEAT_PEERS_ENV
+                    | "ANYAGENTS_DATA"
+                    | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
@@ -483,6 +563,9 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             !matches!(
                 k.as_str(),
                 anyagents_harness::SEAT_LAUNCH_ENV
+                    | anyagents_harness::SEAT_PEERS_ENV
+                    | "ANYAGENTS_DATA"
+                    | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
@@ -626,7 +709,14 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     }
     if let Some((_, ref spec)) = seat_spec {
         env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec.clone()));
+        if let Some(store) = &store_opt {
+            env.push((
+                anyagents_harness::SEAT_PEERS_ENV.to_owned(),
+                crate::sandbox::peer_principals(store).map_err(|e| e.to_string())?,
+            ));
+        }
     }
+    enforce_host_memory_env(&request.agent.harness, &mut env);
     if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
         let program =
             std::env::var("ANYAGENTS_HARNESS_BIN").unwrap_or_else(|_| "anyagents-harness".into());
@@ -876,7 +966,12 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         .map_err(|err| {
             read_opencode_exit_error(&request.config_dir).unwrap_or_else(|| err.to_string())
         })?;
-        Ok(VendorHarness::OpenCode(Box::new(harness)))
+        let vh = VendorHarness::OpenCode(
+            Box::new(harness),
+            request.config_dir.join("opencode-session-id"),
+        );
+        vh.sync_session();
+        Ok(vh)
     } else if request.agent.harness == "codex" {
         env.push((
             "CODEX_HOME".to_string(),
@@ -1140,7 +1235,7 @@ impl Harness for VendorHarness {
         let out = match self {
             Self::Claude(harness, _) => harness.deliver(message),
             Self::Codex(harness, _) => harness.deliver(message),
-            Self::OpenCode(harness) => harness.deliver(message),
+            Self::OpenCode(harness, _) => harness.deliver(message),
             Self::Agy(harness, _) => harness.deliver(message),
             Self::Muse(harness, _) => harness.deliver(message),
             Self::Omp(harness, _) => harness.deliver(message),
@@ -1157,7 +1252,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.background(),
             Self::Codex(harness, _) => harness.background(),
-            Self::OpenCode(harness) => harness.background(),
+            Self::OpenCode(harness, _) => harness.background(),
             Self::Agy(harness, _) => harness.background(),
             Self::Muse(harness, _) => harness.background(),
             Self::Omp(harness, _) => harness.background(),
@@ -1172,7 +1267,7 @@ impl Harness for VendorHarness {
         let out = match self {
             Self::Claude(harness, _) => harness.resume(session),
             Self::Codex(harness, _) => harness.resume(session),
-            Self::OpenCode(harness) => harness.resume(session),
+            Self::OpenCode(harness, _) => harness.resume(session),
             Self::Agy(harness, _) => harness.resume(session),
             Self::Muse(harness, _) => harness.resume(session),
             Self::Omp(harness, _) => harness.resume(session),
@@ -1189,7 +1284,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.cancel(),
             Self::Codex(harness, _) => harness.cancel(),
-            Self::OpenCode(harness) => harness.cancel(),
+            Self::OpenCode(harness, _) => harness.cancel(),
             Self::Agy(harness, _) => harness.cancel(),
             Self::Muse(harness, _) => harness.cancel(),
             Self::Omp(harness, _) => harness.cancel(),
@@ -1200,12 +1295,19 @@ impl Harness for VendorHarness {
         }
     }
 
+    fn exit_diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Claude(harness, _) => harness.exit_diagnostic(),
+            _ => None,
+        }
+    }
+
     fn health(&self) -> HarnessHealth {
         self.sync_session();
         match self {
             Self::Claude(harness, _) => harness.health(),
             Self::Codex(harness, _) => harness.health(),
-            Self::OpenCode(harness) => harness.health(),
+            Self::OpenCode(harness, _) => harness.health(),
             Self::Agy(harness, _) => harness.health(),
             Self::Muse(harness, _) => harness.health(),
             Self::Omp(harness, _) => harness.health(),
@@ -1220,7 +1322,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.input_ready(),
             Self::Codex(harness, _) => harness.input_ready(),
-            Self::OpenCode(harness) => harness.input_ready(),
+            Self::OpenCode(harness, _) => harness.input_ready(),
             Self::Agy(harness, _) => harness.input_ready(),
             Self::Muse(harness, _) => harness.input_ready(),
             Self::Omp(harness, _) => harness.input_ready(),
@@ -1236,7 +1338,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.last_usage(),
             Self::Codex(harness, _) => harness.last_usage(),
-            Self::OpenCode(harness) => harness.last_usage(),
+            Self::OpenCode(harness, _) => harness.last_usage(),
             Self::Agy(harness, _) => harness.last_usage(),
             Self::Muse(harness, _) => harness.last_usage(),
             Self::Omp(harness, _) => harness.last_usage(),
@@ -1251,7 +1353,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.turns_served(),
             Self::Codex(harness, _) => harness.turns_served(),
-            Self::OpenCode(harness) => harness.turns_served(),
+            Self::OpenCode(harness, _) => harness.turns_served(),
             Self::Agy(harness, _) => harness.turns_served(),
             Self::Muse(harness, _) => harness.turns_served(),
             Self::Omp(harness, _) => harness.turns_served(),
@@ -1266,7 +1368,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Codex(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::OpenCode(harness) => harness.quiet_for(id, quiet, patience),
+            Self::OpenCode(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Agy(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Muse(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
@@ -1281,7 +1383,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.ends_on_quiet(),
             Self::Codex(harness, _) => harness.ends_on_quiet(),
-            Self::OpenCode(harness) => harness.ends_on_quiet(),
+            Self::OpenCode(harness, _) => harness.ends_on_quiet(),
             Self::Agy(harness, _) => harness.ends_on_quiet(),
             Self::Muse(harness, _) => harness.ends_on_quiet(),
             Self::Omp(harness, _) => harness.ends_on_quiet(),
@@ -1296,7 +1398,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.clear_quota(),
             Self::Codex(harness, _) => harness.clear_quota(),
-            Self::OpenCode(harness) => harness.clear_quota(),
+            Self::OpenCode(harness, _) => harness.clear_quota(),
             Self::Agy(harness, _) => harness.clear_quota(),
             Self::Muse(harness, _) => harness.clear_quota(),
             Self::Omp(harness, _) => harness.clear_quota(),
@@ -1311,7 +1413,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.process_id(),
             Self::Codex(harness, _) => harness.process_id(),
-            Self::OpenCode(harness) => harness.process_id(),
+            Self::OpenCode(harness, _) => harness.process_id(),
             Self::Agy(harness, _) => harness.process_id(),
             Self::Muse(harness, _) => harness.process_id(),
             Self::Omp(harness, _) => harness.process_id(),
@@ -1326,7 +1428,7 @@ impl Harness for VendorHarness {
         match self {
             Self::Claude(harness, _) => harness.watch_activity(notify),
             Self::Codex(harness, _) => harness.watch_activity(notify),
-            Self::OpenCode(harness) => harness.watch_activity(notify),
+            Self::OpenCode(harness, _) => harness.watch_activity(notify),
             Self::Agy(harness, _) => harness.watch_activity(notify),
             Self::Muse(harness, _) => harness.watch_activity(notify),
             Self::Omp(harness, _) => harness.watch_activity(notify),
@@ -1350,8 +1452,742 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_native_memory_cannot_override_host_authority() {
+        let mut env = vec![
+            ("CLAUDE_CODE_DISABLE_AUTO_MEMORY".into(), "0".into()),
+            ("UNRELATED".into(), "kept".into()),
+        ];
+        enforce_host_memory_env("claude-code", &mut env);
+        let output = std::process::Command::new("/bin/sh")
+            .args([
+                "-c",
+                "printf '%s:%s' \"$CLAUDE_CODE_DISABLE_AUTO_MEMORY\" \"$UNRELATED\"",
+            ])
+            .envs(env)
+            .output()
+            .unwrap();
+        assert_eq!(output.stdout, b"1:kept");
+    }
+
+    // Used by the real seat and the unprivileged refusal controls below.
+    // Inspect only link metadata; never read or traverse a credential target.
+    const NATIVE_FIXTURE_OWNER_CLEANUP: &str = r#"
+set -eu
+[ "$(readlink "$1/skills")" = "$2" ]
+for name in service-account-token connect-token; do
+    path="$3/$name"
+    [ -L "$path" ] || [ ! -e "$path" ]
+done
+for name in service-account-token connect-token; do
+    path="$3/$name"
+    if [ -L "$path" ]; then
+        rm -- "$path"
+    fi
+done
+rmdir -- "$3"
+rm -- "$1/skills"
+rmdir -- "$1"
+"#;
+
+    #[test]
+    fn native_fixture_owner_cleanup_removes_only_expected_links() {
+        for case in ["empty", "links", "regular-token", "unexpected-entry"] {
+            let temp = crate::test_tempdir();
+            let root = temp.path();
+            let agy = root.join("config/.agy");
+            let op = root.join("config/.config/op");
+            let outside = root.join("outside");
+            std::fs::create_dir_all(&agy).unwrap();
+            std::fs::create_dir_all(&op).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), b"preserved").unwrap();
+            std::os::unix::fs::symlink(&outside, agy.join("skills")).unwrap();
+            match case {
+                "links" => {
+                    std::os::unix::fs::symlink(&outside, op.join("service-account-token")).unwrap();
+                    std::os::unix::fs::symlink(root.join("absent"), op.join("connect-token"))
+                        .unwrap();
+                }
+                "regular-token" => {
+                    std::fs::write(op.join("service-account-token"), b"not a link").unwrap();
+                    std::os::unix::fs::symlink(&outside, op.join("connect-token")).unwrap();
+                }
+                "unexpected-entry" => {
+                    std::os::unix::fs::symlink(&outside, op.join("unexpected")).unwrap();
+                }
+                "empty" => {}
+                _ => unreachable!(),
+            }
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", NATIVE_FIXTURE_OWNER_CLEANUP, "fixture-owner-cleanup"])
+                .arg(&agy)
+                .arg(&outside)
+                .arg(&op)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                matches!(case, "empty" | "links"),
+                "{case}: {output:?}"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("sentinel")).unwrap(),
+                b"preserved"
+            );
+            if output.status.success() {
+                assert!(!agy.exists(), "{case}");
+                assert!(!op.exists(), "{case}");
+            } else {
+                assert!(agy.join("skills").is_symlink(), "{case}");
+                if case == "regular-token" {
+                    assert_eq!(
+                        std::fs::read(op.join("service-account-token")).unwrap(),
+                        b"not a link"
+                    );
+                    assert!(op.join("connect-token").is_symlink());
+                } else {
+                    assert!(op.join("unexpected").is_symlink());
+                }
+            }
+        }
+    }
+
+    /// Required by the Linux native-UID lane, never counted as a green skip.
+    /// The executor drops DAC override so a seat-owned 0700 vendor parent really
+    /// denies the daemon and exercises the owner projection fallback.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires the explicit privileged synthetic native-UID CI lane"]
+    fn native_vendor_launch_enforces_shared_boundary_and_real_skill_mounts() {
+        use anyagents_core::{NewAgent, Store};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        assert_eq!(
+            std::env::var("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            crate::sandbox::server_uid(),
+            0,
+            "privileged fixture executor required"
+        );
+        let _env = crate::server::tests::env_lock();
+        let base = std::env::var_os("ANYAGENTS_NATIVE_SEAT_BASE").unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("vendor-seat-")
+            .tempdir_in(base)
+            .unwrap();
+        let fixture = std::fs::canonicalize(fixture.path()).unwrap();
+        let uid = 24031;
+        let gid = 24032;
+        let directory = |path: &Path, mode, owner, group| {
+            std::fs::create_dir_all(path).unwrap_or_else(|error| {
+                panic!("create fixture directory {}: {error}", path.display())
+            });
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c.as_ptr(), owner, group) }, 0);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let file = |path: &Path, content: &str, mode, group| {
+            std::fs::write(path, content).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c.as_ptr(), 0, group) }, 0);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        directory(&fixture, 0o711, 0, 0);
+        let data = fixture.join("data");
+        directory(&data, 0o711, 0, 0);
+        directory(&data.join("agents"), 0o711, 0, 0);
+        let store = Store::open(data.join("state.db")).unwrap();
+        std::fs::set_permissions(
+            data.join("state.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv");
+        }
+        let agent = store
+            .create_agent(NewAgent::new("native-own", "claude-code"))
+            .unwrap();
+        let colocated = store
+            .create_agent(NewAgent::new("native-same-seat", "claude-code"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(&data, &agent.id);
+        let root = config.parent().unwrap();
+        directory(root, 0o711, 0, 0);
+        for path in [
+            &config,
+            &root.join("memory"),
+            &root.join("skills"),
+            &root.join("work"),
+        ] {
+            directory(path, 0o2770, 0, gid);
+        }
+        file(
+            &config.join("mcp-capability"),
+            "synthetic-capability\n",
+            0o640,
+            gid,
+        );
+        file(
+            &root.join("memory/MEMORY.md"),
+            "synthetic-memory-before\n",
+            0o660,
+            gid,
+        );
+        directory(&root.join("skills/local"), 0o2770, 0, gid);
+        file(&root.join("skills/local/SKILL.md"), "# local\n", 0o660, gid);
+        let colocated_root = anyagents_core::agent_config_dir(&data, &colocated.id)
+            .parent()
+            .unwrap()
+            .to_owned();
+        directory(&colocated_root, 0o711, 0, 0);
+        for name in ["config", "memory", "skills"] {
+            directory(&colocated_root.join(name), 0o2770, 0, gid);
+            file(
+                &colocated_root.join(name).join("same-seat"),
+                "legitimate shared principal\n",
+                0o660,
+                gid,
+            );
+        }
+        let peer = data.join("agents/foreign-seat");
+        directory(&peer, 0o711, 0, 0);
+        let mut protected = Vec::new();
+        for name in ["config", "memory", "skills"] {
+            directory(&peer.join(name), 0o700, 0, 0);
+            file(
+                &peer.join(name).join("private"),
+                "foreign-seat-private\n",
+                0o600,
+                0,
+            );
+            protected.push(peer.join(name));
+            protected.push(peer.join(name).join("private"));
+        }
+        for name in ["sessions", "transcripts"] {
+            directory(&root.join(name), 0o700, 0, 0);
+            file(&root.join(name).join("private"), "host-only\n", 0o600, 0);
+            protected.push(root.join(name).join("private"));
+        }
+        for name in [
+            "secrets",
+            "operator-token",
+            "anyagents.sock",
+            "identity-boundary.json",
+        ] {
+            file(&data.join(name), "host-private\n", 0o600, 0);
+            protected.push(data.join(name));
+        }
+        // The executor deliberately has no DAC override. Populate the new
+        // fixture before sealing both directories, exactly as a real publisher
+        // does; read-only must not mean an impossible setup that never launches.
+        directory(&data.join("skills"), 0o755, 0, 0);
+        directory(&data.join("skills/global"), 0o755, 0, 0);
+        file(
+            &data.join("skills/global/SKILL.md"),
+            "# global preserved\n",
+            0o444,
+            0,
+        );
+        for path in [data.join("skills/global"), data.join("skills")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        protected.push(data.join("skills/global/SKILL.md"));
+        // Daemon cannot traverse this exact legitimate owner-private parent.
+        directory(&config.join(".agy"), 0o700, uid, gid);
+        assert_eq!(
+            std::fs::read_dir(config.join(".agy")).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "fixture must actually remove daemon DAC override"
+        );
+        let old_mask = unsafe { libc::umask(0o077) };
+        crate::create::ensure_seat_skills(&config, &fixture);
+        unsafe {
+            libc::umask(old_mask);
+        }
+        assert_eq!(
+            std::fs::metadata(root.join("skills-view")).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read_dir(config.join(".agy")).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "mount fallback must not widen the vendor parent"
+        );
+        // The real launch sharing boundary must grant the daemon-created 0700
+        // mirrors; the fixture does not pre-grant them after umask 077 mounting.
+        file(
+            &config.join("legacy.sqlite"),
+            "legacy sqlite handoff bytes\n",
+            0o600,
+            gid,
+        );
+        let report = config.join("native-vendor-report");
+        let probe = fixture.join("vendor-probe.sh");
+        file(
+            &probe,
+            r#"#!/bin/sh
+exec 2> "$ANYAGENTS_AGENT_CONFIG/native-vendor-trace"
+set -eux
+trap 'status=$?; printf "PROBE_EXIT=%s\n" "$status" >&2' 0
+[ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
+[ -x "$ANYAGENTS_DATA/agents" ]; [ ! -r "$ANYAGENTS_DATA/agents" ]
+workdir=$(cd "$ANYAGENTS_AGENT_CONFIG/../work" && pwd)
+trust=$(/usr/bin/git config --no-includes --file "$ANYAGENTS_AGENT_CONFIG/.gitconfig" --get-all safe.directory)
+[ "$trust" = "$(printf '\n%s' "$workdir")" ]
+for mirror in .claude .agents .agy; do
+  grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/global/SKILL.md"
+  grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/local/SKILL.md"
+done
+printf synthetic-memory-after > "$ANYAGENTS_AGENT_CONFIG/../memory/MEMORY.md"
+printf authored > "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
+rm "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
+for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGENTS_DATA/agents/foreign-seat/memory/private" "$ANYAGENTS_AGENT_CONFIG/../sessions/private"; do
+  if cat "$path" >/dev/null 2>&1; then exit 41; fi
+  if (printf forbidden > "$path") 2>/dev/null; then exit 42; fi
+done
+if (printf forbidden > "$ANYAGENTS_AGENT_CONFIG/.agy/skills/global/SKILL.md") 2>/dev/null; then exit 43; fi
+printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
+# Keep the real adapter child alive until its owner drops the harness.
+cat >/dev/null
+"#,
+            0o555,
+            0,
+        );
+        let snapshot = || {
+            protected
+                .iter()
+                .map(|p| {
+                    let m = std::fs::symlink_metadata(p).unwrap();
+                    (
+                        p.clone(),
+                        m.uid(),
+                        m.gid(),
+                        m.mode(),
+                        if m.is_file() {
+                            std::fs::read(p).unwrap()
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
+            std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "24033");
+            std::env::set_var("ANYAGENTS_CLAUDE_CODE_BIN", &probe);
+            std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv");
+        }
+        let launch = || {
+            vendor_launch(LaunchRequest {
+                agent: agent.clone(),
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            })
+        };
+        assert_eq!(
+            crate::install::program(&data, "claude-code"),
+            probe,
+            "the actual resolver must select the synthetic native probe"
+        );
+        let harness = launch().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !report.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::metadata(config.join("legacy.sqlite"))
+                .unwrap()
+                .uid(),
+            uid
+        );
+        assert_eq!(
+            std::fs::read(config.join("legacy.sqlite")).unwrap(),
+            b"legacy sqlite handoff bytes\n"
+        );
+        assert_eq!(
+            std::fs::metadata(config.join(".agy")).unwrap().mode() & 0o777,
+            0o700,
+            "sharing must retain the existing owner-private vendor parent"
+        );
+        println!("NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED");
+        let evidence = std::fs::read_to_string(&report).unwrap_or_else(|error| {
+            panic!(
+                "native vendor report missing: {error}; process={:?}; synthetic_trace={}",
+                harness.exit_diagnostic(),
+                std::fs::read_to_string(config.join("native-vendor-trace"))
+                    .unwrap_or_else(|e| format!("unavailable: {e}"))
+            );
+        });
+        assert!(
+            evidence.contains("REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK"),
+            "{evidence}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap(),
+            "synthetic-memory-after"
+        );
+        assert!(evidence.contains("GIT_TRUST_EXACT"), "{evidence}");
+        println!("{evidence}");
+        drop(harness);
+        std::fs::remove_file(&report).unwrap();
+        for name in ["memory", "skills", "config"] {
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let error = match launch() {
+                Ok(_) => panic!("writable foreign {name} started vendor"),
+                Err(e) => e,
+            };
+            assert!(
+                error.contains(
+                    "agent not started: boundary check failed: peer seats' private trees are denied"
+                ),
+                "{name}: {error}"
+            );
+            assert!(!report.exists(), "vendor command ran before refusal");
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            println!("NATIVE_VENDOR_WRITABLE_PEER_{name}_REFUSED_BEFORE_COMMAND");
+        }
+        // A distinct reader of a 0711 tree cannot list it but can still read a
+        // known public child. Refuse search access before the actual adapter
+        // starts, not merely directory read/write access in a synthetic shell.
+        for name in ["memory", "skills", "config"] {
+            let tree = peer.join(name);
+            let known = tree.join("known-readable");
+            file(&known, "synthetic-known-peer-bytes\n", 0o444, 0);
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o711)).unwrap();
+            let control = std::process::Command::new("/usr/bin/setpriv")
+                .args([
+                    "--reuid",
+                    "24031",
+                    "--regid",
+                    "24032",
+                    "--clear-groups",
+                    "--no-new-privs",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "[ ! -r \"$1\" ] && [ ! -w \"$1\" ] && [ -x \"$1\" ] && cat \"$2\"",
+                    "search-only-control",
+                ])
+                .arg(&tree)
+                .arg(&known)
+                .output()
+                .unwrap();
+            assert!(control.status.success(), "{name}: {control:?}");
+            assert_eq!(control.stdout, b"synthetic-known-peer-bytes\n");
+            let error = match launch() {
+                Ok(_) => panic!("search-only foreign {name} started vendor"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains(
+                    "agent not started: boundary check failed: peer seats' private trees are denied"
+                ),
+                "{name}: {error}"
+            );
+            assert!(
+                !report.exists(),
+                "vendor command ran before search-only refusal"
+            );
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_file(known).unwrap();
+            println!("NATIVE_VENDOR_SEARCH_ONLY_PEER_{name}_KNOWN_READ_REFUSED_BEFORE_COMMAND");
+        }
+        // The workspace-session initializer runs before normal Muse adapter
+        // launch, including on explicit wake. A fresh marker must not conceal
+        // its exceptional process-construction route from admission.
+        let muse_report = config.join("muse-initializer-processes");
+        let muse_probe = fixture.join("muse-initializer.sh");
+        file(
+            &muse_probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
+[ -z "${ANYAGENTS_SEAT_LAUNCH+x}" ]; [ -z "${ANYAGENTS_SEAT_PEERS+x}" ]
+printf 'started\n' >> "$ANYAGENTS_AGENT_CONFIG/muse-initializer-processes"
+read -r initialize
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+read -r initialized
+read -r start
+printf '{"jsonrpc":"2.0","id":2,"result":{"session":{"sessionId":"synthetic-muse-session"}}}\n'
+"#,
+            0o555,
+            0,
+        );
+        let seat_environment = vec![
+            (
+                anyagents_harness::SEAT_LAUNCH_ENV.into(),
+                format!("/usr/bin/setpriv\t{uid}\t{gid}\t{gid},24033"),
+            ),
+            (
+                anyagents_harness::SEAT_PEERS_ENV.into(),
+                crate::sandbox::peer_principals(&store).unwrap(),
+            ),
+        ];
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+            std::env::set_var("ANYAGENTS_MUSE_BIN", &muse_probe);
+        }
+        let initialize_muse = || {
+            crate::muse_config::ensure_workspace_session(
+                &data,
+                agent.id.as_str(),
+                &config,
+                &root.join("work"),
+                None,
+                &seat_environment,
+            )
+        };
+        let sid = config.join("muse-session-id");
+        let marker = config.join(".anyagents-muse-workspace-session");
+        for name in ["memory", "skills", "config"] {
+            assert!(
+                !sid.exists() && !marker.exists(),
+                "must exercise a fresh Muse session"
+            );
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let error = initialize_muse().unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "agent not started: boundary check failed: peer seats' private trees are denied"
+                ),
+                "{error}"
+            );
+            assert!(
+                !muse_report.exists(),
+                "Muse initializer started before refusal"
+            );
+            assert!(
+                !sid.exists() && !marker.exists(),
+                "refusal must not publish a session"
+            );
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            println!("NATIVE_MUSE_FRESH_SESSION_PEER_{name}_REFUSED_ZERO_PROCESSES");
+        }
+        initialize_muse().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sid).unwrap(),
+            "synthetic-muse-session\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("synthetic-muse-session\t{}\n", root.join("work").display())
+        );
+        initialize_muse().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&muse_report).unwrap(),
+            "started\n",
+            "valid marker reuses exactly one admitted initializer"
+        );
+        println!("NATIVE_MUSE_INITIALIZER_ADMITTED_AND_MARKER_REUSED");
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+
+        // Use the actual Codex adapter, not a Claude command with a different
+        // label. Its active .agents view works while unused .claude projections
+        // are deliberately preserved by the production mount implementation.
+        let personal = fixture.join("personal-skills");
+        directory(&personal, 0o755, 0, 0);
+        directory(&personal.join("private"), 0o755, 0, 0);
+        file(
+            &personal.join("private/SKILL.md"),
+            "personal preserved\n",
+            0o444,
+            0,
+        );
+        let codex_probe = fixture.join("codex-foreign-projection.sh");
+        file(
+            &codex_probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
+grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/.agents/skills/global/SKILL.md"
+grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/.agents/skills/local/SKILL.md"
+printf 'codex-started\n' > "$ANYAGENTS_AGENT_CONFIG/codex-foreign-report"
+while IFS= read -r request; do
+  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"foreign-projection-fixture"}}}\n' "$id"; fi
+done
+"#,
+            0o555,
+            0,
+        );
+        unsafe {
+            std::env::set_var("ANYAGENTS_CODEX_BIN", &codex_probe);
+        }
+        std::fs::rename(config.join(".claude"), config.join(".claude-host-held")).unwrap();
+        for foreign_parent in [true, false] {
+            if foreign_parent {
+                std::os::unix::fs::symlink(&personal, config.join(".claude")).unwrap();
+            } else {
+                directory(&config.join(".claude"), 0o2770, 0, gid);
+                std::os::unix::fs::symlink(&personal, config.join(".claude/skills")).unwrap();
+            }
+            crate::create::ensure_seat_skills(&config, &fixture);
+            let mut codex = agent.clone();
+            codex.harness = "codex".into();
+            let harness = vendor_launch(LaunchRequest {
+                agent: codex,
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(config.join("codex-session-id"))
+                    .unwrap()
+                    .trim(),
+                "foreign-projection-fixture"
+            );
+            assert_eq!(
+                std::fs::read_to_string(config.join("codex-foreign-report")).unwrap(),
+                "codex-started\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(personal.join("private/SKILL.md")).unwrap(),
+                "personal preserved\n"
+            );
+            assert!(!personal.join("skills").exists() && !personal.join("global").exists());
+            drop(harness);
+            std::fs::remove_file(config.join("codex-foreign-report")).unwrap();
+            if foreign_parent {
+                std::fs::remove_file(config.join(".claude")).unwrap();
+            } else {
+                std::fs::remove_file(config.join(".claude/skills")).unwrap();
+                // Launch reconciliation writes its managed instructions into
+                // this fixture-owned parent. Remove only that proven output;
+                // unexpected entries must still make remove_dir fail.
+                let generated = config.join(".claude/CLAUDE.md");
+                assert_eq!(
+                    std::fs::read(&generated).unwrap(),
+                    std::fs::read(config.join("CLAUDE.md")).unwrap()
+                );
+                std::fs::remove_file(generated).unwrap();
+                std::fs::remove_dir(config.join(".claude")).unwrap();
+            }
+            println!(
+                "NATIVE_CODEX_PRESERVED_FOREIGN_{}_LAUNCH_OK",
+                if foreign_parent { "PARENT" } else { "MOUNT" }
+            );
+        }
+        std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
+        assert_eq!(snapshot(), before, "protected bytes or permissions changed");
+        println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
+        // Native launch also creates a private op leaf. Prove that the reduced-
+        // DAC daemon cannot enumerate it before its actual owner removes only
+        // known token links and the empty directory. Do not widen private modes
+        // or recursively traverse any foreign link during fixture teardown.
+        let op = config.join(".config/op");
+        let metadata = std::fs::symlink_metadata(&op).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        assert_eq!(
+            std::fs::read_dir(&op).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        println!("NATIVE_VENDOR_PRIVATE_OP_DENIED_BEFORE_OWNER_CLEANUP");
+        let output = std::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                "24031",
+                "--regid",
+                "24032",
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "/bin/sh",
+                "-c",
+                NATIVE_FIXTURE_OWNER_CLEANUP,
+                "fixture-owner-cleanup",
+            ])
+            .arg(config.join(".agy"))
+            .arg(root.join("skills-view"))
+            .arg(&op)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "owner fixture cleanup: {output:?}");
+        assert!(!config.join(".agy").exists());
+        assert!(!op.exists());
+        // Global read-only fixtures are daemon-owned, but deletion still
+        // requires owner write permission after all preservation assertions.
+        for path in [data.join("skills/global"), data.join("skills")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::remove_dir_all(&fixture).unwrap();
+        assert!(!fixture.exists());
+        println!("NATIVE_VENDOR_FIXTURE_REMOVED");
+    }
+
+    #[test]
+    fn shipping_launch_boundary_pins_before_marker_and_refreshes_only_on_cutover() {
+        use anyagents_core::{NewAgent, Store, host_session};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(NewAgent::new("launch-pin", "claude-code"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "before dispatch").unwrap();
+        let request = |agent| LaunchRequest {
+            agent,
+            data_dir: dir.path().to_owned(),
+            config_dir: config.clone(),
+            work_dir: root.join("work"),
+            extra_env: vec![],
+        };
+        prepare_host_session(&request(agent.clone())).unwrap();
+        let first = host_session::active(root).unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(config.join("CLAUDE.md"))
+                .unwrap()
+                .contains(&first.memory.section)
+        );
+        std::fs::write(root.join("memory/MEMORY.md"), "next session only").unwrap();
+        std::fs::write(config.join("claude-session-id"), "late-marker").unwrap();
+        prepare_host_session(&request(agent.clone())).unwrap();
+        agent.model = Some("changed model".into());
+        prepare_host_session(&request(agent.clone())).unwrap();
+        assert_eq!(host_session::active(root).unwrap().unwrap(), first);
+        assert_eq!(
+            host_session::resume_vendor(root, "claude-code", "late-marker").unwrap(),
+            first
+        );
+        agent.harness = "codex".into();
+        std::fs::write(config.join("codex-session-id"), "old-codex-resume-pointer").unwrap();
+        prepare_host_session(&request(agent.clone())).unwrap();
+        let next = host_session::active(root).unwrap().unwrap();
+        assert_ne!(next.generation, first.generation);
+        assert!(next.memory.section.contains("next session only"));
+        assert!(!config.join("codex-session-id").exists());
+        assert!(
+            std::fs::read_to_string(config.join("AGENTS.md"))
+                .unwrap()
+                .contains(&next.memory.section)
+        );
+        prepare_host_session(&request(agent)).unwrap();
+        assert_eq!(host_session::active(root).unwrap().unwrap(), next);
+    }
+
+    #[test]
     fn ensure_agy_steering_settings_populates_permissions_and_trusted_workspaces() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let config_dir = dir.path().join("config");
         let work_dir = dir.path().join("work");
         std::fs::create_dir_all(&config_dir).unwrap();

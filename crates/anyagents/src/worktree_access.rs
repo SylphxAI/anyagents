@@ -193,6 +193,27 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
     let path_env = std::env::join_paths(paths).map_err(|e| refusal(config, e))?;
     let staging = data.join("worktree-grants");
     std::fs::create_dir_all(&staging)?;
+    let staging = std::fs::canonicalize(staging)?;
+    // Even `git config --file` discovers the caller's repository first. The
+    // daemon may not be able to read that checkout under its reduced identity;
+    // an unrelated malformed config must not govern this file-only operation.
+    let git = || {
+        let mut command = std::process::Command::new("git");
+        command.current_dir(&staging).env("PATH", &path_env);
+        for key in [
+            "GIT_DIR",
+            "GIT_COMMON_DIR",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_CONFIG_COUNT",
+        ] {
+            command.env_remove(key);
+        }
+        // Explicit non-repository metadata also works for data roots containing
+        // ':', which cannot be represented in GIT_CEILING_DIRECTORIES on Unix.
+        command.env("GIT_DIR", "/dev/null");
+        command
+    };
     let temporary = staging.join(format!(
         "gitconfig-{}.tmp",
         anyagents_core::AgentId::generate()
@@ -205,8 +226,7 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
             .open(&temporary)?;
         file.write_all(&bytes)?;
         let edit = |args: &[&str]| -> Result<std::process::Output, Error> {
-            Ok(std::process::Command::new("git")
-                .env("PATH", &path_env)
+            Ok(git()
                 .args(["config", "--no-includes", "--file"])
                 .arg(&temporary)
                 .args(args)
@@ -252,8 +272,7 @@ pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Er
             for root in
                 std::iter::once(String::new()).chain(roots.iter().map(|p| p.display().to_string()))
             {
-                let out = std::process::Command::new("git")
-                    .env("PATH", &path_env)
+                let out = git()
                     .args(["config", "--no-includes", "--file"])
                     .arg(&suffix)
                     .args(["--add", "safe.directory", &root])
@@ -2643,6 +2662,94 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
         assert!(recorded.command().is_err(), "writable config must refuse");
         assert!(!marker.exists());
+    }
+
+    #[test]
+    fn seat_git_configuration_ignores_ambient_repository() {
+        const FIXTURE: &str = "ANYAGENTS_SEAT_GIT_FIXTURE";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let root = PathBuf::from(root);
+            let config = root.join("data/agents/synthetic/config");
+            let workdir = root.join("synthetic-work");
+            crate::create::ensure_seat_environment(&config, &workdir).unwrap();
+            let output = std::process::Command::new("git")
+                .current_dir(&config)
+                .env("GIT_DIR", "/dev/null")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_CONFIG_COUNT")
+                .args(["config", "--no-includes", "--file"])
+                .arg(config.join(".gitconfig"))
+                .args(["--get-all", "safe.directory"])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert_eq!(
+                output.stdout,
+                format!("\n{}\n", workdir.display()).as_bytes()
+            );
+            assert!(
+                std::fs::read_to_string(config.join(".gitconfig"))
+                    .unwrap()
+                    .contains("確認")
+            );
+            let invalid = b"[broken\n";
+            std::fs::write(config.join(".gitconfig"), invalid).unwrap();
+            let error = crate::create::ensure_seat_environment(&config, &workdir).unwrap_err();
+            assert!(
+                error.to_string().contains("cannot narrow safe.directory"),
+                "{error}"
+            );
+            assert_eq!(std::fs::read(config.join(".gitconfig")).unwrap(), invalid);
+            return;
+        }
+        let dir = tempfile::Builder::new()
+            .prefix("seat-git:parser-")
+            .tempdir()
+            .unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir.path())
+            .output()
+            .unwrap();
+        assert!(initialized.status.success(), "{initialized:?}");
+        std::fs::write(dir.path().join(".git/config"), "[ambient-broken\n").unwrap();
+        let config = dir.path().join("data/agents/synthetic/config");
+        std::fs::create_dir_all(&config).unwrap();
+        for routing in [
+            None,
+            Some(("GIT_DIR", dir.path().join(".git").into_os_string())),
+            Some(("GIT_CONFIG_PARAMETERS", "invalid".into())),
+            Some(("GIT_CONFIG_COUNT", "invalid".into())),
+        ] {
+            std::fs::write(
+                config.join(".gitconfig"),
+                "[safe]\n directory = *\n[alias]\n check = 確認\n",
+            )
+            .unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            // Isolate cwd and environment in the child instead of mutating
+            // process-global inputs of concurrently running tests.
+            for (key, _) in std::env::vars_os() {
+                if key.as_encoded_bytes().starts_with(b"ANYAGENTS_") {
+                    child.env_remove(key);
+                }
+            }
+            if let Some((key, value)) = &routing {
+                child.env(key, value);
+            }
+            let output = child
+                .current_dir(dir.path())
+                .env("ANYAGENTS_TESTS", "1")
+                .env(FIXTURE, dir.path())
+                .args([
+                    "--exact",
+                    "worktree_access::tests::seat_git_configuration_ignores_ambient_repository",
+                    "--nocapture",
+                ])
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "routing={routing:?}: {output:?}");
+        }
     }
 
     #[test]

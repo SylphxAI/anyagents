@@ -244,8 +244,43 @@ pub struct InboxResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RawCoordinateView {
+    pub segment: String,
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+    pub seq: u64,
+}
+impl From<anyagents_core::raw_segment::RawCoordinate> for RawCoordinateView {
+    fn from(c: anyagents_core::raw_segment::RawCoordinate) -> Self {
+        Self {
+            segment: c.segment.to_string_lossy().into(),
+            offset: c.offset,
+            length: c.length,
+            sha256: c.sha256,
+            seq: c.seq,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ConversationTurnView {
     pub id: String,
+    /// Exact bytes for an explicit bounded raw-range read; `text` is a lossy preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawCoordinateView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<RawCoordinateView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// `"in"` (received by the agent) or `"out"` (sent by the agent).
     pub direction: String,
     pub from: String,
@@ -253,7 +288,8 @@ pub struct ConversationTurnView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub text: String,
-    pub timestamp_ms: i64,
+    /// Null when the native historical event has no source timestamp.
+    pub timestamp_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]

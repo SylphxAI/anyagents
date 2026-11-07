@@ -2721,6 +2721,93 @@ impl Store {
         Ok(turns)
     }
 
+    /// Upgrade only authorized derivative chunks, in bounded batches. Old
+    /// standalone tool summaries have no recoverable raw mailbox body: preserve
+    /// them exactly rather than inventing the clipped-away suffix. New tools use
+    /// the full-text policy. Redacted mailbox bodies are the authoritative input.
+    fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
+        let mut conn = self.conn();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        loop {
+            let visibility = visible_agent_ids_sql("c.agent_id", visible, 1);
+            let mut select = tx.prepare(&format!(
+                "SELECT c.chunk_id,c.agent_id,c.agent_name,c.direction,c.sender,c.destination,
+                        c.timestamp_ms,COALESCE(m.body,o.body),c.kind,c.tool_name,c.seq
+                 FROM rag_chunks c
+                 LEFT JOIN messages m ON m.agent_id=c.agent_id AND m.id=c.chunk_id
+                 LEFT JOIN outbound_messages o ON o.agent_id=c.agent_id AND o.id=c.chunk_id
+                 WHERE c.text_format<2 AND COALESCE(m.body,o.body) IS NOT NULL{visibility}
+                 ORDER BY c.chunk_id LIMIT 32"
+            ))?;
+            struct Chunk {
+                id: String,
+                owner: String,
+                name: String,
+                direction: String,
+                sender: String,
+                destination: String,
+                timestamp: i64,
+                text: String,
+                kind: String,
+                tool: String,
+                seq: i64,
+            }
+            let chunks = select
+                .query_map(
+                    rusqlite::params_from_iter(scoped_params(&[], visible)),
+                    |r| {
+                        Ok(Chunk {
+                            id: r.get(0)?,
+                            owner: r.get(1)?,
+                            name: r.get(2)?,
+                            direction: r.get(3)?,
+                            sender: r.get(4)?,
+                            destination: r.get(5)?,
+                            timestamp: r.get(6)?,
+                            text: r.get(7)?,
+                            kind: r.get(8)?,
+                            tool: r.get(9)?,
+                            seq: r.get(10)?,
+                        })
+                    },
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            if chunks.is_empty() {
+                break;
+            }
+            for chunk in chunks {
+                if clean_rag_text(&chunk.text).chars().count() < 2 {
+                    tx.execute("DELETE FROM rag_chunks_fts WHERE chunk_id=?1", [&chunk.id])?;
+                    tx.execute(
+                        "DELETE FROM rag_chunks WHERE chunk_id=?1 AND agent_id=?2",
+                        params![chunk.id, chunk.owner],
+                    )?;
+                    continue;
+                }
+                index_rag_chunk(
+                    &tx,
+                    &chunk.id,
+                    &chunk.owner,
+                    &chunk.name,
+                    &chunk.direction,
+                    &chunk.sender,
+                    &chunk.destination,
+                    chunk.timestamp,
+                    &chunk.text,
+                    Some(&chunk.kind),
+                    Some(&chunk.tool),
+                    chunk.seq,
+                )?;
+                tx.execute(
+                    "UPDATE rag_chunks SET text_format=2 WHERE chunk_id=?1 AND agent_id=?2",
+                    params![chunk.id, chunk.owner],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`).
     ///
     /// Searches `rag_chunks` and `rag_chunks_fts` across `req.agent` (`None` or `"all"` searches all agents)
@@ -2730,6 +2817,7 @@ impl Store {
     /// `from_seq`, `to_seq`), ordering (`Relevance`, `Newest`, `Oldest`), and contiguous episode
     /// context expansion (`radius`).
     pub fn search_history(&self, req: &HistorySearchQuery) -> Result<Vec<ConversationTurn>, Error> {
+        self.backfill_full_mailbox_history(req.visible_agent_ids.as_deref())?;
         let conn = self.read_conn();
         let limit = req.limit.clamp(1, 200);
         let radius = req.radius.min(10);
@@ -3126,7 +3214,7 @@ impl Store {
         let mut matched_hits: Vec<(ConversationTurn, String, i64)> = Vec::new();
         for (cid, score) in ranked {
             if let Some((mut turn, aname, seq)) = chunk_meta.remove(&cid) {
-                let sig: String = turn.text.chars().take(180).collect();
+                let sig = crate::learned_memory::sha256(turn.text.as_bytes());
                 if !seen_text_sig.insert(sig) {
                     continue;
                 }
@@ -4602,8 +4690,7 @@ pub fn clean_rag_text(text: &str) -> String {
     {
         t = after_hdr[idx + "-------------------".len()..].trim();
     }
-    let out: String = t.chars().take(2400).collect();
-    out
+    t.to_owned()
 }
 
 /// Deterministic 128-bit FNV-1a content hash (`32` hex chars) shared by Rust and Python indexers.
@@ -4821,8 +4908,8 @@ fn index_rag_chunk(
     conn.execute(
         "INSERT OR REPLACE INTO rag_chunks (
             chunk_id, agent_id, agent_name, direction, sender, destination,
-            timestamp_ms, content_hash, text, kind, tool_name, seq
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            timestamp_ms, content_hash, text, kind, tool_name, seq, text_format
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 2)",
         params![
             chunk_id,
             agent_id,
@@ -6292,7 +6379,7 @@ mod tests {
     use super::*;
 
     fn setup() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         (dir, store)
     }
@@ -6301,6 +6388,35 @@ mod tests {
         store
             .create_agent(NewAgent::new(name, "claude-code"))
             .unwrap()
+    }
+
+    #[test]
+    fn lexical_dedup_keeps_distinct_tails_but_collapses_identical_broadcasts() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "dedup-own");
+        let other = agent(&store, "dedup-other");
+        let prefix = "shared-prefix ".repeat(300);
+        let first = format!("{prefix} dedupneedle first-tail");
+        let second = format!("{prefix} dedupneedle second-tail");
+        store
+            .record_outbound(&own.id, "agent:peer", None, &first)
+            .unwrap();
+        store
+            .record_outbound(&other.id, "agent:peer", None, &second)
+            .unwrap();
+        store
+            .record_outbound(&other.id, "agent:peer", None, &first)
+            .unwrap();
+        let hits = store
+            .search_history(&HistorySearchQuery {
+                query: Some("dedupneedle".into()),
+                visible_agent_ids: Some(vec![own.id.to_string(), other.id.to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.text == first));
+        assert!(hits.iter().any(|h| h.text == second));
     }
 
     #[test]
@@ -6620,7 +6736,7 @@ mod tests {
     /// cursor that still points at a row that exists.
     #[test]
     fn upgrading_a_two_cursor_store_keeps_one_cursor_and_drops_the_answer_rows() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("state.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
@@ -7262,6 +7378,159 @@ mod tests {
             .unwrap();
         assert_eq!(tools.len(), 1, "{tools:?}");
         assert!(tools[0].text.ends_with("own browser"));
+    }
+
+    #[test]
+    fn full_mailbox_tails_upgrade_only_authorized_chunks_and_survive_redaction_restart() {
+        let (dir, store) = setup();
+        let own = agent(&store, "tail-owner");
+        let hidden = agent(&store, "tail-hidden");
+        let prefix = "padding ".repeat(500);
+        let incoming = |text: String| Incoming {
+            text,
+            sender: Some("agent:peer".into()),
+            source_time_ms: None,
+            source_key: None,
+            reply_to: None,
+            quote: None,
+            origin: None,
+            received_at_ms: None,
+        };
+        store
+            .receive(&own.id, incoming(format!("{prefix} firsttailneedle")))
+            .unwrap();
+        store
+            .receive(&own.id, incoming(format!("{prefix} secondtailneedle")))
+            .unwrap();
+        store
+            .receive(&hidden.id, incoming(format!("{prefix} hiddentailneedle")))
+            .unwrap();
+        store
+            .record_outbound(
+                &own.id,
+                "agent:peer",
+                None,
+                &format!("{prefix} outboundtailneedle"),
+            )
+            .unwrap();
+        store
+            .record_tool_event(&own.id, "browser", &format!("{prefix} tooltailneedle"))
+            .unwrap();
+        let ids = [own.id.to_string()];
+        let query = |term: &str| HistorySearchQuery {
+            query: Some(term.into()),
+            visible_agent_ids: Some(ids.to_vec()),
+            ..Default::default()
+        };
+        for term in [
+            "firsttailneedle",
+            "secondtailneedle",
+            "outboundtailneedle",
+            "tooltailneedle",
+        ] {
+            assert_eq!(
+                store.search_history(&query(term)).unwrap().len(),
+                1,
+                "{term}"
+            );
+        }
+        let hashes: i64 = store.conn().query_row("SELECT count(DISTINCT content_hash) FROM rag_chunks WHERE agent_id=?1 AND direction='in'", [own.id.as_str()], |r| r.get(0)).unwrap();
+        assert_eq!(
+            hashes, 2,
+            "identical prefixes must not merge distinct tails"
+        );
+        // Simulate the already-present pre-upgrade population, including FTS.
+        // The real historical bodies remain untouched in the mailbox tables.
+        {
+            let conn = store.conn();
+            conn.execute("UPDATE rag_chunks SET text=substr(text,1,2400),text_format=1 WHERE chunk_id NOT LIKE 'tool_%'", []).unwrap();
+            conn.execute("DELETE FROM rag_chunks_fts", []).unwrap();
+            conn.execute("INSERT INTO rag_chunks_fts(chunk_id,agent_name,sender,destination,kind,tool_name,text,search_tokens) SELECT chunk_id,agent_name,sender,destination,kind,tool_name,text,text FROM rag_chunks", []).unwrap();
+        }
+        assert_eq!(
+            store
+                .search_history(&query("firsttailneedle"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_history(&query("outboundtailneedle"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let hidden_format: i64 = store
+            .conn()
+            .query_row(
+                "SELECT text_format FROM rag_chunks WHERE agent_id=?1",
+                [hidden.id.as_str()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            hidden_format, 1,
+            "hidden bodies must not be read/backfilled"
+        );
+        let message = store
+            .inbox(&own.id, None)
+            .unwrap()
+            .into_iter()
+            .find(|m| m.text.ends_with("firsttailneedle"))
+            .unwrap();
+        store.set_agent_state(&own.id, "archived").unwrap();
+        store
+            .redact_conversation(
+                crate::redaction::Actor::Operator,
+                &own.id,
+                &crate::redaction::Request {
+                    message_id: Some(message.id.to_string()),
+                    seq: None,
+                    span: Some(crate::redaction::Span {
+                        unit: crate::redaction::SpanUnit::Bytes,
+                        start: prefix.len() + 1,
+                        end: message.text.len(),
+                    }),
+                    reason: "remove tail".into(),
+                },
+            )
+            .unwrap();
+        // Retrying the upgrade must consume the redacted authoritative body,
+        // not resurrect text from an earlier derivative snapshot.
+        store
+            .conn()
+            .execute(
+                "UPDATE rag_chunks SET text_format=1 WHERE agent_id=?1",
+                [own.id.as_str()],
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        assert!(
+            store
+                .search_history(&query("firsttailneedle"))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .search_history(&query("secondtailneedle"))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .search_history(&HistorySearchQuery {
+                    query: Some("hiddentailneedle".into()),
+                    visible_agent_ids: Some(vec![hidden.id.to_string()]),
+                    ..Default::default()
+                })
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

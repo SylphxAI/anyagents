@@ -27,6 +27,19 @@ fn main() {
     let log_path = env::var_os("ANYAGENTS_FAKE_LOG").map(PathBuf::from);
     let argv = env::args().skip(1).collect::<Vec<_>>().join(" ");
     log(&log_path, &format!("argv:{argv}"));
+    if mode == "stderr_failure" {
+        let mut stderr = io::stderr().lock();
+        // More than a pipe buffer; no newline and a split diagnostic phrase.
+        stderr
+            .write_all(b"synthetic-password=do-not-publish Permis")
+            .unwrap();
+        stderr.write_all(b"sion denied\0\xff").unwrap();
+        for _ in 0..256 {
+            stderr.write_all(&[b'x'; 4096]).unwrap();
+        }
+        stderr.flush().unwrap();
+        std::process::exit(23);
+    }
     if mode == "die" {
         return;
     }

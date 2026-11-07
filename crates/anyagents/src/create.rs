@@ -755,6 +755,34 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Human Takeover**: On `captcha_detected: true`, call `browser({ \"action\": \"takeover\", \"reason\": \"Solve CAPTCHA\" })`, send `takeover_url` to the user, and resume via `wait_for_user` / `release_takeover`.\n",
     );
 
+    // Only the host lifecycle allocates a generation. Describe/restart/render
+    // consume its persisted pin without opening live learned-memory files.
+    if let Some(root) = config.parent() {
+        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. Only the separately delimited `<learned_memory>` section is the bounded immutable snapshot for this session.\n", root.display(), root.display()));
+        match anyagents_core::host_session::active(root) {
+            Ok(Some(session)) if session.harness == agent.harness => {
+                doc.push('\n');
+                doc.push_str(&session.memory.section);
+                doc.push('\n');
+            }
+            Ok(None) => (), // First dispatch pins and rerenders before launch.
+            Ok(Some(_)) => {
+                eprintln!(
+                    "refusing instruction refresh for {}: host session harness mismatch",
+                    agent.id
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "refusing instruction refresh for {}: invalid host memory pin: {error}",
+                    agent.id
+                );
+                return;
+            }
+        }
+    }
+
     if let Some(shared) = read_shared_agents_md(config) {
         doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
         doc.push_str(&shared);
@@ -1072,94 +1100,111 @@ pub(crate) fn sync_canonical_skills(data_dir: &Path) {
 
 #[cfg(unix)]
 pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
-    let data_skills = data_dir_from_config(target_config)
-        .map(|d| d.join("skills"))
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            target_config
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|d| d.join("skills"))
-                .filter(|p| p.is_dir())
-        });
-    let Some(skills_root) = data_skills else {
+    // An absent shared library must not disable the agent's own overlay.
+    let Some(data) = data_dir_from_config(target_config) else {
         return;
     };
-    for rel in [
-        "skills",
-        ".agents/skills",
-        ".claude/skills",
-        ".codex/skills",
-        "opencode/skills",
-        ".config/opencode/skills",
-        ".gemini/config/skills",
-        "muse/skills",
-        ".config/muse/skills",
-        ".omp/agent/skills",
-        ".dsh/skills",
-        ".grok/skills",
-    ] {
-        let dst = target_config.join(rel);
-        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
-            if meta.file_type().is_symlink()
-                && dst.exists()
-                && std::fs::read_link(&dst).ok().as_deref() == Some(skills_root.as_path())
-            {
-                continue;
-            }
-            if meta.file_type().is_dir() {
-                let _ = std::fs::remove_dir_all(&dst);
-            } else {
-                let _ = std::fs::remove_file(&dst);
-            }
-        }
-        if let Some(parent) = dst.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::os::unix::fs::symlink(&skills_root, &dst).is_err()
-            && !crate::sandbox::is_isolated_test_env()
-            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-            && let Some(anc_meta) = dst
-                .parent()
-                .and_then(|p| p.ancestors().find(|a| a.exists()))
-                .and_then(|a| std::fs::metadata(a).ok())
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let uid = anc_meta.uid();
-            let gid = anc_meta.gid();
-            if uid != 0
-                && let Some(parent) = Path::new(rel).parent()
-            {
-                let rel_parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                let uid_s = uid.to_string();
-                let gid_s = gid.to_string();
-                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
-                    .current_dir(target_config)
-                    .args([
-                        "--reuid",
-                        &uid_s,
-                        "--regid",
-                        &gid_s,
-                        "--groups",
-                        &gid_s,
-                        "--no-new-privs",
-                        "--",
-                        "sh",
-                        "-c",
-                        "mkdir -p \"$1\" && chmod a+rx \"$1\" && rm -rf \"$2\" && ln -sfn \"$3\" \"$2\"",
-                        "sh",
-                    ])
-                    .arg(rel_parent)
-                    .arg(rel)
-                    .arg(&skills_root)
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        }
+    let skills_root = data.join("skills");
+    if let Some(root) = target_config.parent()
+        && let Err(error) = anyagents_core::host_skills::mount_with_fallback(
+            root,
+            &skills_root,
+            target_config,
+            |target, view, global, overlay| {
+                install_skill_projection_as_owner(target_config, target, view, global, overlay)
+            },
+        )
+    {
+        eprintln!(
+            "skill overlay mount refused for {}: {error}",
+            target_config.display()
+        );
+    }
+}
+
+/// Only a refused mirror is delegated, and all effects run as the existing
+/// parent owner. No daemon chmod, broad home grant or foreign-link replacement.
+#[cfg(unix)]
+fn install_skill_projection_as_owner(
+    config: &Path,
+    target: &Path,
+    view: &Path,
+    global: &Path,
+    overlay: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let relative = target.strip_prefix(config).map_err(std::io::Error::other)?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::other("invalid skill projection path"));
+    }
+    let owner = target
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|p| p.starts_with(config))
+        .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
+    let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
+    if owner.uid() == crate::sandbox::server_uid() {
+        return Err(std::io::Error::other(
+            "skill projection is not owned by another seat",
+        ));
+    }
+    let launcher = crate::sandbox::descriptor_launcher()
+        .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
+    let output = std::process::Command::new(launcher).args([
+        "--reuid", &owner.uid().to_string(), "--regid", &owner.gid().to_string(),
+        "--groups", &owner.gid().to_string(), "--no-new-privs", "--", "/bin/sh", "-c",
+        r#"set -eu
+config=$1; relative=$2; view=$3; global=$4; overlay=$5
+# Every existing component is inspected by its actual owner, not the daemon
+# which was denied traversal. Foreign parent links are preserved untouched.
+parent=$config
+old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
+while [ "$#" -gt 1 ]; do
+  parent=$parent/$1; shift
+  if [ -L "$parent" ]; then exit 0; fi
+  mkdir -p "$parent"
+done
+target=$parent/$1
+if [ -L "$target" ]; then
+  old=$(readlink "$target")
+  if [ "$old" = "$view" ]; then exit 0; fi
+  if [ "$old" != "$global" ]; then exit 0; fi
+  temp=$parent/.skills-owner-$$
+  trap 'rm -f "$temp"' EXIT HUP INT TERM
+  ln -s "$view" "$temp"
+  mv -fT "$temp" "$target"
+elif [ -d "$target" ]; then
+  for item in "$target"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item"); source_parent=${old%/*}
+    if { [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; } && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
+  done
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    link=$target/${item##*/}; source=$(readlink "$item")
+    if [ -L "$link" ]; then
+      old=$(readlink "$link"); source_parent=${old%/*}
+      if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
+      if [ "$old" = "$source" ]; then continue; fi
+      rm "$link"
+    elif [ -e "$link" ]; then continue; fi
+    ln -s "$source" "$link"
+  done
+elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
+"#, "skill-projection-owner",
+    ]).args([config.as_os_str(), relative.as_os_str(), view.as_os_str(), global.as_os_str(), overlay.as_os_str()])
+        .stdin(std::process::Stdio::null()).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "owner skill projection refused: {}",
+            output.status
+        )))
     }
 }
 
@@ -1745,6 +1790,29 @@ pub(crate) struct ProviderProfileEntry {
     pub usage: Option<String>,
 }
 
+/// Caller holds the lifecycle lock and has re-read management authority.
+/// Process admission is checked before touching any host pin or native pointer.
+pub(crate) fn reset_agent_session_locked(
+    store: &Store,
+    agent: &Agent,
+) -> Result<serde_json::Value, Error> {
+    if agent.state == "running" {
+        return Err(Error::AgentBusy);
+    }
+    let _process = store.try_lock_agent(&agent.id)?;
+    let root = store.data_dir().join("agents").join(agent.id.as_str());
+    let session = anyagents_core::host_session::reset_session(
+        &root,
+        &agent.harness,
+        harness_session_filename(&agent.harness),
+    )?;
+    Ok(serde_json::json!({
+        "agent_id": agent.id, "name": agent.name, "state": agent.state,
+        "generation": session.generation, "harness": session.harness,
+        "memory_sha256": session.memory.sha256,
+    }))
+}
+
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
     match harness {
         "codex" => Some("codex-session-id"),
@@ -2143,14 +2211,22 @@ pub(crate) fn reconcile_agent_runtime_config(
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
         {
+            let mut seat_environment = Vec::new();
+            if let Some(spec) = spec_opt {
+                seat_environment.push((anyagents_harness::SEAT_LAUNCH_ENV.into(), spec));
+                seat_environment.push((
+                    anyagents_harness::SEAT_PEERS_ENV.into(),
+                    crate::sandbox::peer_principals(store)?,
+                ));
+            }
             muse_config::ensure_workspace_session(
                 data,
                 agent.id.as_str(),
                 config,
                 work_dir,
                 agent.model.as_deref(),
-                spec_opt.as_deref(),
-            );
+                &seat_environment,
+            )?;
         }
     } else {
         #[cfg(unix)]
@@ -2376,7 +2452,7 @@ pub(crate) fn maybe_notify_parent_on_error(
         return;
     };
     let trimmed = err_msg.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || crate::host_memory::is_migration_wait(trimmed) {
         return;
     }
     let rotated_ms = std::fs::read_to_string(config.join(".anyagents-profile-rotated-ms"))
@@ -7992,6 +8068,118 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn seat_skill_wrapper_mounts_overlay_without_shared_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/agent-id/config");
+        let skill = dir.path().join("agents/agent-id/skills/private/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(&skill, "---\nname: private\n---\nexact overlay").unwrap();
+        ensure_seat_skills(&config, dir.path());
+        assert_eq!(
+            std::fs::read(config.join(".claude/skills/private/SKILL.md")).unwrap(),
+            std::fs::read(skill).unwrap()
+        );
+        assert!(!dir.path().join("skills").exists());
+    }
+
+    #[test]
+    fn rendered_whole_memory_block_respects_caps_separate_from_fixed_file_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "caps-rendered",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &agent.id);
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "繁體長記憶".repeat(3000)).unwrap();
+        for harness in ["claude-code", "sylphx"] {
+            agent.harness = harness.into();
+            let pin = anyagents_core::host_session::new_session(root, harness).unwrap();
+            write_agent_instructions(&config, &agent, None);
+            for name in ["AGENTS.md", "CLAUDE.md", "SYSTEM_PROMPT.md"] {
+                let doc = std::fs::read_to_string(config.join(name)).unwrap();
+                // Find full delimiters at line boundaries, not their mention in
+                // the independent fixed operating instructions.
+                let start = doc.find("\n<learned_memory>\n").unwrap() + 1;
+                let end = doc[start..].find("</learned_memory>\n").unwrap()
+                    + start
+                    + "</learned_memory>\n".len();
+                let block = &doc[start..end];
+                assert_eq!(block, pin.memory.section);
+                assert!(block.len() <= 4096, "{name}: {} bytes", block.len());
+                assert!(block.lines().count() <= 150);
+                assert!(block.contains("Memory truncated"));
+                assert!(!block.contains("fixed; not learned memory"));
+                assert!(
+                    doc[..start]
+                        .contains("Host File Operating Instructions (fixed; not learned memory)")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {
+        use anyagents_core::host_session;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "memory-renderer",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(data, &agent.id);
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "PINNED_FIRST_FACT 繁體\n").unwrap();
+        let first = host_session::new_session(root, &agent.harness).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        let paths = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "SYSTEM_PROMPT.md",
+            ".claude/CLAUDE.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/config/GEMINI.md",
+        ];
+        for path in paths {
+            let text = std::fs::read_to_string(config.join(path)).unwrap();
+            assert!(text.contains(&first.memory.section), "{path}");
+        }
+        std::fs::write(root.join("memory/MEMORY.md"), "EDITED_SECOND_FACT\n").unwrap();
+        agent.description = Some("ordinary describe update".into());
+        write_agent_instructions(&config, &agent, None);
+        let rerender = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(rerender.contains("PINNED_FIRST_FACT"));
+        assert!(!rerender.contains("EDITED_SECOND_FACT"));
+        // Launch assembly consumes the actual mirror, not an isolated formatter.
+        let assembled =
+            anyagents_harness_sylphx::assemble_system_prompt(&config, &data.join("workspace"));
+        assert!(assembled.contains(&first.memory.section));
+        assert!(!assembled.contains("EDITED_SECOND_FACT"));
+        agent.harness = "sylphx".into();
+        let switched = host_session::new_session(root, &agent.harness).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        for path in paths {
+            let text = std::fs::read_to_string(config.join(path)).unwrap();
+            assert!(text.contains(&switched.memory.section));
+            assert!(!text.contains("PINNED_FIRST_FACT"));
+            assert!(text.contains("EDITED_SECOND_FACT"));
+        }
+        std::fs::remove_file(root.join("memory/MEMORY.md")).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        assert_eq!(host_session::active(root).unwrap().unwrap(), switched);
+    }
     #[test]
     fn parse_remaining_pct_from_usage_handles_agy_5h_and_7d_windows() {
         let usage = "gemini: 84% left (5h: 100%, 7d: 84%) · opus: 0% left (5h: 0%, 7d: 0%)";

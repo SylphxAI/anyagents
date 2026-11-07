@@ -78,6 +78,9 @@ pub fn agents(data: &Path, action: AgentsCommand) -> Result<(), Error> {
             let view = set_state(data, &name, "running")?;
             println!("{}\t{}\t{}", view.id, view.name, view.state);
         }
+        AgentsCommand::ResetSession { name } => {
+            reset_session_cmd(data, &name)?;
+        }
         AgentsCommand::Delete { name } => {
             delete_cmd(data, &name)?;
         }
@@ -633,6 +636,33 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+pub fn reset_session_cmd(data: &Path, name: &str) -> Result<(), Error> {
+    let result = if client::can_call_server(data) {
+        client::call::<serde_json::Value>(
+            data,
+            "POST",
+            &format!("/v1/agents/{name}/session/reset"),
+            Some(b"{}".to_vec()),
+            &client::authority(data),
+        )
+        .map_err(Error::Message)?
+        .ok_or_else(|| Error::Message("the server answered nothing".into()))?
+    } else {
+        if client::agent_identity().is_some() {
+            return Err(Error::Message(
+                "agent session reset requires the authenticated server; offline database fallback is disabled".into(),
+            ));
+        }
+        let store = open(data)?;
+        let found = store.agent_by_name(name)?;
+        let _lifecycle = store.try_lock_agent_lifecycle(&found.id)?;
+        let found = store.agent(&found.id)?;
+        crate::create::reset_agent_session_locked(&store, &found)?
+    };
+    println!("{result}");
+    Ok(())
+}
+
 pub fn resume_cmd(data: &Path, name: &str, prompt: Option<String>) -> Result<(), Error> {
     let view = set_state(data, name, "running")?;
     if let Some(text) = prompt.filter(|s| !s.trim().is_empty()) {
@@ -1125,7 +1155,12 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             && view.quota_reset_at_ms.is_none_or(|ms| ms <= now)
         {
             if let Some(ref err_msg) = view.last_error {
-                view.turn_state = "errored".to_string();
+                view.turn_state = if crate::host_memory::is_migration_wait(err_msg) {
+                    "idle"
+                } else {
+                    "errored"
+                }
+                .to_owned();
                 if let Ok(agent_rec) = store.agent(&id) {
                     crate::create::maybe_notify_parent_on_error(&store, &agent_rec, &cfg, err_msg);
                 }

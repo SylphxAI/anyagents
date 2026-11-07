@@ -23,7 +23,8 @@ struct Server {
 impl Server {
     fn start(dir: &Path) -> Self {
         let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
-            .env("ANYAGENTS_CLAUDE_BIN", env!("CARGO_BIN_EXE_anyagents"))
+            .env("ANYAGENTS_TESTS", "1")
+            .env("ANYAGENTS_CLAUDE_CODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
             .env("ANYAGENTS_FAKE_CLAUDE", "1")
             .env("PATH", machine_path(dir))
             .env("ANYAGENTS_FAKE_MODE", "hold")

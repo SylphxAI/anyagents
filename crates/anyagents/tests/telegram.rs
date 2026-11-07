@@ -229,14 +229,11 @@ struct Server {
 impl Server {
     /// Start the server on `data`, calling a fake Telegram at `api`.
     fn start(dir: &Path, api: &str) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
             .env("ANYAGENTS_FAKE_OPENCODE", "1")
             .env("ANYAGENTS_FAKE_LOG", dir.join("fake.log"))
             .env("ANYAGENTS_TELEGRAM_API", api)
-            .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-            .env("ANYAGENTS_AGENTS", support::agents_line())
-            .env("ANYAGENTS_TESTS", "own-seat")
             // The server reads its operator's token from this file, the one
             // every call in the test presents.
             .env(
@@ -1027,14 +1024,12 @@ fn a_telegram_webhook_verifies_the_secret_and_delivers_to_the_mailbox() {
     let agent = create(&data, "ada");
     let channel_id = add_channel(&data, "ada", "777:fake-token-not-real");
 
-    let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let child = support::contract_server()
         .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
         .env("ANYAGENTS_FAKE_OPENCODE", "1")
         .env("ANYAGENTS_FAKE_LOG", data.join("fake.log"))
         .env("ANYAGENTS_TELEGRAM_API", &fake.address)
         .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
-        .env("ANYAGENTS_LAUNCHER", support::fake_launcher(&data))
-        .env("ANYAGENTS_AGENTS", support::agents_line())
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
             data.join(support::TOKEN_FILE),

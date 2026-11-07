@@ -32,7 +32,11 @@ pub mod sandbox {
     use std::path::PathBuf;
 
     pub fn is_isolated_test_env() -> bool {
-        cfg!(test)
+        isolated_test_env(cfg!(test))
+    }
+
+    fn isolated_test_env(test_build: bool) -> bool {
+        test_build
             || std::env::var_os("ANYAGENTS_FAKE_MODE").is_some()
             || std::env::var_os("ANYAGENTS_TESTS").is_some()
             || std::env::var_os("ANYAGENTS_FAKE_LOG").is_some()
@@ -73,6 +77,47 @@ pub mod sandbox {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn claude_executable_override_does_not_select_test_isolation() {
+            const PROBE: &str = "ANYAGENTS_ISOLATION_REGRESSION_PROBE";
+            if let Some(expected) = std::env::var_os(PROBE) {
+                // Unit binaries are test builds; exercise the exact production
+                // predicate with that compile-time input false, without host reads.
+                assert_eq!(isolated_test_env(false), expected == "true");
+                assert!(is_isolated_test_env());
+                return;
+            }
+            for (override_bin, explicit_test) in [(false, false), (true, false), (true, true)] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .env_clear()
+                    .env(PROBE, explicit_test.to_string())
+                    .args([
+                        "--exact",
+                        "sandbox::tests::claude_executable_override_does_not_select_test_isolation",
+                        "--nocapture",
+                    ]);
+                if override_bin {
+                    child.env("ANYAGENTS_CLAUDE_CODE_BIN", "/opt/vendor/claude");
+                }
+                if explicit_test {
+                    child.env("ANYAGENTS_TESTS", "1");
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "override={override_bin}, explicit_test={explicit_test}: {}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
     }
 }
 
@@ -6532,9 +6577,9 @@ mod tests {
             &launcher,
             r#"#!/bin/bash
 set -eu
-[[ "$1" == --reuid && "$2" == fixture-uid ]]
-[[ "$3" == --regid && "$4" == fixture-gid ]]
-[[ "$5" == --groups && "$6" == fixture-groups ]]
+[[ "$1" == --reuid && "$2" == 24031 ]]
+[[ "$3" == --regid && "$4" == 24032 ]]
+[[ "$5" == --groups && "$6" == 24032,24033 ]]
 [[ "$7" == --no-new-privs && "$8" == -- ]]
 [[ -z ${ANYAGENTS_SEAT_LAUNCH+x} ]]
 shift 8
@@ -6543,6 +6588,9 @@ if [[ ${WORKSPACE_TEST_REFUSE:-0} == 1 ]]; then
     echo 'fixture launcher refused' >&2
     exit 73
 fi
+# This unit double proves routing only. The required native-UID fixture
+# executes the admission script with real setpriv instead.
+if [[ "$1" == /bin/sh && "${2:-}" == -c ]]; then exit 0; fi
 exec "$@"
 "#,
         )
@@ -6550,12 +6598,10 @@ exec "$@"
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
         (
             vec![
+                ("ANYAGENTS_DATA".into(), root.display().to_string()),
                 (
                     anyagents_harness::SEAT_LAUNCH_ENV.into(),
-                    format!(
-                        "{}\tfixture-uid\tfixture-gid\tfixture-groups",
-                        launcher.display()
-                    ),
+                    format!("{}\t24031\t24032\t24032,24033", launcher.display()),
                 ),
                 (
                     "WORKSPACE_TEST_LAUNCH_LOG".into(),
@@ -6780,7 +6826,7 @@ exec "$@"
             .find(|(k, _)| k == anyagents_harness::SEAT_LAUNCH_ENV)
             .unwrap()
             .1 = format!(
-            "{}\tfixture-uid\tfixture-gid\tfixture-groups",
+            "{}\t24031\t24032\t24032,24033",
             tmp.path().join("no-launcher").display()
         );
         for (name, args) in [
@@ -6801,11 +6847,7 @@ exec "$@"
                 assert_eq!(std::fs::read(path).unwrap(), *bytes);
             }
         }
-        for malformed in [
-            "",
-            "bad\tspec",
-            "\tfixture-uid\tfixture-gid\tfixture-groups",
-        ] {
+        for malformed in ["", "bad\tspec", "\t24031\t24032\t24032,24033"] {
             let mut bad = env.clone();
             bad.iter_mut()
                 .find(|(k, _)| k == anyagents_harness::SEAT_LAUNCH_ENV)

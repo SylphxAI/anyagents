@@ -132,10 +132,10 @@ pub fn ensure_workspace_session(
     config_dir: &Path,
     work_dir: &Path,
     model: Option<&str>,
-    seat_spec: Option<&str>,
-) {
+    seat_environment: &[(String, String)],
+) -> Result<(), Error> {
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_some() {
-        return;
+        return Ok(());
     }
     let sid_path = config_dir.join("muse-session-id");
     let marker_path = config_dir.join(".anyagents-muse-workspace-session");
@@ -146,7 +146,7 @@ pub fn ensure_workspace_session(
     ) {
         let sid = sid.trim();
         if !sid.is_empty() && marker == expected_marker(sid) {
-            return;
+            return Ok(());
         }
     }
     let program = std::env::var("ANYAGENTS_MUSE_BIN").unwrap_or_else(|_| "muse".to_string());
@@ -154,28 +154,27 @@ pub fn ensure_workspace_session(
         .map(str::trim)
         .filter(|m| !m.is_empty())
         .unwrap_or("muse-wonder-full-1.0");
-    let mut cmd = if let Some(spec) = seat_spec {
-        let parts: Vec<&str> = spec.split('\t').collect();
-        if parts.len() == 4 {
-            let mut c = std::process::Command::new(parts[0]);
-            c.args([
-                "--reuid",
-                parts[1],
-                "--regid",
-                parts[2],
-                "--groups",
-                parts[3],
-                "--no-new-privs",
-                "--",
-                &program,
-            ]);
-            c
-        } else {
-            std::process::Command::new(&program)
-        }
-    } else {
-        std::process::Command::new(&program)
-    };
+    let mut environment = seat_environment.to_vec();
+    for (key, value) in [
+        ("ANYAGENTS_DATA", data_dir.to_owned()),
+        ("ANYAGENTS_AGENT_CONFIG", config_dir.to_owned()),
+        ("MUSE_CONFIG_HOME", config_dir.to_owned()),
+        ("XDG_CONFIG_HOME", config_dir.to_owned()),
+        ("XDG_DATA_HOME", config_dir.join("data-home")),
+        ("XDG_STATE_HOME", config_dir.join("state-home")),
+        ("XDG_CACHE_HOME", config_dir.join("cache-home")),
+        ("HOME", config_dir.to_owned()),
+        ("TMPDIR", config_dir.join("tmp")),
+    ] {
+        environment.push((key.to_owned(), value.display().to_string()));
+    }
+    environment.push(("ANYAGENTS_AGENT_ID".into(), agent_id.into()));
+    environment.push(("MUSE_NO_AUTO_UPDATE".into(), "1".into()));
+    // This initializer is a real vendor process, including during explicit
+    // wake reconciliation before the ordinary adapter exists. Use exactly the
+    // same admission and authority stripping as every other vendor launch.
+    let mut cmd = anyagents_harness::spawn_command(Path::new(&program), &environment)
+        .map_err(|error| Error::Message(error.to_string()))?;
     cmd.args([
         "serve",
         "--provider",
@@ -191,32 +190,21 @@ pub fn ensure_workspace_session(
         "context.foreign_personal_skills=false",
     ])
     .current_dir(work_dir)
-    .env("ANYAGENTS_DATA", data_dir)
-    .env("ANYAGENTS_AGENT_ID", agent_id)
-    .env("ANYAGENTS_AGENT_CONFIG", config_dir)
-    .env("MUSE_CONFIG_HOME", config_dir)
-    .env("XDG_CONFIG_HOME", config_dir)
-    .env("XDG_DATA_HOME", config_dir.join("data-home"))
-    .env("XDG_STATE_HOME", config_dir.join("state-home"))
-    .env("XDG_CACHE_HOME", config_dir.join("cache-home"))
-    .env("HOME", config_dir)
-    .env("TMPDIR", config_dir.join("tmp"))
-    .env("MUSE_NO_AUTO_UPDATE", "1")
     .stdin(std::process::Stdio::piped())
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null());
 
     let Ok(mut child) = cmd.spawn() else {
-        return;
+        return Ok(());
     };
     let Some(mut stdin) = child.stdin.take() else {
         let _ = child.wait();
-        return;
+        return Ok(());
     };
     let Some(stdout) = child.stdout.take() else {
         drop(stdin);
         let _ = child.wait();
-        return;
+        return Ok(());
     };
     use std::io::{BufRead as _, BufReader, Write as _};
     let mut reader = BufReader::new(stdout);
@@ -235,13 +223,13 @@ pub fn ensure_workspace_session(
     if writeln!(stdin, "{init}").is_err() || stdin.flush().is_err() {
         drop(stdin);
         let _ = child.wait();
-        return;
+        return Ok(());
     }
     let mut line = String::new();
     if reader.read_line(&mut line).is_err() || line.is_empty() {
         drop(stdin);
         let _ = child.wait();
-        return;
+        return Ok(());
     }
     let _ = writeln!(
         stdin,
@@ -277,7 +265,7 @@ pub fn ensure_workspace_session(
     if writeln!(stdin, "{start_req}").is_err() || stdin.flush().is_err() {
         drop(stdin);
         let _ = child.wait();
-        return;
+        return Ok(());
     }
     let mut minted_sid = None;
     for _ in 0..32 {
@@ -301,6 +289,7 @@ pub fn ensure_workspace_session(
         let _ = std::fs::write(&sid_path, format!("{sid}\n"));
         let _ = std::fs::write(&marker_path, expected_marker(&sid));
     }
+    Ok(())
 }
 
 static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -327,6 +316,61 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn fresh_session_initializer_propagates_admission_refusal_without_starting_vendor() {
+        // Process isolation keeps the real initializer's fake-mode and binary
+        // selectors independent of every other test's inherited environment.
+        const ROOT: &str = "ANYAGENTS_TEST_MUSE_REFUSAL_ROOT";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let data = std::path::PathBuf::from(root);
+            let config = data.join("agents/one/config");
+            let uid = crate::sandbox::server_uid();
+            let environment = vec![(
+                anyagents_harness::SEAT_LAUNCH_ENV.into(),
+                format!("/bin/sh\t{uid}\t2100\t2100"),
+            )];
+            let error = ensure_workspace_session(&data, "one", &config, &data, None, &environment)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("agent not started: the agent uid is root or the server's own uid"),
+                "{error}"
+            );
+            for marker in [
+                "vendor-started",
+                "muse-session-id",
+                ".anyagents-muse-workspace-session",
+            ] {
+                assert!(!config.join(marker).exists(), "refusal created {marker}");
+            }
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("agents/one/config")).unwrap();
+        let probe = dir.path().join("muse-probe");
+        std::fs::write(
+            &probe,
+            b"#!/bin/sh\nprintf started > \"$ANYAGENTS_AGENT_CONFIG/vendor-started\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "muse_config::tests::fresh_session_initializer_propagates_admission_refusal_without_starting_vendor", "--nocapture", "--test-threads=1"])
+            .env_remove("ANYAGENTS_FAKE_MODE")
+            .env("ANYAGENTS_MUSE_BIN", &probe)
+            .env(ROOT, dir.path())
+            .output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    }
 
     #[test]
     fn the_mcp_server_and_model_are_written_and_other_keys_kept() {

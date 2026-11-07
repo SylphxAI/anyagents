@@ -7,10 +7,19 @@
 mod address;
 pub mod boundary;
 mod error;
+mod host_cursor;
+pub mod host_index;
+pub mod host_migration;
+mod host_native_metadata;
+pub mod host_retrieval;
+pub mod host_session;
+pub mod host_skills;
 mod id;
+pub mod learned_memory;
 pub mod masking;
 mod migrate;
 pub mod quote;
+pub mod raw_segment;
 pub mod redaction;
 mod secret;
 mod store;
@@ -37,4 +46,16 @@ pub fn authenticate_presentation(token: Option<&str>) -> Option<String> {
         .map(str::trim)
         .filter(|token| !token.is_empty())
         .map(str::to_string)
+}
+
+/// Physical fixture roots keep system aliases (for example a temporary-root
+/// symlink) outside the boundary. Product readers still refuse all symlinks.
+#[cfg(test)]
+pub(crate) fn test_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary root"),
+    )
+    .expect("owned temporary fixture")
 }

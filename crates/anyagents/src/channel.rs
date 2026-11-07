@@ -329,7 +329,8 @@ fn emit_turns(target: &str, query: Option<&str>, turns: Vec<crate::api::Conversa
     for turn in turns {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}",
-            turn.timestamp_ms,
+            turn.timestamp_ms
+                .map_or_else(|| "unknown".into(), |ms| ms.to_string()),
             turn.direction,
             turn.id,
             turn.from,
@@ -413,13 +414,20 @@ pub fn conversation(
     let views = turns
         .into_iter()
         .map(|t| crate::api::ConversationTurnView {
+            raw_bytes: None,
+            source: None,
+            raw: None,
+            window: None,
+            tool_name: None,
+            tool_names: Vec::new(),
+            role: None,
             id: t.id,
             direction: t.direction,
             from: t.from,
             to: t.to,
             text: t.text,
             reply_to: t.reply_to,
-            timestamp_ms: t.timestamp_ms,
+            timestamp_ms: Some(t.timestamp_ms),
         })
         .collect();
     emit_turns(&target, clean_query, views);

@@ -133,10 +133,12 @@ name = "anyagents-core"
 version = "0.1.3"
 dependencies = [
  "anyagents-harness",
+ "chrono",
  "libc",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "uuid",

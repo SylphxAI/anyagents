@@ -231,7 +231,7 @@ impl OpenCodeHarness {
         &mut self,
         port: u16,
     ) -> Result<(bool, std::sync::mpsc::Receiver<bool>), HarnessError> {
-        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment);
+        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment)?;
         command
             .args([
                 "serve",
@@ -245,9 +245,6 @@ impl OpenCodeHarness {
             .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            command.env(key, value);
         }
         // Inherited credentials suppress the password announcement. Generate a
         // fresh child credential instead; only API children receive it below.
@@ -415,7 +412,7 @@ impl OpenCodeHarness {
     /// One `opencode api` call. Its own process, so a hung vendor call cannot
     /// hold the adapter, and a failure names the call and never a secret.
     fn api(&self, method: &str, path: &str, body: Option<Value>) -> Result<Value, HarnessError> {
-        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment);
+        let mut command = anyagents_harness::spawn_command(&self.program, &self.environment)?;
         // `opencode api --server <url> <METHOD> <path>`, as the CLI reads it:
         // the subcommand comes first, then its flags.
         command.arg("api");
@@ -435,9 +432,6 @@ impl OpenCodeHarness {
             .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            command.env(key, value);
         }
         if let Some(password) = self.lock().password.clone() {
             command.env("OPENCODE_PASSWORD", password);

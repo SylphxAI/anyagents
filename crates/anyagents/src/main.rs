@@ -19,6 +19,7 @@ mod fake_opencode;
 mod gateway;
 mod grok;
 mod harness_double;
+mod host_memory;
 mod identity;
 mod install;
 mod mcp;
@@ -29,6 +30,7 @@ mod operator;
 mod reply;
 mod sandbox;
 mod schedule;
+mod seat_tree;
 mod server;
 mod signin;
 mod sylphx;
@@ -732,6 +734,9 @@ enum AgentsCommand {
     Pause { name: String },
     /// Wake and resume an archived or paused agent (`state = running`).
     Wake { name: String },
+    /// Start a new logical session for a quiescent agent; retain all old history and pins.
+    #[command(alias = "new-session")]
+    ResetSession { name: String },
     /// Permanently delete an agent and its on-disk directory.
     Delete { name: String },
     /// List agents.
@@ -2677,4 +2682,16 @@ fn groups(data: &Path, action: GroupsCommand) -> Result<(), anyagents_core::Erro
         }
     }
     Ok(())
+}
+
+/// Physical fixture roots keep system aliases (for example a temporary-root
+/// symlink) outside the boundary. Product readers still refuse all symlinks.
+#[cfg(test)]
+pub(crate) fn test_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary root"),
+    )
+    .expect("owned temporary fixture")
 }
