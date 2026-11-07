@@ -27,6 +27,15 @@ pub enum Error {
     AgentBusy,
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
+    #[error("failed to provision worktree for `{repo}`: {message}")]
+    WorktreeProvisioning { repo: String, message: String },
+    #[error(
+        "cannot provision worktree from `{source_repo}`: {message}; push to a GitHub remote before spawning"
+    )]
+    WorktreeSourceUnpublished {
+        source_repo: String,
+        message: String,
+    },
     #[error("{0}")]
     Message(String),
 }

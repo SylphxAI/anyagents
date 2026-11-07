@@ -6404,7 +6404,10 @@ impl ApiError {
         let status = match &err {
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
             Error::AgentExists(_) => StatusCode::CONFLICT,
-            Error::InvalidAddress(_) | Error::Message(_) => StatusCode::BAD_REQUEST,
+            Error::InvalidAddress(_)
+            | Error::Message(_)
+            | Error::WorktreeSourceUnpublished { .. } => StatusCode::BAD_REQUEST,
+            Error::WorktreeProvisioning { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

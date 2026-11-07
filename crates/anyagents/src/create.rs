@@ -35,6 +35,20 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
 }
 
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
+    create_with_consumer(
+        store,
+        data,
+        request,
+        &crate::worktree::Consumer::configured(),
+    )
+}
+
+fn create_with_consumer(
+    store: &Store,
+    data: &Path,
+    request: CreateRequest,
+    consumer: &crate::worktree::Consumer,
+) -> Result<Agent, Error> {
     let normalized_harness = match request.harness.trim() {
         "sylphx-agent" | "sylphx_agent" => "sylphx".to_string(),
         other => other.to_string(),
@@ -174,8 +188,8 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
                     None => managed_abs.clone(),
                 };
                 provision_managed_worktree(
+                    consumer,
                     store,
-                    &data,
                     &agent,
                     &config,
                     repo_raw,
@@ -278,9 +292,9 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn provision_managed_worktree(
+fn provision_managed_worktree(
+    consumer: &crate::worktree::Consumer,
     store: &Store,
-    data: &Path,
     agent: &Agent,
     config: &Path,
     repo_raw: &str,
@@ -290,10 +304,6 @@ pub(crate) fn provision_managed_worktree(
     parent_name: Option<&str>,
 ) -> Result<(), Error> {
     if target_wt.exists() {
-        if target_wt.join(".git").exists() {
-            record_managed_worktree_marker(config, target_wt, repo_raw, branch_opt);
-            return Ok(());
-        }
         let is_empty = std::fs::read_dir(target_wt)
             .ok()
             .is_some_and(|mut d| d.next().is_none());
@@ -320,7 +330,7 @@ pub(crate) fn provision_managed_worktree(
         repo_raw.to_ascii_lowercase().as_str(),
         "inherit" | "parent" | "worktree" | "branch" | "isolated"
     ) {
-        let mut parent_wd = agent
+        let parent_wd = agent
             .parent_id
             .as_ref()
             .and_then(|pid| store.agent(pid).ok())
@@ -331,119 +341,11 @@ pub(crate) fn provision_managed_worktree(
                     "repo=\"inherit\" requires a parent agent with an active git workdir".into(),
                 )
             })?;
-        if !is_git_repo_dir(&parent_wd)
-            && let Some(fallback) = crate::server::owner_workdir()
-            && is_git_repo_dir(&fallback)
-        {
-            parent_wd = fallback;
-        }
-        add_git_worktree_from_local_repo(&parent_wd, target_wt, &branch, base)?;
+        consumer.local(&parent_wd, target_wt, &branch, base)?;
     } else if Path::new(repo_raw).is_dir() && is_git_repo_dir(Path::new(repo_raw)) {
-        add_git_worktree_from_local_repo(Path::new(repo_raw), target_wt, &branch, base)?;
-    } else if repo_raw.contains('/') && !repo_raw.contains("..") {
-        let desk_hub_bin = std::env::var_os("ANYAGENTS_GIT_HUB_BIN")
-            .map(PathBuf::from)
-            .or_else(|| crate::sandbox::host_home_dir().map(|h| h.join(".local/bin/desk-git-hub")));
-        let hub_fallback =
-            Path::new("/workspace-data/desk-git-hubs").join(repo_raw.replacen('/', "-", 1));
-        let data_hub_fallback = data.join("git-hubs").join(repo_raw);
-        let data_repos_hub = data.join("repos").join(
-            repo_raw
-                .trim_start_matches("https://github.com/")
-                .trim_end_matches(".git"),
-        );
-        if let Some(ref desk_hub_bin) = desk_hub_bin
-            && desk_hub_bin.is_file()
-            && !crate::sandbox::is_isolated_test_env()
-            && !repo_raw.starts_with("http://")
-            && !repo_raw.starts_with("https://")
-        {
-            if let Some(b) = base
-                && !b.starts_with("origin/")
-                && b != "HEAD"
-            {
-                let _ = std::process::Command::new(desk_hub_bin)
-                    .args(["fetch", repo_raw, b])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-            let mut cmd = std::process::Command::new(desk_hub_bin);
-            cmd.args(["worktree", repo_raw]).arg(target_wt).arg(&branch);
-            if let Some(b) = base {
-                let start_ref = if b.starts_with("origin/") || b == "HEAD" {
-                    b.to_string()
-                } else {
-                    format!("origin/{b}")
-                };
-                cmd.arg(start_ref);
-            }
-            let out = cmd.output()?;
-            if !out.status.success() {
-                if hub_fallback.is_dir() && is_git_repo_dir(&hub_fallback) {
-                    add_git_worktree_from_local_repo(
-                        &hub_fallback,
-                        target_wt,
-                        &branch,
-                        Some(base.unwrap_or("origin/HEAD")),
-                    )?;
-                } else {
-                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-                    return Err(Error::Message(format!(
-                        "failed to provision worktree for `{repo_raw}`: {stderr}"
-                    )));
-                }
-            }
-        } else if data_hub_fallback.is_dir() && is_git_repo_dir(&data_hub_fallback) {
-            add_git_worktree_from_local_repo(&data_hub_fallback, target_wt, &branch, base)?;
-        } else if data_repos_hub.is_dir() && is_git_repo_dir(&data_repos_hub) {
-            add_git_worktree_from_local_repo(&data_repos_hub, target_wt, &branch, base)?;
-        } else if hub_fallback.is_dir() && is_git_repo_dir(&hub_fallback) {
-            add_git_worktree_from_local_repo(
-                &hub_fallback,
-                target_wt,
-                &branch,
-                Some(base.unwrap_or("origin/HEAD")),
-            )?;
-        } else if !crate::sandbox::is_isolated_test_env() {
-            let remote_url = if repo_raw.starts_with("http://")
-                || repo_raw.starts_with("https://")
-                || repo_raw.starts_with("git@")
-            {
-                repo_raw.to_string()
-            } else {
-                format!("https://github.com/{repo_raw}.git")
-            };
-            if let Some(parent_hub) = data_repos_hub.parent() {
-                std::fs::create_dir_all(parent_hub)?;
-            }
-            let clone_out = std::process::Command::new("git")
-                .args(["clone", "--no-checkout", &remote_url])
-                .arg(&data_repos_hub)
-                .output()?;
-            if !clone_out.status.success() {
-                let stderr = String::from_utf8_lossy(&clone_out.stderr)
-                    .trim()
-                    .to_string();
-                return Err(Error::Message(format!(
-                    "git clone for `{repo_raw}` failed: {stderr}"
-                )));
-            }
-            add_git_worktree_from_local_repo(
-                &data_repos_hub,
-                target_wt,
-                &branch,
-                Some(base.unwrap_or("origin/HEAD")),
-            )?;
-        } else {
-            return Err(Error::Message(format!(
-                "repository `{repo_raw}` not found locally"
-            )));
-        }
+        consumer.local(Path::new(repo_raw), target_wt, &branch, base)?;
     } else {
-        return Err(Error::Message(format!(
-            "invalid `repo` value `{repo_raw}`: pass `<org>/<repo>`, `\"inherit\"`, or a local git repository path"
-        )));
+        consumer.remote(repo_raw, target_wt, &branch, base)?;
     }
 
     let _ = std::process::Command::new("git")
@@ -478,40 +380,6 @@ fn is_git_repo_dir(path: &Path) -> bool {
         .stderr(std::process::Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
-}
-
-fn add_git_worktree_from_local_repo(
-    source_repo: &Path,
-    target_wt: &Path,
-    branch: &str,
-    base: Option<&str>,
-) -> Result<(), Error> {
-    let start_ref = base.unwrap_or("HEAD");
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(source_repo)
-        .args(["worktree", "add", "-B", branch])
-        .arg(target_wt)
-        .arg(start_ref)
-        .output()?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let fallback = std::process::Command::new("git")
-        .arg("-C")
-        .arg(source_repo)
-        .args(["worktree", "add", "--detach"])
-        .arg(target_wt)
-        .arg(start_ref)
-        .output()?;
-    if fallback.status.success() {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-    Err(Error::Message(format!(
-        "git worktree add from `{}` failed: {stderr}",
-        source_repo.display()
-    )))
 }
 
 fn provision_cloud_sandbox_worktree_marker(
@@ -7741,6 +7609,114 @@ mod tests {
         );
     }
 
+    fn worktree_request(name: &str, repo: Option<String>) -> CreateRequest {
+        CreateRequest {
+            name: name.into(),
+            role: None,
+            harness: "codex".into(),
+            model: None,
+            profile: None,
+            repo,
+            branch: None,
+            base: None,
+            workdir: None,
+            workdir_default: None,
+            instructions: None,
+            parent_id: None,
+        }
+    }
+
+    #[test]
+    fn consumer_refusal_rolls_back_spawn_and_private_never_calls_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        std::fs::write(&fixture.fail, "worktree").unwrap();
+        let err = create_with_consumer(
+            &store,
+            data,
+            worktree_request("refused", Some("SylphxAI/demo".into())),
+            &fixture.consumer,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::WorktreeProvisioning { ref message, .. }
+            if message.contains("injected policy refusal")),
+            "{err}"
+        );
+        assert!(matches!(
+            store.agent_by_name("refused"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(std::fs::read_dir(data.join("agents")).unwrap().count(), 0);
+        let before = std::fs::read_to_string(&fixture.log).unwrap();
+        let mut request = worktree_request("private", None);
+        request.workdir = Some("private".into());
+        let private = create_with_consumer(&store, data, request, &fixture.consumer).unwrap();
+        let wd = PathBuf::from(private.workdir.unwrap());
+        assert!(wd.is_dir());
+        assert!(!wd.join(".git").exists());
+        assert_eq!(std::fs::read_dir(wd).unwrap().count(), 0);
+        assert_eq!(std::fs::read_to_string(&fixture.log).unwrap(), before);
+    }
+
+    #[test]
+    fn local_repo_spawn_uses_consumer_and_refuses_unpushed_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let repo = fixture.source.display().to_string();
+        let agent = create_with_consumer(
+            &store,
+            data,
+            worktree_request("local", Some(repo.clone())),
+            &fixture.consumer,
+        )
+        .unwrap();
+        fixture.assert_checkout(Path::new(agent.workdir.as_deref().unwrap()));
+        let inherited_workdir = Path::new(agent.workdir.as_deref().unwrap());
+        crate::worktree::tests::git(
+            inherited_workdir,
+            &["commit", "--allow-empty", "-m", "Unpublished parent"],
+        );
+        let mut inherit = worktree_request("unpublished-parent", Some("inherit".into()));
+        inherit.parent_id = Some(agent.id.clone());
+        let err = create_with_consumer(&store, data, inherit, &fixture.consumer).unwrap_err();
+        assert!(
+            matches!(err, Error::WorktreeSourceUnpublished { ref message, .. }
+            if message.contains("push HEAD first")),
+            "{err}"
+        );
+        assert!(matches!(
+            store.agent_by_name("unpublished-parent"),
+            Err(Error::AgentNotFound(_))
+        ));
+        crate::worktree::tests::git(
+            &fixture.source,
+            &["commit", "--allow-empty", "-m", "Unpublished"],
+        );
+        let before = std::fs::read_to_string(&fixture.log).unwrap();
+        let err = create_with_consumer(
+            &store,
+            data,
+            worktree_request("unpublished", Some(repo)),
+            &fixture.consumer,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::WorktreeSourceUnpublished { ref message, .. }
+            if message.contains("push HEAD first")),
+            "{err}"
+        );
+        assert!(matches!(
+            store.agent_by_name("unpublished"),
+            Err(Error::AgentNotFound(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&fixture.log).unwrap(), before);
+    }
+
     #[test]
     fn shared_agents_md_and_managed_repo_worktree_lifecycle() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -7754,46 +7730,10 @@ mod tests {
         )
         .unwrap();
 
-        // 2. Seed a local Git repository to test declarative `repo` worktree provisioning
-        let hub_repo = data.join("git-hubs/SylphxAI/demo");
-        std::fs::create_dir_all(&hub_repo).unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&hub_repo)
-                .args(["init", "-b", "main"])
-                .status()
-                .unwrap()
-                .success()
-        );
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&hub_repo)
-            .args(["config", "user.name", "Kyle Tse"])
-            .status()
-            .unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&hub_repo)
-            .args(["config", "user.email", "hi@kylet.se"])
-            .status()
-            .unwrap();
-        std::fs::write(hub_repo.join("README.md"), "# Demo Repo\n").unwrap();
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&hub_repo)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap();
-        assert!(
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(&hub_repo)
-                .args(["commit", "-m", "Initial commit"])
-                .status()
-                .unwrap()
-                .success()
-        );
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let create = |store: &Store, data: &Path, request: CreateRequest| {
+            create_with_consumer(store, data, request, &fixture.consumer)
+        };
 
         // 3. Create L0 Root Agent
         let root_wd = data.join("root-workspace");
@@ -7842,6 +7782,7 @@ mod tests {
         let l1_wt = PathBuf::from(l1.workdir.as_deref().unwrap());
         assert!(l1_wt.join(".git").exists(), "L1 should have a git worktree");
         assert!(l1_wt.join("README.md").is_file());
+        fixture.assert_checkout(&l1_wt);
 
         // 5. Create L2 Nested Sub-Agent with `repo: "inherit"` (branches from L1's git repo)
         let l2 = create(
@@ -7870,6 +7811,19 @@ mod tests {
             "L2 should have its own isolated git worktree"
         );
         assert!(l2_wt.join("README.md").is_file());
+        fixture.assert_checkout(&l2_wt);
+        assert_eq!(
+            crate::worktree::tests::git(&l1_wt, &["rev-parse", "HEAD"]),
+            crate::worktree::tests::git(&l2_wt, &["rev-parse", "HEAD"]),
+        );
+        assert_eq!(
+            std::fs::read_to_string(&fixture.log)
+                .unwrap()
+                .lines()
+                .filter(|line| line.starts_with("worktree "))
+                .count(),
+            2
+        );
 
         // 6. Verify L0, L1, and L2 all receive the shared AGENTS.md in their config/AGENTS.md
         // AND their own role description in `## 2. Role, Responsibilities & Standing Description`

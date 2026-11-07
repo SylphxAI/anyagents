@@ -33,6 +33,7 @@ mod sylphx;
 mod telegram;
 mod ui;
 mod vendor;
+mod worktree;
 
 #[derive(Parser)]
 #[command(

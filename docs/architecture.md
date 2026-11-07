@@ -197,6 +197,28 @@ this adapter does not invoke a setter or edit shared service configuration.
 - **Antigravity (`agy`).** The installed CLI documents a turn per stream-json input line and `--conversation <id>` for resume. The adapter reports followup/unproven. Its hook helpers are not wired to a confirmed customization root and have no vendor consumption acknowledgement. AGY 1.4.5's embedded lifecycle documentation specifies `hooks.json` in a customization root (for example `.agents/hooks.json`), with a named hook's flat `PreInvocation` command array and output `{"injectSteps":[{"userMessage":"..."}]}`. It does not specify the durable acceptance/replay contract needed to commit the mailbox cursor across hook abort or process restart. The existing `agy-hook` helper only offers `received` rows, while stream pipe writes already mark rows delivered; it cannot establish native mid-turn delivery. Do not advertise steer support or install a hook bound to a seat in a shared workspace until isolated hook discovery and consumption/recovery semantics are verified.
 - **Muse (`muse serve`).** One JSON-RPC child that owns the session: `initialize`, `session/start` (or `session/resume`), `session/setApprovalMode` `allowAll`. Delivery mode is steer: `turn/start` when no turn is open, and `turn/start` with `ifBusy: "steer"` during one. `turn/started` opens a turn, `turn/completed` closes it with its usage or its error, and an `approval/request` is answered by the host. `MUSE_CONFIG_HOME` points the vendor at the agent's config directory, where `settings.json` names the MCP server and the `:unrestricted` permission profile. On Windows the clone is a directory junction at `%APPDATA%\meta\muse`.
 
+### Managed local checkouts
+
+Repository-backed local agents require `desk-git-hub`; set
+`ANYAGENTS_GIT_HUB_BIN` to its executable when it is not installed under the
+host user's `~/.local/bin` or on `PATH`. Repository slugs and GitHub URLs,
+`repo: "inherit"`, and local repository paths all use that consumer for fetching
+and checkout. Sparse-checkout and hook policy belong to the consumer, not the
+agent manager. Fetch, checkout, and executable-launch failures refuse the spawn
+with the consumer's diagnostic; there is no automatic clone, direct-worktree,
+or non-desk fallback.
+
+For inherit/local sources, AnyAgents selects a GitHub remote (preferring
+`origin`), reads its live advertised branches and tags, and requires both the
+source HEAD and requested base to be reachable from them. Push unpublished
+commits before spawning. If a remote tip is not available in local history,
+fetch that remote before trying again. The consumer fetches the verified ref
+and checks out the exact selected commit, including a published feature-branch
+commit that is not on the default branch. Sources without a GitHub remote are
+refused. Existing nonempty checkout targets are not silently adopted by
+repository provisioning. `workdir: "private"` remains an empty directory and
+needs no Git consumer. Cloud-sandbox workspace preparation is unchanged.
+
 ## Mailbox: one log per agent
 
 Every input to an agent (a Telegram message, another agent's `send`, a CLI or TUI message) is appended to that agent's mailbox. The mailbox is the only path into a harness.
