@@ -6450,6 +6450,27 @@ pub(crate) mod tests {
         ENV.lock().unwrap_or_else(|err| err.into_inner())
     }
 
+    /// Process-local environment locks do not isolate forked children or
+    /// process-global PATH. Keep one-tick lifecycle assertions in one worker.
+    fn single_test_worker(name: &str) -> bool {
+        let name = format!("server::tests::{name}");
+        if std::env::var("ANYAGENTS_SINGLE_TEST_WORKER").as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("ANYAGENTS_SINGLE_TEST_WORKER", &name)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed; 0 failed;"),
+            "{name} worker failed or did not execute: {stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        true
+    }
+
     #[test]
     fn describe_preserves_scope_and_audits_authorized_policy_updates() {
         let _env = env_lock();
@@ -6771,6 +6792,11 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive() {
+        if single_test_worker(
+            "archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive",
+        ) {
+            return;
+        }
         let _env = env_lock();
         unsafe {
             std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
@@ -6877,26 +6903,7 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_waits_for_self_archived_process_to_stop() {
-        // flock descriptors are inherited across a concurrent fork until exec.
-        // An unrelated parallel fixture can therefore hold the last lifecycle
-        // lock reference after this fixture drops it. Keep the nonblocking tick
-        // assertion in its own process rather than retrying skipped maintenance.
-        if std::env::var_os("ANYAGENTS_SELF_REAP_WORKER").is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "server::tests::archive_reap_waits_for_self_archived_process_to_stop",
-                    "--nocapture",
-                ])
-                .env("ANYAGENTS_SELF_REAP_WORKER", "1")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "self-reap worker failed: {}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+        if single_test_worker("archive_reap_waits_for_self_archived_process_to_stop") {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -7180,24 +7187,9 @@ pub(crate) mod tests {
     #[test]
     fn archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail() {
         use std::os::unix::fs::PermissionsExt;
-        // PATH is process-global. Keep this temporary Git replacement out of
-        // concurrently executing worktree fixtures, including their children.
-        if std::env::var_os("ANYAGENTS_GIT_BARRIER_WORKER").is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "server::tests::archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail",
-                    "--nocapture",
-                ])
-                .env("ANYAGENTS_GIT_BARRIER_WORKER", "1")
-                .output()
-                .unwrap();
-            assert!(
-                out.status.success(),
-                "Git-barrier worker failed: {}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
+        if single_test_worker(
+            "archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail",
+        ) {
             return;
         }
         let _env = env_lock();
