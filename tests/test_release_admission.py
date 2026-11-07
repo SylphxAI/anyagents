@@ -255,6 +255,21 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             self.inspect()
 
+    def test_request_uses_each_providers_media_type_and_credential(self):
+        cases = (
+            ("https://registry.npmjs.org/package/0.1.2", False, "application/json", None),
+            ("https://api.github.com/repos/example", False, "application/vnd.github+json", "Bearer synthetic-token"),
+            ("https://api.github.com/repos/example/releases/assets/1", True, "application/octet-stream", "Bearer synthetic-token"),
+        )
+        for url, binary, accept, credential in cases:
+            with self.subTest(url=url), patch.dict(os.environ, {"GH_TOKEN": "synthetic-token"}), \
+                    patch.object(release, "urlopen") as fetch:
+                fetch.return_value.__enter__.return_value.read.return_value = b'{}'
+                release.request(url, binary=binary)
+                sent = fetch.call_args.args[0]
+                self.assertEqual(sent.get_header("Accept"), accept)
+                self.assertEqual(sent.get_header("Authorization"), credential)
+
     def test_redirect_keeps_credentials_on_same_origin_only(self):
         request = release.Request("https://api.github.com/repos/example",
                                   headers={"Authorization": "Bearer synthetic-token"})

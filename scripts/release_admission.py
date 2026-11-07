@@ -43,8 +43,9 @@ def git(*args):
 
 
 def request(url, missing=False, binary=False):
-    headers = {"User-Agent": "anyagents-release", "Accept": "application/vnd.github+json"}
+    headers = {"User-Agent": "anyagents-release", "Accept": "application/json"}
     if url.startswith("https://api.github.com/"):
+        headers["Accept"] = "application/vnd.github+json"
         headers["Authorization"] = f"Bearer {os.environ['GH_TOKEN']}"
         headers["X-GitHub-Api-Version"] = "2022-11-28"
         if binary:
@@ -53,10 +54,12 @@ def request(url, missing=False, binary=False):
         with urlopen(Request(url, headers=headers), timeout=30) as response:
             data = response.read()
     except HTTPError as error:
-        if missing and error.code == 404:
+        code = error.code
+        error.close()
+        if missing and code == 404:
             return None
         # No retries: rate limits and transport failures are not proof of absence.
-        raise RuntimeError(f"release read failed: HTTP {error.code} at {url}") from None
+        raise RuntimeError(f"release read failed: HTTP {code} at {url}") from None
     return data if binary else json.loads(data)
 
 
