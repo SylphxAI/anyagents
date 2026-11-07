@@ -2241,6 +2241,23 @@ fn dispatch_takeover_input(
                 .get("buttons")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(if event_type == "mouseReleased" { 0 } else { 1 });
+            if event_type == "mousePressed" {
+                // The viewer can receive its first down before any hover event.
+                // Establish the pointer's target widget as a native move would,
+                // without releasing other buttons already held during a chord.
+                let pressed_button = match button {
+                    "right" => 2,
+                    "middle" => 4,
+                    _ => 1,
+                };
+                cdp.call(
+                    "Input.dispatchMouseEvent",
+                    serde_json::json!({
+                        "type": "mouseMoved", "x": x, "y": y,
+                        "button": "none", "buttons": buttons & !pressed_button,
+                    }),
+                )?;
+            }
             cdp.call(
                 "Input.dispatchMouseEvent",
                 serde_json::json!({
