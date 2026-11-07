@@ -2246,7 +2246,25 @@ mod tests {
         let duplicate = dir.path().join("O.token");
         std::fs::write(&duplicate, "fixture-only").unwrap();
         std::fs::set_permissions(&duplicate, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(token_for_owner(dir.path(), "o"), Err(Error::Auth)));
+        // A case-insensitive filesystem aliases these paths instead of creating
+        // an ambiguous pair. Verify the actual fixture population first.
+        let matching_files = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("o.token"))
+            })
+            .count();
+        if matching_files == 2 {
+            assert!(matches!(token_for_owner(dir.path(), "o"), Err(Error::Auth)));
+        } else {
+            assert_eq!(matching_files, 1);
+            assert_eq!(token_for_owner(dir.path(), "o").unwrap(), "fixture-only");
+        }
     }
 
     #[test]
