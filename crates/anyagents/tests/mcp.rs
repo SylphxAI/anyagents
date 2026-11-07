@@ -258,6 +258,68 @@ fn error_text(result: &CallToolResult) -> String {
 }
 
 #[tokio::test]
+async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let bytes = b"mcprawneedle \0\xff exact binary tail";
+    for name in ["range-own", "range-peer"] {
+        let created = bin()
+            .env("PATH", machine_path(dir.path()))
+            .arg("--data")
+            .arg(dir.path())
+            .args(["agents", "create", name])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let root = dir
+            .path()
+            .join("agents")
+            .join(created_id(dir.path(), name))
+            .join("memory");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("MEMORY.md"), bytes).unwrap();
+    }
+    let _server = start_server(dir.path());
+    let own = connect(dir.path(), "range-own").await;
+    let peer = connect(dir.path(), "range-peer").await;
+    let found: serde_json::Value = ok_json(
+        call(
+            &own,
+            "conversation",
+            serde_json::json!({"scope":"memory","query":"mcprawneedle"}),
+        )
+        .await,
+    );
+    assert_eq!(found["turns"].as_array().unwrap().len(), 1);
+    let hit = &found["turns"][0];
+    let read: serde_json::Value = ok_json(call(&own, "conversation", serde_json::json!({
+        "scope":"memory", "raw_id":hit["id"], "raw_sha256":hit["raw"]["sha256"], "raw_offset":12, "raw_length":8
+    })).await);
+    let actual: Vec<u8> = serde_json::from_value(read["turns"][0]["raw_bytes"].clone()).unwrap();
+    assert_eq!(actual, bytes[12..20]);
+    assert_eq!(read["turns"][0]["window"]["length"], 8);
+    assert_eq!(read["turns"][0]["raw"]["length"], bytes.len());
+    let peer_found: serde_json::Value = ok_json(
+        call(
+            &peer,
+            "conversation",
+            serde_json::json!({"scope":"memory","query":"mcprawneedle"}),
+        )
+        .await,
+    );
+    let peer_hit = &peer_found["turns"][0];
+    let denied = call(&own, "conversation", serde_json::json!({"scope":"memory", "raw_id":peer_hit["id"], "raw_sha256":peer_hit["raw"]["sha256"], "raw_length":8})).await;
+    assert!(error_text(&denied).contains("raw document not found in authorized scope"));
+    let stale = call(&own, "conversation", serde_json::json!({"scope":"memory", "raw_id":hit["id"], "raw_sha256":"0".repeat(64), "raw_length":8})).await;
+    assert!(error_text(&stale).contains("raw document changed since search"));
+    own.cancel().await.unwrap();
+    peer.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn mcp_tools_use_the_server_socket() {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("anyagents.sock");

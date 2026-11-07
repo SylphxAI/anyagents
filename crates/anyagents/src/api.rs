@@ -260,6 +260,9 @@ impl From<anyagents_core::raw_segment::RawCoordinate> for RawCoordinateView {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ConversationTurnView {
     pub id: String,
+    /// Exact bytes for an explicit bounded raw-range read; `text` is a lossy preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bytes: Option<Vec<u8>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

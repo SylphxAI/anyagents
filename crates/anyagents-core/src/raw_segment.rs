@@ -611,9 +611,123 @@ pub fn read_raw(coordinate: &RawCoordinate) -> io::Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Bounded exact-byte readback. The complete indexed event is authenticated in
+/// 64KiB chunks before returning at most 64KiB; no whole-event allocation.
+pub const MAX_RAW_RANGE_BYTES: u64 = 64 * 1024;
+pub fn read_raw_range(
+    coordinate: &RawCoordinate,
+    offset: u64,
+    length: u64,
+) -> io::Result<(RawCoordinate, Vec<u8>)> {
+    if length == 0
+        || length > MAX_RAW_RANGE_BYTES
+        || offset > coordinate.length
+        || offset.checked_add(length).is_none()
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "raw range requires offset within event and length 1..=65536",
+        ));
+    }
+    let end = offset.saturating_add(length).min(coordinate.length);
+    let mut file = open_readonly(&coordinate.segment)?;
+    let stamp = crate::host_cursor::FileStamp::read(&file)?;
+    file.seek(SeekFrom::Start(coordinate.offset))?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0; 65536];
+    let mut at = 0;
+    let mut bytes = Vec::with_capacity((end - offset) as usize);
+    while at < coordinate.length {
+        let length = (coordinate.length - at).min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..length])?;
+        hash.update(&buffer[..length]);
+        let from = offset.max(at);
+        let to = end.min(at + length as u64);
+        if from < to {
+            bytes.extend_from_slice(&buffer[(from - at) as usize..(to - at) as usize]);
+        }
+        at += length as u64;
+    }
+    if format!("{:x}", hash.finalize()) != coordinate.sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "raw coordinate readback mismatch",
+        ));
+    }
+    if crate::host_cursor::FileStamp::read(&open_readonly(&coordinate.segment)?)? != stamp {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "raw source changed during range read; retry",
+        ));
+    }
+    let window = RawCoordinate {
+        segment: coordinate.segment.clone(),
+        offset: coordinate.offset.checked_add(offset).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "raw range offset overflow")
+        })?,
+        length: bytes.len() as u64,
+        sha256: crate::learned_memory::sha256(&bytes),
+        seq: coordinate.seq,
+    };
+    Ok((window, bytes))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn raw_range_authenticates_whole_event_and_bounds_exact_binary_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("binary");
+        let bytes: Vec<u8> = (0..200_000).map(|n| (n % 256) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        let coordinate = RawCoordinate {
+            segment: path.clone(),
+            offset: 13,
+            length: 180_000,
+            sha256: crate::learned_memory::sha256(&bytes[13..180_013]),
+            seq: 7,
+        };
+        let (window, slice) = read_raw_range(&coordinate, 65_530, MAX_RAW_RANGE_BYTES).unwrap();
+        assert_eq!(slice, bytes[65_543..131_079]);
+        assert_eq!(
+            (window.offset, window.length, window.seq),
+            (65_543, MAX_RAW_RANGE_BYTES, 7)
+        );
+        assert_eq!(window.sha256, crate::learned_memory::sha256(&slice));
+        assert_eq!(
+            read_raw_range(&coordinate, 179_990, 32).unwrap().1,
+            bytes[180_003..180_013]
+        );
+        assert!(
+            read_raw_range(&coordinate, 180_000, 1)
+                .unwrap()
+                .1
+                .is_empty()
+        );
+        for (offset, length) in [
+            (0, 0),
+            (0, MAX_RAW_RANGE_BYTES + 1),
+            (180_001, 1),
+            (u64::MAX, 1),
+        ] {
+            assert_eq!(
+                read_raw_range(&coordinate, offset, length)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        // Corruption outside the returned range must still refuse the response.
+        let mut modified = bytes;
+        modified[100] ^= 1;
+        fs::write(&path, modified).unwrap();
+        assert_eq!(
+            read_raw_range(&coordinate, 65_530, 32).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
 
     #[cfg(unix)]
     #[test]

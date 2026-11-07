@@ -407,3 +407,23 @@ standalone tool summaries clipped by an older writer have no raw mailbox body to
 recover; they are preserved as-is rather than claiming a reconstructed suffix.
 Reconciled pages under `agents/<id>/history/owners` are indexed as whole historical
 documents in `transcripts` scope even when they are Markdown rather than JSONL.
+
+For an indexed filesystem result, the canonical `conversation` tool/HTTP route
+accepts `raw_id` (the result ID), required `raw_sha256` (the result's whole-event
+`raw.sha256`), optional `raw_offset` (zero-based event-relative bytes, default 0),
+and `raw_length` (1–65,536 bytes, default 65,536). The range clips at the event end;
+offset equal to the event length returns an empty end-of-event range. The host
+resolves the ID inside the caller's authorized owner set and selected agent/scope,
+then repeats that lookup under the owner lifecycle lock. It rejects missing or
+pending-redaction documents, stale digests and changed raw bytes. Arbitrary paths
+and caller-supplied raw coordinates are not read arguments. Peer/parent history
+remains inaccessible regardless of a guessed document ID or shared group.
+
+Explicit raw reads stream-authenticate the **complete event** SHA-256 with a
+64 KiB buffer before returning at most 64 KiB. This costs O(event length), not
+O(requested range), but does not allocate the entire event. The response's single
+turn includes exact `raw_bytes` as a JSON byte array, a lossy convenience `text`
+preview, the complete `raw` coordinate and the requested `window` coordinate/SHA.
+The byte array is authoritative for invalid UTF-8, zero bytes and ranges splitting
+a Unicode character. It uses the same six-tool MCP surface; no seventh tool or
+native writer handoff is introduced.

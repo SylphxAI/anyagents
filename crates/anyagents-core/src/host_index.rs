@@ -385,6 +385,65 @@ impl HostIndex {
         Ok(true)
     }
 
+    /// Resolve an opaque document ID only within the host-authorized owner set.
+    /// This lookup performs no filesystem reads and accepts no caller path.
+    pub(crate) fn document(
+        &self,
+        visible: &[String],
+        scope: MemoryScope,
+        id: &str,
+    ) -> Result<Option<IndexHit>, IndexError> {
+        if visible.is_empty() {
+            return Ok(None);
+        }
+        let mut values: Vec<Value> = visible.iter().cloned().map(Value::Text).collect();
+        let placeholders = vec!["?"; values.len()].join(",");
+        values.push(id.to_owned().into());
+        values.push(
+            scope
+                .source()
+                .map_or(Value::Null, |s| Value::Text(s.into())),
+        );
+        let sql = format!(
+            "SELECT id,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role,
+                segment,offset,length,sha256,seq FROM host_documents
+                WHERE agent_id IN ({placeholders}) AND id=? AND (? IS NULL OR source=?)"
+        );
+        values.push(values.last().unwrap().clone());
+        Ok(self
+            .conn
+            .query_row(&sql, params_from_iter(values), |r| {
+                let raw = RawCoordinate {
+                    segment: r.get::<_, String>(9)?.into(),
+                    offset: r.get(10)?,
+                    length: r.get(11)?,
+                    sha256: r.get(12)?,
+                    seq: r.get(13)?,
+                };
+                Ok(IndexHit {
+                    id: r.get(0)?,
+                    metadata: IndexMetadata {
+                        agent_id: r.get(1)?,
+                        source: if r.get::<_, String>(2)? == "memory" {
+                            MemoryScope::Memory
+                        } else {
+                            MemoryScope::Transcripts
+                        },
+                        timestamp_ms: r.get(3)?,
+                        direction: r.get(4)?,
+                        sender: r.get(5)?,
+                        destination: r.get(6)?,
+                        tool_name: r.get(7)?,
+                        role: r.get(8)?,
+                    },
+                    window: raw.clone(),
+                    raw,
+                    lexical_score: 0.0,
+                })
+            })
+            .optional()?)
+    }
+
     /// ACL selection precedes ranking and LIMIT. An empty visibility set has no
     /// results, not public access. Callers resolve ancestry/privacy in the host.
     pub fn search(

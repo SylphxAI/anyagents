@@ -4740,6 +4740,10 @@ struct Since {
 
 #[derive(Deserialize)]
 struct ConversationQuery {
+    raw_id: Option<String>,
+    raw_sha256: Option<String>,
+    raw_offset: Option<u64>,
+    raw_length: Option<u64>,
     #[serde(default)]
     scope: anyagents_core::host_index::MemoryScope,
     with: Option<String>,
@@ -4835,6 +4839,116 @@ async fn conversation_route(
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
         let (name, visible_agent_ids) = conversation_visibility(&state.store, &principal, &name)?;
+        if query.raw_id.is_none()
+            && (query.raw_sha256.is_some()
+                || query.raw_offset.is_some()
+                || query.raw_length.is_some())
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "raw_sha256/raw_offset/raw_length require raw_id",
+            ));
+        }
+        if let Some(id) = query.raw_id.as_deref() {
+            let digest = query
+                .raw_sha256
+                .as_deref()
+                .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "raw_sha256 must be the 64-character digest from the search result",
+                    )
+                })?;
+            let length = query
+                .raw_length
+                .unwrap_or(anyagents_core::raw_segment::MAX_RAW_RANGE_BYTES);
+            if id.trim().is_empty()
+                || length == 0
+                || length > anyagents_core::raw_segment::MAX_RAW_RANGE_BYTES
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "raw_id must be nonempty; raw_length must be 1..=65536",
+                ));
+            }
+            let authorized = match visible_agent_ids.as_ref() {
+                Some(ids) => ids.clone(),
+                None => state
+                    .store
+                    .list_agents()
+                    .map_err(ApiError::from_store)?
+                    .into_iter()
+                    .map(|a| a.id.to_string())
+                    .collect(),
+            };
+            let (hit, bytes) = state
+                .store
+                .read_host_file_range(
+                    &authorized,
+                    query.scope,
+                    Some(&name),
+                    anyagents_core::host_retrieval::HostRawRead {
+                        id,
+                        sha256: digest,
+                        offset: query.raw_offset.unwrap_or(0),
+                        length,
+                    },
+                )
+                .map_err(|e| {
+                    ApiError::new(
+                        match &e {
+                            anyagents_core::host_index::IndexError::Io(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::InvalidData
+                                ) =>
+                            {
+                                StatusCode::CONFLICT
+                            }
+                            _ => StatusCode::BAD_REQUEST,
+                        },
+                        e.to_string(),
+                    )
+                })?
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::NOT_FOUND,
+                        "raw document not found in authorized scope",
+                    )
+                })?;
+            let agent = state
+                .store
+                .agent_by_name(&hit.metadata.agent_id)
+                .map_err(ApiError::from_store)?;
+            return Ok(Json(ConversationResponse {
+                agent: agent.name,
+                agent_id: agent.id.to_string(),
+                turns: vec![ConversationTurnView {
+                    id: hit.id,
+                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                    raw_bytes: Some(bytes),
+                    source: Some(
+                        if hit.metadata.source == anyagents_core::host_index::MemoryScope::Memory {
+                            "memory"
+                        } else {
+                            "transcripts"
+                        }
+                        .into(),
+                    ),
+                    direction: hit.metadata.direction,
+                    from: hit.metadata.sender,
+                    to: hit.metadata.destination,
+                    reply_to: None,
+                    timestamp_ms: hit.metadata.timestamp_ms,
+                    raw: Some(hit.raw.into()),
+                    window: Some(hit.window.into()),
+                    tool_name: hit.metadata.tool_name,
+                    role: hit.metadata.role,
+                }],
+            }));
+        }
         let clean_q = query
             .query
             .as_deref()
@@ -4987,6 +5101,7 @@ async fn conversation_route(
         let turns: Vec<_> = raw_turns
             .into_iter()
             .map(|t| ConversationTurnView {
+                raw_bytes: None,
                 source: Some("transcripts".into()),
                 raw: None,
                 window: None,
@@ -5010,6 +5125,7 @@ async fn conversation_route(
             ranked.push((
                 1.0 / (30.0 + rank as f64),
                 ConversationTurnView {
+                    raw_bytes: None,
                     id: hit.id,
                     direction: hit.metadata.direction,
                     from: hit.metadata.sender,
@@ -6701,6 +6817,91 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    #[test]
+    fn canonical_raw_ranges_bind_owned_digest_and_return_bounded_exact_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("range-parent", "sylphx"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("range-child", "sylphx");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("range-peer", "sylphx"))
+            .unwrap();
+        let bytes: Vec<u8> = [
+            b"rangeneedle ".as_slice(),
+            &[0, 0xff, 0xfe],
+            "繁體".as_bytes(),
+            &vec![b'x'; 100_000],
+        ]
+        .concat();
+        for a in [&parent, &child, &peer] {
+            let root = dir.path().join("agents").join(a.id.as_str()).join("memory");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("MEMORY.md"), &bytes).unwrap();
+        }
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
+            let Json(all) = conversation_route(Principal::Operator, State(state.clone()), AxumPath("all".into()),
+                Query(serde_json::from_value(serde_json::json!({"scope":"memory","query":"rangeneedle"})).unwrap())).await.unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(all.turns.len(), 3);
+            let find = |owner: &Agent| all.turns.iter().find(|t| t.raw.as_ref().unwrap().segment.contains(owner.id.as_str())).unwrap();
+            let target = find(&child);
+            let request = |id: &str, sha: &str, offset: u64, length: u64| serde_json::from_value(serde_json::json!({"scope":"memory","raw_id":id,"raw_sha256":sha,"raw_offset":offset,"raw_length":length})).unwrap();
+            let Json(response) = conversation_route(principal(), State(state.clone()), AxumPath("all".into()),
+                Query(request(&target.id, &target.raw.as_ref().unwrap().sha256, 11, 65536))).await.unwrap_or_else(|e| panic!("{}", e.message));
+            let turn = &response.turns[0];
+            assert_eq!(response.agent_id, child.id.as_str());
+            assert_eq!(turn.raw_bytes.as_deref(), Some(&bytes[11..65547]));
+            assert_eq!(turn.raw.as_ref().unwrap().length, bytes.len() as u64);
+            assert_eq!(turn.window.as_ref().unwrap().length, 65536);
+            assert_eq!(turn.window.as_ref().unwrap().sha256, anyagents_core::learned_memory::sha256(&bytes[11..65547]));
+            assert!(turn.text.contains('�'), "text is explicitly a lossy preview");
+            let peer_hit = find(&peer);
+            // Make the hidden file fail if opened. Its ID must still be refused
+            // as not found, not reach descriptor validation or reveal the path.
+            std::fs::hard_link(&peer_hit.raw.as_ref().unwrap().segment, dir.path().join("hidden-hardlink")).unwrap();
+            let denied = conversation_route(principal(), State(state.clone()), AxumPath("all".into()),
+                Query(request(&peer_hit.id, &peer_hit.raw.as_ref().unwrap().sha256, 0, 32))).await.unwrap_err();
+            assert_eq!(denied.status, StatusCode::NOT_FOUND);
+            let denied = conversation_route(principal(), State(state.clone()), AxumPath(peer.name.clone()),
+                Query(request(&peer_hit.id, &peer_hit.raw.as_ref().unwrap().sha256, 0, 32))).await.unwrap_err();
+            assert_eq!(denied.status, StatusCode::FORBIDDEN);
+            let denied = conversation_route(principal(), State(state.clone()), AxumPath(parent.name.clone()),
+                Query(request(&target.id, &target.raw.as_ref().unwrap().sha256, 0, 32))).await.unwrap_err();
+            assert_eq!(denied.status, StatusCode::NOT_FOUND, "explicit owner selector must bind the document");
+            for (offset,length) in [(0,0),(0,65537),(u64::MAX,1),(bytes.len() as u64+1,1)] {
+                let error = conversation_route(principal(), State(state.clone()), AxumPath("all".into()),
+                    Query(request(&target.id, &target.raw.as_ref().unwrap().sha256, offset, length))).await.unwrap_err();
+                assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            }
+            let Json(tail) = conversation_route(principal(), State(state.clone()), AxumPath("all".into()),
+                Query(request(&target.id, &target.raw.as_ref().unwrap().sha256, bytes.len() as u64-5, 32))).await.unwrap_or_else(|e| panic!("{}", e.message));
+            assert_eq!(tail.turns[0].raw_bytes.as_deref(), Some(&bytes[bytes.len()-5..]));
+            let error = conversation_route(principal(), State(state.clone()), AxumPath("all".into()),
+                Query(request(&target.id, &"0".repeat(64), 0, 32))).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT);
+            let error = conversation_route(principal(), State(state.clone()), AxumPath("all".into()),
+                Query(request(&target.raw.as_ref().unwrap().segment, &target.raw.as_ref().unwrap().sha256, 0, 32))).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::NOT_FOUND, "a caller path is not a document ID");
+            let mut edited = bytes.clone(); edited[99_000] = b'y';
+            std::fs::write(&target.raw.as_ref().unwrap().segment, edited).unwrap();
+            let error = conversation_route(principal(), State(state), AxumPath("all".into()),
+                Query(request(&target.id, &target.raw.as_ref().unwrap().sha256, 0, 32))).await.unwrap_err();
+            assert_eq!(error.status, StatusCode::CONFLICT, "mutation outside requested range must fail whole-event SHA");
+        });
+    }
 
     #[test]
     fn canonical_conversation_scopes_files_under_real_ancestor_authority() {

@@ -15,6 +15,14 @@ use std::{
 
 pub const INDEX_FILE: &str = "host-history-index-v1.db";
 
+/// ID and expected digest come from a search result; offsets are event-relative.
+pub struct HostRawRead<'a> {
+    pub id: &'a str,
+    pub sha256: &'a str,
+    pub offset: u64,
+    pub length: u64,
+}
+
 impl Store {
     fn unresolved_host_paths(&self, owner: &str) -> Result<Vec<PathBuf>, IndexError> {
         let paths = self
@@ -82,6 +90,85 @@ impl Store {
         }
         refresh_native_at(&mut index, &agent, &path, true, now_ms)?;
         Ok(true)
+    }
+
+    /// Read a bounded range from an already-indexed document, never a supplied
+    /// path/coordinate. Resolve ACL before file access, then repeat lookup under
+    /// its owner lifecycle lock so redaction cannot race authorization/readback.
+    pub fn read_host_file_range(
+        &self,
+        authorized: &[String],
+        scope: MemoryScope,
+        selected: Option<&str>,
+        request: HostRawRead<'_>,
+    ) -> Result<Option<(IndexHit, Vec<u8>)>, IndexError> {
+        let selected = selected
+            .map(str::trim)
+            .filter(|s| *s != "*" && !s.eq_ignore_ascii_case("all"))
+            .map(|s| self.agent_by_name(s).map(|a| a.id.to_string()))
+            .transpose()
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let visible: Vec<String> = authorized
+            .iter()
+            .filter(|id| selected.as_ref().is_none_or(|s| s == *id))
+            .cloned()
+            .collect();
+        if visible.is_empty() {
+            return Ok(None);
+        }
+        let index_path = self.data_dir().join(INDEX_FILE);
+        if !index_path.exists() {
+            return Ok(None);
+        }
+        let Some(hit) = HostIndex::open(&index_path)?.document(&visible, scope, request.id)? else {
+            return Ok(None);
+        };
+        let agent = self
+            .agent_by_name(&hit.metadata.agent_id)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let _guard = self
+            .lock_agent_lifecycle(&agent.id)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let Some(mut hit) = HostIndex::open(&index_path)?.document(
+            std::slice::from_ref(&agent.id.to_string()),
+            scope,
+            request.id,
+        )?
+        else {
+            return Ok(None);
+        };
+        if hit.raw.sha256 != request.sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raw document changed since search",
+            )
+            .into());
+        }
+        let root = self.data_dir().join("agents").join(agent.id.as_str());
+        if !safe_components(self.data_dir(), &root)?
+            || self
+                .unresolved_host_paths(agent.id.as_str())?
+                .iter()
+                .any(|p| hit.raw.segment.starts_with(p))
+        {
+            return Ok(None);
+        }
+        let paths = match hit.metadata.source {
+            MemoryScope::Memory => regular_files(&root.join("memory"), true)?,
+            MemoryScope::Transcripts => {
+                let mut paths = native_transcripts(&root)?;
+                paths.extend(regular_files(&root.join("history/owners"), true)?);
+                paths
+            }
+            MemoryScope::All => return Ok(None),
+        };
+        if !paths.contains(&hit.raw.segment) {
+            return Ok(None);
+        }
+        let (window, bytes) =
+            crate::raw_segment::read_raw_range(&hit.raw, request.offset, request.length)?;
+        hit.window = window;
+        Ok(Some((hit, bytes)))
     }
 
     /// The caller has already resolved the authorized immutable ID set. Locks
@@ -1109,6 +1196,24 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(String::from_utf8_lossy(&hits[0].1).contains("[redacted]"));
+        let raw_id = hits[0].0.id.clone();
+        let raw_sha = hits[0].0.raw.sha256.clone();
+        assert!(
+            self::Store::read_host_file_range(
+                &store,
+                &ids,
+                MemoryScope::Transcripts,
+                None,
+                HostRawRead {
+                    id: &raw_id,
+                    sha256: &raw_sha,
+                    offset: 0,
+                    length: 65536
+                }
+            )
+            .unwrap()
+            .is_some()
+        );
         // Persisted pending directory exclusions survive a Store reopen and
         // apply to descendants, not merely exact filenames.
         receipt.unscrubbed.push(crate::redaction::CopyFailure {
@@ -1124,6 +1229,22 @@ mod tests {
             .unwrap();
         drop(store);
         let store = Store::open(dir.path().join("state.db")).unwrap();
+        assert!(
+            store
+                .read_host_file_range(
+                    &ids,
+                    MemoryScope::Transcripts,
+                    None,
+                    HostRawRead {
+                        id: &raw_id,
+                        sha256: &raw_sha,
+                        offset: 0,
+                        length: 65536
+                    }
+                )
+                .unwrap()
+                .is_none()
+        );
         assert!(
             store
                 .search_host_files(&ids, MemoryScope::Transcripts, &q)

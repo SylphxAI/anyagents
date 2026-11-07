@@ -413,6 +413,7 @@ pub fn conversation(
     let views = turns
         .into_iter()
         .map(|t| crate::api::ConversationTurnView {
+            raw_bytes: None,
             source: None,
             raw: None,
             window: None,
