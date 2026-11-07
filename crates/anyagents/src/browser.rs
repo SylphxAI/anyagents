@@ -1063,6 +1063,10 @@ fn apply_stealth(cdp: &mut CdpSession, fp: &BrowserFingerprint) -> Result<(), Er
         "Emulation.setTimezoneOverride",
         serde_json::json!({ "timezoneId": fp.timezone }),
     );
+    #[cfg(test)]
+    if std::env::var_os("ANYAGENTS_FOCUS_NO_INJECTED_SCRIPT").is_some() {
+        return Ok(());
+    }
     let script = stealth_init_script(fp);
     let _ = cdp.call(
         "Page.addScriptToEvaluateOnNewDocument",
@@ -5583,7 +5587,6 @@ mod tests {
                         related:e.relatedTarget?.outerHTML||null,active:document.activeElement?.outerHTML,
                         focused:document.hasFocus(),stack:new Error('event '+type).stack,
                         trusted:e.isTrusted,x:e.clientX,y:e.clientY,at:performance.now()});
-                    if(type==='blur') debugger;
                 },true);
         </script>"#;
         let child = spawn_html_server(
@@ -5611,34 +5614,12 @@ mod tests {
             },
         )
         .unwrap();
-        let mut rt = load_runtime(dir.path(), "frame-focus").unwrap();
-        let target = select_page_target(dir.path(), &mut rt, None).unwrap();
-        let parent_ws = target.ws_url.unwrap();
-        let mut parent_cdp = CdpSession::connect(rt.cdp_port, &parent_ws).unwrap();
-        let frame = discover_child_frames(&mut parent_cdp).remove(0);
-        let mut child_cdp = CdpSession::connect(rt.cdp_port, &format!("/devtools/page/{}",frame.frame_id)).unwrap();
-        child_cdp.call("Debugger.enable", serde_json::json!({})).unwrap();
-        child_cdp.stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let observer = std::thread::spawn(move || {
-            while let Ok(text) = child_cdp.read_text_message() {
-                let value:serde_json::Value = serde_json::from_str(&text).unwrap();
-                if value["method"] == "Debugger.paused" {
-                    eprintln!("BLUR PAUSED: {}",value);
-                    let mut parent = CdpSession::connect(rt.cdp_port, &parent_ws).unwrap();
-                    eprintln!("PARENT AT BLUR: {:?}",eval_js(&mut parent,"({active:document.activeElement?.outerHTML,focused:document.hasFocus()})"));
-                    eprintln!("CHILD AT BLUR: {:?}",eval_js(&mut child_cdp,"window.events"));
-                    child_cdp.call("Debugger.resume",serde_json::json!({})).unwrap();
-                    break;
-                }
-            }
-        });
         let response = dispatch_takeover_input(
             dir.path(),
             "frame-focus",
             &serde_json::json!({"type":"click","x":100,"y":100}),
         )
         .unwrap();
-        observer.join().unwrap();
         if response["focus"]["editable"] != true {
             eprintln!("FIRST CLICK: {response}");
             let mut rt = load_runtime(dir.path(), "frame-focus").unwrap();
