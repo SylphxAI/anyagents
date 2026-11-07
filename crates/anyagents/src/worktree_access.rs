@@ -327,6 +327,8 @@ pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
 // foreign principal remains read-only. Inspect effective entries instead.
 fn writable_by_untrusted(path: &Path, owners: &[u32]) -> std::io::Result<bool> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    #[cfg(not(target_os = "linux"))]
+    let _ = owners; // Named-user POSIX ACL classification below is Linux-only.
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)

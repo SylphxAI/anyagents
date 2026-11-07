@@ -7955,8 +7955,8 @@ mod tests {
         let run_as = |uid: u32, gid: u32, script: &str, paths: &[&Path]| {
             let mut command = Command::new("/usr/bin/setpriv");
             command
-                // The GitHub checkout's ancestors are not granted to these
-                // seats. Git init still resolves cwd with absolute operands.
+                // Keep probes in the shared fixture root; these seats cannot
+                // traverse the CI checkout's ancestors.
                 .current_dir(dir.path())
                 .env("HOME", "/nonexistent")
                 .env("XDG_CONFIG_HOME", "/nonexistent")
