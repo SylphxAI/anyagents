@@ -51,6 +51,7 @@ pub enum MigrationStatus {
     RetainedActiveWriter,
     PendingRawHandoff,
     Ambiguous,
+    UnresolvedUntouched,
     Conflict,
     Changed,
 }
@@ -144,6 +145,23 @@ impl HostMigration {
     /// owners-page directory. Unknown and multiply claimed pages are inventoried
     /// but never moved. Nested symlinks are inventoried, not followed.
     pub fn discover(&mut self, agents: &[AgentOwnership], owners_pages: &Path) -> io::Result<()> {
+        for path in ["/home/kyle/.claude/projects", "/home/kyle/.codex/memories"] {
+            self.add(
+                None,
+                PathBuf::from(path),
+                None,
+                MigrationKind::LearnedMemory,
+                Some("UNRESOLVED/UNTOUCHED: personal/global namespace; contents not inspected"),
+            );
+            if let Some(entry) = self
+                .manifest
+                .entries
+                .iter_mut()
+                .find(|e| e.source == Path::new(path))
+            {
+                entry.status = MigrationStatus::UnresolvedUntouched;
+            }
+        }
         for agent in agents {
             let root = self.data_dir.join("agents").join(agent.id.to_string());
             let config = root.join("config");
@@ -265,27 +283,21 @@ impl HostMigration {
     /// Stopped IDs come from the daemon lifecycle lock, never tool arguments.
     /// Raw sources remain in place regardless: PR1 cannot activate their handoff.
     pub fn stage(&mut self, stopped_agents: &HashSet<String>) -> io::Result<()> {
+        self.preflight_memory_bundles()?;
         for idx in 0..self.manifest.entries.len() {
             let entry = self.manifest.entries[idx].clone();
             if matches!(
                 entry.status,
-                MigrationStatus::Ambiguous | MigrationStatus::Conflict | MigrationStatus::Changed
+                MigrationStatus::Ambiguous
+                    | MigrationStatus::UnresolvedUntouched
+                    | MigrationStatus::Conflict
+                    | MigrationStatus::Changed
             ) {
                 continue;
             }
             if entry.status == MigrationStatus::Complete {
-                let dest = entry
-                    .destination
-                    .as_ref()
-                    .ok_or_else(|| io::Error::other("completed migration missing destination"))?;
-                if fingerprint(dest)?
-                    != entry
-                        .readback
-                        .clone()
-                        .ok_or_else(|| io::Error::other("completed migration missing readback"))?
-                {
-                    return Err(io::Error::other("completed migration destination changed"));
-                }
+                // The immutable receipt proves the handoff. The destination is
+                // now host-owned mutable data, not a forever-frozen replica.
                 continue;
             }
             let destination = entry
@@ -398,6 +410,71 @@ impl HostMigration {
         }
         Ok(())
     }
+    /// Refuse a whole Claude memory bundle before any per-file rename if its
+    /// destinations collide. Retained relative index/fact references stay valid.
+    fn preflight_memory_bundles(&mut self) -> io::Result<()> {
+        let mut destinations: BTreeMap<PathBuf, Vec<(usize, Fingerprint)>> = BTreeMap::new();
+        let mut refused = HashSet::new();
+        for (idx, entry) in self.manifest.entries.iter().enumerate() {
+            if entry.kind != MigrationKind::LearnedMemory
+                || !matches!(
+                    entry.status,
+                    MigrationStatus::Planned
+                        | MigrationStatus::Prepared
+                        | MigrationStatus::RetainedActiveWriter
+                )
+            {
+                continue;
+            }
+            let Some(bundle) = memory_bundle(&entry.source) else {
+                continue;
+            };
+            if !entry.source.try_exists()? {
+                continue;
+            }
+            if has_symlink_component(&entry.source, &self.data_dir)?
+                || !fs::symlink_metadata(&entry.source)?.file_type().is_file()
+            {
+                refused.insert(bundle);
+                continue;
+            }
+            let Some(destination) = &entry.destination else {
+                continue;
+            };
+            let current = fingerprint(&entry.source)?;
+            if destination.try_exists()? && fingerprint(destination)? != current {
+                refused.insert(bundle);
+            }
+            destinations
+                .entry(destination.clone())
+                .or_default()
+                .push((idx, current));
+        }
+        for entries in destinations.values() {
+            if entries.iter().any(|(_, fp)| fp != &entries[0].1) {
+                for (idx, _) in entries {
+                    if let Some(bundle) = memory_bundle(&self.manifest.entries[*idx].source) {
+                        refused.insert(bundle);
+                    }
+                }
+            }
+        }
+        for entry in &mut self.manifest.entries {
+            if entry.kind == MigrationKind::LearnedMemory
+                && entry.status != MigrationStatus::Complete
+                && memory_bundle(&entry.source).is_some_and(|b| refused.contains(&b))
+            {
+                entry.status = MigrationStatus::Conflict;
+                entry.reason=Some("whole source memory bundle retained: unresolved destination collision or symlink".into());
+            }
+        }
+        self.save()
+    }
+}
+fn memory_bundle(path: &Path) -> Option<PathBuf> {
+    path.ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "memory"))
+        .map(Path::to_owned)
 }
 
 /// Explicit PR2 primitive, intentionally not called by PR1 staging. Both facts
@@ -572,7 +649,17 @@ fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_os = "macos")]
+fn rename_noreplace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt};
+    let source = CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    let destination = CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn rename_noreplace(_source: &Path, _destination: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -674,8 +761,14 @@ mod tests {
             .discover(&[agent.clone()], &dir.path().join("owners"))
             .unwrap();
         let fp = fingerprint(&source).unwrap();
-        migration.manifest.entries[0].source_fingerprint = Some(fp.clone());
-        migration.manifest.entries[0].status = MigrationStatus::Prepared;
+        let idx = migration
+            .manifest
+            .entries
+            .iter()
+            .position(|e| e.source == source)
+            .unwrap();
+        migration.manifest.entries[idx].source_fingerprint = Some(fp.clone());
+        migration.manifest.entries[idx].status = MigrationStatus::Prepared;
         migration.save().unwrap();
         rename_verified(&source, &destination, &fp).unwrap();
         drop(migration);
@@ -684,10 +777,10 @@ mod tests {
             .stage(&HashSet::from([agent.id.to_string()]))
             .unwrap();
         assert_eq!(
-            migration.manifest.entries[0].status,
+            migration.manifest.entries[idx].status,
             MigrationStatus::Complete
         );
-        assert_eq!(migration.manifest.entries[0].readback, Some(fp));
+        assert_eq!(migration.manifest.entries[idx].readback, Some(fp));
         let other = root.join("config/projects/known/memory/other.md");
         write(&other, b"unique old");
         write(&root.join("memory/other.md"), b"unique new");
@@ -708,6 +801,89 @@ mod tests {
                 .entries
                 .iter()
                 .any(|e| e.status == MigrationStatus::Conflict)
+        );
+    }
+    #[test]
+    fn completed_receipt_allows_host_edits_and_collisions_retain_whole_project_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = AgentOwnership {
+            id: AgentId::generate(),
+            aliases: vec![],
+        };
+        let root = dir.path().join("agents").join(agent.id.to_string());
+        let source = root.join("config/projects/a/memory/MEMORY.md");
+        write(&source, b"[fact](fact.md)\n");
+        write(&source.with_file_name("fact.md"), b"original\n");
+        let mut migration = HostMigration::open(dir.path()).unwrap();
+        migration
+            .discover(&[agent.clone()], &dir.path().join("owners"))
+            .unwrap();
+        let stopped = HashSet::from([agent.id.to_string()]);
+        migration.stage(&stopped).unwrap();
+        let old = migration
+            .manifest
+            .entries
+            .iter()
+            .find(|e| e.source == source)
+            .unwrap()
+            .readback
+            .clone();
+        write(&root.join("memory/fact.md"), b"legitimate latest edit\n");
+        migration.stage(&stopped).unwrap();
+        assert_eq!(
+            fs::read(root.join("memory/fact.md")).unwrap(),
+            b"legitimate latest edit\n"
+        );
+        assert_eq!(
+            migration
+                .manifest
+                .entries
+                .iter()
+                .find(|e| e.source == source)
+                .unwrap()
+                .readback,
+            old
+        );
+        for project in ["b", "c"] {
+            let memory = root.join(format!("config/projects/{project}/memory"));
+            write(
+                &memory.join("MEMORY.md"),
+                format!("{project} [unique](unique.md)\n").as_bytes(),
+            );
+            write(&memory.join("unique.md"), project.as_bytes());
+        }
+        migration
+            .discover(&[agent], &dir.path().join("owners"))
+            .unwrap();
+        migration.stage(&stopped).unwrap();
+        for project in ["b", "c"] {
+            let memory = root.join(format!("config/projects/{project}/memory"));
+            assert!(
+                fs::read_to_string(memory.join("MEMORY.md"))
+                    .unwrap()
+                    .contains("unique.md")
+            );
+            assert_eq!(
+                fs::read_to_string(memory.join("unique.md")).unwrap(),
+                project
+            );
+        }
+        assert_eq!(
+            migration
+                .manifest
+                .entries
+                .iter()
+                .filter(|e| e.status == MigrationStatus::UnresolvedUntouched)
+                .count(),
+            2
+        );
+        assert!(
+            migration
+                .manifest
+                .entries
+                .iter()
+                .filter(|e| e.status == MigrationStatus::UnresolvedUntouched)
+                .all(|e| e.source_fingerprint.is_none() && e.readback.is_none())
         );
     }
     #[test]
