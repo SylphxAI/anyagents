@@ -5645,13 +5645,46 @@ mod tests {
             assert_eq!(rt.display_mode, "xvfb-headed");
             assert!(!rt.headless);
         }
-        let response = dispatch_takeover_input(
-            dir.path(),
-            "frame-focus",
-            &serde_json::json!({"type":"click","x":100,"y":100}),
-        )
-        .unwrap();
-        if response["focus"]["editable"] != true {
+        let response = if std::env::var("ANYAGENTS_FOCUS_PATH").as_deref() == Ok("viewer") {
+            let st = start_or_reuse_takeover_session(
+                dir.path(),
+                "frame-focus",
+                None,
+                Some("First-frame experiment"),
+                Some(120_000),
+                Some(false),
+                &CaptchaDetection::default(),
+            )
+            .unwrap();
+            let output = std::env::var("TAKEOVER_EVIDENCE_DIR").unwrap();
+            let result = Command::new("node")
+                .arg(concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/../../tests/browser-takeover-first-frame.mjs"
+                ))
+                .args([&st.local_url, &output])
+                .env("ANYAGENTS_CHROMIUM", chromium_binary())
+                .status()
+                .unwrap();
+            let observed: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(Path::new(&output).join("viewer-result.json")).unwrap(),
+            )
+            .unwrap();
+            eprintln!("VIEWER RESULT: {observed}");
+            if !result.success() {
+                let _ = stop_profile(dir.path(), "frame-focus");
+                panic!("viewer fixture failed: {observed}");
+            }
+            serde_json::json!({"focus": observed["focus"], "ok": true, "type": "real-viewer-mouse"})
+        } else {
+            dispatch_takeover_input(
+                dir.path(),
+                "frame-focus",
+                &serde_json::json!({"type":"click","x":100,"y":100}),
+            )
+            .unwrap()
+        };
+        {
             eprintln!("FIRST CLICK: {response}");
             let mut rt = load_runtime(dir.path(), "frame-focus").unwrap();
             let target = select_page_target(dir.path(), &mut rt, None).unwrap();
