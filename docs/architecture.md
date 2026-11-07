@@ -97,6 +97,32 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### GitHub event watches
+
+`github:pr:owner/repo#number` and `github:check:owner/repo@ref` use REST
+through the authenticated `gh api` adapter, never a GraphQL check rollup.
+PR observations combine the pull's state/head with every page of Check Runs
+and legacy commit-status contexts. A numeric check reference shares the PR
+watch's target cache. Watch syntax and wake transitions are unchanged.
+
+All agents in one daemon share a serial, single-flight probe cache. Each target
+starts at 60 seconds; unchanged observations double its interval to at most
+300 seconds, and a state transition resets it to 60 seconds. Each REST page
+retains its ETag and a compact observation summary; subsequent reads send
+`If-None-Match`, including unchanged pages after a changed first page. A
+3,000-check PR requires 30 Check Run pages, plus the pull and commit statuses,
+not one expanded GraphQL query per watching agent. Inactive targets expire
+after one hour, and obsolete head/page summaries are discarded.
+
+A 403/429 secondary-limit response or `Retry-After` pauses every GitHub watch
+request until the cooldown expires. Each watch records `probe_error:rate_limited`
+once while preserving its last successful baseline; repeated scheduler ticks
+neither repeat the observation write nor wake an agent. The first eligible
+probe after cooldown rereads REST state, so a merge or check completion during
+the pause is delivered after recovery. Rate-limit responses without a stated
+retry time use exponential cooldowns from 60 to 300 seconds. Permission and
+payload errors remain distinct and never masquerade as completed checks.
+
 ### Archived sub-agent cleanup
 
 An explicit archive creates a fresh `.anyagents-archived` generation in the
@@ -298,6 +324,19 @@ Each stored message carries the context the server authenticated for it: the aut
 
 A message from Telegram keeps the message it quotes: the quoted author, as Telegram marked it (bot or person), its text or caption, and the ids that name it. The quoted text is fenced and neutralised, so a modelled line cannot forge a quoted author.
 
+Named virtual groups store an immutable creator `owner_agent_id`, independent
+of membership. Legacy groups retain NULL ownership (operator-owned), even when
+their roster is empty. Existing members may invite agents to private groups;
+nonmembers need the owner's or operator's invitation. `public` on `join` only
+configures a newly created group and is ignored for existing groups. Visibility
+changes through `members` or `leave` require the owner, an ancestor supervising
+the owner, the operator or an explicitly privileged root admin. Removing another
+agent requires authority over that target (self or ancestor), the group owner or
+the operator. Batch authorization and all membership/visibility writes commit in
+one SQLite transaction; refusals return HTTP 403 without partial group changes.
+Agent creation's `group` option uses the same checks, and agent CLI mutations
+require an authenticated server rather than an offline database fallback.
+
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
@@ -306,7 +345,9 @@ A message from Telegram keeps the message it quotes: the quoted author, as Teleg
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
   - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
-  - **Range reads & contiguous episode windows:** Read verbatim transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
+  - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
+  - **Bounded native transcript recall:** Native `memory_recall` returns at most 32,768 serialized UTF-8 bytes per call. Large range, filter and query results return `mode: "page"`, `format: "json_fragment"`, `content` and `next_cursor`. Repeat the original arguments with that cursor and concatenate `content` fragments to recover the result document; later transcript appends do not change its snapshot. Items already present verbatim in active context return raw pointers instead of replaying their contents. Once evicted, their original ranges remain recoverable. Native `read_file` reads of the current session's transcript, including filesystem aliases, use this same boundary; its line coordinates remain 1-based.
+  - **Budgeted native compaction:** Before dispatch, the native harness budgets the complete serialized request, output reserve and framing margin. It tests in-memory candidates that retain the latest completed tool batch, replace bulky results with original raw-range pointers, or evict completed context while preserving exact pending inbound. Only a candidate that fits commits a new window. If fixed instructions/tools and pending inbound alone cannot fit, preflight refuses without dispatch or a new compaction anchor; repeating the same attempt does not grow its context.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 
 ## Usage and cost

@@ -44,6 +44,7 @@ anyagents --version
 - **Nothing gets lost, and messages steer live.** Every message goes through a durable per-agent mailbox with ordered, idempotent delivery, visible lag and real-time mid-turn steering into active sessions. The guarantees are tested with crash injection.
 - **Zero-config local tools & clean sandbox boundaries.** In local mode (default), agents run under your own user and keep your `$HOME`, CLI tools and hardware while isolating each agent's harness state and `mcp-capability`. For isolated cloud execution, `--harness sylphx` provisions Cloud Kata microVM worktrees (`/home/user/workspace`) with ephemeral in-memory Git credentials (never written to disk) ([ADR 0002](docs/adr/0002-runtime-drivers-and-capability-identity.md)).
 - **Audited erasure for accidental captures.** Ancestors and admins can redact a body/span without changing message ids, order or cursors, including managed JSONL session copies. See [redaction](docs/redaction.md) for permissions, selectors and incomplete-copy receipts.
+- **Groups have explicit owners.** New groups belong to their creator; existing groups without an owner remain operator-owned. Members may invite agents to private groups but cannot change visibility or evict unrelated members. `public` on a join only configures a new group; use `members` with `public` to change an existing group as its owner, the owner’s ancestor, an operator or a root admin.
 - **Agents talk to each other.** Agents can list peers, join internal groups, spawn subagents and message reachable agents. Conversation reads are limited to the caller and its descendants; `agent: "all"` searches only that tree. Reading a parent, sibling, public peer or fellow group member’s private history is refused. Explicit operator and root-admin reads are unrestricted and audited.
 - **One place for cost.** Tokens, cost and quota state per agent, harness, model and day.
 
@@ -54,6 +55,7 @@ anyagents --version
 - [Vision](docs/vision.md): goal, first-version scope, boundaries.
 - [Architecture](docs/architecture.md): state, the three axes, harnesses, the mailbox and its guarantees, runtime boundaries, channels, the gateway, usage.
 - [Verification](docs/verification.md): reproducible scripted harness checks, coverage and live-acceptance boundaries.
+- [Serving identity](docs/serving-identity.md): read back the version, source, binary hash and PID on both server sockets.
 - [Decisions](docs/adr/): [0001](docs/adr/0001-server-first-one-binary.md) (server-first single binary) and [0002](docs/adr/0002-runtime-drivers-and-capability-identity.md) (capability identity and runtime boundaries).
 
 ## Licence

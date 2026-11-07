@@ -391,6 +391,66 @@ fn transcript_text(raw: &str) -> Result<String, Error> {
         .ok_or_else(|| invalid("transcript selector needs a decoded output or content string"))
 }
 
+struct Baseline {
+    chat: i64,
+    message: i64,
+    body: String,
+    namespace: Option<String>,
+}
+
+// Every retained origin is namespaced like the ordinary ingress matcher.
+// NULL ownership belongs to an older binary and is reported, not guessed.
+fn bound_versions(
+    conn: &rusqlite::Connection,
+    target: &AgentId,
+    id: &str,
+) -> Result<Vec<Baseline>, Error> {
+    Ok(conn.prepare(
+        "SELECT DISTINCT v.chat_id, v.message_id, v.body, v.origin_namespace FROM message_versions v
+         JOIN message_origin_aliases a ON a.agent_id = v.agent_id AND a.chat_id = v.chat_id AND a.message_id = v.message_id
+            AND (v.origin_namespace = a.namespace OR v.origin_namespace IS NULL)
+         JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
+         WHERE i.agent_id = ?1 AND i.target_id = ?2")?
+        .query_map(params![target.as_str(), id], |r| Ok(Baseline { chat: r.get(0)?, message: r.get(1)?, body: r.get(2)?, namespace: r.get(3)? }))?
+        .collect::<Result<_, _>>()?)
+}
+
+fn baseline_path(db: &Path, target: &AgentId, chat: i64, message: i64) -> PathBuf {
+    PathBuf::from(format!(
+        "{}#message_versions/{target}/{chat}/{message}",
+        db.display()
+    ))
+}
+
+fn unverified_full_versions(
+    conn: &rusqlite::Connection,
+    db: &Path,
+    target: &AgentId,
+    id: &str,
+) -> Result<Vec<CopyFailure>, Error> {
+    Ok(bound_versions(conn, target, id)?
+        .into_iter()
+        .filter(|v| v.body != TOMBSTONE || v.namespace.as_deref().is_none_or(|n| n == "unscoped"))
+        .map(
+            |Baseline {
+                 chat,
+                 message,
+                 namespace,
+                 ..
+             }| {
+                failure(
+                    &baseline_path(db, target, chat, message),
+                    if namespace.as_deref().is_none_or(|n| n == "unscoped") {
+                        "legacy edit-baseline account is unknown; copy preserved"
+                    } else {
+                        "bound edit baseline is not tombstoned"
+                    },
+                )
+            },
+        )
+        .collect())
+}
+
 impl Store {
     /// Erase one logical body/span and its exact copies from local managed JSONL.
     /// The target must be quiescent; this does not stop/restart a harness or erase
@@ -425,11 +485,11 @@ impl Store {
             .ok_or_else(|| invalid("redaction target not found"))?
         };
         let key = serde_json::to_string(&request.span).map_err(|_| invalid("invalid span"))?;
-        if let Some(raw) = tx.query_row(
+        let replay = tx.query_row(
             "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND request_key = ?3",
-            params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()? {
-            return serde_json::from_str(&raw).map_err(|_| invalid("unreadable redaction receipt"));
-        }
+            params![target.as_str(), id, key], |r| r.get::<_, String>(0)).optional()?
+            .map(|raw| serde_json::from_str::<Receipt>(&raw).map_err(|_| invalid("unreadable redaction receipt")))
+            .transpose()?;
         let state: String = tx.query_row(
             "SELECT state FROM agents WHERE id = ?1",
             [target.as_str()],
@@ -493,11 +553,48 @@ impl Store {
             tx.query_row("SELECT body FROM messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT body FROM outbound_messages WHERE agent_id = ?1 AND id = ?2 UNION ALL SELECT text FROM rag_chunks WHERE agent_id = ?1 AND chunk_id = ?2 LIMIT 1",
                 params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?.ok_or_else(|| invalid("redaction target not found"))?
         };
+        if let Some(receipt) = replay {
+            // A historical receipt is not evidence about today's body. Verify
+            // the replacement at the original selector before returning it;
+            // refuse drift rather than falsely repeat full_scrub=true. No old
+            // content or digest is retained to perform this verification.
+            let still_redacted = if request.span.is_none() {
+                original == TOMBSTONE
+            } else {
+                let start = match receipt.span.unit {
+                    SpanUnit::Bytes => Some(receipt.span.start),
+                    SpanUnit::Chars => original
+                        .char_indices()
+                        .nth(receipt.span.start)
+                        .map(|(i, _)| i),
+                };
+                start.and_then(|i| {
+                    i.checked_add(TOMBSTONE.len())
+                        .and_then(|end| original.get(i..end))
+                }) == Some(TOMBSTONE)
+            };
+            if !still_redacted {
+                return Err(invalid(
+                    "redaction target changed; existing receipt does not verify the current body",
+                ));
+            }
+            if original == TOMBSTONE
+                && !unverified_full_versions(&tx, self.database_path(), target, &id)?.is_empty()
+            {
+                return Err(invalid(
+                    "redaction edit baseline changed or its account is unknown; existing receipt does not verify bound versions",
+                ));
+            }
+            return Ok(receipt);
+        }
         let (span, start, end) = bounds(&original, request.span.as_ref())?;
         if original[start..end] == *TOMBSTONE
             && let Some(raw) = tx.query_row(
                 "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND (SELECT count(*) FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2) = 1 LIMIT 1",
                 params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()? {
+            if original == TOMBSTONE && !unverified_full_versions(&tx, self.database_path(), target, &id)?.is_empty() {
+                return Err(invalid("redaction edit baseline changed or its account is unknown; existing receipt does not verify bound versions"));
+            }
             return serde_json::from_str(&raw).map_err(|_| invalid("unreadable redaction receipt"));
         }
         if request.reason.contains(&original[start..end])
@@ -510,6 +607,7 @@ impl Store {
                 "audit reason must not repeat the removed text or its digest",
             ));
         }
+        let whole_body = start == 0 && end == original.len();
         let redacted = replace_span(&original, start, end);
         let mut prepared = Vec::new();
         for (path, mut file) in sessions {
@@ -575,6 +673,36 @@ impl Store {
             unscrubbed,
             full_scrub: false,
         };
+        // Seed still-available identities for a row created before alias
+        // retention shipped. Already retained aliases are never replaced.
+        // Old aliases discarded by an older binary cannot be reconstructed.
+        tx.execute(
+            "INSERT INTO message_identities (agent_id, target_id, identity_id)
+             SELECT agent_id, id, id FROM messages WHERE agent_id = ?1 AND id = ?2 ON CONFLICT DO NOTHING",
+            params![target.as_str(), id],
+        )?;
+        let route: Option<(Option<String>, Option<String>, String)> = tx.query_row(
+            "SELECT m.origin, m.source_key, i.identity_id FROM messages m
+             JOIN message_identities i ON i.agent_id=m.agent_id AND i.target_id=m.id
+             WHERE m.agent_id=?1 AND m.id=?2
+               AND NOT EXISTS (SELECT 1 FROM message_origin_aliases a WHERE a.agent_id=i.agent_id AND a.identity_id=i.identity_id)",
+            params![target.as_str(), id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).optional()?;
+        if let Some((raw, source, identity)) = route
+            && let Some(origin) = raw.and_then(|r| serde_json::from_str::<crate::Origin>(&r).ok())
+            && let (Some(chat), Some(message)) = (origin.chat_id, origin.message_id)
+        {
+            tx.execute(
+                "INSERT INTO message_origin_aliases (agent_id, identity_id, namespace, chat_id, message_id) VALUES (?1,?2,?3,?4,?5) ON CONFLICT DO NOTHING",
+                params![target.as_str(), identity, crate::store::origin_namespace(chat, source.as_deref()), chat, message])?;
+        }
+        tx.execute(
+            "INSERT INTO message_source_aliases (agent_id, identity_id, source_key)
+             SELECT m.agent_id, i.identity_id, m.source_key FROM messages m
+             JOIN message_identities i ON i.agent_id = m.agent_id AND i.target_id = m.id
+             WHERE m.agent_id = ?1 AND m.id = ?2 AND m.source_key IS NOT NULL AND m.source_key != ''
+             ON CONFLICT DO NOTHING",
+            params![target.as_str(), id],
+        )?;
         // Pending paths are durable before touching any copy: an interruption is
         // never mistaken for success on replay, and no sensitive recovery payload is stored.
         for file in &prepared {
@@ -598,14 +726,47 @@ impl Store {
             )?;
             // Telegram's edit baseline is a second body copy for this same
             // provider message, not a separate mailbox entry. Preserve its keys/time.
-            let versions: Vec<(i64, i64, String)> = tx.prepare(
-                "SELECT v.chat_id, v.message_id, v.body FROM message_versions v JOIN messages m ON m.agent_id = v.agent_id AND json_extract(m.origin, '$.chat_id') = v.chat_id AND json_extract(m.origin, '$.message_id') = v.message_id WHERE m.agent_id = ?1 AND m.id = ?2")?
-                .query_map(params![target.as_str(), id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
-                .collect::<Result<_, _>>()?;
-            for (chat, message, body) in versions {
-                if body.contains(&original[start..end]) {
-                    tx.execute("UPDATE message_versions SET body = ?4 WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3",
-                        params![target.as_str(), chat, message, body.replace(&original[start..end], TOMBSTONE)])?;
+            let versions = bound_versions(&tx, target, &id)?;
+            for Baseline {
+                chat,
+                message,
+                body,
+                namespace,
+            } in versions
+            {
+                if namespace.as_deref().is_none_or(|n| n == "unscoped") {
+                    receipt.unscrubbed.push(failure(
+                        &baseline_path(self.database_path(), target, chat, message),
+                        "legacy edit-baseline account is unknown; copy preserved",
+                    ));
+                    continue;
+                }
+                // A quote/envelope/edit can make a bound baseline different from
+                // the current canonical body. Whole-body erasure is an identity
+                // decision: NEVER make it conditional on text containment.
+                let replacement = if whole_body {
+                    TOMBSTONE.into()
+                } else {
+                    body.replace(&original[start..end], TOMBSTONE)
+                };
+                tx.execute("UPDATE message_versions SET body = ?4 WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3 AND origin_namespace = ?5",
+                    params![target.as_str(), chat, message, replacement, namespace])?;
+                let verified: String = tx.query_row(
+                    "SELECT body FROM message_versions WHERE agent_id=?1 AND chat_id=?2 AND message_id=?3 AND origin_namespace=?4",
+                    params![target.as_str(), chat, message, namespace], |r| r.get(0))?;
+                if verified != replacement {
+                    receipt.unscrubbed.push(failure(
+                        &baseline_path(self.database_path(), target, chat, message),
+                        "edit-baseline write verification failed",
+                    ));
+                }
+            }
+            if whole_body {
+                for unresolved in unverified_full_versions(&tx, self.database_path(), target, &id)?
+                {
+                    if !receipt.unscrubbed.contains(&unresolved) {
+                        receipt.unscrubbed.push(unresolved);
+                    }
                 }
             }
             let cleaned = clean_rag_text(&redacted);
@@ -624,7 +785,17 @@ impl Store {
                 [],
             )?;
         }
-        tx.execute("INSERT INTO conversation_redactions (id, agent_id, target_id, request_key, actor, permission, reason, created_at_ms, span_unit, span_start, span_end, removed_bytes, removed_chars, receipt) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+        // The audit's target_id freezes its complete retained alias set in the
+        // same IMMEDIATE transaction as the body/index rewrite. The primary
+        // origin columns are audit metadata only, never an unqualified fallback.
+        // Ingress joins all aliases to this audit before any ordinary writer.
+        tx.execute("INSERT INTO conversation_redactions (
+                id, agent_id, target_id, request_key, actor, permission, reason,
+                created_at_ms, span_unit, span_start, span_end, removed_bytes,
+                removed_chars, receipt, origin_chat_id, origin_message_id
+            ) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,
+                (SELECT json_extract(origin, '$.chat_id') FROM messages WHERE agent_id = ?2 AND id = ?3),
+                (SELECT json_extract(origin, '$.message_id') FROM messages WHERE agent_id = ?2 AND id = ?3))",
             params![receipt.audit_id, target.as_str(), id, key, receipt.actor, PERMISSION, receipt.reason, timestamp_ms, if receipt.span.unit == SpanUnit::Bytes { "bytes" } else { "chars" }, receipt.span.start as i64, receipt.span.end as i64, receipt.removed_bytes as i64, receipt.removed_chars as i64, serde_json::to_string(&receipt).map_err(|_| invalid("receipt serialization failed"))?])?;
         tx.commit()?;
         for mut session in prepared {
@@ -687,15 +858,28 @@ impl Store {
                 ));
             }
         }
-        let checkpoint: (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-            })?;
-        if checkpoint.0 != 0 {
-            receipt.unscrubbed.push(failure(
-                &self.data_dir().join("state.db-wal"),
-                "SQLite reader prevented WAL truncation",
-            ));
+        if whole_body {
+            for unresolved in unverified_full_versions(&conn, self.database_path(), target, &id)? {
+                if !receipt.unscrubbed.contains(&unresolved) {
+                    receipt.unscrubbed.push(unresolved);
+                }
+            }
+        }
+        let checkpoint = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        });
+        match checkpoint {
+            Ok((0, 0, 0)) => {}
+            Ok(_) => receipt.unscrubbed.push(failure(
+                &PathBuf::from(format!("{}-wal", self.database_path().display())),
+                "SQLite reader prevented WAL truncation; old bytes may remain until the reader exits and a successful TRUNCATE checkpoint")),
+            Err(_) => receipt.unscrubbed.push(failure(
+                &PathBuf::from(format!("{}-wal", self.database_path().display())),
+                "SQLite WAL truncation failed; residual bytes are unverified")),
         }
         receipt.full_scrub = receipt.unscrubbed.is_empty();
         conn.execute(

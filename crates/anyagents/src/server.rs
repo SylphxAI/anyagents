@@ -31,6 +31,7 @@ use crate::api::{
 };
 use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
+use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
@@ -52,12 +53,21 @@ pub fn run(data: &Path) -> Result<(), Error> {
 pub fn run_with(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), Error> {
+    run_with_identity(data, runner, stop, Arc::new(ServingIdentity::capture()))
+}
+
+fn run_with_identity(
+    data: &Path,
+    runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    identity: Arc<ServingIdentity>,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner) => result,
+            result = serve(data, runner, identity) => result,
             _ = &mut stop => Ok(()),
         }
     })
@@ -69,6 +79,7 @@ pub(crate) struct AppState {
     pub(crate) health: HealthBoard,
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
+    pub(crate) identity: Arc<ServingIdentity>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -108,7 +119,11 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
-async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
+async fn serve(
+    data: &Path,
+    sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
+    identity: Arc<ServingIdentity>,
+) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     crate::host_memory::on_start(&store);
@@ -173,6 +188,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     prepare_socket(&path)?;
     let api_listener = tokio::net::UnixListener::bind(&path)?;
     set_socket_mode(&path)?;
+    identity.start_hash();
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&path);
     }
@@ -191,6 +207,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         health: supervisor.board(),
         sign_in,
         auth,
+        identity,
     };
     let _ = boundary;
     let listener = api_listener;
@@ -701,12 +718,8 @@ fn spawn_admin_sylphx_delivery(
                         }
                     }
                     flush_harness_usage(&harness, &mut recorded_usage);
-                    if completed_any
-                        && !had_err
-                        && agent.parent_id.is_some()
-                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
-                    {
-                        reap_idle_subagent_caches(&data, &agent.id);
+                    if completed_any && !had_err && agent.parent_id.is_some() {
+                        let _ = store.complete_idle_subagent(&agent.id);
                     }
                 }
                 Err(reason) => {
@@ -1018,16 +1031,7 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
         return;
     };
     for agent in agents {
-        if agent.parent_id.is_none() {
-            continue;
-        }
-        if agent.state == "idle" {
-            if !health.get(&agent.id).is_some_and(|live| live.process_alive) {
-                reap_idle_subagent_caches(data_dir, &agent.id);
-            }
-            continue;
-        }
-        if agent.state != "archived" {
+        if agent.state != "archived" || agent.parent_id.is_none() {
             continue;
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
@@ -1218,12 +1222,6 @@ fn reconcile_agent_snapshot(
                     }
                 }
             } else {
-                if agent.state == "idle"
-                    && agent.parent_id.is_some()
-                    && !health.get(&agent.id).is_some_and(|l| l.process_alive)
-                {
-                    reap_idle_subagent_caches(data, &agent.id);
-                }
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
             }
         } else if agent.state == "running" {
@@ -1239,7 +1237,6 @@ fn reconcile_agent_snapshot(
                         && agent.parent_id.is_some()
                         && store.complete_idle_subagent(&agent.id).unwrap_or(false)
                     {
-                        reap_idle_subagent_caches(data, &agent.id);
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
                             &agent.id,
@@ -1423,6 +1420,7 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
 }
 
 pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let identity = Arc::new(ServingIdentity::capture());
     let _admin_lock = acquire_admin_lock(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
@@ -1438,6 +1436,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         prepare_socket(&path)?;
         let listener = tokio::net::UnixListener::bind(&path)?;
         set_socket_mode(&path)?;
+        identity.start_hash();
         if auth.is_confined() {
             crate::sandbox::share_socket_with_seats(&path);
         }
@@ -1521,6 +1520,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
             auth,
+            identity,
         };
         let app = Router::new()
             .route("/v1/agents", get(list_agents).post(create_agent_route))
@@ -1579,6 +1579,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             )
             .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
             .route("/v1/whoami", get(whoami))
+            .route("/v1/webhooks/healthz", get(admin_healthz))
             .with_state(state);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1671,8 +1672,21 @@ async fn mint_capability(
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
 /// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
-async fn webhook_healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.identity.status(false)),
+    )
+}
+
+/// Process-local details are available only on the admin Unix socket, never
+/// through the internet-reachable webhook listener or its primary API aliases.
+async fn admin_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.identity.status(true)),
+    )
+        .into_response()
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
@@ -1957,10 +1971,6 @@ async fn harness_route(
             body.profile.as_deref(),
         )
         .map_err(ApiError::from_store)?;
-        if let Some(mut live) = state.health.get(&found.id) {
-            live.last_error = None;
-            state.health.publish(&found.id, live);
-        }
         Ok(Json(out))
     })
     .await
@@ -2492,10 +2502,6 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
-            if let Some(mut live) = state.health.get(&agent.id) {
-                live.last_error = None;
-                state.health.publish(&agent.id, live);
-            }
             Ok(Json(out))
         })
         .await;
@@ -3556,16 +3562,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     ) = match health.get(&agent.id) {
         Some(live) if agent.harness != "sylphx" || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
-            let live_err = if live
-                .live_harness
-                .as_deref()
-                .is_some_and(|h| h != agent.harness)
-            {
-                None
-            } else {
-                live.last_error.clone()
-            };
-            let effective_err = live_err.or(session_error);
+            let effective_err = live.last_error.clone().or(session_error);
             let working = live.process_alive
                 && effective_quota.is_none()
                 && effective_err.is_none()
@@ -3733,13 +3730,30 @@ fn install_state(store: &Store, agent: &Agent) -> String {
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(mut body): Json<CreateAgentRequest>,
+    Json(body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
     let caller_agent = match &principal {
         Principal::Operator => None,
         Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
     };
     spawn_store(move || {
+        let requested_groups: Vec<String> = body
+            .group
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .map(|s| s.strip_prefix("group:").unwrap_or(s))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let requested_group_names: Vec<&str> =
+            requested_groups.iter().map(String::as_str).collect();
+        let group_actor = group_actor(&principal);
+        state
+            .store
+            .check_group_joins(&group_actor, &requested_group_names)
+            .map_err(ApiError::from_store)?;
         let parent_agent = match (&caller_agent, body.parent.as_deref()) {
             (_, Some("root" | "")) => {
                 require_admin_or_operator(
@@ -3761,7 +3775,6 @@ async fn create_agent_route(
             }
             (None, None) => None,
         };
-        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body);
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
@@ -3819,17 +3832,15 @@ async fn create_agent_route(
                 .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
         }
-        if let Some(ref grp_raw) = body.group {
-            for g in grp_raw
-                .split(',')
-                .map(|s| s.trim().strip_prefix("group:").unwrap_or(s.trim()))
-                .filter(|s| !s.is_empty())
-            {
-                if let Some((ref caller_id, _)) = caller_agent {
-                    let _ = state.store.join_group(g, caller_id);
-                }
-                let _ = state.store.join_group(g, &agent.id);
+        if !requested_group_names.is_empty() {
+            let mut targets = vec![agent.id.clone()];
+            if let Some((caller_id, _)) = &caller_agent {
+                targets.push(caller_id.clone());
             }
+            state
+                .store
+                .join_groups_as(&group_actor, &requested_group_names, &targets)
+                .map_err(ApiError::from_store)?;
         }
         if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
             .join("mcp-capability")
@@ -3904,12 +3915,6 @@ async fn archive_agent_route(
         };
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
-        if found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a standing domain mind (with a role) cannot be archived; clear its role first or use pause/harness instead",
-            ));
-        }
         if found.parent_id.is_none() {
             if is_self {
                 return Err(ApiError::new(
@@ -3923,6 +3928,11 @@ async fn archive_agent_route(
                 "agents.archive_root",
                 &found.name,
             )?;
+        } else if is_self && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a standing domain sub-agent (with a role) cannot archive itself; report completion to `parent` instead",
+            ));
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -3958,40 +3968,6 @@ async fn archive_agent_route(
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
-}
-
-pub(crate) fn reap_idle_subagent_caches(
-    data_dir: &Path,
-    agent_id: &anyagents_core::AgentId,
-) -> bool {
-    const IDLE_EPHEMERAL_CACHE_DIRS: &[&str] = &[
-        "cache-home",
-        "cache",
-        ".cache",
-        ".npm",
-        ".bun",
-        ".cargo",
-        ".rustup",
-        ".tmp",
-        "tmp",
-        "shell-snapshots",
-    ];
-    let agent_root = data_dir.join("agents").join(agent_id.as_str());
-    let config_dir = agent_root.join("config");
-    let any_exists = IDLE_EPHEMERAL_CACHE_DIRS
-        .iter()
-        .any(|rel| std::fs::symlink_metadata(config_dir.join(rel)).is_ok());
-    if !any_exists {
-        return true;
-    }
-    let seat_ids =
-        detect_seat_ids(&config_dir).or_else(|| detect_seat_ids(&agent_root.join("work")));
-    let mut complete = true;
-    for rel in IDLE_EPHEMERAL_CACHE_DIRS {
-        let target = config_dir.join(rel);
-        complete &= remove_path_with_seat(&target, seat_ids);
-    }
-    complete
 }
 
 pub(crate) fn reap_subagent_ephemeral_dirs(
@@ -4551,17 +4527,30 @@ async fn list_groups_route(
             .map(|(name, members)| {
                 let public = state.store.is_group_public(&name);
                 let roster = build_group_roster(&state.store, &members);
-                GroupView {
+                Ok(GroupView {
+                    owner_agent_id: state
+                        .store
+                        .group(&name)
+                        .map_err(ApiError::from_store)?
+                        .and_then(|g| g.owner_agent_id)
+                        .map(|id| id.to_string()),
                     name,
                     public,
                     members,
                     roster,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ApiError>>()?;
         Ok(Json(GroupsResponse { groups }))
     })
     .await
+}
+
+fn group_actor(principal: &Principal) -> anyagents_core::GroupActor {
+    match principal {
+        Principal::Operator => anyagents_core::GroupActor::Operator,
+        Principal::Agent { agent_id, .. } => anyagents_core::GroupActor::Agent(agent_id.clone()),
+    }
 }
 
 async fn group_action_route(
@@ -4586,174 +4575,58 @@ async fn group_action_route(
                 "group name is empty",
             ));
         }
-        let existing_members = state
-            .store
-            .room_members(&group)
-            .map_err(ApiError::from_store)?
-            .unwrap_or_default();
-        let is_group_pub = body
-            .public
-            .unwrap_or_else(|| state.store.is_group_public(&group));
-        let caller_is_insider = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { agent_id, name } => {
-                if existing_members.is_empty() || existing_members.iter().any(|m| m == name) {
-                    true
-                } else {
-                    existing_members.iter().any(|m| {
-                        state
-                            .store
-                            .agent_by_name(m)
-                            .ok()
-                            .and_then(|ma| ma.parent_id)
-                            .as_ref()
-                            == Some(agent_id)
-                    })
-                }
-            }
-        };
-        let caller_authorized_for_private_group = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { name, .. } => {
-                if caller_is_insider || is_group_pub {
-                    true
-                } else {
-                    let actor = Actor::Agent(name.clone());
-                    existing_members.iter().all(|m| {
-                        state
-                            .store
-                            .agent_by_name(m)
-                            .ok()
-                            .is_none_or(|ma| can_actor_message_agent(&state.store, &actor, &ma).is_ok())
-                    })
-                }
-            }
-        };
-        let target_name = body
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or(default_agent);
-        match body.action.trim() {
-            "join" => {
-                if !caller_authorized_for_private_group {
-                    return Err(ApiError::forbidden(format!(
-                        "group `{group}` is private (`public: false`); only existing group members or their parent agent can add members"
-                    )));
-                }
-                let who_raw = target_name.ok_or_else(|| {
-                    ApiError::new(StatusCode::BAD_REQUEST, "join needs an agent name")
-                })?;
-                let targets: Vec<&str> = who_raw
-                    .split(',')
-                    .map(str::trim)
-                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if targets.is_empty() {
-                    return Err(ApiError::new(
-                        StatusCode::BAD_REQUEST,
-                        "join needs an agent name",
-                    ));
-                }
-                let mut resolved_agents = Vec::with_capacity(targets.len());
-                for who in targets {
-                    let agent = if who.eq_ignore_ascii_case("self")
-                        && let Principal::Agent { ref agent_id, .. } = principal
-                    {
-                        state.store.agent(agent_id).map_err(ApiError::from_store)?
-                    } else {
-                        state
-                            .store
-                            .agent_by_name(who)
-                            .map_err(ApiError::from_store)?
-                    };
-                    if let Principal::Agent { ref name, .. } = principal {
-                        can_actor_message_agent(
-                            &state.store,
-                            &Actor::Agent(name.clone()),
-                            &agent,
-                        )?;
-                    }
-                    resolved_agents.push(agent);
-                }
-                // When an agent creates a brand-new group and adds another agent,
-                // automatically include the creator in the group as well so they immediately share it.
-                if existing_members.is_empty()
-                    && let Principal::Agent { ref agent_id, .. } = principal
-                    && resolved_agents.iter().any(|a| &a.id != agent_id)
-                {
-                    state
-                        .store
-                        .join_group(&group, agent_id)
-                        .map_err(ApiError::from_store)?;
-                }
-                for agent in resolved_agents {
-                    state
-                        .store
-                        .join_group(&group, &agent.id)
-                        .map_err(ApiError::from_store)?;
-                }
-                if let Some(pub_val) = body.public {
-                    state
-                        .store
-                        .set_group_public(&group, pub_val)
-                        .map_err(ApiError::from_store)?;
-                }
-            }
-            "leave" => {
-                let who_raw = target_name.ok_or_else(|| {
-                    ApiError::new(StatusCode::BAD_REQUEST, "leave needs an agent name")
-                })?;
-                for who in who_raw
-                    .split(',')
-                    .map(str::trim)
-                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
-                    .filter(|s| !s.is_empty())
-                {
-                    let agent = if who.eq_ignore_ascii_case("self")
-                        && let Principal::Agent { ref agent_id, .. } = principal
-                    {
-                        state.store.agent(agent_id).map_err(ApiError::from_store)?
-                    } else {
-                        state
-                            .store
-                            .agent_by_name(who)
-                            .map_err(ApiError::from_store)?
-                    };
-                    state
-                        .store
-                        .leave_group(&group, &agent.id)
-                        .map_err(ApiError::from_store)?;
-                }
-                if let Some(pub_val) = body.public
-                    && caller_authorized_for_private_group
-                {
-                    let _ = state.store.set_group_public(&group, pub_val);
-                }
-            }
-            "members" => {
-                if let Some(pub_val) = body.public {
-                    if !caller_authorized_for_private_group {
-                        return Err(ApiError::forbidden(format!(
-                            "group `{group}` is private (`public: false`); only existing group members or their parent agent can change visibility"
-                        )));
-                    }
-                    state
-                        .store
-                        .set_group_public(&group, pub_val)
-                        .map_err(ApiError::from_store)?;
-                }
-            }
+        let action = match body.action.trim() {
+            "join" => anyagents_core::GroupAction::Join,
+            "leave" => anyagents_core::GroupAction::Leave,
+            "members" => anyagents_core::GroupAction::Members,
             other => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     format!("unknown group action: {other}"),
                 ));
             }
+        };
+        let actor = group_actor(&principal);
+        let mut targets = Vec::new();
+        if action != anyagents_core::GroupAction::Members {
+            let who_raw = body
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(default_agent)
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "group action needs an agent name")
+                })?;
+            for who in who_raw
+                .split(',')
+                .map(str::trim)
+                .map(|s| s.strip_prefix("agent:").unwrap_or(s))
+                .filter(|s| !s.is_empty())
+            {
+                let agent = if who.eq_ignore_ascii_case("self")
+                    && let Principal::Agent { ref agent_id, .. } = principal
+                {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                } else {
+                    state
+                        .store
+                        .agent_by_name(who)
+                        .map_err(ApiError::from_store)?
+                };
+                if action == anyagents_core::GroupAction::Join
+                    && let Principal::Agent { ref name, .. } = principal
+                {
+                    can_actor_message_agent(&state.store, &Actor::Agent(name.clone()), &agent)?;
+                }
+                targets.push(agent.id);
+            }
         }
+        state
+            .store
+            .group_action_as(&actor, &group, action, &targets, body.public)
+            .map_err(ApiError::from_store)?;
         let public = state.store.is_group_public(&group);
         let members = state
             .store
@@ -4762,6 +4635,12 @@ async fn group_action_route(
             .unwrap_or_default();
         let roster = build_group_roster(&state.store, &members);
         Ok(Json(GroupView {
+            owner_agent_id: state
+                .store
+                .group(&group)
+                .map_err(ApiError::from_store)?
+                .and_then(|g| g.owner_agent_id)
+                .map(|id| id.to_string()),
             name: group,
             public,
             members,
@@ -6831,6 +6710,7 @@ impl ApiError {
             Error::PermissionDenied(_) => StatusCode::FORBIDDEN,
             Error::AgentBusy => StatusCode::CONFLICT,
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            Error::GroupForbidden { .. } => StatusCode::FORBIDDEN,
             Error::AgentExists(_) => StatusCode::CONFLICT,
             Error::InvalidAddress(_) | Error::Message(_) => StatusCode::BAD_REQUEST,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
@@ -7178,6 +7058,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -7267,6 +7148,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -7281,6 +7163,138 @@ pub(crate) mod tests {
                 assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
             }
         });
+    }
+
+    #[test]
+    fn readiness_answers_while_the_once_only_image_hash_is_blocked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let _env = env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let token = data.path().join("operator-token");
+        std::fs::write(&token, "an-operator-token-0123456789abcdef\n").unwrap();
+        let settings = [
+            (
+                "ANYAGENTS_OPERATOR_TOKEN_FILE",
+                token.to_string_lossy().into_owned(),
+            ),
+            ("ANYAGENTS_AGENT_UID", unsafe { libc::getuid() }.to_string()),
+            ("ANYAGENTS_AGENT_GID", unsafe { libc::getgid() }.to_string()),
+            (
+                "ANYAGENTS_SOCKET_GID",
+                unsafe { libc::getgid() }.to_string(),
+            ),
+            ("ANYAGENTS_FAKE_MODE", "1".into()),
+        ];
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: this fixture holds env_lock until its server stops.
+                    unsafe {
+                        if let Some(value) = value {
+                            std::env::set_var(key, value);
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            settings
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in settings {
+            // SAFETY: every server fixture uses env_lock.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        let image = data.path().join("image");
+        std::fs::write(&image, b"abc").unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, running) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let identity = Arc::new(ServingIdentity::with_hasher(move || {
+            use sha2::{Digest, Sha256};
+            observed.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+            Ok(format!("{:x}", Sha256::digest(std::fs::read(image)?)))
+        }));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let path = data.path().to_path_buf();
+        let serving = Arc::clone(&identity);
+        let server = std::thread::spawn(move || {
+            run_with_identity(&path, Arc::new(Mutex::new(ProcessRunner)), stopped, serving)
+        });
+        struct Stop(
+            Option<tokio::sync::oneshot::Sender<()>>,
+            Option<std::thread::JoinHandle<Result<(), Error>>>,
+        );
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+                self.1.take().unwrap().join().unwrap().unwrap();
+            }
+        }
+        let _server = Stop(Some(stop), Some(server));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let socket = socket_path(data.path());
+        loop {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readiness waited for the image hash"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        let health = || {
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "GET /v1/webhooks/healthz HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            serde_json::from_str::<serde_json::Value>(response.split_once("\r\n\r\n").unwrap().1)
+                .unwrap()
+        };
+        let computing = health();
+        assert_eq!(computing["binary_sha256_state"], "computing");
+        assert!(computing["binary_sha256"].is_null());
+        assert_eq!(computing["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(computing["source_sha"], env!("ANYAGENTS_SOURCE_SHA"));
+        identity.start_hash();
+        identity.clone().start_hash();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = health();
+            if ready["binary_sha256_state"] == "ready" {
+                // SHA-256 of the exact bytes written to the fixture image.
+                assert_eq!(
+                    ready["binary_sha256"],
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "{ready}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -8227,244 +8241,6 @@ exec /usr/bin/git "$@"
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
-    }
-
-    #[test]
-    fn standing_domain_mind_cannot_be_archived_and_harness_switch_clears_stale_error() {
-        let _env = env_lock();
-        unsafe {
-            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
-        let hub = store
-            .create_agent(anyagents_core::NewAgent::new("argus", "codex"))
-            .unwrap();
-        store.set_agent_admin(&hub.id, true).unwrap();
-        let mut new_mind = anyagents_core::NewAgent::new("calliope", "sylphx");
-        new_mind.parent_id = Some(hub.id.clone());
-        new_mind.role = Some("Game Studio".into());
-        let mind = store.create_agent(new_mind).unwrap();
-        store.set_agent_state(&mind.id, "running").unwrap();
-        let mut new_runner = anyagents_core::NewAgent::new("calliope-sub-1", "opencode");
-        new_runner.parent_id = Some(mind.id.clone());
-        let runner = store.create_agent(new_runner).unwrap();
-        store.set_agent_state(&runner.id, "running").unwrap();
-
-        let state = AppState {
-            store: Arc::clone(&store),
-            health: HealthBoard::default(),
-            sign_in: Arc::new(Mutex::new(ProcessRunner)),
-            auth: auth::Mode::Trusted {
-                data_dir: dir.path().to_path_buf(),
-            },
-        };
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            // Neither self, parent hub (`argus`), nor operator can archive `calliope` while its role is set.
-            for caller in [
-                Principal::Agent {
-                    agent_id: mind.id.clone(),
-                    name: mind.name.clone(),
-                },
-                Principal::Agent {
-                    agent_id: hub.id.clone(),
-                    name: hub.name.clone(),
-                },
-                Principal::Operator,
-            ] {
-                let err =
-                    archive_agent_route(caller, State(state.clone()), AxumPath("calliope".into()))
-                        .await
-                        .expect_err("standing domain mind with role must reject archive");
-                assert_eq!(err.status, StatusCode::BAD_REQUEST);
-                assert!(
-                    err.message
-                        .contains("a standing domain mind (with a role) cannot be archived"),
-                    "unexpected error: {}",
-                    err.message
-                );
-            }
-            assert_eq!(store.agent(&mind.id).unwrap().state, "running");
-            assert_eq!(store.agent(&runner.id).unwrap().state, "running");
-        });
-
-        // Offline CLI path also blocks archiving a standing domain mind with a role.
-        let cli_err = crate::agent::agents(
-            dir.path(),
-            crate::AgentsCommand::Archive {
-                name: "calliope".into(),
-            },
-        )
-        .expect_err("offline archive must also block standing domain mind");
-        assert!(
-            cli_err
-                .to_string()
-                .contains("a standing domain mind (with a role) cannot be archived")
-        );
-
-        // Persist a stale sylphx error and parent-error notification marker, then switch harness.
-        let cfg = anyagents_core::agent_config_dir(dir.path(), &mind.id);
-        std::fs::create_dir_all(&cfg).unwrap();
-        crate::vendor::persist_last_error(&cfg, Some("sylphx stream error 502"), None);
-        std::fs::write(cfg.join(".anyagents-notified-parent-error.json"), "{}").unwrap();
-        assert!(cfg.join(".anyagents-last-error.json").is_file());
-        assert!(cfg.join(".anyagents-notified-parent-error.json").is_file());
-
-        create::set_agent_harness(
-            &store,
-            dir.path(),
-            "agent:argus",
-            "calliope",
-            "codex",
-            None,
-            None,
-        )
-        .unwrap();
-        assert!(!cfg.join(".anyagents-last-error.json").is_file());
-        assert!(!cfg.join(".anyagents-notified-parent-error.json").is_file());
-        let updated_mind = store.agent(&mind.id).unwrap();
-        let view = agent_view(&store, &state.health, &updated_mind)
-            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
-        assert_eq!(view.harness, "codex");
-        assert_eq!(view.turn_state, "idle");
-        assert!(view.last_error.is_none());
-
-        unsafe {
-            std::env::remove_var("ANYAGENTS_FAKE_MODE");
-        }
-    }
-
-    #[test]
-    fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
-        let _env = env_lock();
-        unsafe {
-            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let parent_workdir = dir.path().join("repo");
-        let agents_dir = parent_workdir.join(".agents").join("agents");
-        std::fs::create_dir_all(&agents_dir).unwrap();
-        std::fs::write(
-            agents_dir.join("writer.md"),
-            "---\ndescription: \"Ephemeral worktree PR writer\"\nscope: isolated\nworkdir: private\nharness: codex\nmodel: gpt-5.4\n---\n# Writer Archetype\nAlways run cargo test before opening a PR.\n",
-        )
-        .unwrap();
-
-        let store = Arc::new(crate::agent::open_with_key(dir.path()).unwrap());
-        let mut new_parent = anyagents_core::NewAgent::new("lyra", "opencode");
-        new_parent.workdir = Some(parent_workdir.to_string_lossy().to_string());
-        let parent = store.create_agent(new_parent).unwrap();
-
-        let state = AppState {
-            store: Arc::clone(&store),
-            health: HealthBoard::default(),
-            sign_in: Arc::new(Mutex::new(ProcessRunner)),
-            auth: auth::Mode::Trusted {
-                data_dir: dir.path().to_path_buf(),
-            },
-        };
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(async {
-            let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
-                "name": "lyra-writer-1",
-                "type": "writer",
-                "instructions": "Fix issue #42."
-            }))
-            .unwrap();
-            let (status, Json(created)) = create_agent_route(
-                Principal::Agent {
-                    agent_id: parent.id.clone(),
-                    name: parent.name.clone(),
-                },
-                State(state.clone()),
-                Json(req),
-            )
-            .await
-            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
-            assert_eq!(status, StatusCode::CREATED);
-            assert_eq!(
-                created.description.as_deref(),
-                Some("Ephemeral worktree PR writer")
-            );
-            assert_eq!(created.scope, "isolated");
-            assert_eq!(created.harness, "codex");
-            assert_eq!(created.model.as_deref(), Some("gpt-5.4"));
-            let inst = created.instructions.as_deref().unwrap_or("");
-            assert!(
-                inst.starts_with("# Writer Archetype\nAlways run cargo test before opening a PR.")
-            );
-            assert!(inst.ends_with("Fix issue #42."));
-        });
-        unsafe {
-            std::env::remove_var("ANYAGENTS_FAKE_MODE");
-        }
-    }
-
-    #[test]
-    fn reap_idle_subagent_caches_removes_ephemeral_caches_preserving_sessions_and_work() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let parent = store
-            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
-            .unwrap();
-        let mut new_child = anyagents_core::NewAgent::new("sub-worker", "opencode");
-        new_child.parent_id = Some(parent.id.clone());
-        let child = store.create_agent(new_child).unwrap();
-
-        let agent_root = dir.path().join("agents").join(child.id.as_str());
-        let config_dir = agent_root.join("config");
-        let work_dir = agent_root.join("work");
-        for cache_rel in [
-            "cache-home",
-            "cache",
-            ".cache",
-            ".npm",
-            ".bun",
-            ".cargo",
-            ".rustup",
-            ".tmp",
-            "tmp",
-            "shell-snapshots",
-        ] {
-            let p = config_dir.join(cache_rel);
-            std::fs::create_dir_all(&p).unwrap();
-            std::fs::write(p.join("blob.bin"), b"ephemeral").unwrap();
-        }
-        for keep_rel in [".claude", ".codex", ".gemini", "opencode", ".config"] {
-            let p = config_dir.join(keep_rel);
-            std::fs::create_dir_all(&p).unwrap();
-            std::fs::write(p.join("session.json"), b"{}").unwrap();
-        }
-        std::fs::create_dir_all(&work_dir).unwrap();
-        std::fs::write(work_dir.join("lib.rs"), b"pub fn ok() {}\n").unwrap();
-
-        assert!(reap_idle_subagent_caches(dir.path(), &child.id));
-
-        for cache_rel in [
-            "cache-home",
-            "cache",
-            ".cache",
-            ".npm",
-            ".bun",
-            ".cargo",
-            ".rustup",
-            ".tmp",
-            "tmp",
-            "shell-snapshots",
-        ] {
-            assert!(
-                !config_dir.join(cache_rel).exists(),
-                "expected ephemeral cache {cache_rel} to be removed"
-            );
-        }
-        for keep_rel in [".claude", ".codex", ".gemini", "opencode", ".config"] {
-            assert!(
-                config_dir.join(keep_rel).join("session.json").is_file(),
-                "expected session state {keep_rel} to be preserved"
-            );
-        }
-        assert!(work_dir.join("lib.rs").is_file());
     }
 }
 

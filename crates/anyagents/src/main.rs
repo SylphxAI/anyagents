@@ -20,6 +20,7 @@ mod gateway;
 mod grok;
 mod harness_double;
 mod host_memory;
+mod identity;
 mod install;
 mod mcp;
 mod mcp_config;
@@ -775,6 +776,7 @@ enum AgentsCommand {
 }
 
 fn main() -> ExitCode {
+    identity::mark_process_start();
     sandbox::hydrate_operator_groups_if_needed();
     let cli = Cli::parse();
     match run(cli) {

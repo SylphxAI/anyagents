@@ -668,12 +668,6 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let found = store.agent_by_name(name)?;
     let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
     let found = store.agent(&found.id)?;
-    if state == "archived" && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-        return Err(Error::Message(
-            "a standing domain mind (with a role) cannot be archived; clear its role first or use pause/harness instead"
-                .to_string(),
-        ));
-    }
     if state == "running" {
         let cfg = anyagents_core::agent_config_dir(data, &found.id);
         let work_dir = found
@@ -773,7 +767,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             Err(err) => return Err(err),
         }
     }
-    let mut parsed: crate::api::CreateAgentRequest =
+    let parsed: crate::api::CreateAgentRequest =
         serde_json::from_value(body).map_err(|err| err.to_string())?;
     let store = open_with_key(data).map_err(|err| err.to_string())?;
     let parent_agent = match parsed.parent.as_deref() {
@@ -785,7 +779,6 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         ),
         None => None,
     };
-    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed);
     let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,
@@ -794,10 +787,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
-    let explicit_description = parsed.description.clone();
-    let explicit_scope = parsed.scope.clone();
-    let explicit_public = parsed.public;
-    let mut agent = crate::create::create(
+    let agent = crate::create::create(
         &store,
         data,
         crate::create::CreateRequest {
@@ -816,23 +806,6 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         },
     )
     .map_err(|err| err.to_string())?;
-    if let Some(ref desc) = explicit_description {
-        let trimmed = desc.trim();
-        if !trimmed.is_empty() {
-            agent = store
-                .set_agent_description(&agent.id, Some(trimmed))
-                .map_err(|err| err.to_string())?;
-        }
-    }
-    if let Some(ref scope_val) = explicit_scope {
-        agent = store
-            .set_agent_scope_as(&agent.id, scope_val, "operator")
-            .map_err(|err| err.to_string())?;
-    } else if let Some(pub_val) = explicit_public {
-        agent = store
-            .set_agent_public_as(&agent.id, pub_val, "operator")
-            .map_err(|err| err.to_string())?;
-    }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.
     crate::operator::mint(&store, &agent.id).map_err(|err| err.to_string())?;
@@ -1538,6 +1511,9 @@ pub fn join_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), Er
         .map_err(Error::Message)?;
         return Ok(());
     }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message("agent group mutations require the authenticated server; offline database fallback is disabled".into()));
+    }
     open(data)?.join_group(group, agent_id)
 }
 
@@ -1559,6 +1535,9 @@ pub fn leave_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), E
         )
         .map_err(Error::Message)?;
         return Ok(());
+    }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message("agent group mutations require the authenticated server; offline database fallback is disabled".into()));
     }
     open(data)?.leave_group(group, agent_id)
 }

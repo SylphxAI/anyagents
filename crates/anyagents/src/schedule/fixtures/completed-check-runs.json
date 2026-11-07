@@ -1,0 +1,137 @@
+{
+  "total_count": 22,
+  "check_runs": [
+    {
+      "id": 128210929421,
+      "name": "ci-ok",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128210644689,
+      "name": "full-suite / suite-ok",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128158641462,
+      "name": "full-suite / checks",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128158560644,
+      "name": "gate-workflows",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 128158559113,
+      "name": "gate-desk-delivery",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128158558983,
+      "name": "gate-always-on",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128158558980,
+      "name": "gate-manifests",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128158558940,
+      "name": "gate-kueue-config",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128158558918,
+      "name": "gate-contracts",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157749306,
+      "name": "main-state",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 128157747259,
+      "name": "full-suite / changes",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157747105,
+      "name": "full-suite / chat-senders",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157747084,
+      "name": "full-suite / docs",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157747075,
+      "name": "gate-cell-routing",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157746986,
+      "name": "changes",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157746906,
+      "name": "chat-senders",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128157746666,
+      "name": "docs",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128155191095,
+      "name": "shared-path-effective-argo",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 128155188779,
+      "name": "shared-path-window",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128153727995,
+      "name": "shared-path-source",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128034895855,
+      "name": "sylphx/preview",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128034558139,
+      "name": "repository-binding",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}

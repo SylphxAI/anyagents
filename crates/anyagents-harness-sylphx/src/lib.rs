@@ -2178,9 +2178,10 @@ fn record_pending_native_messages(transcript_path: &Path, pending: &[Value]) {
 /// not touch identity, schedules, mailbox cursors, or execute any tool again.
 fn compact_native_context(
     transcript_path: &Path,
-    input: &mut Vec<Value>,
+    input: &[Value],
     pending_messages: &[Value],
-) {
+    level: usize,
+) -> Value {
     let raw_count = std::fs::read_to_string(transcript_path)
         .map(|raw| raw.lines().count())
         .unwrap_or(0);
@@ -2250,12 +2251,58 @@ fn compact_native_context(
             })
             .map(|(_, item)| item.clone()),
     );
-    let continuity = build_prior_transcript_continuity_block(transcript_path).unwrap_or_default();
-    let anchor = json!({
+    if level >= 1 {
+        // Results are replaceable context, not pending work. Preserve call IDs
+        // and a pointer to the original raw line, never to a nested anchor copy.
+        let indexed = load_transcript_indexed_items(transcript_path);
+        let mut source_end = indexed.len();
+        for item in retained.iter_mut().rev() {
+            if item.get("type").and_then(Value::as_str) != Some("function_call_output")
+                || item
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.len() <= 512)
+            {
+                continue;
+            }
+            // A provider may reuse a call_id after its earlier pair completed.
+            // Resolve this occurrence in the ordered active projection, whose
+            // raw coordinates survive anchors and legacy tool normalization.
+            let position = indexed[..source_end]
+                .iter()
+                .rposition(|(_, original)| original == item);
+            let index = position.map(|position| {
+                source_end = position;
+                indexed[position].0
+            });
+            let range = index.map_or_else(
+                || format!("transcript:0-{}", raw_count.saturating_sub(1)),
+                |idx| format!("transcript:{idx}-{idx}"),
+            );
+            item["output"] = json!(format!(
+                "[Completed tool result evicted from active context; exact raw output preserved at {range}. Use memory_recall with that range before relying on its contents. Do not replay the completed action.]"
+            ));
+        }
+    }
+    if level >= 2 {
+        retained.retain(|item| pending_messages.contains(item));
+    }
+    let bounded = |text: String| auth::truncate_tool_output_middle_utf8(text, 2_000, 900, 900);
+    let prior_handoff = if level >= 3 {
+        String::new()
+    } else {
+        bounded(prior_handoff)
+    };
+    let continuity = if level >= 3 {
+        String::new()
+    } else {
+        bounded(build_prior_transcript_continuity_block(transcript_path).unwrap_or_default())
+    };
+    json!({
         "type": "context_window_open",
         "handoff": format!(
             "Goal: continue the pending inbound work without replaying completed actions.\n\
-             Verified Facts: exact latest tool state and pending messages are retained below.\n\
+             Verified Facts: pending messages are exact; completed tool state may be replaced by raw-history pointers.\n\
              Decisions: automatic pre-request compaction; no mailbox or lifecycle changes.\n\
              Next Action: reconcile the retained results, then continue the pending work.\n\
              Full prior history: transcript:0-{}. Use memory_recall before assuming older work is absent.\n\
@@ -2263,9 +2310,7 @@ fn compact_native_context(
         "retained_items": retained,
         "prior_handoff": prior_handoff,
         "timestamp_ms": anyagents_core::now_ms(),
-    });
-    append_transcript_message(transcript_path, &anchor);
-    *input = load_transcript_input_items(transcript_path);
+    })
 }
 
 /// Budget the complete serialized wire request, not bytes/4 of history alone.
@@ -2308,20 +2353,30 @@ fn prepare_budgeted_request(
     let mut body = build_bounded(input)?;
     let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
     let threshold = limits.window_tokens.saturating_mul(limits.compact_percent) / 100;
-    if force_compact || used >= threshold {
-        compact_native_context(transcript_path, input, pending_messages);
-        body = build_bounded(input)?;
+    let ceiling = limits.window_tokens.saturating_mul(95) / 100;
+    if !force_compact && used < threshold && used <= ceiling {
+        return Ok(body);
     }
+    // Try progressively smaller *pure* candidates. Failed preflight must not
+    // grow the raw log or change the active window on every recovery attempt.
+    for level in 0..=3 {
+        let anchor = compact_native_context(transcript_path, input, pending_messages, level);
+        let candidate = memory::project_context_anchor(&anchor);
+        body = build_bounded(&candidate)?;
+        let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
+        if used <= ceiling {
+            append_transcript_message(transcript_path, &anchor);
+            *input = candidate;
+            return Ok(body);
+        }
+    }
+    // Only exact pending inbound plus fixed instructions/tools remain. Refuse
+    // this genuinely irreducible request before dispatch, without committing.
     let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
-    // Leave a further 5% for provider-specific framing/vision accounting. Never
-    // dispatch an oversized irreducible prompt, even after compaction.
-    if used > limits.window_tokens.saturating_mul(95) / 100 {
-        return Err(format!(
-            "context_request_too_large: compacted current work requires {used} conservative tokens; model window {}; request not sent; raw transcript and pending work preserved",
-            limits.window_tokens
-        ));
-    }
-    Ok(body)
+    Err(format!(
+        "context_request_too_large: compacted current work requires {used} conservative tokens; model window {}; request not sent; raw transcript and pending work preserved",
+        limits.window_tokens
+    ))
 }
 
 fn is_context_overflow(status: u16, raw: &str) -> bool {
@@ -3762,7 +3817,8 @@ fn build_tool_definitions() -> Vec<Value> {
                     "properties": {
                         "path": { "type": "string" },
                         "start_line": { "type": "integer" },
-                        "end_line": { "type": "integer" }
+                        "end_line": { "type": "integer" },
+                        "cursor": { "type": "string", "description": "Continuation for reads of this session's raw transcript; keep path and line range unchanged." }
                     },
                     "required": ["path"]
                 }
@@ -3905,7 +3961,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_recall",
-                "description": "Lossless Raw-RAG BM25 + range recall (`transcript:<from>-<to>`) across full append-only transcript (including pre-compaction turns).",
+                "description": "Lossless Raw-RAG BM25 + range recall across the append-only transcript. Responses are capped at 32 KiB; repeat original arguments with next_cursor to concatenate JSON content fragments. Already-active items return pointers, not verbatim replay.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3919,7 +3975,8 @@ fn build_tool_definitions() -> Vec<Value> {
                         "sort": { "type": "string", "enum": ["relevance", "newest", "oldest"] },
                         "range": { "type": "string" },
                         "limit": { "type": "integer" },
-                        "radius": { "type": "integer" }
+                        "radius": { "type": "integer" },
+                        "cursor": { "type": "string", "description": "Continuation from next_cursor; keep all original arguments unchanged." }
                     }
                 }
             }
@@ -4340,6 +4397,22 @@ fn execute_sylphx_tool(
             let start_line = args.get("start_line").and_then(Value::as_u64);
             let end_line = args.get("end_line").and_then(Value::as_u64);
             let target = resolve_workspace_path(work_dir, rel);
+            let transcript = config_dir.join("sylphx-transcript.jsonl");
+            if std::fs::canonicalize(&target)
+                .ok()
+                .is_some_and(|path| std::fs::canonicalize(&transcript).ok().as_ref() == Some(&path))
+            {
+                // File reads of our own raw store must not bypass replay
+                // suppression or response paging. File lines are 1-based;
+                // transcript coordinates are 0-based.
+                return execute_memory_recall(
+                    &transcript,
+                    &json!({
+                        "range": format!("transcript:{}-{}", start_line.unwrap_or(1).max(1) - 1, end_line.unwrap_or(u64::MAX).saturating_sub(1)),
+                        "cursor": args.get("cursor"),
+                    }),
+                );
+            }
             if let Some(mime) = image_mime_for_path(rel) {
                 return match workspace::read_bytes(&target, env) {
                     Ok(bytes) => format_image_read_output(rel, mime, &bytes),
@@ -4900,6 +4973,100 @@ mod tests {
         validate_responses_input(&input).unwrap();
     }
 
+    // Adapted from the independent review's duplicate-completed-ID probe.
+    #[test]
+    fn review_reused_completed_call_id_pointer_must_recover_latest_result() {
+        for legacy in [false, true] {
+            for anchored in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let transcript = tmp.path().join("sylphx-transcript.jsonl");
+                let call = json!({"type":"function_call", "call_id":"reused", "name":"bash", "arguments":"{}"});
+                let old = "older result A";
+                let latest = "LATEST result B 中文".repeat(5_000);
+                let pending = json!({"role":"user", "content":"continue"});
+                for output in [old, latest.as_str()] {
+                    if legacy {
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"role":"assistant", "tool_calls":[
+                                {"id":"reused", "type":"function", "function":{"name":"bash", "arguments":"{}"}}
+                            ]}),
+                        );
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"role":"tool", "tool_call_id":"reused", "content":output}),
+                        );
+                    } else {
+                        append_transcript_message(&transcript, &call);
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"type":"function_call_output", "call_id":"reused", "output":output}),
+                        );
+                    }
+                }
+                append_transcript_message(&transcript, &pending);
+                let mut input = load_transcript_input_items(&transcript);
+                validate_responses_input(&input).unwrap();
+                if anchored {
+                    // The loader must retain each original raw position through
+                    // repeated anchors, not point to an anchor's handoff text.
+                    for _ in 0..2 {
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"type":"context_window_open", "handoff":"keep current work", "retained_items":input}),
+                        );
+                        input = load_transcript_input_items(&transcript);
+                    }
+                }
+                prepare_budgeted_request(
+                    &transcript,
+                    &mut input,
+                    &[pending],
+                    &context_preflight_limits(24_000),
+                    false,
+                    context_preflight_build,
+                )
+                .unwrap();
+                let pointer = input
+                    .iter()
+                    .find(|v| v["type"] == "function_call_output")
+                    .unwrap()["output"]
+                    .as_str()
+                    .unwrap();
+                assert!(
+                    pointer.contains("transcript:3-3"),
+                    "legacy={legacy}, anchored={anchored}: {pointer}"
+                );
+                assert!(!pointer.contains("transcript:1-1"));
+                let mut args = json!({"range":"transcript:3-3"});
+                let mut recovered_json = String::new();
+                loop {
+                    let page = execute_memory_recall(&transcript, &args);
+                    assert!(page.len() <= 32_768);
+                    let parsed: Value = serde_json::from_str(&page).unwrap();
+                    assert_eq!(parsed["mode"], "page");
+                    recovered_json.push_str(parsed["content"].as_str().unwrap());
+                    let Some(cursor) = parsed["next_cursor"].as_str() else {
+                        break;
+                    };
+                    args["cursor"] = json!(cursor);
+                }
+                let recovered: Value = serde_json::from_str(&recovered_json).unwrap();
+                assert_eq!(recovered["items"][0]["index"], 3);
+                let prefix = if legacy {
+                    "[tool] "
+                } else {
+                    "[tool_output:bash:reused] "
+                };
+                assert_eq!(
+                    recovered["items"][0]["content"],
+                    format!("{prefix}{latest}")
+                );
+                validate_responses_input(&input).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn context_preflight_uses_active_models_catalog_window_and_offline_fallback() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5084,6 +5251,14 @@ mod tests {
             &transcript,
             &json!({"role":"assistant", "content":"old verbose history".repeat(12_000)}),
         );
+        let huge_call = json!({"type":"function_call", "call_id":"completed", "name":"memory_recall", "arguments":"{}"});
+        let huge_result = json!({"type":"function_call_output", "call_id":"completed", "output":"raw original 中\"".repeat(65_000)});
+        append_transcript_message(&transcript, &huge_call);
+        append_transcript_message(&transcript, &huge_result);
+        append_transcript_message(
+            &transcript,
+            &json!({"type":"context_window_open", "handoff":"resume skills batch", "retained_items":[huge_call, huge_result]}),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway = format!("http://{}/v1", listener.local_addr().unwrap());
         let transcript_at_dispatch = transcript.clone();
@@ -5128,6 +5303,25 @@ mod tests {
                 std::fs::read_to_string(transcript_at_dispatch)
                     .unwrap()
                     .contains("context_window_open")
+            );
+            let retained_output = request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "function_call_output")
+                .unwrap();
+            assert_eq!(retained_output["call_id"], "completed");
+            assert!(
+                retained_output["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("transcript:2-2")
+            );
+            assert!(
+                !retained_output["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("raw original")
             );
             assert_eq!(request["max_output_tokens"], 2000);
             assert!(request_token_upper_bound(&request).unwrap() + 2000 < 128_000);
@@ -5204,7 +5398,12 @@ mod tests {
             context_preflight_build,
         )
         .unwrap();
-        assert_eq!(&restarted[1..], &[failed, next]);
+        // The newly enlarged fixture also retains its completed tool pair
+        // when it fits. Only the failed/new inbound remains pending; completed
+        // context may remain visible without being revived as pending work.
+        assert!(restarted[restarted.len() - 2..] == [failed, next]);
+        assert!(load_pending_native_messages(&transcript, &restarted) == pending);
+        validate_responses_input(&restarted).unwrap();
     }
 
     #[test]
@@ -5214,6 +5413,8 @@ mod tests {
         let pending = json!({"role":"user", "content":"must not disappear".repeat(20_000)});
         append_transcript_message(&transcript, &pending);
         let mut input = vec![pending.clone()];
+        let raw_before = std::fs::read(&transcript).unwrap();
+        let input_before = input.clone();
         let result = prepare_budgeted_request(
             &transcript,
             &mut input,
@@ -5222,7 +5423,22 @@ mod tests {
             false,
             context_preflight_build,
         );
-        assert!(result.unwrap_err().contains("request not sent"));
+        let failure = result.unwrap_err();
+        assert!(failure.contains("request not sent"));
+        for _ in 0..3 {
+            let repeated = prepare_budgeted_request(
+                &transcript,
+                &mut input,
+                std::slice::from_ref(&pending),
+                &context_preflight_limits(24_000),
+                true,
+                context_preflight_build,
+            )
+            .unwrap_err();
+            assert_eq!(repeated, failure);
+            assert_eq!(std::fs::read(&transcript).unwrap(), raw_before);
+            assert_eq!(input, input_before);
+        }
         assert!(input.contains(&pending));
         assert!(load_transcript_input_items(&transcript).contains(&pending));
         let body = build_native_responses_request(
@@ -5240,6 +5456,55 @@ mod tests {
             r#"{"error":{"message":"Invalid request: Your request exceeded model token limit: 1048576 (requested: 1274676)","type":"invalid_request_error"}}"#
         ));
         assert!(!is_context_overflow(429, "quota exceeded"));
+    }
+
+    #[test]
+    fn native_transcript_file_reads_share_recall_cap_cursor_and_active_suppression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        let transcript = cfg.join("sylphx-transcript.jsonl");
+        let text = "raw file original 中文\n\"".repeat(4_000);
+        let inbound = json!({"role":"user", "content":text});
+        append_transcript_message(&transcript, &inbound);
+        append_transcript_message(
+            &transcript,
+            &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[inbound]}),
+        );
+        let read = |args: &Value| {
+            execute_sylphx_tool("read_file", args, cfg, cfg, &[], Path::new("unused"), &[])
+        };
+        let mut args = json!({"path":"sylphx-transcript.jsonl", "start_line":1, "end_line":1});
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("sylphx-transcript.jsonl", cfg.join("raw-alias.jsonl"))
+                .unwrap();
+            args["path"] = json!("raw-alias.jsonl");
+        }
+        let active = read(&args);
+        assert!(active.len() <= memory::MEMORY_RECALL_MAX_BYTES);
+        assert!(active.contains("Already present in active context"));
+        assert!(!active.contains("raw file original"));
+        append_transcript_message(
+            &transcript,
+            &json!({"type":"context_window_open", "handoff":"evicted", "retained_items":[]}),
+        );
+        let mut combined = String::new();
+        loop {
+            let page = read(&args);
+            assert!(page.len() <= memory::MEMORY_RECALL_MAX_BYTES);
+            let parsed: Value = serde_json::from_str(&page).unwrap();
+            assert_eq!(parsed["mode"], "page");
+            combined.push_str(parsed["content"].as_str().unwrap());
+            let Some(cursor) = parsed["next_cursor"].as_str() else {
+                break;
+            };
+            args["cursor"] = json!(cursor);
+        }
+        let recovered: Value = serde_json::from_str(&combined).unwrap();
+        assert!(recovered["items"][0]["content"] == format!("[user] {text}"));
+        // Ordinary file reads retain their public line-numbered format.
+        std::fs::write(cfg.join("plain.txt"), "unchanged normal read").unwrap();
+        assert!(read(&json!({"path":"plain.txt"})).contains("   1: unchanged normal read"));
     }
 
     #[test]

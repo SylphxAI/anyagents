@@ -533,9 +533,9 @@ async fn mcp_tools_use_the_server_socket() {
     );
     let _: GroupsResponse = ok_json(
         call(
-            &beta,
+            &alpha,
             "groups",
-            serde_json::json!({"action": "join", "group": "brain-trust"}),
+            serde_json::json!({"action": "join", "group": "brain-trust", "agent": "beta"}),
         )
         .await,
     );
@@ -799,6 +799,32 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(warroom.groups[0].name, "alpha-warroom");
     assert!(!warroom.groups[0].public);
     assert_eq!(warroom.groups[0].members, vec!["alpha", "worker-1"]);
+
+    // The reported public:true join payload must neither authorize a private
+    // outsider nor mutate visibility through the real MCP adapter.
+    let escalation = error_text(
+        &call(&beta, "groups", serde_json::json!({"action":"join","group":"alpha-warroom","agent":"self","public":true})).await,
+    );
+    assert!(escalation.contains("is private"), "{escalation}");
+    let evict = error_text(
+        &call(
+            &beta,
+            "groups",
+            serde_json::json!({"action":"leave","group":"alpha-warroom","agent":"worker-1"}),
+        )
+        .await,
+    );
+    assert!(evict.contains("removing another member"), "{evict}");
+    let unchanged: GroupsResponse = ok_json(
+        call(
+            &alpha,
+            "groups",
+            serde_json::json!({"action":"members","group":"alpha-warroom"}),
+        )
+        .await,
+    );
+    assert!(!unchanged.groups[0].public);
+    assert_eq!(unchanged.groups[0].members, vec!["alpha", "worker-1"]);
 
     let beta_intrude_group = error_text(
         &call(
