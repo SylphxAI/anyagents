@@ -69,7 +69,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-channel-telegram",
  "anyagents-core",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-core",
  "anyagents-harness",
@@ -117,7 +117,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-channel-telegram"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-core",
  "serde",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "libc",
@@ -142,7 +142,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-gateway"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "axum",
  "bytes",
@@ -155,7 +155,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-agy"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
@@ -175,7 +175,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-claude"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "serde_json",
@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-codex"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "serde_json",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-muse"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-omp"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
@@ -213,7 +213,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-opencode"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "anyagents-harness-stream",
@@ -223,7 +223,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-stream"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-harness",
  "libc",
@@ -232,7 +232,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-harness-sylphx"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-core",
  "anyagents-harness",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-installer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "tempfile",
@@ -255,7 +255,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-invariants"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-agent",
  "anyagents-core",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "anyagents-supervisor"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyagents-agent",
  "anyagents-core",

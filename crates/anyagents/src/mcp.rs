@@ -787,7 +787,7 @@ struct GroupsArgs {
         deserialize_with = "crate::api::deserialize_string_or_vec"
     )]
     agents: Vec<String>,
-    /// Optional group visibility toggle: `false` (default = Private / Invite-Only group where only existing members or their parent can add members or post) or `true` (Public / Open group).
+    /// Optional group visibility toggle: `false` (default = Private / Invite-Only group; participation requires membership or an invitation) or `true` (Public / Open group).
     #[serde(default, alias = "allow_external")]
     public: Option<bool>,
 }

@@ -778,7 +778,7 @@ impl Store {
         }
         // The audit's target_id freezes its complete retained alias set in the
         // same IMMEDIATE transaction as the body/index rewrite. The primary
-        // origin columns remain a direct-coordinate fallback, not the alias set.
+        // origin columns are audit metadata only, never an unqualified fallback.
         // Ingress joins all aliases to this audit before any ordinary writer.
         tx.execute("INSERT INTO conversation_redactions (
                 id, agent_id, target_id, request_key, actor, permission, reason,

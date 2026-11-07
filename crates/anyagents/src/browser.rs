@@ -1682,6 +1682,114 @@ fn takeover_focused_field(cdp: &mut CdpSession) -> serde_json::Value {
     focus
 }
 
+// Clipboard extraction is explicit and never exposes a password's value or selection.
+const TAKEOVER_SELECTION_JS: &str = r#"(() => {
+    let el = document.activeElement;
+    try { while (el?.tagName === 'IFRAME' && el.contentDocument) el = el.contentDocument.activeElement; } catch (_) {}
+    if (el?.tagName === 'IFRAME') return {frame_focused:true};
+    if (!document.hasFocus()) return {focused:false};
+    if (el?.type === 'password') return {focused:true,blocked:true};
+    const doc = el?.ownerDocument || document;
+    const identity = doc.__anyagentsTakeoverSelectionIdentity ||= {
+        nonce:Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-'), nodes:new WeakMap(), next:0
+    };
+    const nodeId = node => {
+        if (!node) return null;
+        if (!identity.nodes.has(node)) identity.nodes.set(node, ++identity.next);
+        return identity.nodes.get(node);
+    };
+    if (el && typeof el.selectionStart === 'number') {
+        return {focused:true,text:el.value.slice(el.selectionStart,el.selectionEnd),
+            selection_key:JSON.stringify([identity.nonce,nodeId(el),el.selectionStart,el.selectionEnd,el.selectionDirection])};
+    }
+    const selected = doc.getSelection();
+    return {focused:true,text:selected?.toString() || '',
+        selection_key:JSON.stringify([identity.nonce,nodeId(el),nodeId(selected?.anchorNode),selected?.anchorOffset,nodeId(selected?.focusNode),selected?.focusOffset])};
+})()"#;
+
+fn takeover_selection(cdp: &mut CdpSession) -> Result<serde_json::Value, Error> {
+    takeover_selection_expression(cdp, TAKEOVER_SELECTION_JS)
+}
+
+fn takeover_selection_expression(
+    cdp: &mut CdpSession,
+    expression: &str,
+) -> Result<serde_json::Value, Error> {
+    let selection = eval_js(cdp, expression)?;
+    if selection["frame_focused"].as_bool() == Some(true) {
+        for frame in discover_child_frames(cdp) {
+            if let Ok(child) = eval_js_in_frame(cdp, Some(&frame.frame_id), expression)
+                && child["focused"].as_bool() == Some(true)
+            {
+                return Ok(child);
+            }
+        }
+        return Err(Error::Message("focused selection is unavailable".into()));
+    }
+    Ok(selection)
+}
+
+fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> Result<(), Error> {
+    let key = payload["key"].as_str().unwrap_or("Enter");
+    let modifiers = payload["modifiers"].as_u64().unwrap_or(0) & 15;
+    let shortcut = modifiers & (2 | 4) != 0;
+    let lower = key.to_ascii_lowercase();
+    if shortcut && matches!(lower.as_str(), "w" | "t" | "l") {
+        return Err(Error::Message("browser-tab shortcuts stay local".into()));
+    }
+    let commands: Vec<&str> = payload["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|v| matches!(*v, "selectAll" | "copy" | "cut" | "paste" | "undo" | "redo"))
+        .collect();
+    let inferred = if shortcut {
+        match lower.as_str() {
+            "a" => Some("selectAll"),
+            "c" => Some("copy"),
+            "x" => Some("cut"),
+            "v" => Some("paste"),
+            "z" => Some(if modifiers & 8 != 0 { "redo" } else { "undo" }),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let commands = if commands.is_empty() {
+        inferred.into_iter().collect()
+    } else {
+        commands
+    };
+    if commands.iter().any(|c| matches!(*c, "copy" | "cut"))
+        && takeover_selection(cdp)?["blocked"].as_bool() == Some(true)
+    {
+        return Err(Error::Message(
+            "password fields cannot be copied or cut".into(),
+        ));
+    }
+    let spec = resolve_key_spec(key);
+    let mut down = serde_json::json!({
+        "type":"keyDown", "key":spec.key, "code":spec.code,
+        "windowsVirtualKeyCode":spec.vk, "nativeVirtualKeyCode":spec.vk,
+        "modifiers":modifiers, "commands":commands,
+    });
+    // A modified printable key is a chord, never a literal character insertion.
+    if spec.key.chars().count() == 1 && modifiers & (1 | 2 | 4) == 0 && commands.is_empty() {
+        down["text"] = serde_json::json!(spec.key);
+        down["unmodifiedText"] = serde_json::json!(spec.key);
+    }
+    cdp.call("Input.dispatchKeyEvent", down)?;
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+            "type":"keyUp", "key":spec.key, "code":spec.code,
+            "windowsVirtualKeyCode":spec.vk, "nativeVirtualKeyCode":spec.vk, "modifiers":modifiers,
+        }),
+    )?;
+    Ok(())
+}
+
 fn generate_takeover_token() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -2083,76 +2191,63 @@ fn dispatch_takeover_input(
             Ok(serde_json::json!({ "ok": true, "type": "wheel" }))
         }
         "key" => {
-            let raw_key = payload
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Enter");
-            let spec = resolve_key_spec(raw_key);
-            if spec.key.chars().count() == 1 && spec.vk != 13 && spec.vk != 9 && spec.vk != 8 {
-                let s = spec.key.clone();
-                let _ = cdp.call(
-                    "Input.dispatchKeyEvent",
-                    serde_json::json!({
-                        "type": "keyDown",
-                        "key": s,
-                        "code": spec.code,
-                        "text": s,
-                        "unmodifiedText": s,
-                        "windowsVirtualKeyCode": spec.vk,
-                        "nativeVirtualKeyCode": spec.vk,
-                    }),
-                );
-                let _ = cdp.call(
-                    "Input.dispatchKeyEvent",
-                    serde_json::json!({
-                        "type": "keyUp",
-                        "key": spec.key,
-                        "code": spec.code,
-                        "windowsVirtualKeyCode": spec.vk,
-                        "nativeVirtualKeyCode": spec.vk,
-                    }),
-                );
-            } else {
-                dispatch_cdp_key_down(&mut cdp, &spec, false, None)?;
-                dispatch_cdp_key_up(&mut cdp, &spec, None)?;
-            }
-            Ok(serde_json::json!({ "ok": true, "type": "key", "key": spec.key }))
+            dispatch_takeover_key(&mut cdp, payload)?;
+            Ok(
+                serde_json::json!({ "ok":true, "type":"key", "focus":takeover_focused_field(&mut cdp) }),
+            )
         }
-        "text" => {
-            let text_val = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let submit = payload
-                .get("submit")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if text_val.chars().count() <= 128 && !text_val.contains('\n') {
-                for ch in text_val.chars() {
-                    let s = ch.to_string();
-                    let _ = cdp.call(
-                        "Input.dispatchKeyEvent",
-                        serde_json::json!({
-                            "type": "keyDown",
-                            "key": s,
-                            "text": s,
-                            "unmodifiedText": s,
-                        }),
+        "clipboard" => {
+            let selection = takeover_selection(&mut cdp)?;
+            if selection["blocked"].as_bool() == Some(true) {
+                return Err(Error::Message(
+                    "password fields cannot be copied or cut".into(),
+                ));
+            }
+            let text = selection["text"].as_str().unwrap_or("");
+            match payload["action"].as_str().unwrap_or("copy") {
+                "copy" => Ok(serde_json::json!({
+                    "ok":true, "text":text, "selection_key":selection["selection_key"]
+                })),
+                "cut" => {
+                    // The asynchronous local clipboard write must not authorize deleting
+                    // another field with identical text. Check node/range identity and
+                    // delete in one JavaScript task, with no intervening CDP key event.
+                    let expected = payload.to_string();
+                    let expression = format!(
+                        r#"(() => {{
+                            const selection = {TAKEOVER_SELECTION_JS};
+                            if (selection.frame_focused || !selection.focused) return selection;
+                            const expected = {expected};
+                            if (selection.blocked || !expected.selection_key ||
+                                selection.selection_key !== expected.selection_key ||
+                                selection.text !== expected.expected_text)
+                                return {{focused:true,ok:false,error:'Focus or selection changed. Cut cancelled; select the text again.'}};
+                            let el = document.activeElement;
+                            try {{ while (el?.tagName === 'IFRAME' && el.contentDocument) el = el.contentDocument.activeElement; }} catch (_) {{}}
+                            const doc = el?.ownerDocument || document;
+                            if (selection.text && !doc.execCommand('delete'))
+                                return {{focused:true,ok:false,error:'Cut cancelled; the selected text could not be deleted.'}};
+                            return {{focused:true,ok:true,type:'cut'}};
+                        }})()"#
                     );
-                    let _ = cdp.call(
-                        "Input.dispatchKeyEvent",
-                        serde_json::json!({
-                            "type": "keyUp",
-                            "key": s,
-                        }),
-                    );
+                    takeover_selection_expression(&mut cdp, &expression)
                 }
-            } else if !text_val.is_empty() {
-                let _ = cdp.call("Input.insertText", serde_json::json!({ "text": text_val }));
+                _ => Err(Error::Message("unsupported clipboard action".into())),
             }
+        }
+        "text" | "paste" => {
+            let text = payload["text"].as_str().unwrap_or("");
+            if !text.is_empty() {
+                cdp.call("Input.insertText", serde_json::json!({ "text":text }))?;
+            }
+            let submit = payload["submit"].as_bool().unwrap_or(false);
             if submit {
-                let enter = resolve_key_spec("Enter");
-                let _ = dispatch_cdp_key_down(&mut cdp, &enter, false, None);
-                let _ = dispatch_cdp_key_up(&mut cdp, &enter, None);
+                dispatch_takeover_key(&mut cdp, &serde_json::json!({"key":"Enter"}))?;
             }
-            Ok(serde_json::json!({ "ok": true, "type": "text", "submitted": submit }))
+            // Never echo typed or pasted values, including password text.
+            Ok(
+                serde_json::json!({ "ok":true, "type":kind, "submitted":submit, "focus":takeover_focused_field(&mut cdp) }),
+            )
         }
         "navigate" => {
             if let Some(u) = payload
@@ -5197,8 +5292,20 @@ mod tests {
         );
     }
     #[test]
+    fn takeover_clipboard_ui_acceptance() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        run_takeover_ui_acceptance(true);
+    }
+
+    #[test]
     #[ignore = "requires Chromium and Node >=22; run explicitly for takeover UI changes"]
     fn mobile_takeover_ui_acceptance() {
+        run_takeover_ui_acceptance(false);
+    }
+
+    fn run_takeover_ui_acceptance(clipboard_only: bool) {
         assert!(
             Path::new(&chromium_binary()).exists(),
             "Chromium is required"
@@ -5206,7 +5313,7 @@ mod tests {
         let html = r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
         <title>Remote browser input test</title>
         <style>body{margin:0;background:#edf3fb;font:20px system-ui;color:#172a43}header{padding:28px;background:#fff;border-bottom:1px solid #ccd9e8}input{display:block;font:20px system-ui;width:280px;height:48px;margin-top:12px}#target{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#086bce;color:white;border:0;border-radius:16px;padding:24px;font:20px system-ui}p{margin:28px;max-width:460px;line-height:1.6}</style>
-        <header>Remote browser<input id="entry" placeholder="Type here"></header>
+        <header>Remote browser<input id="entry" placeholder="Type here"><input id="entry2" placeholder="Next field"><input id="password" type="password" placeholder="Password"></header>
         <p>Pinch to inspect the page. Tap the blue target to verify precise input. The remote browser keeps its original identity.</p>
         <button id="target">Click target</button>
         <script>window.clicks=[];window.keys=[];document.addEventListener('click',e=>window.clicks.push({x:e.clientX,y:e.clientY,target:e.target.id,trusted:e.isTrusted}));document.addEventListener('keydown',e=>window.keys.push(e.key));</script>"#.to_string();
@@ -5241,7 +5348,11 @@ mod tests {
         .unwrap();
         let output = std::env::var("TAKEOVER_EVIDENCE_DIR")
             .unwrap_or_else(|_| dir.path().join("captures").display().to_string());
-        let result = Command::new("node")
+        let mut command = Command::new("node");
+        if clipboard_only {
+            command.env("TAKEOVER_CLIPBOARD_ONLY", "1");
+        }
+        let result = command
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tests/browser-takeover.mjs"
@@ -5459,7 +5570,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "Chromium startup race; fix owner: lyra-anyagents-takeover-test-race after #91"]
+    #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md; fix owner: lyra-anyagents-takeover-test-race after #91"]
     fn takeover_focus_finds_cross_origin_input() {
         if !Path::new(&chromium_binary()).exists() {
             return;
@@ -5493,9 +5604,9 @@ mod tests {
             &serde_json::json!({"type":"click","x":100,"y":100}),
         )
         .unwrap();
-        assert_eq!(response["focus"]["editable"], true);
+        let _ = stop_profile(dir.path(), "frame-focus");
+        assert_eq!(response["focus"]["editable"], true, "{response}");
         assert_eq!(response["focus"]["rect"]["x"], 60.0);
         assert_eq!(response["focus"]["rect"]["y"], 80.0);
-        let _ = stop_profile(dir.path(), "frame-focus");
     }
 }

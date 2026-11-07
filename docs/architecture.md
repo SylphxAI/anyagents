@@ -324,6 +324,19 @@ Each stored message carries the context the server authenticated for it: the aut
 
 A message from Telegram keeps the message it quotes: the quoted author, as Telegram marked it (bot or person), its text or caption, and the ids that name it. The quoted text is fenced and neutralised, so a modelled line cannot forge a quoted author.
 
+Named virtual groups store an immutable creator `owner_agent_id`, independent
+of membership. Legacy groups retain NULL ownership (operator-owned), even when
+their roster is empty. Existing members may invite agents to private groups;
+nonmembers need the owner's or operator's invitation. `public` on `join` only
+configures a newly created group and is ignored for existing groups. Visibility
+changes through `members` or `leave` require the owner, an ancestor supervising
+the owner, the operator or an explicitly privileged root admin. Removing another
+agent requires authority over that target (self or ancestor), the group owner or
+the operator. Batch authorization and all membership/visibility writes commit in
+one SQLite transaction; refusals return HTTP 403 without partial group changes.
+Agent creation's `group` option uses the same checks, and agent CLI mutations
+require an authenticated server rather than an offline database fallback.
+
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:

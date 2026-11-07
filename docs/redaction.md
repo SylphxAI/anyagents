@@ -68,8 +68,9 @@ hash of it**. Replay of the original target/span, including equivalent mailbox
 id/seq selectors, returns the existing audit id and receipt without a second edit.
 A replay verifies the current canonical tombstone and, for a whole-body erasure,
 every bound baseline before returning that receipt; if either has drifted, the
-operation refuses instead of presenting a stale receipt as proof of erasure. Replays still require a quiescent target. Coordinates are
-otherwise relative to the body's current version.
+operation refuses instead of presenting a stale receipt as proof of erasure.
+Replays still require a quiescent target. Coordinates are otherwise relative to
+the body's current version.
 
 An inbound redaction binds its recipient and **every retained provider origin and
 source-key alias**, not only the row's current `(chat_id, message_id)`. In basic
@@ -80,16 +81,16 @@ a numeric collision from another bot is a normal independent delivery, never
 an erased alias. Exact source keys remain exact. Unknown relay/source formats
 are limited to their exact keys; a missing basic-group account is not inferred
 from a number. Non-basic chats retain the ordinary matcher's shared-chat
-coordinate semantics. Ingress retains both sides of source deduplication, relay/direct coalescence and origin
-promotion, including intentional late-quote redelivery. Later deliveries or edits
+coordinate semantics. Ingress retains both sides of source deduplication,
+relay/direct coalescence and origin promotion, including intentional late-quote redelivery. Later deliveries or edits
 using any known, correctly namespaced alias return the selected redacted row
-without changing its body, metadata, edit baseline, index or audit, regardless of age. A known alias can add
-another routing identity without accepting its content. All matching edit
+without changing its body, metadata, edit baseline, index or audit, regardless of
+age. A known alias can add another routing identity without accepting its content. All matching edit
 baselines under retained account-qualified origins are scrubbed. A legacy
 baseline without provable account ownership is preserved and explicitly listed
 in `unscrubbed`, rather than erasing another bot's data by a colliding number.
-A redacted identity is excluded from duplicate body enrichment, including after partial-span erasure; a new edit
-is not permission to overwrite it. Other recipients, chats and independent
+A redacted identity is excluded from duplicate body enrichment, including after
+partial-span erasure; a new edit is not permission to overwrite it. Other recipients, chats and independent
 provider messages remain independent; a separate existing mailbox entry is not
 erased implicitly. Rows created by an older binary retain their still-available
 origin/source key on first use, but aliases already discarded before this release

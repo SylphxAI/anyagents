@@ -3654,6 +3654,23 @@ async fn create_agent_route(
         Principal::Agent { agent_id, name } => Some((agent_id.clone(), name.clone())),
     };
     spawn_store(move || {
+        let requested_groups: Vec<String> = body
+            .group
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .map(|s| s.strip_prefix("group:").unwrap_or(s))
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        let requested_group_names: Vec<&str> =
+            requested_groups.iter().map(String::as_str).collect();
+        let group_actor = group_actor(&principal);
+        state
+            .store
+            .check_group_joins(&group_actor, &requested_group_names)
+            .map_err(ApiError::from_store)?;
         let parent_agent = match (&caller_agent, body.parent.as_deref()) {
             (_, Some("root" | "")) => {
                 require_admin_or_operator(
@@ -3732,17 +3749,15 @@ async fn create_agent_route(
                 .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
         }
-        if let Some(ref grp_raw) = body.group {
-            for g in grp_raw
-                .split(',')
-                .map(|s| s.trim().strip_prefix("group:").unwrap_or(s.trim()))
-                .filter(|s| !s.is_empty())
-            {
-                if let Some((ref caller_id, _)) = caller_agent {
-                    let _ = state.store.join_group(g, caller_id);
-                }
-                let _ = state.store.join_group(g, &agent.id);
+        if !requested_group_names.is_empty() {
+            let mut targets = vec![agent.id.clone()];
+            if let Some((caller_id, _)) = &caller_agent {
+                targets.push(caller_id.clone());
             }
+            state
+                .store
+                .join_groups_as(&group_actor, &requested_group_names, &targets)
+                .map_err(ApiError::from_store)?;
         }
         if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
             .join("mcp-capability")
@@ -4429,17 +4444,30 @@ async fn list_groups_route(
             .map(|(name, members)| {
                 let public = state.store.is_group_public(&name);
                 let roster = build_group_roster(&state.store, &members);
-                GroupView {
+                Ok(GroupView {
+                    owner_agent_id: state
+                        .store
+                        .group(&name)
+                        .map_err(ApiError::from_store)?
+                        .and_then(|g| g.owner_agent_id)
+                        .map(|id| id.to_string()),
                     name,
                     public,
                     members,
                     roster,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>, ApiError>>()?;
         Ok(Json(GroupsResponse { groups }))
     })
     .await
+}
+
+fn group_actor(principal: &Principal) -> anyagents_core::GroupActor {
+    match principal {
+        Principal::Operator => anyagents_core::GroupActor::Operator,
+        Principal::Agent { agent_id, .. } => anyagents_core::GroupActor::Agent(agent_id.clone()),
+    }
 }
 
 async fn group_action_route(
@@ -4464,174 +4492,58 @@ async fn group_action_route(
                 "group name is empty",
             ));
         }
-        let existing_members = state
-            .store
-            .room_members(&group)
-            .map_err(ApiError::from_store)?
-            .unwrap_or_default();
-        let is_group_pub = body
-            .public
-            .unwrap_or_else(|| state.store.is_group_public(&group));
-        let caller_is_insider = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { agent_id, name } => {
-                if existing_members.is_empty() || existing_members.iter().any(|m| m == name) {
-                    true
-                } else {
-                    existing_members.iter().any(|m| {
-                        state
-                            .store
-                            .agent_by_name(m)
-                            .ok()
-                            .and_then(|ma| ma.parent_id)
-                            .as_ref()
-                            == Some(agent_id)
-                    })
-                }
-            }
-        };
-        let caller_authorized_for_private_group = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { name, .. } => {
-                if caller_is_insider || is_group_pub {
-                    true
-                } else {
-                    let actor = Actor::Agent(name.clone());
-                    existing_members.iter().all(|m| {
-                        state
-                            .store
-                            .agent_by_name(m)
-                            .ok()
-                            .is_none_or(|ma| can_actor_message_agent(&state.store, &actor, &ma).is_ok())
-                    })
-                }
-            }
-        };
-        let target_name = body
-            .agent
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .or(default_agent);
-        match body.action.trim() {
-            "join" => {
-                if !caller_authorized_for_private_group {
-                    return Err(ApiError::forbidden(format!(
-                        "group `{group}` is private (`public: false`); only existing group members or their parent agent can add members"
-                    )));
-                }
-                let who_raw = target_name.ok_or_else(|| {
-                    ApiError::new(StatusCode::BAD_REQUEST, "join needs an agent name")
-                })?;
-                let targets: Vec<&str> = who_raw
-                    .split(',')
-                    .map(str::trim)
-                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if targets.is_empty() {
-                    return Err(ApiError::new(
-                        StatusCode::BAD_REQUEST,
-                        "join needs an agent name",
-                    ));
-                }
-                let mut resolved_agents = Vec::with_capacity(targets.len());
-                for who in targets {
-                    let agent = if who.eq_ignore_ascii_case("self")
-                        && let Principal::Agent { ref agent_id, .. } = principal
-                    {
-                        state.store.agent(agent_id).map_err(ApiError::from_store)?
-                    } else {
-                        state
-                            .store
-                            .agent_by_name(who)
-                            .map_err(ApiError::from_store)?
-                    };
-                    if let Principal::Agent { ref name, .. } = principal {
-                        can_actor_message_agent(
-                            &state.store,
-                            &Actor::Agent(name.clone()),
-                            &agent,
-                        )?;
-                    }
-                    resolved_agents.push(agent);
-                }
-                // When an agent creates a brand-new group and adds another agent,
-                // automatically include the creator in the group as well so they immediately share it.
-                if existing_members.is_empty()
-                    && let Principal::Agent { ref agent_id, .. } = principal
-                    && resolved_agents.iter().any(|a| &a.id != agent_id)
-                {
-                    state
-                        .store
-                        .join_group(&group, agent_id)
-                        .map_err(ApiError::from_store)?;
-                }
-                for agent in resolved_agents {
-                    state
-                        .store
-                        .join_group(&group, &agent.id)
-                        .map_err(ApiError::from_store)?;
-                }
-                if let Some(pub_val) = body.public {
-                    state
-                        .store
-                        .set_group_public(&group, pub_val)
-                        .map_err(ApiError::from_store)?;
-                }
-            }
-            "leave" => {
-                let who_raw = target_name.ok_or_else(|| {
-                    ApiError::new(StatusCode::BAD_REQUEST, "leave needs an agent name")
-                })?;
-                for who in who_raw
-                    .split(',')
-                    .map(str::trim)
-                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
-                    .filter(|s| !s.is_empty())
-                {
-                    let agent = if who.eq_ignore_ascii_case("self")
-                        && let Principal::Agent { ref agent_id, .. } = principal
-                    {
-                        state.store.agent(agent_id).map_err(ApiError::from_store)?
-                    } else {
-                        state
-                            .store
-                            .agent_by_name(who)
-                            .map_err(ApiError::from_store)?
-                    };
-                    state
-                        .store
-                        .leave_group(&group, &agent.id)
-                        .map_err(ApiError::from_store)?;
-                }
-                if let Some(pub_val) = body.public
-                    && caller_authorized_for_private_group
-                {
-                    let _ = state.store.set_group_public(&group, pub_val);
-                }
-            }
-            "members" => {
-                if let Some(pub_val) = body.public {
-                    if !caller_authorized_for_private_group {
-                        return Err(ApiError::forbidden(format!(
-                            "group `{group}` is private (`public: false`); only existing group members or their parent agent can change visibility"
-                        )));
-                    }
-                    state
-                        .store
-                        .set_group_public(&group, pub_val)
-                        .map_err(ApiError::from_store)?;
-                }
-            }
+        let action = match body.action.trim() {
+            "join" => anyagents_core::GroupAction::Join,
+            "leave" => anyagents_core::GroupAction::Leave,
+            "members" => anyagents_core::GroupAction::Members,
             other => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
                     format!("unknown group action: {other}"),
                 ));
             }
+        };
+        let actor = group_actor(&principal);
+        let mut targets = Vec::new();
+        if action != anyagents_core::GroupAction::Members {
+            let who_raw = body
+                .agent
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or(default_agent)
+                .ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "group action needs an agent name")
+                })?;
+            for who in who_raw
+                .split(',')
+                .map(str::trim)
+                .map(|s| s.strip_prefix("agent:").unwrap_or(s))
+                .filter(|s| !s.is_empty())
+            {
+                let agent = if who.eq_ignore_ascii_case("self")
+                    && let Principal::Agent { ref agent_id, .. } = principal
+                {
+                    state.store.agent(agent_id).map_err(ApiError::from_store)?
+                } else {
+                    state
+                        .store
+                        .agent_by_name(who)
+                        .map_err(ApiError::from_store)?
+                };
+                if action == anyagents_core::GroupAction::Join
+                    && let Principal::Agent { ref name, .. } = principal
+                {
+                    can_actor_message_agent(&state.store, &Actor::Agent(name.clone()), &agent)?;
+                }
+                targets.push(agent.id);
+            }
         }
+        state
+            .store
+            .group_action_as(&actor, &group, action, &targets, body.public)
+            .map_err(ApiError::from_store)?;
         let public = state.store.is_group_public(&group);
         let members = state
             .store
@@ -4640,6 +4552,12 @@ async fn group_action_route(
             .unwrap_or_default();
         let roster = build_group_roster(&state.store, &members);
         Ok(Json(GroupView {
+            owner_agent_id: state
+                .store
+                .group(&group)
+                .map_err(ApiError::from_store)?
+                .and_then(|g| g.owner_agent_id)
+                .map(|id| id.to_string()),
             name: group,
             public,
             members,
@@ -6480,6 +6398,7 @@ impl ApiError {
             Error::PermissionDenied(_) => StatusCode::FORBIDDEN,
             Error::AgentBusy => StatusCode::CONFLICT,
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
+            Error::GroupForbidden { .. } => StatusCode::FORBIDDEN,
             Error::AgentExists(_) => StatusCode::CONFLICT,
             Error::InvalidAddress(_) | Error::Message(_) => StatusCode::BAD_REQUEST,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
