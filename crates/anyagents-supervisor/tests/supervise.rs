@@ -920,6 +920,8 @@ struct SwitchHarness {
 struct SwitchProbe {
     health: anyagents_harness::HarnessHealth,
     accept: bool,
+    accept_recovery: bool,
+    offers: usize,
     given: Vec<String>,
     health_reads: usize,
 }
@@ -936,6 +938,8 @@ impl Default for SwitchProbe {
                 sign_in_fault: None,
             },
             accept: false,
+            accept_recovery: false,
+            offers: 0,
             given: Vec::new(),
             health_reads: 0,
         }
@@ -948,7 +952,8 @@ impl anyagents_harness::Harness for SwitchHarness {
         message: &anyagents_harness::OutboundMessage,
     ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
         let mut probe = self.probe.lock().unwrap();
-        if !probe.accept {
+        probe.offers += 1;
+        if !probe.accept && !(probe.accept_recovery && message.id.starts_with("recovery_")) {
             return Ok(anyagents_harness::DeliverOutcome::Deferred);
         }
         probe.given.push(message.id.clone());
@@ -1159,4 +1164,115 @@ fn a_faulted_quota_blocked_process_switches_without_replaying_mail() {
 #[test]
 fn a_dead_process_switches_without_waiting_for_restart_backoff() {
     switch_at_dispatch("running", RetiringTurn::Dead, false);
+}
+
+#[test]
+fn deferred_pending_mail_precedes_interrupted_turn_recovery() {
+    use std::sync::{Mutex, atomic::AtomicBool, mpsc};
+
+    struct DispatchClock {
+        inner: ManualClock,
+        probe: Arc<Mutex<SwitchProbe>>,
+        parked: mpsc::Sender<(usize, Vec<String>)>,
+    }
+    impl Clock for DispatchClock {
+        fn now_ms(&self) -> i64 {
+            self.inner.now_ms()
+        }
+        fn wait(&self, deadline: Option<i64>, woken: &AtomicBool) {
+            let snapshot = {
+                let probe = self.probe.lock().unwrap();
+                (probe.offers, probe.given.clone())
+            };
+            let _ = self.parked.send(snapshot);
+            self.inner.wait(deadline, woken);
+        }
+        fn poke(&self) {
+            self.inner.poke();
+        }
+    }
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("interrupted", "codex"))
+        .unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().display().to_string())
+        .unwrap();
+    store
+        .receive(&agent.id, Incoming::new("interrupted turn"))
+        .unwrap();
+    let interrupted = store.next_undelivered(&agent.id).unwrap().unwrap();
+    store.note_delivered(&agent.id, interrupted.seq).unwrap();
+    let open = store.open_turn(&agent.id).unwrap().unwrap();
+    store
+        .receive(&agent.id, Incoming::new("pending mail"))
+        .unwrap();
+    let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
+
+    // Real mail is deferred, but recovery would be accepted immediately. This
+    // makes an invalid recovery offer observable without racing an input gate.
+    let probe = Arc::new(Mutex::new(SwitchProbe {
+        accept_recovery: true,
+        ..SwitchProbe::default()
+    }));
+    let (tx, rx) = mpsc::channel();
+    let clock = Arc::new(DispatchClock {
+        inner: ManualClock::new(1_700_000_000_000),
+        probe: Arc::clone(&probe),
+        parked: tx,
+    });
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        clock,
+        {
+            let probe = Arc::clone(&probe);
+            Arc::new(move |_: LaunchRequest| {
+                Ok(SwitchHarness {
+                    probe: Arc::clone(&probe),
+                })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    let deadline = Instant::now() + WAIT_CEILING;
+    loop {
+        let (offers, given) = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("dispatch must park");
+        if offers > 0 {
+            assert!(
+                given.is_empty(),
+                "recovery must not overtake deferred mail: {given:?}"
+            );
+            break;
+        }
+    }
+    assert_eq!(store.delivered_cursor(&agent.id).unwrap(), interrupted.seq);
+    assert_eq!(store.open_turn(&agent.id).unwrap(), Some(open));
+    assert_eq!(
+        store.next_undelivered(&agent.id).unwrap().unwrap().id,
+        pending.id
+    );
+
+    probe.lock().unwrap().accept = true;
+    store.poke(Wake::Mail {
+        agent_id: agent.id.clone(),
+    });
+    let deadline = Instant::now() + WAIT_CEILING;
+    loop {
+        let (_, given) = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("delivery must park");
+        if !given.is_empty() {
+            assert_eq!(given, vec![pending.id.to_string()]);
+            break;
+        }
+    }
+    assert_eq!(store.delivered_cursor(&agent.id).unwrap(), pending.seq);
+    assert!(store.next_undelivered(&agent.id).unwrap().is_none());
+    assert!(store.open_turn(&agent.id).unwrap().is_none());
+    drop(supervisor);
 }

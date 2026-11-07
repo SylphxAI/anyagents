@@ -94,6 +94,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Release cut policy
         run: node --test tests/release-cut.test.mjs
+      - name: Release admission policy
+        run: python3 -m unittest discover -s tests -p 'test_release_admission.py' -v
       - name: Takeover geometry
         run: node --test tests/browser-takeover-geometry.test.mjs
       - name: Test
