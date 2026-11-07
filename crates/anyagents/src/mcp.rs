@@ -485,12 +485,6 @@ struct AgentsArgs {
     /// `"subagents"` (all sub-agents across all parents), `"root"` (root agents with no parent), or an agent name/`agt_...` ID.
     #[serde(default)]
     parent: Option<String>,
-    /// Optional case-insensitive multi-token search query for `list` across `name`, `id`, `role`, `description`, `workdir`, `harness`, `model`, and `aliases`.
-    #[serde(default, alias = "q", alias = "search", alias = "filter")]
-    query: Option<String>,
-    /// Optional agent archetype template (`"writer"`, `"reviewer"`, `"mind"`, etc.) resolved from `.agents/agents/<archetype>.md` or `<data_dir>/archetypes/<archetype>.md` when `action` is `"spawn"` or `"create"`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
     /// Target agent name or `agt_...` ID (`"self"`, `"all"`, or a peer/sub-agent name; optional on `spawn` where a `<caller>-sub-<id>` name is auto-generated if omitted).
     #[serde(
         default,
@@ -580,9 +574,6 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional agent archetype template (`"writer"`, `"reviewer"`, `"mind"`, etc.) resolved from `.agents/agents/<archetype>.md` or `<data_dir>/archetypes/<archetype>.md`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
     /// Optional short role label for the spawned agent.
     #[serde(default)]
     role: Option<String>,
@@ -680,12 +671,6 @@ struct SubagentsArgs {
     /// Optional parent filter for `list`: `"self"` (default: this agent's sub-agents), `"all"` (all sub-agents across all parents), or a parent agent name/ID.
     #[serde(default)]
     parent: Option<String>,
-    /// Optional case-insensitive multi-token search query for `list` across `name`, `id`, `role`, `description`, `workdir`, `harness`, `model`, and `aliases`.
-    #[serde(default, alias = "q", alias = "search", alias = "filter")]
-    query: Option<String>,
-    /// Optional agent archetype template (`"writer"`, `"reviewer"`, `"mind"`, etc.) when `action = "spawn"`.
-    #[serde(default, alias = "type", alias = "template", alias = "preset")]
-    archetype: Option<String>,
     /// Harness catalog ID when `action = "spawn"` (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
     #[serde(default)]
     harness: Option<String>,
@@ -1113,10 +1098,7 @@ impl AgentMcp {
                 {
                     "describe".to_string()
                 } else if args.prompt.is_some()
-                    && (args.repo.is_some()
-                        || args.workdir.is_some()
-                        || args.branch.is_some()
-                        || args.archetype.is_some())
+                    && (args.repo.is_some() || args.workdir.is_some() || args.branch.is_some())
                 {
                     "spawn".to_string()
                 } else {
@@ -1136,8 +1118,6 @@ impl AgentMcp {
                         response.agents.retain(|a| {
                             a.state.eq_ignore_ascii_case(state_filter)
                                 || a.turn_state.eq_ignore_ascii_case(state_filter)
-                                || (state_filter.eq_ignore_ascii_case("scaled_to_zero")
-                                    && a.state == "idle")
                         });
                     }
                     Some(_) => {}
@@ -1201,14 +1181,62 @@ impl AgentMcp {
                         }
                     }
                 }
-                let summary = filter_and_summarize_agent_list(
-                    &mut response.agents,
-                    args.query.as_deref(),
-                    args.limit,
-                );
+                let total_matched = response.agents.len();
+                let running = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running")
+                    .count();
+                let working = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "working")
+                    .count();
+                let errored = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.turn_state == "errored")
+                    .count();
+                let paused = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "paused")
+                    .count();
+                let archived = response
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "archived")
+                    .count();
+                let max_archived = args.limit.unwrap_or(25);
+                if archived > max_archived {
+                    let mut skip_archived = archived - max_archived;
+                    response.agents.retain(|a| {
+                        if a.state == "archived" && skip_archived > 0 {
+                            skip_archived -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                for a in &mut response.agents {
+                    a.instructions = None;
+                }
                 let mut val = serde_json::to_value(&response).map_err(|e| e.to_string())?;
                 if let Some(obj) = val.as_object_mut() {
-                    obj.insert("summary".to_string(), summary);
+                    obj.insert(
+                        "summary".to_string(),
+                        serde_json::json!({
+                            "total": total_matched,
+                            "returned": response.agents.len(),
+                            "running": running,
+                            "working": working,
+                            "errored": errored,
+                            "idle": running.saturating_sub(working).saturating_sub(errored),
+                            "paused": paused,
+                            "archived": archived,
+                        }),
+                    );
                 }
                 Ok(rmcp::handler::server::wrapper::Json(val))
             }
@@ -1216,7 +1244,6 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.name,
-                        archetype: args.archetype,
                         role: args.role,
                         harness: args.harness,
                         model: args.model,
@@ -1265,7 +1292,6 @@ impl AgentMcp {
                 };
                 let body = CreateAgentRequest {
                     name,
-                    archetype: args.archetype,
                     role: args.role,
                     harness,
                     model: args.model,
@@ -1596,7 +1622,6 @@ impl AgentMcp {
             .to_string();
         let body = CreateAgentRequest {
             name,
-            archetype: args.archetype,
             role: args.role,
             harness,
             model: args.model,
@@ -1676,19 +1701,50 @@ impl AgentMcp {
                     .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("all"))
                 {
                     resp.agents.retain(|a| {
-                        a.state.eq_ignore_ascii_case(st)
-                            || a.turn_state.eq_ignore_ascii_case(st)
-                            || (st.eq_ignore_ascii_case("scaled_to_zero") && a.state == "idle")
+                        a.state.eq_ignore_ascii_case(st) || a.turn_state.eq_ignore_ascii_case(st)
                     });
                 }
-                let summary = filter_and_summarize_agent_list(
-                    &mut resp.agents,
-                    args.query.as_deref(),
-                    args.limit,
-                );
+                let total_matched = resp.agents.len();
+                let running = resp.agents.iter().filter(|a| a.state == "running").count();
+                let working = resp
+                    .agents
+                    .iter()
+                    .filter(|a| a.state == "running" && a.turn_state == "working")
+                    .count();
+                let errored = resp
+                    .agents
+                    .iter()
+                    .filter(|a| a.turn_state == "errored")
+                    .count();
+                let paused = resp.agents.iter().filter(|a| a.state == "paused").count();
+                let archived = resp.agents.iter().filter(|a| a.state == "archived").count();
+                let max_archived = args.limit.unwrap_or(25);
+                if archived > max_archived {
+                    let mut skip_archived = archived - max_archived;
+                    resp.agents.retain(|a| {
+                        if a.state == "archived" && skip_archived > 0 {
+                            skip_archived -= 1;
+                            false
+                        } else {
+                            true
+                        }
+                    });
+                }
+                for a in &mut resp.agents {
+                    a.instructions = None;
+                }
                 Ok(rmcp::handler::server::wrapper::Json(serde_json::json!({
                     "parent": self.agent.name,
-                    "summary": summary,
+                    "summary": {
+                        "total": total_matched,
+                        "returned": resp.agents.len(),
+                        "running": running,
+                        "working": working,
+                        "errored": errored,
+                        "idle": running.saturating_sub(working).saturating_sub(errored),
+                        "paused": paused,
+                        "archived": archived,
+                    },
                     "subagents": resp.agents,
                 })))
             }
@@ -1733,7 +1789,6 @@ impl AgentMcp {
                 let spawned = self
                     .spawn(Parameters(SpawnArgs {
                         name: args.agent,
-                        archetype: args.archetype,
                         role: None,
                         harness: args.harness,
                         model: args.model,
@@ -2342,224 +2397,10 @@ pub(crate) async fn request_naming(
     Ok((status, bytes))
 }
 
-const DEFAULT_AGENT_LIST_LIMIT: usize = 100;
-
-fn agent_matches_query(a: &AgentView, query: &str) -> bool {
-    let tokens: Vec<String> = query
-        .split_whitespace()
-        .map(str::trim)
-        .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
-        .collect();
-    if tokens.is_empty() {
-        return true;
-    }
-    let name = a.name.to_lowercase();
-    let id = a.id.to_lowercase();
-    let role = a.role.as_deref().unwrap_or("").to_lowercase();
-    let description = a.description.as_deref().unwrap_or("").to_lowercase();
-    let workdir = a.workdir.as_deref().unwrap_or("").to_lowercase();
-    let harness = a.harness.to_lowercase();
-    let model = a.model.as_deref().unwrap_or("").to_lowercase();
-    let aliases: Vec<String> = a.aliases.iter().map(|al| al.to_lowercase()).collect();
-    tokens.iter().all(|tok| {
-        name.contains(tok)
-            || id.contains(tok)
-            || role.contains(tok)
-            || description.contains(tok)
-            || workdir.contains(tok)
-            || harness.contains(tok)
-            || model.contains(tok)
-            || aliases.iter().any(|al| al.contains(tok))
-    })
-}
-
-fn agent_list_priority(a: &AgentView) -> u8 {
-    if a.turn_state == "working" || a.turn_state == "errored" {
-        0
-    } else if a.state == "running" {
-        1
-    } else if a.state == "idle" || a.state == "created" {
-        2
-    } else if a.state == "paused" {
-        3
-    } else {
-        4
-    }
-}
-
-pub(crate) fn filter_and_summarize_agent_list(
-    agents: &mut Vec<AgentView>,
-    query: Option<&str>,
-    limit: Option<usize>,
-) -> serde_json::Value {
-    if let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) {
-        agents.retain(|a| agent_matches_query(a, q));
-    }
-    let total_matched = agents.len();
-    let running = agents.iter().filter(|a| a.state == "running").count();
-    let scaled_to_zero = agents.iter().filter(|a| a.state == "idle").count();
-    let working = agents
-        .iter()
-        .filter(|a| a.state == "running" && a.turn_state == "working")
-        .count();
-    let errored = agents.iter().filter(|a| a.turn_state == "errored").count();
-    let idle = agents
-        .iter()
-        .filter(|a| {
-            (a.state == "running" || a.state == "idle")
-                && a.turn_state != "working"
-                && a.turn_state != "errored"
-        })
-        .count();
-    let paused = agents.iter().filter(|a| a.state == "paused").count();
-    let archived = agents.iter().filter(|a| a.state == "archived").count();
-    let max_archived = limit.unwrap_or(25);
-    if archived > max_archived {
-        let mut skip_archived = archived - max_archived;
-        agents.retain(|a| {
-            if a.state == "archived" && skip_archived > 0 {
-                skip_archived -= 1;
-                false
-            } else {
-                true
-            }
-        });
-    }
-    let cap = limit.unwrap_or(DEFAULT_AGENT_LIST_LIMIT);
-    if limit.is_some() || agents.len() > cap {
-        agents.sort_by_key(agent_list_priority);
-        agents.truncate(cap);
-    }
-    for a in agents.iter_mut() {
-        a.instructions = None;
-    }
-    serde_json::json!({
-        "total": total_matched,
-        "returned": agents.len(),
-        "running": running,
-        "working": working,
-        "errored": errored,
-        "idle": idle,
-        "scaled_to_zero": scaled_to_zero,
-        "paused": paused,
-        "archived": archived,
-    })
-}
-
 #[cfg(test)]
 mod spawn_args_tests {
     use super::*;
     use serde_json::json;
-
-    fn sample_agent(
-        id: &str,
-        name: &str,
-        state: &str,
-        turn_state: &str,
-        role: Option<&str>,
-        description: Option<&str>,
-        workdir: Option<&str>,
-    ) -> AgentView {
-        AgentView {
-            id: id.to_string(),
-            name: name.to_string(),
-            role: role.map(str::to_string),
-            aliases: Vec::new(),
-            parent: Some("agt_parent".to_string()),
-            scope: "private".to_string(),
-            relationship: Some("child".to_string()),
-            can_message: Some(true),
-            harness: "opencode".to_string(),
-            model: Some("sylphx/kimi-k2.5".to_string()),
-            live_harness: None,
-            live_model: None,
-            process_started_at_ms: None,
-            pending_switch: false,
-            workdir: workdir.map(str::to_string),
-            state: state.to_string(),
-            process: if state == "running" { "alive" } else { "down" }.to_string(),
-            turn_state: turn_state.to_string(),
-            delivery_mode: "turn".to_string(),
-            steer_support: "next_turn".to_string(),
-            quota_reset_at_ms: None,
-            block_reason: None,
-            last_error: None,
-            oldest_undelivered_age_ms: None,
-            install: "installed".to_string(),
-            description: description.map(str::to_string),
-            instructions: Some("secret".to_string()),
-            seat_user: None,
-            seat_uid: None,
-            seat_gid: None,
-            schedules: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn list_query_and_pagination_preserve_summary_and_prioritize_working_agents() {
-        let mut agents = Vec::new();
-        for idx in 0..120 {
-            agents.push(sample_agent(
-                &format!("agt_idle_{idx}"),
-                &format!("sub-idle-{idx}"),
-                "idle",
-                "idle",
-                None,
-                Some("Idle worker"),
-                Some("/tmp/wt-idle"),
-            ));
-        }
-        agents.push(sample_agent(
-            "agt_run_idle",
-            "standing-mind",
-            "running",
-            "idle",
-            Some("Growth"),
-            Some("Growth domain mind"),
-            Some("/workspace/growth"),
-        ));
-        agents.push(sample_agent(
-            "agt_working",
-            "active-writer",
-            "running",
-            "working",
-            Some("Writer"),
-            Some("Fixing PR #88"),
-            Some("/tmp/wt-88"),
-        ));
-        agents.push(sample_agent(
-            "agt_errored",
-            "broken-writer",
-            "running",
-            "errored",
-            None,
-            Some("Hit auth error"),
-            Some("/tmp/wt-err"),
-        ));
-
-        let mut queried = agents.clone();
-        let q_summary = filter_and_summarize_agent_list(&mut queried, Some("writer #88"), None);
-        assert_eq!(queried.len(), 1);
-        assert_eq!(queried[0].name, "active-writer");
-        assert_eq!(q_summary["total"], 1);
-        assert_eq!(q_summary["working"], 1);
-
-        let summary = filter_and_summarize_agent_list(&mut agents, None, None);
-        assert_eq!(summary["total"], 123);
-        assert_eq!(summary["returned"], 100);
-        assert_eq!(summary["running"], 3);
-        assert_eq!(summary["working"], 1);
-        assert_eq!(summary["errored"], 1);
-        assert_eq!(summary["scaled_to_zero"], 120);
-        assert_eq!(summary["idle"], 121);
-        assert_eq!(agents.len(), 100);
-        // Working and errored come first, followed by running, then idle.
-        assert_eq!(agents[0].name, "active-writer");
-        assert_eq!(agents[1].name, "broken-writer");
-        assert_eq!(agents[2].name, "standing-mind");
-        assert!(agents.iter().all(|a| a.instructions.is_none()));
-    }
 
     #[test]
     fn spawn_routes_accept_separate_description_and_instructions() {

@@ -544,10 +544,20 @@ pub struct OpenTurn {
     pub completed_outbounds: Vec<OutboundEffect>,
 }
 
-/// Held for the life of one agent loop. Drop releases the lock.
+/// Held for one vendor loop or lifecycle mutation. Drop explicitly releases the
+/// flock even while a fork-inherited descriptor remains open.
 #[derive(Debug)]
 pub struct AgentLock {
     _file: File,
+}
+
+impl Drop for AgentLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor leaves flock held by a concurrent fork's
+        // inherited copy until exec. Release the open-file-description lock
+        // explicitly so the next turn and busy probe see the intended lifetime.
+        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
 }
 
 /// A mailbox or agent change a waiter can block on.
@@ -878,17 +888,21 @@ impl Store {
     /// Serialize lifecycle state and archive-marker changes across API/server
     /// processes. This is separate from the vendor-process lock: an archived
     /// or live process must never prevent its lifecycle from being changed.
-    /// Keep the returned file open through preparation and the store commit.
-    pub fn lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+    /// Keep the returned guard alive through preparation and the store commit.
+    pub fn lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
         self.agent_lifecycle_lock(agent_id, false)
     }
 
     /// Maintenance must skip a busy lifecycle rather than delay unrelated mail.
-    pub fn try_lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+    pub fn try_lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<AgentLock, Error> {
         self.agent_lifecycle_lock(agent_id, true)
     }
 
-    fn agent_lifecycle_lock(&self, agent_id: &AgentId, nonblocking: bool) -> Result<File, Error> {
+    fn agent_lifecycle_lock(
+        &self,
+        agent_id: &AgentId,
+        nonblocking: bool,
+    ) -> Result<AgentLock, Error> {
         let dir = self.data_dir.join("locks");
         std::fs::create_dir_all(&dir)?;
         let file = OpenOptions::new()
@@ -901,7 +915,7 @@ impl Store {
         loop {
             let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
             if rc == 0 {
-                return Ok(file);
+                return Ok(AgentLock { _file: file });
             }
             let error = std::io::Error::last_os_error();
             if error.kind() == ErrorKind::WouldBlock {
@@ -6321,6 +6335,42 @@ mod tests {
         let _other_lock = store.try_lock_agent(&other.id).unwrap();
         drop(held);
         again.try_lock_agent(&held_agent.id).unwrap();
+    }
+
+    #[test]
+    fn dropping_agent_lock_releases_it_with_an_inherited_descriptor_open() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        // A concurrent fork can inherit this open file description until exec.
+        // A clone deterministically models that lifetime without timing a fork.
+        let inherited = lock._file.try_clone().unwrap();
+        drop(lock);
+        let _next_turn = store.try_lock_agent(&owner.id).unwrap();
+        drop(inherited);
+    }
+
+    #[test]
+    fn dropping_lifecycle_lock_releases_it_with_an_inherited_descriptor_open() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        for nonblocking in [false, true] {
+            let lock = if nonblocking {
+                store.try_lock_agent_lifecycle(&owner.id).unwrap()
+            } else {
+                store.lock_agent_lifecycle(&owner.id).unwrap()
+            };
+            // A duplicate shares the open file description inherited by fork,
+            // even when the descriptor is close-on-exec. No fork timing needed.
+            let inherited = lock._file.try_clone().unwrap();
+            assert!(matches!(
+                store.try_lock_agent_lifecycle(&owner.id),
+                Err(Error::AgentBusy)
+            ));
+            drop(lock);
+            let _next_lifecycle = store.try_lock_agent_lifecycle(&owner.id).unwrap();
+            drop(inherited);
+        }
     }
 
     #[test]
