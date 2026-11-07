@@ -2171,8 +2171,41 @@ fn dispatch_takeover_input(
     let ws_url = target
         .ws_url
         .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
+    #[cfg(test)]
+    if std::env::var("ANYAGENTS_FOCUS_ARM").as_deref() == Ok("persistent-input") {
+        // The HTTP listener has one thread per takeover; this slot ends with it.
+        thread_local! {
+            static INPUT: std::cell::RefCell<Option<(u16, String, CdpSession)>> = const {
+                std::cell::RefCell::new(None)
+            };
+        }
+        return INPUT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_none_or(|(port, target, _)| *port != rt.cdp_port || *target != ws_url)
+            {
+                *slot = Some((
+                    rt.cdp_port,
+                    ws_url.clone(),
+                    CdpSession::connect(rt.cdp_port, &ws_url)?,
+                ));
+            }
+            let result = dispatch_takeover_input_cdp(&mut slot.as_mut().unwrap().2, payload);
+            if result.is_err() {
+                *slot = None;
+            }
+            result
+        });
+    }
     let mut cdp = CdpSession::connect(rt.cdp_port, &ws_url)?;
+    dispatch_takeover_input_cdp(&mut cdp, payload)
+}
 
+fn dispatch_takeover_input_cdp(
+    mut cdp: &mut CdpSession,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
     let kind = payload
         .get("type")
         .and_then(|v| v.as_str())
@@ -2223,6 +2256,17 @@ fn dispatch_takeover_input(
                 .get("buttons")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(if event_type == "mouseReleased" { 0 } else { 1 });
+            #[cfg(test)]
+            if event_type == "mousePressed"
+                && std::env::var("ANYAGENTS_FOCUS_ARM").as_deref() == Ok("pre-down-move")
+            {
+                cdp.call(
+                    "Input.dispatchMouseEvent",
+                    serde_json::json!({
+                        "type":"mouseMoved", "x":x, "y":y, "button":"none", "buttons":0,
+                    }),
+                )?;
+            }
             #[cfg(test)]
             let routed = {
                 let arm = std::env::var("ANYAGENTS_FOCUS_ARM").unwrap_or_default();
