@@ -22,6 +22,11 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      takeover:
+        description: Run the real Chromium takeover interaction acceptance
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -98,6 +103,24 @@ jobs:
         run: npm test
       - name: Test
         run: cargo test --workspace --locked
+      - name: Takeover interaction acceptance
+        if: github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
+        env:
+          TAKEOVER_EVIDENCE_DIR: ${{ runner.temp }}/takeover-evidence
+          ANYAGENTS_CHROMIUM_BIN: /usr/bin/google-chrome
+        run: |
+          set -euo pipefail
+          node --version
+          "$ANYAGENTS_CHROMIUM_BIN" --version
+          cargo test -p anyagents --bin anyagents --locked \
+            browser::tests::mobile_takeover_ui_acceptance -- --ignored --exact --nocapture
+      - name: Takeover acceptance evidence
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: takeover-evidence
+          path: ${{ runner.temp }}/takeover-evidence
+          if-no-files-found: error
 
   # The macOS lane: the same gate on a second platform. macOS is a supported
   # host for a long-lived agent, so its build is checked before merge.

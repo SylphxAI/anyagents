@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyagents_core::{Error, now_ms};
@@ -489,7 +490,9 @@ fn save_runtime(data: &Path, state: &BrowserRuntimeState) {
     let dir = profile_dir(data, &state.profile);
     let _ = std::fs::create_dir_all(&dir);
     if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(dir.join("runtime.json"), bytes);
+        // A frame/state reader must never mistake a truncated runtime for a
+        // stopped browser while the independent input lane updates activity.
+        let _ = publish_browser_json(&dir.join("runtime.json"), &bytes);
     }
 }
 
@@ -1528,14 +1531,13 @@ fn load_takeover_state(data: &Path, profile: &str) -> Option<BrowserTakeoverStat
     serde_json::from_slice(&bytes).ok()
 }
 
-fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
+fn publish_browser_json(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = profile_dir(data, &state.profile);
     let seq = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = dir.join(format!(".takeover.{}.{seq}.json", std::process::id()));
-    let publish = || -> std::io::Result<()> {
-        std::fs::create_dir_all(&dir)?;
-        let bytes = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
+    let dir = path.parent().unwrap();
+    let tmp = dir.join(format!(".browser.{}.{seq}.json", std::process::id()));
+    let result = (|| {
+        std::fs::create_dir_all(dir)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -1544,14 +1546,18 @@ fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
             options.mode(0o600);
         }
         let mut file = options.open(&tmp)?;
-        file.write_all(&bytes)?;
-        // Readers include the listener's liveness loop. Never truncate the live
-        // file: a partial JSON read looks like a missing session and stops it.
-        std::fs::rename(&tmp, dir.join("takeover.json"))?;
-        Ok(())
-    };
-    let _ = publish();
+        file.write_all(bytes)?;
+        // Listener, frame and input readers always see a complete snapshot.
+        std::fs::rename(&tmp, path)
+    })();
     let _ = std::fs::remove_file(tmp);
+    result
+}
+
+fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
+        let _ = publish_browser_json(&takeover_path(data, &state.profile), &bytes);
+    }
 }
 
 fn is_human_takeover_active(data: &Path, profile: &str, now: i64) -> bool {
@@ -1826,6 +1832,14 @@ fn takeover_selection_expression(
 fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> Result<(), Error> {
     let key = payload["key"].as_str().unwrap_or("Enter");
     let modifiers = payload["modifiers"].as_u64().unwrap_or(0) & 15;
+    // The viewer's OS need not match the remote host. Linux/Windows Chromium
+    // treats Control, not a Mac viewer's Meta, as the editing accelerator.
+    #[cfg(not(target_os = "macos"))]
+    let modifiers = if modifiers & 4 != 0 {
+        (modifiers & !4) | 2
+    } else {
+        modifiers
+    };
     let shortcut = modifiers & (2 | 4) != 0;
     let lower = key.to_ascii_lowercase();
     if shortcut && matches!(lower.as_str(), "w" | "t" | "l") {
@@ -1845,6 +1859,7 @@ fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> R
             "x" => Some("cut"),
             "v" => Some("paste"),
             "z" => Some(if modifiers & 8 != 0 { "redo" } else { "undo" }),
+            "y" => Some("redo"),
             _ => None,
         }
     } else {
@@ -2200,20 +2215,53 @@ fn render_takeover_html(profile: &str, token: &str, reason: Option<&str>) -> Str
         .replace("{{SCRIPT}}", include_str!("browser_takeover.js"))
 }
 
+struct TakeoverInputSession {
+    target_id: String,
+    cdp: CdpSession,
+}
+
+#[cfg(test)]
 fn dispatch_takeover_input(
     data: &Path,
     profile: &str,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
+    dispatch_takeover_input_session(data, profile, payload, &mut None)
+}
+
+fn dispatch_takeover_input_session(
+    data: &Path,
+    profile: &str,
+    payload: &serde_json::Value,
+    session: &mut Option<TakeoverInputSession>,
+) -> Result<serde_json::Value, Error> {
     let mut rt = load_runtime(data, profile)
         .ok_or_else(|| Error::Message(format!("browser profile `{profile}` is not running")))?;
     touch_runtime(data, &mut rt);
-    let target = select_page_target(data, &mut rt, None)?;
-    let ws_url = target
-        .ws_url
-        .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
-    let mut cdp = CdpSession::connect(rt.cdp_port, &ws_url)?;
+    if session.as_ref().is_none_or(|s| {
+        s.cdp.port != rt.cdp_port || rt.active_target_id.as_deref() != Some(&s.target_id)
+    }) {
+        let target = select_page_target(data, &mut rt, None)?;
+        let ws_url = target
+            .ws_url
+            .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
+        *session = Some(TakeoverInputSession {
+            target_id: target.id,
+            cdp: CdpSession::connect(rt.cdp_port, &ws_url)?,
+        });
+    }
+    let result = dispatch_takeover_cdp_input(&mut session.as_mut().unwrap().cdp, payload);
+    // Reconnect for the next action, never replay a possibly committed input.
+    if result.is_err() {
+        *session = None;
+    }
+    result
+}
 
+fn dispatch_takeover_cdp_input(
+    cdp: &mut CdpSession,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
     let kind = payload
         .get("type")
         .and_then(|v| v.as_str())
@@ -2222,8 +2270,8 @@ fn dispatch_takeover_input(
         "click" => {
             let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
-            dispatch_trusted_click(&mut cdp, x, y)?;
-            let focus = takeover_focused_field(&mut cdp);
+            dispatch_trusted_click(cdp, x, y)?;
+            let focus = takeover_focused_field(cdp);
             Ok(serde_json::json!({ "ok": true, "type": "click", "x": x, "y": y, "focus": focus }))
         }
         "mouse" => {
@@ -2270,7 +2318,7 @@ fn dispatch_takeover_input(
                 }),
             )?;
             let focus = if event_type == "mouseReleased" {
-                Some(takeover_focused_field(&mut cdp))
+                Some(takeover_focused_field(cdp))
             } else {
                 None
             };
@@ -2302,13 +2350,11 @@ fn dispatch_takeover_input(
             Ok(serde_json::json!({ "ok": true, "type": "wheel" }))
         }
         "key" => {
-            dispatch_takeover_key(&mut cdp, payload)?;
-            Ok(
-                serde_json::json!({ "ok":true, "type":"key", "focus":takeover_focused_field(&mut cdp) }),
-            )
+            dispatch_takeover_key(cdp, payload)?;
+            Ok(serde_json::json!({ "ok":true, "type":"key", "focus":takeover_focused_field(cdp) }))
         }
         "clipboard" => {
-            let selection = takeover_selection(&mut cdp)?;
+            let selection = takeover_selection(cdp)?;
             if selection["blocked"].as_bool() == Some(true) {
                 return Err(Error::Message(
                     "password fields cannot be copied or cut".into(),
@@ -2341,7 +2387,7 @@ fn dispatch_takeover_input(
                             return {{focused:true,ok:true,type:'cut'}};
                         }})()"#
                     );
-                    takeover_selection_expression(&mut cdp, &expression)
+                    takeover_selection_expression(cdp, &expression)
                 }
                 _ => Err(Error::Message("unsupported clipboard action".into())),
             }
@@ -2353,11 +2399,11 @@ fn dispatch_takeover_input(
             }
             let submit = payload["submit"].as_bool().unwrap_or(false);
             if submit {
-                dispatch_takeover_key(&mut cdp, &serde_json::json!({"key":"Enter"}))?;
+                dispatch_takeover_key(cdp, &serde_json::json!({"key":"Enter"}))?;
             }
             // Never echo typed or pasted values, including password text.
             Ok(
-                serde_json::json!({ "ok":true, "type":kind, "submitted":submit, "focus":takeover_focused_field(&mut cdp) }),
+                serde_json::json!({ "ok":true, "type":kind, "submitted":submit, "focus":takeover_focused_field(cdp) }),
             )
         }
         "navigate" => {
@@ -2436,12 +2482,55 @@ fn jpeg_size(bytes: &[u8]) -> Option<TakeoverFrameSize> {
     None
 }
 
+#[derive(Default)]
+struct TakeoverServerShared {
+    last_frame: Mutex<Option<TakeoverFrameSize>>,
+    input: Mutex<Option<TakeoverInputSession>>,
+    // Serialize read-modify-publish of viewport/heartbeat/completion only.
+    control: Mutex<()>,
+}
+
+// Bounded parallel clients keep screenshot capture, state inspection and slow
+// HTTP readers off the input path. A persistent, independently locked CDP input
+// session preserves a press/move/release trajectory across HTTP requests.
+fn spawn_takeover_client(
+    stream: TcpStream,
+    data: PathBuf,
+    profile: String,
+    token: String,
+    shared: Arc<TakeoverServerShared>,
+    active: Arc<std::sync::atomic::AtomicUsize>,
+) {
+    use std::sync::atomic::Ordering;
+    if active.fetch_add(1, Ordering::AcqRel) >= 32 {
+        active.fetch_sub(1, Ordering::AcqRel);
+        return;
+    }
+    let counter = active.clone();
+    let result = std::thread::Builder::new()
+        .name(format!("takeover-client-{profile}"))
+        .spawn(move || {
+            struct ActiveClient(Arc<std::sync::atomic::AtomicUsize>);
+            impl Drop for ActiveClient {
+                fn drop(&mut self) {
+                    self.0.fetch_sub(1, Ordering::AcqRel);
+                }
+            }
+            let _active = ActiveClient(counter);
+            let _ = stream.set_nonblocking(false);
+            handle_takeover_http_client(stream, &data, &profile, &token, &shared);
+        });
+    if result.is_err() {
+        active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn handle_takeover_http_client(
     mut stream: TcpStream,
     data: &Path,
     profile: &str,
     expected_token: &str,
-    last_frame: &mut Option<TakeoverFrameSize>,
+    shared: &TakeoverServerShared,
 ) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -2565,7 +2654,7 @@ fn handle_takeover_http_client(
             ) && let Some(b64) = shot.get("data").and_then(|v| v.as_str())
                 && let Ok(jpeg_bytes) = decode_base64(b64)
             {
-                *last_frame = jpeg_size(&jpeg_bytes);
+                *shared.last_frame.lock().unwrap() = jpeg_size(&jpeg_bytes);
                 let dpr = metrics["device_scale_factor"].as_f64().unwrap_or(1.0);
                 let width = metrics["width"].as_u64().unwrap_or(1280);
                 let height = metrics["height"].as_u64().unwrap_or(800);
@@ -2589,6 +2678,8 @@ fn handle_takeover_http_client(
             false
         }
         ("GET", "/state") => {
+            let _control = shared.control.lock().unwrap();
+            let last_frame = *shared.last_frame.lock().unwrap();
             let mut url = String::new();
             let mut title = String::new();
             let mut cap = CaptchaDetection::default();
@@ -2645,6 +2736,7 @@ fn handle_takeover_http_client(
             false
         }
         ("POST", "/viewport") => {
+            let _control = shared.control.lock().unwrap();
             let payload = serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
             let result = set_takeover_viewport(data, profile, &payload);
             let (status, body) = match result {
@@ -2665,7 +2757,8 @@ fn handle_takeover_http_client(
         ("POST", "/input") => {
             let payload: serde_json::Value =
                 serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
-            match dispatch_takeover_input(data, profile, &payload) {
+            let mut session = shared.input.lock().unwrap();
+            match dispatch_takeover_input_session(data, profile, &payload, &mut session) {
                 Ok(res) => {
                     let bytes = serde_json::to_vec(&res).unwrap_or_default();
                     let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
@@ -2687,6 +2780,7 @@ fn handle_takeover_http_client(
             false
         }
         ("POST", "/complete") => {
+            let _control = shared.control.lock().unwrap();
             let payload: serde_json::Value =
                 serde_json::from_slice(body_bytes).unwrap_or_else(|_| serde_json::json!({}));
             let note = payload
@@ -2842,10 +2936,14 @@ fn start_or_reuse_takeover_session(
     std::thread::Builder::new()
         .name(format!("anyagents-takeover-{prof}"))
         .spawn(move || {
-            let mut last_frame = None;
+            let shared = Arc::new(TakeoverServerShared::default());
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             loop {
                 let now = now_ms();
-                reap_disconnected_takeover_viewport(&data_dir, &prof, now);
+                // Never wait for state inspection in the accept loop.
+                if let Ok(_control) = shared.control.try_lock() {
+                    reap_disconnected_takeover_viewport(&data_dir, &prof, now);
+                }
                 let Some(cur) = load_takeover_state(&data_dir, &prof) else {
                     break;
                 };
@@ -2861,21 +2959,17 @@ fn start_or_reuse_takeover_session(
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
-                        let finished = handle_takeover_http_client(
+                        spawn_takeover_client(
                             stream,
-                            &data_dir,
-                            &prof,
-                            &tok,
-                            &mut last_frame,
+                            data_dir.clone(),
+                            prof.clone(),
+                            tok.clone(),
+                            shared.clone(),
+                            active.clone(),
                         );
-                        if finished {
-                            std::thread::sleep(Duration::from_millis(150));
-                            break;
-                        }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(40));
+                        std::thread::sleep(Duration::from_millis(5));
                     }
                     Err(_) => break,
                 }
@@ -5610,6 +5704,46 @@ mod tests {
             "mobile takeover acceptance failed; captures: {output}"
         );
     }
+    #[test]
+    fn takeover_input_is_not_blocked_by_a_slow_frame_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = start_or_reuse_takeover_session(
+            dir.path(),
+            "parallel-input",
+            None,
+            None,
+            Some(30_000),
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        let mut slow = TcpStream::connect(("127.0.0.1", st.port)).unwrap();
+        // This request cannot finish until the test drops it. The old single
+        // synchronous listener waits its full 3s read deadline before /input.
+        write!(
+            slow,
+            "GET /takeover/{}/frame.jpg HTTP/1.1\r\nHost: localhost\r\n",
+            st.token
+        )
+        .unwrap();
+        let begin = std::time::Instant::now();
+        let (code, body) = raw_http_call(
+            st.port,
+            "POST",
+            &format!("/takeover/{}/input", st.token),
+            Some(r#"{"type":"key","key":"Escape"}"#),
+        );
+        assert_eq!(code, 400);
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(body["error"].as_str().unwrap().contains("is not running"));
+        assert!(
+            begin.elapsed() < Duration::from_secs(1),
+            "input was blocked by an unrelated HTTP reader"
+        );
+        drop(slow);
+        cleanup_takeover_session(dir.path(), "parallel-input").unwrap();
+    }
+
     #[test]
     fn takeover_state_publication_preserves_in_flight_readers() {
         let dir = tempfile::tempdir().unwrap();

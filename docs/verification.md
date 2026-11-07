@@ -100,9 +100,10 @@ or live authentication. See [ADR 0002](adr/0002-runtime-drivers-and-capability-i
 
 Takeover starts with the original desktop page, fitted to a full-viewport canvas.
 The floating control pill expands to reveal typing, Enter, Backspace, reset/1:1,
-and an opt-in phone layout. Touch pinches zoom locally; dragging pans when
-zoomed and scrolls the remote page at fit. Mouse dragging continues to operate
-the remote page. Phone layout resizes only the browser window, leaving its
+and an opt-in phone layout. A single finger clicks or press-drags the remote page, including sliders.
+Two fingers scroll the remote page or pinch to zoom locally. The explicit
+“Touch: pan view” mode moves the zoomed local view without interacting with
+the page. Mouse press-drag and wheel operate the remote page. Phone layout resizes only the browser window, leaving its
 User-Agent, Client Hints, screen and DPR unchanged. The original window bounds
 and state are restored on Done, agent release, expiry, navigation away, or a
 lost viewer heartbeat (more than 10 seconds). The viewer polls state 800 ms
@@ -118,8 +119,13 @@ the viewport regression advances the reaper's explicit clock without writing
 expired deadlines or stale heartbeats that race its background loop. Neither
 regression needs timing sleeps or retries.
 
-Desktop takeover accepts native modifier chords, including select-all, copy,
-cut, paste and undo. Paste inserts local clipboard text into the remote focus;
+Takeover routes keyboard shortcuts globally, including when the canvas,
+page background, stage or a HUD button has focus. Only local HUD text fields
+keep their own typing and clipboard. Both Control and Command support
+select-all, copy, cut, paste, undo and redo (Shift+Z or Control+Y). The remote
+host maps a Mac viewer’s Command to Control on Linux/Windows. A native paste
+event and a clipboard-read fallback share a single-insertion guard. Clipboard
+permission refusal remains visible; failed inputs are never automatically replayed. Paste inserts local clipboard text into the remote focus;
 copy and cut export the remote selection only after checking that the focus is
 not a password field. The viewer keeps new-tab, close-tab and address-bar
 shortcuts local. The floating pill also exposes Paste, Copy, Select all, Tab and Esc;
@@ -127,6 +133,29 @@ clipboard permission refusal displays a prompt instead of silently losing input.
 On touch devices the native keyboard input overlays the remote field and tracks
 its position through zoom and pan, so the device's Paste menu works in place.
 No typed or pasted text is returned in input acknowledgements.
+
+The server gives input a persistent CDP session independent of screenshots and
+state inspection. At most 32 concurrent HTTP clients are admitted. Frame metadata
+uses short locks; viewport/heartbeat/completion updates share a separate control
+lock that input never waits on. Unsent mouse moves are coalesced without crossing
+press/release/key boundaries, and coalesced wheels preserve total scroll distance.
+The viewer polls JPEGs 32 ms after each completed frame and automatically retries
+frame/state reads on the same URL after disconnection. Each fetch has a 5-second
+deadline. Input failures report connection loss rather than replaying a possibly
+committed action.
+
+`tests/browser-takeover-interaction.mjs` drives the actual Rust HTTP server with
+trusted Chromium input at 1440×900, 834×1194 and 390×844. It covers global focus
+owners, native/fallback single paste, password paste, clipboard/undo/redo, IME,
+local HUD isolation, sign-in clicks, desktop/touch slider drag, mouse/two-finger
+scroll, same-URL reconnect and 20 input-to-painted-JPEG latency samples with a
+150 ms maximum. Emulated touch is not a physical iPhone Safari receipt.
+`npm test` checks bounded move/wheel queues and no replay on input failure. The
+resource-free Rust regression holds an incomplete frame HTTP request open while
+verifying a separate input request completes, distinguishing the old serial
+listener. A manual `ci` dispatch with `takeover=true` executes the full ignored
+Chromium fixture and uploads `takeover-evidence`; it does not remove the existing
+startup quarantine from ordinary PR/merge-group runs.
 
 `takeover_clipboard_ui_acceptance` covers the Chromium viewer clipboard and
 keyboard regressions. It is temporarily quarantined by #118: Linux jobs

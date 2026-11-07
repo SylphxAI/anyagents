@@ -5,6 +5,7 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { stopProcessGroup } from './browser-process-group.mjs';
+import { interactionAcceptance } from './browser-takeover-interaction.mjs';
 const [url, remoteWs, output] = process.argv.slice(2);
 assert.ok(url && remoteWs && output, 'usage: node browser-takeover.mjs URL REMOTE_WS OUTPUT');
 await mkdir(output, { recursive: true });
@@ -70,7 +71,7 @@ try {
     }
   }
   async function key(key, code, vk, modifiers = 0) {
-    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers });
+    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers, ...(key.length===1 && !(modifiers&7) ? {text:key,unmodifiedText:key} : {}) });
     await viewer.call('Input.dispatchKeyEvent', { type:'keyUp', key, code, windowsVirtualKeyCode:vk, modifiers });
   }
   async function remoteField(id) {
@@ -84,6 +85,7 @@ try {
     await until(() => remote.eval(`document.activeElement.id === '${id}'`), 'remote field '+id);
   }
   await viewer.call('Browser.grantPermissions', {origin:new URL(url).origin,permissions:['clipboardReadWrite','clipboardSanitizedWrite']});
+  await interactionAcceptance({viewer,remote,url,output,until,key,touch,api,screenshot});
   for (const [width,height] of [[1440,900],[390,844]]) {
     await viewer.call('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width<700});
     await viewer.call('Emulation.setTouchEmulationEnabled', {enabled:width<700});
