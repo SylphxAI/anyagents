@@ -549,7 +549,7 @@ struct AgentsArgs {
     #[serde(default)]
     description: Option<String>,
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt) when `action` is `"spawn"`, `"create"`, or `"describe"`.
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`) when `action` is `"spawn"`, `"create"`, or `"describe"`.
     #[serde(default)]
@@ -626,7 +626,7 @@ struct SpawnArgs {
     #[serde(default)]
     description: Option<String>,
     /// Optional detailed private standing instructions (`instructions`, Layer 2) for the spawned agent.
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
@@ -652,7 +652,7 @@ struct DescribeArgs {
     #[serde(default, alias = "text")]
     description: Option<String>,
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     /// Optional display-only role label; no effect on lifecycle, scope or prompts.
     #[serde(default)]
@@ -725,7 +725,12 @@ struct SubagentsArgs {
     #[serde(default)]
     description: Option<String>,
     /// Optional private system/role instructions when `action = "spawn"`.
-    #[serde(default, alias = "role")]
+    #[serde(
+        default,
+        alias = "role",
+        alias = "instruction",
+        alias = "system_prompt"
+    )]
     instructions: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
     #[serde(default)]
@@ -2702,5 +2707,36 @@ mod spawn_args_tests {
                 .iter()
                 .all(|agent| agent.name.starts_with("archived-worker-1"))
         );
+    }
+
+    #[test]
+    fn mcp_and_api_accept_singular_instruction_and_system_prompt_aliases() {
+        for key in ["instruction", "system_prompt"] {
+            let input = json!({
+                "action": "spawn",
+                "name": "worker",
+                "description": "Public summary",
+                key: "Private standing SOP"
+            });
+            let agents: AgentsArgs = serde_json::from_value(input.clone()).unwrap();
+            let spawn: SpawnArgs = serde_json::from_value(input.clone()).unwrap();
+            let describe: DescribeArgs = serde_json::from_value(input.clone()).unwrap();
+            let subagents: SubagentsArgs = serde_json::from_value(input.clone()).unwrap();
+            let api_req: crate::api::CreateAgentRequest = serde_json::from_value(input).unwrap();
+            assert_eq!(agents.instructions.as_deref(), Some("Private standing SOP"));
+            assert_eq!(spawn.instructions.as_deref(), Some("Private standing SOP"));
+            assert_eq!(
+                describe.instructions.as_deref(),
+                Some("Private standing SOP")
+            );
+            assert_eq!(
+                subagents.instructions.as_deref(),
+                Some("Private standing SOP")
+            );
+            assert_eq!(
+                api_req.instructions.as_deref(),
+                Some("Private standing SOP")
+            );
+        }
     }
 }

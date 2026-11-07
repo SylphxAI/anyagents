@@ -127,6 +127,10 @@ retains its ETag and a compact observation summary; subsequent reads send
 3,000-check PR requires 30 Check Run pages, plus the pull and commit statuses,
 not one expanded GraphQL query per watching agent. Inactive targets expire
 after one hour, and obsolete head/page summaries are discarded.
+If the `gh` adapter supplies a disk-cached JSON body with a `304 Not Modified`
+response before this daemon has cached that page, the watch parses the body to
+initialize its page summary. A bodyless 304 still requires an in-memory page;
+without either source, the watch reports a payload error.
 
 A 403/429 secondary-limit response or `Retry-After` pauses every GitHub watch
 request until the cooldown expires. Each watch records `probe_error:rate_limited`
