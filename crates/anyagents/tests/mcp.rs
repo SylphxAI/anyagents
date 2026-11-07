@@ -66,6 +66,8 @@ struct GroupsResponse {
 #[derive(Deserialize)]
 struct GroupView {
     name: String,
+    #[serde(default)]
+    public: bool,
     members: Vec<String>,
 }
 
@@ -548,6 +550,133 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(l2_to_parent.deliveries.len(), 1);
     assert_eq!(l2_to_parent.deliveries[0].to, "agent:worker-1");
 
+    // Encapsulation boundary across levels: Root `alpha` (grandparent) and `beta` (unrelated root)
+    // cannot skip `worker-1` to message private L2 sub-agent `worker-1-child` (`public: false`) directly.
+    let root_skip_l1_err = error_text(
+        &call(
+            &alpha,
+            "send",
+            serde_json::json!({"to": ["worker-1-child"], "text": "skipping L1 to L2"}),
+        )
+        .await,
+    );
+    assert!(
+        root_skip_l1_err.contains("cannot message sub-agent `worker-1-child` directly")
+            && root_skip_l1_err.contains("agent:worker-1"),
+        "unexpected error: {root_skip_l1_err}"
+    );
+
+    // Sub-agent communication encapsulation (`public: false` by default):
+    // 1. Spawn a sibling `worker-2` under `alpha` (defaults to `public: false`).
+    // 2. Verify `worker-1` cannot DM `worker-2` directly or via `siblings` while `public: false`.
+    // 3. Verify Parent `alpha` can opt `worker-2` in via `describe(public: true)`, after which `worker-1` CAN DM `worker-2`.
+    // 4. Verify Parent `alpha` can also put `public: false` sub-agents into a shared virtual group (`group:collab`) so they can collaborate without becoming globally `public: true`.
+    let spawned_sib: AgentView = ok_json(
+        call(
+            &alpha,
+            "spawn",
+            serde_json::json!({
+                "name": "worker-2",
+                "prompt": "sibling subagent task"
+            }),
+        )
+        .await,
+    );
+    let p2p_direct_err = error_text(
+        &call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["worker-2"], "text": "sibling peer-to-peer attempt"}),
+        )
+        .await,
+    );
+    assert!(
+        p2p_direct_err.contains("cannot message sub-agent `worker-2` directly")
+            && p2p_direct_err.contains("public: false"),
+        "unexpected error: {p2p_direct_err}"
+    );
+    let p2p_alias_err = error_text(
+        &call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["siblings"], "text": "sibling broadcast attempt"}),
+        )
+        .await,
+    );
+    assert!(
+        p2p_alias_err.contains("no reachable sibling sub-agents"),
+        "unexpected error: {p2p_alias_err}"
+    );
+
+    // Parent `alpha` sets `public: true` on `worker-2` -> `worker-1` can now DM `worker-2`!
+    let desc_pub: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "describe",
+            serde_json::json!({"agent": "worker-2", "public": true}),
+        )
+        .await,
+    );
+    assert_eq!(desc_pub["public"], true);
+    let pub_dm: SendResponse = ok_json(
+        call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["worker-2"], "text": "allowed after parent set public: true"}),
+        )
+        .await,
+    );
+    assert_eq!(pub_dm.deliveries[0].to, "agent:worker-2");
+
+    // Parent `alpha` sets `public: false` again, then adds `worker-1` and `worker-2` to a virtual group `collab`.
+    let desc_priv: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "describe",
+            serde_json::json!({"agent": "worker-2", "public": false}),
+        )
+        .await,
+    );
+    assert_eq!(desc_priv["public"], false);
+    for m in ["worker-1", "worker-2"] {
+        let _: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "groups",
+                serde_json::json!({"action": "join", "group": "collab", "agent": m}),
+            )
+            .await,
+        );
+    }
+    let grp_dm: SendResponse = ok_json(
+        call(
+            &worker_1,
+            "send",
+            serde_json::json!({"to": ["worker-2"], "text": "allowed via shared virtual group"}),
+        )
+        .await,
+    );
+    assert_eq!(grp_dm.deliveries[0].to, "agent:worker-2");
+    for m in ["worker-1", "worker-2"] {
+        let _: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "groups",
+                serde_json::json!({"action": "leave", "group": "collab", "agent": m}),
+            )
+            .await,
+        );
+    }
+
+    let _: serde_json::Value = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action": "delete", "name": &spawned_sib.id}),
+        )
+        .await,
+    );
+
     let _: AgentView = ok_json(
         call(
             &worker_1,
@@ -588,6 +717,45 @@ async fn mcp_tools_use_the_server_socket() {
         cross_parent_err.contains("cannot message sub-agent `worker-1` directly")
             && cross_parent_err.contains("agent:alpha"),
         "unexpected error: {cross_parent_err}"
+    );
+
+    // Private group creation & access control: `alpha` creates private group `alpha-warroom` with `worker-1` (auto-joining `alpha`),
+    // and unrelated Root peer `beta` is refused from joining or posting to `alpha-warroom` until it is made public or `alpha` adds `beta`.
+    let warroom: GroupsResponse = ok_json(
+        call(
+            &alpha,
+            "groups",
+            serde_json::json!({"action": "join", "group": "alpha-warroom", "agent": &spawned.id}),
+        )
+        .await,
+    );
+    assert_eq!(warroom.groups[0].name, "alpha-warroom");
+    assert!(!warroom.groups[0].public);
+    assert_eq!(warroom.groups[0].members, vec!["alpha", "worker-1"]);
+
+    let beta_intrude_group = error_text(
+        &call(
+            &beta,
+            "groups",
+            serde_json::json!({"action": "join", "group": "alpha-warroom"}),
+        )
+        .await,
+    );
+    assert!(
+        beta_intrude_group.contains("is private"),
+        "unexpected private group join error: {beta_intrude_group}"
+    );
+    let beta_post_private_group = error_text(
+        &call(
+            &beta,
+            "send",
+            serde_json::json!({"to": ["group:alpha-warroom"], "text": "uninvited post"}),
+        )
+        .await,
+    );
+    assert!(
+        beta_post_private_group.contains("private group"),
+        "unexpected private group post error: {beta_post_private_group}"
     );
 
     // Custody transfer (`agents` `action = "transfer"`): `alpha` transfers `worker-1` to `beta`,

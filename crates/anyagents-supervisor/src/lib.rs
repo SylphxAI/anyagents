@@ -1184,6 +1184,11 @@ impl<H: Harness + 'static> Session<H> {
     /// to the sub-agent automatically wakes and resumes it.
     fn try_auto_archive_subagent(&mut self) -> bool {
         if self.agent.parent_id.is_none()
+            || self
+                .agent
+                .role
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty())
             || !self.completed_turn_in_session
             || self.last_error.is_some()
         {
@@ -1373,14 +1378,11 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     }
 }
 
-fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
+fn reap_ephemeral_dirs(config_dir: &std::path::Path, _managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
     for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
-    }
-    if !managed_work.join(".git").exists() {
-        remove_path_with_seat(managed_work, seat_ids);
     }
 }
 
