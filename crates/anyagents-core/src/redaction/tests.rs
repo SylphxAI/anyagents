@@ -232,7 +232,7 @@ fn replay_refuses_a_stale_receipt_when_the_canonical_tombstone_has_drifted() {
 // the ordinary deduplicator's bounded history window.
 #[test]
 fn redacted_provider_redelivery_and_edits_preserve_body_index_and_audit() {
-    for chat_id in [-100_123_456_7890, -1234] {
+    for chat_id in [-1_001_234_567_890, -1234] {
         for source in ["webhook:initial", "tg-in:initial"] {
             for partial in [false, true] {
                 let f = Fixture::new();
@@ -421,7 +421,7 @@ fn unredacted_provider_duplicates_still_enrich_both_body_update_paths() {
         incoming.sender = Some("telegram:user:123".into());
         incoming.source_key = Some(source.into());
         incoming.origin = Some(crate::Origin {
-            chat_id: Some(-100_123_456_7890),
+            chat_id: Some(-1_001_234_567_890),
             message_id: Some(42),
             thread_id: None,
         });
