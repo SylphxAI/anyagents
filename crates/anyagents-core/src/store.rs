@@ -7197,7 +7197,7 @@ mod tests {
         let second = store.create_agent(new).unwrap();
         store.set_agent_scope(&first.id, "siblings").unwrap();
         store.set_agent_scope(&second.id, "siblings").unwrap();
-        let roster = read_children_roster(dir.path(), &parent.id);
+        let roster = read_children_roster(dir.path(), parent.id.as_str());
         assert_eq!(
             roster.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
             ["first", "second"]
