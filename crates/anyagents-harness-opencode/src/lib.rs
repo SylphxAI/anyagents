@@ -202,15 +202,22 @@ impl OpenCodeHarness {
                 previous,
             )?);
             let port = self.port.as_ref().expect("allocated port").port;
-            if self.launch_service(port)? {
+            let (announced, collision) = self.launch_service(port)?;
+            if announced {
                 return self.resume_session();
             }
             self.stop_child();
+            // The holder may already have released the port. Preserve the
+            // child's bind result rather than inferring it from a later probe.
+            let reported_collision = collision
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or(false);
             // An unrelated process can win the bind after socket handoff.
             // Only retry a witnessed collision, never a generic startup error.
             if attempt == 2
-                || !matches!(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)),
-                    Err(err) if err.kind() == std::io::ErrorKind::AddrInUse)
+                || (!reported_collision
+                    && !matches!(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)),
+                        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse))
             {
                 return Err(HarnessError::Failed(
                     "the OpenCode service did not announce its private endpoint; the session is untouched".into(),
@@ -220,7 +227,10 @@ impl OpenCodeHarness {
         unreachable!("bounded startup attempts")
     }
 
-    fn launch_service(&mut self, port: u16) -> Result<bool, HarnessError> {
+    fn launch_service(
+        &mut self,
+        port: u16,
+    ) -> Result<(bool, std::sync::mpsc::Receiver<bool>), HarnessError> {
         let mut command = anyagents_harness::spawn_command(&self.program, &self.environment);
         command
             .args([
@@ -232,7 +242,7 @@ impl OpenCodeHarness {
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
         }
@@ -245,9 +255,10 @@ impl OpenCodeHarness {
             .env_remove("OPENCODE_PASSWORD")
             .env_remove("OPENCODE_SERVER_PASSWORD");
         self.port.as_mut().expect("allocated port").handoff();
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
+        let collision = port::watch_collision(child.stderr.take().expect("piped stderr"));
         self.child = Some(child);
         if let Some(stdout) = self.child.as_mut().and_then(|child| child.stdout.take()) {
             use std::io::{BufRead, BufReader, Read};
@@ -299,7 +310,7 @@ impl OpenCodeHarness {
         }
         let announced = self.lock().service.is_some() && self.lock().password.is_some();
         self.lock().alive = announced;
-        Ok(announced)
+        Ok((announced, collision))
     }
 
     fn resume_session(&mut self) -> Result<(), HarnessError> {

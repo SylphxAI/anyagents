@@ -172,7 +172,10 @@ Each OpenCode agent persists its service port in
 `<agent>/config/opencode-service-port`. Allocation probes loopback ports
 20000–29999, reuses the saved port when free, and reserves it while the child
 starts. An occupied saved port or a bind race selects a replacement, persists it,
-and logs the old and new numbers. Stopping the harness releases its socket and
+and logs the old and new numbers. Collision classification preserves a bounded,
+private stderr signal from the child, including when the holder has already
+released the port before a later bind probe. Raw stderr is not published.
+Stopping the harness releases its socket and
 in-process reservation; deleting the agent also removes the saved allocation
 with its config directory.
 

@@ -516,3 +516,37 @@ fn real_opencode_services_use_private_ports_and_reuse_them_after_restart() {
     drop(restarted);
     drop(b);
 }
+
+#[test]
+fn a_transient_bind_collision_is_retried_even_after_the_holder_releases_it() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::thread::scope(|scope| {
+        let launch = scope.spawn(|| start_with_config(&dir, "transient-bind-race", &config));
+        let wait = |path: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "barrier {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let first = dir.path().join("first-serve-port");
+        wait(&first);
+        let port: u16 = std::fs::read_to_string(&first).unwrap().parse().unwrap();
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
+        wait(&dir.path().join("collision-reported"));
+        drop(occupied);
+        // The fixture cannot exit until the holder is gone. A later bind probe
+        // alone therefore cannot diagnose the collision that actually occurred.
+        std::fs::write(dir.path().join("collision-released"), "released").unwrap();
+        let harness = launch.join().unwrap();
+        assert_ne!(port_of(&config), port);
+        assert_eq!(log_of(&dir).matches("serve:").count(), 2);
+        drop(harness);
+    });
+}
