@@ -1183,7 +1183,7 @@ fn start_spiron(
         ),
         ("SPIRON_SKILLS".to_string(), skills.display().to_string()),
     ]);
-    StreamHarness::launch(Launch {
+    let harness = StreamHarness::launch(Launch {
         spec,
         program: program.to_path_buf(),
         args,
@@ -1193,7 +1193,9 @@ fn start_spiron(
         mode: anyagents_harness::DeliveryMode::Steer,
         steer: anyagents_harness::SteerSupport::Yes,
     })
-    .map_err(|err| err.to_string())
+    .map_err(|err| err.to_string())?;
+    harness.set_state_dir(config_dir);
+    Ok(harness)
 }
 
 fn start_codex(

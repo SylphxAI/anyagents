@@ -634,3 +634,41 @@ sys.stdin.read()
     assert!(reset > 0);
     assert!(!harness.wait_finished("m-quota", Duration::from_millis(100)));
 }
+
+#[test]
+fn bounded_stderr_withholds_partial_lines_and_decodes_invalid_utf8() {
+    let mut capture = super::BoundedStderr::default();
+    capture.push(b"safe diagnostic\n");
+    capture.push(&vec![b'x'; super::STDERR_LIMIT - 20]);
+    capture.push(b"sk-SYNTHETIC_LONG_UNTERMINATED_CREDENTIAL_0123456789");
+    let masked = capture.masked(true);
+    assert!(masked.starts_with("safe diagnostic\n"));
+    assert!(masked.contains("stderr truncated"));
+    assert!(!masked.contains("SYNTHETIC"));
+    assert!(!masked.contains("sk-"));
+    assert_eq!(capture.bytes.len(), super::STDERR_LIMIT);
+    let mut ordinary = super::BoundedStderr::default();
+    ordinary.push(b"failed \xff\n");
+    assert_eq!(ordinary.masked(true), "failed \u{fffd}\n");
+}
+
+#[test]
+fn partial_stderr_prefix_is_withheld_until_eof_and_uncertainty_keeps_exit_diagnostic() {
+    let mut capture = super::BoundedStderr::default();
+    capture.push(b"safe diagnostic\nsk-SYNTH");
+    assert_eq!(capture.masked(false), "safe diagnostic\n");
+    capture.push(b"ETIC_COMPLETE_CREDENTIAL_0123456789");
+    assert_eq!(capture.masked(true), "safe diagnostic\n[redacted]");
+    let mut safe = super::BoundedStderr::default();
+    safe.push("config.toml is invalid; 測試🙂".as_bytes());
+    assert_eq!(safe.masked(false), "");
+    assert_eq!(safe.masked(true), "config.toml is invalid; 測試🙂");
+    let mut state = super::State::new(None);
+    state.unconfirmed = true;
+    state.exit_fault =
+        Some("harness exited with exit status: 1; stderr: failed to parse config.toml".into());
+    let error = state.failure().unwrap();
+    assert!(error.contains("unconfirmed steering input"));
+    assert!(error.contains("exit status: 1"));
+    assert!(error.contains("failed to parse config.toml"));
+}

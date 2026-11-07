@@ -71,6 +71,7 @@ dependencies = [
 name = "anyagents"
 version = "0.1.3"
 dependencies = [
+ "anyagents-agent",
  "anyagents-channel-telegram",
  "anyagents-core",
  "anyagents-gateway",

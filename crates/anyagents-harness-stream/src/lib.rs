@@ -13,9 +13,9 @@ mod rpc;
 pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -247,6 +247,7 @@ pub struct StreamHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     pending: Option<PendingWrite>,
     #[cfg(target_os = "linux")]
     readiness: Option<JoinHandle<()>>,
@@ -264,6 +265,12 @@ struct PendingWrite {
 /// Shared by every harness over one child: the owner and any reader.
 struct State {
     child: Option<Child>,
+    stderr: BoundedStderr,
+    stderr_done: bool,
+    exit_status: Option<ExitStatus>,
+    exit_fault: Option<String>,
+    state_dir: Option<PathBuf>,
+    unconfirmed: bool,
     alive: bool,
     epoch: u64,
     generation: u64,
@@ -318,6 +325,7 @@ impl StreamHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
+            stderr_reader: None,
             pending: None,
             #[cfg(target_os = "linux")]
             readiness: None,
@@ -345,6 +353,19 @@ impl StreamHarness {
             mode: DeliveryMode::Followup,
             steer: SteerSupport::Unproven,
         })
+    }
+
+    /// Persist transport failures and unconfirmed steering custody for the
+    /// external adapter. A terminal uncertainty hold is never an auto-retry.
+    pub fn set_state_dir(&self, dir: &Path) {
+        let mut state = lock(&self.shared);
+        state.state_dir = Some(dir.to_path_buf());
+        state.unconfirmed |= dir
+            .join("spiron-unconfirmed-steers.json")
+            .try_exists()
+            .unwrap_or(true);
+        state.refresh_exit_fault();
+        state.persist_failure();
     }
 
     pub fn program(&self) -> &Path {
@@ -451,11 +472,22 @@ impl StreamHarness {
     /// be open, so the answer may still grow.
     pub fn text_for(&self, id: &str) -> Option<String> {
         let state = lock(&self.shared);
+        if self.spec.protocol == LineProtocol::AcknowledgedResult && !state.finished.contains(id) {
+            return None;
+        }
         state
             .text
             .as_ref()
             .filter(|(owner, _)| owner == id)
-            .map(|(_, lines)| lines.join("\n"))
+            .map(|(_, lines)| {
+                let joined =
+                    lines.join(if self.spec.protocol == LineProtocol::AcknowledgedResult {
+                        ""
+                    } else {
+                        "\n"
+                    });
+                anyagents_harness::masking::mask_known_secrets(&joined).into_owned()
+            })
     }
 
     /// Write one line for `message`, unless that id was already written or echoed.
@@ -537,15 +569,12 @@ impl StreamHarness {
 
     pub fn health(&self) -> HarnessHealth {
         let mut state = lock(&self.shared);
-        if !state.alive
-            && let Some(child) = state.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            state.child = None;
+        if !state.alive {
+            state.reap_child();
         }
         HarnessHealth {
             process_alive: state.alive,
-            turn_state: if state.open.is_empty() {
+            turn_state: if state.open.is_empty() && !state.unconfirmed {
                 TurnState::Idle
             } else {
                 TurnState::InTurn
@@ -553,7 +582,7 @@ impl StreamHarness {
             delivery_mode: self.mode,
             steer_support: self.steer,
             quota_reset_at_ms: state.quota_reset_at_ms,
-            sign_in_fault: state.sign_in_fault.clone(),
+            sign_in_fault: state.failure(),
         }
     }
 
@@ -565,11 +594,8 @@ impl StreamHarness {
 
     pub fn process_id(&self) -> Option<u32> {
         let mut state = lock(&self.shared);
-        if !state.alive
-            && let Some(child) = state.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            state.child = None;
+        if !state.alive {
+            state.reap_child();
         }
         state.child.as_ref().map(Child::id)
     }
@@ -587,6 +613,9 @@ impl StreamHarness {
         let mut agy_steer_ctx = None;
         {
             let mut state = lock(&self.shared);
+            if state.unconfirmed {
+                return Ok(DeliverOutcome::Deferred);
+            }
             if !state.alive {
                 return Err(HarnessError::Dead);
             }
@@ -605,7 +634,12 @@ impl StreamHarness {
                 }
                 if state.seen.contains(&message.id) {
                     if self.spec.protocol == LineProtocol::AcknowledgedResult
-                        && !state.acknowledged.contains(&message.id)
+                        && (!state.acknowledged.contains(&message.id)
+                            || (state
+                                .input_turns
+                                .get(&message.id)
+                                .is_some_and(|turn| turn != &message.id)
+                                && !state.finished.contains(&message.id)))
                     {
                         return Ok(DeliverOutcome::Deferred);
                     }
@@ -831,7 +865,7 @@ impl StreamHarness {
 
     pub fn input_ready(&self) -> bool {
         let state = lock(&self.shared);
-        if state.input_blocked {
+        if state.input_blocked || state.unconfirmed {
             return false;
         }
         if self.agy_rpc.is_some()
@@ -881,7 +915,7 @@ impl StreamHarness {
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
         }
@@ -900,6 +934,11 @@ impl StreamHarness {
             let _ = child.kill();
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
+        };
+        let Some(stderr) = child.stderr.take() else {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(HarnessError::Failed("child stderr missing".into()));
         };
         if let Err(err) = nonblocking_stdin(&child_stdin) {
             anyagents_harness::kill_child(&mut child, &self.environment);
@@ -921,6 +960,16 @@ impl StreamHarness {
             state.usages.clear();
             state.quota_reset_at_ms = None;
             state.sign_in_fault = None;
+            if let Some(dir) = &state.state_dir {
+                state.unconfirmed = dir
+                    .join("spiron-unconfirmed-steers.json")
+                    .try_exists()
+                    .unwrap_or(true);
+            }
+            state.stderr = BoundedStderr::default();
+            state.stderr_done = false;
+            state.exit_status = None;
+            state.exit_fault = None;
             state.child = Some(child);
             state.alive = true;
             state.open.clear();
@@ -963,6 +1012,41 @@ impl StreamHarness {
         *lock(&self.stdin) = Some(child_stdin);
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
+        self.stderr_reader = match thread::Builder::new()
+            .name(format!("{}-stderr", self.spec.name))
+            .spawn(move || {
+                let mut stderr = stderr;
+                let mut bytes = [0; 4096];
+                loop {
+                    match stderr.read(&mut bytes) {
+                        Ok(0) => break,
+                        Ok(count) => {
+                            let mut state = lock(&shared);
+                            if state.generation != generation {
+                                return;
+                            }
+                            state.stderr.push(&bytes[..count]);
+                        }
+                        Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(_) => break,
+                    }
+                }
+                let mut state = lock(&shared);
+                if state.generation == generation {
+                    state.stderr_done = true;
+                    state.refresh_exit_fault();
+                    state.epoch = state.epoch.wrapping_add(1);
+                }
+                wake.notify_all();
+            }) {
+            Ok(handle) => Some(handle),
+            Err(err) => {
+                self.stop_child();
+                return Err(HarnessError::Failed(err.to_string()));
+            }
+        };
+        let shared = Arc::clone(&self.shared);
+        let wake = Arc::clone(&self.wake);
         let spec = self.spec.clone();
         let agy_rpc = self.agy_rpc.clone();
         match thread::Builder::new()
@@ -992,6 +1076,9 @@ impl StreamHarness {
             let _ = child.wait();
         }
         if let Some(handle) = self.reader.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.stderr_reader.take() {
             let _ = handle.join();
         }
         #[cfg(target_os = "linux")]
@@ -1039,10 +1126,110 @@ impl Drop for StreamHarness {
     }
 }
 
+// Retain at most 16 KiB while draining the entire pipe. If retention cuts a
+// line, withhold that partial line rather than publishing a credential prefix.
+const STDERR_LIMIT: usize = 16 * 1024;
+const UNCONFIRMED_STEERS: &str = "Spiron reported unconfirmed steering input; mailbox custody retained. Reconcile spiron-unconfirmed-steers.json before resuming; do not blindly replay.";
+
+#[derive(Default)]
+struct BoundedStderr {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+impl BoundedStderr {
+    fn push(&mut self, bytes: &[u8]) {
+        let retain = bytes.len().min(STDERR_LIMIT - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..retain]);
+        self.truncated |= retain < bytes.len();
+    }
+
+    fn masked(&self, complete: bool) -> String {
+        let bytes = if self.truncated || !complete {
+            let end = self
+                .bytes
+                .iter()
+                .rposition(|b| *b == b'\n')
+                .map_or(0, |pos| pos + 1);
+            &self.bytes[..end]
+        } else {
+            &self.bytes[..]
+        };
+        let text = String::from_utf8_lossy(bytes);
+        let mut masked = anyagents_harness::masking::mask_known_secrets(&text).into_owned();
+        if self.truncated {
+            masked.push_str("\n[stderr truncated; incomplete line withheld]");
+        }
+        masked
+    }
+}
+
 impl State {
+    fn failure(&self) -> Option<String> {
+        let diagnostic = self
+            .exit_fault
+            .clone()
+            .or_else(|| self.sign_in_fault.clone());
+        if self.unconfirmed {
+            Some(match diagnostic {
+                Some(error) => format!("{UNCONFIRMED_STEERS}; {error}"),
+                None => UNCONFIRMED_STEERS.to_string(),
+            })
+        } else {
+            diagnostic
+        }
+    }
+
+    fn persist_failure(&self) {
+        if let (Some(dir), Some(error)) = (&self.state_dir, self.failure()) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_millis());
+            let _ = std::fs::write(dir.join(".anyagents-last-error.json"), json!({
+                "error": error, "timestamp_ms": now, "quota_reset_at_ms": self.quota_reset_at_ms,
+            }).to_string());
+        }
+    }
+
+    fn reap_child(&mut self) {
+        if let Some(child) = self.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            self.child = None;
+            self.exit_status = Some(status);
+            self.refresh_exit_fault();
+        }
+    }
+
+    fn refresh_exit_fault(&mut self) {
+        if let Some(status) = self.exit_status
+            && !status.success()
+        {
+            let stderr = self.stderr.masked(self.stderr_done);
+            self.exit_fault = Some(format!(
+                "harness exited with {status}{}{}{}{}",
+                self.sign_in_fault.as_ref().map_or("", |_| ": "),
+                self.sign_in_fault.as_deref().unwrap_or(""),
+                if stderr.trim().is_empty() {
+                    ""
+                } else {
+                    "; stderr: "
+                },
+                stderr.trim()
+            ));
+            self.persist_failure();
+        }
+    }
+
     fn new(session_id: Option<&str>) -> Self {
         Self {
             child: None,
+            stderr: BoundedStderr::default(),
+            stderr_done: false,
+            exit_status: None,
+            exit_fault: None,
+            state_dir: None,
+            unconfirmed: false,
             alive: false,
             epoch: 0,
             generation: 0,
@@ -1084,10 +1271,17 @@ fn read_stdout(
         if line.trim().is_empty() {
             continue;
         }
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+        let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
+        let raw_text = (spec.protocol == LineProtocol::AcknowledgedResult)
+            .then(|| spec.text_of(&value, false))
+            .flatten();
+        anyagents_harness::masking::mask_json_strings(&mut value);
         let mut effect = spec.effect(&value);
+        if raw_text.is_some() {
+            effect.text = raw_text;
+        }
         let kind = value
             .get("type")
             .or_else(|| value.get("event"))
@@ -1232,6 +1426,14 @@ fn read_stdout(
                     .and_then(Value::as_str)
                     .is_some_and(|id| state.input_turns.values().any(|owner| owner == id));
             if effect.finishes_turn && correlated {
+                if spec.protocol == LineProtocol::AcknowledgedResult
+                    && let Some((_, lines)) = &mut state.text
+                {
+                    *lines = vec![
+                        anyagents_harness::masking::mask_known_secrets(&lines.concat())
+                            .into_owned(),
+                    ];
+                }
                 state.sign_in_fault = None;
                 if spec.protocol == LineProtocol::AcknowledgedResult {
                     let error = value
@@ -1253,7 +1455,15 @@ fn read_stdout(
                 }
                 let usage = effect.usage.unwrap_or_default();
                 if spec.protocol == LineProtocol::AcknowledgedResult {
-                    finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);
+                    let unconfirmed = value.get("undelivered_steers").is_some_and(|items| {
+                        items.as_array().is_none_or(|items| !items.is_empty())
+                    });
+                    finish_correlated(
+                        &mut state,
+                        value["request_id"].as_str().unwrap(),
+                        usage,
+                        unconfirmed,
+                    );
                 } else {
                     finish_open(&mut state, usage);
                 }
@@ -1277,39 +1487,39 @@ fn read_stdout(
                 state.open.clear();
                 state.followups.clear();
             }
+            if effect.finishes_turn
+                && correlated
+                && state.failure().is_none()
+                && let Some(dir) = &state.state_dir
+            {
+                let _ = std::fs::remove_file(dir.join(".anyagents-last-error.json"));
+            }
+            state.persist_failure();
             state.epoch = state.epoch.wrapping_add(1);
         }
         wake.notify_all();
     }
-    {
-        let mut state = lock(&shared);
+    // EOF can race waitpid and the independent stderr drainer. Collect both
+    // before publishing a normal exit, with the old bounded reap grace period.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let mut state = lock(&shared);
+    loop {
         if state.generation != generation {
             return;
         }
-        state.alive = false;
-        if let Some(child) = state.child.as_mut()
-            && matches!(child.try_wait(), Ok(Some(_)))
-        {
-            state.child = None;
+        state.reap_child();
+        if (state.child.is_none() && state.stderr_done) || Instant::now() >= deadline {
+            break;
         }
-        state.epoch = state.epoch.wrapping_add(1);
+        let (guard, _) = wake
+            .wait_timeout(state, Duration::from_millis(10))
+            .unwrap_or_else(|err| err.into_inner());
+        state = guard;
     }
+    state.alive = false;
+    state.refresh_exit_fault();
+    state.epoch = state.epoch.wrapping_add(1);
     wake.notify_all();
-    for _ in 0..10 {
-        {
-            let mut state = lock(&shared);
-            if state.generation != generation || state.child.is_none() {
-                break;
-            }
-            if let Some(child) = state.child.as_mut()
-                && matches!(child.try_wait(), Ok(Some(_)))
-            {
-                state.child = None;
-                break;
-            }
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
 }
 
 /// A harness that streams without a closing result line ends its turn here:
@@ -1360,7 +1570,7 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     }
 }
 
-fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
+fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage, unconfirmed: bool) {
     let ids: Vec<String> = state
         .open
         .iter()
@@ -1373,7 +1583,19 @@ fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
         })
         .cloned()
         .collect();
+    if unconfirmed {
+        state.unconfirmed = true;
+        if let Some(dir) = &state.state_dir {
+            // IDs only: the original messages stay in the durable mailbox.
+            // Conservatively hold every steer if the peer supplies no IDs.
+            let _ = std::fs::write(dir.join("spiron-unconfirmed-steers.json"),
+                json!({"turn_id": turn, "request_ids": ids.iter().filter(|id| id.as_str() != turn).collect::<Vec<_>>()}).to_string());
+        }
+    }
     for id in ids {
+        if unconfirmed && id != turn {
+            continue;
+        }
         state.open.retain(|open| open != &id);
         state.followups.retain(|open| open != &id);
         state.finished.insert(id.clone());

@@ -442,3 +442,16 @@ on new mail. Its ID, role, instructions, scope, session, mailbox cursor, pending
 deliveries and schedules remain intact. There is no role-based residency flag.
 Topology and child discovery follow relationships and explicit scope, never the
 presence of a role label. The default CLI depth limit applies equally to all roles.
+
+### External steering custody
+
+A Spiron `steer_ack` proves socket acceptance, not journal commit. AnyAgents
+keeps that message in its durable mailbox until the owner's terminal `result`
+confirms completion without `undelivered_steers`. A terminal nonempty or malformed
+`undelivered_steers` receipt retains steering custody, records a reconciliation
+fault, and writes an ID-only `spiron-unconfirmed-steers.json` hold in the agent's
+config directory. The hold survives child/coordinator restart; the adapter neither
+marks the steer finished nor silently replays potentially side-effecting work.
+The original message remains in the mailbox. Reconcile the named turn/input
+against the external session journal and any completed effects before removing
+the hold and resuming; removing it without reconciliation can duplicate effects.
