@@ -8137,9 +8137,16 @@ if rm "$2/logs/HEAD"; then exit 28; fi
             r#"git -c safe.directory="$1" -C "$1" remote add refresh-proof /nonexistent/refresh-proof"#,
             r#"set -eu; git init --bare "$2"; git -c safe.directory="$1" -C "$1" push -u "$2" HEAD:refs/heads/parent-proof"#,
         ] {
-            let before = std::fs::metadata(&common_config).unwrap().ino();
+            // push -u can replace config twice. Keep the old inode allocated
+            // until comparison so a later replacement cannot reuse its number.
+            let before = std::fs::File::open(&common_config).unwrap();
             run_as(a_uid, a_gid, edit, &[&f.source, &parent_push]);
-            assert_ne!(std::fs::metadata(&common_config).unwrap().ino(), before);
+            assert_ne!(
+                std::fs::metadata(&common_config).unwrap().ino(),
+                before.metadata().unwrap().ino(),
+                "parent config rewrite did not replace the pinned inode: {edit}"
+            );
+            drop(before);
             for (uid, gid, checkout, sibling) in [
                 (b_uid, b_gid, target.as_path(), &c_private),
                 (
