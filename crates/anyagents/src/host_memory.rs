@@ -400,6 +400,30 @@ mod tests {
     #[test]
     fn discovery_failure_is_deferred_per_stopped_owner_and_retried() {
         use std::os::unix::fs::PermissionsExt;
+        // A concurrent test can fork while this fixture owns a flock. CLOEXEC
+        // closes its inherited descriptor only at exec, so a nonblocking retry
+        // can legitimately defer after the owning guard has been dropped. Make
+        // this fixture's data/locks only after exec in a single-test process.
+        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_RETRY_FIXTURE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "host_memory::tests::discovery_failure_is_deferred_per_stopped_owner_and_retried",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "retry fixture: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         for block_page in [false, true] {
             let dir = crate::test_tempdir();
             let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -459,7 +483,14 @@ mod tests {
             }
             on_start_from(&store, &owners).unwrap();
             assert_eq!(
-                fs::read(root(&bad.id).join("memory/MEMORY.md")).unwrap(),
+                fs::read(root(&bad.id).join("memory/MEMORY.md")).unwrap_or_else(|error| {
+                    panic!(
+                        "retry output missing (block_page={block_page}): {error}; population={}; manifest={}",
+                        fs::read_to_string(&receipt_path).unwrap_or_else(|e| e.to_string()),
+                        fs::read_to_string(dir.path().join("host-memory-migration/manifest-v1.json"))
+                            .unwrap_or_else(|e| e.to_string())
+                    )
+                }),
                 b"unreadable"
             );
             let receipt: serde_json::Value =

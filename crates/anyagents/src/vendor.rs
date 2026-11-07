@@ -1650,6 +1650,9 @@ set -eux
 trap 'status=$?; printf "PROBE_EXIT=%s\n" "$status" >&2' 0
 [ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
 [ -x "$ANYAGENTS_DATA/agents" ]; [ ! -r "$ANYAGENTS_DATA/agents" ]
+workdir=$(cd "$ANYAGENTS_AGENT_CONFIG/../work" && pwd)
+trust=$(/usr/bin/git config --no-includes --file "$ANYAGENTS_AGENT_CONFIG/.gitconfig" --get-all safe.directory)
+[ "$trust" = "$(printf '\n%s' "$workdir")" ]
 for mirror in .claude .agents .agy; do
   grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/global/SKILL.md"
   grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/local/SKILL.md"
@@ -1662,7 +1665,7 @@ for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGEN
   if (printf forbidden > "$path") 2>/dev/null; then exit 42; fi
 done
 if (printf forbidden > "$ANYAGENTS_AGENT_CONFIG/.agy/skills/global/SKILL.md") 2>/dev/null; then exit 43; fi
-printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
+printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED GIT_TRUST_EXACT\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
 # Keep the real adapter child alive until its owner drops the harness.
 cat >/dev/null
 "#,
@@ -1748,6 +1751,7 @@ cat >/dev/null
             std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap(),
             "synthetic-memory-after"
         );
+        assert!(evidence.contains("GIT_TRUST_EXACT"), "{evidence}");
         println!("{evidence}");
         drop(harness);
         std::fs::remove_file(&report).unwrap();

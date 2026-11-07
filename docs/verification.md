@@ -33,6 +33,25 @@ cargo test --workspace --locked
 npm test
 ```
 
+## Seat Git configuration
+
+Seat Git configuration runs file-only edits in daemon-owned staging, with
+`GIT_DIR=/dev/null` and inherited Git repository/parameter routing removed.
+An absolute `git config --file` argument alone still allows Git to inspect the
+caller's checkout. That checkout can be malformed or inaccessible after the
+native test drops DAC override. The explicit non-repository metadata path also
+supports data roots containing `:`, unlike Unix path-list discovery ceilings.
+
+`cargo test -p anyagents --bin anyagents seat_git_configuration --locked` exercises
+`ensure_seat_environment` from an unrelated malformed repository in isolated
+subprocesses, including separate explicit Git routing controls and a colon-bearing
+data root. It verifies exact trust for a synthetic non-repository workdir,
+preserved caller settings, and refusal without replacement when the seat's own
+configuration is invalid. The ordinary vendor suite does not execute the ignored
+native-UID case: the Linux managed-UID lane must additionally verify that the
+actual seat reads only its exact Git trust root alongside the existing memory,
+skill and cross-seat isolation checks.
+
 ## OpenCode port-collision fixtures
 
 The scripted child owns a competing socket before publishing its handoff barrier
