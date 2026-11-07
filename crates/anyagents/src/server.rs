@@ -1003,15 +1003,17 @@ fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
         return;
     };
     for agent in agents {
-        if agent.state != "archived"
-            || agent.parent_id.is_none()
-            || health.get(&agent.id).is_some_and(|live| live.process_alive)
-        {
+        if agent.state != "archived" || agent.parent_id.is_none() {
             continue;
         }
         let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
             continue;
         };
+        // A wake followed by a new self-archive may have started a process since
+        // the population read. Check current health only after taking the lock.
+        if health.get(&agent.id).is_some_and(|live| live.process_alive) {
+            continue;
+        }
         // Re-read under the lock: this population may predate a direct wake.
         reap_archived_agent_locked(store, data_dir, &agent.id);
     }
@@ -6755,6 +6757,42 @@ pub(crate) mod tests {
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn archive_reap_waits_for_self_archived_process_to_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        let health = HealthBoard::default();
+        let (delivery_mode, steer_support) = declared(&child.harness);
+        let mut live = anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: anyagents_harness::TurnState::Idle,
+            delivery_mode,
+            steer_support,
+            quota_reset_at_ms: None,
+            restart_at_ms: None,
+            pid: None,
+            live_harness: Some(child.harness.clone()),
+            live_model: None,
+            process_started_at_ms: None,
+            last_error: None,
+        };
+        health.publish(&child.id, live.clone());
+        reap_archived_agents(&store, dir.path(), &health);
+        assert!(cfg.join(".claude").exists());
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        live.process_alive = false;
+        health.publish(&child.id, live);
+        reap_archived_agents(&store, dir.path(), &health);
+        assert!(!cfg.join(".claude").exists());
+        assert!(cfg.join(".anyagents-reaped").exists());
     }
 
     #[test]

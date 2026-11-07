@@ -115,10 +115,14 @@ impl Drop for Serve {
 }
 
 fn start_server(data: &std::path::Path) -> Serve {
+    start_server_mode(data, "serve")
+}
+
+fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
     let mut child = bin()
         .arg("--data")
         .arg(data)
-        .arg("serve")
+        .arg(mode)
         .env("PATH", machine_path(data))
         .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
@@ -135,7 +139,11 @@ fn start_server(data: &std::path::Path) -> Serve {
         let _ = pipe.read_to_string(&mut buf);
         *captured.lock().unwrap() = buf;
     });
-    let socket = data.join("anyagents.sock");
+    let socket = data.join(if mode == "serve-admin" {
+        "admin.sock"
+    } else {
+        "anyagents.sock"
+    });
     let started = Instant::now();
     loop {
         if socket.exists() {
@@ -903,26 +911,6 @@ async fn mcp_tools_use_the_server_socket() {
     );
     assert_eq!(woken.state, "running");
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-        let alpha_cfg = dir.path().join("agents").join(&alpha_id).join("config");
-        std::fs::set_permissions(&alpha_cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
-        let before_gid = std::fs::metadata(&alpha_cfg).unwrap().gid();
-        let desc_res: serde_json::Value = ok_json(
-            call(
-                &alpha,
-                "describe",
-                serde_json::json!({"agent": "self", "description": "Standing owner role description."}),
-            )
-            .await,
-        );
-        assert_eq!(desc_res["system_prompt_synced"], true);
-        let after_meta = std::fs::metadata(&alpha_cfg).unwrap();
-        assert_eq!(after_meta.permissions().mode() & 0o7777, 0o0700);
-        assert_eq!(after_meta.gid(), before_gid);
-    }
-
     for route in ["agents", "subagents"] {
         let worker: serde_json::Value = ok_json(
             call(
@@ -975,4 +963,52 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(listed.lines().count(), 6, "{listed}");
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
+}
+
+#[tokio::test]
+async fn describe_preserves_config_permissions_without_vendor_restart_writers() {
+    let dir = tempfile::tempdir().unwrap();
+    let created = bin()
+        .env("PATH", machine_path(dir.path()))
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "create", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    // The primary fixture's /bin/true harness exits and restarts, concurrently
+    // preparing config. This case measures describe's own permission contract,
+    // so keep the real MCP/auth/HTTP path but run no vendor-config writer.
+    let server = start_server_mode(dir.path(), "serve-admin");
+    // MCP initialization asks whoami on the primary socket name. Route that
+    // fixture-only name to the admin router rather than starting a supervisor.
+    std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
+    let alpha = connect(dir.path(), "alpha").await;
+    let alpha_id = created_id(dir.path(), "alpha");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let alpha_cfg = dir.path().join("agents").join(&alpha_id).join("config");
+        std::fs::set_permissions(&alpha_cfg, std::fs::Permissions::from_mode(0o0700)).unwrap();
+        let before_gid = std::fs::metadata(&alpha_cfg).unwrap().gid();
+        let desc_res: serde_json::Value = ok_json(
+            call(
+                &alpha,
+                "describe",
+                serde_json::json!({"agent": "self", "description": "Standing owner role description."}),
+            )
+            .await,
+        );
+        assert_eq!(desc_res["system_prompt_synced"], true);
+        let after_meta = std::fs::metadata(&alpha_cfg).unwrap();
+        assert_eq!(after_meta.permissions().mode() & 0o7777, 0o0700);
+        assert_eq!(after_meta.gid(), before_gid);
+    }
+
+    alpha.cancel().await.unwrap();
+    drop(server);
 }
