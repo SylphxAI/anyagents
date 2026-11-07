@@ -38,7 +38,7 @@ An agent is configured on three independent choices:
 
 | Axis | Values (first version) | Notes |
 | --- | --- | --- |
-| Harness | `sylphx` (built-in native), `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, and more by adapter | `sylphx` is built in; third-party harnesses install lazily when first chosen. |
+| Harness | `spiron` (`sylphx` compatibility alias), `claude-code`, `codex`, `opencode`, `agy`, `muse`, `omp`, `dsh`, `grok`, and more by adapter | All harnesses are external processes; Spiron must be installed on `PATH` or selected with `ANYAGENTS_SPIRON_BIN`. |
 | Model | `sylphx/openai/gpt-6.1-sol#xhigh`, Claude, GPT, Gemini, DeepSeek, Grok, MiMo and any model a configured provider serves | Chosen separately from the harness. |
 | Auth | `sylphx` (RFC 8628 Device Flow), `subscription`, or `api-key` | Decides which (harness, model) pairs are valid. |
 
@@ -182,7 +182,7 @@ size limit. HTTP refusals retain their status and response body.
 
 | Harness | Mode | How a line reaches it |
 | --- | --- | --- |
-| `sylphx` | `steer` | Built-in native Sylphx harness (`crates/anyagents-harness-sylphx`). Drains `steer_queue` between every tool step in native Sylphx AI Responses mode (`/v1/responses`) or forwards `POST /v1/{env}/agent_sessions/{id}:steer` in `Sylphx Agents` BaaS mode (`SYLPHX_AGENT_ENV`). |
+| `spiron` / `sylphx` | `steer` | External `spiron --headless --json` process. Correlated `user` JSONL receives `accepted` (new turn) or `steer_ack` (active turn) before mailbox acceptance. Only the matching terminal `result` closes a turn; `cancel_ack` alone does not. |
 | `opencode` | `steer` | `POST /api/session/{id}/prompt` with `delivery: "steer"`; the session's own inbox decides whether it joins the running turn or starts the next one. Accepted when the prompt API answers with `data`. |
 | `codex` | `steer` | `turn/start`, with `ifBusy: "steer"` while a turn is open. |
 | `claude-code` | `steer` | Idle: a stream-json `user` message. Active turn: an SDK `PreToolUse` callback returns pending lines as `additionalContext` in the current transcript before the tool proceeds; stdin replay alone is not evidence of mid-turn delivery. |
@@ -464,15 +464,14 @@ require an authenticated server rather than an offline database fallback.
 
 - `send(to: [address], text, reply_to?)`. An address is an agent (`agent:<name>`, or a bare name), a named group of agents (`group:<name>`), or a channel target (`telegram:chat:<id>[:<topic>]`, `telegram:user:<id>[:<message>]`). A list of one is a direct message; a mixed list delivers once per address. There is no default address.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
-- `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
+- `conversation(...)` / `search(...)` run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
   - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
-  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary recall/compaction remains lossless.
+  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary coordinator history reads remain lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
   - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
   - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
-  - **Bounded native transcript recall:** Native `memory_recall` returns at most 32,768 serialized UTF-8 bytes per call. Large range, filter and query results return `mode: "page"`, `format: "json_fragment"`, `content` and `next_cursor`. Repeat the original arguments with that cursor and concatenate `content` fragments to recover the result document; later transcript appends do not change its snapshot. Items already present verbatim in active context return raw pointers instead of replaying their contents. Once evicted, their original ranges remain recoverable. Native `read_file` reads of the current session's transcript, including filesystem aliases, use this same boundary; its line coordinates remain 1-based.
-  - **Budgeted native compaction:** Before dispatch, the native harness budgets the complete serialized request, output reserve and framing margin. It tests in-memory candidates that retain the latest completed tool batch, replace bulky results with original raw-range pointers, or evict completed context while preserving exact pending inbound. Only a candidate that fits commits a new window. If fixed instructions/tools and pending inbound alone cannot fit, preflight refuses without dispatch or a new compaction anchor; repeating the same attempt does not grow its context.
+- Harness-local recall, context windowing and compaction belong to the external CLI, not AnyAgents. Spiron receives `--state-dir` and `--instructions-file` pointing into the existing agent configuration directory, plus workspace, skills and MCP paths. The adapter reads `spiron-session-id` or legacy `sylphx-session-id` and writes only the canonical session marker. Legacy transcript, window, cloud-session and Goal files remain available to Spiron's continuity reader; AnyAgents never rewrites or summarizes them.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 
 ## Usage and cost
@@ -648,3 +647,19 @@ on new mail. Its ID, role, instructions, scope, session, mailbox cursor, pending
 deliveries and schedules remain intact. There is no role-based residency flag.
 Topology and child discovery follow relationships and explicit scope, never the
 presence of a role label. The default CLI depth limit applies equally to all roles.
+
+### External steering custody
+
+A Spiron `steer_ack` proves socket acceptance, not journal commit. AnyAgents
+keeps that message in its durable mailbox until the owner's terminal `result`
+confirms completion without `undelivered_steers`. A terminal nonempty or malformed
+`undelivered_steers` receipt retains steering custody, records a reconciliation
+fault, and retains the ID-only `spiron-unconfirmed-steers.json` hold written in
+its config directory before any input bytes are dispatched. A returned hold-write
+error refuses the unsent input without advancing its mailbox cursor; confirmed
+terminal completion clears the hold. The hold survives child/coordinator restart;
+the adapter neither marks the steer finished nor silently replays potentially
+side-effecting work.
+The original message remains in the mailbox. Reconcile the named turn/input
+against the external session journal and any completed effects before removing
+the hold and resuming; removing it without reconciliation can duplicate effects.

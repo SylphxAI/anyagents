@@ -51,16 +51,6 @@ impl Installer {
     }
 
     fn install(&self, harness: &str) -> Result<Install, String> {
-        if harness == "sylphx" {
-            let dir = self
-                .root
-                .join("harnesses")
-                .join("sylphx")
-                .join(env!("CARGO_PKG_VERSION"));
-            let _ = std::fs::create_dir_all(&dir);
-            let _ = std::fs::write(dir.join(".installed"), env!("CARGO_PKG_VERSION"));
-            return Ok(Install { dir });
-        }
         let dirs = self.root.join("harnesses").join(harness);
         if let Ok(versions) = std::fs::read_dir(&dirs) {
             let mut installed: Vec<PathBuf> = versions
@@ -107,9 +97,6 @@ fn version_sort_key(path: &Path) -> (u64, u64, u64, String) {
 
 /// Detect the currently active version string of `harness`.
 pub fn detect_version(root: &Path, harness: &str) -> String {
-    if harness == "sylphx" {
-        return env!("CARGO_PKG_VERSION").to_string();
-    }
     let dirs = root.join("harnesses").join(harness);
     if let Ok(versions) = std::fs::read_dir(&dirs) {
         let mut installed: Vec<PathBuf> = versions
@@ -296,7 +283,7 @@ fn ensure_vendored_binary(root: &Path, harness: &str) {
 pub fn adapter(harness: &str) -> Result<(), anyagents_core::Error> {
     match harness {
         "claude-code" | "codex" | "opencode" | "agy" | "muse" | "omp" | "dsh" | "grok"
-        | "sylphx" | "sylphx-agent" | "sylphx_agent" => Ok(()),
+        | "spiron" | "sylphx" | "sylphx-agent" | "sylphx_agent" | "sylphx/default" => Ok(()),
         other => Err(anyagents_core::Error::Message(format!(
             "unknown harness: {other}"
         ))),
@@ -333,9 +320,10 @@ pub fn recorded(harness: &str) -> Option<Result<(), String>> {
 /// operating system looks up. `ANYAGENTS_<ID>_BIN` wins, so tests never start a
 /// real vendor and an unusual install can be pointed at.
 pub fn program(root: &Path, harness: &str) -> PathBuf {
-    if harness == "sylphx" {
-        return crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
-    }
+    let harness = match harness {
+        "sylphx" | "sylphx-agent" | "sylphx_agent" | "sylphx/default" => "spiron",
+        other => other,
+    };
     if let Some(named) = std::env::var_os(format!(
         "ANYAGENTS_{}_BIN",
         harness.to_uppercase().replace('-', "_")

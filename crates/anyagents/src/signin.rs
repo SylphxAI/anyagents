@@ -82,17 +82,6 @@ impl CommandRunner for ProcessRunner {
         env: &[(&str, &str)],
         on_line: &mut dyn LineSink,
     ) -> Result<(), InstallError> {
-        if program == "sylphx"
-            && args.first().map(String::as_str) == Some("login")
-            && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-        {
-            let target_dir = env
-                .iter()
-                .find(|(k, _)| *k == "HOME")
-                .map(|(_, v)| Path::new(*v))
-                .unwrap_or(dir);
-            return crate::sylphx::run_device_flow_login(target_dir, on_line);
-        }
         let resolved_program: std::path::PathBuf = if std::env::var_os("ANYAGENTS_FAKE_MODE")
             .is_none()
             && std::env::var_os("ANYAGENTS_FAKE_VENDOR_MODE").is_none()

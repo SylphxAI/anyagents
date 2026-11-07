@@ -3,6 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+echo '== External Spiron JSONL protocol (synthetic CLI) =='
+cargo test --locked -p anyagents spiron_external
+
 echo '== Native adapter protocols (scripted vendor processes) =='
 for adapter in claude codex opencode agy muse omp; do
     echo "== $adapter =="
