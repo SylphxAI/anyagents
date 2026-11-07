@@ -764,6 +764,12 @@ fn wait_for_chromium_cdp(
     let started = std::time::Instant::now();
     let deadline = started + timeout;
     let tracing = std::env::var_os("ANYAGENTS_STARTUP_TRACE_FILE").is_some();
+    // Synthetic direct readiness tests own their accept populations. Only real
+    // profile launches have user-data, so never add observer sockets to doubles.
+    let tracing_tcp = tracing
+        && log_path
+            .parent()
+            .is_some_and(|dir| dir.join("user-data").is_dir());
     let mut first_tcp = false;
     let mut last_probe = "not attempted".to_string();
     let reason = loop {
@@ -779,7 +785,7 @@ fn wait_for_chromium_cdp(
                 timeout.as_millis()
             );
         }
-        if tracing
+        if tracing_tcp
             && !first_tcp
             && TcpStream::connect_timeout(
                 &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
