@@ -1228,7 +1228,7 @@ fn checks(config: Option<&Path>, boundary: &Boundary, uid: u32, gid: u32) -> Vec
         });
         list.push(Check {
             what: "host memory and skills are writable only in the agent's own tree",
-            program: "root=${MINE%/config}; [ -w \"$root/memory\" ] && [ -w \"$root/skills\" ]; \
+            program: "root=${MINE%/config}; [ -w \"$root/memory\" ] || exit 1; [ -w \"$root/skills\" ] || exit 1; \
                       for d in \"$DATA\"/agents/*; do [ \"$d\" = \"$root\" ] && continue; \
                       for n in memory skills; do [ ! -w \"$d/$n\" ] || exit 1; done; done; \
                       [ ! -w \"$DATA/skills\" ]"
@@ -1396,6 +1396,42 @@ mod tests {
             std::env::remove_var("ANYAGENTS_AGENT_GID");
             std::env::remove_var("ANYAGENTS_SOCKET_GID");
         }
+    }
+
+    #[test]
+    fn assembled_overlay_probe_fails_for_each_missing_required_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let contract = boundary::write(dir.path()).unwrap();
+        let root = dir.path().join("agents/one");
+        let config = root.join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        // The absent shared library makes the final denial check succeed;
+        // an earlier false requirement must not be hidden by that success.
+        let shared = dir.path().join("skills");
+        let overlay_check = checks(Some(&config), &contract, 2100, 2100)
+            .into_iter()
+            .find(|c| c.what.starts_with("host memory and skills"))
+            .unwrap();
+        let script = format!("set -e\n{}\n", overlay_check.program);
+        let run = || {
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .env("MINE", &config)
+                .env("DATA", dir.path())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(!run(), "both required directories absent");
+        std::fs::create_dir(root.join("memory")).unwrap();
+        assert!(!run(), "skills absent");
+        std::fs::remove_dir(root.join("memory")).unwrap();
+        std::fs::create_dir(root.join("skills")).unwrap();
+        assert!(!run(), "memory absent despite later successful checks");
+        std::fs::create_dir(root.join("memory")).unwrap();
+        assert!(run(), "both required directories present");
+        std::fs::create_dir(&shared).unwrap();
+        assert!(!run(), "global library must not be writable");
     }
 
     #[test]
