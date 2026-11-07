@@ -5757,7 +5757,7 @@ mod tests {
             CdpSession::connect(port, version["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
         cdp.call("Tracing.start", serde_json::json!({
             "transferMode":"ReturnAsStream", "streamFormat":"proto", "streamCompression":"none",
-            "categories":"blink,blink.user_timing,devtools.timeline,devtools,toplevel,mojom,mojom.flow,toplevel.flow,navigation,content,input,renderer_host",
+            "categories":"blink,blink.user_timing,devtools.timeline,devtools,toplevel,mojom,mojom.flow,toplevel.flow,navigation,content,input,renderer_host,disabled-by-default-devtools.timeline.inputs",
             "options":"record-until-full", "bufferUsageReportingInterval":1000
         })).unwrap();
         Some(cdp)
@@ -5830,7 +5830,6 @@ mod tests {
                         related:e.relatedTarget?.outerHTML||null,active:document.activeElement?.outerHTML,
                         focused:document.hasFocus(),stack:new Error('event '+type).stack});
                     window.events.push(event);
-                    performance.mark('focus-probe:'+type+':'+event.target+':active='+document.activeElement.tagName+':hasFocus='+document.hasFocus());
                 },true);
         </script>"#;
         let child = spawn_html_server(
@@ -5915,11 +5914,18 @@ mod tests {
             let mut cdp = CdpSession::connect(rt.cdp_port, &target.ws_url.unwrap()).unwrap();
             let diag = "({url:location.href,ready:document.readyState,focus:document.hasFocus(),active:document.activeElement?.outerHTML,hit:document.elementFromPoint(40,20)?.outerHTML,events:window.events})";
             eprintln!("PARENT: {:?}", eval_js(&mut cdp, diag));
+            let marks = "window.events.forEach((row,index)=>performance.mark('focus-probe:'+location.origin+':'+index+':'+row.type,{startTime:row.at,detail:row}))";
+            if native_trace.is_some() {
+                eval_js(&mut cdp, marks).unwrap();
+            }
             for frame in discover_child_frames(&mut cdp) {
                 eprintln!(
                     "CHILD {frame:?}: {:?}",
                     eval_js_in_frame(&mut cdp, Some(&frame.frame_id), diag)
                 );
+                if native_trace.is_some() {
+                    eval_js_in_frame(&mut cdp, Some(&frame.frame_id), marks).unwrap();
+                }
             }
         }
         if let Some(trace) = native_trace.as_mut() {
