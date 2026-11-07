@@ -22,10 +22,12 @@ use anyagents_harness::{
 };
 
 /// Maximum drain window (ms) to let an active turn finish naturally after a
-/// harness, model, or profile switch is requested. While draining, new mailbox
+/// harness or model switch is requested. While draining, new mailbox
 /// messages are held back in SQLite (never steered into the retiring process)
 /// so continuous incoming messages cannot extend the old turn indefinitely.
 /// Once the turn finishes or this drain window expires, the process is replaced.
+/// Profile rotations instead wait for the active turn to finish, without a
+/// deadline that could kill ongoing work.
 const PENDING_SWITCH_DRAIN_MS: i64 = 15_000;
 
 /// Time source. Production uses the wall clock. Tests advance a manual clock.
@@ -940,7 +942,30 @@ impl<H: Harness + 'static> Session<H> {
         !self.stop.load(Ordering::SeqCst)
     }
 
+    fn profile_rotation_pending(&self) -> bool {
+        fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .is_some_and(|ms| ms > self.process_profile_rotated_ms)
+    }
+
+    fn profile_rotation_waits_for_turn(&self) -> bool {
+        self.profile_rotation_pending()
+            && self.delivery.as_ref().is_some_and(|delivery| {
+                let health = delivery.harness().health();
+                health.process_alive && health.turn_state == TurnState::InTurn
+            })
+    }
+
     fn replace_process(&mut self) {
+        // Every replacement path (including quota recovery) must preserve an
+        // active child when a profile refresh is pending. A dead child can
+        // still be recovered immediately.
+        if self.profile_rotation_waits_for_turn() {
+            self.pending_switch_started_at
+                .get_or_insert(self.inner.clock.now_ms());
+            return;
+        }
         if self.delivery.is_none() {
             self.restart_at = None;
             return;
@@ -1018,9 +1043,17 @@ impl<H: Harness + 'static> Session<H> {
             // A harness, model, or profile switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
             // replacement process instead of steering them into the old turn,
-            // and cut over as soon as the turn finishes or the drain window ends.
+            // and cut over at the turn boundary for profile rotations, or at
+            // the drain deadline for an explicit harness/model switch.
             let deadline = switch_started_at.saturating_add(PENDING_SWITCH_DRAIN_MS);
-            let wait_until = deadline.min(self.inner.clock.now_ms() + 1_000);
+            let now = self.inner.clock.now_ms();
+            let wait_until = if deadline > now {
+                deadline.min(now + 1_000)
+            } else {
+                // A deferred profile rotation may outlive the drain deadline.
+                // Never busy-loop on a wait whose deadline is already past.
+                now + 1_000
+            };
             self.inner.clock.wait(Some(wait_until), &self.woken);
             return false;
         }
@@ -1101,7 +1134,8 @@ impl<H: Harness + 'static> Session<H> {
     /// hold new incoming mailbox messages at the gate so they cannot extend
     /// an active turn on the retiring process, and replace the live process
     /// immediately when idle or faulted, or once `PENDING_SWITCH_DRAIN_MS`
-    /// expires. An errored turn cannot drain successfully on the old harness.
+    /// expires. A profile rotation never preempts a live `InTurn` child; it
+    /// remains pending until that turn finishes (or the child exits).
     fn try_apply_pending_switch(&mut self) -> bool {
         let replaceable = {
             let Some(delivery) = self.delivery.as_ref() else {
@@ -1117,20 +1151,18 @@ impl<H: Harness + 'static> Session<H> {
         let Ok(fresh) = self.inner.store.agent(&self.id) else {
             return false;
         };
-        let current_rotated_ms =
-            fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-                .unwrap_or(0);
         let config_changed = fresh.harness != self.agent.harness
             || fresh.model != self.agent.model
-            || current_rotated_ms > self.process_profile_rotated_ms;
+            || self.profile_rotation_pending();
         if !config_changed {
             self.pending_switch_started_at = None;
             return false;
         }
         let now = self.inner.clock.now_ms();
         let started_at = *self.pending_switch_started_at.get_or_insert(now);
+        if self.profile_rotation_waits_for_turn() {
+            return false;
+        }
         let drain_expired = now.saturating_sub(started_at) >= PENDING_SWITCH_DRAIN_MS;
         if !replaceable && !drain_expired {
             return false;

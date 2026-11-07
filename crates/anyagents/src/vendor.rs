@@ -426,6 +426,8 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 }
 
 fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> {
+    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
+        .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = request
         .extra_env
@@ -452,6 +454,10 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     env.push((
         "ANYAGENTS_AGENT_ID".to_string(),
         request.agent.id.as_str().to_string(),
+    ));
+    env.push((
+        "ANYAGENTS_AGENT_NAME".to_string(),
+        request.agent.name.clone(),
     ));
     // The agent's own config directory. Its tool server reads the mailbox
     // capability from here and nothing else.
@@ -552,7 +558,8 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         }
     }
     if let Some((ref seat_user, ref seat_launch)) = seat_spec {
-        crate::create::ensure_seat_environment(&request.config_dir);
+        crate::create::ensure_seat_environment(&request.config_dir, &request.work_dir)
+            .map_err(|e| e.to_string())?;
         let cache_home = request.config_dir.join("cache-home");
         let _ = std::fs::create_dir_all(&cache_home);
         let tmp_dir = request.config_dir.join("tmp");

@@ -444,10 +444,19 @@ fn read_page(
         return Err(Error::Auth);
     }
     if response.status == 304 {
-        let mut page = cached.cloned().ok_or(Error::Payload)?;
-        page.used_at = now;
-        target.pages.insert(path.to_string(), page.clone());
-        return Ok(page);
+        if let Some(mut page) = cached.cloned() {
+            if let Some(etag) = response.headers.get("etag") {
+                page.etag = Some(etag.clone());
+            }
+            page.used_at = now;
+            target.pages.insert(path.to_string(), page.clone());
+            return Ok(page);
+        }
+        if response.body.trim().is_empty() {
+            return Err(Error::Payload);
+        }
+        // The gh wrapper can restore a disk-cached body under 304 headers
+        // before this process has an in-memory page to reuse.
     }
     if response.status == 403 || response.status == 429 {
         let secondary = response.body.to_ascii_lowercase();
@@ -483,7 +492,7 @@ fn read_page(
             return Err(Error::RateLimited(until));
         }
     }
-    if response.status != 200 {
+    if response.status != 200 && response.status != 304 {
         return Err(Error::Http(response.status));
     }
     let json: Value = serde_json::from_str(&response.body).map_err(|_| Error::Payload)?;
@@ -831,13 +840,17 @@ mod tests {
     use serde_json::json;
 
     fn response(status: u16, body: Value, headers: &[(&str, &str)]) -> Response {
+        response_body(status, body.to_string(), headers)
+    }
+
+    fn response_body(status: u16, body: impl Into<String>, headers: &[(&str, &str)]) -> Response {
         Response {
             status,
             headers: headers
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            body: body.to_string(),
+            body: body.into(),
         }
     }
 
@@ -851,6 +864,86 @@ mod tests {
 
     fn pull(state: &str, merged: bool, sha: &str) -> Value {
         json!({"state": state, "merged": merged, "merged_at": null, "head": {"sha": sha}})
+    }
+
+    #[test]
+    fn not_modified_with_cached_page_uses_cache_when_body_is_empty() {
+        let path = "repos/o/r/commits/sha/check-runs?per_page=100&page=1";
+        let mut target = Target::default();
+        target.pages.insert(
+            path.to_string(),
+            Page {
+                etag: Some("old".to_string()),
+                last_modified: None,
+                next: false,
+                summary: Summary::Checks(Checks {
+                    count: 1,
+                    pending: true,
+                    review_failed: false,
+                }),
+                used_at: 0,
+            },
+        );
+
+        for (now, headers, expected_etag) in
+            [(123, vec![], "old"), (456, vec![("etag", "new")], "new")]
+        {
+            let page = read_page(&mut target, path, now, &mut |_, etag, _| {
+                assert_eq!(etag, Some("old"));
+                Ok(response_body(304, "", &headers))
+            })
+            .unwrap();
+
+            assert_eq!(page.etag.as_deref(), Some(expected_etag));
+            assert_eq!(page.used_at, now);
+            assert!(matches!(
+                page.summary,
+                Summary::Checks(Checks { count: 1, .. })
+            ));
+            assert_eq!(target.pages[path].etag.as_deref(), Some(expected_etag));
+            assert_eq!(target.pages[path].used_at, now);
+        }
+    }
+
+    #[test]
+    fn not_modified_with_disk_cached_body_populates_cold_check_probe_page() {
+        let mut probes = Probes::default();
+        let body = completed();
+        let expected_count = body["check_runs"].as_array().unwrap().len();
+        let result = probes.probe("check", "o", "r", "sha", false, 0, |path, etag, _| {
+            assert_eq!(path, "repos/o/r/commits/sha/check-runs?per_page=100&page=1");
+            assert_eq!(etag, None);
+            parse_response(
+                format!("HTTP/2.0 304 Not Modified\nEtag: \"disk\"\n\n{body}").as_bytes(),
+            )
+        });
+
+        assert_eq!(result, (true, "checks_completed".to_string()));
+        let page = probes.targets["check"]
+            .pages
+            .get("repos/o/r/commits/sha/check-runs?per_page=100&page=1");
+        let page = page.expect("304 body should populate the in-memory page cache");
+        assert_eq!(page.etag.as_deref(), Some("\"disk\""));
+        assert_eq!(page.used_at, 0);
+        assert!(matches!(
+            page.summary,
+            Summary::Checks(Checks { count, .. }) if count == expected_count
+        ));
+    }
+
+    #[test]
+    fn not_modified_without_cached_page_or_body_is_a_payload_error() {
+        let path = "repos/o/r/commits/sha/check-runs?per_page=100&page=1";
+        for body in ["", " \t\r\n", "invalid json", "null"] {
+            let mut target = Target::default();
+            let result = read_page(&mut target, path, 123, &mut |_, etag, _| {
+                assert_eq!(etag, None);
+                Ok(response_body(304, body, &[]))
+            });
+
+            assert!(matches!(result, Err(Error::Payload)), "body: {body:?}");
+            assert!(target.pages.is_empty());
+        }
     }
 
     #[test]

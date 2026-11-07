@@ -6,26 +6,19 @@ on:
     branches: [main]
     types: [completed]
   workflow_dispatch:
-    inputs:
-      ci_run_id:
-        description: Successful push/main ci run for this exact current main SHA
-        required: true
-        type: string
 
 permissions:
   contents: read
 
-# Serialize publishers, including manual completion of a partial publication.
+# Events are wake-ups, not a queue of release intents. A surviving run reconciles
+# every incomplete cut in its main-history snapshot, including evicted events.
 concurrency:
   group: release
   cancel-in-progress: false
 
 jobs:
   admit:
-    if: >-
-      github.event.repository.visibility == 'public' && github.ref == 'refs/heads/main' &&
-      (github.event_name == 'workflow_dispatch' ||
-       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
+    if: github.event.repository.visibility == 'public' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -34,11 +27,12 @@ jobs:
     outputs:
       publish: ${{ steps.admit.outputs.publish }}
       admission: ${{ steps.admit.outputs.admission }}
+      matrix: ${{ steps.admit.outputs.matrix }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.sha }}
-          fetch-depth: 2
+          fetch-depth: 0
           persist-credentials: false
       - id: admit
         env:
@@ -48,7 +42,11 @@ jobs:
   release:
     needs: admit
     if: github.event.repository.visibility == 'public' && needs.admit.outputs.publish == 'true'
-    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@ef675524e619fe3dde5b88213e8598046f0aaff6
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.admit.outputs.matrix) }}
+    uses: SylphxAI/mcp-kit/.github/workflows/release.yml@ee5c6ba4d058b50e960c461a0708d74c5d00bf69
     permissions:
       contents: write
       id-token: write
@@ -56,7 +54,8 @@ jobs:
     secrets:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     with:
-      kit-ref: ef675524e619fe3dde5b88213e8598046f0aaff6
+      kit-ref: ee5c6ba4d058b50e960c461a0708d74c5d00bf69
+      source-sha: ${{ matrix.source }}
       name: anyagents
       npm-package: '@sylphx/anyagents'
       platforms: darwin-arm64 darwin-x64 linux-x64-gnu linux-arm64-gnu
