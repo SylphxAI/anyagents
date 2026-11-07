@@ -8,6 +8,7 @@ mod address;
 pub mod boundary;
 mod error;
 mod id;
+pub mod masking;
 mod migrate;
 pub mod quote;
 mod secret;

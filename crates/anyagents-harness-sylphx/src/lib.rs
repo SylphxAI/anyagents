@@ -2666,7 +2666,7 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": output,
                     });
-                    append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
                 }
             } else {
@@ -2739,7 +2739,7 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": clean_output,
                     });
-                    append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
                     if let Some(data_url) = attached_image_data_url {
                         let image_item = json!({

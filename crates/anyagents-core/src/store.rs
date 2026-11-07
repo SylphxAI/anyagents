@@ -2337,6 +2337,7 @@ impl Store {
         let id = format!("tool_{}", MessageId::generate());
         let ts_ms = now_ms();
         let clean_tool = tool_name.trim().to_ascii_lowercase();
+        let summary = crate::masking::mask_known_secrets(summary);
         let text = if summary.trim().starts_with("[tool") {
             summary.trim().to_string()
         } else {
