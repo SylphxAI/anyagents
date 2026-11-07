@@ -1723,7 +1723,7 @@ fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> R
         .into_iter()
         .flatten()
         .filter_map(|v| v.as_str())
-        .filter(|v| matches!(*v, "selectAll" | "copy" | "cut" | "paste"))
+        .filter(|v| matches!(*v, "selectAll" | "copy" | "cut" | "paste" | "undo" | "redo"))
         .collect();
     let inferred = if shortcut {
         match lower.as_str() {
@@ -1731,6 +1731,7 @@ fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> R
             "c" => Some("copy"),
             "x" => Some("cut"),
             "v" => Some("paste"),
+            "z" => Some(if modifiers & 8 != 0 { "redo" } else { "undo" }),
             _ => None,
         }
     } else {
@@ -5257,8 +5258,20 @@ mod tests {
         );
     }
     #[test]
+    fn takeover_clipboard_ui_acceptance() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        run_takeover_ui_acceptance(true);
+    }
+
+    #[test]
     #[ignore = "requires Chromium and Node >=22; run explicitly for takeover UI changes"]
     fn mobile_takeover_ui_acceptance() {
+        run_takeover_ui_acceptance(false);
+    }
+
+    fn run_takeover_ui_acceptance(clipboard_only: bool) {
         assert!(
             Path::new(&chromium_binary()).exists(),
             "Chromium is required"
@@ -5301,7 +5314,11 @@ mod tests {
         .unwrap();
         let output = std::env::var("TAKEOVER_EVIDENCE_DIR")
             .unwrap_or_else(|_| dir.path().join("captures").display().to_string());
-        let result = Command::new("node")
+        let mut command = Command::new("node");
+        if clipboard_only {
+            command.env("TAKEOVER_CLIPBOARD_ONLY", "1");
+        }
+        let result = command
             .arg(concat!(
                 env!("CARGO_MANIFEST_DIR"),
                 "/../../tests/browser-takeover.mjs"

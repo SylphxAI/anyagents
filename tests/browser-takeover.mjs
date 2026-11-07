@@ -90,6 +90,9 @@ try {
     await until(() => viewer.eval(`!!document.querySelector('#screen') && document.querySelector('#connection').hidden`), 'clipboard viewer connected');
     await remote.eval(`document.querySelector('#entry').value='';document.querySelector('#entry2').value=''`);
     await remoteField('entry');
+    await api('/input',{type:'paste',text:'undo fixture'});
+    await key('z','KeyZ',90,2);
+    await until(() => remote.eval(`document.querySelector('#entry').value === ''`), 'Ctrl+Z undo');
     await viewer.eval(`navigator.clipboard.writeText('pasted once ✓')`);
     await key('v','KeyV',86,2);
     await until(() => remote.eval(`document.querySelector('#entry').value === 'pasted once ✓'`), 'native paste inserted once');
@@ -122,6 +125,25 @@ try {
       await viewer.eval(`navigator.clipboard.writeText('mobile paste')`);
       await key('v','KeyV',86,2);
       await until(() => remote.eval(`document.querySelector('#entry').value === 'mobile paste'`), 'aligned phone native paste');
+    }
+    const beforeDenied = await remote.eval(`document.querySelector('#entry').value`);
+    await viewer.eval(`window.originalReadText=navigator.clipboard.readText;navigator.clipboard.readText=async()=>{throw new DOMException('Denied','NotAllowedError')}`);
+    await clickSelector('#paste-btn');
+    await until(() => viewer.eval(`document.querySelector('#clipboard-status').textContent.includes('Allow clipboard access')`), 'paste permission prompt');
+    assert.equal(await remote.eval(`document.querySelector('#entry').value`),beforeDenied,'refused paste must not insert');
+    await viewer.eval(`navigator.clipboard.readText=window.originalReadText`);
+    // A native phone paste event is also the bridge for an OS long-press menu.
+    await api('/input',{type:'key',key:'a',modifiers:2});
+    await viewer.eval(`(() => {const data=new DataTransfer();data.setData('text/plain','synthetic paste once');document.activeElement.dispatchEvent(new ClipboardEvent('paste',{clipboardData:data,bubbles:true,cancelable:true}));})()`);
+    await until(() => remote.eval(`document.querySelector('#entry').value === 'synthetic paste once'`), 'synthetic paste inserts once');
+    if (width<700) {
+      await touch('touchStart',[[110,500],[280,500]]); await touch('touchMove',[[70,500],[320,500]]); await touch('touchEnd',[]);
+      await touch('touchStart',[[200,500]]); await touch('touchMove',[[170,470]]); await touch('touchEnd',[]);
+      const aligned=await viewer.eval(`(() => {const p=document.querySelector('#keyboard-proxy').getBoundingClientRect(),c=document.querySelector('#screen'),r=c.getBoundingClientRect();return {x:p.x,y:p.y,width:p.width,height:p.height,screen:{x:r.x,y:r.y,width:r.width},remoteWidth:Number(c.dataset.remoteWidth)}})()`);
+      const field=await remote.eval(`(() => {const r=document.querySelector('#entry').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}})()`);
+      const scale=aligned.screen.width/aligned.remoteWidth;
+      assert.ok(Math.abs(aligned.x-(aligned.screen.x+field.x*scale))<1 && Math.abs(aligned.y-(aligned.screen.y+field.y*scale))<1,JSON.stringify(aligned));
+      assert.ok(Math.abs(aligned.width-field.width*scale)<1 && Math.abs(aligned.height-field.height*scale)<1,JSON.stringify(aligned));
     }
     await screenshot(`${width}-clipboard`);
     await remoteField('password');

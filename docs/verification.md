@@ -106,6 +106,23 @@ the viewport regression advances the reaper's explicit clock without writing
 expired deadlines or stale heartbeats that race its background loop. Neither
 regression needs timing sleeps or retries.
 
+Desktop takeover accepts native modifier chords, including select-all, copy,
+cut, paste and undo. Paste inserts local clipboard text into the remote focus;
+copy and cut export the remote selection only after checking that the focus is
+not a password field. The viewer keeps new-tab, close-tab and address-bar
+shortcuts local. The floating pill also exposes Paste, Copy, All, Tab and Esc;
+clipboard permission refusal displays a prompt instead of silently losing input.
+On touch devices the native keyboard input overlays the remote field and tracks
+its position through zoom and pan, so the device's Paste menu works in place.
+No typed or pasted text is returned in input acknowledgements.
+
+`takeover_clipboard_ui_acceptance` runs the Chromium viewer clipboard and
+keyboard regressions in the ordinary native suite when Chromium is available.
+The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
+copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
+export denial. Actual iPhone Safari keyboard and long-press menus require a
+post-deployment device check; Chromium emulation does not certify those OS menus.
+
 Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
 and reported DPR. A screenshot captured by a fresh CDP session can be 1920×1080
 while the document reports DPR 2; dividing image coordinates by DPR alone is
