@@ -5,6 +5,7 @@ import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { stopProcessGroup } from './browser-process-group.mjs';
+import { interactionAcceptance } from './browser-takeover-interaction.mjs';
 const [url, remoteWs, output] = process.argv.slice(2);
 assert.ok(url && remoteWs && output, 'usage: node browser-takeover.mjs URL REMOTE_WS OUTPUT');
 await mkdir(output, { recursive: true });
@@ -70,7 +71,7 @@ try {
     }
   }
   async function key(key, code, vk, modifiers = 0) {
-    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers });
+    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers, ...(key.length===1 && !(modifiers&7) ? {text:key,unmodifiedText:key} : {}) });
     await viewer.call('Input.dispatchKeyEvent', { type:'keyUp', key, code, windowsVirtualKeyCode:vk, modifiers });
   }
   async function remoteField(id) {
@@ -84,6 +85,7 @@ try {
     await until(() => remote.eval(`document.activeElement.id === '${id}'`), 'remote field '+id);
   }
   await viewer.call('Browser.grantPermissions', {origin:new URL(url).origin,permissions:['clipboardReadWrite','clipboardSanitizedWrite']});
+  await interactionAcceptance({viewer,remote,url,output,until,key,touch,api,screenshot});
   for (const [width,height] of [[1440,900],[390,844]]) {
     await viewer.call('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width<700});
     await viewer.call('Emulation.setTouchEmulationEnabled', {enabled:width<700});
@@ -307,6 +309,32 @@ try {
   await writeFile(path.join(output, 'remote-click-log.json'), JSON.stringify(logs, null, 2));
   console.log(JSON.stringify({passed:true, viewports:4, clicks:logs.length, screenshots:output}));
   }
+} catch (error) {
+  // Keep the original failure even if diagnostics or teardown also fail. These
+  // pages contain only disposable fixture values, never a user's browser data.
+  const evidence = { passed:false, error:String(error), stack:error.stack };
+  async function capture(name, operation) {
+    let timer;
+    try {
+      evidence[name] = await Promise.race([operation(), new Promise((_, reject) => {
+        timer=setTimeout(()=>reject(new Error('diagnostic timeout')),2000);
+      })]);
+    } catch (failure) { evidence[name] = { error:String(failure) }; }
+    finally { clearTimeout(timer); }
+  }
+  if (viewer) {
+    await capture('viewer',()=>viewer.eval(`({active:document.activeElement.id,proxyType:document.querySelector('#keyboard-proxy')?.type,proxyLength:document.querySelector('#keyboard-proxy')?.value.length,status:document.querySelector('#connection')?.textContent,connectionHidden:document.querySelector('#connection')?.hidden,pointerTrace:window.pointerTrace,canvas:document.querySelector('#screen')?.getBoundingClientRect().toJSON()})`));
+    await capture('screenshot',async()=>{
+      const shot=await viewer.call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+      await writeFile(path.join(output,'failure.png'),Buffer.from(shot.data,'base64'));
+      return 'failure.png';
+    });
+  }
+  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,trajectory:window.trajectory,wheelHistory:window.wheelHistory,scrollTop:document.querySelector('#scrollbox')?.scrollTop})`));
+  try { await writeFile(path.join(output,'failure.json'),JSON.stringify(evidence,null,2)); }
+  catch (failure) { console.error('could not retain failure evidence',failure); }
+  console.error('acceptance failure evidence',JSON.stringify(evidence));
+  throw error;
 } finally {
   viewer?.close(); remote?.close();
   // Parent exit does not establish helper exit. Refuse deletion while any
