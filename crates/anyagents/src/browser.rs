@@ -2128,6 +2128,22 @@ fn dispatch_takeover_input(
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("click");
+    #[cfg(test)]
+    let _focus_sessions = {
+        let arm = std::env::var("ANYAGENTS_FOCUS_ARM").unwrap_or_default();
+        let mut children = Vec::new();
+        if arm == "main" || arm == "all" {
+            cdp.call("Emulation.setFocusEmulationEnabled", serde_json::json!({"enabled":true}))?;
+        }
+        if arm == "all" {
+            for frame in discover_child_frames(&mut cdp) {
+                let mut child = CdpSession::connect(cdp.port, &format!("/devtools/page/{}",frame.frame_id))?;
+                child.call("Emulation.setFocusEmulationEnabled",serde_json::json!({"enabled":true}))?;
+                children.push(child);
+            }
+        }
+        children
+    };
     match kind {
         "click" => {
             let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
