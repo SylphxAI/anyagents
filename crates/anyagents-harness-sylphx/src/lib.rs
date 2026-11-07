@@ -2178,9 +2178,10 @@ fn record_pending_native_messages(transcript_path: &Path, pending: &[Value]) {
 /// not touch identity, schedules, mailbox cursors, or execute any tool again.
 fn compact_native_context(
     transcript_path: &Path,
-    input: &mut Vec<Value>,
+    input: &[Value],
     pending_messages: &[Value],
-) {
+    level: usize,
+) -> Value {
     let raw_count = std::fs::read_to_string(transcript_path)
         .map(|raw| raw.lines().count())
         .unwrap_or(0);
@@ -2250,12 +2251,57 @@ fn compact_native_context(
             })
             .map(|(_, item)| item.clone()),
     );
-    let continuity = build_prior_transcript_continuity_block(transcript_path).unwrap_or_default();
-    let anchor = json!({
+    if level >= 1 {
+        // Results are replaceable context, not pending work. Preserve call IDs
+        // and a pointer to the original raw line, never to a nested anchor copy.
+        let raw = std::fs::read_to_string(transcript_path).unwrap_or_default();
+        for item in &mut retained {
+            if item.get("type").and_then(Value::as_str) != Some("function_call_output")
+                || item
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .is_none_or(|s| s.len() <= 512)
+            {
+                continue;
+            }
+            let cid = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+            let index = raw.lines().enumerate().find_map(|(idx, line)| {
+                let original: Value = serde_json::from_str(line).ok()?;
+                let matches = (original.get("type").and_then(Value::as_str)
+                    == Some("function_call_output")
+                    && original.get("call_id").and_then(Value::as_str) == Some(cid))
+                    || (original.get("role").and_then(Value::as_str) == Some("tool")
+                        && original.get("tool_call_id").and_then(Value::as_str) == Some(cid));
+                matches.then_some(idx)
+            });
+            let range = index.map_or_else(
+                || format!("transcript:0-{}", raw_count.saturating_sub(1)),
+                |idx| format!("transcript:{idx}-{idx}"),
+            );
+            item["output"] = json!(format!(
+                "[Completed tool result evicted from active context; exact raw output preserved at {range}. Use memory_recall with that range before relying on its contents. Do not replay the completed action.]"
+            ));
+        }
+    }
+    if level >= 2 {
+        retained.retain(|item| pending_messages.contains(item));
+    }
+    let bounded = |text: String| auth::truncate_tool_output_middle_utf8(text, 2_000, 900, 900);
+    let prior_handoff = if level >= 3 {
+        String::new()
+    } else {
+        bounded(prior_handoff)
+    };
+    let continuity = if level >= 3 {
+        String::new()
+    } else {
+        bounded(build_prior_transcript_continuity_block(transcript_path).unwrap_or_default())
+    };
+    json!({
         "type": "context_window_open",
         "handoff": format!(
             "Goal: continue the pending inbound work without replaying completed actions.\n\
-             Verified Facts: exact latest tool state and pending messages are retained below.\n\
+             Verified Facts: pending messages are exact; completed tool state may be replaced by raw-history pointers.\n\
              Decisions: automatic pre-request compaction; no mailbox or lifecycle changes.\n\
              Next Action: reconcile the retained results, then continue the pending work.\n\
              Full prior history: transcript:0-{}. Use memory_recall before assuming older work is absent.\n\
@@ -2263,9 +2309,7 @@ fn compact_native_context(
         "retained_items": retained,
         "prior_handoff": prior_handoff,
         "timestamp_ms": anyagents_core::now_ms(),
-    });
-    append_transcript_message(transcript_path, &anchor);
-    *input = load_transcript_input_items(transcript_path);
+    })
 }
 
 /// Budget the complete serialized wire request, not bytes/4 of history alone.
@@ -2308,20 +2352,30 @@ fn prepare_budgeted_request(
     let mut body = build_bounded(input)?;
     let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
     let threshold = limits.window_tokens.saturating_mul(limits.compact_percent) / 100;
-    if force_compact || used >= threshold {
-        compact_native_context(transcript_path, input, pending_messages);
-        body = build_bounded(input)?;
+    let ceiling = limits.window_tokens.saturating_mul(95) / 100;
+    if !force_compact && used < threshold && used <= ceiling {
+        return Ok(body);
     }
+    // Try progressively smaller *pure* candidates. Failed preflight must not
+    // grow the raw log or change the active window on every recovery attempt.
+    for level in 0..=3 {
+        let anchor = compact_native_context(transcript_path, input, pending_messages, level);
+        let candidate = memory::project_context_anchor(&anchor);
+        body = build_bounded(&candidate)?;
+        let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
+        if used <= ceiling {
+            append_transcript_message(transcript_path, &anchor);
+            *input = candidate;
+            return Ok(body);
+        }
+    }
+    // Only exact pending inbound plus fixed instructions/tools remain. Refuse
+    // this genuinely irreducible request before dispatch, without committing.
     let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
-    // Leave a further 5% for provider-specific framing/vision accounting. Never
-    // dispatch an oversized irreducible prompt, even after compaction.
-    if used > limits.window_tokens.saturating_mul(95) / 100 {
-        return Err(format!(
-            "context_request_too_large: compacted current work requires {used} conservative tokens; model window {}; request not sent; raw transcript and pending work preserved",
-            limits.window_tokens
-        ));
-    }
-    Ok(body)
+    Err(format!(
+        "context_request_too_large: compacted current work requires {used} conservative tokens; model window {}; request not sent; raw transcript and pending work preserved",
+        limits.window_tokens
+    ))
 }
 
 fn is_context_overflow(status: u16, raw: &str) -> bool {
@@ -3762,7 +3816,8 @@ fn build_tool_definitions() -> Vec<Value> {
                     "properties": {
                         "path": { "type": "string" },
                         "start_line": { "type": "integer" },
-                        "end_line": { "type": "integer" }
+                        "end_line": { "type": "integer" },
+                        "cursor": { "type": "string", "description": "Continuation for reads of this session's raw transcript; keep path and line range unchanged." }
                     },
                     "required": ["path"]
                 }
@@ -3905,7 +3960,7 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "memory_recall",
-                "description": "Lossless Raw-RAG BM25 + range recall (`transcript:<from>-<to>`) across full append-only transcript (including pre-compaction turns).",
+                "description": "Lossless Raw-RAG BM25 + range recall across the append-only transcript. Responses are capped at 32 KiB; repeat original arguments with next_cursor to concatenate JSON content fragments. Already-active items return pointers, not verbatim replay.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -3919,7 +3974,8 @@ fn build_tool_definitions() -> Vec<Value> {
                         "sort": { "type": "string", "enum": ["relevance", "newest", "oldest"] },
                         "range": { "type": "string" },
                         "limit": { "type": "integer" },
-                        "radius": { "type": "integer" }
+                        "radius": { "type": "integer" },
+                        "cursor": { "type": "string", "description": "Continuation from next_cursor; keep all original arguments unchanged." }
                     }
                 }
             }
@@ -4340,6 +4396,22 @@ fn execute_sylphx_tool(
             let start_line = args.get("start_line").and_then(Value::as_u64);
             let end_line = args.get("end_line").and_then(Value::as_u64);
             let target = resolve_workspace_path(work_dir, rel);
+            let transcript = config_dir.join("sylphx-transcript.jsonl");
+            if std::fs::canonicalize(&target)
+                .ok()
+                .is_some_and(|path| std::fs::canonicalize(&transcript).ok().as_ref() == Some(&path))
+            {
+                // File reads of our own raw store must not bypass replay
+                // suppression or response paging. File lines are 1-based;
+                // transcript coordinates are 0-based.
+                return execute_memory_recall(
+                    &transcript,
+                    &json!({
+                        "range": format!("transcript:{}-{}", start_line.unwrap_or(1).max(1) - 1, end_line.unwrap_or(u64::MAX).saturating_sub(1)),
+                        "cursor": args.get("cursor"),
+                    }),
+                );
+            }
             if let Some(mime) = image_mime_for_path(rel) {
                 return match workspace::read_bytes(&target, env) {
                     Ok(bytes) => format_image_read_output(rel, mime, &bytes),
@@ -5084,6 +5156,14 @@ mod tests {
             &transcript,
             &json!({"role":"assistant", "content":"old verbose history".repeat(12_000)}),
         );
+        let huge_call = json!({"type":"function_call", "call_id":"completed", "name":"memory_recall", "arguments":"{}"});
+        let huge_result = json!({"type":"function_call_output", "call_id":"completed", "output":"raw original 中\"".repeat(65_000)});
+        append_transcript_message(&transcript, &huge_call);
+        append_transcript_message(&transcript, &huge_result);
+        append_transcript_message(
+            &transcript,
+            &json!({"type":"context_window_open", "handoff":"resume skills batch", "retained_items":[huge_call, huge_result]}),
+        );
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let gateway = format!("http://{}/v1", listener.local_addr().unwrap());
         let transcript_at_dispatch = transcript.clone();
@@ -5128,6 +5208,25 @@ mod tests {
                 std::fs::read_to_string(transcript_at_dispatch)
                     .unwrap()
                     .contains("context_window_open")
+            );
+            let retained_output = request["input"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["type"] == "function_call_output")
+                .unwrap();
+            assert_eq!(retained_output["call_id"], "completed");
+            assert!(
+                retained_output["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("transcript:2-2")
+            );
+            assert!(
+                !retained_output["output"]
+                    .as_str()
+                    .unwrap()
+                    .contains("raw original")
             );
             assert_eq!(request["max_output_tokens"], 2000);
             assert!(request_token_upper_bound(&request).unwrap() + 2000 < 128_000);
@@ -5214,6 +5313,8 @@ mod tests {
         let pending = json!({"role":"user", "content":"must not disappear".repeat(20_000)});
         append_transcript_message(&transcript, &pending);
         let mut input = vec![pending.clone()];
+        let raw_before = std::fs::read(&transcript).unwrap();
+        let input_before = input.clone();
         let result = prepare_budgeted_request(
             &transcript,
             &mut input,
@@ -5222,7 +5323,22 @@ mod tests {
             false,
             context_preflight_build,
         );
-        assert!(result.unwrap_err().contains("request not sent"));
+        let failure = result.unwrap_err();
+        assert!(failure.contains("request not sent"));
+        for _ in 0..3 {
+            let repeated = prepare_budgeted_request(
+                &transcript,
+                &mut input,
+                std::slice::from_ref(&pending),
+                &context_preflight_limits(24_000),
+                true,
+                context_preflight_build,
+            )
+            .unwrap_err();
+            assert_eq!(repeated, failure);
+            assert_eq!(std::fs::read(&transcript).unwrap(), raw_before);
+            assert_eq!(input, input_before);
+        }
         assert!(input.contains(&pending));
         assert!(load_transcript_input_items(&transcript).contains(&pending));
         let body = build_native_responses_request(
