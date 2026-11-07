@@ -10,6 +10,7 @@ mod error;
 pub mod host_index;
 pub mod host_migration;
 pub mod host_session;
+pub mod host_skills;
 mod id;
 pub mod learned_memory;
 mod migrate;

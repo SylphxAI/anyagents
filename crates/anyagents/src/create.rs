@@ -1135,81 +1135,13 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
     let Some(skills_root) = data_skills else {
         return;
     };
-    for rel in [
-        "skills",
-        ".agents/skills",
-        ".claude/skills",
-        ".codex/skills",
-        "opencode/skills",
-        ".config/opencode/skills",
-        ".gemini/config/skills",
-        "muse/skills",
-        ".config/muse/skills",
-        ".omp/agent/skills",
-        ".dsh/skills",
-        ".grok/skills",
-    ] {
-        let dst = target_config.join(rel);
-        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
-            if meta.file_type().is_symlink()
-                && dst.exists()
-                && std::fs::read_link(&dst).ok().as_deref() == Some(skills_root.as_path())
-            {
-                continue;
-            }
-            if meta.file_type().is_dir() {
-                let _ = std::fs::remove_dir_all(&dst);
-            } else {
-                let _ = std::fs::remove_file(&dst);
-            }
-        }
-        if let Some(parent) = dst.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::os::unix::fs::symlink(&skills_root, &dst).is_err()
-            && !crate::sandbox::is_isolated_test_env()
-            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-            && let Some(anc_meta) = dst
-                .parent()
-                .and_then(|p| p.ancestors().find(|a| a.exists()))
-                .and_then(|a| std::fs::metadata(a).ok())
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let uid = anc_meta.uid();
-            let gid = anc_meta.gid();
-            if uid != 0
-                && let Some(parent) = Path::new(rel).parent()
-            {
-                let rel_parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                let uid_s = uid.to_string();
-                let gid_s = gid.to_string();
-                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
-                    .current_dir(target_config)
-                    .args([
-                        "--reuid",
-                        &uid_s,
-                        "--regid",
-                        &gid_s,
-                        "--groups",
-                        &gid_s,
-                        "--no-new-privs",
-                        "--",
-                        "sh",
-                        "-c",
-                        "mkdir -p \"$1\" && chmod a+rx \"$1\" && rm -rf \"$2\" && ln -sfn \"$3\" \"$2\"",
-                        "sh",
-                    ])
-                    .arg(rel_parent)
-                    .arg(rel)
-                    .arg(&skills_root)
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        }
+    if let Some(root) = target_config.parent()
+        && let Err(error) = anyagents_core::host_skills::mount(root, &skills_root, target_config)
+    {
+        eprintln!(
+            "skill overlay mount refused for {}: {error}",
+            target_config.display()
+        );
     }
 }
 
