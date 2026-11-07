@@ -8467,3 +8467,7 @@ exec /usr/bin/git "$@"
         assert!(work_dir.join("lib.rs").is_file());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "server_history_benchmark.rs"]
+mod history_benchmark;

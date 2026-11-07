@@ -3084,7 +3084,7 @@ impl Store {
         let mut matched_hits: Vec<(ConversationTurn, String, i64)> = Vec::new();
         for (cid, score) in ranked {
             if let Some((mut turn, aname, seq)) = chunk_meta.remove(&cid) {
-                let sig: String = turn.text.chars().take(180).collect();
+                let sig = crate::learned_memory::sha256(turn.text.as_bytes());
                 if !seen_text_sig.insert(sig) {
                     continue;
                 }
@@ -6063,6 +6063,35 @@ mod tests {
         store
             .create_agent(NewAgent::new(name, "claude-code"))
             .unwrap()
+    }
+
+    #[test]
+    fn lexical_dedup_keeps_distinct_tails_but_collapses_identical_broadcasts() {
+        let (_dir, store) = setup();
+        let own = agent(&store, "dedup-own");
+        let other = agent(&store, "dedup-other");
+        let prefix = "shared-prefix ".repeat(300);
+        let first = format!("{prefix} dedupneedle first-tail");
+        let second = format!("{prefix} dedupneedle second-tail");
+        store
+            .record_outbound(&own.id, "agent:peer", None, &first)
+            .unwrap();
+        store
+            .record_outbound(&other.id, "agent:peer", None, &second)
+            .unwrap();
+        store
+            .record_outbound(&other.id, "agent:peer", None, &first)
+            .unwrap();
+        let hits = store
+            .search_history(&HistorySearchQuery {
+                query: Some("dedupneedle".into()),
+                visible_agent_ids: Some(vec![own.id.to_string(), other.id.to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().any(|h| h.text == first));
+        assert!(hits.iter().any(|h| h.text == second));
     }
 
     #[test]
