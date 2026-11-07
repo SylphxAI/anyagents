@@ -33,6 +33,16 @@ cargo test --workspace --locked
 npm test
 ```
 
+## Synthetic agent identities
+
+The shared server fixtures derive eight distinct nonzero synthetic agent UIDs
+while excluding the executor's real UID. Both `operator()` and explicit server
+launches use that same map; these numbers are fixture metadata, not host-account
+provisioning. `server_harnesses` covers every candidate collision, including
+real UID 2106, and runs the unchanged server against a deliberately matching UID
+(refused before socket creation) and the collision-free fixture (accepted).
+The strict product launch guard remains enabled.
+
 ## OpenCode port-collision fixtures
 
 The scripted child owns a competing socket before publishing its handoff barrier
