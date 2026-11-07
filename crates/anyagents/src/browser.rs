@@ -720,6 +720,10 @@ fn wait_for_chromium_cdp(
     // for the cause of a startup failure. Reap the launched child after cleanup.
     let before_cleanup = format!("{:?}", child.try_wait());
     stop_process_group(child.id());
+    // `process_alive` is /proc-based; on hosts without /proc the group helper
+    // may return before a TERM-ignoring launcher exits. Never wait for that
+    // child indefinitely on the startup failure path.
+    let _ = child.kill();
     let after_cleanup = format!("{:?}", child.wait());
     Err(Error::Message(format!(
         "{reason}; port={port}; elapsed={}ms; before_cleanup={before_cleanup}; \
