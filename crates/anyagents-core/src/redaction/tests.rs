@@ -144,26 +144,49 @@ fn exact_provider_retry_and_redaction_replay_cannot_resurrect_plaintext() {
     let mut incoming = Incoming::new(original);
     incoming.source_key = Some("first-source".into());
     incoming.origin = Some(crate::Origin {
-        chat_id: Some(123), message_id: Some(2), thread_id: None,
+        chat_id: Some(123),
+        message_id: Some(2),
+        thread_id: None,
     });
-    let ReceiveOutcome::New(mut expected) = f.store.receive(&f.target.id, incoming.clone()).unwrap() else {
+    let ReceiveOutcome::New(mut expected) =
+        f.store.receive(&f.target.id, incoming.clone()).unwrap()
+    else {
         panic!("initial message must be new");
     };
-    assert_eq!(f.store.search_conversation(Some("child"), None, None, None, "exactredeliverycanary").unwrap().len(), 1);
+    assert_eq!(
+        f.store
+            .search_conversation(Some("child"), None, None, None, "exactredeliverycanary")
+            .unwrap()
+            .len(),
+        1
+    );
     let req = request(expected.id.as_str(), None);
     let receipt = f.redact(&req).unwrap();
     assert!(receipt.full_scrub);
     expected.text = TOMBSTONE.into();
     incoming.source_key = Some("second-source".into());
-    let ReceiveOutcome::Duplicate(duplicate) = f.store.receive(&f.target.id, incoming).unwrap() else {
+    let ReceiveOutcome::Duplicate(duplicate) = f.store.receive(&f.target.id, incoming).unwrap()
+    else {
         panic!("same-origin retry must be duplicate");
     };
     assert_eq!(duplicate, expected);
     assert_eq!(f.redact(&req).unwrap(), receipt);
     assert_eq!(f.store.inbox(&f.target.id, None).unwrap(), vec![expected]);
-    assert!(f.store.search_conversation(Some("child"), None, None, None, "exactredeliverycanary").unwrap().is_empty());
-    let (count, audit): (i64, String) = f.store.conn().query_row(
-        "SELECT count(*), receipt FROM conversation_redactions", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert!(
+        f.store
+            .search_conversation(Some("child"), None, None, None, "exactredeliverycanary")
+            .unwrap()
+            .is_empty()
+    );
+    let (count, audit): (i64, String) = f
+        .store
+        .conn()
+        .query_row(
+            "SELECT count(*), receipt FROM conversation_redactions",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
     assert_eq!(count, 1);
     assert_eq!(serde_json::from_str::<Receipt>(&audit).unwrap(), receipt);
 }
@@ -178,12 +201,28 @@ fn replay_refuses_a_stale_receipt_when_the_canonical_tombstone_has_drifted() {
         assert_eq!(f.redact(&req).unwrap(), receipt);
         // Synthetic storage corruption, not an application writer: replay must
         // independently verify today's canonical body rather than trust audit.
-        f.store.conn().execute("UPDATE messages SET body = ?1 WHERE id = ?2",
-            params![m.text, m.id.as_str()]).unwrap();
+        f.store
+            .conn()
+            .execute(
+                "UPDATE messages SET body = ?1 WHERE id = ?2",
+                params![m.text, m.id.as_str()],
+            )
+            .unwrap();
         let err = f.redact(&req).unwrap_err();
-        assert!(err.to_string().contains("existing receipt does not verify the current body"), "{err}");
-        let audit: String = f.store.conn().query_row("SELECT receipt FROM conversation_redactions WHERE id = ?1",
-            [&receipt.audit_id], |r| r.get(0)).unwrap();
+        assert!(
+            err.to_string()
+                .contains("existing receipt does not verify the current body"),
+            "{err}"
+        );
+        let audit: String = f
+            .store
+            .conn()
+            .query_row(
+                "SELECT receipt FROM conversation_redactions WHERE id = ?1",
+                [&receipt.audit_id],
+                |r| r.get(0),
+            )
+            .unwrap();
         assert_eq!(serde_json::from_str::<Receipt>(&audit).unwrap(), receipt);
     }
 }

@@ -494,12 +494,20 @@ impl Store {
             } else {
                 let start = match receipt.span.unit {
                     SpanUnit::Bytes => Some(receipt.span.start),
-                    SpanUnit::Chars => original.char_indices().nth(receipt.span.start).map(|(i, _)| i),
+                    SpanUnit::Chars => original
+                        .char_indices()
+                        .nth(receipt.span.start)
+                        .map(|(i, _)| i),
                 };
-                start.and_then(|i| i.checked_add(TOMBSTONE.len()).and_then(|end| original.get(i..end))) == Some(TOMBSTONE)
+                start.and_then(|i| {
+                    i.checked_add(TOMBSTONE.len())
+                        .and_then(|end| original.get(i..end))
+                }) == Some(TOMBSTONE)
             };
             if !still_redacted {
-                return Err(invalid("redaction target changed; existing receipt does not verify the current body"));
+                return Err(invalid(
+                    "redaction target changed; existing receipt does not verify the current body",
+                ));
             }
             return Ok(receipt);
         }
