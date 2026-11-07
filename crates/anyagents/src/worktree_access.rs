@@ -386,10 +386,10 @@ fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
 fn grant_metadata_acl(file: &std::fs::File, gid: u32) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata()?;
-    if meta.gid() == gid && meta.mode() & 0o070 == 0o070 {
-        Ok(())
-    } else if meta.uid() == unsafe { libc::geteuid() } && gid == unsafe { libc::getegid() } {
-        // Same-principal non-Linux hosts need no new cross-seat grant.
+    // Same-principal non-Linux hosts need no new cross-seat grant.
+    let same_principal =
+        meta.uid() == unsafe { libc::geteuid() } && gid == unsafe { libc::getegid() };
+    if (meta.gid() == gid && meta.mode() & 0o070 == 0o070) || same_principal {
         Ok(())
     } else {
         Err(std::io::Error::other(
