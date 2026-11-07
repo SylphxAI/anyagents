@@ -548,7 +548,7 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
             child,
             socket: data.join(socket),
         };
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
             assert!(Instant::now() < deadline, "{verb} did not bind");
             std::thread::sleep(Duration::from_millis(20));
@@ -564,10 +564,25 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
         );
         serde_json::from_str::<Value>(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
     };
+    let complete = |socket: &Path| {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let value = health(socket);
+            if value["binary_sha256_state"] == "ready" {
+                return value;
+            }
+            assert_eq!(value["binary_sha256_state"], "computing", "{value}");
+            assert!(value["binary_sha256"].is_null(), "{value}");
+            assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(value["source_sha"], expected_source);
+            assert!(Instant::now() < deadline, "hash did not complete: {value}");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
     let serve = start("serve", "anyagents.sock");
     let admin = start("serve-admin", "admin.sock");
-    let serving = health(&serve.socket);
-    let administering = health(&admin.socket);
+    let serving = complete(&serve.socket);
+    let administering = complete(&admin.socket);
     for value in [&serving, &administering] {
         assert_eq!(value["ok"], true);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
@@ -576,14 +591,14 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     }
     assert!(serving.get("pid").is_none());
     assert!(serving.get("process_started_at_ms").is_none());
-    assert_eq!(serving.as_object().unwrap().len(), 4);
+    assert_eq!(serving.as_object().unwrap().len(), 5);
     assert_eq!(administering["pid"], admin.child.id());
     assert_ne!(administering["pid"], serve.child.id());
     let started = administering["process_started_at_ms"].as_i64().unwrap();
     assert!(started >= earliest_start && started <= anyagents_core::now_ms());
     assert_eq!(
         administering.as_object().unwrap().len(),
-        6,
+        7,
         "no private state in health"
     );
 
@@ -624,7 +639,7 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     // The old sidecar leaves its socket file, so remove only this test's file.
     std::fs::remove_file(data.join("admin.sock")).unwrap();
     let restarted = start("serve-admin", "admin.sock");
-    let identity = health(&restarted.socket);
+    let identity = complete(&restarted.socket);
     assert_ne!(identity["pid"], old_pid);
     assert_eq!(identity["pid"], restarted.child.id());
     assert_eq!(identity["binary_sha256"], expected_hash);

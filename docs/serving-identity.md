@@ -16,9 +16,14 @@ curl --unix-socket "$DATA/admin.sock" http://local/v1/webhooks/healthz
 | `ok` | `true`, preserving the existing readiness response. |
 | `version` | Cargo package version embedded at build time. |
 | `source_sha` | Git HEAD embedded at build time; `unknown` for a source archive without Git metadata. Runtime environment variables do not override it. |
-| `binary_sha256` | Lowercase SHA-256 of the executable image, computed once before the listener starts. Linux reads `/proc/self/exe`; other supported Unix hosts use `current_exe()`. A read failure prevents startup. |
+| `binary_sha256` | Lowercase SHA-256 of the running image, computed once in a background worker after bind; `null` until complete. Linux reads `/proc/self/exe`; other supported Unix hosts use `current_exe()`. |
+| `binary_sha256_state` | `computing`, `ready`, or `failed`. A read failure leaves the hash `null`, without blocking readiness. |
 | `process_started_at_ms` | Admin socket only: UTC Unix milliseconds captured at entry to `main`, before command parsing. |
 | `pid` | Admin socket only: PID of the responding process. |
+
+Version and source SHA are available immediately. Wait for
+`binary_sha256_state: "ready"` before comparing the hash; a `failed` state never
+substitutes an installed-path hash or a fabricated value.
 
 Responses carry `Cache-Control: no-store`. Replacing the installed executable
 path does not change a running process's response. Read each socket separately
