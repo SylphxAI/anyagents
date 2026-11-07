@@ -1,0 +1,213 @@
+{
+  "read_at_utc": "2026-11-07T11:02:23.672311+00:00",
+  "base_tag": "v0.1.3",
+  "cut_source_sha": "1dbc3740291b4ffac74ccb11058a3e9fb25076f0",
+  "release_candidate_branch": "agent/lyra-anyagents-release-0.1.4",
+  "release_gate": "Full Linux, macOS, exact-head ci-ok, independent exact-head PASS and operations-security stamp on the release candidate before the normal merge queue. Publication and daemon activation require separate receipts.",
+  "pull_requests": [
+    {
+      "number": 127,
+      "title": "Protect GitHub watch polling with dedicated credentials and quota holds",
+      "head_sha": "302a80b74202f56b7f87f4f91c122978f029bab2",
+      "merge_sha": "571738c133d15c2cf1533a428fbdb23991d5c13c",
+      "merged_at": "2026-11-07T07:31:05Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T06:59:32Z",
+          "completedAt": "2026-11-07T06:59:34Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42349049978/job/128333946983",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        },
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T07:10:12Z",
+          "completedAt": "2026-11-07T07:10:16Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42349844367/job/128336265629",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 121,
+      "title": "[review] fix: keep agent roles methodology-neutral",
+      "head_sha": "c9fe8b54a73761f6e6b99326b13c2916067d7cd2",
+      "merge_sha": "a2d6d876eaa007780cd4aaef5d6a3fd4622656e5",
+      "merged_at": "2026-11-07T09:01:34Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T08:29:48Z",
+          "completedAt": "2026-11-07T08:29:51Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42355446056/job/128353265964",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 125,
+      "title": "[review] fix: mask recognized credentials before tool-output persistence",
+      "head_sha": "e0fdf09d35ae64198b66298404ed579971201b48",
+      "merge_sha": "0df8bca60f73dec6eec834b3fd7d5c30d1b65e91",
+      "merged_at": "2026-11-07T09:17:09Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T05:59:53Z",
+          "completedAt": "2026-11-07T05:59:56Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42344763916/job/128320805619",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 120,
+      "title": "fix(spawn): align workspace schemas with private defaults",
+      "head_sha": "e80187661d385ad808503b329b36b505f4322d67",
+      "merge_sha": "3f67b327beaeabaee019238fa63f7adeafeec026",
+      "merged_at": "2026-11-07T09:36:25Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T09:20:55Z",
+          "completedAt": "2026-11-07T09:20:58Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42359066381/job/128364189677",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 135,
+      "title": "fix(prompt): deduplicate agy rules under 24KB cap and unify instructions sync",
+      "head_sha": "411e42adecc31150ea428a5e64bc49d7caee5777",
+      "merge_sha": "da4f1f07808baa87566b596817b5f99182cb64f5",
+      "merged_at": "2026-11-07T10:15:20Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T10:09:09Z",
+          "completedAt": "2026-11-07T10:09:14Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42362445240/job/128374260915",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 131,
+      "title": "[review] fix(profiles): include sub-agents in rebalancing and quota load",
+      "head_sha": "6dd2734b4b63e7288d2ca0325f8dd3739035d384",
+      "merge_sha": "0de38cbcf4e06ecec8d1659f187fef7d808b3616",
+      "merged_at": "2026-11-07T10:38:42Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T10:00:33Z",
+          "completedAt": "2026-11-07T10:00:36Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42361830502/job/128372395229",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 136,
+      "title": "fix: restore GitHub watch pages from cached 304 bodies",
+      "head_sha": "7d3ca5402525f3f3f3f6a591b1de8643d55293a0",
+      "merge_sha": "f574518a258b3e4f52090050897022689f82b44a",
+      "merged_at": "2026-11-07T10:47:27Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T10:28:48Z",
+          "completedAt": "2026-11-07T10:28:52Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42363862235/job/128378460581",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 28,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    },
+    {
+      "number": 133,
+      "title": "[review] ci: reconcile releases from version-cut history",
+      "head_sha": "b8f9b4472080138d4b6995d4dbcef2cb51de73e4",
+      "merge_sha": "1dbc3740291b4ffac74ccb11058a3e9fb25076f0",
+      "merged_at": "2026-11-07T10:47:28Z",
+      "ci_ok": [
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T09:50:14Z",
+          "completedAt": "2026-11-07T09:50:17Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42361095973/job/128370347068",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 29,
+          "stale": false,
+          "stale_reason": null
+        },
+        {
+          "name": "ci-ok",
+          "status": "completed",
+          "conclusion": "success",
+          "startedAt": "2026-11-07T10:46:55Z",
+          "completedAt": "2026-11-07T10:46:57Z",
+          "url": "https://github.com/SylphxAI/anyagents/actions/runs/42365125499/job/128382246071",
+          "fetched_at_epoch": 1794049257,
+          "fetch_age_s": 29,
+          "stale": false,
+          "stale_reason": null
+        }
+      ],
+      "disposition": "included"
+    }
+  ],
+  "excluded_open_pull_requests": [
+    108,
+    124
+  ]
+}
