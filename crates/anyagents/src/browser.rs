@@ -837,6 +837,8 @@ struct CdpSession {
     stream: TcpStream,
     read_buf: Vec<u8>,
     next_id: u64,
+    #[cfg(test)]
+    events: Vec<serde_json::Value>,
 }
 
 impl CdpSession {
@@ -891,6 +893,8 @@ impl CdpSession {
             stream,
             read_buf: leftover,
             next_id: 1,
+            #[cfg(test)]
+            events: Vec::new(),
         })
     }
 
@@ -925,6 +929,10 @@ impl CdpSession {
             let Ok(val) = serde_json::from_str::<serde_json::Value>(&msg_text) else {
                 continue;
             };
+            #[cfg(test)]
+            if val.get("method").and_then(|v| v.as_str()) == Some("Target.attachedToTarget") {
+                self.events.push(val.clone());
+            }
             if val.get("id").and_then(|v| v.as_u64()) == Some(id) {
                 if let Some(err) = val.get("error") {
                     let msg = err
@@ -2174,7 +2182,57 @@ fn dispatch_takeover_input(
                 .get("buttons")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(if event_type == "mouseReleased" { 0 } else { 1 });
-            cdp.call(
+            #[cfg(test)]
+            let routed = {
+                let arm = std::env::var("ANYAGENTS_FOCUS_ARM").unwrap_or_default();
+                if arm == "child-target" || arm == "attached-root-control" {
+                    cdp.call(
+                        "Target.setAutoAttach",
+                        serde_json::json!({
+                            "autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true,
+                        }),
+                    )?;
+                    let frames = discover_child_frames(&mut cdp);
+                    let frame = frames.first().expect("fixture child frame");
+                    let attached = cdp
+                        .events
+                        .iter()
+                        .find(|event| {
+                            event
+                                .pointer("/params/targetInfo/targetId")
+                                .and_then(|v| v.as_str())
+                                == Some(frame.frame_id.as_str())
+                        })
+                        .expect("child target auto-attached before dispatch");
+                    let session = attached
+                        .pointer("/params/sessionId")
+                        .and_then(|v| v.as_str())
+                        .expect("attached child session")
+                        .to_string();
+                    eprintln!(
+                        "DISPATCH ARM: {arm} target={} session={session} root=({x},{y}) local=({},{})",
+                        frame.frame_id,
+                        x - frame.offset_x,
+                        y - frame.offset_y
+                    );
+                    if arm == "child-target" {
+                        Some((session, x - frame.offset_x, y - frame.offset_y))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            #[cfg(test)]
+            let (session, x, y) = match routed.as_ref() {
+                Some((session, local_x, local_y)) => (Some(session.as_str()), *local_x, *local_y),
+                None => (None, x, y),
+            };
+            #[cfg(not(test))]
+            let session = None;
+            cdp.call_in_session(
+                session,
                 "Input.dispatchMouseEvent",
                 serde_json::json!({
                     "type": event_type,
