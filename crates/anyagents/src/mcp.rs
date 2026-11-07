@@ -479,6 +479,19 @@ struct AgentsArgs {
     /// - `"models"` (list upstream provider profile model catalogs)
     #[serde(default)]
     action: Option<String>,
+    /// Target body id when action = "redact"; `transcript:<zero-based-line>` addresses
+    /// a Sylphx output/content string in config/sylphx-transcript.jsonl.
+    #[serde(default)]
+    message_id: Option<String>,
+    /// Mailbox sequence instead of message_id when action = "redact".
+    #[serde(default)]
+    seq: Option<i64>,
+    /// Optional end-exclusive decoded-text span. Omit to tombstone the whole body.
+    #[serde(default)]
+    span: Option<crate::api::RedactionSpan>,
+    /// Required audit reason for redact. Never repeat sensitive text in this field.
+    #[serde(default)]
+    reason: Option<String>,
     /// Optional state filter for `list`: `"running"`, `"working"`, `"errored"`, `"paused"`, `"archived"`, or `"all"` (default `"all"`).
     #[serde(default)]
     state: Option<String>,
@@ -1077,7 +1090,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; or use `create`, `rename`, `role`, `harness`, `models`."
+        description = "Unified agent & cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `create` | `describe` | `redact` | `steer` | `wake` | `pause` | `archive` | `delete` | `rename` | `role` | `harness` | `models`, supporting multi-level sub-agent trees). Use `list` (default, with optional `parent`: `\"self\"` | `\"subagents\"` | `\"root\"` and `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`) to inspect agents and sub-agents; use `inspect` (`name`: `\"<agent-or-id>\"`, `limit`: `10`) to view live status, schedules, and recent turns; use `spawn` (`name`, `repo`: `\"<org>/<repo>\"` | `\"inherit\"`, `branch`, `base`, `workdir`: path | `\"worktree\"` | `\"private\"` | `\"inherit\"`, `description`, `prompt`, `harness`, `model`, `profile`) to launch a sub-agent with an isolated managed Git worktree; use `describe` (`name`: `\"self\"` | `\"all\"` | `\"<agent>\"`, `description`: `\"...\"`) to read or update role descriptions; use `steer`, `wake`, `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), or `delete` to control lifecycle; use `redact` (`name`, `message_id` or `seq`, optional `span`: {`unit`: `bytes` | `chars`, `start`, `end`}, `reason`) for audited erasure with permission `conversation.redact` (ancestors/admin only, quiescent target); or use `create`, `rename`, `role`, `harness`, `models`."
     )]
     async fn agents(
         &self,
@@ -1107,6 +1120,37 @@ impl AgentMcp {
                 }
             });
         match action.as_str() {
+            "redact" => {
+                let target = args
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| "redact requires a target agent".to_string())?;
+                let request = anyagents_core::redaction::Request {
+                    message_id: args.message_id,
+                    seq: args.seq,
+                    span: args
+                        .span
+                        .map(TryInto::try_into)
+                        .transpose()
+                        .map_err(|e: Error| e.to_string())?,
+                    reason: args.reason.ok_or_else(|| {
+                        "redact requires a reason (without sensitive text)".to_string()
+                    })?,
+                };
+                let path = format!(
+                    "/v1/agents/{}/conversation/redact",
+                    urlencoding_simple(target.strip_prefix("agent:").unwrap_or(target))
+                );
+                let response = self
+                    .client
+                    .get(
+                        &path,
+                        Some(serde_json::to_vec(&request).map_err(|e| e.to_string())?),
+                    )
+                    .await?;
+                Ok(rmcp::handler::server::wrapper::Json(response))
+            }
             "list" | "ls" => {
                 let mut response: AgentsResponse = self.client.get_agents().await?;
                 let state_trimmed = args

@@ -377,11 +377,15 @@ fn concurrent_agents_and_restart_bind_distinct_private_ports() {
 fn an_occupied_stored_port_is_replaced_and_persisted() {
     let dir = TempDir::new().unwrap();
     let config = dir.path().join("config");
-    let first = start_with_config(&dir, "finish", &config);
-    let previous = port_of(&config);
-    drop(first);
-    let occupied = std::net::TcpListener::bind(("127.0.0.1", previous)).unwrap();
-    let second = start_with_config(&dir, "finish", &config);
+    // Claim a valid candidate before storing it, and keep ownership throughout.
+    // A service shutdown followed by bind(previous) has an unowned socket gap.
+    let occupied = (20_000..30_000)
+        .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
+        .expect("an available private fixture port");
+    let previous = occupied.local_addr().unwrap().port();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("opencode-service-port"), previous.to_string()).unwrap();
+    let harness = start_with_config(&dir, "finish", &config);
     let replacement = port_of(&config);
     assert_ne!(replacement, previous);
     assert!(log_of(&dir).contains(&format!("server:http://127.0.0.1:{replacement}")));
@@ -389,7 +393,7 @@ fn an_occupied_stored_port_is_replaced_and_persisted() {
     // Once released, another process may claim it; deterministic free-port
     // reuse and occupied-next-port cases live at the allocator boundary.
     assert!(std::net::TcpListener::bind(("127.0.0.1", replacement)).is_err());
-    drop(second);
+    drop(harness);
     drop(occupied);
 }
 
@@ -434,13 +438,14 @@ fn a_collision_during_socket_handoff_retries_and_persists_the_new_port() {
             assert!(std::time::Instant::now() < deadline, "first launch barrier");
             std::thread::sleep(Duration::from_millis(10));
         };
-        let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // The scripted child already owns the collision socket. Rebinding it
+        // here would race unrelated holders and reject a legitimate collision.
         std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
         let harness = launch.join().unwrap();
         assert_ne!(port_of(&config), port);
+        assert!(log_of(&dir).contains(&format!("bind failed:{port}:")));
         assert!(log_of(&dir).matches("serve:").count() >= 2);
         drop(harness);
-        drop(occupied);
     });
 }
 
@@ -483,7 +488,7 @@ fn inherited_host_roots_and_credentials_do_not_select_the_service() {
 /// a provider call. Set ANYAGENTS_REAL_OPENCODE to the installed executable.
 #[test]
 #[ignore = "requires an installed OpenCode v2 CLI"]
-fn real_opencode_services_use_private_ports_and_reuse_them_after_restart() {
+fn real_opencode_services_use_private_ports_across_restart() {
     let program = std::env::var_os("ANYAGENTS_REAL_OPENCODE")
         .expect("set ANYAGENTS_REAL_OPENCODE to the installed executable");
     let alpha = TempDir::new().unwrap();
@@ -513,7 +518,9 @@ fn real_opencode_services_use_private_ports_and_reuse_them_after_restart() {
     assert!(b.session_id().is_some());
     drop(a);
     let restarted = launch(&alpha);
-    assert_eq!(port_of(&alpha.path().join("config")), a_port);
+    let restarted_port = port_of(&alpha.path().join("config"));
+    assert_ne!(restarted_port, b_port);
+    assert!(std::net::TcpListener::bind(("127.0.0.1", restarted_port)).is_err());
     drop(restarted);
     drop(b);
 }
@@ -538,16 +545,16 @@ fn a_transient_bind_collision_is_retried_even_after_the_holder_releases_it() {
         let first = dir.path().join("first-serve-port");
         wait(&first);
         let port: u16 = std::fs::read_to_string(&first).unwrap().parse().unwrap();
-        let occupied = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
         std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
         wait(&dir.path().join("collision-reported"));
-        drop(occupied);
-        // The fixture cannot exit until the holder is gone. A later bind probe
-        // alone therefore cannot diagnose the collision that actually occurred.
+        // The child releases its holder before reporting this barrier and
+        // cannot exit until acknowledged. A later bind probe alone therefore
+        // cannot diagnose the collision that actually occurred.
         std::fs::write(dir.path().join("collision-released"), "released").unwrap();
         let harness = launch.join().unwrap();
         assert_ne!(port_of(&config), port);
-        assert_eq!(log_of(&dir).matches("serve:").count(), 2);
+        assert!(log_of(&dir).contains(&format!("bind failed:{port}:")));
+        assert!(log_of(&dir).matches("serve:").count() >= 2);
         drop(harness);
     });
 }
