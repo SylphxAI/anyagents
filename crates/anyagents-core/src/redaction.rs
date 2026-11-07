@@ -115,8 +115,8 @@ fn authorize(
                         r.get(0)
                     })?;
             }
-            Err(invalid(
-                "conversation.redact requires a target ancestor or admin; self and peers are refused",
+            Err(Error::PermissionDenied(
+                "conversation.redact requires a target ancestor or admin; self and peers are refused".into(),
             ))
         }
     }
@@ -164,6 +164,15 @@ fn replace_span(text: &str, start: usize, end: usize) -> String {
 // reserialize unrelated records/whitespace/keys. JSON escaping is decoded before
 // matching, so quotes, Unicode escapes and nested serialized tool output work.
 fn rewrite_json_strings(raw: &str, old: &str, replacement: &str) -> Result<(String, usize), Error> {
+    rewrite_json_strings_inner(raw, old, replacement, false)
+}
+
+fn rewrite_json_strings_inner(
+    raw: &str,
+    old: &str,
+    replacement: &str,
+    nested_payload: bool,
+) -> Result<(String, usize), Error> {
     let _: serde_json::Value =
         serde_json::from_str(raw).map_err(|_| invalid("invalid session JSON"))?;
     let bytes = raw.as_bytes();
@@ -171,6 +180,7 @@ fn rewrite_json_strings(raw: &str, old: &str, replacement: &str) -> Result<(Stri
     let mut cursor = 0;
     let mut i = 0;
     let mut count = 0;
+    let mut last_key = String::new();
     while i < bytes.len() {
         if bytes[i] != b'"' {
             i += 1;
@@ -190,12 +200,39 @@ fn rewrite_json_strings(raw: &str, old: &str, replacement: &str) -> Result<(Stri
         }
         let decoded: String = serde_json::from_str(&raw[start..i])
             .map_err(|_| invalid("invalid session JSON string"))?;
+        let is_key = raw[i..].trim_start().starts_with(':');
+        if is_key {
+            last_key = decoded;
+            continue;
+        }
+        if !nested_payload
+            && matches!(
+                last_key.as_str(),
+                "id" | "uuid"
+                    | "parentUuid"
+                    | "sessionId"
+                    | "session_id"
+                    | "call_id"
+                    | "type"
+                    | "role"
+                    | "name"
+                    | "timestamp"
+                    | "timestamp_ms"
+                    | "seq"
+                    | "from"
+                    | "to"
+                    | "sender"
+                    | "destination"
+            )
+        {
+            continue;
+        }
         let changed = if decoded.contains(old) {
             count += decoded.matches(old).count();
             decoded.replace(old, replacement)
         } else if matches!(decoded.trim().chars().next(), Some('{' | '[')) {
             // Function output can itself be serialized JSON inside a JSON string.
-            if let Ok((nested, n)) = rewrite_json_strings(&decoded, old, replacement) {
+            if let Ok((nested, n)) = rewrite_json_strings_inner(&decoded, old, replacement, true) {
                 count += n;
                 nested
             } else {
@@ -319,8 +356,12 @@ fn collect_sessions(
             }
         } else if matches!(
             child_path.extension().and_then(|s| s.to_str()),
-            Some("db" | "sqlite" | "sqlite3")
-        ) {
+            Some("db" | "sqlite" | "sqlite3" | "db-wal" | "sqlite-wal" | "sqlite3-wal")
+        ) || entry
+            .file_name()
+            .to_str()
+            .is_some_and(|s| s.contains(".jsonl."))
+        {
             failures.push(failure(
                 &child_path,
                 "binary harness store is not supported; no full scrub claimed",
@@ -405,6 +446,13 @@ impl Store {
                 }
             }
         }
+        let cloud_metadata = config.join("sylphx-cloud-session.json");
+        if cloud_metadata.exists() {
+            unscrubbed.push(failure(
+                &cloud_metadata,
+                "remote harness session exists; remote erasure is unsupported",
+            ));
+        }
         let transcript_index = id
             .strip_prefix("transcript:")
             .map(|i| {
@@ -431,6 +479,22 @@ impl Store {
                 params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()?.ok_or_else(|| invalid("redaction target not found"))?
         };
         let (span, start, end) = bounds(&original, request.span.as_ref())?;
+        if original[start..end] == *TOMBSTONE
+            && let Some(raw) = tx.query_row(
+                "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()? {
+            return serde_json::from_str(&raw).map_err(|_| invalid("unreadable redaction receipt"));
+        }
+        if request.reason.contains(&original[start..end])
+            || request.reason.contains(&rag_content_hash(&original))
+            || request
+                .reason
+                .contains(&rag_content_hash(&original[start..end]))
+        {
+            return Err(invalid(
+                "audit reason must not repeat the removed text or its digest",
+            ));
+        }
         let redacted = replace_span(&original, start, end);
         let mut prepared = Vec::new();
         for (path, mut file) in sessions {
@@ -442,6 +506,7 @@ impl Store {
             let mut replacement = String::new();
             let mut changed = false;
             let mut valid = true;
+            let mut remains = false;
             for line in raw.split_inclusive('\n') {
                 if line.trim().is_empty() {
                     replacement.push_str(line);
@@ -449,6 +514,13 @@ impl Store {
                 }
                 match rewrite_json_strings(line, &original, &redacted) {
                     Ok((text, n)) => {
+                        remains |= rewrite_json_strings_inner(
+                            &text,
+                            &original[start..end],
+                            TOMBSTONE,
+                            true,
+                        )
+                        .is_ok_and(|(_, n)| n > 0);
                         replacement.push_str(&text);
                         changed |= n > 0;
                     }
@@ -457,6 +529,9 @@ impl Store {
                         break;
                     }
                 }
+            }
+            if remains {
+                unscrubbed.push(failure(&path, "selected text remains in a nonmatching session record; address that record separately"));
             }
             if !valid {
                 unscrubbed.push(failure(&path, "invalid session JSON; file not changed"));
@@ -506,6 +581,18 @@ impl Store {
                 "UPDATE outbound_messages SET body = ?3 WHERE agent_id = ?1 AND id = ?2",
                 params![target.as_str(), id, redacted],
             )?;
+            // Telegram's edit baseline is a second body copy for this same
+            // provider message, not a separate mailbox entry. Preserve its keys/time.
+            let versions: Vec<(i64, i64, String)> = tx.prepare(
+                "SELECT v.chat_id, v.message_id, v.body FROM message_versions v JOIN messages m ON m.agent_id = v.agent_id AND json_extract(m.origin, '$.chat_id') = v.chat_id AND json_extract(m.origin, '$.message_id') = v.message_id WHERE m.agent_id = ?1 AND m.id = ?2")?
+                .query_map(params![target.as_str(), id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<Result<_, _>>()?;
+            for (chat, message, body) in versions {
+                if body.contains(&original[start..end]) {
+                    tx.execute("UPDATE message_versions SET body = ?4 WHERE agent_id = ?1 AND chat_id = ?2 AND message_id = ?3",
+                        params![target.as_str(), chat, message, body.replace(&original[start..end], TOMBSTONE)])?;
+                }
+            }
             let cleaned = clean_rag_text(&redacted);
             tx.execute("UPDATE rag_chunks SET text = ?3, content_hash = ?4 WHERE agent_id = ?1 AND chunk_id = ?2", params![target.as_str(), id, cleaned, rag_content_hash(&cleaned)])?;
             tx.execute(
@@ -533,6 +620,18 @@ impl Store {
             // A stale descriptor snapshot must not overwrite an append or edit.
             let mut current = String::new();
             let written = (|| -> std::io::Result<()> {
+                let same_file = || -> std::io::Result<()> {
+                    let opened = session.file.metadata()?;
+                    let named = std::fs::symlink_metadata(&session.path)?;
+                    if opened.dev() != named.dev()
+                        || opened.ino() != named.ino()
+                        || named.nlink() != 1
+                    {
+                        return Err(std::io::Error::other("session path changed"));
+                    }
+                    Ok(())
+                };
+                same_file()?;
                 session.file.rewind()?;
                 session.file.read_to_string(&mut current)?;
                 if current != session.original {
@@ -552,6 +651,11 @@ impl Store {
                 session.file.seek(SeekFrom::Start(0))?;
                 let mut verified = String::new();
                 session.file.read_to_string(&mut verified)?;
+                let opened = session.file.metadata()?;
+                let named = std::fs::symlink_metadata(&session.path)?;
+                if opened.dev() != named.dev() || opened.ino() != named.ino() {
+                    return Err(std::io::Error::other("session path changed"));
+                }
                 if verified != session.replacement {
                     return Err(std::io::Error::other("verification failed"));
                 }
@@ -590,3 +694,6 @@ impl Store {
         Ok(receipt)
     }
 }
+
+#[cfg(test)]
+mod tests;

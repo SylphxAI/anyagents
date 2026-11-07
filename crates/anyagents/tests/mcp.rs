@@ -976,3 +976,92 @@ async fn mcp_tools_use_the_server_socket() {
     assert!(listed.contains("room line"), "{listed}");
     assert!(listed.contains("broadcast to active"), "{listed}");
 }
+
+#[tokio::test]
+async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
+    use anyagents_core::{NewAgent, Store, agent_config_dir};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let root = store
+        .create_agent(NewAgent::new("redaction-root", "sylphx"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("redaction-peer", "sylphx"))
+        .unwrap();
+    let mut input = NewAgent::new("redaction-child", "sylphx");
+    input.parent_id = Some(root.id.clone());
+    let child = store.create_agent(input).unwrap();
+    for agent in [&root, &peer, &child] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let config = agent_config_dir(dir.path(), &child.id);
+    std::fs::create_dir_all(&config).unwrap();
+    let transcript = config.join("sylphx-transcript.jsonl");
+    std::fs::write(&transcript, "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"prefix syntheticcanary suffix\"}\n").unwrap();
+    let _server = start_server(dir.path());
+    let root_mcp = connect(dir.path(), &root.name).await;
+    let peer_mcp = connect(dir.path(), &peer.name).await;
+    let args = serde_json::json!({"action":"redact", "name":child.name, "message_id":"transcript:0", "span":{"unit":"chars","start":7,"end":22}, "reason":"accidental synthetic capture"});
+    let denied = call(&peer_mcp, "agents", args.clone()).await;
+    assert_eq!(denied.is_error, Some(true), "{denied:?}");
+    assert!(
+        serde_json::to_string(&denied)
+            .unwrap()
+            .contains("requires a target ancestor"),
+        "{denied:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&transcript)
+            .unwrap()
+            .contains("syntheticcanary")
+    );
+    let receipt: serde_json::Value = ok_json(call(&root_mcp, "agents", args).await);
+    assert_eq!(receipt["permission"], "conversation.redact");
+    assert_eq!(receipt["full_scrub"], true);
+    assert!(
+        !std::fs::read_to_string(&transcript)
+            .unwrap()
+            .contains("syntheticcanary")
+    );
+    let cli = bin()
+        .env("ANYAGENTS_AGENT_ID", root.id.as_str())
+        .env(
+            "ANYAGENTS_AGENT_CONFIG",
+            agent_config_dir(dir.path(), &root.id),
+        )
+        .arg("--data")
+        .arg(dir.path())
+        .args([
+            "redact",
+            &child.name,
+            "--message-id",
+            "transcript:0",
+            "--start",
+            "7",
+            "--end",
+            "22",
+            "--unit",
+            "chars",
+            "--reason",
+            "same request replay",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let replay: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_eq!(replay["audit_id"], receipt["audit_id"]);
+    let invalid = call(&root_mcp, "agents", serde_json::json!({"action":"redact", "name":child.name,"message_id":"transcript:0","span":{"unit":"bytes","start":0,"end":9999},"reason":"invalid span check"})).await;
+    assert_eq!(invalid.is_error, Some(true));
+    assert!(
+        serde_json::to_string(&invalid)
+            .unwrap()
+            .contains("span out of range"),
+        "{invalid:?}"
+    );
+    root_mcp.cancel().await.unwrap();
+    peer_mcp.cancel().await.unwrap();
+}
