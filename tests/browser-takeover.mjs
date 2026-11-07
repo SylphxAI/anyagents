@@ -323,14 +323,14 @@ try {
     finally { clearTimeout(timer); }
   }
   if (viewer) {
-    await capture('viewer',()=>viewer.eval(`({active:document.activeElement.id,proxyType:document.querySelector('#keyboard-proxy')?.type,proxyLength:document.querySelector('#keyboard-proxy')?.value.length,status:document.querySelector('#connection')?.textContent})`));
+    await capture('viewer',()=>viewer.eval(`({active:document.activeElement.id,proxyType:document.querySelector('#keyboard-proxy')?.type,proxyLength:document.querySelector('#keyboard-proxy')?.value.length,status:document.querySelector('#connection')?.textContent,connectionHidden:document.querySelector('#connection')?.hidden,pointerTrace:window.pointerTrace,canvas:document.querySelector('#screen')?.getBoundingClientRect().toJSON()})`));
     await capture('screenshot',async()=>{
       const shot=await viewer.call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
       await writeFile(path.join(output,'failure.png'),Buffer.from(shot.data,'base64'));
       return 'failure.png';
     });
   }
-  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,trajectory:window.trajectory})`));
+  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,trajectory:window.trajectory,wheelHistory:window.wheelHistory,scrollTop:document.querySelector('#scrollbox')?.scrollTop})`));
   try { await writeFile(path.join(output,'failure.json'),JSON.stringify(evidence,null,2)); }
   catch (failure) { console.error('could not retain failure evidence',failure); }
   console.error('acceptance failure evidence',JSON.stringify(evidence));

@@ -65,7 +65,7 @@ if (typeof document !== 'undefined') {
   let phone = false, remoteFocus = null, keyboardActive = false, composing = false;
   let frameRevision = 0, lastFrame = 0;
   const pointers = new Map();
-  let gesture = null, pressed = null, touchPan = false, motion = null, motionFrame = 0;
+  let gesture = null, pressed = null, touchPan = false, motion = null, motionFrame = 0, pairFrame = 0;
   const size = () => ({ width: stage.clientWidth, height: stage.clientHeight });
   const extent = () => remoteExtent(canvas.width, canvas.height, metrics);
   const fitScale = () => Math.min(size().width / extent().width, size().height / extent().height);
@@ -167,20 +167,28 @@ if (typeof document !== 'undefined') {
       sendInput({ type: 'mouse', event_type: 'mousePressed', ...pressed.point, button, buttons: pressed.buttons }).catch(reconnect);
     }
   });
+  function flushPairMotion() {
+    if (!pairFrame) return;
+    cancelAnimationFrame(pairFrame); pairFrame = 0;
+    if (pointers.size < 2 || gesture?.kind !== 'pair') return;
+    const p = pair(), g = gesture;
+    if (g.zooming || Math.abs(p.distance / g.distance - 1) > .08) {
+      g.zooming = true;
+      const scale = Math.min(8, Math.max(fitScale(), g.view.scale * p.distance / g.distance));
+      view = zoomAt(g.view, scale, g.x, g.y);
+      view.x += p.x - g.x; view.y += p.y - g.y; fitMode = false; paintView();
+    } else {
+      sendInput({ type: 'wheel', ...point(g.x, g.y), delta_x: (g.last.x - p.x) / view.scale, delta_y: (g.last.y - p.y) / view.scale }).catch(reconnect);
+    }
+    g.last = p;
+  }
   stage.addEventListener('pointermove', e => {
     if (!pointers.has(e.pointerId)) return;
     e.preventDefault(); pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size >= 2 && gesture?.kind === 'pair') {
-      const p = pair(), g = gesture;
-      if (g.zooming || Math.abs(p.distance / g.distance - 1) > .08) {
-        g.zooming = true;
-        const scale = Math.min(8, Math.max(fitScale(), g.view.scale * p.distance / g.distance));
-        view = zoomAt(g.view, scale, g.x, g.y);
-        view.x += p.x - g.x; view.y += p.y - g.y; fitMode = false; paintView();
-      } else {
-        sendInput({ type: 'wheel', ...point(g.x, g.y), delta_x: (g.last.x - p.x) / view.scale, delta_y: (g.last.y - p.y) / view.scale }).catch(reconnect);
-      }
-      g.last = p;
+      // Pointer Events deliver each finger separately. Evaluate one native
+      // sample together, or a parallel translation looks like a false pinch.
+      if (!pairFrame) pairFrame = requestAnimationFrame(flushPairMotion);
     } else if (pressed) {
       pressed.point = point(e.clientX, e.clientY);
       move({ type: 'mouse', event_type: 'mouseMoved', ...pressed.point, button: pressed.button, buttons: pressed.buttons });
@@ -190,6 +198,7 @@ if (typeof document !== 'undefined') {
   });
   function endPointer(e) {
     if (!pointers.has(e.pointerId)) return;
+    flushPairMotion();
     if (pressed) pressed.point = point(e.clientX, e.clientY);
     releasePointer(); pointers.delete(e.pointerId);
     // The remaining finger after a two-finger gesture cannot click/drag.
@@ -198,7 +207,7 @@ if (typeof document !== 'undefined') {
   stage.addEventListener('pointerup', endPointer);
   stage.addEventListener('pointercancel', endPointer);
   stage.addEventListener('lostpointercapture', endPointer);
-  addEventListener('blur', () => { releasePointer(); pointers.clear(); gesture = null; });
+  addEventListener('blur', () => { flushPairMotion(); releasePointer(); pointers.clear(); gesture = null; });
   stage.addEventListener('contextmenu', e => e.preventDefault());
   stage.addEventListener('wheel', e => {
     e.preventDefault();

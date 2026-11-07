@@ -10,7 +10,8 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     const fixture = document.createElement('section'); fixture.id='interaction-fixture';
     fixture.innerHTML='<button id="signin" style="position:fixed;left:400px;top:30px;width:200px;height:50px">Sign in</button><div id="paint-marker" style="position:fixed;left:650px;top:30px;width:60px;height:60px;background:rgb(240,0,240)"></div><div id="track" style="position:fixed;left:400px;top:200px;width:320px;height:50px;background:#aaa"><div id="slider" style="width:40px;height:50px;background:#06c;position:absolute;left:0"></div></div><div id="scrollbox" style="position:fixed;left:400px;top:320px;width:320px;height:120px;overflow:auto;background:#fff"><div style="height:2000px">Scroll here</div></div>';
     document.body.append(fixture);
-    window.signins=0;window.trajectory=[];window.remoteInputs=0;
+    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];
+    document.addEventListener('wheel',e=>window.wheelHistory.push({x:e.clientX,y:e.clientY,dy:e.deltaY,target:e.target.id,trusted:e.isTrusted}));
     document.querySelector('#entry').addEventListener('input',()=>window.remoteInputs++);
     document.querySelector('#signin').onclick=e=>{
       window.signins++; window.lastSigninTrusted=e.isTrusted;
@@ -45,6 +46,7 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     await viewer.call('Emulation.setTouchEmulationEnabled',{enabled:mobile});
     await viewer.call('Page.navigate',{url});
     await until(()=>viewer.eval(`!!document.querySelector('#screen') && document.querySelector('#connection').hidden`),'interaction connected');
+    await viewer.eval(`window.pointerTrace=[];for(const type of ['pointerdown','pointermove','pointerup','pointercancel'])document.addEventListener(type,e=>{window.pointerTrace.push({type:e.type,id:e.pointerId,x:e.clientX,y:e.clientY,target:e.target.id});if(window.pointerTrace.length>30)window.pointerTrace.shift()},{capture:true})`);
     assert.equal(await viewer.eval(`getComputedStyle(document.querySelector('#screen')).cursor`),'default');
     assert.equal(await viewer.eval(`document.activeElement.id`),'screen','viewer auto-focuses on load');
     await remote.eval(`document.querySelector('#entry').value='';document.querySelector('#password').value=''`);
