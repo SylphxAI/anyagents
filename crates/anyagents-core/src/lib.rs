@@ -7,8 +7,6 @@
 mod address;
 pub mod boundary;
 mod error;
-#[cfg(feature = "dense-benchmark")]
-pub mod host_dense;
 pub mod host_index;
 pub mod host_migration;
 pub mod host_retrieval;
