@@ -26,7 +26,7 @@ not concatenated into the pinned prompt.
 
 A managed agent can start a fresh session through `agents` with
 `action: "reset_session"` (alias `"new_session"`), the CLI
-`anyagents reset-session <name>`, or `POST /v1/agents/{name}/session/reset`.
+`anyagents agents reset-session <name>`, or `POST /v1/agents/{name}/session/reset`.
 Management authority and process/state quiescence are rechecked under the
 lifecycle lock before any pin or current-pointer mutation. A prepared intent
 binds the new pin and old vendor pointer digest for crash recovery. Reset retires
@@ -55,8 +55,9 @@ at runtime, inside an IMMEDIATE transaction; no state backfill lives in the SQL
 schema migration. Broadcast deduplication hashes the full message, so equal
 prefixes with different tails remain separate results.
 
-Use a result's opaque `raw_id` and `raw_sha256`, with optional `raw_offset` and
-`raw_length`, to retrieve exact `raw_bytes`. Each request returns at most
+Use a result's opaque `id` as input `raw_id` and its `raw.sha256` as input
+`raw_sha256`, with optional `raw_offset` and `raw_length`, to retrieve exact
+`raw_bytes`. Each request returns at most
 **65536 bytes**. Callers cannot supply paths. The host resolves the authorized
 owner and scope first, repeats validation under its lifecycle lock, checks the
 whole-event digest and gates unresolved redaction before reading. The returned
