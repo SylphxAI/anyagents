@@ -49,6 +49,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         24,
         include_str!("../migrations/025_conversation_redactions.sql"),
     ),
+    (
+        25,
+        include_str!("../migrations/026_full_mailbox_history.sql"),
+    ),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
@@ -107,7 +111,7 @@ mod tests {
 
     #[test]
     fn redaction_migration_upgrades_scope_audit_and_group_owner_without_replacing_them() {
-        for baseline in [22, 23] {
+        for baseline in [22, 23, 24] {
             let mut conn = Connection::open_in_memory().unwrap();
             conn.execute_batch(
             "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
@@ -122,10 +126,11 @@ mod tests {
                     .unwrap();
             }
             migrate(&mut conn).unwrap();
-            assert_eq!(current_version(&conn).unwrap(), 24);
+            assert_eq!(current_version(&conn).unwrap(), 25);
             conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
                 .unwrap();
             conn.prepare("SELECT owner_agent_id FROM groups").unwrap();
+            conn.prepare("SELECT text_format FROM rag_chunks").unwrap();
             conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
                 .unwrap();
             conn.prepare(
@@ -137,7 +142,7 @@ mod tests {
             conn.prepare("SELECT agent_id, target_id, identity_id FROM message_identities")
                 .unwrap();
             migrate(&mut conn).unwrap();
-            assert_eq!(current_version(&conn).unwrap(), 24);
+            assert_eq!(current_version(&conn).unwrap(), 25);
         }
     }
 }

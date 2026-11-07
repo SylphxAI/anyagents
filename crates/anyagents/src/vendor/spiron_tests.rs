@@ -66,7 +66,7 @@ import sys, os, json, pathlib, time
 root = pathlib.Path(os.environ['ANYAGENTS_AGENT_CONFIG'])
 args = sys.argv[1:]
 with (root/'launches.jsonl').open('a') as out:
-    out.write(json.dumps({'args':args, 'cwd':os.getcwd(), 'home':os.environ['HOME']})+'\n')
+    out.write(json.dumps({'args':args, 'cwd':os.getcwd(), 'home':os.environ['HOME'], 'instructions':pathlib.Path(args[args.index('--instructions-file')+1]).read_text()})+'\n')
 session = args[args.index('--session')+1] if '--session' in args else 'fresh-session'
 def emit(kind, id=None, **fields):
     print(json.dumps(dict(type=kind, session_id=session, request_id=id, **fields)), flush=True)
@@ -109,6 +109,8 @@ for line in sys.stdin:
         let data = temp.path().join(harness_name.replace('/', "-"));
         std::fs::create_dir_all(&data).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
+        std::fs::create_dir_all(data.join("memory")).unwrap();
+        std::fs::write(data.join("memory/MEMORY.md"), "PINNED_EXTERNAL_FACT").unwrap();
         let config = data.join("config");
         let work = data.join("work");
         std::fs::create_dir_all(config.join(".agents/skills")).unwrap();
@@ -171,6 +173,18 @@ for line in sys.stdin:
         };
         let mut vendor = vendor_launch(request()).unwrap();
         assert!(matches!(vendor, VendorHarness::Spiron(..)));
+        let host_pin = anyagents_core::host_session::active(&data)
+            .unwrap()
+            .unwrap();
+        assert_eq!(host_pin.harness, harness_name);
+        assert!(host_pin.memory.section.contains("PINNED_EXTERNAL_FACT"));
+        std::fs::write(data.join("memory/MEMORY.md"), "EDITED_LATER_FACT").unwrap();
+        assert_eq!(
+            anyagents_core::host_session::bound_vendor(&data, harness_name, "legacy-session")
+                .unwrap()
+                .unwrap(),
+            host_pin,
+        );
         assert_eq!(
             vendor.deliver(&message("first")).unwrap(),
             DeliverOutcome::Deferred
@@ -258,7 +272,16 @@ for line in sys.stdin:
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
         assert_eq!(launches.len(), 2);
+        assert_eq!(
+            anyagents_core::host_session::active(&data)
+                .unwrap()
+                .unwrap(),
+            host_pin
+        );
         for launch in launches {
+            let instructions = launch["instructions"].as_str().unwrap();
+            assert!(instructions.contains(&host_pin.memory.section));
+            assert!(!instructions.contains("EDITED_LATER_FACT"));
             // getcwd resolves directory aliases (including macOS /var ->
             // /private/var). CLI arguments must retain the configured path,
             // while the child's effective directory has filesystem identity.
@@ -411,6 +434,7 @@ for line in sys.stdin:
         VendorHarness::Spiron(
             Box::new(harness),
             temp.path().join("config/spiron-session-id"),
+            "spiron".into(),
         ),
     )
     .unwrap();
@@ -521,6 +545,7 @@ for line in sys.stdin:
         VendorHarness::Spiron(
             Box::new(harness),
             temp.path().join("config/spiron-session-id"),
+            "spiron".into(),
         ),
     )
     .unwrap();
@@ -579,7 +604,11 @@ for line in sys.stdin:
     let mut restarted = DeliveryLoop::start(
         store,
         agent.id.clone(),
-        VendorHarness::Spiron(Box::new(restarted), config.join("spiron-session-id")),
+        VendorHarness::Spiron(
+            Box::new(restarted),
+            config.join("spiron-session-id"),
+            "spiron".into(),
+        ),
     )
     .unwrap();
     restarted.run_once().unwrap();

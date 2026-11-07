@@ -235,16 +235,13 @@ impl CodexHarness {
             wake: Arc::new(Condvar::new()),
             reader: None,
         };
-        let mut cmd = anyagents_harness::spawn_command(&program, &env_pairs);
+        let mut cmd = anyagents_harness::spawn_command(&program, &env_pairs)?;
         cmd.arg("app-server")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
         if let Some(dir) = work_dir {
             cmd.current_dir(dir);
-        }
-        for (key, value) in environment {
-            cmd.env(key, value);
         }
         let mut child = cmd
             .spawn()

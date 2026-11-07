@@ -755,6 +755,34 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Human Takeover**: On `captcha_detected: true`, call `browser({ \"action\": \"takeover\", \"reason\": \"Solve CAPTCHA\" })`, send `takeover_url` to the user, and resume via `wait_for_user` / `release_takeover`.\n",
     );
 
+    // Only the host lifecycle allocates a generation. Describe/restart/render
+    // consume its persisted pin without opening live learned-memory files.
+    if let Some(root) = config.parent() {
+        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. Only the separately delimited `<learned_memory>` section is the bounded immutable snapshot for this session.\n", root.display(), root.display()));
+        match anyagents_core::host_session::active(root) {
+            Ok(Some(session)) if session.harness == agent.harness => {
+                doc.push('\n');
+                doc.push_str(&session.memory.section);
+                doc.push('\n');
+            }
+            Ok(None) => (), // First dispatch pins and rerenders before launch.
+            Ok(Some(_)) => {
+                eprintln!(
+                    "refusing instruction refresh for {}: host session harness mismatch",
+                    agent.id
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!(
+                    "refusing instruction refresh for {}: invalid host memory pin: {error}",
+                    agent.id
+                );
+                return;
+            }
+        }
+    }
+
     if let Some(shared) = read_shared_agents_md(config) {
         doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
         doc.push_str(&shared);
@@ -1072,94 +1100,111 @@ pub(crate) fn sync_canonical_skills(data_dir: &Path) {
 
 #[cfg(unix)]
 pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
-    let data_skills = data_dir_from_config(target_config)
-        .map(|d| d.join("skills"))
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            target_config
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|d| d.join("skills"))
-                .filter(|p| p.is_dir())
-        });
-    let Some(skills_root) = data_skills else {
+    // An absent shared library must not disable the agent's own overlay.
+    let Some(data) = data_dir_from_config(target_config) else {
         return;
     };
-    for rel in [
-        "skills",
-        ".agents/skills",
-        ".claude/skills",
-        ".codex/skills",
-        "opencode/skills",
-        ".config/opencode/skills",
-        ".gemini/config/skills",
-        "muse/skills",
-        ".config/muse/skills",
-        ".omp/agent/skills",
-        ".dsh/skills",
-        ".grok/skills",
-    ] {
-        let dst = target_config.join(rel);
-        if let Ok(meta) = std::fs::symlink_metadata(&dst) {
-            if meta.file_type().is_symlink()
-                && dst.exists()
-                && std::fs::read_link(&dst).ok().as_deref() == Some(skills_root.as_path())
-            {
-                continue;
-            }
-            if meta.file_type().is_dir() {
-                let _ = std::fs::remove_dir_all(&dst);
-            } else {
-                let _ = std::fs::remove_file(&dst);
-            }
-        }
-        if let Some(parent) = dst.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::os::unix::fs::symlink(&skills_root, &dst).is_err()
-            && !crate::sandbox::is_isolated_test_env()
-            && Path::new("/usr/local/bin/anyagents-setpriv").is_file()
-            && let Some(anc_meta) = dst
-                .parent()
-                .and_then(|p| p.ancestors().find(|a| a.exists()))
-                .and_then(|a| std::fs::metadata(a).ok())
-        {
-            use std::os::unix::fs::MetadataExt as _;
-            let uid = anc_meta.uid();
-            let gid = anc_meta.gid();
-            if uid != 0
-                && let Some(parent) = Path::new(rel).parent()
-            {
-                let rel_parent = if parent.as_os_str().is_empty() {
-                    Path::new(".")
-                } else {
-                    parent
-                };
-                let uid_s = uid.to_string();
-                let gid_s = gid.to_string();
-                let _ = std::process::Command::new("/usr/local/bin/anyagents-setpriv")
-                    .current_dir(target_config)
-                    .args([
-                        "--reuid",
-                        &uid_s,
-                        "--regid",
-                        &gid_s,
-                        "--groups",
-                        &gid_s,
-                        "--no-new-privs",
-                        "--",
-                        "sh",
-                        "-c",
-                        "mkdir -p \"$1\" && chmod a+rx \"$1\" && rm -rf \"$2\" && ln -sfn \"$3\" \"$2\"",
-                        "sh",
-                    ])
-                    .arg(rel_parent)
-                    .arg(rel)
-                    .arg(&skills_root)
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-        }
+    let skills_root = data.join("skills");
+    if let Some(root) = target_config.parent()
+        && let Err(error) = anyagents_core::host_skills::mount_with_fallback(
+            root,
+            &skills_root,
+            target_config,
+            |target, view, global, overlay| {
+                install_skill_projection_as_owner(target_config, target, view, global, overlay)
+            },
+        )
+    {
+        eprintln!(
+            "skill overlay mount refused for {}: {error}",
+            target_config.display()
+        );
+    }
+}
+
+/// Only a refused mirror is delegated, and all effects run as the existing
+/// parent owner. No daemon chmod, broad home grant or foreign-link replacement.
+#[cfg(unix)]
+fn install_skill_projection_as_owner(
+    config: &Path,
+    target: &Path,
+    view: &Path,
+    global: &Path,
+    overlay: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let relative = target.strip_prefix(config).map_err(std::io::Error::other)?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::other("invalid skill projection path"));
+    }
+    let owner = target
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|p| p.starts_with(config))
+        .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
+    let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
+    if owner.uid() == crate::sandbox::server_uid() {
+        return Err(std::io::Error::other(
+            "skill projection is not owned by another seat",
+        ));
+    }
+    let launcher = crate::sandbox::descriptor_launcher()
+        .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
+    let output = std::process::Command::new(launcher).args([
+        "--reuid", &owner.uid().to_string(), "--regid", &owner.gid().to_string(),
+        "--groups", &owner.gid().to_string(), "--no-new-privs", "--", "/bin/sh", "-c",
+        r#"set -eu
+config=$1; relative=$2; view=$3; global=$4; overlay=$5
+# Every existing component is inspected by its actual owner, not the daemon
+# which was denied traversal. Foreign parent links are preserved untouched.
+parent=$config
+old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
+while [ "$#" -gt 1 ]; do
+  parent=$parent/$1; shift
+  if [ -L "$parent" ]; then exit 0; fi
+  mkdir -p "$parent"
+done
+target=$parent/$1
+if [ -L "$target" ]; then
+  old=$(readlink "$target")
+  if [ "$old" = "$view" ]; then exit 0; fi
+  if [ "$old" != "$global" ]; then exit 0; fi
+  temp=$parent/.skills-owner-$$
+  trap 'rm -f "$temp"' EXIT HUP INT TERM
+  ln -s "$view" "$temp"
+  mv -fT "$temp" "$target"
+elif [ -d "$target" ]; then
+  for item in "$target"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item"); source_parent=${old%/*}
+    if { [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; } && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
+  done
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    link=$target/${item##*/}; source=$(readlink "$item")
+    if [ -L "$link" ]; then
+      old=$(readlink "$link"); source_parent=${old%/*}
+      if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
+      if [ "$old" = "$source" ]; then continue; fi
+      rm "$link"
+    elif [ -e "$link" ]; then continue; fi
+    ln -s "$source" "$link"
+  done
+elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
+"#, "skill-projection-owner",
+    ]).args([config.as_os_str(), relative.as_os_str(), view.as_os_str(), global.as_os_str(), overlay.as_os_str()])
+        .stdin(std::process::Stdio::null()).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "owner skill projection refused: {}",
+            output.status
+        )))
     }
 }
 
@@ -1744,6 +1789,29 @@ pub(crate) struct ProviderProfileEntry {
     pub usage: Option<String>,
 }
 
+/// Caller holds the lifecycle lock and has re-read management authority.
+/// Process admission is checked before touching any host pin or native pointer.
+pub(crate) fn reset_agent_session_locked(
+    store: &Store,
+    agent: &Agent,
+) -> Result<serde_json::Value, Error> {
+    if agent.state == "running" {
+        return Err(Error::AgentBusy);
+    }
+    let _process = store.try_lock_agent(&agent.id)?;
+    let root = store.data_dir().join("agents").join(agent.id.as_str());
+    let session = anyagents_core::host_session::reset_session(
+        &root,
+        &agent.harness,
+        harness_session_filename(&agent.harness),
+    )?;
+    Ok(serde_json::json!({
+        "agent_id": agent.id, "name": agent.name, "state": agent.state,
+        "generation": session.generation, "harness": session.harness,
+        "memory_sha256": session.memory.sha256,
+    }))
+}
+
 pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
     match harness {
         "codex" => Some("codex-session-id"),
@@ -1754,7 +1822,7 @@ pub(crate) fn harness_session_filename(harness: &str) -> Option<&'static str> {
         "omp" => Some("omp-session-id"),
         "dsh" => Some("dsh-session-id"),
         "grok" => Some("grok-session-id"),
-        "spiron" | "sylphx" => Some("spiron-session-id"),
+        selector if crate::vendor::is_spiron_harness(selector) => Some("spiron-session-id"),
         _ => None,
     }
 }
@@ -2141,14 +2209,22 @@ pub(crate) fn reconcile_agent_runtime_config(
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
         {
+            let mut seat_environment = Vec::new();
+            if let Some(spec) = spec_opt {
+                seat_environment.push((anyagents_harness::SEAT_LAUNCH_ENV.into(), spec));
+                seat_environment.push((
+                    anyagents_harness::SEAT_PEERS_ENV.into(),
+                    crate::sandbox::peer_principals(store)?,
+                ));
+            }
             muse_config::ensure_workspace_session(
                 data,
                 agent.id.as_str(),
                 config,
                 work_dir,
                 agent.model.as_deref(),
-                spec_opt.as_deref(),
-            );
+                &seat_environment,
+            )?;
         }
     } else {
         #[cfg(unix)]
@@ -2374,7 +2450,7 @@ pub(crate) fn maybe_notify_parent_on_error(
         return;
     };
     let trimmed = err_msg.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || crate::host_memory::is_migration_wait(trimmed) {
         return;
     }
     let rotated_ms = std::fs::read_to_string(config.join(".anyagents-profile-rotated-ms"))
@@ -7191,6 +7267,438 @@ pub(crate) fn save_subagent_defaults(
     Ok(())
 }
 
+/// Parsed archetype template loaded from `<archetype>.md` or `<archetype>/agent.md`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArchetypeTemplate {
+    pub description: Option<String>,
+    pub scope: Option<String>,
+    pub workdir: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub role: Option<String>,
+    pub profile: Option<String>,
+    pub body: String,
+}
+
+/// Parse optional YAML frontmatter (`description`, `scope`, `workdir`, `harness`, `model`,
+/// `role`, `profile`) and markdown body from an archetype `.md` file.
+///
+/// Templates are configuration, rather than best-effort prose.  In particular, once a
+/// document starts with a frontmatter delimiter, an incomplete or malformed delimiter must
+/// not turn the rest of the file into an instruction body by accident.
+pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, Error> {
+    let mut tpl = ArchetypeTemplate::default();
+    let normalized = raw.replace("\r\n", "\n");
+    let trimmed_start = normalized.trim_start_matches('\u{feff}');
+    let body = if let Some(rest) = trimmed_start.strip_prefix("---\n") {
+        let mut offset = 0;
+        let mut closing = None;
+        for line in rest.split_inclusive('\n') {
+            if line.trim_end_matches('\n') == "---" {
+                closing = Some((offset, offset + line.len()));
+                break;
+            }
+            offset += line.len();
+        }
+        let (start, end) = closing.ok_or_else(|| {
+            Error::Message("archetype template has unclosed YAML frontmatter".to_string())
+        })?;
+        let frontmatter = &rest[..start];
+        let invalid_yaml = |err: serde_yaml_ng::Error| {
+            // YAML errors can quote the input. Do not reflect private template
+            // contents into a validation response.
+            Error::Message(format!(
+                "archetype template has malformed YAML frontmatter{}",
+                err.location()
+                    .map(|loc| format!(" at line {}", loc.line()))
+                    .unwrap_or_default()
+            ))
+        };
+        let fields: std::collections::BTreeMap<String, String> = if frontmatter
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim().starts_with('#'))
+        {
+            std::collections::BTreeMap::new()
+        } else {
+            // Value's mapping parser also rejects duplicate keys; a direct
+            // BTreeMap deserializer would silently overwrite them.
+            let mapping: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(frontmatter).map_err(invalid_yaml)?;
+            serde_yaml_ng::from_value(mapping).map_err(invalid_yaml)?
+        };
+        if fields.is_empty() && rest[end..].trim().is_empty() {
+            return Err(Error::Message(
+                "archetype template frontmatter requires fields or a markdown body".to_string(),
+            ));
+        }
+        for (key, value) in fields {
+            let value = value.trim();
+            if key.trim().is_empty() || value.is_empty() {
+                return Err(Error::Message(
+                    "archetype template has an empty YAML key or value".to_string(),
+                ));
+            }
+            match key.to_ascii_lowercase().as_str() {
+                "description" | "summary" => tpl.description = Some(value.to_string()),
+                "scope" => tpl.scope = Some(anyagents_core::parse_agent_scope(value)?.to_string()),
+                "workdir" | "workspace" => tpl.workdir = Some(value.to_string()),
+                "harness" => tpl.harness = Some(value.to_string()),
+                "model" => tpl.model = Some(value.to_string()),
+                "role" => tpl.role = Some(value.to_string()),
+                "profile" => tpl.profile = Some(value.to_string()),
+                _ => {
+                    return Err(Error::Message(format!(
+                        "unknown archetype template frontmatter key {key:?}"
+                    )));
+                }
+            }
+        }
+        &rest[end..]
+    } else {
+        trimmed_start
+    };
+    tpl.body = body.trim().to_string();
+    Ok(tpl)
+}
+
+/// Resolve an archetype template by name across:
+/// 1. `<explicit_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
+/// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
+/// 3. `<data_dir>/agents-templates/<archetype>.md` (or `<data_dir>/archetypes/`, `<data_dir>/.agents/agents/`)
+/// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
+pub(crate) fn resolve_archetype_template(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Result<Option<ArchetypeTemplate>, Error> {
+    let slug = archetype.trim();
+    if !valid_template_stem(slug) {
+        return Err(Error::Message(format!(
+            "invalid archetype template name {archetype:?}; expected a single filename stem"
+        )));
+    }
+
+    let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
+    if let Some(wd) = explicit_workdir {
+        let s = wd.to_string_lossy();
+        if !matches!(s.trim(), "" | "worktree" | "branch" | "private" | "inherit") {
+            search_roots.push((wd.to_path_buf(), PathBuf::from(".agents/agents")));
+        }
+    }
+    if let Some(pwd) = parent_workdir {
+        search_roots.push((pwd.to_path_buf(), PathBuf::from(".agents/agents")));
+    }
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from("agents-templates")));
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from("archetypes")));
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        search_roots.push((home, PathBuf::from(".agents/agents")));
+    }
+    if let Some(owd) = crate::server::owner_workdir() {
+        search_roots.push((owd, PathBuf::from(".agents/agents")));
+    }
+
+    let candidates = [
+        format!("{slug}.md"),
+        format!("{}/agent.md", slug),
+        format!("{}/AGENT.md", slug),
+    ];
+
+    for (base, root) in search_roots {
+        for rel in &candidates {
+            if let Some(raw) = read_archetype_file(&base, &root.join(rel))? {
+                return parse_archetype_markdown(&raw).map(Some);
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Read a template without ever following a symlink in the candidate path.  The
+/// check is intentionally performed for every lookup, including implicit role
+/// lookup, so a hostile `.agents/agents` cannot be bypassed by falling through to
+/// another search root.
+fn read_archetype_file(base: &Path, relative: &Path) -> Result<Option<String>, Error> {
+    let inspect = |component: &Path| -> Result<bool, Error> {
+        let metadata = match std::fs::symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(Error::Message(format!(
+                    "cannot inspect archetype template path {}: {err}",
+                    component.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Message(format!(
+                "archetype template path contains a symlink: {}",
+                component.display()
+            )));
+        }
+        Ok(true)
+    };
+    if !inspect(base)? {
+        return Ok(None);
+    }
+    // Ancestors above the authorized base can contain OS aliases (e.g. macOS
+    // /var -> /private/var). Resolve those once, then refuse every symlink from
+    // the base through the template file itself.
+    let canonical_base = std::fs::canonicalize(base).map_err(|err| {
+        Error::Message(format!(
+            "cannot resolve archetype base {}: {err}",
+            base.display()
+        ))
+    })?;
+    let mut component = canonical_base.clone();
+    for part in relative.components() {
+        component.push(part);
+        if !inspect(&component)? {
+            return Ok(None);
+        }
+    }
+    let path = canonical_base.join(relative);
+    let path = path.as_path();
+
+    let template_dir = path.parent().ok_or_else(|| {
+        Error::Message(format!(
+            "archetype template has no containing directory: {}",
+            path.display()
+        ))
+    })?;
+    let canonical_dir = std::fs::canonicalize(template_dir).map_err(|err| {
+        Error::Message(format!(
+            "cannot resolve archetype template directory {}: {err}",
+            template_dir.display()
+        ))
+    })?;
+    let canonical_file = std::fs::canonicalize(path).map_err(|err| {
+        Error::Message(format!(
+            "cannot resolve archetype template {}: {err}",
+            path.display()
+        ))
+    })?;
+    if canonical_file.parent() != Some(canonical_dir.as_path()) {
+        return Err(Error::Message(format!(
+            "archetype template escapes its authorized directory: {}",
+            path.display()
+        )));
+    }
+
+    let file = open_archetype_nofollow(path).map_err(|err| {
+        Error::Message(format!(
+            "cannot open archetype template {} without following symlinks: {err}",
+            path.display()
+        ))
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Message(format!(
+            "archetype template is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut raw = String::new();
+    use std::io::Read;
+    std::io::BufReader::new(file)
+        .read_to_string(&mut raw)
+        .map_err(|err| {
+            Error::Message(format!(
+                "cannot read archetype template {}: {err}",
+                path.display()
+            ))
+        })?;
+    Ok(Some(raw))
+}
+
+// Pin each parent directory by descriptor. O_NOFOLLOW on the final file alone
+// would still allow an intermediate directory to be swapped for a symlink after
+// symlink_metadata has checked it.
+#[cfg(unix)]
+fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })?;
+    let mut parts = path
+        .components()
+        .filter(|part| !matches!(part, Component::RootDir))
+        .peekable();
+    while let Some(part) = parts.next() {
+        let name = std::ffi::CString::new(part.as_os_str().as_bytes())?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        if parts.peek().is_some() {
+            flags |= libc::O_DIRECTORY;
+        }
+        // SAFETY: name is a NUL-terminated path component and the borrowed
+        // directory descriptor is live. A successful descriptor is owned once.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new descriptor and ownership is transferred.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if parts.peek().is_none() {
+            return Ok(file);
+        }
+        directory = file;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "empty template path",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
+}
+
+/// Apply archetype template defaults (`.agents/agents/<archetype>.md`) to a `CreateAgentRequest`
+/// in-place before agent creation. When `archetype` is omitted, also checks whether `role`
+/// matches a template slug (e.g. `role: "code-reviewer"` when `.agents/agents/code-reviewer.md`
+/// exists) while keeping `role` methodology-neutral when no template matches.
+pub(crate) fn apply_archetype_defaults(
+    data_dir: &Path,
+    parent: Option<&Agent>,
+    body: &mut crate::api::CreateAgentRequest,
+) -> Result<(), Error> {
+    let explicit_wd = body
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let parent_wd = parent.and_then(|p| p.workdir.as_deref()).map(Path::new);
+    let tpl = if let Some(arch) = body
+        .archetype
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        match resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)? {
+            Some(template) => Some(template),
+            None => {
+                return Err(Error::Message(format!(
+                    "unknown archetype template {arch:?}"
+                )));
+            }
+        }
+    } else if let Some(role) = body
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let slugified = role.to_ascii_lowercase().replace(' ', "-");
+        let direct = if valid_template_stem(role) {
+            resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?
+        } else {
+            None
+        };
+        if direct.is_some() {
+            direct
+        } else if valid_template_stem(&slugified) {
+            resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+        } else {
+            // A display label is not required to be a template stem.
+            None
+        }
+    } else {
+        None
+    };
+    let Some(tpl) = tpl else {
+        return Ok(());
+    };
+
+    if body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(desc) = tpl.description
+    {
+        body.description = Some(desc);
+    }
+    if body
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && body.public.is_none()
+        && let Some(scope) = tpl.scope
+    {
+        body.scope = Some(scope);
+    }
+    if body
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && body
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        && let Some(wd) = tpl.workdir
+    {
+        body.workdir = Some(wd);
+    }
+    if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
+        && let Some(h) = tpl.harness
+    {
+        body.harness = Some(h);
+    }
+    if body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(m) = tpl.model
+    {
+        body.model = Some(m);
+    }
+    if body
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(p) = tpl.profile
+    {
+        body.profile = Some(p);
+    }
+    if body
+        .role
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(r) = tpl.role
+    {
+        body.role = Some(r);
+    }
+    if !tpl.body.is_empty() {
+        body.instructions = match body
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(existing) => Some(format!("{}\n\n{}", tpl.body, existing)),
+            None => Some(tpl.body),
+        };
+    }
+    Ok(())
+}
+
+fn valid_template_stem(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
 /// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.
 pub(crate) fn resolve_subagent_defaults(
     data: &Path,
@@ -7571,6 +8079,115 @@ mod tests {
         );
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn seat_skill_wrapper_mounts_overlay_without_shared_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/agent-id/config");
+        let skill = dir.path().join("agents/agent-id/skills/private/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(&skill, "---\nname: private\n---\nexact overlay").unwrap();
+        ensure_seat_skills(&config, dir.path());
+        assert_eq!(
+            std::fs::read(config.join(".claude/skills/private/SKILL.md")).unwrap(),
+            std::fs::read(skill).unwrap()
+        );
+        assert!(!dir.path().join("skills").exists());
+    }
+
+    #[test]
+    fn rendered_whole_memory_block_respects_caps_separate_from_fixed_file_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "caps-rendered",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &agent.id);
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "繁體長記憶".repeat(3000)).unwrap();
+        for harness in ["claude-code", "sylphx"] {
+            agent.harness = harness.into();
+            let pin = anyagents_core::host_session::new_session(root, harness).unwrap();
+            write_agent_instructions(&config, &agent, None);
+            for name in ["AGENTS.md", "CLAUDE.md", "SYSTEM_PROMPT.md"] {
+                let doc = std::fs::read_to_string(config.join(name)).unwrap();
+                // Find full delimiters at line boundaries, not their mention in
+                // the independent fixed operating instructions.
+                let start = doc.find("\n<learned_memory>\n").unwrap() + 1;
+                let end = doc[start..].find("</learned_memory>\n").unwrap()
+                    + start
+                    + "</learned_memory>\n".len();
+                let block = &doc[start..end];
+                assert_eq!(block, pin.memory.section);
+                assert!(block.len() <= 4096, "{name}: {} bytes", block.len());
+                assert!(block.lines().count() <= 150);
+                assert!(block.contains("Memory truncated"));
+                assert!(!block.contains("fixed; not learned memory"));
+                assert!(
+                    doc[..start]
+                        .contains("Host File Operating Instructions (fixed; not learned memory)")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {
+        use anyagents_core::host_session;
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "memory-renderer",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(data, &agent.id);
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "PINNED_FIRST_FACT 繁體\n").unwrap();
+        let first = host_session::new_session(root, &agent.harness).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        let paths = [
+            "AGENTS.md",
+            "CLAUDE.md",
+            "SYSTEM_PROMPT.md",
+            ".claude/CLAUDE.md",
+            ".config/opencode/AGENTS.md",
+            ".gemini/config/GEMINI.md",
+        ];
+        for path in paths {
+            let text = std::fs::read_to_string(config.join(path)).unwrap();
+            assert!(text.contains(&first.memory.section), "{path}");
+        }
+        std::fs::write(root.join("memory/MEMORY.md"), "EDITED_SECOND_FACT\n").unwrap();
+        agent.description = Some("ordinary describe update".into());
+        write_agent_instructions(&config, &agent, None);
+        let rerender = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(rerender.contains("PINNED_FIRST_FACT"));
+        assert!(!rerender.contains("EDITED_SECOND_FACT"));
+        // External CLI consumption of this mirror is exercised by the real-pipe
+        // Spiron launch/wake probe; AnyAgents no longer assembles model prompts.
+        agent.harness = "sylphx".into();
+        let switched = host_session::new_session(root, &agent.harness).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        for path in paths {
+            let text = std::fs::read_to_string(config.join(path)).unwrap();
+            assert!(text.contains(&switched.memory.section));
+            assert!(!text.contains("PINNED_FIRST_FACT"));
+            assert!(text.contains("EDITED_SECOND_FACT"));
+        }
+        std::fs::remove_file(root.join("memory/MEMORY.md")).unwrap();
+        write_agent_instructions(&config, &agent, None);
+        assert_eq!(host_session::active(root).unwrap().unwrap(), switched);
+    }
     #[test]
     fn parse_remaining_pct_from_usage_handles_agy_5h_and_7d_windows() {
         let usage = "gemini: 84% left (5h: 100%, 7d: 84%) · opus: 0% left (5h: 0%, 7d: 0%)";
@@ -9633,5 +10250,106 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                 canon_base
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod archetype_tests {
+    use super::*;
+
+    #[test]
+    fn archetype_frontmatter_requires_valid_yaml_and_complete_delimiters() {
+        for raw in [
+            "---\ndescription: broken",
+            "---\ndescription: broken\n---not-a-delimiter\nbody",
+            "---\ndescription missing colon\n---\nbody",
+            "---\ndescription: \"unclosed\n---\nbody",
+            "---\ndescription: [unclosed\n---\nbody",
+            "---\ndescription: {unclosed\n---\nbody",
+            "---\n: missing key\n---\nbody",
+            "---\ndescription:\n---\nbody",
+            "---\ndescription: ''\n---\nbody",
+            "---\ndescription: first\ndescription: second\n---\nbody",
+            "---\n---",
+            "---\n# comment only\n---\n",
+        ] {
+            let error = parse_archetype_markdown(raw).unwrap_err().to_string();
+            assert!(error.contains("archetype template"), "{error}");
+        }
+
+        for raw in [
+            "---\ndescription: 'Reviewer: #1'\n---\nReview this change.",
+            "---\r\ndescription: 'Reviewer: #1'\r\n---\r\nReview this change.",
+        ] {
+            let template = parse_archetype_markdown(raw).unwrap();
+            assert_eq!(template.description.as_deref(), Some("Reviewer: #1"));
+            assert_eq!(template.body, "Review this change.");
+        }
+        let fields_only = parse_archetype_markdown("---\nrole: reviewer\n---").unwrap();
+        assert_eq!(fields_only.role.as_deref(), Some("reviewer"));
+        assert!(fields_only.body.is_empty());
+        assert_eq!(
+            parse_archetype_markdown("---\n---\nBody.").unwrap().body,
+            "Body."
+        );
+        assert_eq!(
+            parse_archetype_markdown("Plain markdown.").unwrap().body,
+            "Plain markdown."
+        );
+    }
+
+    #[test]
+    fn archetype_frontmatter_rejects_unknown_keys_and_invalid_scope() {
+        for (raw, expected) in [
+            (
+                "---\nscpoe: isolated\n---\nUNKNOWN_KEY_BODY",
+                "unknown archetype template frontmatter key \"scpoe\"",
+            ),
+            (
+                "---\nscope: invalid-review-scope\n---\nINVALID_SCOPE_BODY",
+                "invalid scope `invalid-review-scope`",
+            ),
+        ] {
+            let error = parse_archetype_markdown(raw).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        let template = parse_archetype_markdown("---\nscope: team\n---\nBody.").unwrap();
+        assert_eq!(template.scope.as_deref(), Some("siblings"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archetype_nofollow_opens_refuse_symlinks_but_allow_os_aliases_above_base() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let templates = real.join("work/.agents/agents");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("writer.md"), "Trusted template.").unwrap();
+        let alias = root.join("alias");
+        symlink(&real, &alias).unwrap();
+        let template =
+            resolve_archetype_template("writer", Some(&alias.join("work")), None, dir.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(template.body, "Trusted template.");
+
+        // These use the descriptor-only open directly, so the race-resistant
+        // layer is independently covered rather than masked by metadata checks.
+        symlink(templates.join("writer.md"), templates.join("escape.md")).unwrap();
+        assert_eq!(
+            open_archetype_nofollow(&templates.join("escape.md"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        symlink(&templates, real.join("redirected")).unwrap();
+        let error = open_archetype_nofollow(&real.join("redirected/writer.md")).unwrap_err();
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "{error}"
+        );
     }
 }

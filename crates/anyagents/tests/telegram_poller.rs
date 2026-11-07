@@ -204,12 +204,9 @@ struct Server {
 
 impl Server {
     fn start(dir: &Path, api: &str) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             .env("ANYAGENTS_OPENCODE_BIN", env!("CARGO_BIN_EXE_anyagents"))
             .env("ANYAGENTS_TELEGRAM_API", api)
-            .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
-            .env("ANYAGENTS_AGENTS", support::agents_line())
-            .env("ANYAGENTS_TESTS", "own-seat")
             .env(
                 "ANYAGENTS_OPERATOR_TOKEN_FILE",
                 dir.join(support::TOKEN_FILE),
@@ -266,7 +263,7 @@ fn create(dir: &Path, name: &str) -> String {
         .arg(dir)
         .args(["agents", "create", name, "--harness", "claude-code"])
         .env("PATH", machine_path(dir))
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", "/bin/true")
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_AGENTS", support::agents_line())
         .env("ANYAGENTS_TESTS", "own-seat")

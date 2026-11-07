@@ -919,7 +919,7 @@ impl StreamHarness {
     fn spawn(&mut self) -> Result<(), HarnessError> {
         // The seat the server configured for this agent: the child starts as
         // the agent's own uid, and no server-only key reaches it.
-        let mut command = spawn_command(&self.program, &self.environment);
+        let mut command = spawn_command(&self.program, &self.environment)?;
         command.args(&self.args);
         command
             .stdin(Stdio::piped())
@@ -927,9 +927,6 @@ impl StreamHarness {
             .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            command.env(key, value);
         }
         let mut child = command
             .spawn()

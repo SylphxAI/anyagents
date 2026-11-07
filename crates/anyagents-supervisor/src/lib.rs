@@ -889,7 +889,10 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         None
                     },
-                    last_error: health.sign_in_fault.or_else(|| self.last_error.clone()),
+                    last_error: health
+                        .sign_in_fault
+                        .or_else(|| delivery.harness().exit_diagnostic())
+                        .or_else(|| self.last_error.clone()),
                 }
             }
             None => {

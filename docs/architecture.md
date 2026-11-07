@@ -531,14 +531,108 @@ ORDER BY id;
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
 
+### Host history index refresh
+
+Host history keeps raw text in its source files. The rebuildable contentless FTS
+index stores metadata, bounded search windows and SHA-256 raw coordinates, not a
+second raw transcript. Each source frontier and its documents/windows commit
+atomically. A source changing during publication defers that snapshot without
+advancing its frontier. `memory` and `transcripts` queries refresh/prune only their
+requested source class; `all` refreshes both.
+
+An unchanged native JSONL source reuses its persisted cursor. For the same device
+and inode with no size decrease, a changed source checks the last **64 KiB before
+the complete-record frontier**, then scans/indexes only the suffix. Capturing the
+new frontier adds one more bounded 64 KiB read. A changed boundary, shrink,
+replacement inode or parser-policy change rebuilds the complete source. Incomplete
+last records stay outside the committed frontier. Search result window reads
+always verify their own SHA; explicit whole-event readback verifies the event SHA.
+
+This is deliberately not an append-only proof: a same-size edit **outside** the
+boundary may remain missing/stale in the index until full verification. The daemon
+maintenance loop fully rebuilds at most **one due source per 60-second tick**, with
+sources due **one hour after their last full verification**. Backlog, a continuously
+changing source or failures can extend that detection delay; no fixed one-hour
+upper bound is promised. Failed sources rotate behind other due sources without
+publishing a new frontier. A stale returned window is refused immediately by its
+SHA check. Full verification uses the same lifecycle locks and pending-redaction
+path exclusions as query refresh; it never edits the source. This maintenance is
+host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
+the host raw append port is not activated by this index.
+
+The retained mailbox index no longer clips newly recorded inbound, outbound or
+tool text at 2,400 characters; full cleaned bodies also define deduplication hashes.
+The first authorized lexical/structured search upgrades pre-existing mailbox
+chunks from their authoritative inbound/outbound bodies in one transaction,
+reading 32 rows per batch. The policy marker and FTS/text changes commit together;
+subsequent searches skip upgraded rows. This backfill may add first-search latency
+and retains the legacy mailbox index representation; it is not the filesystem
+index's suffix-only scanner. Hidden owners are neither read nor upgraded.
+Redacted mailbox bodies remain authoritative on retry/restart. Historical
+standalone tool summaries clipped by an older writer have no raw mailbox body to
+recover; they are preserved as-is rather than claiming a reconstructed suffix.
+Reconciled pages under `agents/<id>/history/owners` are indexed as whole historical
+documents in `transcripts` scope even when they are Markdown rather than JSONL.
+
+For an indexed filesystem result, the canonical `conversation` tool/HTTP route
+accepts `raw_id` (the result ID), required `raw_sha256` (the result's whole-event
+`raw.sha256`), optional `raw_offset` (zero-based event-relative bytes, default 0),
+and `raw_length` (1–65,536 bytes, default 65,536). The range clips at the event end;
+offset equal to the event length returns an empty end-of-event range. The host
+resolves the ID inside the caller's authorized owner set and selected agent/scope,
+then repeats that lookup under the owner lifecycle lock. It rejects missing or
+pending-redaction documents, stale digests and changed raw bytes. Arbitrary paths
+and caller-supplied raw coordinates are not read arguments. Peer/parent history
+remains inaccessible regardless of a guessed document ID or shared group.
+
+Explicit raw reads stream-authenticate the **complete event** SHA-256 with a
+64 KiB buffer before returning at most 64 KiB. This costs O(event length), not
+O(requested range), but does not allocate the entire event. The response's single
+turn includes exact `raw_bytes` as a JSON byte array, a lossy convenience `text`
+preview, the complete `raw` coordinate and the requested `window` coordinate/SHA.
+The byte array is authoritative for invalid UTF-8, zero bytes and ranges splitting
+a Unicode character. It uses the same six-tool MCP surface; no seventh tool or
+native writer handoff is introduced.
+
+## Host-owned memory and retained history
+
+[Host memory](host-memory.md) documents pinned learned facts, ACL-scoped lexical
+retrieval, resumable migration, retained native writers and measured limits.
 ## Methodology-neutral roles and lifecycle
 
-`role` is an optional display label. It does not select a prompt, communication
-policy, discovery membership or process lifetime. Private `instructions` define
-an agent's responsibilities, reporting conventions and decision to archive.
-AnyAgents ships no company hierarchy, standing-agent policy or role templates.
-Role labels are not interpreted as template names; callers that manage templates
-supply their contents through `instructions`.
+`role` is an optional display label, not a lifecycle or residency policy.
+Private `instructions` define an agent's responsibilities, reporting conventions
+and decision to archive. AnyAgents ships no company hierarchy, standing-agent
+policy or built-in role templates.
+
+Callers may supply local Markdown templates through `archetype` (aliases:
+`template`, `type`, `preset`). A name is a single ASCII filename stem containing
+only letters, digits, `-` or `_`, without a `.md` suffix. Lookup searches the
+explicit and parent workspaces' `.agents/agents`, the data directory's
+`agents-templates`, `archetypes` and `.agents/agents`, then the home and owner
+workspaces' `.agents/agents`. Both `<name>.md` and `<name>/agent.md` (or `AGENT.md`)
+are supported. An explicit nonempty selector must resolve; an unknown name is a
+validation error. Without a selector, a matching `role` or its lowercase,
+space-to-hyphen form may supply template defaults; an unmatched label stays a
+label. Templates prepend their Markdown body to caller instructions and supply
+missing fields from YAML frontmatter (`description`/`summary`, `scope`,
+`workdir`/`workspace`, `harness`, `model`, `role`, `profile`). Unknown keys,
+invalid scopes, malformed or unclosed frontmatter and
+symlinks in any template path are validation errors, including implicit lookup;
+lookup never silently falls through after a refusal. Scope validation happens
+before agent persistence. Without a template, omitted HTTP harness retains
+`claude-code`; an explicit empty harness or `inherit` selects child defaults.
+
+MCP agent lists first apply visibility, parent and state scope. `summary.total`
+and health/state counts describe that full population, before `query` or
+pagination. `summary.matched` counts query matches before truncation and
+`summary.returned` counts the returned slice. Every matched list is ordered by
+working/errored status, running, idle, paused, then other states, with name and
+ID tie-breakers, before slicing. List `limit` defaults to 100 and is clamped to
+1–100. `cursor` (alias `offset`) is a zero-based position; `next_cursor` is the
+next position or null at the end. Both unified and legacy sub-agent tools return
+it. Continue with the same query, parent and state. Pages reflect current state,
+not a snapshot; concurrent population/state changes can shift positions.
 
 Every agent, including a root or role-bearing child, may archive itself.
 Archive is reversible: an intentional direct message wakes the identity again;
