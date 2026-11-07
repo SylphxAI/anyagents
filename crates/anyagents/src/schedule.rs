@@ -756,7 +756,7 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 if block.is_some() {
                     // Record latest observation while the owning agent is busy/paused without
                     // consuming a terminal transition or mutating the baseline.
-                    if eval.observed.is_some() {
+                    if eval.observed.is_some() && eval.observed != sched.last_observed {
                         let _ = store.update_schedule_watch_observation(
                             &sched.id,
                             sched.watch_baseline.as_deref(),
@@ -766,7 +766,16 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                     continue;
                 }
                 if !eval.triggered {
-                    if eval.baseline.is_some() || eval.observed.is_some() {
+                    if (eval.baseline.is_some() || eval.observed.is_some())
+                        && (eval
+                            .baseline
+                            .as_ref()
+                            .is_some_and(|b| Some(b) != sched.watch_baseline.as_ref())
+                            || eval
+                                .observed
+                                .as_ref()
+                                .is_some_and(|o| Some(o) != sched.last_observed.as_ref()))
+                    {
                         let _ = store.update_schedule_watch_observation(
                             &sched.id,
                             eval.baseline.as_deref(),
@@ -952,47 +961,7 @@ fn evaluate_watch(
             else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
-            if state_desc.starts_with("probe_error:") {
-                return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
-            }
-            let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
-            if state_desc == "merged" || state_desc == "closed" {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "fired",
-                    transition: Some(state_desc.clone()),
-                    observed: Some(state_desc.clone()),
-                    baseline: Some(state_desc),
-                };
-            }
-            if prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "active",
-                    transition: Some("evicted".to_string()),
-                    observed: Some(format!("evicted:{state_desc}")),
-                    baseline: Some(state_desc),
-                };
-            }
-            if state_desc == "review_failed" && prev != "review_failed" {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "active",
-                    transition: Some("review_failed".to_string()),
-                    observed: Some("review_failed".to_string()),
-                    baseline: Some("review_failed".to_string()),
-                };
-            }
-            if state_desc == "checks_completed" && prev != "checks_completed" {
-                return WatchEval {
-                    triggered: true,
-                    next_state: "active",
-                    transition: Some("checks_completed".to_string()),
-                    observed: Some("checks_completed".to_string()),
-                    baseline: Some("checks_completed".to_string()),
-                };
-            }
-            WatchEval::pending(Some(state_desc.clone()), Some(state_desc))
+            evaluate_pr_observation(sched, state_desc)
         }
         WatchTarget::GitHubCheck {
             owner,
@@ -1044,6 +1013,50 @@ fn evaluate_watch(
             }
         }
     }
+}
+
+fn evaluate_pr_observation(sched: &AgentSchedule, state_desc: String) -> WatchEval {
+    if state_desc.starts_with("probe_error:") {
+        return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
+    }
+    let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
+    if state_desc == "merged" || state_desc == "closed" {
+        return WatchEval {
+            triggered: true,
+            next_state: "fired",
+            transition: Some(state_desc.clone()),
+            observed: Some(state_desc.clone()),
+            baseline: Some(state_desc),
+        };
+    }
+    if prev.starts_with("merge_queue:") && !state_desc.starts_with("merge_queue:") {
+        return WatchEval {
+            triggered: true,
+            next_state: "active",
+            transition: Some("evicted".to_string()),
+            observed: Some(format!("evicted:{state_desc}")),
+            baseline: Some(state_desc),
+        };
+    }
+    if state_desc == "review_failed" && prev != "review_failed" {
+        return WatchEval {
+            triggered: true,
+            next_state: "active",
+            transition: Some("review_failed".to_string()),
+            observed: Some("review_failed".to_string()),
+            baseline: Some("review_failed".to_string()),
+        };
+    }
+    if state_desc == "checks_completed" && prev != "checks_completed" {
+        return WatchEval {
+            triggered: true,
+            next_state: "active",
+            transition: Some("checks_completed".to_string()),
+            observed: Some("checks_completed".to_string()),
+            baseline: Some("checks_completed".to_string()),
+        };
+    }
+    WatchEval::pending(Some(state_desc.clone()), Some(state_desc))
 }
 
 fn probe_process_alive(pid: u32) -> bool {
@@ -1538,14 +1551,46 @@ mod tests {
     }
 
     #[test]
+    fn legacy_queue_eviction_and_rate_errors_keep_existing_wake_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let owner = store
+            .create_agent(NewAgent::new("legacy-pr-watch", "codex"))
+            .unwrap();
+        let mut sched = store
+            .create_schedule(NewSchedule {
+                agent_id: owner.id,
+                kind: "watch".to_string(),
+                spec: "github:pr:o/r#42".to_string(),
+                prompt: "verify".to_string(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("merge_queue:queued".to_string()),
+            })
+            .unwrap();
+        let error = evaluate_pr_observation(&sched, "probe_error:rate_limited".to_string());
+        assert!(!error.triggered);
+        assert_eq!(error.baseline, sched.watch_baseline);
+        let evicted = evaluate_pr_observation(&sched, "checks_completed".to_string());
+        assert!(evicted.triggered);
+        assert_eq!(evicted.transition.as_deref(), Some("evicted"));
+        assert_eq!(evicted.next_state, "active");
+        sched.watch_baseline = evicted.baseline;
+        assert!(!evaluate_pr_observation(&sched, "checks_completed".to_string()).triggered);
+    }
+
+    #[test]
     fn github_pr_watch_stays_active_across_checks_and_review_failure_until_merged() {
         use std::io::{Read, Write};
         use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Arc, Mutex};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let stage = Arc::new(Mutex::new(0));
         let server_stage = Arc::clone(&stage);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let server_calls = Arc::clone(&calls);
         let server = std::thread::spawn(move || {
             for mut stream in listener.incoming().flatten() {
                 let mut buf = [0u8; 2048];
@@ -1554,6 +1599,12 @@ mod tests {
                 let stage = *server_stage.lock().unwrap();
                 if stage == 99 {
                     break;
+                }
+                server_calls.fetch_add(1, Ordering::SeqCst);
+                if stage == 5 {
+                    let body = r#"{"message":"You have exceeded a secondary rate limit."}"#;
+                    write!(stream, "HTTP/1.1 403 Forbidden\r\nRetry-After: 120\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap();
+                    continue;
                 }
                 let body = if request.contains("/pulls/") {
                     if stage == 4 {
@@ -1603,12 +1654,34 @@ mod tests {
         )
         .unwrap();
         let now = anyagents_core::now_ms();
+        let barrier = Arc::new(std::sync::Barrier::new(101));
+        let handles: Vec<_> = (0..100)
+            .map(|i| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    // Agent identity must not fragment the single-flight cache.
+                    probe_github_check_terminal(
+                        "Cubeage",
+                        "hk-mahjong-tycoon",
+                        "#452",
+                        &format!("agent{i}"),
+                        now,
+                    )
+                })
+            })
+            .collect();
+        barrier.wait();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap().1, "checks_in_progress");
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
         for (stage_num, transition) in [
             (1, "checks_completed"),
             (2, "review_failed"),
             (3, "checks_completed"),
-            (4, "merged"),
         ] {
             *stage.lock().unwrap() = stage_num;
             let at = now + i64::from(stage_num) * 60_000;
@@ -1620,8 +1693,37 @@ mod tests {
             store.note_turn_completed(&owner.id).unwrap();
             assert_eq!(tick_schedules_once(&store, &health, at + 1_000), 0);
             let active = store.list_schedules(Some(&owner.id), true).unwrap();
-            assert_eq!(active.len(), usize::from(stage_num != 4));
+            assert_eq!(active.len(), 1);
         }
+        // A shared secondary-limit window records one typed error, retains
+        // the successful baseline, and rereads the terminal state on recovery.
+        *stage.lock().unwrap() = 5;
+        assert_eq!(tick_schedules_once(&store, &health, now + 240_000), 0);
+        let active = store.list_schedules(Some(&owner.id), true).unwrap();
+        assert_eq!(
+            active[0].watch_baseline.as_deref(),
+            Some("checks_completed")
+        );
+        assert_eq!(
+            active[0].last_observed.as_deref(),
+            Some("probe_error:rate_limited")
+        );
+        let before = calls.load(Ordering::SeqCst);
+        *stage.lock().unwrap() = 4;
+        for at in [240_001, 300_000, 359_999] {
+            assert_eq!(tick_schedules_once(&store, &health, now + at), 0);
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), before);
+        assert_eq!(tick_schedules_once(&store, &health, now + 360_000), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        let inbox = store.inbox(&owner.id, None).unwrap();
+        assert!(inbox.last().unwrap().text.contains("transition=merged]"));
+        assert!(
+            store
+                .list_schedules(Some(&owner.id), true)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             store.list_schedules(Some(&owner.id), false).unwrap()[0].id,
             sched.id

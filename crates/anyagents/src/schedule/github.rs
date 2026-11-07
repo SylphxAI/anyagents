@@ -64,6 +64,8 @@ struct Target {
     // Last successful observation survives transport/rate errors.
     successful: Option<Observation>,
     pages: HashMap<String, Page>,
+    head: Option<String>,
+    accessed_at: i64,
 }
 
 #[derive(Default)]
@@ -139,7 +141,10 @@ impl Probes {
         if now < self.limited_until {
             return Error::RateLimited(self.limited_until).observation();
         }
+        self.targets
+            .retain(|_, target| now.saturating_sub(target.accessed_at) < 3_600_000);
         let target = self.targets.entry(key.to_string()).or_default();
+        target.accessed_at = now;
         // A cooldown overrides the normal interval. Always re-read on recovery,
         // even when the last ordinary observation had a five-minute TTL.
         let recovering = self.limited_until != 0 && target.next_at <= self.limited_until;
@@ -208,6 +213,10 @@ fn read_target(
     } else {
         reference.to_string()
     };
+    if target.head.as_deref() != Some(&head) {
+        target.pages.retain(|path, _| path.contains("/pulls/"));
+        target.head = Some(head.clone());
+    }
     let mut checks = read_checks(
         target,
         &format!("{root}/commits/{}/check-runs", encode(&head)),
@@ -273,8 +282,7 @@ fn read_page(
                 .is_some_and(|v| v == "0")
         {
             let until = retry
-                .and_then(|v| v.parse::<i64>().ok())
-                .map(|s| now.saturating_add(s.saturating_mul(1_000)))
+                .and_then(|v| retry_after(v, now))
                 .or_else(|| {
                     response
                         .headers
@@ -350,6 +358,27 @@ fn read_page(
     };
     target.pages.insert(path.to_string(), page.clone());
     Ok(page)
+}
+
+fn retry_after(raw: &str, now: i64) -> Option<i64> {
+    if let Ok(seconds) = raw.parse::<i64>() {
+        return Some(now.saturating_add(seconds.max(0).saturating_mul(1_000)));
+    }
+    // HTTP-date is permitted by Retry-After as well as delta-seconds.
+    let parts: Vec<_> = raw.split_whitespace().collect();
+    if parts.len() != 6 || parts[5] != "GMT" {
+        return None;
+    }
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|month| *month == parts[2])?
+        + 1;
+    super::parse_rfc3339_ms(&format!(
+        "{}-{month:02}-{}T{}Z",
+        parts[3], parts[1], parts[4]
+    ))
 }
 
 fn encode(value: &str) -> String {
@@ -447,4 +476,371 @@ fn parse_response(bytes: &[u8]) -> Result<Response, Error> {
         headers,
         body: body.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn response(status: u16, body: Value, headers: &[(&str, &str)]) -> Response {
+        Response {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: body.to_string(),
+        }
+    }
+
+    fn completed() -> Value {
+        serde_json::from_str(include_str!("fixtures/completed-check-runs.json")).unwrap()
+    }
+
+    fn pending() -> Value {
+        serde_json::from_str(include_str!("fixtures/pending-check-runs.json")).unwrap()
+    }
+
+    fn pull(state: &str, merged: bool, sha: &str) -> Value {
+        json!({"state": state, "merged": merged, "merged_at": null, "head": {"sha": sha}})
+    }
+
+    #[test]
+    fn conditional_pages_adapt_and_recover_after_changes() {
+        let mut probes = Probes::default();
+        let mut calls = 0;
+        let expected = [
+            (0, 60_000),
+            (60_000, 120_000),
+            (180_000, 240_000),
+            (420_000, 300_000),
+            (720_000, 300_000),
+        ];
+        for (now, interval) in expected {
+            let result = probes.probe("target", "o", "r", "sha", false, now, |path, etag| {
+                assert_eq!(path, "repos/o/r/commits/sha/check-runs?per_page=100&page=1");
+                calls += 1;
+                if now == 0 {
+                    assert_eq!(etag, None);
+                    Ok(response(200, pending(), &[("etag", "\"pending\"")]))
+                } else {
+                    assert_eq!(etag, Some("\"pending\""));
+                    Ok(response(304, Value::Null, &[]))
+                }
+            });
+            assert_eq!(result, (false, "checks_in_progress".to_string()));
+            assert_eq!(probes.targets["target"].interval, interval);
+            for offset in [0, 1, interval - 1] {
+                assert_eq!(
+                    probes.probe(
+                        "target",
+                        "o",
+                        "r",
+                        "sha",
+                        false,
+                        now + offset,
+                        |_, _| panic!("duplicate request")
+                    ),
+                    result
+                );
+            }
+        }
+        assert_eq!(calls, 5);
+        assert_eq!(
+            probes.probe("target", "o", "r", "sha", false, 1_020_000, |_, etag| {
+                assert_eq!(etag, Some("\"pending\""));
+                Ok(response(200, completed(), &[("etag", "\"done\"")]))
+            }),
+            (true, "checks_completed".to_string())
+        );
+        assert_eq!(probes.targets["target"].interval, MIN_INTERVAL);
+    }
+
+    #[test]
+    fn three_thousand_checks_revalidate_every_page_and_never_complete_early() {
+        let mut probes = Probes::default();
+        let template = completed()["check_runs"][0].clone();
+        for (now, done) in [(0, false), (60_000, false), (180_000, true)] {
+            let mut pages = 0;
+            let result = probes.probe("pr", "o", "r", "42", true, now, |path, etag| {
+                pages += 1;
+                if path.ends_with("/pulls/42") {
+                    return Ok(if now == 0 {
+                        response(200, pull("open", false, "head"), &[("etag", "pull")])
+                    } else {
+                        assert_eq!(etag, Some("pull"));
+                        response(304, Value::Null, &[])
+                    });
+                }
+                if path.contains("/status?") {
+                    return Ok(response(200, json!({"statuses":[]}), &[]));
+                }
+                let n: usize = path.rsplit_once("page=").unwrap().1.parse().unwrap();
+                assert!((1..=30).contains(&n));
+                if now != 0 {
+                    assert_eq!(etag, Some(format!("page{n}").as_str()));
+                }
+                if now != 0 && !(done && n == 30) {
+                    return Ok(response(304, Value::Null, &[]));
+                }
+                let mut runs = vec![template.clone(); 100];
+                for (i, run) in runs.iter_mut().enumerate() {
+                    run["id"] = json!((n - 1) * 100 + i);
+                }
+                if n == 30 && !done {
+                    runs[99]["status"] = json!("in_progress");
+                    runs[99]["conclusion"] = Value::Null;
+                }
+                let mut headers = vec![("etag".to_string(), format!("page{n}"))];
+                if n < 30 {
+                    headers.push((
+                        "link".to_string(),
+                        format!(
+                            "<https://api.github.com/ignored?page={}>; rel=\"next\"",
+                            n + 1
+                        ),
+                    ));
+                }
+                Ok(Response {
+                    status: 200,
+                    headers: headers.into_iter().collect(),
+                    body: json!({"total_count":3000,"check_runs":runs}).to_string(),
+                })
+            });
+            assert_eq!(pages, 32); // pull + 30 check pages + legacy commit statuses
+            assert_eq!(
+                result,
+                (
+                    done,
+                    if done {
+                        "checks_completed"
+                    } else {
+                        "checks_in_progress"
+                    }
+                    .to_string()
+                )
+            );
+            assert_eq!(probes.targets["pr"].pages.len(), 32);
+        }
+    }
+
+    #[test]
+    fn rate_limit_is_global_and_recovery_rereads_without_losing_the_baseline() {
+        let mut probes = Probes::default();
+        let first = probes.probe("pr", "o", "r", "42", true, 0, |path, _| {
+            Ok(response(
+                200,
+                if path.contains("/pulls/") {
+                    pull("open", false, "head")
+                } else if path.contains("/status?") {
+                    json!({"statuses":[]})
+                } else {
+                    pending()
+                },
+                &[("etag", "before")],
+            ))
+        });
+        assert_eq!(first.1, "checks_in_progress");
+        assert_eq!(
+            probes
+                .probe("other", "o", "r", "sha", false, 1_000, |_, _| {
+                    Ok(response(
+                        403,
+                        json!({"message":"You have exceeded a secondary rate limit."}),
+                        &[("retry-after", "180")],
+                    ))
+                })
+                .1,
+            "probe_error:rate_limited"
+        );
+        assert_eq!(probes.limited_until, 181_000);
+        for now in [1_001, 60_000, 180_999] {
+            for key in ["pr", "other", "new-target"] {
+                assert_eq!(
+                    probes
+                        .probe(key, "o", "r", "42", true, now, |_, _| panic!(
+                            "global cooldown bypassed"
+                        ))
+                        .1,
+                    "probe_error:rate_limited"
+                );
+            }
+        }
+        assert_eq!(
+            probes.targets["pr"].successful.as_ref().unwrap().1,
+            "checks_in_progress"
+        );
+        assert_eq!(
+            probes.probe("pr", "o", "r", "42", true, 181_000, |path, etag| {
+                assert!(path.ends_with("/pulls/42"));
+                assert_eq!(etag, Some("before"));
+                Ok(response(
+                    200,
+                    pull("closed", true, "head"),
+                    &[("etag", "after")],
+                ))
+            }),
+            (true, "merged".to_string())
+        );
+        assert_eq!(probes.targets["pr"].pages.len(), 1);
+        assert_eq!(probes.targets["pr"].interval, MIN_INTERVAL);
+    }
+
+    #[test]
+    fn repeated_secondary_limits_back_off_and_permission_errors_do_not() {
+        let mut probes = Probes::default();
+        let mut now = 0;
+        for delay in [60_000, 120_000, 240_000, 300_000, 300_000] {
+            assert_eq!(
+                probes
+                    .probe("a", "o", "r", "sha", false, now, |_, _| {
+                        Ok(response(
+                            429,
+                            json!({"message":"secondary rate limit"}),
+                            &[],
+                        ))
+                    })
+                    .1,
+                "probe_error:rate_limited"
+            );
+            assert_eq!(probes.limited_until, now + delay);
+            now += delay;
+        }
+        let mut probes = Probes::default();
+        assert_eq!(
+            probes
+                .probe("a", "o", "r", "sha", false, 0, |_, _| {
+                    Ok(response(
+                        403,
+                        json!({"message":"Resource not accessible by integration"}),
+                        &[],
+                    ))
+                })
+                .1,
+            "probe_error:http:403"
+        );
+        assert_eq!(probes.limited_until, 0);
+        assert_eq!(
+            probes
+                .probe("b", "o", "r", "sha", false, 0, |_, _| Ok(response(
+                    200,
+                    completed(),
+                    &[]
+                )))
+                .1,
+            "checks_completed"
+        );
+    }
+
+    #[test]
+    fn status_contexts_and_review_failures_preserve_pr_semantics() {
+        for (run, statuses, expected) in [
+            (
+                completed(),
+                json!([{"context":"deploy","state":"pending"}]),
+                "checks_in_progress",
+            ),
+            (
+                completed(),
+                json!([{"context":"review","state":"failure"}]),
+                "review_failed",
+            ),
+            (
+                json!({"check_runs":[{"name":"review","status":"completed","conclusion":"timed_out"}]}),
+                json!([]),
+                "review_failed",
+            ),
+            (
+                json!({"check_runs":[]}),
+                json!([{"context":"ci","state":"error"}]),
+                "checks_completed",
+            ),
+            (json!({"check_runs":[]}), json!([]), "open"),
+        ] {
+            let mut probes = Probes::default();
+            assert_eq!(
+                probes
+                    .probe("pr", "o", "r", "42", true, 0, |path, _| Ok(response(
+                        200,
+                        if path.contains("/pulls/") {
+                            pull("open", false, "head")
+                        } else if path.contains("/status?") {
+                            json!({"statuses":statuses})
+                        } else {
+                            run.clone()
+                        },
+                        &[]
+                    )))
+                    .1,
+                expected
+            );
+        }
+        for (state, merged, expected) in [("closed", false, "closed"), ("closed", true, "merged")] {
+            let mut probes = Probes::default();
+            let mut calls = 0;
+            assert_eq!(
+                probes.probe("pr", "o", "r", "42", true, 0, |path, _| {
+                    calls += 1;
+                    assert!(path.contains("/pulls/"));
+                    Ok(response(200, pull(state, merged, "head"), &[]))
+                }),
+                (true, expected.to_string())
+            );
+            assert_eq!(calls, 1);
+        }
+    }
+
+    #[test]
+    fn malformed_or_partial_pages_never_report_completion() {
+        let mut probes = Probes::default();
+        assert_eq!(
+            probes
+                .probe("a", "o", "r", "sha", false, 0, |_, _| Ok(response(
+                    304,
+                    Value::Null,
+                    &[]
+                )))
+                .1,
+            "probe_error:payload"
+        );
+        assert_eq!(
+            probes
+                .probe("b", "o", "r", "sha", false, 0, |path, _| {
+                    Ok(if path.ends_with("page=1") {
+                        response(200, completed(), &[("link", "<x>; rel=\"next\"")])
+                    } else {
+                        response(200, json!({"message":"bad payload"}), &[])
+                    })
+                })
+                .1,
+            "probe_error:payload"
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_delta_seconds_and_http_date() {
+        assert_eq!(retry_after("120", 1_000), Some(121_000));
+        assert_eq!(
+            retry_after("Sat, 07 Nov 2026 03:00:00 GMT", 0),
+            super::super::parse_rfc3339_ms("2026-11-07T03:00:00Z")
+        );
+        assert_eq!(retry_after("invalid", 0), None);
+    }
+
+    #[test]
+    fn gh_included_headers_keep_error_responses_and_etags() {
+        let response = parse_response(b"HTTP/2.0 403 Forbidden\r\nRetry-After: 120\r\nETag: W/\"a\"\r\n\r\n{\"message\":\"secondary rate limit\"}\n").unwrap();
+        assert_eq!(response.status, 403);
+        assert_eq!(response.headers["retry-after"], "120");
+        assert_eq!(response.headers["etag"], "W/\"a\"");
+        assert!(response.body.contains("secondary rate limit"));
+        assert_eq!(
+            parse_response(b"HTTP/2.0 304 Not Modified\nEtag: x\n\n")
+                .unwrap()
+                .status,
+            304
+        );
+        assert_eq!(encode("feature/path #?"), "feature%2Fpath%20%23%3F");
+    }
 }
