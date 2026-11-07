@@ -334,8 +334,9 @@ struct SendArgs {
     /// Destinations: agent names or IDs (`sage`, `agent:sage`, `agt_...`, `parent`,
     /// `children`), internal groups (`group:owners`, `group:<name>`, `group:all`, `all`),
     /// or external channel targets (`telegram:chat:<chat_id>[:<topic_id>]`,
-    /// `telegram:user:<user_id>[:<message_id>]`). Sending to an archived agent's
-    /// name or `agt_...` ID automatically wakes and resumes its session. May be
+    /// `telegram:user:<user_id>[:<message_id>]`). An authored send addressed to
+    /// exactly one archived agent by name or `agt_...` ID wakes its session.
+    /// Broadcasts, channel updates and system events do not. May be
     /// empty (`[]`) when `reply_to` names a mailbox reference (`anyagents:reply:<msg_id>`)
     /// or when performing a message interaction (`action`: `"react"` | `"vote"` | `"edit"` | `"delete"` | `"pin"` | `"unpin"` | `"stop_poll"`).
     #[serde(default, deserialize_with = "crate::api::deserialize_string_or_vec")]
@@ -669,8 +670,8 @@ struct SubagentsArgs {
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ArchiveArgs {
     /// Agent name or `agt_...` ID to archive (scales process to zero while keeping
-    /// its permanent `agt_...` ID, mailbox, and session on disk so any future message
-    /// or `wake` call resumes it). Defaults to this agent itself when omitted.
+    /// its permanent `agt_...` ID, mailbox, and session on disk so an intentional
+    /// direct `send` or `wake` call resumes it). Defaults to this agent itself when omitted.
     #[serde(
         default,
         alias = "id",
@@ -1792,7 +1793,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so any future message or `wake` call resumes it. For sub-agents with a managed Git worktree, automatically runs `git worktree remove` if the worktree is clean and has no unpushed commits, or preserves the worktree on disk if uncommitted/unpushed work remains."
+        description = "Archive an agent (`state = archived`), stopping its OS process while preserving its permanent `agt_...` ID, mailbox, and session so an intentional direct `send` or `wake` call resumes it. For sub-agents with a managed Git worktree, automatically runs `git worktree remove` if the worktree is clean and has no unpushed commits, or preserves the worktree on disk if uncommitted/unpushed work remains."
     )]
     async fn archive(
         &self,

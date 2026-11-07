@@ -700,8 +700,7 @@ async fn mcp_tools_use_the_server_socket() {
         "{all_recipients:?}"
     );
 
-    // Sending directly to an explicitly archived sub-agent queues the message without auto-waking it;
-    // only an explicit `wake` action resumes it to `running`.
+    // An intentional direct send by immutable id wakes the archived sub-agent.
     let queued_send: SendResponse = ok_json(
         call(
             &alpha,
@@ -724,7 +723,7 @@ async fn mcp_tools_use_the_server_socket() {
         .iter()
         .find(|a| a.id == spawned.id)
         .expect("worker-1");
-    assert_eq!(worker_row.state, "archived");
+    assert_eq!(worker_row.state, "running");
 
     let woken: AgentView = ok_json(
         call(

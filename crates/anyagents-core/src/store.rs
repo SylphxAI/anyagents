@@ -644,6 +644,17 @@ impl Store {
             .optional()?)
     }
 
+    /// A committed mailbox receipt for this source, including when the server
+    /// stopped before recording its whole-send receipt. Call under the lifecycle
+    /// lock before preparing an archived recipient for an idempotent retry.
+    pub fn message_by_source_key(
+        &self,
+        agent_id: &AgentId,
+        key: &str,
+    ) -> Result<Option<Message>, Error> {
+        message_by_source(&self.conn(), agent_id, key)
+    }
+
     /// Keep one named send's receipt after it was delivered.
     pub fn record_send_receipt(&self, id: &str, receipt: &str) -> Result<(), Error> {
         let conn = self.conn();
@@ -771,6 +782,31 @@ impl Store {
             return Err(Error::Io(err));
         }
         Ok(AgentLock { _file: file })
+    }
+
+    /// Serialize lifecycle state and archive-marker changes across API/server
+    /// processes. This is separate from the vendor-process lock: an archived
+    /// or live process must never prevent its lifecycle from being changed.
+    /// Keep the returned file open through preparation and the store commit.
+    pub fn lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+        let dir = self.data_dir.join("locks");
+        std::fs::create_dir_all(&dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(format!("{}.lifecycle", agent_id.as_str())))?;
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if rc == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(Error::Io(error));
+            }
+        }
     }
 
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
@@ -1407,6 +1443,29 @@ impl Store {
     /// Append one message, or return the row already stored for this source key.
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_wake(agent_id, incoming, false)
+    }
+
+    /// Append an intentional, directly addressed send and wake its recipient,
+    /// including an archived agent, in the same transaction. The caller must
+    /// authenticate the author, exclude fan-out and channel/system events, and
+    /// hold the lifecycle lock through clearing any explicit archive marker and
+    /// this call. Ordinary ingress must
+    /// use `receive`; a duplicate never changes the recipient's lifecycle.
+    pub fn receive_direct_send(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+    ) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_wake(agent_id, incoming, true)
+    }
+
+    fn receive_with_wake(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+    ) -> Result<ReceiveOutcome, Error> {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
@@ -1656,7 +1715,13 @@ impl Store {
             ],
         )?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
-        let woke_idle = if is_passive_reaction {
+        let woke_agent = if wake_archived {
+            tx.execute(
+                "UPDATE agents SET state = 'running'
+                 WHERE id = ?1 AND state IN ('idle', 'created', 'archived')",
+                [agent_id.as_str()],
+            )? > 0
+        } else if is_passive_reaction {
             false
         } else {
             tx.execute(
@@ -1685,7 +1750,7 @@ impl Store {
         }
         tx.commit()?;
         drop(conn);
-        if woke_idle {
+        if woke_agent {
             self.notify(Wake::Agent {
                 agent_id: agent_id.clone(),
             });
@@ -5926,6 +5991,55 @@ mod tests {
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
         store.receive(&child.id, Incoming::new("task 3")).unwrap();
         assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+    }
+
+    #[test]
+    fn only_direct_send_ingress_wakes_archived_and_duplicate_does_not_rewake() {
+        let (dir, store) = setup();
+        let recipient = agent(&store, "recipient");
+        store.set_agent_state(&recipient.id, "archived").unwrap();
+        // Lifecycle, channel and schedule ingress uses receive, even when a
+        // generated notification names an agent as its sender.
+        for (sender, key, text) in [
+            (
+                "agent:child",
+                "subagent_completed:child:1",
+                "[Sub-Agent Completed] done",
+            ),
+            (
+                "agent:child",
+                "subagent-error:child:1",
+                "[Sub-Agent Error] failed",
+            ),
+            ("system", "idle:1", "idle event"),
+            ("telegram:user:123", "telegram:123:1", "channel update"),
+            ("schedule:timer", "schedule:timer:1", "timer prompt"),
+            ("schedule:watch", "watch:watch:1", "watch prompt"),
+        ] {
+            let mut incoming = Incoming::new(text);
+            incoming.sender = Some(sender.into());
+            incoming.source_key = Some(key.into());
+            store.receive(&recipient.id, incoming).unwrap();
+            assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
+        }
+        let mut incoming = Incoming::new("intentional follow-up");
+        incoming.sender = Some("agent:parent".into());
+        incoming.source_key = Some("direct-1".into());
+        let sent = store
+            .receive_direct_send(&recipient.id, incoming.clone())
+            .unwrap();
+        assert!(matches!(sent, ReceiveOutcome::New(_)));
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
+        store.set_agent_state(&recipient.id, "archived").unwrap();
+        assert!(matches!(
+            store.receive_direct_send(&recipient.id, incoming).unwrap(),
+            ReceiveOutcome::Duplicate(_)
+        ));
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
+        assert_eq!(store.inbox(&recipient.id, None).unwrap().len(), 7);
     }
 
     #[test]
