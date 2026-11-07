@@ -280,6 +280,16 @@ fn open_child(
     }
 }
 
+fn open_managed_config(data: &Path, target: &AgentId) -> std::io::Result<File> {
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(data)?;
+    let agents = open_child(&root, std::ffi::OsStr::new("agents"), true, false)?;
+    let agent = open_child(&agents, std::ffi::OsStr::new(target.as_str()), true, false)?;
+    open_child(&agent, std::ffi::OsStr::new("config"), true, false)
+}
+
 struct SessionFile {
     path: PathBuf,
     file: File,
@@ -435,11 +445,7 @@ impl Store {
         let mut sessions = Vec::new();
         let mut unscrubbed = Vec::new();
         if config.exists() {
-            match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
-                .open(&config)
-            {
+            match open_managed_config(self.data_dir(), target) {
                 Ok(dir) => collect_sessions(dir, &config, &mut sessions, &mut unscrubbed),
                 Err(_) => {
                     unscrubbed.push(failure(&config, "cannot inspect managed config directory"))
@@ -481,7 +487,7 @@ impl Store {
         let (span, start, end) = bounds(&original, request.span.as_ref())?;
         if original[start..end] == *TOMBSTONE
             && let Some(raw) = tx.query_row(
-                "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 ORDER BY created_at_ms DESC LIMIT 1",
+                "SELECT receipt FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2 AND (SELECT count(*) FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2) = 1 LIMIT 1",
                 params![target.as_str(), id], |r| r.get::<_, String>(0)).optional()? {
             return serde_json::from_str(&raw).map_err(|_| invalid("unreadable redaction receipt"));
         }

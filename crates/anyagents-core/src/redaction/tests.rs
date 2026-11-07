@@ -472,3 +472,47 @@ fn transcript_content_equal_to_protocol_identifier_never_changes_call_id() {
     assert_eq!(value["output"], TOMBSTONE);
     assert!(!receipt.full_scrub); // Deliberately preserved protocol metadata is reported.
 }
+
+#[test]
+fn linked_agent_directory_cannot_redirect_scrubbing_outside_the_managed_tree() {
+    let f = Fixture::new();
+    let m = f.message("syntheticcanary");
+    let outside = f.dir.path().join("outside-agent");
+    std::fs::create_dir_all(outside.join("config")).unwrap();
+    let external_session = outside.join("config/sylphx-transcript.jsonl");
+    let raw = format!("{}\n", json!({"output":m.text}));
+    std::fs::write(&external_session, &raw).unwrap();
+    std::fs::create_dir_all(f.dir.path().join("agents")).unwrap();
+    std::os::unix::fs::symlink(
+        &outside,
+        f.dir.path().join("agents").join(f.target.id.as_str()),
+    )
+    .unwrap();
+    let receipt = f.redact(&request(m.id.as_str(), None)).unwrap();
+    assert!(!receipt.full_scrub);
+    assert_eq!(receipt.unscrubbed.len(), 1);
+    assert_eq!(std::fs::read_to_string(external_session).unwrap(), raw);
+}
+
+#[test]
+fn nested_serialized_json_and_unicode_escapes_scrub_logical_text() {
+    let f = Fixture::new();
+    let m = f.message("prefix 後syntheticcanary suffix");
+    let path = f.path("sylphx-transcript.jsonl");
+    let nested = json!({"rows":[{"value":m.text}]}).to_string();
+    let raw = format!(
+        "{}\n",
+        json!({"type":"function_call_output", "call_id":"stable", "output":nested})
+    )
+    .replace('後', "\\u5f8c");
+    std::fs::write(&path, raw).unwrap();
+    let receipt = f
+        .redact(&request(m.id.as_str(), Some(chars(7, 23))))
+        .unwrap();
+    assert!(receipt.full_scrub, "{receipt:?}");
+    let outer: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let inner: serde_json::Value = serde_json::from_str(outer["output"].as_str().unwrap()).unwrap();
+    assert_eq!(inner["rows"][0]["value"], "prefix [redacted] suffix");
+    assert_eq!(outer["call_id"], "stable");
+}
