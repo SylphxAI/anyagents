@@ -3007,6 +3007,80 @@ fn is_self_or_ancestor(
     false
 }
 
+/// Resolve the caller's conversation visibility once, before selecting a
+/// recent or Raw-RAG read path. Non-admin agents see only themselves and their
+/// descendants; `all` is an alias for exactly that set. Administrative reads
+/// are intentionally unrestricted and leave an audit row.
+fn conversation_visibility(
+    store: &Store,
+    principal: &Principal,
+    requested: &str,
+) -> Result<(String, Option<Vec<String>>), ApiError> {
+    let requested = requested.trim();
+    match principal {
+        Principal::Operator => {
+            store
+                .record_admin_audit("operator", "conversation.read", requested)
+                .map_err(ApiError::from_store)?;
+            Ok((requested.to_string(), None))
+        }
+        Principal::Agent { agent_id, .. } => {
+            let caller = store.agent(agent_id).map_err(ApiError::from_store)?;
+            let admin = caller.parent_id.is_none() && caller.is_admin;
+            if admin {
+                let requested = if requested.eq_ignore_ascii_case("self") {
+                    caller.name.as_str()
+                } else {
+                    requested
+                };
+                store
+                    .record_admin_audit(
+                        &format!("agent:{}", caller.name),
+                        "conversation.read",
+                        requested,
+                    )
+                    .map_err(ApiError::from_store)?;
+                return Ok((requested.to_string(), None));
+            }
+
+            let agents = store.list_agents().map_err(ApiError::from_store)?;
+            let mut visible_ids = std::collections::HashSet::from([caller.id.clone()]);
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for agent in &agents {
+                    if let Some(parent) = &agent.parent_id
+                        && visible_ids.contains(parent)
+                        && visible_ids.insert(agent.id.clone())
+                    {
+                        changed = true;
+                    }
+                }
+            }
+            let visible_agent_ids: Vec<String> =
+                visible_ids.iter().map(ToString::to_string).collect();
+
+            if requested.eq_ignore_ascii_case("self") {
+                return Ok((caller.name, Some(vec![caller.id.to_string()])));
+            }
+            if requested.eq_ignore_ascii_case("all") || requested == "*" {
+                return Ok(("all".to_string(), Some(visible_agent_ids)));
+            }
+
+            let target = store
+                .agent_by_name(requested)
+                .map_err(ApiError::from_store)?;
+            if !visible_ids.contains(&target.id) {
+                return Err(ApiError::forbidden(format!(
+                    "agent `{}` cannot read private conversation history of `{}`",
+                    caller.name, target.name
+                )));
+            }
+            Ok((target.name, Some(vec![target.id.to_string()])))
+        }
+    }
+}
+
 async fn add_channel_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -4641,47 +4715,7 @@ async fn conversation_route(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
-        let mut effective_name = name.clone();
-        if let Principal::Agent { ref agent_id, .. } = principal
-            && let Ok(caller) = state.store.agent(agent_id)
-        {
-            if caller.is_isolated() {
-                if effective_name.eq_ignore_ascii_case("all")
-                    || effective_name == "*"
-                    || effective_name.eq_ignore_ascii_case("self")
-                {
-                    effective_name = caller.name.clone();
-                } else if let Ok(target) = state.store.agent_by_name(&effective_name)
-                    && !is_self_or_ancestor(&state.store, &caller.id, &target)
-                {
-                    return Err(ApiError::forbidden(format!(
-                        "isolated agent `{}` (`scope: isolated`) can only read its own or its descendants' conversation history",
-                        caller.name
-                    )));
-                }
-            } else if !effective_name.eq_ignore_ascii_case("all")
-                && effective_name != "*"
-                && !effective_name.eq_ignore_ascii_case("self")
-                && let Ok(target) = state.store.agent_by_name(&effective_name)
-                && !is_self_or_ancestor(&state.store, &caller.id, &target)
-            {
-                let allowed = !target.is_isolated()
-                    && (caller.parent_id.is_none()
-                        || (caller.allows_sibling_messages()
-                            && caller.parent_id == target.parent_id)
-                        || target.is_public()
-                        || state.store.share_any_group_or_chat(&caller.id, &target.id));
-                if !allowed {
-                    return Err(ApiError::forbidden(format!(
-                        "agent `{}` cannot read private conversation history of `{}` (`scope: {}`)",
-                        caller.name,
-                        target.name,
-                        target.scope()
-                    )));
-                }
-            }
-        }
-        let name = effective_name;
+        let (name, visible_agent_ids) = conversation_visibility(&state.store, &principal, &name)?;
         let clean_q = query
             .query
             .as_deref()
@@ -4740,6 +4774,7 @@ async fn conversation_route(
                 sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
                 radius: query.radius.unwrap_or(0),
                 limit: query.limit.unwrap_or(20),
+                visible_agent_ids: visible_agent_ids.clone(),
             };
             let turns = state
                 .store
@@ -4756,7 +4791,12 @@ async fn conversation_route(
         } else if is_all {
             let turns = state
                 .store
-                .conversation_all(query.with.as_deref(), query.since_ms, query.limit)
+                .conversation_all_scoped(
+                    query.with.as_deref(),
+                    query.since_ms,
+                    query.limit,
+                    visible_agent_ids.as_deref(),
+                )
                 .map_err(ApiError::from_store)?;
             ("all".to_string(), "all".to_string(), turns)
         } else {
@@ -4766,11 +4806,12 @@ async fn conversation_route(
                 .map_err(ApiError::from_store)?;
             let turns = state
                 .store
-                .conversation(
+                .conversation_scoped(
                     &agent.id,
                     query.with.as_deref(),
                     query.since_ms,
                     query.limit,
+                    visible_agent_ids.as_deref(),
                 )
                 .map_err(ApiError::from_store)?;
             (agent.name, agent.id.to_string(), turns)
