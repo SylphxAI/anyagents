@@ -615,6 +615,11 @@ pub fn reset_session_cmd(data: &Path, name: &str) -> Result<(), Error> {
         .map_err(Error::Message)?
         .ok_or_else(|| Error::Message("the server answered nothing".into()))?
     } else {
+        if client::agent_identity().is_some() {
+            return Err(Error::Message(
+                "agent session reset requires the authenticated server; offline database fallback is disabled".into(),
+            ));
+        }
         let store = open(data)?;
         let found = store.agent_by_name(name)?;
         let _lifecycle = store.try_lock_agent_lifecycle(&found.id)?;

@@ -6773,6 +6773,7 @@ pub(crate) mod tests {
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
+            identity: Arc::new(ServingIdentity::capture()),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = |a: &Agent| Principal::Agent {
@@ -6886,6 +6887,7 @@ pub(crate) mod tests {
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
+            identity: Arc::new(ServingIdentity::capture()),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             let principal = || Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() };
@@ -6970,6 +6972,7 @@ pub(crate) mod tests {
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
+            identity: Arc::new(ServingIdentity::capture()),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
@@ -7152,6 +7155,7 @@ pub(crate) mod tests {
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
+            identity: Arc::new(ServingIdentity::capture()),
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
             for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {

@@ -1363,3 +1363,91 @@ fn agent_group_cli_mutations_refuse_offline_database_fallback() {
     );
     assert!(store.group_members("offline-room").unwrap().is_empty());
 }
+
+#[test]
+fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    let store = Store::open(data.join("state.db")).unwrap();
+    let own = store
+        .create_agent(NewAgent::new("offline-reset-own", "sylphx"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("offline-reset-peer", "sylphx"))
+        .unwrap();
+    for target in [&own, &peer] {
+        store.set_agent_state(&target.id, "paused").unwrap();
+        let root = data.join("agents").join(target.id.as_str());
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "old offline pin").unwrap();
+        let first = host_session::ensure_active(&root, "sylphx").unwrap();
+        std::fs::write(
+            root.join("config/sylphx-session-id"),
+            "old-offline-vendor\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("config/sylphx-transcript.jsonl"),
+            "retained raw bytes",
+        )
+        .unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "new offline pin").unwrap();
+        let registry = std::fs::read(root.join("sessions/registry.json")).unwrap();
+        let pin_count = std::fs::read_dir(root.join("sessions")).unwrap().count();
+        assert!(!data.join("anyagents.sock").exists());
+        let refused = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .arg("--data")
+            .arg(data)
+            .args(["agents", "reset-session", &target.name])
+            .env("ANYAGENTS_AGENT_ID", own.id.as_str())
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            !refused.status.success(),
+            "agent reset succeeded: {refused:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("session reset requires the authenticated server"),
+            "{refused:?}"
+        );
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert_eq!(
+            std::fs::read(root.join("sessions/registry.json")).unwrap(),
+            registry
+        );
+        assert_eq!(
+            std::fs::read_dir(root.join("sessions")).unwrap().count(),
+            pin_count
+        );
+        assert_eq!(
+            std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+            b"old-offline-vendor\n"
+        );
+        assert_eq!(host_session::active(&root).unwrap().unwrap(), first);
+
+        let accepted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+            .arg("--data")
+            .arg(data)
+            .args(["agents", "new-session", &target.name])
+            .env_remove("ANYAGENTS_AGENT_ID")
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .output()
+            .unwrap();
+        assert!(accepted.status.success(), "{accepted:?}");
+        let value: Value = serde_json::from_slice(&accepted.stdout).unwrap();
+        let next = host_session::active(&root).unwrap().unwrap();
+        assert_eq!(value["generation"], next.generation);
+        assert_ne!(next.generation, first.generation);
+        assert!(next.memory.section.contains("new offline pin"));
+        assert!(!root.join("config/sylphx-session-id").exists());
+        assert_eq!(
+            std::fs::read(root.join("config/sylphx-transcript.jsonl")).unwrap(),
+            b"retained raw bytes"
+        );
+    }
+}

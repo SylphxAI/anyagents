@@ -28,6 +28,7 @@ fn state(store: Arc<Store>, data: &Path) -> AppState {
         auth: auth::Mode::Trusted {
             data_dir: data.into(),
         },
+        identity: Arc::new(ServingIdentity::capture()),
     }
 }
 
