@@ -284,6 +284,16 @@ fn read_page(
             let until = retry
                 .and_then(|v| retry_after(v, now))
                 .or_else(|| {
+                    // Secondary limits have an independent primary reset
+                    // header, often an hour away. Use it only for primary
+                    // exhaustion, never as the secondary cooldown.
+                    if response
+                        .headers
+                        .get("x-ratelimit-remaining")
+                        .is_none_or(|v| v != "0")
+                    {
+                        return None;
+                    }
                     response
                         .headers
                         .get("x-ratelimit-reset")
@@ -816,6 +826,46 @@ mod tests {
                 .1,
             "probe_error:payload"
         );
+    }
+
+    #[test]
+    fn secondary_limits_do_not_wait_for_an_unexhausted_primary_window() {
+        let mut probes = Probes::default();
+        for (now, until) in [(0, 60_000), (60_000, 180_000)] {
+            assert_eq!(
+                probes
+                    .probe("a", "o", "r", "sha", false, now, |_, _| {
+                        Ok(response(
+                            403,
+                            json!({"message":"You have exceeded a secondary rate limit."}),
+                            &[
+                                ("x-ratelimit-remaining", "4990"),
+                                ("x-ratelimit-reset", "3600"),
+                            ],
+                        ))
+                    })
+                    .1,
+                "probe_error:rate_limited"
+            );
+            assert_eq!(probes.limited_until, until);
+        }
+        let mut probes = Probes::default();
+        assert_eq!(
+            probes
+                .probe("a", "o", "r", "sha", false, 0, |_, _| {
+                    Ok(response(
+                        403,
+                        json!({"message":"API rate limit exceeded"}),
+                        &[
+                            ("x-ratelimit-remaining", "0"),
+                            ("x-ratelimit-reset", "3600"),
+                        ],
+                    ))
+                })
+                .1,
+            "probe_error:rate_limited"
+        );
+        assert_eq!(probes.limited_until, 3_600_000);
     }
 
     #[test]
