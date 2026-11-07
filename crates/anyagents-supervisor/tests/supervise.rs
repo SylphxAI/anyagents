@@ -972,7 +972,16 @@ impl anyagents_harness::Harness for SwitchHarness {
     }
 }
 
-fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RetiringTurn {
+    Healthy,
+    Faulted,
+    FaultedIdle,
+    QuotaBlocked,
+    Dead,
+}
+
+fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
     use anyagents_harness::TurnState;
     use std::sync::Mutex;
 
@@ -996,6 +1005,17 @@ fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
         .unwrap();
     let pending = store.next_undelivered(&agent.id).unwrap().unwrap();
     let before_cursor = store.delivered_cursor(&agent.id).unwrap();
+    let schedule = store
+        .create_schedule(anyagents_core::NewSchedule {
+            agent_id: agent.id.clone(),
+            kind: "watch".into(),
+            spec: "file:/synthetic/event".into(),
+            prompt: "preserve the existing wake".into(),
+            interval_ms: None,
+            next_fire_at_ms: None,
+            watch_baseline: Some("original-baseline".into()),
+        })
+        .unwrap();
     let launches = Arc::new(Mutex::new(Vec::new()));
     let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
     let clock = ManualClock::new(1_700_000_000_000);
@@ -1019,12 +1039,22 @@ fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
     let old = Arc::clone(&probes.lock().unwrap()[0]);
     {
         let mut probe = old.lock().unwrap();
-        probe.health.turn_state = TurnState::InTurn;
-        if faulted {
+        probe.health.turn_state = if retiring == RetiringTurn::FaultedIdle {
+            TurnState::Idle
+        } else {
+            TurnState::InTurn
+        };
+        if matches!(
+            retiring,
+            RetiringTurn::Faulted | RetiringTurn::FaultedIdle | RetiringTurn::QuotaBlocked
+        ) {
             probe.health.sign_in_fault = Some("HTTP 400: context limit exceeded".into());
+        }
+        if retiring == RetiringTurn::QuotaBlocked {
             // A pending switch must not inherit the retiring process's hold.
             probe.health.quota_reset_at_ms = Some(clock.now_ms() + 60_000);
         }
+        probe.health.process_alive = retiring != RetiringTurn::Dead;
     }
     if state != "running" {
         store.set_agent_state(&agent.id, state).unwrap();
@@ -1041,7 +1071,7 @@ fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
     store.poke(Wake::Agent {
         agent_id: agent.id.clone(),
     });
-    if state == "running" && !faulted {
+    if state == "running" && retiring == RetiringTurn::Healthy {
         assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
         assert_eq!(
             launches.lock().unwrap().len(),
@@ -1068,6 +1098,7 @@ fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
     let updated = store.agent(&agent.id).unwrap();
     assert_eq!(updated.id, agent.id);
     assert_eq!(updated.instructions, agent.instructions);
+    assert_eq!(store.get_schedule(&schedule.id).unwrap(), Some(schedule));
     assert!(old.lock().unwrap().given.is_empty());
     let replacement = Arc::clone(probes.lock().unwrap().last().unwrap());
     assert!(replacement.lock().unwrap().given.is_empty());
@@ -1087,25 +1118,40 @@ fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
 
 #[test]
 fn an_errored_turn_switches_harness_on_wake_without_draining_or_replaying_mail() {
-    switch_at_dispatch("running", true, false);
+    switch_at_dispatch("running", RetiringTurn::Faulted, false);
 }
 
 #[test]
 fn an_errored_turn_switches_model_on_wake_without_draining_or_replaying_mail() {
-    switch_at_dispatch("running", true, true);
+    switch_at_dispatch("running", RetiringTurn::Faulted, true);
 }
 
 #[test]
 fn a_paused_agent_switches_on_wake_without_replaying_mail() {
-    switch_at_dispatch("paused", false, false);
+    switch_at_dispatch("paused", RetiringTurn::Healthy, false);
 }
 
 #[test]
 fn an_archived_agent_switches_on_wake_without_replaying_mail() {
-    switch_at_dispatch("archived", false, false);
+    switch_at_dispatch("archived", RetiringTurn::Healthy, false);
 }
 
 #[test]
 fn a_healthy_turn_defers_switch_until_the_boundary_without_replaying_mail() {
-    switch_at_dispatch("running", false, false);
+    switch_at_dispatch("running", RetiringTurn::Healthy, false);
+}
+
+#[test]
+fn a_faulted_idle_process_switches_without_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::FaultedIdle, false);
+}
+
+#[test]
+fn a_faulted_quota_blocked_process_switches_without_replaying_mail() {
+    switch_at_dispatch("running", RetiringTurn::QuotaBlocked, false);
+}
+
+#[test]
+fn a_dead_process_switches_without_waiting_for_restart_backoff() {
+    switch_at_dispatch("running", RetiringTurn::Dead, false);
 }
