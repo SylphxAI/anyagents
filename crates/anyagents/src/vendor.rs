@@ -1288,6 +1288,13 @@ impl Harness for VendorHarness {
         }
     }
 
+    fn exit_diagnostic(&self) -> Option<String> {
+        match self {
+            Self::Claude(harness, _) => harness.exit_diagnostic(),
+            _ => None,
+        }
+    }
+
     fn health(&self) -> HarnessHealth {
         self.sync_session();
         match self {
@@ -1631,7 +1638,9 @@ mod tests {
         file(
             &probe,
             r#"#!/bin/sh
-set -eu
+exec 2> "$ANYAGENTS_AGENT_CONFIG/native-vendor-trace"
+set -eux
+trap 'status=$?; printf "PROBE_EXIT=%s\n" "$status" >&2' 0
 [ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
 [ -x "$ANYAGENTS_DATA/agents" ]; [ ! -r "$ANYAGENTS_DATA/agents" ]
 for mirror in .claude .agents .agy; do
@@ -1678,7 +1687,7 @@ cat >/dev/null
             std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
             std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
             std::env::set_var("ANYAGENTS_SOCKET_GID", "24033");
-            std::env::set_var("ANYAGENTS_CLAUDE_BIN", &probe);
+            std::env::set_var("ANYAGENTS_CLAUDE_CODE_BIN", &probe);
             std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv");
         }
         let launch = || {
@@ -1690,6 +1699,11 @@ cat >/dev/null
                 extra_env: vec![],
             })
         };
+        assert_eq!(
+            crate::install::program(&data, "claude-code"),
+            probe,
+            "the actual resolver must select the synthetic native probe"
+        );
         let harness = launch().unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !report.is_file() && std::time::Instant::now() < deadline {
@@ -1711,7 +1725,14 @@ cat >/dev/null
             "sharing must retain the existing owner-private vendor parent"
         );
         println!("NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED");
-        let evidence = std::fs::read_to_string(&report).unwrap();
+        let evidence = std::fs::read_to_string(&report).unwrap_or_else(|error| {
+            panic!(
+                "native vendor report missing: {error}; process={:?}; synthetic_trace={}",
+                harness.exit_diagnostic(),
+                std::fs::read_to_string(config.join("native-vendor-trace"))
+                    .unwrap_or_else(|e| format!("unavailable: {e}"))
+            );
+        });
         assert!(
             evidence.contains("REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK"),
             "{evidence}"
@@ -1740,6 +1761,52 @@ cat >/dev/null
             std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o700))
                 .unwrap();
             println!("NATIVE_VENDOR_WRITABLE_PEER_{name}_REFUSED_BEFORE_COMMAND");
+        }
+        // A distinct reader of a 0711 tree cannot list it but can still read a
+        // known public child. Refuse search access before the actual adapter
+        // starts, not merely directory read/write access in a synthetic shell.
+        for name in ["memory", "skills", "config"] {
+            let tree = peer.join(name);
+            let known = tree.join("known-readable");
+            file(&known, "synthetic-known-peer-bytes\n", 0o444, 0);
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o711)).unwrap();
+            let control = std::process::Command::new("/usr/bin/setpriv")
+                .args([
+                    "--reuid",
+                    "24031",
+                    "--regid",
+                    "24032",
+                    "--clear-groups",
+                    "--no-new-privs",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                    "[ ! -r \"$1\" ] && [ ! -w \"$1\" ] && [ -x \"$1\" ] && cat \"$2\"",
+                    "search-only-control",
+                ])
+                .arg(&tree)
+                .arg(&known)
+                .output()
+                .unwrap();
+            assert!(control.status.success(), "{name}: {control:?}");
+            assert_eq!(control.stdout, b"synthetic-known-peer-bytes\n");
+            let error = match launch() {
+                Ok(_) => panic!("search-only foreign {name} started vendor"),
+                Err(error) => error,
+            };
+            assert!(
+                error.contains(
+                    "agent not started: boundary check failed: peer seats' private trees are denied"
+                ),
+                "{name}: {error}"
+            );
+            assert!(
+                !report.exists(),
+                "vendor command ran before search-only refusal"
+            );
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_file(known).unwrap();
+            println!("NATIVE_VENDOR_SEARCH_ONLY_PEER_{name}_KNOWN_READ_REFUSED_BEFORE_COMMAND");
         }
         // The workspace-session initializer runs before normal Muse adapter
         // launch, including on explicit wake. A fresh marker must not conceal

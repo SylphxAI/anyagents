@@ -550,6 +550,23 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_program_override_uses_the_canonical_harness_identifier() {
+        let _environment = crate::server::tests::env_lock();
+        let root = crate::test_tempdir();
+        let expected = root.path().join("synthetic-claude-code-probe");
+        let decoy = root.path().join("noncanonical-claude-probe");
+        unsafe {
+            std::env::set_var("ANYAGENTS_CLAUDE_BIN", &decoy);
+            std::env::set_var("ANYAGENTS_CLAUDE_CODE_BIN", &expected);
+        }
+        assert_eq!(program(root.path(), "claude-code"), expected);
+        unsafe {
+            std::env::remove_var("ANYAGENTS_CLAUDE_BIN");
+            std::env::remove_var("ANYAGENTS_CLAUDE_CODE_BIN");
+        }
+    }
+
+    #[test]
     fn a_harness_that_answered_once_keeps_that_answer() {
         let root = tempfile::tempdir().unwrap();
         let installer = Installer::new(root.path());

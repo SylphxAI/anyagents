@@ -441,3 +441,43 @@ fn claude_code_2_1_assistant_rate_limit_event_and_session_jsonl_detection() {
         None
     );
 }
+
+#[test]
+fn stderr_is_drained_bounded_and_classified_without_publishing_vendor_secrets() {
+    let dir = TempDir::new().unwrap();
+    let mut harness = start(&dir, "hold", None);
+    assert!(harness.exit_diagnostic().is_none(), "live control");
+    drop(harness);
+    harness = start(&dir, "stderr_failure", None);
+    assert!(
+        harness.wait_dead(Duration::from_secs(5)),
+        "stderr must not fill the pipe"
+    );
+    // EOF on stdout and stderr can race; wait for the complete evidence rather
+    // than asserting a scheduler-specific order of reader notifications.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let diagnostic = loop {
+        let text = harness.exit_diagnostic().unwrap();
+        if text.contains("exit_code=23") && text.contains("stderr_complete=true") {
+            break text;
+        }
+        assert!(Instant::now() < deadline, "{text}");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert!(
+        diagnostic.contains("mentions_permission_denied"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("raw_stderr=withheld"));
+    assert!(
+        !diagnostic.contains("synthetic-password")
+            && !diagnostic.contains("do-not-publish")
+            && !diagnostic.contains("xxx")
+    );
+    assert!(diagnostic.len() < 300);
+    harness.resume("new-session").unwrap();
+    assert!(
+        harness.wait_dead(Duration::from_secs(5)),
+        "relaunch drains stderr independently"
+    );
+}

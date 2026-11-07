@@ -267,15 +267,19 @@ skills under daemon umask `077`, and requires reads through the actual
 must receive its projection through the narrow owner fallback without widening
 that parent. It also checks legacy SQLite ownership handoff with exact bytes,
 a second registered agent on the same UID/GID, writable foreign-seat
-memory/skills/config refusals before vendor execution, protected bytes/modes,
+memory/skills/config refusals before vendor execution, search-only (`0711`)
+foreign-tree refusal despite a known readable file, protected bytes/modes,
 and fixture removal. The same required test exercises the real Muse workspace
 session initializer with a fresh marker: each writable peer tree refuses before
 any vendor process starts, while a valid boundary admits one initializer and
 reuses its saved marker. It also launches the real Codex adapter with a preserved
 foreign `.claude` parent and with a foreign `.claude/skills` mount. Personal bytes
 remain unchanged and the active `.agents` skills remain readable. Admission
-honors these intentionally preserved foreign projections rather than requiring
-unrelated host names through them; ordinary host-managed views still must read.
+checks all three folders, not just the active harness. It honors intentionally
+preserved personal projections outside foreign managed-seat roots rather than
+requiring unrelated host names through them. Symlinked parents and mounts are
+resolved under the admitted identity and refuse foreign managed-seat roots or
+unresolvable targets; ordinary host-managed views still must read.
 Same-seat exceptions require the host-resolved principal
 and exact registered root, not merely ownership of a directory. Local unprivileged
 tests separately exercise deterministic directory-to-symlink replacement during

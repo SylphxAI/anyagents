@@ -325,18 +325,15 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(gamma_conv.contains("subagent task"), "{gamma_conv}");
 
-    // A root agent cannot be archived by an agent capability (prevents accidental self-archive).
-    let root_archive_refused = support::call_raw(
+    // Any root agent can intentionally archive itself.
+    let root_archived = support::call_raw(
         &socket,
         "POST",
         "/v1/agents/alpha/archive",
         "{}",
         &alpha_auth,
     );
-    assert!(
-        root_archive_refused.starts_with("HTTP/1.1 400"),
-        "{root_archive_refused}"
-    );
+    assert!(root_archived.starts_with("HTTP/1.1 200"), "{root_archived}");
 
     // An intentional direct send wakes an explicitly archived agent.
     let archived = support::call_raw(

@@ -22,6 +22,8 @@
 mod aci;
 mod auth;
 mod cloud;
+#[cfg(test)]
+mod masking_tests;
 mod memory;
 pub mod sdk;
 mod workspace;
@@ -2721,7 +2723,7 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": output,
                     });
-                    append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
                 }
             } else {
@@ -2794,7 +2796,7 @@ pub(crate) fn run_native_gateway_turn(
                         "call_id": call_id,
                         "output": clean_output,
                     });
-                    append_transcript_message(&transcript_path, &tool_out_item);
+                    let tool_out_item = append_transcript_message(&transcript_path, &tool_out_item);
                     input_items.push(tool_out_item);
                     if let Some(data_url) = attached_image_data_url {
                         let image_item = json!({
@@ -3623,7 +3625,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "agent": { "type": "string", "description": "`\"self\"` (default), `\"all\"`, or agent name/`agt_...` ID." },
                         "description": { "type": "string", "description": "Public role/capability summary." },
                         "instructions": { "type": "string", "description": "Private system prompt (`SYSTEM_PROMPT.md`)." },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "public": { "type": "boolean", "description": "Whether agents outside this agent's parent/children tree can message it directly." },
                         "clear": { "type": "boolean" }
                     }
@@ -3657,7 +3659,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "new_name": { "type": "string", "description": "Target name when `action` is `\"rename\"`." },
                         "parent": { "type": "string" },
                         "state": { "type": "string" },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "harness": { "type": "string" },
                         "model": { "type": "string" },
                         "profile": { "type": "string" },
@@ -4035,7 +4037,48 @@ fn build_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// The sole tool-result ingress: every execution route yields complete text here.
+/// Mask before any size projection, then expose only this value to local/cloud
+/// consumers. Producers must not truncate text before returning to this boundary.
 fn execute_sylphx_tool(
+    name: &str,
+    args: &Value,
+    config_dir: &Path,
+    work_dir: &Path,
+    env: &[(String, String)],
+    mcp_command: &Path,
+    mcp_args: &[String],
+) -> String {
+    let raw = execute_sylphx_tool_raw(name, args, config_dir, work_dir, env, mcp_command, mcp_args);
+    let masked = anyagents_core::masking::mask_known_secrets(&raw).into_owned();
+    let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
+    // Preserve the existing producer-specific observation bounds. Binary image
+    // attachments and native recall retain their own structured representations.
+    let limits = match normalized {
+        "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
+        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
+            Some((24_000, 11_000, 11_000))
+        }
+        "bash" | "shell" | "code_mode" | "grep" | "glob" => Some((30_000, 14_000, 14_000)),
+        "list_dir" if workspace::delegated(env) => Some((30_000, 14_000, 14_000)),
+        "read_file"
+            if args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(image_mime_for_path)
+                .is_none() =>
+        {
+            Some((64_000, 30_000, 30_000))
+        }
+        _ => None,
+    };
+    match limits {
+        Some((max, head, tail)) => truncate_tool_output_middle_utf8(masked, max, head, tail),
+        None => masked,
+    }
+}
+
+fn execute_sylphx_tool_raw(
     name: &str,
     args: &Value,
     config_dir: &Path,
@@ -4316,7 +4359,7 @@ fn execute_sylphx_tool(
             let script = format!(
                 "rg -n --max-count 100{glob_arg} -- '{escaped_pat}' '{escaped_path}' | head -n 200"
             );
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4334,7 +4377,7 @@ fn execute_sylphx_tool(
             let escaped_pat = pat.replace('\'', "'\\''");
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("rg --files -g '{escaped_pat}' '{escaped_path}' | head -n 200");
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4351,7 +4394,7 @@ fn execute_sylphx_tool(
             }
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("ls -la '{escaped_path}' | head -n 200");
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4370,7 +4413,7 @@ fn execute_sylphx_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(120_000);
             let wrapped = build_code_mode_command(code_str, config_dir, mcp_command, mcp_args);
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": wrapped, "timeout_ms": timeout_ms }),
                 config_dir,
@@ -4639,7 +4682,7 @@ fn call_anyagents_mcp_tool(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| value.to_string());
-                return truncate_tool_output_middle_utf8(output, 24_000, 11_000, 11_000);
+                return output;
             }
             Err(err) => {
                 last_err = err;
@@ -5235,9 +5278,98 @@ mod tests {
         assert!(b.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
 
+    // Both HTTP fakes consume a complete framed request before replying. One
+    // TCP read may return just part of a header or body; closing with unread
+    // bytes can reset the client and consume a scripted retry response.
+    fn read_gateway_request(reader: &mut impl std::io::Read) -> std::io::Result<Value> {
+        use std::io::{Error, ErrorKind};
+        const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, length) = loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "gateway HTTP headers truncated",
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+            if bytes.len() > MAX_REQUEST_BYTES {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "gateway HTTP request too large",
+                ));
+            }
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                if !headers.starts_with("post /v1/responses ") {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "unexpected gateway HTTP route",
+                    ));
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "gateway Content-Length missing")
+                    })?;
+                break (end + 4, length);
+            }
+        };
+        let total = header_end
+            .checked_add(length)
+            .filter(|total| *total <= MAX_REQUEST_BYTES)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "gateway HTTP request too large"))?;
+        if bytes.len() < total {
+            let received = bytes.len();
+            bytes.resize(total, 0);
+            reader.read_exact(&mut bytes[received..])?;
+        }
+        serde_json::from_slice(&bytes[header_end..total])
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))
+    }
+
+    #[test]
+    fn gateway_http_fixture_reads_fragmented_headers_and_large_bodies_completely() {
+        use std::io::{Cursor, Read as _};
+        let expected =
+            json!({"input": [{"role": "user", "content": "fragmented 中 payload ".repeat(1500)}]});
+        let body = serde_json::to_vec(&expected).unwrap();
+        assert!(body.len() > 8192);
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut fragments = Cursor::new(&headers.as_bytes()[..17])
+            .chain(Cursor::new(&headers.as_bytes()[17..headers.len() - 1]))
+            .chain(Cursor::new(&headers.as_bytes()[headers.len() - 1..]))
+            .chain(Cursor::new(&body[..13]))
+            .chain(Cursor::new(&body[13..]));
+        assert_eq!(read_gateway_request(&mut fragments).unwrap(), expected);
+    }
+
+    #[test]
+    fn gateway_http_fixture_refuses_truncated_or_oversized_bodies() {
+        let mut truncated = &b"POST /v1/responses HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}"[..];
+        assert_eq!(
+            read_gateway_request(&mut truncated).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let mut oversized = &b"POST /v1/responses HTTP/1.1\r\nContent-Length: 2097152\r\n\r\n"[..];
+        assert_eq!(
+            read_gateway_request(&mut oversized).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn context_preflight_guards_real_native_http_dispatch() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
@@ -5267,32 +5399,7 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            let (header_end, length) = loop {
-                let n = stream.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
-                    assert!(headers.starts_with("post /v1/responses "));
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    break (end + 4, length);
-                }
-            };
-            while bytes.len() < header_end + length {
-                let n = stream.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-            }
-            let request: Value =
-                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            let request = read_gateway_request(&mut stream).unwrap();
             assert!(
                 request["input"][0]["content"]
                     .as_str()
@@ -6017,7 +6124,7 @@ mod tests {
 
     #[test]
     fn transient_503_model_unavailable_retries_and_persistent_503_surfaces_fault() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         use std::sync::atomic::AtomicUsize;
 
@@ -6029,8 +6136,10 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let _request = read_gateway_request(&mut stream).unwrap();
                 let n = hits_cl.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     // 1st attempt: transient 503 model_unavailable
@@ -6090,6 +6199,26 @@ mod tests {
         )
         .unwrap();
 
+        let (activity_tx, activity_rx) = std::sync::mpsc::channel();
+        harness.watch_activity(Arc::new(move || {
+            let _ = activity_tx.send(());
+        }));
+        let wait_for_completion = |harness: &SylphxHarness| {
+            // A progress ceiling, not a retry latency requirement. CI run
+            // 42345118559 failed the count assertion after a 1.6 s poll limit.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while harness.health().turn_state != TurnState::Idle {
+                assert!(
+                    activity_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .is_ok(),
+                    "turn did not complete: health={:?}, HTTP requests={}",
+                    harness.health(),
+                    hits.load(Ordering::SeqCst),
+                );
+            }
+        };
+
         // Turn 1: first request gets 503, retries automatically, and succeeds on 2nd request!
         let msg1 = OutboundMessage {
             id: "msg_retry_ok".to_string(),
@@ -6101,13 +6230,9 @@ mod tests {
             context: Context::default(),
         };
         harness.deliver(&msg1).unwrap();
-        for _ in 0..80 {
-            if harness.health().turn_state == TurnState::Idle {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_completion(&harness);
         assert_eq!(harness.turns_served(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(harness.health().sign_in_fault.is_none());
         assert!(!cfg.join(".anyagents-last-error.json").exists());
 
@@ -6122,13 +6247,9 @@ mod tests {
             context: Context::default(),
         };
         harness.deliver(&msg2).unwrap();
-        for _ in 0..80 {
-            if harness.health().turn_state == TurnState::Idle {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_completion(&harness);
         assert_eq!(harness.turns_served(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
         let fault = harness
             .health()
             .sign_in_fault

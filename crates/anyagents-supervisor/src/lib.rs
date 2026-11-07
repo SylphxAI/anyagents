@@ -278,6 +278,9 @@ struct Slot {
     thread: Option<JoinHandle<()>>,
 }
 
+#[cfg(test)]
+type IdleReleaseHook = Arc<dyn Fn(&AgentId) + Send + Sync>;
+
 struct Inner<H> {
     store: Arc<Store>,
     clock: Arc<dyn Clock>,
@@ -286,6 +289,8 @@ struct Inner<H> {
     board: HealthBoard,
     stop: AtomicBool,
     workers: Mutex<HashMap<AgentId, Slot>>,
+    #[cfg(test)]
+    idle_release_hook: Option<IdleReleaseHook>,
 }
 
 /// Keeps one harness process alive for every agent in state `running`.
@@ -311,6 +316,8 @@ impl<H: Harness + 'static> Supervisor<H> {
             board: HealthBoard::default(),
             stop: AtomicBool::new(false),
             workers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            idle_release_hook: None,
         });
         let (wake_path, listener) = bind_wake(&inner)?;
         let events = store.subscribe();
@@ -696,7 +703,7 @@ struct Session<H: Harness> {
     /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
     pending_recovery: bool,
     /// Set once at least one turn has completed during this session, enabling
-    /// automatic scale-to-zero (`archived`) for sub-agents when idle.
+    /// automatic scale-to-zero (`idle`) for any agent after a completed turn.
     completed_turn_in_session: bool,
     /// Clock timestamp (`now_ms`) when the current quota wait began, so an
     /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
@@ -878,7 +885,10 @@ impl<H: Harness + 'static> Session<H> {
                     } else {
                         None
                     },
-                    last_error: health.sign_in_fault.or_else(|| self.last_error.clone()),
+                    last_error: health
+                        .sign_in_fault
+                        .or_else(|| delivery.harness().exit_diagnostic())
+                        .or_else(|| self.last_error.clone()),
                 }
             }
             None => {
@@ -1044,7 +1054,7 @@ impl<H: Harness + 'static> Session<H> {
                 if self.pending_recovery && self.recover_once() {
                     return false;
                 }
-                if self.try_auto_archive_subagent() {
+                if self.try_release_idle_agent() {
                     return false;
                 }
                 self.inner.clock.wait(
@@ -1184,21 +1194,13 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "idle"`)
+    /// Automatically scale any agent to zero (`state = "idle"`)
     /// once it has finished its turn, its mailbox is drained, it has no active
     /// child sub-agents, and its harness process has no in-flight background commands.
     /// Its config directory and session are preserved so sending any future message
-    /// to the sub-agent automatically wakes and resumes it.
-    fn try_auto_archive_subagent(&mut self) -> bool {
-        if self.agent.parent_id.is_none()
-            || self
-                .agent
-                .role
-                .as_deref()
-                .is_some_and(|r| !r.trim().is_empty())
-            || !self.completed_turn_in_session
-            || self.last_error.is_some()
-        {
+    /// to the agent automatically wakes and resumes it.
+    fn try_release_idle_agent(&mut self) -> bool {
+        if !self.completed_turn_in_session || self.last_error.is_some() {
             return false;
         }
         let scaled = {
@@ -1214,10 +1216,31 @@ impl<H: Harness + 'static> Session<H> {
             }
             delivery
                 .store()
-                .complete_idle_subagent(&self.id)
+                .complete_idle_agent(&self.id)
                 .unwrap_or(false)
         };
         if !scaled {
+            return false;
+        }
+        #[cfg(test)]
+        if let Some(hook) = &self.inner.idle_release_hook {
+            hook(&self.id);
+        }
+        // Mail may have committed after the idle transition, with its wake
+        // already consumed by ensure() while this slot still looked active.
+        // Serialize the fresh check and stop publication with ensure(): abort
+        // for existing work; a later arrival sees a stopping slot and replaces
+        // it. Keep the delivery lock until teardown finishes under this guard,
+        // so the replacement cannot boot into AgentBusy and lose that wake.
+        let inner = Arc::clone(&self.inner);
+        let _workers = lock(&inner.workers);
+        if !inner
+            .store
+            .agent(&self.id)
+            .is_ok_and(|agent| agent.state == "idle")
+            || !matches!(inner.store.next_undelivered(&self.id), Ok(None))
+        {
+            self.woken.store(true, Ordering::SeqCst);
             return false;
         }
         self.stop.store(true, Ordering::SeqCst);
@@ -1564,6 +1587,153 @@ mod tests {
     }
 
     use super::*;
+
+    struct FinishFirstTurn(anyagents_harness::FakeHarness);
+
+    impl Harness for FinishFirstTurn {
+        fn deliver(
+            &mut self,
+            message: &anyagents_harness::OutboundMessage,
+        ) -> Result<anyagents_harness::DeliverOutcome, anyagents_harness::HarnessError> {
+            self.0.set_auto_finish(message.seq == 1);
+            self.0.deliver(message)
+        }
+
+        fn background(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            self.0.background()
+        }
+
+        fn resume(&mut self, session: &str) -> Result<(), anyagents_harness::HarnessError> {
+            self.0.resume(session)
+        }
+
+        fn cancel(&mut self) -> Result<(), anyagents_harness::HarnessError> {
+            self.0.cancel()
+        }
+
+        fn health(&self) -> anyagents_harness::HarnessHealth {
+            self.0.health()
+        }
+
+        fn turns_served(&self) -> u32 {
+            self.0.turns_served()
+        }
+    }
+
+    #[test]
+    fn mail_during_idle_release_keeps_a_roleless_child_live() {
+        assert_mail_during_idle_release_is_delivered(false, None);
+    }
+
+    #[test]
+    fn mail_during_idle_release_keeps_a_role_bearing_child_live() {
+        assert_mail_during_idle_release_is_delivered(false, Some("Researcher"));
+    }
+
+    #[test]
+    fn mail_during_idle_release_keeps_a_role_bearing_root_live() {
+        assert_mail_during_idle_release_is_delivered(true, Some("Researcher"));
+    }
+
+    fn assert_mail_during_idle_release_is_delivered(is_root: bool, role: Option<&str>) {
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let mut new = anyagents_core::NewAgent::new("worker", "contract");
+        if !is_root {
+            let parent = store
+                .create_agent(anyagents_core::NewAgent::new("parent", "contract"))
+                .unwrap();
+            new.parent_id = Some(parent.id);
+        }
+        new.role = role.map(str::to_string);
+        let agent = store.create_agent(new).unwrap();
+        let work = dir.path().join("work");
+        fs::create_dir_all(&work).unwrap();
+        store
+            .set_agent_running(&agent.id, work.to_str().unwrap())
+            .unwrap();
+        store
+            .receive(&agent.id, anyagents_core::Incoming::new("first"))
+            .unwrap();
+
+        let (at_idle_tx, at_idle_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_rx = Mutex::new(resume_rx);
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted_launches = Arc::clone(&launches);
+        let inner = Arc::new(Inner {
+            store: Arc::clone(&store),
+            clock: Arc::new(SystemClock::new()),
+            launch: Arc::new(move |_| {
+                counted_launches.fetch_add(1, Ordering::SeqCst);
+                Ok(FinishFirstTurn(anyagents_harness::FakeHarness::new(
+                    DeliveryMode::Steer,
+                )))
+            }),
+            extra_env: Vec::new(),
+            board: HealthBoard::default(),
+            stop: AtomicBool::new(false),
+            workers: Mutex::new(HashMap::new()),
+            idle_release_hook: Some(Arc::new(move |_| {
+                at_idle_tx.send(()).unwrap();
+                lock(&resume_rx)
+                    .recv_timeout(Duration::from_secs(30))
+                    .unwrap();
+            })),
+        });
+        // Run the real worker and ensure() path without an asynchronous router:
+        // consume every arrival wake explicitly at the exact blocked boundary.
+        let supervisor = Supervisor {
+            inner: Arc::clone(&inner),
+            wake_path: None,
+            listener: None,
+            router: None,
+        };
+        ensure(&inner, agent.id.clone());
+        at_idle_rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert_eq!(store.agent(&agent.id).unwrap().state, "idle");
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 1);
+        assert!(store.open_turn(&agent.id).unwrap().is_none());
+
+        // Commit through another Store after idle committed but before stop.
+        // ensure() consumes the wake while the old slot is still active.
+        let other = Store::open(dir.path().join("state.db")).unwrap();
+        other
+            .receive(&agent.id, anyagents_core::Incoming::new("second"))
+            .unwrap();
+        ensure(&inner, agent.id.clone());
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        assert!(other.next_undelivered(&agent.id).unwrap().is_some());
+        resume_tx.send(()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let delivered = other.delivered_cursor(&agent.id).unwrap() == 2;
+            let live = supervisor
+                .live(&agent.id)
+                .is_some_and(|live| live.process_alive && live.turn_state == TurnState::InTurn);
+            if delivered && live {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "committed mail was stranded after idle release"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(other.agent(&agent.id).unwrap().state, "running");
+        assert!(other.next_undelivered(&agent.id).unwrap().is_none());
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let workers = lock(&inner.workers);
+        let slot = workers.get(&agent.id).unwrap();
+        assert!(!slot.stop.load(Ordering::SeqCst));
+        assert!(!slot.done.load(Ordering::SeqCst));
+        drop(workers);
+        drop(supervisor);
+    }
 
     #[test]
     fn restart_delay_stays_in_range() {

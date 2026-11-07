@@ -157,7 +157,7 @@ fn checks_with_principals(
         let path = quote(path)?;
         Ok(Check {
             what,
-            program: format!("[ ! -r {path} ] && [ ! -w {path} ]"),
+            program: format!("[ ! -r {path} ] && [ ! -w {path} ] && [ ! -x {path} ]"),
         })
     };
     let mut list = vec![
@@ -200,6 +200,7 @@ fn checks_with_principals(
         Err(err) => return Err(err),
     };
     peers.sort();
+    let mut foreign_roots = Vec::new();
     for peer in peers {
         // Two agents can legitimately share one OS principal. Only a host-
         // resolved UID/GID+root tuple grants this exception, never directory
@@ -210,6 +211,7 @@ fn checks_with_principals(
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
             continue;
         }
+        foreign_roots.push(std::fs::canonicalize(&peer)?);
         for name in ["config", "memory", "skills"] {
             list.push(deny(
                 "peer seats' private trees are denied",
@@ -239,6 +241,40 @@ fn checks_with_principals(
                 quote(&data.join("skills"))?,
             ),
         });
+        // A preserved personal projection is not a grant to another seat.
+        // Resolve links under the admitted identity (including an owner-private
+        // vendor parent), and compare against the host's complete foreign-root
+        // inventory. Unresolvable foreign projections refuse rather than skip.
+        for mirror in [".claude/skills", ".agents/skills", ".agy/skills"] {
+            let target = config.join(mirror);
+            let mut program = String::new();
+            for path in [target.parent().unwrap(), target.as_path()] {
+                let path = quote(path)?;
+                let managed = if path == quote(&target)? {
+                    format!(
+                        " && [ \"$(readlink {path})\" != {} ] && [ \"$(readlink {path})\" != {} ]",
+                        quote(&root.join("skills-view"))?,
+                        quote(&data.join("skills"))?,
+                    )
+                } else {
+                    String::new()
+                };
+                program.push_str(&format!(
+                    "if [ -L {path} ]{managed}; then resolved=$(CDPATH= cd -P {path} 2>/dev/null && pwd -P) || exit 1;\n"
+                ));
+                for peer in &foreign_roots {
+                    let peer = quote(peer)?;
+                    program.push_str(&format!(
+                        "case \"$resolved\" in {peer}|{peer}/*) exit 1;; esac\n"
+                    ));
+                }
+                program.push_str("fi\n");
+            }
+            list.push(Check {
+                what: "mounted host skills are readable by the agent",
+                program,
+            });
+        }
         // Prove the published mirrors, not direct links to the source trees.
         // Enumerate source names as the host even when vendor parents are 0700.
         for source in [data.join("skills"), root.join("skills")] {
@@ -429,6 +465,68 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn every_foreign_projection_refuses_peer_roots_but_allows_personal_and_same_seat() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/own/config");
+        let peer = dir.path().join("agents/peer's private tree");
+        let personal = dir.path().join("personal");
+        for path in [&config, &peer, &personal] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(peer.join("SKILL.md"), "peer-private").unwrap();
+        let run = |principals: &[crate::SeatPeer]| {
+            let selected =
+                checks_with_principals(Some(&config), dir.path(), 24031, 24032, principals)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|c| c.what == "mounted host skills are readable by the agent");
+            Command::new("/bin/sh")
+                .args(["-c", &admission_script(selected)])
+                .output()
+                .unwrap()
+        };
+        for mirror in [".claude", ".agents", ".agy"] {
+            for parent in [true, false] {
+                let projection = if parent {
+                    config.join(mirror)
+                } else {
+                    std::fs::create_dir(config.join(mirror)).unwrap();
+                    config.join(mirror).join("skills")
+                };
+                symlink(&peer, &projection).unwrap();
+                let denied = run(&[]);
+                assert!(!denied.status.success(), "{mirror} parent={parent} escaped");
+                assert_eq!(
+                    denied.stderr,
+                    b"boundary check failed: mounted host skills are readable by the agent\n"
+                );
+                assert!(
+                    run(&[crate::SeatPeer {
+                        root: peer.clone(),
+                        uid: 24031,
+                        gid: 24032
+                    }])
+                    .status
+                    .success(),
+                    "registered same principal continuity"
+                );
+                std::fs::remove_file(&projection).unwrap();
+                symlink(&personal, &projection).unwrap();
+                assert!(
+                    run(&[]).status.success(),
+                    "{mirror} personal parent={parent}"
+                );
+                std::fs::remove_file(&projection).unwrap();
+                if !parent {
+                    std::fs::remove_dir(config.join(mirror)).unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn peer_inventory_errors_refuse_except_absent_configless_layout() {
         let dir = tempfile::tempdir().unwrap();
         let config = dir.path().join("agents/own/config");
@@ -558,5 +656,151 @@ mod tests {
             assert!(text.contains(denied), "{text}");
         }
         assert!(text.contains("mcp-capability"), "{text}");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod peer_projection_regressions {
+    use super::*;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    fn escapes(mirror: &str, foreign_parent: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agents/own");
+        let config = root.join("config");
+        let global = dir.path().join("skills");
+        let peer = dir.path().join("agents/peer");
+        let peer_skills = peer.join("skills");
+        std::fs::create_dir_all(global.join("shared")).unwrap();
+        std::fs::write(global.join("shared/SKILL.md"), "host skill").unwrap();
+        std::fs::create_dir_all(peer_skills.join("shared")).unwrap();
+        std::fs::write(peer_skills.join("shared/SKILL.md"), "peer skill").unwrap();
+        for vendor in [".claude", ".agents", ".agy"] {
+            std::fs::create_dir_all(config.join(vendor).join("skills/shared")).unwrap();
+            std::fs::write(
+                config.join(vendor).join("skills/shared/SKILL.md"),
+                "host skill",
+            )
+            .unwrap();
+        }
+        let run = || {
+            let selected = checks(Some(&config), dir.path(), 24031, 24032)
+                .unwrap()
+                .into_iter()
+                .filter(|c| {
+                    c.what == "peer seats' private trees are denied"
+                        || c.what == "mounted host skills are readable by the agent"
+                });
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &admission_script(selected)])
+                .output()
+                .unwrap()
+        };
+        let writable = run();
+        assert!(
+            !writable.status.success(),
+            "control: peer writable skills must refuse"
+        );
+        assert_eq!(
+            writable.stderr,
+            b"boundary check failed: peer seats' private trees are denied\n"
+        );
+        std::fs::set_permissions(&peer_skills, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            run().status.success(),
+            "control: protected peer and all ordinary host views pass"
+        );
+        std::fs::remove_dir_all(config.join(mirror)).unwrap();
+        if foreign_parent {
+            symlink(&peer, config.join(mirror)).unwrap();
+        } else {
+            std::fs::create_dir(config.join(mirror)).unwrap();
+            symlink(&peer_skills, config.join(mirror).join("skills")).unwrap();
+        }
+        assert!(
+            !config.join(mirror).join("skills/shared/SKILL.md").is_file(),
+            "active skill must be inaccessible"
+        );
+        let escaped = run();
+        std::fs::set_permissions(&peer_skills, std::fs::Permissions::from_mode(0o700)).unwrap();
+        eprintln!(
+            "mirror={mirror} foreign_parent={foreign_parent} writable_control=REFUSED valid_control=PASS escaped_exit={:?} escaped_stderr={:?}",
+            escaped.status.code(),
+            String::from_utf8_lossy(&escaped.stderr)
+        );
+        assert!(
+            !escaped.status.success(),
+            "active {mirror} escape into inaccessible peer skills was admitted"
+        );
+    }
+    #[test]
+    fn claude_mount_escape_must_refuse() {
+        escapes(".claude", false);
+    }
+    #[test]
+    fn agents_mount_escape_must_refuse() {
+        escapes(".agents", false);
+    }
+    #[test]
+    fn agy_mount_escape_must_refuse() {
+        escapes(".agy", false);
+    }
+    #[test]
+    fn claude_parent_escape_must_refuse() {
+        escapes(".claude", true);
+    }
+    #[test]
+    fn agents_parent_escape_must_refuse() {
+        escapes(".agents", true);
+    }
+    #[test]
+    fn agy_parent_escape_must_refuse() {
+        escapes(".agy", true);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod peer_search_regressions {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn search_only_peer_trees_refuse_before_known_private_reads() {
+        for name in ["config", "memory", "skills"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("agents/own/config");
+            let peer = dir.path().join("agents/peer");
+            std::fs::create_dir_all(&config).unwrap();
+            let tree = peer.join(name);
+            std::fs::create_dir_all(tree.join("shared")).unwrap();
+            let known = tree.join("shared/SKILL.md");
+            std::fs::write(&known, "READABLE_PEER_SKILL").unwrap();
+            // Same-UID 0111 models a distinct reader's search/no-list on 0711.
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o111)).unwrap();
+            assert!(std::fs::read_dir(&tree).is_err());
+            assert_eq!(std::fs::read(&known).unwrap(), b"READABLE_PEER_SKILL");
+            let selected = checks(Some(&config), dir.path(), 24031, 24032)
+                .unwrap()
+                .into_iter()
+                .filter(|c| c.what == "peer seats' private trees are denied");
+            let script = format!(
+                "{}\ncat '{}'\n",
+                admission_script(selected),
+                known.display()
+            );
+            let result = Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            std::fs::set_permissions(&tree, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(!result.status.success(), "{name} search-only peer admitted");
+            assert!(
+                result.stdout.is_empty(),
+                "known private bytes were read after admission"
+            );
+            assert_eq!(
+                result.stderr,
+                b"boundary check failed: peer seats' private trees are denied\n"
+            );
+        }
     }
 }

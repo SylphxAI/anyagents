@@ -16,6 +16,7 @@ pub mod host_session;
 pub mod host_skills;
 mod id;
 pub mod learned_memory;
+pub mod masking;
 mod migrate;
 pub mod quote;
 pub mod raw_segment;

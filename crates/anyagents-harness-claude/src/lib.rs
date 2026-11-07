@@ -23,6 +23,8 @@
 //! Resume starts the child again with `--resume` when the session id changed or the
 //! process has exited. Cancel sends a `control_request` whose subtype is `interrupt`.
 
+mod diagnostics;
+
 use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -47,12 +49,14 @@ pub struct ClaudeHarness {
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     wake: Arc<Condvar>,
     reader: Option<JoinHandle<()>>,
+    stderr_reader: Option<JoinHandle<()>>,
     steer: Option<SteerQueue>,
 }
 
 #[derive(Default)]
 struct State {
     child: Option<Child>,
+    stderr: diagnostics::Evidence,
     alive: bool,
     epoch: u64,
     seen: HashSet<String>,
@@ -118,6 +122,7 @@ impl ClaudeHarness {
             stdin: Arc::new(Mutex::new(None)),
             wake: Arc::new(Condvar::new()),
             reader: None,
+            stderr_reader: None,
             steer: None,
         };
         harness.launch(session_id)?;
@@ -276,7 +281,7 @@ impl ClaudeHarness {
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             cmd.current_dir(dir);
         }
@@ -293,6 +298,7 @@ impl ClaudeHarness {
             let _ = child.wait();
             return Err(HarnessError::Failed("child stdout missing".into()));
         };
+        let stderr = child.stderr.take().expect("piped child stderr");
         {
             let initial_quota = self
                 .environment
@@ -309,6 +315,7 @@ impl ClaudeHarness {
                 });
             let mut state = lock(&self.shared);
             state.child = Some(child);
+            state.stderr = diagnostics::Evidence::default();
             state.alive = true;
             state.sign_in_fault = None;
             state.open.clear();
@@ -321,6 +328,18 @@ impl ClaudeHarness {
             }
         }
         *lock(&self.stdin) = Some(child_stdin);
+        let stderr_shared = Arc::clone(&self.shared);
+        let stderr_wake = Arc::clone(&self.wake);
+        match thread::Builder::new()
+            .name("anyagents-claude-stderr".into())
+            .spawn(move || diagnostics::drain(stderr, stderr_shared, stderr_wake))
+        {
+            Ok(handle) => self.stderr_reader = Some(handle),
+            Err(error) => {
+                self.stop_child();
+                return Err(HarnessError::Failed(error.to_string()));
+            }
+        }
         let shared = Arc::clone(&self.shared);
         let wake = Arc::clone(&self.wake);
         match thread::Builder::new()
@@ -350,8 +369,13 @@ impl ClaudeHarness {
         if let Some(handle) = self.reader.take() {
             let _ = handle.join();
         }
-        if let Some(mut child) = child {
-            let _ = child.wait();
+        if let Some(mut child) = child
+            && let Ok(status) = child.wait()
+        {
+            lock(&self.shared).stderr.status = Some(status);
+        }
+        if let Some(handle) = self.stderr_reader.take() {
+            let _ = handle.join();
         }
         let mut state = lock(&self.shared);
         state.open.clear();
@@ -462,6 +486,17 @@ impl Harness for ClaudeHarness {
         }
         state.open.clear();
         Ok(())
+    }
+
+    fn exit_diagnostic(&self) -> Option<String> {
+        let mut state = lock(&self.shared);
+        if let Some(child) = state.child.as_mut()
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            state.stderr.status = Some(status);
+            state.alive = false;
+        }
+        (!state.alive).then(|| state.stderr.projection())
     }
 
     fn health(&self) -> HarnessHealth {

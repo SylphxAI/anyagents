@@ -479,7 +479,7 @@ enum Command {
         agent: Option<String>,
         /// New role/responsibility description (syncs into the agent's private system prompt and group roster).
         description: Option<String>,
-        /// Optional short role label (`Spiron`, `Design`, `Revenue`, `Growth`, `Lead`, `Standards`, ...).
+        /// Optional display-only role label; no effect on lifecycle or scope.
         #[arg(long)]
         role: Option<String>,
         /// Clear custom description.
@@ -497,7 +497,7 @@ enum Command {
     Role {
         /// Target agent name or `agt_...` ID.
         agent: String,
-        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Display-only role label; no effect on lifecycle or scope.
         role: Option<String>,
         /// Clear the role label.
         #[arg(long)]
@@ -682,7 +682,7 @@ enum AgentsCommand {
     Role {
         /// Target agent name or `agt_...` ID.
         agent: String,
-        /// Short role label (`Spiron`, `Design`, `Revenue`, ...).
+        /// Display-only role label; no effect on lifecycle or scope.
         role: Option<String>,
         /// Clear the role label.
         #[arg(long)]

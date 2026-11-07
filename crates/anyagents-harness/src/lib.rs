@@ -541,6 +541,12 @@ pub trait Harness: Send {
     /// `inject` is still holding. Called when `inject` cannot take them now.
     fn release_steer(&mut self, _keep: &str) {}
 
+    /// Secret-safe process-exit evidence, never unfiltered vendor output.
+    /// Kept separate from sign-in state and delivery/restart decisions.
+    fn exit_diagnostic(&self) -> Option<String> {
+        None
+    }
+
     /// Operating system id of the vendor process, when it has one.
     fn process_id(&self) -> Option<u32> {
         None
