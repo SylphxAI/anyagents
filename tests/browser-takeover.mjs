@@ -111,6 +111,25 @@ try {
     await until(() => remote.eval(`document.activeElement.id === 'entry2'`), 'Tab remote focus');
     await key('Tab','Tab',9,8);
     await until(() => remote.eval(`document.activeElement.id === 'entry'`), 'Shift+Tab remote focus');
+    // The clipboard write may yield while another event moves remote focus.
+    // Matching text in another field must never authorize cutting that field.
+    await remote.eval(`for (const id of ['entry','entry2']) document.querySelector('#'+id).value='same';document.querySelector('#entry').focus();document.querySelector('#entry').select()`);
+    const captured = await api('/input',{type:'clipboard',action:'copy'});
+    await remote.eval(`document.querySelector('#entry2').focus();document.querySelector('#entry2').select()`);
+    const moved = await api('/input',{type:'clipboard',action:'cut',expected_text:captured.text,selection_key:captured.selection_key});
+    assert.equal(moved.ok,false,'A-to-B focus race must refuse cut even when selected text matches');
+    assert.deepEqual(await remote.eval(`['entry','entry2'].map(id=>document.querySelector('#'+id).value)`),['same','same'],'neither field may be deleted after focus moves');
+    // Hold the real viewer's asynchronous clipboard write at the exact yield.
+    await remote.eval(`document.querySelector('#entry').focus();document.querySelector('#entry').select()`);
+    await viewer.eval(`window.originalClipboardWrite=navigator.clipboard.write.bind(navigator.clipboard);window.clipboardCaptured=false;navigator.clipboard.write=async items=>{await items[0].getType('text/plain');window.clipboardCaptured=true;await new Promise(resolve=>window.releaseClipboardWrite=resolve);await window.originalClipboardWrite(items)}`);
+    await key('x','KeyX',88,4);
+    await until(() => viewer.eval(`window.clipboardCaptured`),'cut selection captured before asynchronous write');
+    await remote.eval(`document.querySelector('#entry2').focus();document.querySelector('#entry2').select()`);
+    await viewer.eval(`window.releaseClipboardWrite()`);
+    await until(() => viewer.eval(`document.querySelector('#clipboard-status').textContent.includes('Cut cancelled')`),'changed-focus cut has a clear cancellation status');
+    assert.deepEqual(await remote.eval(`['entry','entry2'].map(id=>document.querySelector('#'+id).value)`),['same','same'],'viewer async cut cannot delete either field after focus moves');
+    await viewer.eval(`navigator.clipboard.write=window.originalClipboardWrite`);
+    await remote.eval(`document.querySelector('#entry').value='';document.querySelector('#entry2').value='';document.querySelector('#entry').focus()`);
     await viewer.eval(`navigator.clipboard.writeText('pill paste')`);
     await clickSelector('#paste-btn');
     await until(() => remote.eval(`document.querySelector('#entry').value === 'pill paste'`), 'one-tap paste pill');

@@ -1689,17 +1689,36 @@ const TAKEOVER_SELECTION_JS: &str = r#"(() => {
     if (el?.tagName === 'IFRAME') return {frame_focused:true};
     if (!document.hasFocus()) return {focused:false};
     if (el?.type === 'password') return {focused:true,blocked:true};
+    const doc = el?.ownerDocument || document;
+    const identity = doc.__anyagentsTakeoverSelectionIdentity ||= {
+        nonce:Array.from(crypto.getRandomValues(new Uint32Array(4))).join('-'), nodes:new WeakMap(), next:0
+    };
+    const nodeId = node => {
+        if (!node) return null;
+        if (!identity.nodes.has(node)) identity.nodes.set(node, ++identity.next);
+        return identity.nodes.get(node);
+    };
     if (el && typeof el.selectionStart === 'number') {
-        return {focused:true,text:el.value.slice(el.selectionStart,el.selectionEnd)};
+        return {focused:true,text:el.value.slice(el.selectionStart,el.selectionEnd),
+            selection_key:JSON.stringify([identity.nonce,nodeId(el),el.selectionStart,el.selectionEnd,el.selectionDirection])};
     }
-    return {focused:true,text:(el?.ownerDocument || document).getSelection()?.toString() || ''};
+    const selected = doc.getSelection();
+    return {focused:true,text:selected?.toString() || '',
+        selection_key:JSON.stringify([identity.nonce,nodeId(el),nodeId(selected?.anchorNode),selected?.anchorOffset,nodeId(selected?.focusNode),selected?.focusOffset])};
 })()"#;
 
 fn takeover_selection(cdp: &mut CdpSession) -> Result<serde_json::Value, Error> {
-    let selection = eval_js(cdp, TAKEOVER_SELECTION_JS)?;
+    takeover_selection_expression(cdp, TAKEOVER_SELECTION_JS)
+}
+
+fn takeover_selection_expression(
+    cdp: &mut CdpSession,
+    expression: &str,
+) -> Result<serde_json::Value, Error> {
+    let selection = eval_js(cdp, expression)?;
     if selection["frame_focused"].as_bool() == Some(true) {
         for frame in discover_child_frames(cdp) {
-            if let Ok(child) = eval_js_in_frame(cdp, Some(&frame.frame_id), TAKEOVER_SELECTION_JS)
+            if let Ok(child) = eval_js_in_frame(cdp, Some(&frame.frame_id), expression)
                 && child["focused"].as_bool() == Some(true)
             {
                 return Ok(child);
@@ -2186,17 +2205,32 @@ fn dispatch_takeover_input(
             }
             let text = selection["text"].as_str().unwrap_or("");
             match payload["action"].as_str().unwrap_or("copy") {
-                "copy" => Ok(serde_json::json!({ "ok":true, "text":text })),
+                "copy" => Ok(serde_json::json!({
+                    "ok":true, "text":text, "selection_key":selection["selection_key"]
+                })),
                 "cut" => {
-                    // The local clipboard must accept the selection before deletion.
-                    // Refuse a changed selection rather than cutting unrelated new input.
-                    if payload["expected_text"].as_str() != Some(text) {
-                        return Err(Error::Message("selection changed before cut".into()));
-                    }
-                    if !text.is_empty() {
-                        dispatch_takeover_key(&mut cdp, &serde_json::json!({"key":"Backspace"}))?;
-                    }
-                    Ok(serde_json::json!({ "ok":true, "type":"cut" }))
+                    // The asynchronous local clipboard write must not authorize deleting
+                    // another field with identical text. Check node/range identity and
+                    // delete in one JavaScript task, with no intervening CDP key event.
+                    let expected = payload.to_string();
+                    let expression = format!(
+                        r#"(() => {{
+                            const selection = {TAKEOVER_SELECTION_JS};
+                            if (selection.frame_focused || !selection.focused) return selection;
+                            const expected = {expected};
+                            if (selection.blocked || !expected.selection_key ||
+                                selection.selection_key !== expected.selection_key ||
+                                selection.text !== expected.expected_text)
+                                return {{focused:true,ok:false,error:'Focus or selection changed. Cut cancelled; select the text again.'}};
+                            let el = document.activeElement;
+                            try {{ while (el?.tagName === 'IFRAME' && el.contentDocument) el = el.contentDocument.activeElement; }} catch (_) {{}}
+                            const doc = el?.ownerDocument || document;
+                            if (selection.text && !doc.execCommand('delete'))
+                                return {{focused:true,ok:false,error:'Cut cancelled; the selected text could not be deleted.'}};
+                            return {{focused:true,ok:true,type:'cut'}};
+                        }})()"#
+                    );
+                    takeover_selection_expression(&mut cdp, &expression)
                 }
                 _ => Err(Error::Message("unsupported clipboard action".into())),
             }

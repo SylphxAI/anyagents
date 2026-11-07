@@ -162,7 +162,7 @@ if (typeof document !== 'undefined') {
   }, { passive: false });
   const remoteTarget = target => target === canvas || target === proxy || target === document.body;
   const modifiers = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
-  function clipboardError() { $('clipboard-status').textContent = 'Allow clipboard access, or use your device’s Paste menu.'; }
+  function clipboardError(error) { $('clipboard-status').textContent = error?.message?.includes('Cut cancelled') ? error.message : 'Allow clipboard access, or use your device’s Paste menu.'; }
   async function clipboardOut(action = 'copy') {
     if (remoteFocus?.input_type === 'password') return;
     const selection = sendInput({ type: 'clipboard', action: 'copy' });
@@ -176,9 +176,9 @@ if (typeof document !== 'undefined') {
         await navigator.clipboard.writeText(result.text || '');
       }
       const result = await selection;
-      if (action === 'cut') await sendInput({ type: 'clipboard', action: 'cut', expected_text: result.text || '' });
+      if (action === 'cut') await sendInput({ type: 'clipboard', action: 'cut', expected_text: result.text || '', selection_key: result.selection_key });
       $('clipboard-status').textContent = '';
-    } catch (_) { clipboardError(); }
+    } catch (error) { clipboardError(error); }
   }
   function pasteText(text) {
     $('clipboard-status').textContent = '';
