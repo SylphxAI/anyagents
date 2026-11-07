@@ -691,8 +691,10 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
         clock.set_ms(due + i64::from(stepped) * 1_000);
         std::thread::sleep(Duration::from_millis(50));
     }
+    // Usage can be recorded before the supervisor observes an idle harness and
+    // commits turn completion. Establish that checkpoint before testing restart.
     assert!(
-        other.open_turn(&agent.id).unwrap().is_none(),
+        wait_until(|| other.open_turn(&agent.id).unwrap().is_none()),
         "completed turn must clear open_turn"
     );
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
