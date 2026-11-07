@@ -788,6 +788,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **`\"private\"` *(Default for Task Sub-Agents)*:** Only direct `parent`, own `children`, or members of a shared `group:<name>` can message it; reports upward via `to: [\"parent\"]`.\n\
            - **`\"siblings\"` *(Default for Standing Domain Sub-Agents with a `role`)*:** Can freely collaborate with and message direct `parent`, own `children`, and sibling domain sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`), without crossing into another root manager's tree.\n\
            - **`\"public\"` *(Root Agents & Cross-Tree Shared Services)*:** Reachable across the workspace.\n\
+           - **Scope updates:** An explicit `scope` persists across restarts and reconciliation. Legacy `public: true` selects `public`; `public: false` only revokes public reachability, preserving nonpublic scopes (including `siblings`) or restoring the role-based default. Explicit `scope` wins when both are supplied.\n\
            - **Downward-Only Supervision:** A parent/ancestor can inspect its descendants' `instructions` and `conversation` history, never the reverse (a child or sibling can never read its parent's or sibling's private instructions or private conversations).\n\
            - **Group Chat Discipline:** When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
     );

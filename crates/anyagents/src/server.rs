@@ -2697,6 +2697,10 @@ async fn set_description_route(
                 &target.name,
             )?;
         }
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { name, .. } => format!("agent:{name}"),
+        };
         let mut rec = target;
         let is_ancestor = match &principal {
             Principal::Agent { agent_id, .. } => {
@@ -2710,7 +2714,7 @@ async fn set_description_route(
             }
             rec = state
                 .store
-                .set_agent_scope(&rec.id, scope_val)
+                .set_agent_scope_as(&rec.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
         } else if let Some(pub_val) = body.public {
             if !is_ancestor {
@@ -2718,7 +2722,7 @@ async fn set_description_route(
             }
             rec = state
                 .store
-                .set_agent_public(&rec.id, pub_val)
+                .set_agent_public_as(&rec.id, pub_val, &actor)
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref role_str) = body.role {
@@ -3531,20 +3535,24 @@ async fn create_agent_route(
                     .map_err(ApiError::from_store)?;
             }
         }
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { name, .. } => format!("agent:{name}"),
+        };
         if let Some(ref scope_val) = body.scope {
             agent = state
                 .store
-                .set_agent_scope(&agent.id, scope_val)
+                .set_agent_scope_as(&agent.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
         } else if body.public == Some(true) {
             agent = state
                 .store
-                .set_agent_public(&agent.id, true)
+                .set_agent_public_as(&agent.id, true, &actor)
                 .map_err(ApiError::from_store)?;
         } else if body.public == Some(false) {
             agent = state
                 .store
-                .set_agent_public(&agent.id, false)
+                .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
         }
         if let Some(ref grp_raw) = body.group {
@@ -6287,6 +6295,129 @@ pub(crate) mod tests {
     /// server started by one never reads another's settings.
     pub(crate) fn env_lock() -> MutexGuard<'static, ()> {
         ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    #[test]
+    fn describe_preserves_scope_and_audits_authorized_policy_updates() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("mind", "codex");
+        new.parent_id = Some(parent.id.clone());
+        new.role = Some("Mind".into());
+        let mind = store.create_agent(new).unwrap();
+        let state = AppState {
+            send_namespace: "test".into(),
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let caller = |agent: &Agent| Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut expected_audit = Vec::new();
+            for (body, before, after, source) in [
+                (serde_json::json!({"scope":"siblings"}), "siblings", "siblings", "scope"),
+                (serde_json::json!({"description":"Public charter", "public":false}), "siblings", "siblings", "public"),
+                (serde_json::json!({"instructions":"Private instructions"}), "siblings", "siblings", ""),
+                (serde_json::json!({"role":"Updated Mind"}), "siblings", "siblings", ""),
+                (serde_json::json!({"public":true}), "siblings", "public", "public"),
+                (serde_json::json!({"public":false}), "public", "siblings", "public"),
+                (serde_json::json!({"scope":"isolated", "public":true}), "siblings", "isolated", "scope"),
+                (serde_json::json!({"public":false}), "isolated", "isolated", "public"),
+                (serde_json::json!({"scope":"private"}), "isolated", "private", "scope"),
+                (serde_json::json!({"public":false}), "private", "private", "public"),
+                (serde_json::json!({"scope":"siblings"}), "private", "siblings", "scope"),
+            ] {
+                let Json(updated) = set_description_route(
+                    caller(&parent), State(state.clone()), AxumPath("mind".into()),
+                    Json(serde_json::from_value(body).unwrap()),
+                ).await.unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert_eq!(updated["scope"], after);
+                if !source.is_empty() {
+                    expected_audit.push(("agent:parent".to_string(), before.to_string(), after.to_string(), source.to_string()));
+                }
+            }
+            let before = store.agent(&mind.id).unwrap();
+            let outsider = store.create_agent(anyagents_core::NewAgent::new("outsider", "codex")).unwrap();
+            let mut sibling_new = anyagents_core::NewAgent::new("sibling", "codex");
+            sibling_new.parent_id = Some(parent.id.clone());
+            let sibling = store.create_agent(sibling_new).unwrap();
+            for agent in [&outsider, &sibling] {
+                for body in [serde_json::json!({"scope":"public"}), serde_json::json!({"description":"Overwrite", "instructions":"Overwrite"})] {
+                    let err = set_description_route(caller(agent), State(state.clone()), AxumPath("mind".into()), Json(serde_json::from_value(body).unwrap()))
+                        .await.expect_err("unrelated caller must be refused");
+                    assert_eq!(err.status, StatusCode::FORBIDDEN);
+                    assert_eq!(store.agent(&mind.id).unwrap(), before);
+                }
+            }
+            let err = set_description_route(caller(&mind), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"public"})).unwrap()))
+                .await.expect_err("self cannot widen scope");
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+            // An admin's self update is allowed and has the same atomic audit.
+            store.set_agent_admin(&parent.id, true).unwrap();
+            let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated"})).unwrap()))
+                .await.unwrap_or_else(|e| panic!("{}", e.message));
+            let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+            let mut stmt = conn.prepare("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='mind' AND source IS NOT NULL ORDER BY id").unwrap();
+            let rows: Vec<(String,String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(rows, expected_audit);
+            let self_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(self_audit, ("agent:parent".into(),"public".into(),"isolated".into(),"scope".into()));
+            assert_eq!(store.agent(&mind.id).unwrap().description.as_deref(), Some("Public charter"));
+            // Every runtime-config pass reads the store's policy; none owns it.
+            for _ in 0..2 {
+                let current = store.agent(&mind.id).unwrap();
+                let config = anyagents_core::agent_config_dir(dir.path(), &mind.id);
+                let work = anyagents_core::agent_work_dir(dir.path(), &mind.id);
+                create::reconcile_agent_runtime_config(&store, dir.path(), &current, &config, &work).unwrap();
+                let reloaded = Store::open(dir.path().join("state.db")).unwrap().agent(&mind.id).unwrap();
+                assert_eq!(reloaded.scope(), "siblings");
+                assert_eq!(reloaded.description, current.description);
+            }
+        });
+    }
+
+    #[test]
+    fn role_spawn_defaults_to_siblings_and_task_spawn_defaults_to_private() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let state = AppState {
+            send_namespace: "test".into(),
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {
+                let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
+                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
+                assert_eq!(created.scope, scope);
+                let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":true})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
+                let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":false})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
+                assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
+            }
+        });
     }
 
     #[test]

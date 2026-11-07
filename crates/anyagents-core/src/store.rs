@@ -42,6 +42,16 @@ fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
 }
 
+fn scope_env(agent: &Agent, scope: &str) -> Vec<(String, String)> {
+    let mut env = agent.launch_env.clone();
+    env.retain(|(key, _)| !is_scope_env_key(key));
+    env.push(("ANYAGENTS_SCOPE".to_string(), scope.to_string()));
+    if scope == "public" {
+        env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
+    }
+    env
+}
+
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
@@ -122,6 +132,10 @@ impl Agent {
                 _ => {}
             }
         }
+        self.default_scope()
+    }
+
+    fn default_scope(&self) -> &'static str {
         if self.parent_id.is_none() {
             "public"
         } else if self.name.ends_with("-assistant") {
@@ -1893,13 +1907,19 @@ impl Store {
         id: &AgentId,
         env: &[(String, String)],
     ) -> Result<Agent, Error> {
-        self.update_agent_launch_env(id, |current| {
+        self.update_agent_launch_env(id, None, |current| {
             let mut refreshed: Vec<_> = env
                 .iter()
                 .filter(|(key, _)| !is_scope_env_key(key))
                 .cloned()
                 .collect();
-            refreshed.extend(current.into_iter().filter(|(key, _)| is_scope_env_key(key)));
+            refreshed.extend(
+                current
+                    .launch_env
+                    .iter()
+                    .filter(|(key, _)| is_scope_env_key(key))
+                    .cloned(),
+            );
             refreshed
         })
     }
@@ -1907,7 +1927,8 @@ impl Store {
     fn update_agent_launch_env(
         &self,
         id: &AgentId,
-        update: impl FnOnce(Vec<(String, String)>) -> Vec<(String, String)>,
+        audit: Option<(&str, &str)>,
+        update: impl FnOnce(&Agent) -> Vec<(String, String)>,
     ) -> Result<Agent, Error> {
         let changed = {
             let mut conn = self.conn();
@@ -1915,7 +1936,7 @@ impl Store {
             // serve and serve-admin use separate Store connections.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = agent_by_id(&tx, id)?;
-            let json = encode_env(&update(current.launch_env));
+            let json = encode_env(&update(&current));
             // A database written before this column existed still reads: the
             // harness then keeps whatever sign-in it already has.
             let updated = tx
@@ -1937,6 +1958,13 @@ impl Store {
                 return Err(Error::AgentNotFound(id.to_string()));
             }
             let changed = agent_by_id(&tx, id)?;
+            if let Some((actor, source)) = audit {
+                tx.execute(
+                    "INSERT INTO admin_audit (created_at, actor, action, target, before_scope, after_scope, source)
+                     VALUES (?1, ?2, 'agents.scope', ?3, ?4, ?5, ?6)",
+                    params![now_ms(), actor, changed.name, current.scope(), changed.scope(), source],
+                )?;
+            }
             tx.commit()?;
             changed
         };
@@ -3091,6 +3119,16 @@ impl Store {
 
     /// Set the internal communication and discovery scope (`"isolated"`, `"private"`, `"siblings"`, or `"public"`).
     pub fn set_agent_scope(&self, agent_id: &AgentId, scope: &str) -> Result<Agent, Error> {
+        self.set_agent_scope_as(agent_id, scope, "system")
+    }
+
+    /// Set scope and atomically record its authenticated actor and before/after policy.
+    pub fn set_agent_scope_as(
+        &self,
+        agent_id: &AgentId,
+        scope: &str,
+        actor: &str,
+    ) -> Result<Agent, Error> {
         let normalized = match scope.trim().to_ascii_lowercase().as_str() {
             "isolated" | "none" => "isolated",
             "private" | "false" | "0" => "private",
@@ -3102,20 +3140,34 @@ impl Store {
                 )));
             }
         };
-        self.update_agent_launch_env(agent_id, |mut env| {
-            env.retain(|(key, _)| !is_scope_env_key(key));
-            env.push(("ANYAGENTS_SCOPE".to_string(), normalized.to_string()));
-            if normalized == "public" {
-                env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
-            }
-            env
+        self.update_agent_launch_env(agent_id, Some((actor, "scope")), |current| {
+            scope_env(current, normalized)
         })
     }
 
     /// Set whether a sub-agent accepts external messages from agents outside its
     /// direct parent/child lineage (`ANYAGENTS_PUBLIC=1` in `launch_env`).
     pub fn set_agent_public(&self, agent_id: &AgentId, public: bool) -> Result<Agent, Error> {
-        self.set_agent_scope(agent_id, if public { "public" } else { "private" })
+        self.set_agent_public_as(agent_id, public, "system")
+    }
+
+    /// The legacy boolean only grants/revokes public reachability. Revocation
+    /// restores the default for public agents and preserves all nonpublic scopes.
+    pub fn set_agent_public_as(
+        &self,
+        agent_id: &AgentId,
+        public: bool,
+        actor: &str,
+    ) -> Result<Agent, Error> {
+        self.update_agent_launch_env(agent_id, Some((actor, "public")), |current| {
+            if public {
+                scope_env(current, "public")
+            } else if current.scope() == "public" {
+                scope_env(current, current.default_scope())
+            } else {
+                current.launch_env.clone()
+            }
+        })
     }
 
     /// Returns `true` when `agent_a` and `agent_b` are members of at least one shared
@@ -5895,6 +5947,58 @@ mod tests {
         // A stale transfer/harness snapshot cannot put the old policy back.
         store.set_agent_launch_env(&alpha.id, &stale).unwrap();
         assert_eq!(store.agent(&alpha.id).unwrap().scope(), "isolated");
+    }
+
+    #[test]
+    fn legacy_public_revokes_only_public_reachability() {
+        let (_dir, store) = setup();
+        let parent = agent(&store, "parent");
+        for (name, role, default) in [
+            ("mind", Some("Mind"), "siblings"),
+            ("task", None, "private"),
+            ("liaison-assistant", Some("Liaison"), "isolated"),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = Some(parent.id.clone());
+            new.role = role.map(str::to_string);
+            let child = store.create_agent(new).unwrap();
+            assert_eq!(child.scope(), default);
+            for scope in ["siblings", "isolated", "private"] {
+                store.set_agent_scope(&child.id, scope).unwrap();
+                assert_eq!(
+                    store.set_agent_public(&child.id, false).unwrap().scope(),
+                    scope
+                );
+            }
+            assert_eq!(
+                store.set_agent_public(&child.id, true).unwrap().scope(),
+                "public"
+            );
+            assert_eq!(
+                store.set_agent_public(&child.id, false).unwrap().scope(),
+                default
+            );
+        }
+    }
+
+    #[test]
+    fn scope_update_rolls_back_if_its_audit_cannot_commit() {
+        let (_dir, store) = setup();
+        let alpha = agent(&store, "alpha");
+        store.set_agent_scope(&alpha.id, "siblings").unwrap();
+        let before = store.agent(&alpha.id).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_scope_audit BEFORE INSERT ON admin_audit
+             WHEN NEW.source IS NOT NULL BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+            )
+            .unwrap();
+        let err = store
+            .set_agent_scope_as(&alpha.id, "public", "agent:parent")
+            .unwrap_err();
+        assert!(err.to_string().contains("audit unavailable"), "{err}");
+        assert_eq!(store.agent(&alpha.id).unwrap(), before);
     }
 
     #[test]
