@@ -3680,7 +3680,7 @@ fn install_state(store: &Store, agent: &Agent) -> String {
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(body): Json<CreateAgentRequest>,
+    Json(mut body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
     let caller_agent = match &principal {
         Principal::Operator => None,
@@ -3725,6 +3725,7 @@ async fn create_agent_route(
             }
             (None, None) => None,
         };
+        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body);
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
@@ -7747,6 +7748,143 @@ exec /usr/bin/git "$@"
         assert_eq!(store.agent(&child.id).unwrap().state, "running");
         assert!(!has_explicit_archive_marker(dir.path(), &parent.id));
         assert!(!has_explicit_archive_marker(dir.path(), &child.id));
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent_work = dir.path().join("parent-work");
+        let agents_dir = parent_work.join(".agents").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("writer.md"),
+            "---\ndescription: Ephemeral isolated-worktree sole writer\nscope: isolated\nworkdir: private\nharness: opencode\nmodel: gpt-5.4-mini\n---\nAlways run cargo test before opening a PR.",
+        )
+        .unwrap();
+        std::fs::write(
+            agents_dir.join("code-reviewer.md"),
+            "---\ndescription: Read-only code reviewer\nscope: siblings\nharness: claude-code\n---\nVerify all invariants before approving.",
+        )
+        .unwrap();
+
+        let data_templates = dir.path().join("agents-templates");
+        std::fs::create_dir_all(&data_templates).unwrap();
+        std::fs::write(
+            data_templates.join("auditor.md"),
+            "---\ndescription: Global template auditor\n---\nAudit template body.",
+        )
+        .unwrap();
+
+        let mut new_parent = anyagents_core::NewAgent::new("calliope", "claude-code");
+        new_parent.role = Some("Mind".into());
+        new_parent.workdir = Some(parent_work.to_string_lossy().into_owned());
+        new_parent.description = Some("Parent mind".into());
+        let parent = store.create_agent(new_parent).unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let (status, Json(created)) = create_agent_route(
+                Principal::Agent {
+                    agent_id: parent.id.clone(),
+                    name: parent.name.clone(),
+                },
+                State(state.clone()),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "writer-sub-1",
+                        "type": "writer",
+                        "instructions": "Fix issue #42."
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(
+                created.description.as_deref(),
+                Some("Ephemeral isolated-worktree sole writer")
+            );
+            assert_eq!(created.scope, "isolated");
+            assert_eq!(created.harness, "opencode");
+            assert_eq!(created.model.as_deref(), Some("gpt-5.4-mini"));
+            let stored = store.agent_by_name("writer-sub-1").unwrap();
+            assert_eq!(
+                stored.instructions.as_deref(),
+                Some("Always run cargo test before opening a PR.\n\nFix issue #42.")
+            );
+
+            // Role matching a template slug (`role: "code-reviewer"`) applies template defaults
+            // when `archetype` is omitted.
+            let (_, Json(reviewer)) = create_agent_route(
+                Principal::Agent {
+                    agent_id: parent.id.clone(),
+                    name: parent.name.clone(),
+                },
+                State(state.clone()),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "reviewer-sub-1",
+                        "role": "code-reviewer"
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+            assert_eq!(
+                reviewer.description.as_deref(),
+                Some("Read-only code reviewer")
+            );
+            assert_eq!(reviewer.scope, "siblings");
+            let reviewer_stored = store.agent_by_name("reviewer-sub-1").unwrap();
+            assert_eq!(
+                reviewer_stored.instructions.as_deref(),
+                Some("Verify all invariants before approving.")
+            );
+
+            // `<data_dir>/agents-templates/<name>.md` is also searched.
+            let (_, Json(auditor)) = create_agent_route(
+                Principal::Agent {
+                    agent_id: parent.id.clone(),
+                    name: parent.name.clone(),
+                },
+                State(state),
+                Json(
+                    serde_json::from_value(serde_json::json!({
+                        "name": "auditor-sub-1",
+                        "template": "auditor"
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+            assert_eq!(
+                auditor.description.as_deref(),
+                Some("Global template auditor")
+            );
+        });
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }

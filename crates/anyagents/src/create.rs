@@ -7176,6 +7176,249 @@ pub(crate) fn save_subagent_defaults(
     Ok(())
 }
 
+/// Parsed archetype template loaded from `<archetype>.md` or `<archetype>/agent.md`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArchetypeTemplate {
+    pub description: Option<String>,
+    pub scope: Option<String>,
+    pub workdir: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub role: Option<String>,
+    pub profile: Option<String>,
+    pub body: String,
+}
+
+/// Parse optional YAML frontmatter (`description`, `scope`, `workdir`, `harness`, `model`,
+/// `role`, `profile`) and markdown body from an archetype `.md` file.
+pub(crate) fn parse_archetype_markdown(raw: &str) -> ArchetypeTemplate {
+    let mut tpl = ArchetypeTemplate::default();
+    let normalized = raw.replace("\r\n", "\n");
+    let trimmed_start = normalized.trim_start_matches('\u{feff}');
+    let body = if let Some(rest) = trimmed_start.strip_prefix("---\n") {
+        if let Some(end_idx) = rest.find("\n---") {
+            let frontmatter = &rest[..end_idx];
+            let after_closing = &rest[end_idx + 4..];
+            let body_part = after_closing.strip_prefix('\n').unwrap_or(after_closing);
+            for line in frontmatter.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                let Some((k, v)) = line.split_once(':') else {
+                    continue;
+                };
+                let key = k.trim().to_ascii_lowercase();
+                let mut val = v.trim();
+                if (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
+                    || (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
+                {
+                    val = &val[1..val.len() - 1];
+                }
+                let val_trimmed = val.trim();
+                if val_trimmed.is_empty() {
+                    continue;
+                }
+                match key.as_str() {
+                    "description" | "summary" => tpl.description = Some(val_trimmed.to_string()),
+                    "scope" => tpl.scope = Some(val_trimmed.to_string()),
+                    "workdir" | "workspace" => tpl.workdir = Some(val_trimmed.to_string()),
+                    "harness" => tpl.harness = Some(val_trimmed.to_string()),
+                    "model" => tpl.model = Some(val_trimmed.to_string()),
+                    "role" => tpl.role = Some(val_trimmed.to_string()),
+                    "profile" => tpl.profile = Some(val_trimmed.to_string()),
+                    _ => {}
+                }
+            }
+            body_part
+        } else {
+            trimmed_start
+        }
+    } else {
+        trimmed_start
+    };
+    tpl.body = body.trim().to_string();
+    tpl
+}
+
+/// Resolve an archetype template by name across:
+/// 1. `<explicit_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
+/// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
+/// 3. `<data_dir>/agents-templates/<archetype>.md` (or `<data_dir>/archetypes/`, `<data_dir>/.agents/agents/`)
+/// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
+pub(crate) fn resolve_archetype_template(
+    archetype: &str,
+    explicit_workdir: Option<&Path>,
+    parent_workdir: Option<&Path>,
+    data_dir: &Path,
+) -> Option<ArchetypeTemplate> {
+    let slug = archetype.trim().trim_end_matches(".md");
+    if slug.is_empty()
+        || slug.contains("..")
+        || slug.contains('/')
+        || slug.contains('\\')
+        || !slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+    {
+        return None;
+    }
+
+    let mut search_roots: Vec<PathBuf> = Vec::new();
+    if let Some(wd) = explicit_workdir {
+        let s = wd.to_string_lossy();
+        if !matches!(s.trim(), "" | "worktree" | "branch" | "private" | "inherit") {
+            search_roots.push(wd.join(".agents").join("agents"));
+        }
+    }
+    if let Some(pwd) = parent_workdir {
+        search_roots.push(pwd.join(".agents").join("agents"));
+    }
+    search_roots.push(data_dir.join("agents-templates"));
+    search_roots.push(data_dir.join("archetypes"));
+    search_roots.push(data_dir.join(".agents").join("agents"));
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        search_roots.push(home.join(".agents").join("agents"));
+    }
+    if let Some(owd) = crate::server::owner_workdir() {
+        search_roots.push(owd.join(".agents").join("agents"));
+    }
+
+    let candidates = [
+        format!("{slug}.md"),
+        format!("{}/agent.md", slug),
+        format!("{}/AGENT.md", slug),
+    ];
+
+    for root in search_roots {
+        for rel in &candidates {
+            let candidate = root.join(rel);
+            if let Ok(raw) = std::fs::read_to_string(&candidate) {
+                return Some(parse_archetype_markdown(&raw));
+            }
+        }
+    }
+    None
+}
+
+/// Apply archetype template defaults (`.agents/agents/<archetype>.md`) to a `CreateAgentRequest`
+/// in-place before agent creation. When `archetype` is omitted, also checks whether `role`
+/// matches a template slug (e.g. `role: "code-reviewer"` when `.agents/agents/code-reviewer.md`
+/// exists) while keeping `role` methodology-neutral when no template matches.
+pub(crate) fn apply_archetype_defaults(
+    data_dir: &Path,
+    parent: Option<&Agent>,
+    body: &mut crate::api::CreateAgentRequest,
+) {
+    let explicit_wd = body
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let parent_wd = parent.and_then(|p| p.workdir.as_deref()).map(Path::new);
+    let tpl = if let Some(arch) = body
+        .archetype
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)
+    } else if let Some(role) = body
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let slugified = role.to_ascii_lowercase().replace(' ', "-");
+        resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir).or_else(
+            || resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir),
+        )
+    } else {
+        None
+    };
+    let Some(tpl) = tpl else {
+        return;
+    };
+
+    if body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(desc) = tpl.description
+    {
+        body.description = Some(desc);
+    }
+    if body
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && body.public.is_none()
+        && let Some(scope) = tpl.scope
+    {
+        body.scope = Some(scope);
+    }
+    if body
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && body
+            .repo
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        && let Some(wd) = tpl.workdir
+    {
+        body.workdir = Some(wd);
+    }
+    if body.harness.trim().is_empty()
+        && let Some(h) = tpl.harness
+    {
+        body.harness = h;
+    }
+    if body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(m) = tpl.model
+    {
+        body.model = Some(m);
+    }
+    if body
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(p) = tpl.profile
+    {
+        body.profile = Some(p);
+    }
+    if body
+        .role
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && let Some(r) = tpl.role
+    {
+        body.role = Some(r);
+    }
+    if !tpl.body.is_empty() {
+        body.instructions = match body
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(existing) => Some(format!("{}\n\n{}", tpl.body, existing)),
+            None => Some(tpl.body),
+        };
+    }
+}
+
 /// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.
 pub(crate) fn resolve_subagent_defaults(
     data: &Path,

@@ -742,7 +742,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             Err(err) => return Err(err),
         }
     }
-    let parsed: crate::api::CreateAgentRequest =
+    let mut parsed: crate::api::CreateAgentRequest =
         serde_json::from_value(body).map_err(|err| err.to_string())?;
     let store = open_with_key(data).map_err(|err| err.to_string())?;
     let parent_agent = match parsed.parent.as_deref() {
@@ -754,6 +754,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         ),
         None => None,
     };
+    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed);
     let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,
@@ -762,7 +763,10 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
-    let agent = crate::create::create(
+    let explicit_description = parsed.description.clone();
+    let explicit_scope = parsed.scope.clone();
+    let explicit_public = parsed.public;
+    let mut agent = crate::create::create(
         &store,
         data,
         crate::create::CreateRequest {
@@ -776,11 +780,28 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             base: parsed.base,
             workdir: parsed.workdir.map(std::path::PathBuf::from),
             workdir_default: server::owner_workdir(),
-            instructions: parsed.instructions,
+            instructions: parsed.instructions.or(parsed.description),
             parent_id,
         },
     )
     .map_err(|err| err.to_string())?;
+    if let Some(desc) = explicit_description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let _ = store.set_agent_description(&agent.id, Some(desc));
+    }
+    if let Some(scope_raw) = explicit_scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let _ = store.set_agent_scope(&agent.id, scope_raw);
+    } else if let Some(pub_flag) = explicit_public {
+        let _ = store.set_agent_public(&agent.id, pub_flag);
+    }
+    agent = store.agent(&agent.id).unwrap_or(agent);
     // A create is a new instance: its capability is minted so its harness
     // starts with one.
     crate::operator::mint(&store, &agent.id).map_err(|err| err.to_string())?;
