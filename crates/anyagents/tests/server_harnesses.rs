@@ -57,6 +57,115 @@ impl Drop for Server {
     }
 }
 
+#[test]
+fn fixture_agent_uids_never_match_the_server_uid() {
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let line = support::agents_line();
+    let seats: Vec<_> = line
+        .split(',')
+        .map(|entry| {
+            let (name, seat) = entry.split_once('=').unwrap();
+            (name, seat.parse::<u32>().unwrap())
+        })
+        .collect();
+    assert_eq!(seats.len(), 8);
+    let unique: std::collections::HashSet<_> = seats.iter().map(|(_, seat)| seat).collect();
+    assert_eq!(unique.len(), seats.len());
+    for (name, seat) in seats {
+        assert_ne!(seat, 0, "root is never a synthetic agent: {name}");
+        assert_ne!(seat, uid, "{name} collides with the server's real UID");
+    }
+}
+
+#[test]
+fn synthetic_uid_selection_excludes_every_possible_candidate_collision() {
+    let names = [
+        "alpha", "beta", "ada", "bea", "cy", "kind", "gamma", "delta",
+    ];
+    for uid in [0, 1, 501, 1001, u32::MAX].into_iter().chain(2101..=2109) {
+        let line = support::agents_line_for_uid(uid);
+        let entries: Vec<_> = line.split(',').collect();
+        assert_eq!(entries.len(), names.len());
+        let mut seen = std::collections::HashSet::new();
+        for (entry, expected_name) in entries.into_iter().zip(names) {
+            let (name, seat) = entry.split_once('=').unwrap();
+            let seat: u32 = seat.parse().unwrap();
+            assert_eq!(name, expected_name);
+            assert_ne!(seat, 0);
+            assert_ne!(seat, uid, "{name} collides with server UID {uid}");
+            assert!(seen.insert(seat), "duplicate fixture UID {seat}");
+        }
+    }
+}
+
+#[test]
+fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    create_asker(&data);
+    assert_eq!(
+        std::env::var("ANYAGENTS_AGENTS").unwrap(),
+        support::agents_line()
+    );
+    // SAFETY: getuid takes no arguments and cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let log = data.join("matching-uid.log");
+    let child = bin()
+        .env("ANYAGENTS_AGENTS", format!("kind={uid}"))
+        .arg("--data")
+        .arg(&data)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut refused = Server { child };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = refused.child.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "a matching UID was not refused");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let stderr = std::fs::read_to_string(log).unwrap();
+    assert!(!status.success(), "{stderr}");
+    assert!(
+        stderr.contains("no OS seat is in place for its agents"),
+        "{stderr}"
+    );
+    assert!(!data.join("anyagents.sock").exists());
+    drop(refused);
+
+    // Keep the configured seat and launcher on both sides. The protocol-only
+    // Server::start helper intentionally removes those declarations and would
+    // not distinguish a corrected map from an absent launch boundary.
+    let accepted_log = data.join("distinct-uid.log");
+    let child = bin()
+        .env("ANYAGENTS_AGENTS", support::agents_line())
+        .arg("--data")
+        .arg(&data)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&accepted_log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut accepted = Server { child };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !data.join("anyagents.sock").exists() {
+        assert!(
+            accepted.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "the corrected fixture was not admitted: {}",
+            std::fs::read_to_string(&accepted_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// A `PATH` where creating an agent installs nothing: `npm` answers a version
 /// and a no-op install. The harnesses the tests run are on the machine already.
 fn machine_path(dir: &Path) -> std::ffi::OsString {

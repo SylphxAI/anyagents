@@ -404,6 +404,7 @@ impl SylphxSdkSession {
         let exe = crate::clean_exe_path(
             &std::env::current_exe().unwrap_or_else(|_| PathBuf::from("anyagents")),
         );
+        let environment = self.env.clone().into();
         match self.execution_mode {
             SylphxExecutionMode::LocalOnly => run_native_gateway_turn(
                 &state,
@@ -411,7 +412,7 @@ impl SylphxSdkSession {
                 &self.config_dir,
                 &self.work_dir,
                 self.model.as_deref(),
-                &self.env,
+                &environment,
                 &exe,
                 &[],
                 user_prompt,
@@ -423,7 +424,7 @@ impl SylphxSdkSession {
                     &self.config_dir,
                     &self.work_dir,
                     self.model.as_deref(),
-                    &self.env,
+                    &environment,
                     &exe,
                     &[],
                     DEFAULT_SYLPHX_SANDBOX_PARENT,
@@ -439,7 +440,7 @@ impl SylphxSdkSession {
                             &self.config_dir,
                             &self.work_dir,
                             self.model.as_deref(),
-                            &self.env,
+                            &environment,
                             &exe,
                             &[],
                             DEFAULT_SYLPHX_SANDBOX_PARENT,
@@ -456,7 +457,7 @@ impl SylphxSdkSession {
                     &self.config_dir,
                     &self.work_dir,
                     self.model.as_deref(),
-                    &self.env,
+                    &environment,
                     &exe,
                     &[],
                     DEFAULT_SYLPHX_SANDBOX_PARENT,
@@ -472,7 +473,7 @@ impl SylphxSdkSession {
                             &self.config_dir,
                             &self.work_dir,
                             self.model.as_deref(),
-                            &self.env,
+                            &environment,
                             &exe,
                             &[],
                             DEFAULT_SYLPHX_SANDBOX_PARENT,
@@ -498,7 +499,7 @@ impl SylphxSdkSession {
                             &self.config_dir,
                             &self.work_dir,
                             self.model.as_deref(),
-                            &self.env,
+                            &environment,
                             &exe,
                             &[],
                             user_prompt,
