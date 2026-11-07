@@ -1076,12 +1076,35 @@ fn curl_post_json_fallback(
     curl_post_json_fallback_with_ua(url, bearer_token, None, payload)
 }
 
+fn remove_provider_key_environment(cmd: &mut Command) {
+    // These are the process-environment aliases used by the key resolvers above.
+    // Curl receives the selected key through its private header file instead;
+    // preserve proxy, certificate and other operational configuration.
+    for key in [
+        "SYLPHX_API_KEY",
+        "SYLPHX_AI_KEY",
+        "SYLPHX_GATEWAY_KEY",
+        "KIMI_CODE_PLAN_API_KEY",
+        "KIMI_API_KEY",
+        "QWEN_TOKEN_PLAN_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "GLM_CODE_PLAN_API_KEY",
+        "ZAI_API_KEY",
+        "MINIMAX_CODE_PLAN_API_KEY",
+        "MINIMAX_API_KEY",
+        "OPENROUTER_API_KEY",
+    ] {
+        cmd.env_remove(key);
+    }
+}
+
 // Keep the private header file alive until curl exits. Only its path, never
 // the credential, may enter argv; stdin remains available for the JSON body.
 fn curl_command(
     bearer_token: Option<&str>,
 ) -> Result<(Command, Option<tempfile::NamedTempFile>), String> {
     let mut cmd = Command::new("curl");
+    remove_provider_key_environment(&mut cmd);
     let header_file = if let Some(tok) = bearer_token {
         // NamedTempFile is created exclusively with mode 0600 on Unix.
         let mut file = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
