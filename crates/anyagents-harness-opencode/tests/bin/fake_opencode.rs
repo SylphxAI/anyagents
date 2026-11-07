@@ -66,11 +66,22 @@ fn serve(args: &[String]) {
     assert!(env::var_os("OPENCODE_PASSWORD").is_none());
     assert!(env::var_os("OPENCODE_SERVER_PASSWORD").is_none());
     let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_default();
+    let mut collision_holder = None;
+    let mut witnessed_bind_error = None;
     if matches!(mode.as_str(), "bind-race" | "transient-bind-race") {
         let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
         let announced = state.join("first-serve-port");
         if !announced.exists() {
-            std::fs::write(&announced, port.to_string()).unwrap();
+            // Own the collision before publishing the barrier. Asking the test
+            // to bind after handoff races every other process on the runner.
+            // If one already won, retain that acquisition-time error instead.
+            match std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)) {
+                Ok(holder) => collision_holder = Some(holder),
+                Err(error) => witnessed_bind_error = Some(error),
+            }
+            let pending = state.join("first-serve-port.new");
+            std::fs::write(&pending, port.to_string()).unwrap();
+            std::fs::rename(pending, &announced).unwrap();
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while !state.join("collision-bound").exists() {
                 assert!(std::time::Instant::now() < deadline, "collision barrier");
@@ -78,24 +89,30 @@ fn serve(args: &[String]) {
             }
         }
     }
-    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
-        .unwrap_or_else(|error| {
-            log(&format!("bind failed:{port}:{error}"));
-            eprintln!("{error}");
-            if mode == "transient-bind-race" {
-                let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
-                std::fs::write(state.join("collision-reported"), "reported").unwrap();
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                while !state.join("collision-released").exists() {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "release collision barrier"
-                    );
-                    thread::sleep(Duration::from_millis(10));
-                }
+    let binding = match witnessed_bind_error {
+        Some(error) => Err(error),
+        None => std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)),
+    };
+    let listener = binding.unwrap_or_else(|error| {
+        log(&format!("bind failed:{port}:{error}"));
+        eprintln!("{error}");
+        if mode == "transient-bind-race" {
+            // The parent acknowledges this marker before allowing exit:
+            // the adapter's later probe cannot see our former holder.
+            drop(collision_holder.take());
+            let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
+            std::fs::write(state.join("collision-reported"), "reported").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !state.join("collision-released").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "release collision barrier"
+                );
+                thread::sleep(Duration::from_millis(10));
             }
-            exit(1);
-        });
+        }
+        exit(1);
+    });
     std::thread::spawn(move || {
         for connection in listener.incoming() {
             if connection.is_err() {

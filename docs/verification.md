@@ -33,16 +33,17 @@ cargo test --workspace --locked
 npm test
 ```
 
-## OpenCode port ownership
+## OpenCode port-collision fixtures
 
-`cargo test -p anyagents-harness-opencode --locked` runs both the scripted
-protocol suite and internal allocator/startup cases. Collision fixtures retain a
-cloned socket across the actual child handoff, so their setup never rebinds an
-unowned port. They verify both held and already-released collisions, startup
-retry, the persisted replacement and its live endpoint. Exact available-port
-reuse is checked through fixture-owned allocator reservations; a shared host may
-legitimately claim a released port before a service restarts. The verification
-script builds the scripted CLI before running the internal cases as well.
+The scripted child owns a competing socket before publishing its handoff barrier
+by atomic rename, then deliberately attempts the conflicting bind. The transient
+case releases that holder before acknowledging its bind failure and cannot exit
+until the test acknowledges the release. Both cases require the witnessed bind
+failure, startup retry and a different persisted port. The stored-port fixture
+retains its socket throughout setup; restart checks accept a legal replacement
+rather than assuming a released number stays available on a shared runner.
+These cases run in the ordinary OpenCode `protocol` suite without product hooks
+or an installed vendor CLI. The real-CLI case remains optional and ignored.
 
 ## Archived sub-agent cleanup
 

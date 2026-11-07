@@ -29,7 +29,7 @@ impl PortLease {
 
     // Keep allocation decisions testable with fixture-owned reservations and
     // an ephemeral range, without adding a public runtime/test setting.
-    pub(super) fn acquire_with(
+    fn acquire_with(
         config: Option<&Path>,
         avoid: Option<u16>,
         range: std::ops::Range<u16>,

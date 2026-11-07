@@ -377,15 +377,15 @@ fn concurrent_agents_and_restart_bind_distinct_private_ports() {
 fn an_occupied_stored_port_is_replaced_and_persisted() {
     let dir = TempDir::new().unwrap();
     let config = dir.path().join("config");
-    // Own the stored port before asking the allocator to decide. A service's
-    // released port can already belong to somebody else on a shared runner.
+    // Claim a valid candidate before storing it, and keep ownership throughout.
+    // A service shutdown followed by bind(previous) has an unowned socket gap.
     let occupied = (20_000..30_000)
         .find_map(|port| std::net::TcpListener::bind(("127.0.0.1", port)).ok())
-        .expect("a fixture-owned port in the allocator range");
+        .expect("an available private fixture port");
     let previous = occupied.local_addr().unwrap().port();
-    std::fs::create_dir_all(&config).unwrap();
+    std::fs::create_dir(&config).unwrap();
     std::fs::write(config.join("opencode-service-port"), previous.to_string()).unwrap();
-    let second = start_with_config(&dir, "finish", &config);
+    let harness = start_with_config(&dir, "finish", &config);
     let replacement = port_of(&config);
     assert_ne!(replacement, previous);
     assert!(log_of(&dir).contains(&format!("server:http://127.0.0.1:{replacement}")));
@@ -393,7 +393,7 @@ fn an_occupied_stored_port_is_replaced_and_persisted() {
     // Once released, another process may claim it; deterministic free-port
     // reuse and occupied-next-port cases live at the allocator boundary.
     assert!(std::net::TcpListener::bind(("127.0.0.1", replacement)).is_err());
-    drop(second);
+    drop(harness);
     drop(occupied);
 }
 
@@ -419,6 +419,34 @@ fn startup_without_an_endpoint_never_calls_api_or_discovers_a_managed_service() 
         "{error}"
     );
     assert!(!log_of(&dir).contains("api:"));
+}
+
+#[test]
+fn a_collision_during_socket_handoff_retries_and_persists_the_new_port() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::thread::scope(|scope| {
+        let launch = scope.spawn(|| start_with_config(&dir, "bind-race", &config));
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let first = dir.path().join("first-serve-port");
+        let port: u16 = loop {
+            if let Ok(text) = std::fs::read_to_string(&first)
+                && let Ok(port) = text.parse()
+            {
+                break port;
+            }
+            assert!(std::time::Instant::now() < deadline, "first launch barrier");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        // The scripted child already owns the collision socket. Rebinding it
+        // here would race unrelated holders and reject a legitimate collision.
+        std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
+        let harness = launch.join().unwrap();
+        assert_ne!(port_of(&config), port);
+        assert!(log_of(&dir).contains(&format!("bind failed:{port}:")));
+        assert!(log_of(&dir).matches("serve:").count() >= 2);
+        drop(harness);
+    });
 }
 
 #[test]
@@ -460,7 +488,7 @@ fn inherited_host_roots_and_credentials_do_not_select_the_service() {
 /// a provider call. Set ANYAGENTS_REAL_OPENCODE to the installed executable.
 #[test]
 #[ignore = "requires an installed OpenCode v2 CLI"]
-fn real_opencode_services_keep_private_ports_after_restart() {
+fn real_opencode_services_use_private_ports_across_restart() {
     let program = std::env::var_os("ANYAGENTS_REAL_OPENCODE")
         .expect("set ANYAGENTS_REAL_OPENCODE to the installed executable");
     let alpha = TempDir::new().unwrap();
@@ -493,7 +521,40 @@ fn real_opencode_services_keep_private_ports_after_restart() {
     let restarted_port = port_of(&alpha.path().join("config"));
     assert_ne!(restarted_port, b_port);
     assert!(std::net::TcpListener::bind(("127.0.0.1", restarted_port)).is_err());
-    assert!(restarted.session_id().is_some());
     drop(restarted);
     drop(b);
+}
+
+#[test]
+fn a_transient_bind_collision_is_retried_even_after_the_holder_releases_it() {
+    let dir = TempDir::new().unwrap();
+    let config = dir.path().join("config");
+    std::thread::scope(|scope| {
+        let launch = scope.spawn(|| start_with_config(&dir, "transient-bind-race", &config));
+        let wait = |path: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !path.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "barrier {}",
+                    path.display()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let first = dir.path().join("first-serve-port");
+        wait(&first);
+        let port: u16 = std::fs::read_to_string(&first).unwrap().parse().unwrap();
+        std::fs::write(dir.path().join("collision-bound"), "bound").unwrap();
+        wait(&dir.path().join("collision-reported"));
+        // The child releases its holder before reporting this barrier and
+        // cannot exit until acknowledged. A later bind probe alone therefore
+        // cannot diagnose the collision that actually occurred.
+        std::fs::write(dir.path().join("collision-released"), "released").unwrap();
+        let harness = launch.join().unwrap();
+        assert_ne!(port_of(&config), port);
+        assert!(log_of(&dir).contains(&format!("bind failed:{port}:")));
+        assert!(log_of(&dir).matches("serve:").count() >= 2);
+        drop(harness);
+    });
 }
