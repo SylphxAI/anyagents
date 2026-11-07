@@ -136,6 +136,43 @@ impl HostIndex {
         Ok(())
     }
 
+    /// Full verification is hourly per source, serviced one source per daemon
+    /// maintenance tick. Attempt ordering prevents a corrupt source monopolizing
+    /// the verifier. Backlog may extend the detection delay beyond one hour.
+    pub(crate) fn verification_candidate(
+        &self,
+        now_ms: i64,
+    ) -> Result<Option<(String, std::path::PathBuf)>, IndexError> {
+        let mut due = self
+            .conn
+            .prepare("SELECT agent_id,segment,cursor FROM host_sources")?
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .map(|r| -> Result<_, IndexError> {
+                let (owner, path, raw) = r?;
+                let cursor: crate::host_cursor::SourceCursor = serde_json::from_str(&raw)?;
+                Ok((owner, std::path::PathBuf::from(path), cursor))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        due.retain(|(_, _, c)| {
+            c.policy.starts_with("native-jsonl-v2:")
+                && c.full_verified_ms <= now_ms.saturating_sub(3_600_000)
+        });
+        due.sort_by(|a, b| {
+            (a.2.verification_attempt_ms, &a.0, &a.1).cmp(&(
+                b.2.verification_attempt_ms,
+                &b.0,
+                &b.1,
+            ))
+        });
+        Ok(due.into_iter().next().map(|(owner, path, _)| (owner, path)))
+    }
+
     pub(crate) fn source_cursor(
         &self,
         owner: &str,

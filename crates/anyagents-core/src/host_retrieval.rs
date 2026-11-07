@@ -16,6 +16,74 @@ use std::{
 pub const INDEX_FILE: &str = "host-history-index-v1.db";
 
 impl Store {
+    fn unresolved_host_paths(&self, owner: &str) -> Result<Vec<PathBuf>, IndexError> {
+        let paths = self
+            .conn()
+            .prepare("SELECT receipt FROM conversation_redactions WHERE agent_id=?1")?
+            .query_map([owner], |r| r.get::<_, String>(0))?
+            .map(|raw| -> Result<_, IndexError> {
+                let receipt: crate::redaction::Receipt = serde_json::from_str(&raw?)?;
+                Ok(receipt
+                    .unscrubbed
+                    .into_iter()
+                    .map(|f| PathBuf::from(f.path))
+                    .collect::<Vec<_>>())
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        Ok(paths)
+    }
+
+    /// Low-priority daemon maintenance: at most one due native source per call.
+    /// Failures advance only attempt ordering, so one bad source cannot starve
+    /// others; frontier/documents remain the previous atomic publication.
+    pub fn verify_one_host_history_source(&self, now_ms: i64) -> Result<bool, IndexError> {
+        let index_path = self.data_dir().join(INDEX_FILE);
+        if !index_path.exists() {
+            return Ok(false);
+        }
+        let candidate = HostIndex::open(&index_path)?.verification_candidate(now_ms)?;
+        let Some((owner, path)) = candidate else {
+            return Ok(false);
+        };
+        let agent = self
+            .list_agents()
+            .map_err(|e| io::Error::other(e.to_string()))?
+            .into_iter()
+            .find(|a| a.id.as_str() == owner);
+        let Some(agent) = agent else {
+            let index = HostIndex::open(&index_path)?;
+            index.clear_source(&owner, &path)?;
+            index.checkpoint()?;
+            return Ok(true);
+        };
+        let _guard = self
+            .lock_agent_lifecycle(&agent.id)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut index = HostIndex::open(&index_path)?;
+        let Some(mut cursor) = index.source_cursor(&owner, &path)? else {
+            return Ok(false);
+        };
+        cursor.verification_attempt_ms = now_ms;
+        index.save_source(&owner, &path, &cursor)?;
+        let root = self.data_dir().join("agents").join(agent.id.as_str());
+        if !safe_components(self.data_dir(), &root)?
+            || !native_transcripts(&root)?.contains(&path)
+            || self
+                .unresolved_host_paths(&owner)?
+                .iter()
+                .any(|p| path.starts_with(p))
+        {
+            index.clear_source(&owner, &path)?;
+            index.checkpoint()?;
+            return Ok(true);
+        }
+        refresh_native_at(&mut index, &agent, &path, true, now_ms)?;
+        Ok(true)
+    }
+
     /// The caller has already resolved the authorized immutable ID set. Locks
     /// serialize refresh/readback against redaction, rename and lifecycle changes.
     pub fn search_host_files(
@@ -58,22 +126,7 @@ impl Store {
             // The durable redactor is the only text mutation authority. A
             // pending/failed copy excludes precisely that path and descendants;
             // an unrelated unsupported store does not hide scrubbed local data.
-            let unresolved = self
-                .conn()
-                .prepare("SELECT receipt FROM conversation_redactions WHERE agent_id=?1")?
-                .query_map([agent.id.as_str()], |r| r.get::<_, String>(0))?
-                .map(|raw| -> Result<_, IndexError> {
-                    let receipt: crate::redaction::Receipt = serde_json::from_str(&raw?)?;
-                    Ok(receipt
-                        .unscrubbed
-                        .into_iter()
-                        .map(|f| PathBuf::from(f.path))
-                        .collect::<Vec<_>>())
-                })
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .flatten()
-                .collect::<Vec<_>>();
+            let unresolved = self.unresolved_host_paths(agent.id.as_str())?;
             if scope != MemoryScope::Transcripts {
                 for path in regular_files(&root.join("memory"), true)? {
                     if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
@@ -127,6 +180,7 @@ impl Store {
 pub struct RefreshStats {
     pub documents: Vec<String>,
     pub prefix_verified_bytes: u64,
+    pub boundary_capture_bytes: u64,
     pub suffix_scanned_bytes: u64,
     pub indexed_records: usize,
 }
@@ -166,7 +220,9 @@ fn refresh_document_before_publish(
                     policy,
                     end: raw.length,
                     next_seq: 2,
-                    prefix_sha256: raw.sha256.clone(),
+                    boundary_sha256: String::new(),
+                    full_verified_ms: 0,
+                    verification_attempt_ms: 0,
                 },
             )?;
         } else {
@@ -184,18 +240,27 @@ fn refresh_native(
     agent: &Agent,
     path: &Path,
 ) -> Result<RefreshStats, IndexError> {
+    refresh_native_at(index, agent, path, false, crate::now_ms())
+}
+fn refresh_native_at(
+    index: &mut HostIndex,
+    agent: &Agent,
+    path: &Path,
+    force_full: bool,
+    now_ms: i64,
+) -> Result<RefreshStats, IndexError> {
     let stamp = FileStamp::read(&open_readonly(path)?)?;
-    let policy = format!("native-jsonl-v1:{}:{}", agent.id, agent.name);
+    let policy = format!("native-jsonl-v2:{}:{}", agent.id, agent.name);
     let old = index
         .source_cursor(agent.id.as_str(), path)?
         .filter(|old| old.policy == policy);
-    if old.as_ref().is_some_and(|old| old.stamp == stamp) {
+    if !force_full && old.as_ref().is_some_and(|old| old.stamp == stamp) {
         return Ok(RefreshStats {
             documents: index.source_documents(agent.id.as_str(), path)?,
             ..Default::default()
         });
     }
-    let scan = crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref())?;
+    let scan = crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref(), force_full)?;
     index.refresh_source(|index| {
         if scan.replace {
             index.clear_source(agent.id.as_str(), path)?;
@@ -227,7 +292,17 @@ fn refresh_native(
                     policy,
                     end: scan.end,
                     next_seq: scan.next_seq,
-                    prefix_sha256: scan.prefix_sha256.clone(),
+                    boundary_sha256: scan.boundary_sha256.clone(),
+                    full_verified_ms: if scan.replace {
+                        now_ms
+                    } else {
+                        old.as_ref().map_or(0, |c| c.full_verified_ms)
+                    },
+                    verification_attempt_ms: if scan.replace {
+                        now_ms
+                    } else {
+                        old.as_ref().map_or(0, |c| c.verification_attempt_ms)
+                    },
                 },
             )?;
         } else {
@@ -242,6 +317,7 @@ fn refresh_native(
         Ok(RefreshStats {
             documents: index.source_documents(agent.id.as_str(), path)?,
             prefix_verified_bytes: scan.prefix_verified_bytes,
+            boundary_capture_bytes: scan.boundary_capture_bytes,
             suffix_scanned_bytes: scan.suffix_scanned_bytes,
             indexed_records: scan.records.len(),
         })
@@ -399,6 +475,203 @@ fn event_metadata(agent: &Agent, value: &EventHeader, fallback_time: i64) -> Ind
 mod tests {
     use super::*;
     use crate::NewAgent;
+    #[test]
+    fn boundary_fast_path_reads_bounded_prefix_and_periodic_verifier_recovers_older_edits() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("boundary-owner", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        fs::create_dir_all(root.join("config")).unwrap();
+        let path = root.join("config/sylphx-transcript.jsonl");
+        let prefix = format!(
+            "{{\"content\":\"oldneedle {}\"}}\n",
+            "padding ".repeat(40_000)
+        );
+        fs::write(&path, &prefix).unwrap();
+        let index_path = dir.path().join(INDEX_FILE);
+        let mut index = HostIndex::open(&index_path).unwrap();
+        let t0 = crate::now_ms();
+        refresh_native_at(&mut index, &agent, &path, false, t0).unwrap();
+        let suffix = b"{\"content\":\"suffixneedle\"}\n";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix)
+            .unwrap();
+        let append = refresh_native_at(&mut index, &agent, &path, false, t0 + 1).unwrap();
+        assert_eq!(
+            append.prefix_verified_bytes,
+            crate::host_cursor::BOUNDARY_BYTES
+        );
+        assert_eq!(
+            append.boundary_capture_bytes,
+            crate::host_cursor::BOUNDARY_BYTES
+        );
+        assert_eq!(append.suffix_scanned_bytes, suffix.len() as u64);
+        assert_eq!(append.indexed_records, 1);
+        assert_eq!(append.documents.len(), 2);
+        // Same-size edit inside the last boundary must trigger full replacement.
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(prefix.len() as u64 + 12))
+            .unwrap();
+        file.write_all(b"inside").unwrap();
+        let inside = refresh_native_at(&mut index, &agent, &path, false, t0 + 2).unwrap();
+        assert_eq!(inside.indexed_records, 2);
+        assert_eq!(
+            inside.suffix_scanned_bytes,
+            (prefix.len() + suffix.len()) as u64
+        );
+        // An old edit outside the boundary is the documented delayed-detection
+        // case, even when an append follows it. Per-hit SHA still refuses stale
+        // returned bytes immediately, before the full verifier catches up.
+        file.seek(SeekFrom::Start(12)).unwrap();
+        file.write_all(b"newneedle").unwrap();
+        let mut append_file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        append_file.write_all(suffix).unwrap();
+        let outside = refresh_native_at(&mut index, &agent, &path, false, t0 + 3).unwrap();
+        assert_eq!(outside.indexed_records, 1);
+        assert_eq!(
+            outside.prefix_verified_bytes,
+            crate::host_cursor::BOUNDARY_BYTES
+        );
+        let query = |term: &str| HistorySearchQuery {
+            query: Some(term.into()),
+            ..Default::default()
+        };
+        let ids = [agent.id.to_string()];
+        assert!(
+            index
+                .search(&ids, MemoryScope::Transcripts, &query("newneedle"))
+                .unwrap()
+                .is_empty()
+        );
+        let stale = index
+            .search(&ids, MemoryScope::Transcripts, &query("oldneedle"))
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert!(read_raw(&stale[0].window).is_err());
+        drop(index);
+        assert!(
+            !store
+                .verify_one_host_history_source(t0 + 3_599_000)
+                .unwrap()
+        );
+        assert!(
+            store
+                .verify_one_host_history_source(t0 + 3_600_003)
+                .unwrap()
+        );
+        let mut index = HostIndex::open(&index_path).unwrap();
+        assert!(
+            index
+                .search(&ids, MemoryScope::Transcripts, &query("oldneedle"))
+                .unwrap()
+                .is_empty()
+        );
+        let fresh = index
+            .search(&ids, MemoryScope::Transcripts, &query("newneedle"))
+            .unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert!(
+            String::from_utf8_lossy(&read_raw(&fresh[0].window).unwrap()).contains("newneedle")
+        );
+        // Shrink and a new inode use the complete-source path, not suffix reuse.
+        fs::write(&path, suffix).unwrap();
+        let shrink = refresh_native_at(&mut index, &agent, &path, false, t0 + 3_600_004).unwrap();
+        assert_eq!(
+            (
+                shrink.prefix_verified_bytes,
+                shrink.suffix_scanned_bytes,
+                shrink.indexed_records
+            ),
+            (0, suffix.len() as u64, 1)
+        );
+        let replacement = root.join("replacement");
+        fs::write(&replacement, &prefix).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let replaced = refresh_native_at(&mut index, &agent, &path, false, t0 + 3_600_005).unwrap();
+        assert_eq!(
+            (
+                replaced.prefix_verified_bytes,
+                replaced.suffix_scanned_bytes,
+                replaced.indexed_records
+            ),
+            (0, prefix.len() as u64, 1)
+        );
+    }
+
+    #[test]
+    fn periodic_verifier_rotates_failed_sources_without_advancing_their_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("verifier-owner", "sylphx"))
+            .unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("transcripts");
+        fs::create_dir_all(&root).unwrap();
+        let bad = root.join("a.jsonl");
+        let good = root.join("b.jsonl");
+        fs::write(&bad, "{\"content\":\"badneedle\"}\n").unwrap();
+        fs::write(&good, "{\"content\":\"goodneedle\"}\n").unwrap();
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let t0 = crate::now_ms();
+        refresh_native_at(&mut index, &agent, &bad, false, t0).unwrap();
+        refresh_native_at(&mut index, &agent, &good, false, t0).unwrap();
+        let before = index
+            .source_cursor(agent.id.as_str(), &bad)
+            .unwrap()
+            .unwrap();
+        fs::write(&bad, "malformed complete line\n").unwrap();
+        drop(index);
+        let error = store
+            .verify_one_host_history_source(t0 + 3_600_001)
+            .unwrap_err();
+        assert!(matches!(error, IndexError::Io(ref e) if e.kind() == io::ErrorKind::InvalidData));
+        assert!(
+            store
+                .verify_one_host_history_source(t0 + 3_600_002)
+                .unwrap()
+        );
+        let index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let after = index
+            .source_cursor(agent.id.as_str(), &bad)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (
+                after.end,
+                after.next_seq,
+                after.boundary_sha256,
+                after.stamp,
+                after.full_verified_ms
+            ),
+            (
+                before.end,
+                before.next_seq,
+                before.boundary_sha256,
+                before.stamp,
+                before.full_verified_ms
+            )
+        );
+        assert_eq!(after.verification_attempt_ms, t0 + 3_600_001);
+        assert_eq!(
+            index
+                .source_cursor(agent.id.as_str(), &good)
+                .unwrap()
+                .unwrap()
+                .full_verified_ms,
+            t0 + 3_600_002
+        );
+    }
+
     #[test]
     fn memory_changed_during_publication_rolls_back_documents_and_cursor() {
         let dir = tempfile::tempdir().unwrap();

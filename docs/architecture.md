@@ -364,3 +364,32 @@ ORDER BY id;
 ## Storage
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
+
+### Host history index refresh
+
+Host history keeps raw text in its source files. The rebuildable contentless FTS
+index stores metadata, bounded search windows and SHA-256 raw coordinates, not a
+second raw transcript. Each source frontier and its documents/windows commit
+atomically. A source changing during publication defers that snapshot without
+advancing its frontier. `memory` and `transcripts` queries refresh/prune only their
+requested source class; `all` refreshes both.
+
+An unchanged native JSONL source reuses its persisted cursor. For the same device
+and inode with no size decrease, a changed source checks the last **64 KiB before
+the complete-record frontier**, then scans/indexes only the suffix. Capturing the
+new frontier adds one more bounded 64 KiB read. A changed boundary, shrink,
+replacement inode or parser-policy change rebuilds the complete source. Incomplete
+last records stay outside the committed frontier. Search result window reads
+always verify their own SHA; explicit whole-event readback verifies the event SHA.
+
+This is deliberately not an append-only proof: a same-size edit **outside** the
+boundary may remain missing/stale in the index until full verification. The daemon
+maintenance loop fully rebuilds at most **one due source per 60-second tick**, with
+sources due **one hour after their last full verification**. Backlog, a continuously
+changing source or failures can extend that detection delay; no fixed one-hour
+upper bound is promised. Failed sources rotate behind other due sources without
+publishing a new frontier. A stale returned window is refused immediately by its
+SHA check. Full verification uses the same lifecycle locks and pending-redaction
+path exclusions as query refresh; it never edits the source. This maintenance is
+host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
+the host raw append port is not activated by this index.

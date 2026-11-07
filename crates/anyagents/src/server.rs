@@ -210,6 +210,11 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
                 let health = reaper_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     reap_archived_agents(&store, &root, &health);
+                    if let Err(error) =
+                        store.verify_one_host_history_source(anyagents_core::now_ms())
+                    {
+                        eprintln!("anyagents-host-history: deferred full verification: {error}");
+                    }
                     crate::browser::reap_idle_browsers(&root);
                     crate::create::sync_fresher_bound_agent_credentials(&root);
                     #[cfg(unix)]
