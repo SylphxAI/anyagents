@@ -423,6 +423,8 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
 }
 
 fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> {
+    crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
+        .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
     let mut env: Vec<(String, String)> = request
         .extra_env

@@ -257,6 +257,22 @@ pub(crate) mod tests {
         String::from_utf8(out.stdout).unwrap().trim().into()
     }
 
+    /// The test parent must never hold a writable executable descriptor: an
+    /// unrelated parallel fork can inherit it until exec and cause ETXTBSY even
+    /// after std::fs::write returns. A waited writer has no surviving children.
+    pub(crate) fn write_executable(path: &Path, body: &str) {
+        assert!(
+            Command::new("/bin/sh")
+                .args(["-c", "printf '%s' \"$2\" > \"$1\"", "fixture-writer"])
+                .arg(path)
+                .arg(body)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     impl Fixture {
         pub(crate) fn new(dir: &Path) -> Self {
             let source = dir.join("source");
@@ -304,9 +320,9 @@ pub(crate) mod tests {
             git(&source, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
             // The authority fixture deliberately owns sparse checkout and hooks;
             // the consumer must not reimplement either policy or recover on failure.
-            std::fs::write(
+            write_executable(
                 &executable,
-                format!(
+                &format!(
                     r#"#!/bin/sh
 set -eu
 printf '%s\n' "$*" >> {log:?}
@@ -329,9 +345,7 @@ case "$1" in
 esac
 "#
                 ),
-            )
-            .unwrap();
-            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+            );
             Self {
                 consumer: Consumer { executable },
                 source,

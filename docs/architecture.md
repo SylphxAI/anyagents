@@ -225,6 +225,14 @@ both seats on future writes without admitting a child to sibling metadata.
 Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
 private gitdir protects `config.worktree` (and its unlink/rename), `commondir` and
 `gitdir`; mutable HEAD/index files belong to the child so Git lock+rename works.
+Temporary cleanup inspections persist each ACL target's exact path, device and
+inode before granting read/traverse access. Startup recovers those objects through
+no-follow descriptors; legacy intents use a best-effort no-follow tree walk.
+An unsafe recovery target or failed revocation quarantines only the recorded
+worktree and emits a warning, never aborting unrelated server startup.
+Quarantine preserves checkout data and refuses automatic harness launch, wake and
+reap until the operator repairs the recorded recovery state; it does not assert
+that an unreachable or hard-linked object's residual ACL was removed.
 Shared refs remain a same-repository integrity boundary: a child can move another
 branch ref. This is not hostile-repository isolation, and AnyAgents does not
 intercept arbitrary harness commit/push commands or provide a branch-tip guard.

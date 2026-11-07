@@ -177,5 +177,12 @@ admission failure verifies rollback revocation. ACL readbacks cover every change
 object. A missing privilege is an explicit local skip, never the CI acceptance:
 the required environment flag makes a privilege skip fail.
 
+Three Linux recovery regressions plant a FIFO, a hard link or an outside-target
+symlink during a durably open inspection. Each covers legacy and exact-object
+journals through both primary and admin HTTP servers: the affected worktree is
+quarantined, wake/reap/automatic harness launch refuse it, remaining targets and
+an independent interrupted inspection are revoked, an active same-common seat's
+ACLs remain unchanged, and outside-link contents and ACLs are preserved.
+
 Shared refs are intentionally writable within one repository. These checks do not
 claim branch-tip integrity for arbitrary agent shell commits or pushes.

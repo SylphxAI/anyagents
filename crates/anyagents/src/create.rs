@@ -7886,12 +7886,13 @@ mod tests {
             std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&common_config).unwrap());
         let authority = data.join("consumer-authority");
         std::fs::rename(data.join("consumer"), &authority).unwrap();
-        std::fs::write(data.join("consumer"), format!("#!/bin/sh\nexec /usr/bin/setpriv --reuid {a_uid} --regid {a_gid} --clear-groups -- env HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev/null {:?} \"$@\"\n", authority)).unwrap();
-        std::fs::set_permissions(
-            data.join("consumer"),
-            std::fs::Permissions::from_mode(0o755),
-        )
-        .unwrap();
+        crate::worktree::tests::write_executable(
+            &data.join("consumer"),
+            &format!(
+                "#!/bin/sh\nexec /usr/bin/setpriv --reuid {a_uid} --regid {a_gid} --clear-groups -- env HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev/null {:?} \"$@\"\n",
+                authority
+            ),
+        );
         let store = Store::open(data.join("state.db")).unwrap();
         let parent = store
             .create_agent(NewAgent::new("parent-a", "codex"))

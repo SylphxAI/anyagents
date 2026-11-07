@@ -318,10 +318,40 @@ struct Grant {
     active: bool,
     #[serde(default)]
     inspection: bool,
+    #[serde(default)]
+    inspection_paths: Option<Vec<InspectionPath>>,
+    #[serde(default)]
+    quarantined: bool,
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct InspectionPath {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
 }
 
 pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
     data.join("worktree-grants").join(format!("{id}.json"))
+}
+
+/// The supervisor's automatic restart and explicit wakes share this refusal.
+/// A quarantined checkout must not run even if its lifecycle row says running.
+pub(crate) fn ensure_launchable(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
+    let journal = grant_path(data, id);
+    let bytes = match std::fs::read(&journal) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(refusal(&journal, error)),
+    };
+    let grant: Grant = serde_json::from_slice(&bytes).map_err(|error| refusal(&journal, error))?;
+    if grant.quarantined || grant.inspection {
+        return Err(refusal(
+            &journal,
+            "worktree is quarantined or has incomplete ACL recovery",
+        ));
+    }
+    Ok(())
 }
 
 // st_mode's group bits are the POSIX ACL mask, not the owning-group entry.
@@ -405,6 +435,12 @@ impl RecordedWorktree {
     pub(crate) fn validate(&self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         let g = &self.grant;
+        let current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
+        if current.quarantined {
+            return Err(std::io::Error::other(
+                "worktree is quarantined after incomplete ACL recovery",
+            ));
+        }
         if g.private.parent() != Some(g.common.join("worktrees").as_path()) {
             return Err(std::io::Error::other("unrecorded private gitdir layout"));
         }
@@ -474,14 +510,18 @@ impl RecordedWorktree {
         {
             return Err(std::io::Error::other("worktree journal changed"));
         }
+        if current.inspection {
+            return Err(std::io::Error::other(
+                "worktree has incomplete ACL recovery",
+            ));
+        }
         if current.active || g.uid == crate::sandbox::server_uid() {
             drop(lock);
             return read();
         }
         let retained = other_active_grants(&self.journal, g)?;
-        current.inspection = true;
-        write_grant(&self.journal, &current)?;
-        let granted = walk_tree(&g.common, false, &|_| {}, &|file, path| {
+        let files = std::cell::RefCell::new(Vec::new());
+        walk_tree(&g.common, false, &|_| {}, &|file, path| {
             if !retained_path(&g.common, path, g) {
                 return Ok(());
             }
@@ -506,7 +546,24 @@ impl RecordedWorktree {
             {
                 return Ok(());
             }
-            update_metadata_acl(file, g.gid, Some(permissions), false, None)
+            use std::os::unix::fs::MetadataExt;
+            let meta = file.metadata()?;
+            files.borrow_mut().push((
+                InspectionPath {
+                    path: path.to_path_buf(),
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                },
+                permissions,
+            ));
+            Ok(())
+        })?;
+        let files = files.into_inner();
+        current.inspection_paths = Some(files.iter().map(|(target, _)| target.clone()).collect());
+        current.inspection = true;
+        write_grant(&self.journal, &current)?;
+        let granted = files.iter().try_for_each(|(target, permissions)| {
+            update_metadata_acl(&target.open()?, g.gid, Some(*permissions), false, None)
         });
         drop(lock);
         let result = granted.and_then(|()| read());
@@ -515,9 +572,14 @@ impl RecordedWorktree {
         let _lock = lock_journals(&self.journal)?;
         let mut current: Grant = serde_json::from_slice(&std::fs::read(&self.journal)?)?;
         let retained = other_active_grants(&self.journal, g)?;
-        if !current.active {
-            revoke_common(&g.common, g.uid, g.gid, &retained)?;
+        if !current.active
+            && let Err(error) = revoke_inspection(&current, &retained)
+        {
+            current.quarantined = true;
+            write_grant(&self.journal, &current)?;
+            return Err(error);
         }
+        current.inspection_paths = None;
         current.inspection = false;
         write_grant(&self.journal, &current)?;
         result
@@ -642,18 +704,32 @@ pub(crate) fn recover_inspections(data: &Path) -> Result<(), Error> {
         if journal.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let mut grant: Grant =
-            serde_json::from_slice(&std::fs::read(&journal)?).map_err(|e| refusal(&journal, e))?;
-        if !grant.inspection {
-            continue;
+        let recover = || -> std::io::Result<()> {
+            let mut grant: Grant = serde_json::from_slice(&std::fs::read(&journal)?)?;
+            if !grant.inspection {
+                return Ok(());
+            }
+            let result = if grant.active {
+                Err(std::io::Error::other("active grant has an open inspection"))
+            } else {
+                other_active_grants(&journal, &grant)
+                    .and_then(|retained| revoke_inspection(&grant, &retained))
+            };
+            if result.is_err() {
+                grant.quarantined = true;
+            } else {
+                grant.inspection = false;
+                grant.inspection_paths = None;
+            }
+            write_grant(&journal, &grant)?;
+            result
+        };
+        if let Err(error) = recover() {
+            eprintln!(
+                "warning: quarantined worktree journal {}: {error}",
+                journal.display()
+            );
         }
-        if grant.active {
-            return Err(refusal(&journal, "active grant has an open inspection"));
-        }
-        let retained = other_active_grants(&journal, &grant)?;
-        revoke_common(&grant.common, grant.uid, grant.gid, &retained)?;
-        grant.inspection = false;
-        write_grant(&journal, &grant)?;
     }
     Ok(())
 }
@@ -720,26 +796,129 @@ fn retained_path(common: &Path, path: &Path, grant: &Grant) -> bool {
         || path.starts_with(&grant.private)
 }
 
+fn revoke_binding(
+    file: &std::fs::File,
+    path: &Path,
+    common: &Path,
+    uid: u32,
+    gid: u32,
+    retained: &[Grant],
+) -> std::io::Result<()> {
+    let keep_group = retained
+        .iter()
+        .any(|g| g.gid == gid && retained_path(common, path, g));
+    let keep_user = retained
+        .iter()
+        .any(|g| g.uid == uid && retained_path(common, path, g));
+    if keep_group && keep_user {
+        return Ok(());
+    }
+    update_metadata_acl(
+        file,
+        if keep_group { u32::MAX } else { gid },
+        None,
+        false,
+        (!keep_user).then_some(uid),
+    )
+}
+
 fn revoke_common(common: &Path, uid: u32, gid: u32, retained: &[Grant]) -> std::io::Result<()> {
     walk_tree(common, false, &|_| {}, &|file, path| {
-        // Group and named-user bindings have independent lifetimes. Preserve
-        // either only where another active journal still needs that binding.
-        let keep_group = retained
-            .iter()
-            .any(|g| g.gid == gid && retained_path(common, path, g));
-        let keep_user = retained
-            .iter()
-            .any(|g| g.uid == uid && retained_path(common, path, g));
-        if keep_group && keep_user {
-            return Ok(());
-        }
-        if keep_group {
-            // The reserved ID cannot be a POSIX named group. This removes only
-            // the expired named-user binding when a different UID shares a GID.
-            return update_metadata_acl(file, u32::MAX, None, false, (!keep_user).then_some(uid));
-        }
-        update_metadata_acl(file, gid, None, false, (!keep_user).then_some(uid))
+        revoke_binding(file, path, common, uid, gid, retained)
     })
+}
+
+/// New inspection intents name every opened object before the first ACL write.
+/// Legacy intents require a best-effort no-follow walk; hostile entries never
+/// prevent revocation of the remaining regular files or another worktree.
+fn revoke_inspection(grant: &Grant, retained: &[Grant]) -> std::io::Result<()> {
+    let issues = std::cell::RefCell::new(Vec::new());
+    if let Some(paths) = &grant.inspection_paths {
+        for target in paths {
+            let revoke = || -> std::io::Result<()> {
+                if !target.path.starts_with(&grant.common)
+                    || !retained_path(&grant.common, &target.path, grant)
+                {
+                    return Err(std::io::Error::other(
+                        "inspection target outside journaled grant set",
+                    ));
+                }
+                let file = target.open()?;
+                revoke_binding(
+                    &file,
+                    &target.path,
+                    &grant.common,
+                    grant.uid,
+                    grant.gid,
+                    retained,
+                )
+            };
+            if let Err(error) = revoke() {
+                issues
+                    .borrow_mut()
+                    .push(format!("{}: {error}", target.path.display()));
+            }
+        }
+    } else if let Err(error) = walk_tree_policy(
+        &grant.common,
+        false,
+        &|_| {},
+        &|file, path| revoke_binding(file, path, &grant.common, grant.uid, grant.gid, retained),
+        true,
+        Some(&issues),
+    ) {
+        issues.borrow_mut().push(error.to_string());
+    }
+    let issues = issues.into_inner();
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(issues.join("; ")))
+    }
+}
+
+impl InspectionPath {
+    fn open(&self) -> std::io::Result<std::fs::File> {
+        use std::os::unix::fs::MetadataExt;
+        let file = open_nofollow(&self.path)?;
+        let meta = file.metadata()?;
+        if (!meta.is_file() && !meta.is_dir()) || meta.dev() != self.dev || meta.ino() != self.ino {
+            return Err(std::io::Error::other(
+                "inspection target type or identity changed",
+            ));
+        }
+        Ok(file)
+    }
+}
+
+/// Resolve every component without canonicalizing a planted symlink first.
+fn open_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if !path.is_absolute() {
+        return Err(std::io::Error::other("metadata path is not absolute"));
+    }
+    let mut file = std::fs::File::open("/")?;
+    for component in path.components() {
+        match component {
+            std::path::Component::RootDir => {}
+            std::path::Component::Normal(name) => {
+                let name = std::ffi::CString::new(name.as_encoded_bytes())?;
+                let fd = unsafe {
+                    libc::openat(
+                        file.as_raw_fd(),
+                        name.as_ptr(),
+                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                    )
+                };
+                if fd < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                file = unsafe { std::fs::File::from_raw_fd(fd) };
+            }
+            _ => return Err(std::io::Error::other("non-normal metadata path")),
+        }
+    }
+    Ok(file)
 }
 
 /// Change only opened objects, never a symlink's target. Metadata sharing is an
@@ -784,6 +963,12 @@ pub(crate) fn restore_recorded(data: &Path, id: &anyagents_core::AgentId) -> Res
         Err(e) => return Err(refusal(&journal, e)),
     };
     let grant: Grant = serde_json::from_slice(&bytes).map_err(|e| refusal(&journal, e))?;
+    if grant.quarantined || grant.inspection {
+        return Err(refusal(
+            &journal,
+            "worktree is quarantined after incomplete ACL recovery",
+        ));
+    }
     if grant.active || !grant.checkout.join(".git").exists() {
         return Ok(());
     }
@@ -826,6 +1011,8 @@ fn share_known_locked(
         checkout: path.to_path_buf(),
         active: true,
         inspection: false,
+        inspection_paths: None,
+        quarantined: false,
     };
     let retained = other_active_grants(journal, &grant).map_err(|e| refusal(journal, e))?;
     write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
@@ -1069,23 +1256,38 @@ fn walk_tree_depth(
     apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
     descend: bool,
 ) -> std::io::Result<()> {
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let canonical = std::fs::canonicalize(path)?;
-    let mut file = std::fs::File::open("/")?;
-    for component in canonical.components() {
-        if let std::path::Component::Normal(name) = component {
-            let name = std::ffi::CString::new(name.as_encoded_bytes())?;
-            let fd = unsafe {
-                libc::openat(
-                    file.as_raw_fd(),
-                    name.as_ptr(),
-                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
-                )
-            };
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            file = unsafe { std::fs::File::from_raw_fd(fd) };
+    walk_tree_policy(path, skip_git, before_open, apply, descend, None)
+}
+
+#[cfg(unix)]
+fn walk_tree_policy(
+    path: &Path,
+    skip_git: bool,
+    before_open: &dyn Fn(&Path),
+    apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
+    descend: bool,
+    issues: Option<&std::cell::RefCell<Vec<String>>>,
+) -> std::io::Result<()> {
+    // Ordinary callers historically resolve trusted host aliases (e.g. macOS
+    // /var -> /private/var). Recovery must never resolve a replacement alias.
+    let resolved = if issues.is_none() {
+        std::fs::canonicalize(path)?
+    } else {
+        path.to_path_buf()
+    };
+    let file = open_nofollow(&resolved)?;
+    fn record(
+        issues: Option<&std::cell::RefCell<Vec<String>>>,
+        path: &Path,
+        error: std::io::Error,
+    ) -> std::io::Result<()> {
+        if let Some(issues) = issues {
+            issues
+                .borrow_mut()
+                .push(format!("{}: {error}", path.display()));
+            Ok(())
+        } else {
+            Err(error)
         }
     }
     fn visit(
@@ -1095,12 +1297,15 @@ fn walk_tree_depth(
         before_open: &dyn Fn(&Path),
         apply: &dyn Fn(&std::fs::File, &Path) -> std::io::Result<()>,
         descend: bool,
+        issues: Option<&std::cell::RefCell<Vec<String>>>,
     ) -> std::io::Result<()> {
         use std::os::fd::{AsRawFd, FromRawFd};
         use std::os::unix::fs::MetadataExt;
         let meta = file.metadata()?;
         let fd = file.as_raw_fd();
-        apply(file, path)?;
+        if let Err(error) = apply(file, path) {
+            record(issues, path, error)?;
+        }
         if !meta.is_dir() || !descend {
             return Ok(());
         }
@@ -1152,11 +1357,19 @@ fn walk_tree_depth(
                 )
             } != 0
             {
-                return Err(std::io::Error::last_os_error());
+                record(issues, &child_path, std::io::Error::last_os_error())?;
+                continue;
             }
             let stat = unsafe { stat.assume_init() };
             let kind = stat.st_mode & libc::S_IFMT;
             if kind == libc::S_IFLNK {
+                if issues.is_some() {
+                    record(
+                        issues,
+                        &child_path,
+                        std::io::Error::other("symlink skipped during ACL recovery"),
+                    )?;
+                }
                 continue;
             }
             if skip_git && name.to_bytes() == b".git" {
@@ -1164,10 +1377,12 @@ fn walk_tree_depth(
                 continue;
             }
             if kind != libc::S_IFDIR && kind != libc::S_IFREG {
-                return Err(std::io::Error::other(format!(
-                    "{}: unsupported file type",
-                    child_path.display()
-                )));
+                record(
+                    issues,
+                    &child_path,
+                    std::io::Error::other("unsupported file type skipped"),
+                )?;
+                continue;
             }
             let flags = libc::O_RDONLY
                 | libc::O_NOFOLLOW
@@ -1181,7 +1396,8 @@ fn walk_tree_depth(
             before_open(&child_path);
             let child = unsafe { libc::openat(fd, name.as_ptr(), flags) };
             if child < 0 {
-                return Err(std::io::Error::last_os_error());
+                record(issues, &child_path, std::io::Error::last_os_error())?;
+                continue;
             }
             let child = unsafe { std::fs::File::from_raw_fd(child) };
             let opened = child.metadata()?;
@@ -1190,16 +1406,28 @@ fn walk_tree_depth(
                 reason = "stat fields differ across Unix targets"
             )]
             if opened.dev() != stat.st_dev as u64 || opened.ino() != stat.st_ino as u64 {
-                return Err(std::io::Error::other(format!(
-                    "{}: object replaced during sharing",
-                    child_path.display()
-                )));
+                record(
+                    issues,
+                    &child_path,
+                    std::io::Error::other("object replaced during sharing"),
+                )?;
+                continue;
             }
-            visit(&child, &child_path, skip_git, before_open, apply, descend)?;
+            if let Err(error) = visit(
+                &child,
+                &child_path,
+                skip_git,
+                before_open,
+                apply,
+                descend,
+                issues,
+            ) {
+                record(issues, &child_path, error)?;
+            }
         }
         Ok(())
     }
-    visit(&file, path, skip_git, before_open, apply, descend)
+    visit(&file, path, skip_git, before_open, apply, descend, issues)
 }
 
 #[cfg(not(unix))]
@@ -1526,6 +1754,372 @@ mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn exact_inspection_recovery_ignores_unrelated_special_entries() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let common = dir.path().join("common");
+        std::fs::create_dir(&common).unwrap();
+        let path = common.join("HEAD");
+        std::fs::write(&path, "recorded content").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let gid = crate::sandbox::server_gid().wrapping_add(100000);
+        update_metadata_acl(&file, gid, Some(4), false, None).unwrap();
+        let meta = file.metadata().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "outside content").unwrap();
+        std::fs::hard_link(&outside, common.join("unrelated-hardlink")).unwrap();
+        std::os::unix::fs::symlink(&outside, common.join("unrelated-symlink")).unwrap();
+        let fifo =
+            std::ffi::CString::new(common.join("unrelated-fifo").as_os_str().as_encoded_bytes())
+                .unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let id = anyagents_core::AgentId::generate();
+        let journal = grant_path(dir.path(), &id);
+        write_grant(
+            &journal,
+            &Grant {
+                common: common.clone(),
+                private: common.join("worktrees/child"),
+                checkout: dir.path().join("checkout"),
+                uid: crate::sandbox::server_uid(),
+                gid,
+                active: false,
+                inspection: true,
+                quarantined: false,
+                inspection_paths: Some(vec![InspectionPath {
+                    path,
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                }]),
+            },
+        )
+        .unwrap();
+        recover_inspections(dir.path()).unwrap();
+        let grant: Grant = serde_json::from_slice(&std::fs::read(journal).unwrap()).unwrap();
+        assert!(!grant.inspection && !grant.quarantined && grant.inspection_paths.is_none());
+        let mut bytes = [0u8; 65536];
+        let len = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if len >= 0 {
+            assert!(
+                !bytes[4..len as usize]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .any(|entry| {
+                        u16::from_le_bytes(entry[..2].try_into().unwrap()) == 8
+                            && u32::from_le_bytes(entry[4..].try_into().unwrap()) == gid
+                    })
+            );
+        } else {
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ENODATA)
+            );
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside content");
+        assert_eq!(std::fs::metadata(&outside).unwrap().nlink(), 2);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recovery_server_worker() {
+        let Some(data) = std::env::var_os("ANYAGENTS_RECOVERY_WORKER_DATA") else {
+            return;
+        };
+        if std::env::var("ANYAGENTS_RECOVERY_WORKER_MODE").unwrap() == "admin" {
+            crate::server::run_admin(Path::new(&data)).unwrap();
+        } else {
+            crate::server::run(Path::new(&data)).unwrap();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn recovery_quarantines_hostile_entry(kind: &str) {
+        use std::io::{Read, Write};
+        use std::os::{fd::AsRawFd, unix::net::UnixStream};
+        fn acl(path: &Path) -> Vec<u8> {
+            let file = std::fs::File::open(path).unwrap();
+            let mut bytes = vec![0; 65536];
+            let len = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    c"system.posix_acl_access".as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if len < 0 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ENODATA)
+                );
+                return Vec::new();
+            }
+            bytes.truncate(len as usize);
+            bytes
+        }
+        fn has_group(path: &Path, gid: u32) -> bool {
+            acl(path)
+                .get(4..)
+                .unwrap_or_default()
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .any(|e| {
+                    u16::from_le_bytes(e[..2].try_into().unwrap()) == 8
+                        && u32::from_le_bytes(e[4..].try_into().unwrap()) == gid
+                })
+        }
+        fn target(path: &Path, gid: u32) -> InspectionPath {
+            std::fs::write(path, "inspection content\n").unwrap();
+            let file = std::fs::File::open(path).unwrap();
+            update_metadata_acl(&file, gid, Some(4), false, None).unwrap();
+            let meta = file.metadata().unwrap();
+            InspectionPath {
+                path: path.to_path_buf(),
+                dev: meta.dev(),
+                ino: meta.ino(),
+            }
+        }
+        struct Server(std::process::Child);
+        impl Drop for Server {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        // Exercise both the deployed pre-upgrade journal and the exact-object
+        // journal. A malicious entry must not abort either server entrypoint.
+        for exact in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = crate::worktree::tests::Fixture::new(dir.path());
+            let uid = crate::sandbox::server_uid();
+            let gid = crate::sandbox::server_gid().wrapping_add(100000);
+            let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+            let bad_agent = store
+                .create_agent(anyagents_core::NewAgent::new("bad-seat", "codex"))
+                .unwrap();
+            let good_agent = store
+                .create_agent(anyagents_core::NewAgent::new("good-seat", "codex"))
+                .unwrap();
+            store.set_agent_state(&bad_agent.id, "paused").unwrap();
+            store.set_agent_state(&good_agent.id, "paused").unwrap();
+            let bad = bad_agent.id.clone();
+            let good = good_agent.id.clone();
+            let checkout = dir.path().join("bad");
+            let survivor = dir.path().join("good");
+            for (id, path, group, branch) in [
+                (&bad, &checkout, gid, "bad"),
+                (&good, &survivor, gid + 1, "good"),
+            ] {
+                f.consumer
+                    .remote("SylphxAI/demo", path, branch, None)
+                    .unwrap();
+                let dirs = git_dirs(path).unwrap();
+                share_known(
+                    path,
+                    &dirs[0],
+                    dirs.last().unwrap(),
+                    uid,
+                    group,
+                    &grant_path(dir.path(), id),
+                )
+                .unwrap();
+            }
+            let bad_record = RecordedWorktree::load(dir.path(), &bad, &checkout).unwrap();
+            bad_record.validate().unwrap(); // baseline reaches the actual guard
+            revoke_recorded(dir.path(), &bad).unwrap();
+            let journal = grant_path(dir.path(), &bad);
+            let mut grant: Grant =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            let common = grant.common.clone();
+            let hostile = common.join("objects/inspection-hostile");
+            let after = common.join("objects/inspection-after");
+            let paths = vec![target(&hostile, gid), target(&after, gid)];
+            grant.inspection = true;
+            grant.inspection_paths = exact.then_some(paths);
+            write_grant(&journal, &grant).unwrap();
+            let outside = dir.path().join("outside");
+            match kind {
+                "fifo" => {
+                    std::fs::remove_file(&hostile).unwrap();
+                    let name =
+                        std::ffi::CString::new(hostile.as_os_str().as_encoded_bytes()).unwrap();
+                    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+                    std::fs::write(&outside, "outside content\n").unwrap();
+                }
+                "hardlink" => {
+                    std::fs::hard_link(&hostile, &outside).unwrap();
+                }
+                "symlink" => {
+                    std::fs::remove_file(&hostile).unwrap();
+                    std::fs::write(&outside, "outside content\n").unwrap();
+                    std::os::unix::fs::symlink(&outside, &hostile).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let outside_bytes = std::fs::read(&outside).unwrap();
+            let outside_acl = acl(&outside);
+            let survivor_dirs = git_dirs(&survivor).unwrap();
+            let survivor_acl = acl(&survivor_dirs[0]);
+            let objects_acl = acl(&common.join("objects"));
+            assert!(has_group(&after, gid));
+            // A second interrupted inspection in an independent common store
+            // must also be recovered, regardless of journal enumeration order.
+            let other = dir.path().join("other-common");
+            std::fs::create_dir(&other).unwrap();
+            let other_target = target(&other.join("HEAD"), gid + 2);
+            let other_id = anyagents_core::AgentId::generate();
+            let other_journal = grant_path(dir.path(), &other_id);
+            write_grant(
+                &other_journal,
+                &Grant {
+                    common: other.clone(),
+                    private: other.join("worktrees/other"),
+                    checkout: dir.path().join("other-checkout"),
+                    uid,
+                    gid: gid + 2,
+                    active: false,
+                    inspection: true,
+                    inspection_paths: Some(vec![other_target]),
+                    quarantined: false,
+                },
+            )
+            .unwrap();
+            for mode in ["primary", "admin"] {
+                let log = dir.path().join(format!("{mode}.log"));
+                let command_env = std::env::vars_os()
+                    .filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"ANYAGENTS_"));
+                let mut server = Server(
+                    std::process::Command::new(std::env::current_exe().unwrap())
+                        .env_clear()
+                        .envs(command_env)
+                        .env("ANYAGENTS_RECOVERY_WORKER_DATA", dir.path())
+                        .env("ANYAGENTS_RECOVERY_WORKER_MODE", mode)
+                        .env("TOKIO_WORKER_THREADS", "2")
+                        .args([
+                            "--exact",
+                            "worktree_access::tests::recovery_server_worker",
+                            "--nocapture",
+                        ])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::fs::File::create(&log).unwrap())
+                        .spawn()
+                        .unwrap(),
+                );
+                let socket = if mode == "admin" {
+                    dir.path().join("admin.sock")
+                } else {
+                    crate::server::socket_path(dir.path())
+                };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                let mut stream = loop {
+                    if let Ok(stream) = UnixStream::connect(&socket) {
+                        break stream;
+                    }
+                    assert!(
+                        server.0.try_wait().unwrap().is_none()
+                            && std::time::Instant::now() < deadline,
+                        "{kind}, exact={exact}, {mode}: {}",
+                        std::fs::read_to_string(&log).unwrap()
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                stream.write_all(format!("GET /v1/whoami HTTP/1.1\r\nHost: local\r\n{}: {}\r\nConnection: close\r\n\r\n", crate::auth::AGENT_ID_HEADER, good).as_bytes()).unwrap();
+                let mut response = String::new();
+                stream.read_to_string(&mut response).unwrap();
+                assert!(
+                    response.starts_with("HTTP/1.1 200") && response.contains(good.as_str()),
+                    "{response}"
+                );
+                let recovered: Grant =
+                    serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+                assert!(recovered.quarantined && recovered.inspection && !recovered.active);
+                assert!(
+                    bad_record
+                        .validate()
+                        .unwrap_err()
+                        .to_string()
+                        .contains("quarantined")
+                );
+                assert!(
+                    restore_recorded(dir.path(), &bad)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("quarantined")
+                );
+                let launch = crate::vendor::vendor_launch(anyagents_supervisor::LaunchRequest {
+                    agent: bad_agent.clone(),
+                    data_dir: dir.path().to_path_buf(),
+                    config_dir: anyagents_core::agent_config_dir(dir.path(), &bad),
+                    work_dir: checkout.clone(),
+                    extra_env: Vec::new(),
+                });
+                let error = match launch {
+                    Err(error) => error,
+                    Ok(_) => panic!("quarantined worktree launched"),
+                };
+                assert!(error.contains("quarantined"), "{error}");
+                ensure_launchable(dir.path(), &good).unwrap();
+                assert!(
+                    !has_group(&after, gid),
+                    "a hostile entry stopped later revocation"
+                );
+                assert_eq!(acl(&survivor_dirs[0]), survivor_acl);
+                assert_eq!(acl(&common.join("objects")), objects_acl);
+                RecordedWorktree::load(dir.path(), &good, &survivor)
+                    .unwrap()
+                    .validate()
+                    .unwrap();
+                assert!(!has_group(&other.join("HEAD"), gid + 2));
+                let other_grant: Grant =
+                    serde_json::from_slice(&std::fs::read(&other_journal).unwrap()).unwrap();
+                assert!(!other_grant.inspection && !other_grant.quarantined);
+                assert_eq!(std::fs::read(&outside).unwrap(), outside_bytes);
+                assert_eq!(
+                    acl(&outside),
+                    outside_acl,
+                    "outside link target ACL changed"
+                );
+                assert!(
+                    std::fs::read_to_string(&log)
+                        .unwrap()
+                        .contains("quarantined worktree journal")
+                );
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fifo_inspection_recovery_quarantines_only_its_worktree() {
+        recovery_quarantines_hostile_entry("fifo");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hardlink_inspection_recovery_quarantines_only_its_worktree() {
+        recovery_quarantines_hostile_entry("hardlink");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn symlink_inspection_recovery_quarantines_only_its_worktree() {
+        recovery_quarantines_hostile_entry("symlink");
+    }
+
     #[test]
     fn private_identity_preserves_common_config_and_requires_extension() {
         let dir = tempfile::tempdir().unwrap();
@@ -1674,6 +2268,8 @@ mod tests {
                 gid: crate::sandbox::server_gid(),
                 active: true,
                 inspection: false,
+                inspection_paths: None,
+                quarantined: false,
             },
         )
         .unwrap();
