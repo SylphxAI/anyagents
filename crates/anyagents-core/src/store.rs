@@ -550,6 +550,15 @@ pub struct AgentLock {
     _file: File,
 }
 
+impl Drop for AgentLock {
+    fn drop(&mut self) {
+        // Closing only our descriptor leaves flock held by a concurrent fork's
+        // inherited copy until exec. Release the open-file-description lock
+        // explicitly so the next turn and busy probe see the intended lifetime.
+        let _ = unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 /// A mailbox or agent change a waiter can block on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Wake {
@@ -6321,6 +6330,19 @@ mod tests {
         let _other_lock = store.try_lock_agent(&other.id).unwrap();
         drop(held);
         again.try_lock_agent(&held_agent.id).unwrap();
+    }
+
+    #[test]
+    fn dropping_agent_lock_releases_it_with_an_inherited_descriptor_open() {
+        let (_dir, store) = setup();
+        let owner = agent(&store, "owner");
+        let lock = store.try_lock_agent(&owner.id).unwrap();
+        // A concurrent fork can inherit this open file description until exec.
+        // A clone deterministically models that lifetime without timing a fork.
+        let inherited = lock._file.try_clone().unwrap();
+        drop(lock);
+        let _next_turn = store.try_lock_agent(&owner.id).unwrap();
+        drop(inherited);
     }
 
     #[test]
