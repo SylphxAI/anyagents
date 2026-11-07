@@ -7,10 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
-### Next release
+## 0.1.3
 
-- Serving-process identity read-back (#106) did not pass its exact-head CI gate
-  by the 0.1.2 cut and remains for the next release.
+### Added
+
+- Serving-process image identity in health probes: embedded version and source
+  SHA, a once-computed executable hash, and admin-only PID and start time.
+- Permissioned, audited conversation redaction through the API, CLI and MCP,
+  preserving transcript sequence numbers and recording each erasure operation.
+
+### Fixed
+
+- Native context compaction stays within the active model budget, including
+  tool-output overhead, so oversized requests do not wedge agent turns.
+- Group ownership and membership permissions are enforced consistently.
+- HTTP fallback provider keys stay out of child-process environments. Provider
+  key environment aliases share one implementation.
+- OpenCode port handoff and Telegram batch checkpoint fixtures use deterministic
+  synchronization; an intermittent browser clipboard startup fixture is
+  quarantined rather than retried.
+- The completed-turn restart fixture waits for durable turn completion before
+  killing the vendor process; usage accounting alone is not completion.
+- The native retry fixture waits for completed turns before checking success or
+  persistent failure, preserving exact retry-request and error assertions.
+
+### Release verification
+
+- Publication is bound to the release commit's exact successful push/main CI;
+  package metadata and all platform identity files are read back after publish.
+- The [release CI audit](docs/releases/v0.1.3-ci-audit.json) records all twelve PRs
+  merged after v0.1.2 through source `648de67161412e2bda27b70f6f2239b57d23ef77`.
+- #113 already shipped in v0.1.2's merge-queue base. #108, #115, #120, #121 and
+  #122 were not merged at this cut and are not included.
+
+### Included pull requests
+
+- [#110](https://github.com/SylphxAI/anyagents/pull/110): fix: bind releases to exact successful main CI.
+- [#111](https://github.com/SylphxAI/anyagents/pull/111): Enforce group ownership and membership permissions.
+- [#112](https://github.com/SylphxAI/anyagents/pull/112): fix(auth): remove provider keys from curl environment.
+- [#106](https://github.com/SylphxAI/anyagents/pull/106): feat: expose serving process identity in health probes.
+- [#116](https://github.com/SylphxAI/anyagents/pull/116): Test OpenCode handoff collisions with owned sockets.
+- [#118](https://github.com/SylphxAI/anyagents/pull/118): test(browser): quarantine intermittent clipboard fixture startup.
+- [#119](https://github.com/SylphxAI/anyagents/pull/119): refactor(auth): share provider key environment aliases.
+- [#117](https://github.com/SylphxAI/anyagents/pull/117): Keep native context compaction within the model budget.
+- [#92](https://github.com/SylphxAI/anyagents/pull/92): feat: add audited conversation redaction.
+- [#114](https://github.com/SylphxAI/anyagents/pull/114): fix(test): wait for the Telegram batch checkpoint.
+- [#126](https://github.com/SylphxAI/anyagents/pull/126): test(supervisor): synchronize the completed-turn restart fixture.
+- [#128](https://github.com/SylphxAI/anyagents/pull/128): test(sylphx): await retry turn completion before assertions.
 
 ## 0.1.2
 
@@ -84,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [#107](https://github.com/SylphxAI/anyagents/pull/107): docs: describe the required merge queue.
 - [#101](https://github.com/SylphxAI/anyagents/pull/101): fix(auth): keep HTTP fallback credentials out of argv.
 - [#91](https://github.com/SylphxAI/anyagents/pull/91): feat(browser): support native takeover clipboard and keyboard shortcuts.
+- [#113](https://github.com/SylphxAI/anyagents/pull/113): Test OpenCode port reuse with owned reservations (merge-queue base).
 
 ### Verification and exclusions
 
