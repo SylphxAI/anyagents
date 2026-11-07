@@ -111,7 +111,7 @@ impl From<anyagents_core::AgentSchedule> for ScheduleView {
 }
 
 fn default_harness() -> String {
-    String::new()
+    "claude-code".to_string()
 }
 
 /// Body of `POST /v1/agents`.
@@ -119,14 +119,6 @@ fn default_harness() -> String {
 pub struct CreateAgentRequest {
     #[serde(alias = "agent", alias = "id", alias = "agent_id", alias = "target")]
     pub name: String,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "type",
-        alias = "template",
-        alias = "preset"
-    )]
-    pub archetype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default = "default_harness")]
@@ -473,25 +465,6 @@ mod create_agent_tests {
         }
         let legacy: LegacyRequest = serde_json::from_value(serialized).unwrap();
         assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
-    }
-
-    #[test]
-    fn archetype_aliases_deserialize_and_omit_when_absent() {
-        for key in ["archetype", "type", "template", "preset"] {
-            let request: CreateAgentRequest = serde_json::from_value(json!({
-                "name": "worker",
-                key: "writer",
-            }))
-            .unwrap();
-            assert_eq!(request.archetype.as_deref(), Some("writer"));
-        }
-        let plain: CreateAgentRequest = serde_json::from_value(json!({
-            "name": "worker"
-        }))
-        .unwrap();
-        assert!(plain.archetype.is_none());
-        let serialized = serde_json::to_value(plain).unwrap();
-        assert!(serialized.get("archetype").is_none());
     }
 }
 

@@ -1,0 +1,53 @@
+{
+  "total_count": 8,
+  "check_runs": [
+    {
+      "id": 128082564645,
+      "name": "plan",
+      "status": "queued",
+      "conclusion": null
+    },
+    {
+      "id": 128082564610,
+      "name": "guards",
+      "status": "queued",
+      "conclusion": null
+    },
+    {
+      "id": 128082514519,
+      "name": "regenerate",
+      "status": "queued",
+      "conclusion": null
+    },
+    {
+      "id": 128081860685,
+      "name": "sylphx/preview",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128081464858,
+      "name": "main-state",
+      "status": "completed",
+      "conclusion": "skipped"
+    },
+    {
+      "id": 128081464387,
+      "name": "scope",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128081462921,
+      "name": "admission",
+      "status": "completed",
+      "conclusion": "success"
+    },
+    {
+      "id": 128081459860,
+      "name": "migration-guard",
+      "status": "completed",
+      "conclusion": "success"
+    }
+  ]
+}

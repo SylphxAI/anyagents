@@ -350,7 +350,7 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
-    /// Read or search (`--query`) any agent's full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
+    /// Read or search (`--query`) authorized agents' full two-way (`in` + `out`) conversation across users, channels, groups, and peers.
     Conversation {
         /// Agent name (`sage`, `volt`, `xenon`, `all`) or `agt_...` id (defaults to this agent, or `all` when `--query` is set).
         agent: Option<String>,

@@ -445,17 +445,14 @@ async fn mcp_tools_use_the_server_socket() {
     .await;
     assert!(error_text(&empty).contains("send needs an address"));
 
-    // Cross-agent conversation reading: alpha can read beta's conversation by name or ID, with optional limit.
-    let peer_conv: ConversationResponse = ok_json(
-        call(
-            &alpha,
-            "conversation",
-            serde_json::json!({"agent": "beta", "limit": 2}),
-        )
-        .await,
-    );
-    assert_eq!(peer_conv.turns.len(), 2);
-    assert_eq!(peer_conv.turns[1].text, "room line");
+    // Peer messaging and shared groups do not grant private conversation access.
+    let peer_conv = call(
+        &alpha,
+        "conversation",
+        serde_json::json!({"agent": "beta", "limit": 2}),
+    )
+    .await;
+    assert!(error_text(&peer_conv).contains("cannot read private conversation"));
 
     // Pure internal group creation & membership via `groups` MCP tool.
     let joined_group: GroupsResponse = ok_json(
@@ -1099,5 +1096,132 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
     }
 
     alpha.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
+async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
+    use anyagents_core::{Incoming, Store};
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["argus", "lyra", "helios", "runner"] {
+        let created = bin()
+            .env("PATH", machine_path(dir.path()))
+            .arg("--data")
+            .arg(dir.path())
+            .args(["agents", "create", name])
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "{created:?}");
+    }
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let argus = store.agent_by_name("argus").unwrap();
+    let lyra = store.agent_by_name("lyra").unwrap();
+    let helios = store.agent_by_name("helios").unwrap();
+    let runner = store.agent_by_name("runner").unwrap();
+    store.set_agent_parent(&lyra.id, Some(&argus.id)).unwrap();
+    store.set_agent_parent(&helios.id, Some(&argus.id)).unwrap();
+    store.set_agent_parent(&runner.id, Some(&lyra.id)).unwrap();
+    // Synthetic bodies only. These identifiers reproduce the reported search
+    // shape without importing any production conversation content.
+    for (id, text) in [
+        (
+            &argus.id,
+            "C msg_01m6svh4znevfapf3mmpsnk0a4 #2291 private parent",
+        ),
+        (
+            &helios.id,
+            "C msg_01m6svrywtez39wvnttdvz53xf #2291 private sibling",
+        ),
+        (&lyra.id, "C #2291 authorized own mailbox"),
+        (&runner.id, "C #2291 authorized descendant"),
+    ] {
+        store
+            .receive(
+                id,
+                Incoming {
+                    text: text.into(),
+                    sender: Some(
+                        if id == &argus.id {
+                            "agent:lyra"
+                        } else {
+                            "agent:argus"
+                        }
+                        .into(),
+                    ),
+                    source_time_ms: None,
+                    source_key: None,
+                    reply_to: None,
+                    quote: None,
+                    origin: None,
+                    received_at_ms: Some(1_000),
+                },
+            )
+            .unwrap();
+        store
+            .record_tool_event(id, "browser", &format!("C {text}"))
+            .unwrap();
+    }
+    store
+        .record_outbound(
+            &argus.id,
+            "telegram:chat:-100",
+            None,
+            "C out_msg_01m6svqn4nesw9ws13fjy48kzt #2291 private outbound",
+        )
+        .unwrap();
+    let server = start_server_mode(dir.path(), "serve-admin");
+    std::os::unix::fs::symlink("admin.sock", dir.path().join("anyagents.sock")).unwrap();
+    let client = connect(dir.path(), "lyra").await;
+    let native: ConversationResponse = ok_json(
+        call(
+            &client,
+            "conversation",
+            serde_json::json!({"with":"lyra", "direction":"in", "query":"C", "limit":4}),
+        )
+        .await,
+    );
+    assert!(!native.turns.is_empty());
+    assert!(
+        native
+            .turns
+            .iter()
+            .all(|turn| turn.text.contains("authorized own mailbox")),
+        "{:?}",
+        native.turns
+    );
+    for args in [
+        serde_json::json!({"agent":"all", "query":"msg_01m6svh4znevfapf3mmpsnk0a4", "queries":["#2291", "msg_01m6svrywtez39wvnttdvz53xf", "out_msg_01m6svqn4nesw9ws13fjy48kzt"], "radius":10}),
+        serde_json::json!({"agent":"*", "query":"C", "radius":10}),
+        serde_json::json!({"query":"C", "only_tools":true, "tool_name":"browser", "radius":10}),
+        serde_json::json!({"agent":"all", "range":"seq:1-1", "direction":"in", "radius":10}),
+        serde_json::json!({"agent":"all", "limit":50}),
+    ] {
+        let response: ConversationResponse =
+            ok_json(call(&client, "conversation", args.clone()).await);
+        assert!(!response.turns.is_empty(), "{args}");
+        assert!(
+            response
+                .turns
+                .iter()
+                .all(|turn| turn.text.contains("authorized")),
+            "{args}: {:?}",
+            response.turns
+        );
+    }
+    for target in ["argus", "helios", argus.id.as_str(), helios.id.as_str()] {
+        for tool in ["conversation", "search"] {
+            let denied = call(
+                &client,
+                tool,
+                serde_json::json!({"agent":target, "query":"C"}),
+            )
+            .await;
+            assert!(
+                error_text(&denied).contains("cannot read private conversation"),
+                "{denied:?}"
+            );
+        }
+    }
+    client.cancel().await.unwrap();
     drop(server);
 }
