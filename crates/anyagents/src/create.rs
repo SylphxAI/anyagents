@@ -750,18 +750,14 @@ pub(crate) fn write_agent_instructions_with_continuity(
         ));
     }
     if let Some(parent) = parent_name {
-        if agent.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            doc.push_str(&format!(
-                "- **Role**: Standing Domain Sub-Agent under Parent `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). You are a permanent domain owner under `agent:{parent}` — **do not** archive yourself; stay active and spawn your own child sub-agents (`agents({{ \"action\": \"spawn\", ... }})`) to execute concrete tasks end-to-end.\n"
-            ));
-        } else {
-            doc.push_str(&format!(
-                "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `agents({{ \"action\": \"archive\" }})` to retire yourself.\n"
-            ));
-        }
+        doc.push_str(&format!(
+            "- **Relationship**: Sub-agent of `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`).\n"
+        ));
     } else {
         doc.push_str("- **Role**: Root Agent\n");
     }
+
+    doc.push_str("- **Lifecycle**: Your role is a label, not a lifecycle policy. Follow your own instructions for when to archive. Any agent may call `agents({ \"action\": \"archive\" })` to archive itself. After a completed turn, an idle agent releases its process when its mailbox is drained and no child or background work is active; its identity and session are preserved.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -781,14 +777,14 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain strictly private in Section 2 above (visible only to you and your ancestor supervisors).\n\
          - **Event-Driven Topology (100% Static System Prompt + User-Message `<topology>` Events)**:\n\
            - To keep your LLM prompt prefix KV cache 100% stable, dynamic peer/sibling/sub-agent rosters are **never** injected into this System Prompt.\n\
-           - Instead, your initial relationship snapshot arrives on your first user message inside `<topology event=\"initial\" self=\"...\" scope=\"...\" parent=\"...\" siblings=\"...\" children=\"...\" groups=\"...\" />`, and any subsequent changes (when a sibling, peer, standing child, or group is added or removed) arrive as incremental inbox events `<topology event=\"delta\" changes=\"+sibling: ...; -sibling: ...\" />`.\n\
+           - Instead, your initial relationship snapshot arrives on your first user message inside `<topology event=\"initial\" self=\"...\" scope=\"...\" parent=\"...\" siblings=\"...\" children=\"...\" groups=\"...\" />`, and any subsequent changes (when a sibling, peer, child, or group is added or removed) arrive as incremental inbox events `<topology event=\"delta\" changes=\"+sibling: ...; -sibling: ...\" />`.\n\
            - Every incoming `<message ...>` also carries `sender_rel=\"parent|sibling|child|peer|external_user\"` and `sender_role=\"...\"`.\n\
          - **Orthogonal Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`) & External Channels**:\n\
            - **`\"isolated\"` *(External Partner / Personal Liaison Bots)*:** Confined strictly to direct `parent`, own `children`, and bound external channels (e.g. Telegram). Cannot message or read siblings or other roots.\n\
-           - **`\"private\"` *(Default for Task Sub-Agents)*:** Only direct `parent`, own `children`, or members of a shared `group:<name>` can message it; reports upward via `to: [\"parent\"]`.\n\
-           - **`\"siblings\"` *(Default for Standing Domain Sub-Agents with a `role`)*:** Can freely collaborate with and message direct `parent`, own `children`, and sibling domain sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`), without crossing into another root manager's tree.\n\
+           - **`\"private\"` *(Default for all sub-agents)*:** Only direct `parent`, own `children`, or members of a shared `group:<name>` can message it; reports upward via `to: [\"parent\"]`.\n\
+           - **`\"siblings\"` *(Explicit opt-in)*:** Can freely collaborate with and message direct `parent`, own `children`, and sibling domain sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`), without crossing into another root manager's tree.\n\
            - **`\"public\"` *(Root Agents & Cross-Tree Shared Services)*:** Reachable across the workspace.\n\
-           - **Scope updates:** An explicit `scope` persists across restarts and reconciliation. Legacy `public: true` selects `public`; `public: false` only revokes public reachability, preserving nonpublic scopes (including `siblings`) or restoring the role-based default. Explicit `scope` wins when both are supplied.\n\
+           - **Scope updates:** An explicit `scope` persists across restarts and reconciliation. Legacy `public: true` selects `public`; `public: false` only revokes public reachability, preserving nonpublic scopes (including `siblings`) or restoring the relationship-based default. Explicit `scope` wins when both are supplied.\n\
            - **Downward-Only Supervision:** A parent/ancestor can inspect its descendants' `instructions` and `conversation` history, never the reverse (a child or sibling can never read its parent's or sibling's private instructions or private conversations).\n\
            - **Group Chat Discipline:** When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
     );
@@ -1793,7 +1789,7 @@ pub(crate) fn build_harness_continuity_summary(
     };
     let mut out = format!(
         "## 4. Cross-Harness Session Continuity ({header_pair})\n\n\
-         - This AnyAgents identity (`{}` / `{}`) is running on harness `{target_harness}` while retaining its AnyAgents ID, role description, model (`{}`), workdir (`{}`), mailbox cursor, and external Spiron execution custody.\n\
+         - This AnyAgents identity (`{}` / `{}`) is running on harness `{target_harness}` while retaining its AnyAgents ID, role description, model (`{}`), workdir (`{}`), mailbox cursor, and external execution custody.\n\
          - **Do NOT replay or repeat already-completed `[OUT]` turns or external side effects** listed below; your mailbox cursor (`delivered_seq`) is already advanced past all prior delivered messages.\n\
          - **Do NOT reopen paused, archived, or restricted product work** merely because the harness session started; act only on the new incoming `<message>` envelope delivered in the current turn.\n\
          - Your full historical two-way transcript in `state.db` remains queryable on demand via `conversation({{ \"agent\": \"self\", \"limit\": 30 }})`.\n\n\

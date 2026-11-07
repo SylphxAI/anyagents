@@ -707,8 +707,8 @@ fn spawn_admin_sylphx_delivery(
                         }
                     }
                     flush_harness_usage(&harness, &mut recorded_usage);
-                    if completed_any && !had_err && agent.parent_id.is_some() {
-                        let _ = store.complete_idle_subagent(&agent.id);
+                    if completed_any && !had_err {
+                        let _ = store.complete_idle_agent(&agent.id);
                     }
                 }
                 Err(reason) => {
@@ -1223,8 +1223,7 @@ fn reconcile_agent_snapshot(
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
                     if !has_pending_work
                         && persisted_err.is_none()
-                        && agent.parent_id.is_some()
-                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                        && store.complete_idle_agent(&agent.id).unwrap_or(false)
                     {
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
@@ -3858,24 +3857,13 @@ async fn archive_agent_route(
         };
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
-        if found.parent_id.is_none() {
-            if is_self {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "a root agent cannot archive itself; pass a target agent name or id in `agent`",
-                ));
-            }
+        if found.parent_id.is_none() && !is_self {
             require_admin_or_operator(
                 &state.store,
                 &principal,
                 "agents.archive_root",
                 &found.name,
             )?;
-        } else if is_self && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a standing domain sub-agent (with a role) cannot archive itself; report completion to `parent` instead",
-            ));
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -3905,7 +3893,11 @@ async fn archive_agent_route(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        if state.health.get(&found.id).is_none_or(|live| !live.process_alive) {
+        if state
+            .health
+            .get(&found.id)
+            .is_none_or(|live| !live.process_alive)
+        {
             reap_archived_agent_locked(&state.store, state.store.data_dir(), &found.id);
         }
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
@@ -3965,10 +3957,6 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Some(agent) = agent {
         let _ = crate::browser::stop_profile(data_dir, &agent.name);
-        if parent_id.is_some() && agent.role.as_deref().is_none_or(|r| r.trim().is_empty()) {
-            let bp = data_dir.join("browser-profiles").join(&agent.name);
-            complete &= remove_path_with_seat(&bp, seat_ids);
-        }
     }
     for other in &agents {
         let keep_protected =
@@ -4360,6 +4348,15 @@ async fn delete_agent_route(
             .join("agents")
             .join(deleted.id.as_str());
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
+        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
+        remove_path_with_seat(
+            &state
+                .store
+                .data_dir()
+                .join("browser-profiles")
+                .join(&deleted.name),
+            seat_ids,
+        );
         reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
         remove_path_with_seat(&agent_dir.join("config"), seat_ids);
         if !agent_dir.join("work").exists() {

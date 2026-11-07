@@ -106,13 +106,17 @@ impl Agent {
     /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`):
     /// - `"isolated"`: strictly confined to direct `parent`, own `children`, and bound external channels;
     ///   cannot message or read siblings or other roots.
-    /// - `"private"` (default for task sub-agents without a standing `role`): only direct `parent`,
+    /// - `"private"` (default for all sub-agents): only direct `parent`,
     ///   own `children`, or shared `group:<name>` can message it; can message `public` agents.
-    /// - `"siblings"` (default for standing domain sub-agents with a `role` that are not `*-assistant`):
+    /// - `"siblings"` (explicit opt-in):
     ///   reachable by `parent`, `children`, and sibling sub-agents under the same `parent` with
     ///   `"siblings"` or `"public"` scope.
     /// - `"public"` (default for Root Agents, or sub-agents with `public: true`): reachable across the workspace.
     pub fn scope(&self) -> &'static str {
+        self.scope_or_default(self.default_scope())
+    }
+
+    fn scope_or_default(&self, default: &'static str) -> &'static str {
         if let Some((_, v)) = self.launch_env.iter().find(|(k, _)| k == "ANYAGENTS_SCOPE") {
             match v.trim().to_ascii_lowercase().as_str() {
                 "isolated" | "none" => return "isolated",
@@ -135,16 +139,12 @@ impl Agent {
                 _ => {}
             }
         }
-        self.default_scope()
+        default
     }
 
     fn default_scope(&self) -> &'static str {
         if self.parent_id.is_none() {
             "public"
-        } else if self.name.ends_with("-assistant") {
-            "isolated"
-        } else if self.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            "siblings"
         } else {
             "private"
         }
@@ -606,6 +606,45 @@ impl std::ops::Deref for ReadConn<'_> {
 /// A capability is 32 random bytes, written in hex.
 const CAPABILITY_BYTES: usize = 32;
 
+/// Freeze the old effective policy before removing implicit role/name defaults.
+/// New rows always have an explicit scope. This bounded, transactional upgrade
+/// touches only legacy environment metadata, never identities or work state.
+fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM agents WHERE NOT EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(launch_env) THEN launch_env ELSE '[]' END) entry
+                WHERE entry.key % 2 = 0 AND entry.value = 'ANYAGENTS_SCOPE'
+                  AND lower(trim(json_extract(launch_env, '$[' || (entry.key + 1) || ']'))) IN (
+                    'isolated','none','private','false','0','siblings','sibling','team',
+                    'public','org','all','true','1'))",
+        )?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    for id in ids {
+        let agent = agent_by_id(&tx, &AgentId::parse(&id)?)?;
+        // Compatibility only: role and name never select policy for new agents.
+        let legacy_default = if agent.parent_id.is_none() {
+            "public"
+        } else if agent.name.ends_with("-assistant") {
+            "isolated"
+        } else if agent.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            "siblings"
+        } else {
+            "private"
+        };
+        let scope = agent.scope_or_default(legacy_default);
+        tx.execute(
+            "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+            params![encode_env(&scope_env(&agent, scope)), id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     /// Open or create the database, turn on WAL, and apply pending migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -626,6 +665,7 @@ impl Store {
         }
         let mut conn = conn;
         migrate::migrate(&mut conn)?;
+        preserve_legacy_scopes(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
@@ -964,7 +1004,7 @@ impl Store {
                     .filter(|s| !s.is_empty())
                     .map(|line| line.chars().take(300).collect())
             });
-        let agent = Agent {
+        let mut agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
@@ -979,6 +1019,7 @@ impl Store {
             launch_env: Vec::new(),
             parent_id: new.parent_id,
         };
+        agent.launch_env = scope_env(&agent, agent.default_scope());
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let taken: i64 = tx.query_row(
@@ -991,8 +1032,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10, ?11)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -1004,6 +1045,7 @@ impl Store {
                 agent.parent_id.as_ref().map(|id| id.as_str()),
                 agent.role,
                 agent.description,
+                encode_env(&agent.launch_env),
             ],
         )?;
         tx.execute(
@@ -2115,16 +2157,16 @@ impl Store {
         Ok(changed)
     }
 
-    /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
+    /// Atomically transition any running agent to
     /// `idle` (process released / scaled to zero) when it has delivered every
     /// message in its mailbox, completed its latest turn
     /// (`completed_seq >= opened_seq >= max_seq > 0`), and has no active
     /// (`running`) child sub-agents of its own.
     ///
-    /// Returns `Ok(true)` when the sub-agent transitioned to `idle` (and
+    /// Returns `Ok(true)` when the agent transitioned to `idle` (and
     /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
     /// mail arrived, a turn is still open, or a child sub-agent is still running.
-    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+    pub fn complete_idle_agent(&self, id: &AgentId) -> Result<bool, Error> {
         let err_file =
             crate::agent_config_dir(self.data_dir(), id).join(".anyagents-last-error.json");
         if let Ok(raw) = std::fs::read_to_string(&err_file)
@@ -2141,7 +2183,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let parent_id_opt: Option<AgentId> = tx
                 .query_row(
-                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL AND (role IS NULL OR TRIM(role) = '')",
+                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
                     [id.as_str()],
                     |r| {
                         let pid: String = r.get(0)?;
@@ -2157,7 +2199,6 @@ impl Store {
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
-                       AND (a.role IS NULL OR TRIM(a.role) = '')
                        AND a.state = 'running'
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
@@ -2180,8 +2221,6 @@ impl Store {
                 "UPDATE agents
                  SET state = 'idle'
                  WHERE id = ?1
-                   AND parent_id IS NOT NULL
-                   AND (role IS NULL OR TRIM(role) = '')
                    AND state = 'running'
                    AND NOT EXISTS (
                        SELECT 1 FROM agents child
@@ -2238,6 +2277,11 @@ impl Store {
             }
         }
         Ok(transitioned)
+    }
+
+    /// Compatibility alias; idle release now applies to roots and children alike.
+    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+        self.complete_idle_agent(id)
     }
 
     /// Permanently delete an agent and its associated records from the store.
@@ -4059,7 +4103,7 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
 }
 
 /// Reads the active direct child sub-agents `(name, role, public_description)` for `parent_id`
-/// that have a standing `role` label from `{data}/state.db` read-only.
+/// from `{data}/state.db` read-only, regardless of role label.
 pub fn read_children_roster(
     data_dir: &Path,
     parent_id: &str,
@@ -4076,7 +4120,7 @@ pub fn read_children_roster(
     let _ = conn.busy_timeout(Duration::from_millis(500));
     let query = "SELECT name, role, description, instructions
          FROM agents
-         WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != ''
+         WHERE parent_id = ?1 AND state != 'archived'
          ORDER BY name ASC";
     let mut roster = Vec::new();
     if let Ok(mut stmt) = conn.prepare(query)
@@ -5570,7 +5614,7 @@ fn compute_and_diff_topology_event(
     } else if rec.allows_sibling_messages()
         && let Some(ref pid) = rec.parent_id
         && let Ok(mut stmt) = conn.prepare(
-            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 ORDER BY name ASC",
         )
         && let Ok(rows) = stmt.query_map(params![pid.as_str(), rec.id.as_str()], |r| {
             r.get::<_, String>(0)
@@ -5588,14 +5632,17 @@ fn compute_and_diff_topology_event(
 
     let mut children = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' ORDER BY name ASC",
     ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
     {
         for id_str in rows.flatten() {
             if let Ok(aid) = AgentId::parse(&id_str)
                 && let Ok(child) = agent_by_id(conn, &aid)
             {
-                children.push(format_agent_topology_tag(&child.name, child.role.as_deref()));
+                children.push(format_agent_topology_tag(
+                    &child.name,
+                    child.role.as_deref(),
+                ));
             }
         }
     }

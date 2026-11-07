@@ -1006,18 +1006,8 @@ pub fn print_agents_table_with_options(
 
         let stop_here = max_depth.is_some_and(|m| depth >= m);
         if let Some(kids) = children_by_parent.get(node.id.as_str()) {
-            let visible_kids: Vec<&'a AgentView> = if stop_here {
-                if depth == 0 && max_depth == Some(0) {
-                    kids.iter()
-                        .copied()
-                        .filter(|k| k.role.as_deref().is_some_and(|r| !r.trim().is_empty()))
-                        .collect()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                kids.clone()
-            };
+            let visible_kids: Vec<&'a AgentView> =
+                if stop_here { Vec::new() } else { kids.clone() };
             let count = visible_kids.len();
             let my_runtime = Some((node.harness.as_str(), node.model.as_deref()));
             for (idx, &kid) in visible_kids.iter().enumerate() {

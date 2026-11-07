@@ -696,7 +696,7 @@ struct Session<H: Harness> {
     /// with a `[Recovery]` prompt if no new mailbox message wakes it first.
     pending_recovery: bool,
     /// Set once at least one turn has completed during this session, enabling
-    /// automatic scale-to-zero (`archived`) for sub-agents when idle.
+    /// automatic scale-to-zero (`idle`) for any agent after a completed turn.
     completed_turn_in_session: bool,
     /// Clock timestamp (`now_ms`) when the current quota wait began, so an
     /// operator profile refresh/upgrade (`.anyagents-profile-rotated-ms`)
@@ -1044,7 +1044,7 @@ impl<H: Harness + 'static> Session<H> {
                 if self.pending_recovery && self.recover_once() {
                     return false;
                 }
-                if self.try_auto_archive_subagent() {
+                if self.try_release_idle_agent() {
                     return false;
                 }
                 self.inner.clock.wait(
@@ -1184,21 +1184,13 @@ impl<H: Harness + 'static> Session<H> {
         }
     }
 
-    /// Automatically scale a sub-agent (`parent_id.is_some()`) to zero (`state = "idle"`)
+    /// Automatically scale any agent to zero (`state = "idle"`)
     /// once it has finished its turn, its mailbox is drained, it has no active
     /// child sub-agents, and its harness process has no in-flight background commands.
     /// Its config directory and session are preserved so sending any future message
-    /// to the sub-agent automatically wakes and resumes it.
-    fn try_auto_archive_subagent(&mut self) -> bool {
-        if self.agent.parent_id.is_none()
-            || self
-                .agent
-                .role
-                .as_deref()
-                .is_some_and(|r| !r.trim().is_empty())
-            || !self.completed_turn_in_session
-            || self.last_error.is_some()
-        {
+    /// to the agent automatically wakes and resumes it.
+    fn try_release_idle_agent(&mut self) -> bool {
+        if !self.completed_turn_in_session || self.last_error.is_some() {
             return false;
         }
         let scaled = {
@@ -1214,7 +1206,7 @@ impl<H: Harness + 'static> Session<H> {
             }
             delivery
                 .store()
-                .complete_idle_subagent(&self.id)
+                .complete_idle_agent(&self.id)
                 .unwrap_or(false)
         };
         if !scaled {
