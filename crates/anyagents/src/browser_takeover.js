@@ -66,7 +66,7 @@ if (typeof document !== 'undefined') {
   let frameRevision = 0, lastFrame = 0;
   const pointers = new Map();
   let gesture = null, pressed = null, touchPan = false, motion = null, motionFrame = 0, pairFrame = 0;
-  let focusSequence = 0;
+  let touchTimer = 0, focusSequence = 0;
   // Proxy focus is an acknowledgement of remote ownership, not a new choice.
   document.addEventListener('focusin', e => { if (e.target !== proxy) focusSequence++; });
   // Blurring into a non-focusable local surface has no matching focusin.
@@ -160,7 +160,16 @@ if (typeof document !== 'undefined') {
     const p = pressed; pressed = null;
     sendWithFocus({ type: 'mouse', event_type: 'mouseReleased', ...p.point, button: p.button, buttons: 0 }).catch(reconnect);
   }
+  function cancelTouchTimer() { clearTimeout(touchTimer); touchTimer = 0; }
+  function cancelPointer() {
+    flushMotion();
+    if (!pressed) return;
+    const p = pressed; pressed = null;
+    // A late second finger must end a held press without activating its target.
+    sendInput({ type: 'mouseCancel', ...p.point, button: p.button }).catch(reconnect);
+  }
   function pressPointer(g) {
+    cancelTouchTimer();
     if (g.pointerType !== 'mouse' && matchMedia('(pointer: coarse)').matches) openKeyboard();
     else canvas.focus({ preventScroll: true });
     pressed = { point: g.point, button: g.button, buttons: g.buttons };
@@ -169,21 +178,20 @@ if (typeof document !== 'undefined') {
   stage.addEventListener('pointerdown', e => {
     if (!ready || completed) return;
     e.preventDefault();
-    // Once a drag owns the remote press, another finger cannot turn its
-    // arrival into a release/click. Only the original pointer can end it.
-    if (pressed && pointers.size) return;
     stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) {
+      cancelTouchTimer(); cancelPointer();
       gesture = { kind: 'pair', ...pair(), last: pair(), view: { ...view } };
     } else if (pointers.size === 1) {
-      // A stationary touch stays undecided until lift or an 8 CSS px drag.
-      // Time alone cannot commit a press: a later second finger may scroll.
+      // Immediate pairs never press. A stationary hold commits after 180ms
+      // for press-and-hold challenges; a later pair explicitly cancels it.
       const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
       const g = gesture = { kind: 'single', x: e.clientX, y: e.clientY, view: { ...view },
         point: point(e.clientX, e.clientY), button, buttons: e.pointerType === 'mouse' ? e.buttons : 1, pointerType: e.pointerType };
       if (e.pointerType !== 'mouse' && touchPan) return;
       if (e.pointerType === 'mouse') pressPointer(g);
+      else touchTimer = setTimeout(() => { if (gesture === g && pointers.size === 1) pressPointer(g); }, 180);
     }
   });
   function flushPairMotion() {
@@ -220,7 +228,7 @@ if (typeof document !== 'undefined') {
   });
   function endPointer(e) {
     if (!pointers.has(e.pointerId)) return;
-    flushPairMotion();
+    cancelTouchTimer(); flushPairMotion();
     if (!pressed && gesture?.kind === 'single' && !touchPan && e.type === 'pointerup') pressPointer(gesture);
     if (pressed) pressed.point = point(e.clientX, e.clientY);
     releasePointer(); pointers.delete(e.pointerId);
@@ -230,7 +238,7 @@ if (typeof document !== 'undefined') {
   stage.addEventListener('pointerup', endPointer);
   stage.addEventListener('pointercancel', endPointer);
   stage.addEventListener('lostpointercapture', endPointer);
-  addEventListener('blur', () => { focusSequence++; flushPairMotion(); releasePointer(); pointers.clear(); gesture = null; });
+  addEventListener('blur', () => { focusSequence++; cancelTouchTimer(); flushPairMotion(); releasePointer(); pointers.clear(); gesture = null; });
   stage.addEventListener('contextmenu', e => e.preventDefault());
   stage.addEventListener('wheel', e => {
     e.preventDefault();

@@ -8,10 +8,15 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
   const results = [], latency = [];
   await remote.eval(`(() => {
     const fixture = document.createElement('section'); fixture.id='interaction-fixture';
-    fixture.innerHTML='<button id="signin" style="position:fixed;left:400px;top:30px;width:200px;height:50px">Sign in</button><div id="paint-marker" style="position:fixed;left:650px;top:30px;width:60px;height:60px;background:rgb(240,0,240)"></div><div id="track" style="position:fixed;left:400px;top:200px;width:320px;height:50px;background:#aaa"><div id="slider" style="width:40px;height:50px;background:#06c;position:absolute;left:0"></div></div><div id="scrollbox" style="position:fixed;left:400px;top:320px;width:320px;height:120px;overflow:auto;background:#fff"><div style="height:2000px"><button id="scroll-button" style="width:320px;height:60px">Scroll starting here</button></div></div>';
+    fixture.innerHTML='<button id="signin" style="position:fixed;left:400px;top:30px;width:200px;height:50px">Sign in</button><button id="hold-button" style="position:fixed;left:400px;top:110px;width:200px;height:50px">Press and hold</button><div id="paint-marker" style="position:fixed;left:650px;top:30px;width:60px;height:60px;background:rgb(240,0,240)"></div><div id="track" style="position:fixed;left:400px;top:200px;width:320px;height:50px;background:#aaa"><div id="slider" style="width:40px;height:50px;background:#06c;position:absolute;left:0"></div></div><div id="scrollbox" style="position:fixed;left:400px;top:320px;width:320px;height:120px;overflow:auto;background:#fff"><div style="height:2000px"><button id="scroll-button" style="width:320px;height:60px">Scroll starting here</button></div></div>';
     document.body.append(fixture);
-    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];window.scrollButtonClicks=0;window.signinEvents=[];
+    window.nativeClicks=0;window.addEventListener('click',()=>window.nativeClicks++,{capture:true});
+    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];window.scrollButtonClicks=0;window.scrollButtonDowns=0;window.signinEvents=[];window.holdButtonEvents=[];
     document.querySelector('#scroll-button').onclick=()=>window.scrollButtonClicks++;
+    // Pointer capture must not defeat cancellation of a committed hold.
+    document.querySelector('#scroll-button').onpointerdown=e=>e.target.setPointerCapture(e.pointerId);
+    document.querySelector('#scroll-button').onmousedown=()=>window.scrollButtonDowns++;
+    for(const type of ['mousedown','mouseup'])document.querySelector('#hold-button').addEventListener(type,e=>window.holdButtonEvents.push({type:e.type,trusted:e.isTrusted,time:performance.now(),epoch:Date.now()}));
     for(const type of ['mousedown','mouseup'])document.querySelector('#signin').addEventListener(type,e=>window.signinEvents.push({type:e.type,trusted:e.isTrusted}));
     document.addEventListener('wheel',e=>window.wheelHistory.push({x:e.clientX,y:e.clientY,dy:e.deltaY,target:e.target.id,trusted:e.isTrusted}));
     document.querySelector('#entry').addEventListener('input',()=>window.remoteInputs++);
@@ -148,17 +153,39 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     const scroll=await localPoint(540,380);
     if(mobile) {
       const button=await localPoint(540,350);
-      for(const delay of [0,250]) {
-        await remote.eval('window.scrollButtonClicks=0;document.querySelector("#scrollbox").scrollTop=0');
+      for(const delay of [0,250,600]) {
+        await remote.eval('window.scrollButtonClicks=0;window.scrollButtonDowns=0;document.querySelector("#scrollbox").scrollTop=0');
         await touch('touchStart',[[button.x-12,button.y]]);
-        if(delay) await viewer.eval(`new Promise(resolve=>setTimeout(resolve,${delay}))`);
+        if(delay) {
+          await viewer.eval(`new Promise(resolve=>setTimeout(resolve,${delay}))`);
+          assert.equal(await remote.eval('window.scrollButtonDowns'),1,'delayed pair starts after a committed remote press');
+        }
         await touch('touchStart',[[button.x-12,button.y],[button.x+12,button.y]]);
         await touch('touchMove',[[button.x-12,button.y-40],[button.x+12,button.y-40]]);
         await touch('touchEnd',[]);
         await until(()=>remote.eval(`document.querySelector('#scrollbox').scrollTop>0`),'two-finger scroll after '+delay+'ms');
         assert.equal(await remote.eval('window.scrollButtonClicks'),0,'two-finger scroll starting on a button must not click after '+delay+'ms');
+        await remote.eval('document.querySelector("#scrollbox").scrollTop=0');
+        await viewer.eval('new Promise(resolve=>setTimeout(resolve,500))');
+        await touch('touchStart',[[button.x,button.y]]); await touch('touchEnd',[]);
+        await until(()=>remote.eval('window.scrollButtonClicks===1'),'tap after cancelled pair still clicks once');
       }
-      await remote.eval('window.scrollButtonClicks=0;document.querySelector("#scrollbox").scrollTop=0');
+      // A disabled target emits no native click at cancellation. Cleanup must
+      // still leave the next intentional tap intact, with no page-world globals.
+      await remote.eval('window.scrollButtonClicks=0;window.nativeClicks=0;document.querySelector("#scrollbox").scrollTop=0;document.querySelector("#scroll-button").disabled=true');
+      await touch('touchStart',[[button.x-12,button.y]]);
+      await viewer.eval('new Promise(resolve=>setTimeout(resolve,250))');
+      await touch('touchStart',[[button.x-12,button.y],[button.x+12,button.y]]);
+      await touch('touchMove',[[button.x-12,button.y-40],[button.x+12,button.y-40]]);
+      await touch('touchEnd',[]);
+      await until(()=>remote.eval('document.querySelector("#scrollbox").scrollTop>0'),'disabled-target cancelled pair completes');
+      assert.equal(await remote.eval('window.nativeClicks'),0,'disabled-target cancellation emits no native click event');
+      await remote.eval('document.querySelector("#scroll-button").disabled=false;document.querySelector("#scrollbox").scrollTop=0');
+      await viewer.eval('new Promise(resolve=>setTimeout(resolve,500))');
+      assert.equal(await remote.eval("Object.getOwnPropertySymbols(window).some(s=>Symbol.keyFor(s)==='anyagents.takeover.cancelClick')"),false,'cancellation has no page-world global');
+      await touch('touchStart',[[button.x,button.y]]); await touch('touchEnd',[]);
+      await until(()=>remote.eval('window.scrollButtonClicks===1'),'tap after no-click cancellation remains usable');
+      await remote.eval('window.scrollButtonClicks=0;window.scrollButtonDowns=0;document.querySelector("#scrollbox").scrollTop=0');
       const beforePinch=await viewer.eval(`document.querySelector('#screen').getBoundingClientRect().width`);
       await touch('touchStart',[[button.x-12,button.y]]);
       await viewer.eval('new Promise(resolve=>setTimeout(resolve,250))');
@@ -179,14 +206,23 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     await until(()=>remote.eval(`window.signins===${before+1} && window.lastSigninTrusted`),'trusted sign-in click');
     assert.deepEqual(await remote.eval('window.signinEvents'),[{type:'mousedown',trusted:true},{type:'mouseup',trusted:true}],'single tap sends one trusted press and release');
     if(mobile) {
-      const button=await localPoint(500,55),heldBefore=await remote.eval('window.signins');
-      await remote.eval('window.signinEvents=[]');
+      const button=await localPoint(500,135);
+      await remote.eval('window.holdButtonEvents=[]');
+      const began=Date.now();
       await touch('touchStart',[[button.x,button.y]]);
-      await viewer.eval('new Promise(resolve=>setTimeout(resolve,600))');
-      assert.deepEqual(await remote.eval('window.signinEvents'),[],'stationary hold cannot commit a press before lift');
+      await until(()=>remote.eval('window.holdButtonEvents.length===1'),'stationary hold presses remotely');
+      const down=await remote.eval('window.holdButtonEvents[0]');
+      assert.equal(down.type,'mousedown'); assert.equal(down.trusted,true);
+      assert.ok(down.epoch-began<=200,'remote hold starts within 200ms: '+(down.epoch-began));
+      await new Promise(resolve=>setTimeout(resolve,Math.max(0,5000-(Date.now()-began))));
+      assert.equal(await remote.eval('window.holdButtonEvents.length'),1,'five-second hold has no premature release');
       await touch('touchEnd',[]);
-      await until(()=>remote.eval(`window.signins===${heldBefore+1}`),'stationary long-press clicks once on lift');
-      assert.deepEqual(await remote.eval('window.signinEvents'),[{type:'mousedown',trusted:true},{type:'mouseup',trusted:true}]);
+      await until(()=>remote.eval('window.holdButtonEvents.length===2'),'held button releases at lift');
+      const held=await remote.eval('window.holdButtonEvents');
+      assert.deepEqual(held.map(e=>({type:e.type,trusted:e.trusted})),[{type:'mousedown',trusted:true},{type:'mouseup',trusted:true}]);
+      const heldMs=held[1].time-held[0].time;
+      assert.ok(heldMs>=4800,'remote held duration >=4800ms: '+heldMs);
+      results.push({width,holdStartMs:down.epoch-began,heldMs,delayedPairClicks:0,pointerCaptureCancellation:true});
     }
     // Deliberately overlap actual screenshot/state requests with input.
     const reads=[api('/state'),fetch(url+'/frame.jpg').then(r=>r.arrayBuffer())];

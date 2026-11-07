@@ -2270,6 +2270,104 @@ fn takeover_page_session<'a>(
     Ok(&mut session.as_mut().unwrap().cdp)
 }
 
+// Cancellation code stays in a separate world, including in cross-origin frames.
+// Its capture listener shares DOM event propagation but no page globals.
+fn eval_takeover_cancel_js(
+    cdp: &mut CdpSession,
+    frame_id: &str,
+    expression: &str,
+) -> Result<serde_json::Value, Error> {
+    fn evaluate(
+        cdp: &mut CdpSession,
+        frame_id: &str,
+        expression: &str,
+    ) -> Result<serde_json::Value, Error> {
+        let world = cdp.call(
+            "Page.createIsolatedWorld",
+            serde_json::json!({"frameId": frame_id, "worldName": "anyagents-takeover-cancel"}),
+        )?;
+        let context = world["executionContextId"]
+            .as_u64()
+            .ok_or_else(|| Error::Message("missing cancellation world".into()))?;
+        eval_js_with_session(cdp, None, Some(context), expression)
+    }
+    match evaluate(cdp, frame_id, expression) {
+        Ok(value) => Ok(value),
+        Err(_) => {
+            let mut child = CdpSession::connect(cdp.port, &format!("/devtools/page/{frame_id}"))?;
+            evaluate(&mut child, frame_id, expression)
+        }
+    }
+}
+
+// CDP has no mouse-cancel event. Off-viewport release still clicks a pointer-
+// capturing target, and clickCount:0 on release does not stop Chromium's click.
+// Intercept just this release's native click before it reaches its target.
+fn cancel_takeover_mouse(
+    cdp: &mut CdpSession,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let tree = cdp.call("Page.getFrameTree", serde_json::json!({}))?;
+    let main = tree
+        .pointer("/frameTree/frame/id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Message("missing cancellation frame".into()))?;
+    let frames: Vec<_> = std::iter::once(main.to_string())
+        .chain(discover_child_frames(cdp).into_iter().map(|f| f.frame_id))
+        .collect();
+    release_cancelled_takeover_mouse(cdp, payload, &frames)
+}
+
+fn release_cancelled_takeover_mouse(
+    cdp: &mut CdpSession,
+    payload: &serde_json::Value,
+    frames: &[String],
+) -> Result<serde_json::Value, Error> {
+    let install = r#"(() => {
+        const key = Symbol.for('anyagents.takeover.cancelClick');
+        if (window[key]) { window[key].controller.abort(); clearTimeout(window[key].timer); }
+        const state = {controller: new AbortController()};
+        const clear = () => { state.controller.abort(); clearTimeout(state.timer); if (window[key] === state) delete window[key]; };
+        window[key] = state;
+        window.addEventListener('click', e => { clear(); e.preventDefault(); e.stopImmediatePropagation(); }, {capture:true, once:true, signal:state.controller.signal});
+        state.timer = setTimeout(clear, 250);
+        return true;
+    })()"#;
+    let cleanup = r#"(() => {
+        const key = Symbol.for('anyagents.takeover.cancelClick'), state = window[key];
+        if (state) { state.controller.abort(); clearTimeout(state.timer); delete window[key]; }
+    })()"#;
+    let started = std::time::Instant::now();
+    let result = (|| {
+        for frame in frames {
+            if eval_takeover_cancel_js(cdp, frame, install)? != serde_json::json!(true) {
+                return Err(Error::Message("cancellation listener not installed".into()));
+            }
+        }
+        // Never send a bare release after a slow/failed installation. Leave
+        // margin before the earliest listener's 250ms self-cleanup deadline.
+        if started.elapsed() >= Duration::from_millis(200) {
+            return Err(Error::Message("cancellation installation timed out".into()));
+        }
+        cdp.call(
+            "Input.dispatchMouseEvent",
+            serde_json::json!({
+                "type": "mouseReleased",
+                "x": payload["x"].as_f64().unwrap_or(0.0),
+                "y": payload["y"].as_f64().unwrap_or(0.0),
+                "button": payload["button"].as_str().unwrap_or("left"),
+                "buttons": 0,
+                "clickCount": 1,
+            }),
+        )?;
+        Ok(serde_json::json!({"ok": true, "type": "mouseCancel"}))
+    })();
+    for frame in frames {
+        let _ = eval_takeover_cancel_js(cdp, frame, cleanup);
+    }
+    result
+}
+
 fn dispatch_takeover_cdp_input(
     cdp: &mut CdpSession,
     payload: &serde_json::Value,
@@ -2279,6 +2377,7 @@ fn dispatch_takeover_cdp_input(
         .and_then(|v| v.as_str())
         .unwrap_or("click");
     match kind {
+        "mouseCancel" => cancel_takeover_mouse(cdp, payload),
         "click" => {
             let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -4862,6 +4961,86 @@ mod tests {
             .stderr(Stdio::from(std::fs::File::create(log).unwrap()))
             .spawn()
             .unwrap()
+    }
+
+    #[test]
+    fn cancelled_mouse_release_requires_every_isolated_listener_acknowledgement() {
+        for mode in ["ready", "failed", "slow"] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let endpoint = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_nodelay(true).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut server = CdpSession {
+                    port: 0,
+                    stream,
+                    read_buf: Vec::new(),
+                    next_id: 1,
+                };
+                let mut calls = Vec::new();
+                let mut installs = 0;
+                while let Ok(text) = server.read_text_message() {
+                    let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    let method = call["method"].as_str().unwrap();
+                    let mut response = serde_json::json!({"id": call["id"], "result": {}});
+                    if method == "Page.createIsolatedWorld" {
+                        assert_eq!(call["params"]["worldName"], "anyagents-takeover-cancel");
+                        response["result"] = serde_json::json!({"executionContextId": if call["params"]["frameId"] == "main" {1} else {2}});
+                        if mode == "failed" && call["params"]["frameId"] == "child" {
+                            response = serde_json::json!({"id":call["id"],"error":{"message":"installation refused"}});
+                        }
+                    } else if method == "Runtime.evaluate" {
+                        assert!(call["params"]["contextId"].as_u64().is_some());
+                        installs += 1;
+                        if mode == "slow" && installs == 1 {
+                            std::thread::sleep(Duration::from_millis(210));
+                        }
+                        response["result"] = serde_json::json!({"result":{"value":true}});
+                    }
+                    calls.push(call);
+                    server
+                        .send_text_frame(response.to_string().as_bytes())
+                        .unwrap();
+                }
+                calls
+            });
+            let mut cdp = CdpSession {
+                port: 0,
+                stream,
+                read_buf: Vec::new(),
+                next_id: 1,
+            };
+            let result = release_cancelled_takeover_mouse(
+                &mut cdp,
+                &serde_json::json!({"x":100,"y":400,"button":"left"}),
+                &["main".into(), "child".into()],
+            );
+            assert_eq!(result.is_ok(), mode == "ready");
+            drop(cdp);
+            let calls = endpoint.join().unwrap();
+            let releases: Vec<_> = calls
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| c["method"] == "Input.dispatchMouseEvent")
+                .collect();
+            if mode == "ready" {
+                assert_eq!(releases.len(), 1);
+                assert_eq!(
+                    releases[0].0, 4,
+                    "both isolated installs are acknowledged before release"
+                );
+                assert_eq!(releases[0].1["params"]["type"], "mouseReleased");
+            } else {
+                assert!(
+                    releases.is_empty(),
+                    "failed/slow installation must withhold release"
+                );
+            }
+        }
     }
 
     #[test]

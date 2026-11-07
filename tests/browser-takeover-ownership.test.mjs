@@ -126,11 +126,12 @@ test('late focus acknowledgement cannot undo a blur to the local document', asyn
   assert.equal(ui.document.activeElement.id, 'body');
 });
 
-test('a stationary held touch stays undecided until release, then clicks once', async () => {
+test('a stationary held touch presses by 180ms and releases only on lift', async () => {
   const ui = await mount();
   ui.pointer('pointerdown', 1, 100, 400);
-  await ui.advance(600);
-  assert.deepEqual(ui.inputs, [], 'elapsed time alone cannot commit a remote press');
+  await ui.advance(179); assert.deepEqual(ui.inputs, []);
+  await ui.advance(1); assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed']);
+  await ui.advance(4820); assert.equal(ui.inputs.length, 1, 'the remote button stays held for five seconds');
   ui.pointer('pointerup', 1, 100, 400); await ui.settle();
   assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed', 'mouseReleased']);
 });
@@ -142,23 +143,21 @@ for (const delay of [0, 250, 600]) test(`a second finger after ${delay}ms cancel
   ui.pointer('pointermove', 1, 100, 360); ui.pointer('pointermove', 2, 140, 360);
   ui.pointer('pointerup', 1, 100, 360); ui.pointer('pointerup', 2, 140, 360);
   await ui.settle();
-  assert.deepEqual(ui.inputs.map(p => p.type), ['wheel'], 'only the pair wheel may reach the remote');
-  assert.ok(ui.inputs[0].delta_y > 0);
+  assert.deepEqual(ui.inputs.map(p => p.type), delay ? ['mouse', 'mouseCancel', 'wheel'] : ['wheel']);
+  assert.equal(ui.inputs.some(p => p.event_type === 'mouseReleased'), false, 'a pair cannot complete a remote click');
+  assert.ok(ui.inputs.at(-1).delta_y > 0);
 });
 
-test('a second finger cannot release an already committed remote drag', async () => {
+test('a second finger cancels an already committed drag before its wheel', async () => {
   const ui = await mount();
-  ui.pointer('pointerdown', 1, 100, 400); await ui.advance(250);
-  ui.pointer('pointermove', 1, 116, 400); await ui.settle();
+  ui.pointer('pointerdown', 1, 100, 400); ui.pointer('pointermove', 1, 116, 400); await ui.settle();
   assert.equal(ui.inputs[0].event_type, 'mousePressed');
   ui.pointer('pointerdown', 2, 140, 400);
-  ui.pointer('pointermove', 2, 140, 360); ui.pointer('pointerup', 2, 140, 360);
+  ui.pointer('pointermove', 1, 116, 360); ui.pointer('pointermove', 2, 140, 360);
+  ui.pointer('pointerup', 2, 140, 360); ui.pointer('pointerup', 1, 116, 360);
   await ui.settle();
-  assert.equal(ui.inputs.some(p => p.event_type === 'mouseReleased'), false, 'the other finger cannot release/click');
-  ui.pointer('pointermove', 1, 160, 400); ui.pointer('pointerup', 1, 180, 400);
-  await ui.settle();
-  assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed', 'mouseMoved', 'mouseReleased']);
-  assert.ok(ui.inputs[0].x < ui.inputs[1].x && ui.inputs[1].x < ui.inputs[2].x);
+  assert.deepEqual(ui.inputs.map(p => p.event_type || p.type), ['mousePressed', 'mouseMoved', 'mouseCancel', 'wheel']);
+  assert.equal(ui.inputs.some(p => p.event_type === 'mouseReleased'), false);
 });
 
 for (const isTrusted of [true, false]) test(`two independent paste events each insert once (trusted=${isTrusted})`, async () => {
