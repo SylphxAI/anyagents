@@ -1000,6 +1000,11 @@ fn switch_at_dispatch(state: &str, retiring: RetiringTurn, model_only: bool) {
         .unwrap();
     let first = store.next_undelivered(&agent.id).unwrap().unwrap();
     store.note_delivered(&agent.id, first.seq).unwrap();
+    assert!(store.has_open_turn(&agent.id).unwrap());
+    // The no-replay control is completed work, not an interrupted turn that
+    // legitimately needs a synthetic recovery prompt after replacement.
+    store.note_turn_completed(&agent.id).unwrap();
+    assert!(!store.has_open_turn(&agent.id).unwrap());
     store
         .receive(&agent.id, Incoming::new("pending delivery"))
         .unwrap();
