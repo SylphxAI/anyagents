@@ -1069,7 +1069,7 @@ fn switch_at_dispatch(state: &str, faulted: bool, model_only: bool) {
     assert_eq!(updated.id, agent.id);
     assert_eq!(updated.instructions, agent.instructions);
     assert!(old.lock().unwrap().given.is_empty());
-    let replacement = Arc::clone(&probes.lock().unwrap().last().unwrap());
+    let replacement = Arc::clone(probes.lock().unwrap().last().unwrap());
     assert!(replacement.lock().unwrap().given.is_empty());
     replacement.lock().unwrap().accept = true;
     store.poke(Wake::Mail {
