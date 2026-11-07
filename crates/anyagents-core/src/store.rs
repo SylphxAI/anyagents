@@ -38,6 +38,20 @@ const MESSAGE_COLS: &str = "id, agent_id, seq, source_time_ms, source_key, sende
 const AGENT_COLS: &str = "id, name, harness, model, workdir, instructions, state, \
      created_at_ms, launch_env, parent_id, is_admin, role, description";
 
+fn is_scope_env_key(key: &str) -> bool {
+    matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
+}
+
+fn scope_env(agent: &Agent, scope: &str) -> Vec<(String, String)> {
+    let mut env = agent.launch_env.clone();
+    env.retain(|(key, _)| !is_scope_env_key(key));
+    env.push(("ANYAGENTS_SCOPE".to_string(), scope.to_string()));
+    if scope == "public" {
+        env.push(("ANYAGENTS_PUBLIC".to_string(), "1".to_string()));
+    }
+    env
+}
+
 /// One agent row.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Agent {
@@ -84,6 +98,74 @@ impl Agent {
         }
         let truncated: String = first_line.chars().take(300).collect();
         Some(truncated)
+    }
+
+    /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`):
+    /// - `"isolated"`: strictly confined to direct `parent`, own `children`, and bound external channels;
+    ///   cannot message or read siblings or other roots.
+    /// - `"private"` (default for task sub-agents without a standing `role`): only direct `parent`,
+    ///   own `children`, or shared `group:<name>` can message it; can message `public` agents.
+    /// - `"siblings"` (default for standing domain sub-agents with a `role` that are not `*-assistant`):
+    ///   reachable by `parent`, `children`, and sibling sub-agents under the same `parent` with
+    ///   `"siblings"` or `"public"` scope.
+    /// - `"public"` (default for Root Agents, or sub-agents with `public: true`): reachable across the workspace.
+    pub fn scope(&self) -> &'static str {
+        if let Some((_, v)) = self.launch_env.iter().find(|(k, _)| k == "ANYAGENTS_SCOPE") {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "isolated" | "none" => return "isolated",
+                "private" | "false" | "0" => return "private",
+                "siblings" | "sibling" | "team" => return "siblings",
+                "public" | "org" | "all" | "true" | "1" => return "public",
+                _ => {}
+            }
+        }
+        if let Some((_, v)) = self
+            .launch_env
+            .iter()
+            .find(|(k, _)| k == "ANYAGENTS_PUBLIC")
+        {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "public" => return "public",
+                "siblings" | "sibling" | "team" => return "siblings",
+                "isolated" => return "isolated",
+                "0" | "false" | "no" | "private" => return "private",
+                _ => {}
+            }
+        }
+        self.default_scope()
+    }
+
+    fn default_scope(&self) -> &'static str {
+        if self.parent_id.is_none() {
+            "public"
+        } else if self.name.ends_with("-assistant") {
+            "isolated"
+        } else if self.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            "siblings"
+        } else {
+            "private"
+        }
+    }
+
+    pub fn is_isolated(&self) -> bool {
+        self.scope() == "isolated"
+    }
+
+    pub fn allows_sibling_messages(&self) -> bool {
+        matches!(self.scope(), "siblings" | "public")
+    }
+
+    /// Whether this sub-agent has been explicitly opted in (`public: true` / `ANYAGENTS_PUBLIC=1`)
+    /// by its Parent Agent to accept external messages and group invites across the workspace.
+    pub fn is_public_subagent(&self) -> bool {
+        self.parent_id.is_some() && self.scope() == "public"
+    }
+
+    /// Whether this agent accepts direct messages and group invites from agents
+    /// outside its direct parent/child lineage. Root agents are always public (`true`);
+    /// sub-agents default to `false` (`private`) unless their Parent sets `public: true`.
+    pub fn is_public(&self) -> bool {
+        self.parent_id.is_none() || self.scope() == "public"
     }
 }
 
@@ -548,7 +630,16 @@ impl Store {
                 body TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 PRIMARY KEY (agent_id, chat_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS agent_topology_state (
+                agent_id TEXT PRIMARY KEY,
+                state_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL
             );",
+        );
+        let _ = conn.execute(
+            "ALTER TABLE groups ADD COLUMN public INTEGER NOT NULL DEFAULT 0",
+            [],
         );
         let _ = ensure_lexical_fts_backfilled(&mut conn);
         Ok(Self {
@@ -642,6 +733,17 @@ impl Store {
                 row.get(0)
             })
             .optional()?)
+    }
+
+    /// A committed mailbox receipt for this source, including when the server
+    /// stopped before recording its whole-send receipt. Call under the lifecycle
+    /// lock before preparing an archived recipient for an idempotent retry.
+    pub fn message_by_source_key(
+        &self,
+        agent_id: &AgentId,
+        key: &str,
+    ) -> Result<Option<Message>, Error> {
+        message_by_source(&self.conn(), agent_id, key)
     }
 
     /// Keep one named send's receipt after it was delivered.
@@ -771,6 +873,44 @@ impl Store {
             return Err(Error::Io(err));
         }
         Ok(AgentLock { _file: file })
+    }
+
+    /// Serialize lifecycle state and archive-marker changes across API/server
+    /// processes. This is separate from the vendor-process lock: an archived
+    /// or live process must never prevent its lifecycle from being changed.
+    /// Keep the returned file open through preparation and the store commit.
+    pub fn lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+        self.agent_lifecycle_lock(agent_id, false)
+    }
+
+    /// Maintenance must skip a busy lifecycle rather than delay unrelated mail.
+    pub fn try_lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+        self.agent_lifecycle_lock(agent_id, true)
+    }
+
+    fn agent_lifecycle_lock(&self, agent_id: &AgentId, nonblocking: bool) -> Result<File, Error> {
+        let dir = self.data_dir.join("locks");
+        std::fs::create_dir_all(&dir)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join(format!("{}.lifecycle", agent_id.as_str())))?;
+        let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
+        loop {
+            let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
+            if rc == 0 {
+                return Ok(file);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::WouldBlock {
+                return Err(Error::AgentBusy);
+            }
+            if error.kind() != ErrorKind::Interrupted {
+                return Err(Error::Io(error));
+            }
+        }
     }
 
     pub fn create_agent(&self, new: NewAgent) -> Result<Agent, Error> {
@@ -1167,6 +1307,26 @@ impl Store {
             {
                 continue;
             }
+            let default_room_reply = incoming.reply_to.clone().or_else(|| {
+                let clean = room
+                    .strip_prefix("group:")
+                    .or_else(|| room.strip_prefix("telegram:chat:"))
+                    .or_else(|| room.strip_prefix("chat:"))
+                    .unwrap_or(room);
+                if clean == "all"
+                    || clean == "peers"
+                    || clean
+                        .split(':')
+                        .next()
+                        .unwrap_or(clean)
+                        .parse::<i64>()
+                        .is_ok()
+                {
+                    None
+                } else {
+                    Some(format!("group:{clean}"))
+                }
+            });
             let mut one = Incoming {
                 text: incoming.text.clone(),
                 sender: sender.clone(),
@@ -1175,7 +1335,7 @@ impl Store {
                     .source_key
                     .as_ref()
                     .map(|key| format!("room:{room}:{key}")),
-                reply_to: incoming.reply_to.clone(),
+                reply_to: default_room_reply,
                 quote: incoming.quote.clone(),
                 origin: incoming.origin,
                 received_at_ms: incoming.received_at_ms,
@@ -1272,6 +1432,41 @@ impl Store {
             params![name, agent_id.as_str()],
         )?;
         Ok(())
+    }
+
+    /// Remove an agent from all non-system virtual groups (`group_agents`, excluding `owners`)
+    /// when an ephemeral sub-agent is archived or deleted.
+    pub fn leave_all_groups(&self, agent_id: &AgentId) -> Result<(), Error> {
+        let conn = self.conn();
+        conn.execute(
+            "DELETE FROM group_agents WHERE agent_id = ?1 AND group_name != 'owners'",
+            [agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Set whether a named virtual group is `public` (`true` = open to any public agent;
+    /// `false` = private/invite-only to group members and their parents).
+    pub fn set_group_public(&self, name: &str, public: bool) -> Result<(), Error> {
+        if name.is_empty() || name.contains(':') || name.chars().any(char::is_whitespace) {
+            return Err(Error::Message(format!("invalid group name: {name}")));
+        }
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO groups (name, created_at_ms, public) VALUES (?1, ?2, ?3)
+             ON CONFLICT(name) DO UPDATE SET public = excluded.public",
+            params![name, now_ms(), i32::from(public)],
+        )?;
+        Ok(())
+    }
+
+    /// Whether a named virtual group is `public` (`true`) or `private` (`false`, default).
+    pub fn is_group_public(&self, name: &str) -> bool {
+        let conn = self.conn();
+        conn.query_row("SELECT public FROM groups WHERE name = ?1", [name], |r| {
+            Ok(r.get::<_, i64>(0)? != 0)
+        })
+        .unwrap_or(false)
     }
 
     /// The agents in a named group, by name. An unknown group is empty.
@@ -1404,9 +1599,73 @@ impl Store {
         Ok(())
     }
 
+    /// Update a channel's external identity (e.g. Telegram `@username` or `id:username`).
+    pub fn set_channel_identity(
+        &self,
+        channel_id: &ChannelId,
+        identity: Option<&str>,
+    ) -> Result<(), Error> {
+        let clean = identity.map(str::trim).filter(|s| !s.is_empty());
+        let changed = self.conn().execute(
+            "UPDATE channels SET identity = ?2 WHERE id = ?1",
+            params![channel_id.as_str(), clean],
+        )?;
+        if changed == 0 {
+            return Err(Error::ChannelNotFound(channel_id.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Detach all agents currently bound to `channel_id` (used when re-assigning a channel).
+    pub fn detach_channel_agents(&self, channel_id: &ChannelId) -> Result<(), Error> {
+        let conn = self.conn();
+        channel_with(&conn, channel_id)?;
+        conn.execute(
+            "DELETE FROM channel_agents WHERE channel_id = ?1",
+            params![channel_id.as_str()],
+        )?;
+        Ok(())
+    }
+
+    /// Detach one agent from `channel_id`.
+    pub fn detach_channel_agent(
+        &self,
+        channel_id: &ChannelId,
+        agent_id: &AgentId,
+    ) -> Result<(), Error> {
+        self.conn().execute(
+            "DELETE FROM channel_agents WHERE channel_id = ?1 AND agent_id = ?2",
+            params![channel_id.as_str(), agent_id.as_str()],
+        )?;
+        Ok(())
+    }
+
     /// Append one message, or return the row already stored for this source key.
     /// The sequence is assigned inside the insert transaction.
     pub fn receive(&self, agent_id: &AgentId, incoming: Incoming) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_wake(agent_id, incoming, false)
+    }
+
+    /// Append an intentional, directly addressed send and wake its recipient,
+    /// including an archived agent, in the same transaction. The caller must
+    /// authenticate the author, exclude fan-out and channel/system events, and
+    /// hold the lifecycle lock through clearing any explicit archive marker and
+    /// this call. Ordinary ingress must
+    /// use `receive`; a duplicate never changes the recipient's lifecycle.
+    pub fn receive_direct_send(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+    ) -> Result<ReceiveOutcome, Error> {
+        self.receive_with_wake(agent_id, incoming, true)
+    }
+
+    fn receive_with_wake(
+        &self,
+        agent_id: &AgentId,
+        incoming: Incoming,
+        wake_archived: bool,
+    ) -> Result<ReceiveOutcome, Error> {
         let mut incoming = incoming;
         let source_key = incoming.source_key.take().filter(|key| !key.is_empty());
         let received_at_ms = incoming.received_at_ms.unwrap_or_else(now_ms);
@@ -1596,12 +1855,24 @@ impl Store {
         });
         let participants =
             resolve_conversation_participants(&tx, chat_id_val, resolved_destination.as_deref());
+        let (sender_role, sender_rel) = resolve_sender_relationship_and_role(
+            &tx,
+            recipient_agent.as_ref(),
+            incoming.sender.as_deref(),
+        );
+        let topology = if event.as_deref() == Some("reaction_passive") {
+            None
+        } else {
+            compute_and_diff_topology_event(&tx, recipient_agent.as_ref(), received_at_ms)
+        };
         // The trusted header is built from the record that arrives, before any
         // field is moved into the row: the author, the channel, the chat and
         // topic, and the reply a bare answer reaches.
         let context = anyagents_harness::Context {
             sender: incoming.sender.clone(),
             sender_name: None,
+            sender_role,
+            sender_rel,
             recipient,
             channel: incoming
                 .sender
@@ -1619,6 +1890,7 @@ impl Store {
             reply_to_author,
             mentions,
             participants,
+            topology,
         };
         let message = Message {
             id: MessageId::generate(),
@@ -1656,7 +1928,13 @@ impl Store {
             ],
         )?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
-        let woke_idle = if is_passive_reaction {
+        let woke_agent = if wake_archived {
+            tx.execute(
+                "UPDATE agents SET state = 'running'
+                 WHERE id = ?1 AND state IN ('idle', 'created', 'archived')",
+                [agent_id.as_str()],
+            )? > 0
+        } else if is_passive_reaction {
             false
         } else {
             tx.execute(
@@ -1685,7 +1963,7 @@ impl Store {
         }
         tx.commit()?;
         drop(conn);
-        if woke_idle {
+        if woke_agent {
             self.notify(Wake::Agent {
                 agent_id: agent_id.clone(),
             });
@@ -1698,19 +1976,48 @@ impl Store {
         Ok(ReceiveOutcome::New(message))
     }
 
-    /// Store the environment the agent's harness is started with, and wake it
-    /// so the next start reads it. Never called with a provider key.
+    /// Replace the harness launch environment, preserving communication policy.
+    /// Only `set_agent_scope` owns `ANYAGENTS_SCOPE` / `ANYAGENTS_PUBLIC`;
+    /// gateway refreshes and stale environment snapshots must not overwrite them.
+    /// Never called with a provider key.
     pub fn set_agent_launch_env(
         &self,
         id: &AgentId,
         env: &[(String, String)],
     ) -> Result<Agent, Error> {
-        let json = encode_env(env);
+        self.update_agent_launch_env(id, None, |current| {
+            let mut refreshed: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| !is_scope_env_key(key))
+                .cloned()
+                .collect();
+            refreshed.extend(
+                current
+                    .launch_env
+                    .iter()
+                    .filter(|(key, _)| is_scope_env_key(key))
+                    .cloned(),
+            );
+            refreshed
+        })
+    }
+
+    fn update_agent_launch_env(
+        &self,
+        id: &AgentId,
+        audit: Option<(&str, &str)>,
+        update: impl FnOnce(&Agent) -> Vec<(String, String)>,
+    ) -> Result<Agent, Error> {
         let changed = {
-            let conn = self.conn();
+            let mut conn = self.conn();
+            // Read and merge under the same write transaction, including when
+            // serve and serve-admin use separate Store connections.
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = agent_by_id(&tx, id)?;
+            let json = encode_env(&update(&current));
             // A database written before this column existed still reads: the
             // harness then keeps whatever sign-in it already has.
-            let updated = conn
+            let updated = tx
                 .execute(
                     "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
                     params![json, id.as_str()],
@@ -1728,7 +2035,16 @@ impl Store {
             if updated == 0 {
                 return Err(Error::AgentNotFound(id.to_string()));
             }
-            agent_by_id(&conn, id)?
+            let changed = agent_by_id(&tx, id)?;
+            if let Some((actor, source)) = audit {
+                tx.execute(
+                    "INSERT INTO admin_audit (created_at, actor, action, target, before_scope, after_scope, source)
+                     VALUES (?1, ?2, 'agents.scope', ?3, ?4, ?5, ?6)",
+                    params![now_ms(), actor, changed.name, current.scope(), changed.scope(), source],
+                )?;
+            }
+            tx.commit()?;
+            changed
         };
         self.notify(Wake::Agent {
             agent_id: id.clone(),
@@ -1801,7 +2117,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let parent_id_opt: Option<AgentId> = tx
                 .query_row(
-                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
+                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL AND (role IS NULL OR TRIM(role) = '')",
                     [id.as_str()],
                     |r| {
                         let pid: String = r.get(0)?;
@@ -1817,6 +2133,7 @@ impl Store {
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
+                       AND (a.role IS NULL OR TRIM(a.role) = '')
                        AND a.state = 'running'
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
@@ -1840,6 +2157,7 @@ impl Store {
                  SET state = 'idle'
                  WHERE id = ?1
                    AND parent_id IS NOT NULL
+                   AND (role IS NULL OR TRIM(role) = '')
                    AND state = 'running'
                    AND NOT EXISTS (
                        SELECT 1 FROM agents child
@@ -2877,6 +3195,117 @@ impl Store {
         Ok(())
     }
 
+    /// Set the internal communication and discovery scope (`"isolated"`, `"private"`, `"siblings"`, or `"public"`).
+    pub fn set_agent_scope(&self, agent_id: &AgentId, scope: &str) -> Result<Agent, Error> {
+        self.set_agent_scope_as(agent_id, scope, "system")
+    }
+
+    /// Set scope and atomically record its authenticated actor and before/after policy.
+    pub fn set_agent_scope_as(
+        &self,
+        agent_id: &AgentId,
+        scope: &str,
+        actor: &str,
+    ) -> Result<Agent, Error> {
+        let normalized = match scope.trim().to_ascii_lowercase().as_str() {
+            "isolated" | "none" => "isolated",
+            "private" | "false" | "0" => "private",
+            "siblings" | "sibling" | "team" => "siblings",
+            "public" | "org" | "all" | "true" | "1" => "public",
+            other => {
+                return Err(Error::Message(format!(
+                    "invalid scope `{other}`; expected `isolated`, `private`, `siblings`, or `public`"
+                )));
+            }
+        };
+        self.update_agent_launch_env(agent_id, Some((actor, "scope")), |current| {
+            scope_env(current, normalized)
+        })
+    }
+
+    /// Set whether a sub-agent accepts external messages from agents outside its
+    /// direct parent/child lineage (`ANYAGENTS_PUBLIC=1` in `launch_env`).
+    pub fn set_agent_public(&self, agent_id: &AgentId, public: bool) -> Result<Agent, Error> {
+        self.set_agent_public_as(agent_id, public, "system")
+    }
+
+    /// The legacy boolean only grants/revokes public reachability. Revocation
+    /// restores the default for public agents and preserves all nonpublic scopes.
+    pub fn set_agent_public_as(
+        &self,
+        agent_id: &AgentId,
+        public: bool,
+        actor: &str,
+    ) -> Result<Agent, Error> {
+        self.update_agent_launch_env(agent_id, Some((actor, "public")), |current| {
+            if public {
+                scope_env(current, "public")
+            } else if current.scope() == "public" {
+                scope_env(current, current.default_scope())
+            } else {
+                current.launch_env.clone()
+            }
+        })
+    }
+
+    /// Returns `true` when `agent_a` and `agent_b` are members of at least one shared
+    /// internal virtual group (`group_agents`) or attached to the same Telegram chat.
+    pub fn share_any_group_or_chat(&self, agent_a: &AgentId, agent_b: &AgentId) -> bool {
+        let shares_group = {
+            let conn = self.conn();
+            conn.query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM group_agents g1
+                     JOIN group_agents g2 ON g1.group_name = g2.group_name
+                     WHERE g1.agent_id = ?1 AND g2.agent_id = ?2
+                 )",
+                params![agent_a.as_str(), agent_b.as_str()],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+        };
+        if shares_group {
+            return true;
+        }
+        let Ok(channels) = self.list_channels() else {
+            return false;
+        };
+        let mut chats_a = std::collections::HashSet::new();
+        let mut chats_b = std::collections::HashSet::new();
+        for ch in channels {
+            let has_a = ch.agents.iter().any(|id| id == agent_a);
+            let has_b = ch.agents.iter().any(|id| id == agent_b);
+            if !has_a && !has_b {
+                continue;
+            }
+            for (_, chat_id) in telegram_chat_links(&ch.state) {
+                if has_a {
+                    chats_a.insert(chat_id);
+                }
+                if has_b {
+                    chats_b.insert(chat_id);
+                }
+            }
+        }
+        chats_a.iter().any(|cid| chats_b.contains(cid))
+    }
+
+    /// Stateful reply capability: returns `true` if `from_agent` has previously sent a direct
+    /// message to `to_agent`, allowing `to_agent` to reply back even if `from_agent` is `public: false`.
+    pub fn has_messaged(&self, from_agent: &Agent, to_agent: &Agent) -> bool {
+        let dest_name = format!("agent:{}", to_agent.name);
+        let conn = self.conn();
+        conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM outbound_messages
+                 WHERE agent_id = ?1 AND (destination = ?2 OR destination = ?3)
+             )",
+            params![from_agent.id.as_str(), dest_name, to_agent.id.as_str()],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap_or(false)
+    }
+
     /// Mark the agent's current open turn as completed (`completed_seq = opened_seq`).
     pub fn note_turn_completed(&self, agent_id: &AgentId) -> Result<(), Error> {
         let conn = self.conn();
@@ -3526,6 +3955,59 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
                 model: None,
                 workdir: None,
                 description: None,
+                instructions,
+                is_admin: false,
+                state: "running".to_string(),
+                created_at_ms: 0,
+                launch_env: Vec::new(),
+            };
+            roster.push((name, role, dummy.public_description()));
+        }
+    }
+    roster
+}
+
+/// Reads the active direct child sub-agents `(name, role, public_description)` for `parent_id`
+/// that have a standing `role` label from `{data}/state.db` read-only.
+pub fn read_children_roster(
+    data_dir: &Path,
+    parent_id: &str,
+) -> Vec<(String, Option<String>, Option<String>)> {
+    let db_path = data_dir.join("state.db");
+    if !db_path.is_file() {
+        return Vec::new();
+    }
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let Ok(conn) = Connection::open_with_flags(&db_path, flags) else {
+        return Vec::new();
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(500));
+    let query = "SELECT name, role, description, instructions
+         FROM agents
+         WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != ''
+         ORDER BY name ASC";
+    let mut roster = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(query)
+        && let Ok(rows) = stmt.query_map([parent_id], |row| {
+            let name: String = row.get(0)?;
+            let role: Option<String> = row.get(1)?;
+            let description: Option<String> = row.get(2)?;
+            let instructions: Option<String> = row.get(3)?;
+            Ok((name, role, description, instructions))
+        })
+    {
+        for item in rows.flatten() {
+            let (name, role, description, instructions) = item;
+            let dummy = Agent {
+                id: AgentId::generate(),
+                name: name.clone(),
+                role: role.clone(),
+                parent_id: None,
+                harness: String::new(),
+                model: None,
+                workdir: None,
+                description,
                 instructions,
                 is_admin: false,
                 state: "running".to_string(),
@@ -4797,7 +5279,7 @@ fn resolve_conversation_participants(
                 }
             }
         } else if let Ok(mut stmt) =
-            conn.prepare("SELECT agent_id FROM group_members WHERE group_name = ?1")
+            conn.prepare("SELECT agent_id FROM group_agents WHERE group_name = ?1")
             && let Ok(mut rows) = stmt.query([group_name])
         {
             while let Ok(Some(row)) = rows.next() {
@@ -4835,6 +5317,300 @@ fn resolve_conversation_participants(
     }
     participants.sort();
     participants
+}
+
+fn format_agent_topology_tag(name: &str, role: Option<&str>) -> String {
+    match role.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(r) => format!("agent:{name} [{r}]"),
+        None => format!("agent:{name}"),
+    }
+}
+
+fn xml_escape_attr_local(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn is_ancestor_in_conn(conn: &Connection, ancestor_id: &AgentId, target: &Agent) -> bool {
+    let mut cursor = target.parent_id.clone();
+    let mut depth = 0usize;
+    while let Some(pid) = cursor {
+        if &pid == ancestor_id {
+            return true;
+        }
+        depth += 1;
+        if depth > 32 {
+            break;
+        }
+        cursor = agent_by_id(conn, &pid).ok().and_then(|a| a.parent_id);
+    }
+    false
+}
+
+fn resolve_sender_relationship_and_role(
+    conn: &Connection,
+    recipient: Option<&Agent>,
+    sender: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let Some(sender_raw) = sender.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    if sender_raw.starts_with("telegram:user:") {
+        return (None, Some("external_user".to_string()));
+    }
+    if sender_raw == "operator" {
+        return (None, Some("operator".to_string()));
+    }
+    let Some(sender_name) = sender_raw.strip_prefix("agent:") else {
+        return (None, None);
+    };
+    let Some(sender_id_str) = conn
+        .query_row(
+            "SELECT id FROM agents WHERE name = ?1",
+            [sender_name],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+    else {
+        return (None, None);
+    };
+    let Ok(sender_id) = AgentId::parse(&sender_id_str) else {
+        return (None, None);
+    };
+    let Ok(sender_agent) = agent_by_id(conn, &sender_id) else {
+        return (None, None);
+    };
+    let sender_role = sender_agent
+        .role
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let Some(rec) = recipient else {
+        return (sender_role, None);
+    };
+    let rel = if sender_agent.id == rec.id {
+        "self"
+    } else if rec.parent_id.as_ref() == Some(&sender_agent.id) {
+        "parent"
+    } else if sender_agent.parent_id.as_ref() == Some(&rec.id) {
+        "child"
+    } else if rec.parent_id.is_some() && rec.parent_id == sender_agent.parent_id {
+        "sibling"
+    } else if is_ancestor_in_conn(conn, &sender_agent.id, rec) {
+        "ancestor"
+    } else if is_ancestor_in_conn(conn, &rec.id, &sender_agent) {
+        "descendant"
+    } else {
+        "peer"
+    };
+    (sender_role, Some(rel.to_string()))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct PersistedTopologyState {
+    scope: String,
+    parent: Option<String>,
+    peers: Vec<String>,
+    children: Vec<String>,
+    groups: Vec<String>,
+}
+
+fn compute_and_diff_topology_event(
+    conn: &Connection,
+    recipient: Option<&Agent>,
+    now_ms: i64,
+) -> Option<String> {
+    let rec = recipient?;
+    let scope = rec.scope().to_string();
+    let parent = rec
+        .parent_id
+        .as_ref()
+        .and_then(|pid| agent_by_id(conn, pid).ok())
+        .map(|p| format_agent_topology_tag(&p.name, p.role.as_deref()));
+
+    let mut peers = Vec::new();
+    if rec.parent_id.is_none() {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM agents WHERE parent_id IS NULL AND state != 'archived' AND id != ?1 ORDER BY name ASC",
+        ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+        {
+            for id_str in rows.flatten() {
+                if let Ok(aid) = AgentId::parse(&id_str)
+                    && let Ok(peer) = agent_by_id(conn, &aid)
+                {
+                    peers.push(format_agent_topology_tag(&peer.name, peer.role.as_deref()));
+                }
+            }
+        }
+    } else if rec.allows_sibling_messages()
+        && let Some(ref pid) = rec.parent_id
+        && let Ok(mut stmt) = conn.prepare(
+            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+        )
+        && let Ok(rows) = stmt.query_map(params![pid.as_str(), rec.id.as_str()], |r| {
+            r.get::<_, String>(0)
+        })
+    {
+        for id_str in rows.flatten() {
+            if let Ok(aid) = AgentId::parse(&id_str)
+                && let Ok(sib) = agent_by_id(conn, &aid)
+                && sib.allows_sibling_messages()
+            {
+                peers.push(format_agent_topology_tag(&sib.name, sib.role.as_deref()));
+            }
+        }
+    }
+
+    let mut children = Vec::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+    ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+    {
+        for id_str in rows.flatten() {
+            if let Ok(aid) = AgentId::parse(&id_str)
+                && let Ok(child) = agent_by_id(conn, &aid)
+            {
+                children.push(format_agent_topology_tag(&child.name, child.role.as_deref()));
+            }
+        }
+    }
+
+    let mut groups = Vec::new();
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT group_name FROM group_agents WHERE agent_id = ?1 ORDER BY group_name ASC")
+        && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
+    {
+        for g in rows.flatten() {
+            groups.push(format!("group:{g}"));
+        }
+    }
+
+    let current = PersistedTopologyState {
+        scope: scope.clone(),
+        parent: parent.clone(),
+        peers: peers.clone(),
+        children: children.clone(),
+        groups: groups.clone(),
+    };
+    let current_json = serde_json::to_string(&current).ok()?;
+
+    let prev_json: Option<String> = conn
+        .query_row(
+            "SELECT state_json FROM agent_topology_state WHERE agent_id = ?1",
+            [rec.id.as_str()],
+            |r| r.get(0),
+        )
+        .optional()
+        .ok()
+        .flatten();
+
+    match prev_json.and_then(|s| serde_json::from_str::<PersistedTopologyState>(&s).ok()) {
+        None => {
+            let _ = conn.execute(
+                "INSERT INTO agent_topology_state (agent_id, state_json, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (agent_id) DO UPDATE SET state_json = excluded.state_json, updated_at_ms = excluded.updated_at_ms",
+                params![rec.id.as_str(), current_json, now_ms],
+            );
+            let self_tag = format_agent_topology_tag(&rec.name, rec.role.as_deref());
+            let mut tag = format!(
+                "<topology event=\"initial\" self=\"{}\" scope=\"{}\"",
+                xml_escape_attr_local(&self_tag),
+                xml_escape_attr_local(&scope)
+            );
+            if let Some(ref p) = parent {
+                tag.push_str(&format!(" parent=\"{}\"", xml_escape_attr_local(p)));
+            }
+            if !peers.is_empty() {
+                let attr_name = if rec.parent_id.is_some() {
+                    "siblings"
+                } else {
+                    "peers"
+                };
+                tag.push_str(&format!(
+                    " {attr_name}=\"{}\"",
+                    xml_escape_attr_local(&peers.join(", "))
+                ));
+            }
+            if !children.is_empty() {
+                tag.push_str(&format!(
+                    " children=\"{}\"",
+                    xml_escape_attr_local(&children.join(", "))
+                ));
+            }
+            if !groups.is_empty() {
+                tag.push_str(&format!(
+                    " groups=\"{}\"",
+                    xml_escape_attr_local(&groups.join(", "))
+                ));
+            }
+            tag.push_str(" />");
+            Some(tag)
+        }
+        Some(prev) if prev == current => None,
+        Some(prev) => {
+            let _ = conn.execute(
+                "UPDATE agent_topology_state SET state_json = ?1, updated_at_ms = ?2 WHERE agent_id = ?3",
+                params![current_json, now_ms, rec.id.as_str()],
+            );
+            let mut changes = Vec::new();
+            if prev.scope != current.scope {
+                changes.push(format!("scope: {} -> {}", prev.scope, current.scope));
+            }
+            if prev.parent != current.parent {
+                changes.push(format!(
+                    "parent: {}",
+                    current.parent.as_deref().unwrap_or("none")
+                ));
+            }
+            let peer_label = if rec.parent_id.is_some() {
+                "sibling"
+            } else {
+                "peer"
+            };
+            for p in &current.peers {
+                if !prev.peers.contains(p) {
+                    changes.push(format!("+{peer_label}: {p}"));
+                }
+            }
+            for p in &prev.peers {
+                if !current.peers.contains(p) {
+                    changes.push(format!("-{peer_label}: {p}"));
+                }
+            }
+            for c in &current.children {
+                if !prev.children.contains(c) {
+                    changes.push(format!("+child: {c}"));
+                }
+            }
+            for c in &prev.children {
+                if !current.children.contains(c) {
+                    changes.push(format!("-child: {c}"));
+                }
+            }
+            for g in &current.groups {
+                if !prev.groups.contains(g) {
+                    changes.push(format!("+group: {g}"));
+                }
+            }
+            for g in &prev.groups {
+                if !current.groups.contains(g) {
+                    changes.push(format!("-group: {g}"));
+                }
+            }
+            if changes.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "<topology event=\"delta\" changes=\"{}\" />",
+                    xml_escape_attr_local(&changes.join("; "))
+                ))
+            }
+        }
+    }
 }
 
 fn has_quoted_block(text: &str) -> bool {
@@ -5188,6 +5964,119 @@ mod tests {
         // A value with a quote, a backslash and a newline keeps its characters.
         let awkward = vec![("K".to_string(), "a\"b\\c\nd".to_string())];
         assert_eq!(decode_env(&encode_env(&awkward)), awkward);
+    }
+
+    #[test]
+    fn explicit_scope_and_description_survive_launch_env_refresh_and_reopen() {
+        let (dir, store) = setup();
+        let root = agent(&store, "root");
+        let mut new = NewAgent::new("worker", "claude-code");
+        new.parent_id = Some(root.id);
+        let worker = store.create_agent(new).unwrap();
+        let db = dir.path().join("state.db");
+        store
+            .set_agent_description(&worker.id, Some("Public charter"))
+            .unwrap();
+        for scope in ["siblings", "isolated", "public", "private"] {
+            store.set_agent_scope(&worker.id, scope).unwrap();
+            assert_eq!(store.agent(&worker.id).unwrap().scope(), scope);
+            // These are the gateway-only environments written at startup and
+            // provider refresh; none owns communication policy.
+            for port in [41001, 41002] {
+                let refreshed = store
+                    .set_agent_launch_env(
+                        &worker.id,
+                        &[("OPENAI_BASE_URL".into(), format!("http://127.0.0.1:{port}"))],
+                    )
+                    .unwrap();
+                assert_eq!(refreshed.scope(), scope);
+                assert_eq!(refreshed.description.as_deref(), Some("Public charter"));
+                let reopened = Store::open(&db).unwrap().agent(&worker.id).unwrap();
+                assert_eq!(reopened.scope(), scope);
+                assert_eq!(reopened.description, refreshed.description);
+                assert!(
+                    reopened
+                        .launch_env
+                        .contains(&("OPENAI_BASE_URL".into(), format!("http://127.0.0.1:{port}"),))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unrelated_agent_updates_preserve_explicit_scope() {
+        let (_dir, store) = setup();
+        let alpha = agent(&store, "alpha");
+        store.set_agent_scope(&alpha.id, "siblings").unwrap();
+        store
+            .set_agent_description(&alpha.id, Some("Charter"))
+            .unwrap();
+        store
+            .set_agent_instructions(&alpha.id, Some("Instructions"))
+            .unwrap();
+        store.set_agent_role(&alpha.id, Some("Mind")).unwrap();
+        store.set_agent_model(&alpha.id, "model").unwrap();
+        store.set_agent_harness(&alpha.id, "codex").unwrap();
+        store.rename_agent(&alpha.id, "renamed").unwrap();
+        assert_eq!(store.agent(&alpha.id).unwrap().scope(), "siblings");
+
+        let stale = store.agent(&alpha.id).unwrap().launch_env;
+        store.set_agent_scope(&alpha.id, "isolated").unwrap();
+        // A stale transfer/harness snapshot cannot put the old policy back.
+        store.set_agent_launch_env(&alpha.id, &stale).unwrap();
+        assert_eq!(store.agent(&alpha.id).unwrap().scope(), "isolated");
+    }
+
+    #[test]
+    fn legacy_public_revokes_only_public_reachability() {
+        let (_dir, store) = setup();
+        let parent = agent(&store, "parent");
+        for (name, role, default) in [
+            ("mind", Some("Mind"), "siblings"),
+            ("task", None, "private"),
+            ("liaison-assistant", Some("Liaison"), "isolated"),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = Some(parent.id.clone());
+            new.role = role.map(str::to_string);
+            let child = store.create_agent(new).unwrap();
+            assert_eq!(child.scope(), default);
+            for scope in ["siblings", "isolated", "private"] {
+                store.set_agent_scope(&child.id, scope).unwrap();
+                assert_eq!(
+                    store.set_agent_public(&child.id, false).unwrap().scope(),
+                    scope
+                );
+            }
+            assert_eq!(
+                store.set_agent_public(&child.id, true).unwrap().scope(),
+                "public"
+            );
+            assert_eq!(
+                store.set_agent_public(&child.id, false).unwrap().scope(),
+                default
+            );
+        }
+    }
+
+    #[test]
+    fn scope_update_rolls_back_if_its_audit_cannot_commit() {
+        let (_dir, store) = setup();
+        let alpha = agent(&store, "alpha");
+        store.set_agent_scope(&alpha.id, "siblings").unwrap();
+        let before = store.agent(&alpha.id).unwrap();
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER refuse_scope_audit BEFORE INSERT ON admin_audit
+             WHEN NEW.source IS NOT NULL BEGIN SELECT RAISE(ABORT, 'audit unavailable'); END;",
+            )
+            .unwrap();
+        let err = store
+            .set_agent_scope_as(&alpha.id, "public", "agent:parent")
+            .unwrap_err();
+        assert!(err.to_string().contains("audit unavailable"), "{err}");
+        assert_eq!(store.agent(&alpha.id).unwrap(), before);
     }
 
     #[test]
@@ -5929,6 +6818,55 @@ mod tests {
     }
 
     #[test]
+    fn only_direct_send_ingress_wakes_archived_and_duplicate_does_not_rewake() {
+        let (dir, store) = setup();
+        let recipient = agent(&store, "recipient");
+        store.set_agent_state(&recipient.id, "archived").unwrap();
+        // Lifecycle, channel and schedule ingress uses receive, even when a
+        // generated notification names an agent as its sender.
+        for (sender, key, text) in [
+            (
+                "agent:child",
+                "subagent_completed:child:1",
+                "[Sub-Agent Completed] done",
+            ),
+            (
+                "agent:child",
+                "subagent-error:child:1",
+                "[Sub-Agent Error] failed",
+            ),
+            ("system", "idle:1", "idle event"),
+            ("telegram:user:123", "telegram:123:1", "channel update"),
+            ("schedule:timer", "schedule:timer:1", "timer prompt"),
+            ("schedule:watch", "watch:watch:1", "watch prompt"),
+        ] {
+            let mut incoming = Incoming::new(text);
+            incoming.sender = Some(sender.into());
+            incoming.source_key = Some(key.into());
+            store.receive(&recipient.id, incoming).unwrap();
+            assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
+        }
+        let mut incoming = Incoming::new("intentional follow-up");
+        incoming.sender = Some("agent:parent".into());
+        incoming.source_key = Some("direct-1".into());
+        let sent = store
+            .receive_direct_send(&recipient.id, incoming.clone())
+            .unwrap();
+        assert!(matches!(sent, ReceiveOutcome::New(_)));
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
+        store.set_agent_state(&recipient.id, "archived").unwrap();
+        assert!(matches!(
+            store.receive_direct_send(&recipient.id, incoming).unwrap(),
+            ReceiveOutcome::Duplicate(_)
+        ));
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
+        assert_eq!(store.inbox(&recipient.id, None).unwrap().len(), 7);
+    }
+
+    #[test]
     fn rename_agent_preserves_id_grants_history_and_resolves_old_alias_and_role() {
         let (_dir, store) = setup();
         let argon = agent(&store, "argon");
@@ -6173,5 +7111,154 @@ mod tests {
         });
         let third_out = store.receive(&sage.id, third_webhook).unwrap();
         assert!(matches!(third_out, ReceiveOutcome::Duplicate(_)));
+    }
+
+    #[test]
+    fn event_driven_topology_initial_delta_and_isolated_scope() {
+        let (_dir, store) = setup();
+        let argus = store
+            .create_agent(NewAgent {
+                name: "argus".to_string(),
+                role: Some("公司業務總管".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: None,
+            })
+            .unwrap();
+        let helios = store
+            .create_agent(NewAgent {
+                name: "helios".to_string(),
+                role: Some("產品與功能".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        let plutus = store
+            .create_agent(NewAgent {
+                name: "plutus".to_string(),
+                role: Some("商業化與營收".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(argus.scope(), "public");
+        assert_eq!(helios.scope(), "siblings");
+        assert_eq!(plutus.scope(), "siblings");
+
+        // 1. First message to helios from argus -> emits `<topology event="initial" ... />`
+        let mut m1 = Incoming::new("Start sprint");
+        m1.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg1) = store.receive(&helios.id, m1).unwrap() else {
+            panic!("expected new message");
+        };
+        assert_eq!(msg1.context.sender_rel.as_deref(), Some("parent"));
+        assert_eq!(msg1.context.sender_role.as_deref(), Some("公司業務總管"));
+        let topo1 = msg1.context.topology.as_deref().expect("initial topology");
+        assert!(topo1.contains("event=\"initial\""), "topo1={topo1}");
+        assert!(topo1.contains("scope=\"siblings\""), "topo1={topo1}");
+        assert!(
+            topo1.contains("parent=\"agent:argus [公司業務總管]\""),
+            "topo1={topo1}"
+        );
+        assert!(
+            topo1.contains("agent:plutus [商業化與營收]"),
+            "topo1={topo1}"
+        );
+
+        // 2. Second message with no topology change -> `topology` is None
+        let mut m2 = Incoming::new("Status check");
+        m2.sender = Some("agent:plutus".to_string());
+        let ReceiveOutcome::New(msg2) = store.receive(&helios.id, m2).unwrap() else {
+            panic!("expected new message");
+        };
+        assert_eq!(msg2.context.sender_rel.as_deref(), Some("sibling"));
+        assert!(
+            msg2.context.topology.is_none(),
+            "no delta expected when unchanged"
+        );
+
+        // 3. New standing sibling `sage` added -> next message to helios emits `<topology event="delta" ... />`
+        let sage = store
+            .create_agent(NewAgent {
+                name: "sage".to_string(),
+                role: Some("用戶體驗與設計".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        let mut m3 = Incoming::new("Design sync");
+        m3.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
+            panic!("expected new message");
+        };
+        let topo3 = msg3
+            .context
+            .topology
+            .as_deref()
+            .expect("delta topology on add");
+        assert!(topo3.contains("event=\"delta\""), "topo3={topo3}");
+        assert!(
+            topo3.contains("+sibling: agent:sage [用戶體驗與設計]"),
+            "topo3={topo3}"
+        );
+
+        // 4. Archive `sage` -> next message to helios emits `-sibling: sage`
+        store.set_agent_state(&sage.id, "archived").unwrap();
+        let mut m4 = Incoming::new("After archive");
+        m4.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg4) = store.receive(&helios.id, m4).unwrap() else {
+            panic!("expected new message");
+        };
+        let topo4 = msg4
+            .context
+            .topology
+            .as_deref()
+            .expect("delta topology on archive");
+        assert!(
+            topo4.contains("-sibling: agent:sage [用戶體驗與設計]"),
+            "topo4={topo4}"
+        );
+
+        // 5. External liaison `stanley-assistant` defaults to `scope = "isolated"` and sees no siblings
+        let stanley = store
+            .create_agent(NewAgent {
+                name: "stanley-assistant".to_string(),
+                role: Some("Stanley 專屬助手".to_string()),
+                description: None,
+                harness: "agy".to_string(),
+                model: None,
+                workdir: None,
+                instructions: None,
+                parent_id: Some(argus.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(stanley.scope(), "isolated");
+        let mut m5 = Incoming::new("Hello Stanley");
+        m5.sender = Some("agent:argus".to_string());
+        let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {
+            panic!("expected new message");
+        };
+        let topo5 = msg5
+            .context
+            .topology
+            .as_deref()
+            .expect("initial topology for isolated");
+        assert!(topo5.contains("scope=\"isolated\""), "topo5={topo5}");
+        assert!(!topo5.contains("siblings="), "topo5={topo5}");
     }
 }

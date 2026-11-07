@@ -1,16 +1,262 @@
 //! Append-Only KV-Cache Pinned Context Window, Autonomous Compaction (`context_window_open`),
 //! and Lossless `Raw-RAG` Hybrid BM25 + Contiguous Episode Recall (`memory_recall`).
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+// Conservative offline budget for supported long-context models when neither the
+// live nor persisted catalog identifies the active model. Never a per-model limit.
 pub const DEFAULT_CONTEXT_WINDOW_TOKENS: usize = 128_000;
-pub const MAX_WINDOW_EST_TOKENS: usize = 160_000;
-pub const CONTEXT_WATERMARK_PERCENT: usize = 75;
-pub const WINDOW_MAX_ITEMS: usize = 160;
-pub const WINDOW_STRIDE_ITEMS: usize = 80;
+pub const MAX_WINDOW_EST_TOKENS: usize = DEFAULT_CONTEXT_WINDOW_TOKENS * 95 / 100;
+pub const CONTEXT_WATERMARK_PERCENT: usize = 85;
+pub const WINDOW_MAX_ITEMS: usize = 4_000;
+pub const WINDOW_STRIDE_ITEMS: usize = 1_000;
+
+type RemoteModelLimitsMap = HashMap<String, (usize, usize, Option<usize>)>;
+
+type RemoteModelsCache = HashMap<(std::path::PathBuf, String), (Instant, RemoteModelLimitsMap)>;
+
+fn remote_models_cache() -> &'static Mutex<RemoteModelsCache> {
+    static CACHE: OnceLock<Mutex<RemoteModelsCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn parse_models_catalog_json(val: &Value, map: &mut RemoteModelLimitsMap) {
+    let arr = val
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| val.get("models").and_then(Value::as_array));
+    let Some(items) = arr else {
+        return;
+    };
+    for item in items {
+        let Some(slug) = item
+            .get("id")
+            .or_else(|| item.get("slug"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let cw = item
+            .pointer("/limits/constraints/context_window_tokens")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                item.pointer("/limits/context_window")
+                    .and_then(Value::as_u64)
+            })
+            .or_else(|| item.get("context_window").and_then(Value::as_u64))
+            .or_else(|| item.get("max_context_window").and_then(Value::as_u64))
+            .or_else(|| item.get("context_length").and_then(Value::as_u64))
+            .unwrap_or(0) as usize;
+        if cw == 0 {
+            continue;
+        }
+        let eff_pct = item
+            .get("effective_context_window_percent")
+            .and_then(Value::as_u64)
+            .map(|p| (p as usize).clamp(40, 95))
+            .unwrap_or(CONTEXT_WATERMARK_PERCENT);
+        let max_output = item
+            .pointer("/limits/constraints/max_output_tokens")
+            .or_else(|| item.pointer("/limits/max_output_tokens"))
+            .or_else(|| item.get("max_output_tokens"))
+            .and_then(Value::as_u64)
+            .filter(|n| *n > 0)
+            .map(|n| n as usize);
+        map.insert(slug.to_ascii_lowercase(), (cw, eff_pct, max_output));
+    }
+}
+
+fn canonicalize_model_lookup_key(raw_model: &str) -> Vec<String> {
+    let base = raw_model
+        .split('#')
+        .next()
+        .unwrap_or(raw_model)
+        .trim()
+        .to_ascii_lowercase();
+    let stripped = base.strip_prefix("sylphx/").unwrap_or(&base);
+    let mut keys = vec![stripped.to_string(), base.clone()];
+    if stripped.contains("k3.1-pro") || stripped.contains("kimi-k3") {
+        keys.push("moonshotai/kimi-k3.1-pro".to_string());
+        keys.push("moonshotai/kimi-k3".to_string());
+    } else if stripped.contains("k2.7") || stripped.contains("kimi-for-coding") {
+        keys.push("moonshotai/kimi-k2.7-code".to_string());
+    } else if stripped.contains("gpt-6.1-sol") {
+        keys.push("openai/gpt-6.1-sol".to_string());
+    } else if stripped.contains("claude-opus-5") {
+        keys.push("anthropic/claude-opus-5.5".to_string());
+    } else if stripped.contains("argon") {
+        keys.push("google/gemini-4-argon".to_string());
+    }
+    keys
+}
+
+/// Resolves `(window_tokens, max_window_est_tokens, watermark_percent)` dynamically from the
+/// remote Sylphx Model Gateway (`GET /v1/models`) and cached catalog for the agent's model.
+pub(super) fn resolve_context_window_for_transcript(
+    transcript_path: &Path,
+) -> (usize, usize, usize) {
+    let Some(config_dir) = transcript_path.parent() else {
+        return (
+            DEFAULT_CONTEXT_WINDOW_TOKENS,
+            MAX_WINDOW_EST_TOKENS,
+            CONTEXT_WATERMARK_PERCENT,
+        );
+    };
+    let agent_json = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let raw_model = agent_json
+        .as_ref()
+        .and_then(|v| v.get("model"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(super::auth::DEFAULT_SYLPHX_MODEL);
+
+    let limits = resolve_model_context_limits(config_dir, raw_model, &[]);
+    (
+        limits.window_tokens,
+        limits.window_tokens * 95 / 100,
+        limits.compact_percent,
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum ContextLimitSource {
+    Catalog,
+    ConservativeFallback,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ModelContextLimits {
+    pub window_tokens: usize,
+    pub compact_percent: usize,
+    pub max_output_tokens: Option<usize>,
+    pub source: ContextLimitSource,
+}
+
+/// Resolve the actual dispatch model, not a possibly stale model in agent.json.
+/// Persisted catalogs remain usable through outages; unknown IDs use a visible,
+/// conservative 128k budget rather than either assuming 1M or stalling all turns.
+pub(super) fn resolve_model_context_limits(
+    config_dir: &Path,
+    raw_model: &str,
+    env: &[(String, String)],
+) -> ModelContextLimits {
+    let agent_json = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let lookup_keys = canonicalize_model_lookup_key(raw_model);
+    let env_gateway = env
+        .iter()
+        .find(|(k, _)| k == "SYLPHX_GATEWAY_URL")
+        .map(|(_, value)| value.clone())
+        .or_else(|| std::env::var("SYLPHX_GATEWAY_URL").ok());
+    let gw_url = env_gateway
+        .as_deref()
+        .or_else(|| {
+            agent_json
+                .as_ref()
+                .and_then(|v| v.get("gateway_base_url"))
+                .and_then(Value::as_str)
+        })
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty())
+        .unwrap_or(super::auth::DEFAULT_SYLPHX_GATEWAY_URL);
+    // Catalogs from another gateway or agent/profile are not authoritative for
+    // this dispatch, even when model IDs happen to match.
+    let cache_scope = (config_dir.to_path_buf(), gw_url.to_string());
+
+    // 1. Check process-wide remote `/v1/models` cache (TTL 10 minutes).
+    if let Ok(guard) = remote_models_cache().lock()
+        && let Some((fetched_at, map)) = guard.get(&cache_scope)
+        && fetched_at.elapsed() < Duration::from_secs(600)
+    {
+        for k in &lookup_keys {
+            if let Some(&(cw, eff_pct, max_output_tokens)) = map.get(k) {
+                return ModelContextLimits {
+                    window_tokens: cw,
+                    compact_percent: eff_pct,
+                    max_output_tokens,
+                    source: ContextLimitSource::Catalog,
+                };
+            }
+        }
+    }
+
+    // 2. Fetch live from remote `GET {gateway_base_url}/models` (unless in isolated unit test).
+    let mut map = remote_models_cache()
+        .lock()
+        .ok()
+        .and_then(|g| g.get(&cache_scope).map(|(_, map)| map.clone()))
+        .unwrap_or_default();
+    for local_file in [".sylphx-remote-models.json", "model-catalog-direct.json"] {
+        if let Ok(raw) = std::fs::read_to_string(config_dir.join(local_file))
+            && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        {
+            if local_file == ".sylphx-remote-models.json" {
+                // A persisted response from another gateway (or an old cache
+                // with no provenance) is not evidence for this endpoint.
+                if val.get("gateway_base_url").and_then(Value::as_str) == Some(gw_url)
+                    && let Some(catalog) = val.get("catalog")
+                {
+                    parse_models_catalog_json(catalog, &mut map);
+                }
+            } else {
+                parse_models_catalog_json(&val, &mut map);
+            }
+        }
+    }
+    if !super::sandbox::is_isolated_test_env()
+        && let Some(api_key) = super::auth::resolve_sylphx_gateway_key(config_dir, env)
+    {
+        let models_url = format!("{gw_url}/models");
+        if let Ok((status, raw)) = super::curl_get(&models_url, Some(&api_key))
+            && (200..300).contains(&status)
+            && let Ok(val) = serde_json::from_str::<Value>(&raw)
+        {
+            parse_models_catalog_json(&val, &mut map);
+            let cache = json!({"gateway_base_url": gw_url, "catalog": val});
+            if let Ok(serialized) = serde_json::to_vec(&cache) {
+                let _ = std::fs::write(config_dir.join(".sylphx-remote-models.json"), serialized);
+            }
+        }
+    }
+    if !map.is_empty()
+        && let Ok(mut guard) = remote_models_cache().lock()
+    {
+        guard.insert(cache_scope, (Instant::now(), map.clone()));
+    }
+    for k in &lookup_keys {
+        if let Some(&(cw, eff_pct, max_output_tokens)) = map.get(k) {
+            return ModelContextLimits {
+                window_tokens: cw,
+                compact_percent: eff_pct,
+                max_output_tokens,
+                source: ContextLimitSource::Catalog,
+            };
+        }
+    }
+    ModelContextLimits {
+        window_tokens: map
+            .values()
+            .map(|(window, _, _)| *window)
+            .min()
+            .unwrap_or(DEFAULT_CONTEXT_WINDOW_TOKENS)
+            .min(DEFAULT_CONTEXT_WINDOW_TOKENS),
+        compact_percent: CONTEXT_WATERMARK_PERCENT,
+        max_output_tokens: None,
+        source: ContextLimitSource::ConservativeFallback,
+    }
+}
 
 /// Move a suffix boundary back over every completed call/output pair it splits.
 /// Parallel calls can interleave, so inspecting only the first retained item is
@@ -270,6 +516,7 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
         return Vec::new();
     };
     let mut history: Vec<(usize, Value)> = Vec::new();
+    let mut budget_managed_window = false;
     let mut pruned_open_calls = std::collections::HashSet::new();
     for (raw_idx, line) in BufReader::new(file)
         .lines()
@@ -286,6 +533,7 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
                 .unwrap_or("")
                 .trim();
             history.clear();
+            budget_managed_window = m.get("retained_items").is_some();
             pruned_open_calls.clear();
             history.push((
                 raw_idx,
@@ -296,6 +544,9 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
                     ),
                 }),
             ));
+            if let Some(retained) = m.get("retained_items").and_then(Value::as_array) {
+                history.extend(retained.iter().cloned().map(|item| (raw_idx, item)));
+            }
             continue;
         }
         if m.get("type").and_then(Value::as_str) == Some("context_edit") {
@@ -303,6 +554,9 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             // call's result is appended. Carry pairing through those later
             // results, without applying keep_only to future unrelated messages.
             pruned_open_calls.extend(apply_context_edit_to_history(&mut history, &m));
+            continue;
+        }
+        if m.get("type").and_then(Value::as_str) == Some("native_turn_state") {
             continue;
         }
         if m.get("type").is_some() {
@@ -386,6 +640,12 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             .is_some_and(|cid| open_calls.remove(cid)),
         _ => true,
     });
+    // Automatic anchors retain exact pending state. Never silently discard it
+    // using the legacy bytes/4 sliding heuristic: the wire preflight owns this
+    // window and either fits it or refuses before dispatch.
+    if budget_managed_window {
+        return history;
+    }
     if history.len() > WINDOW_MAX_ITEMS {
         let excess = history.len() - WINDOW_STRIDE_ITEMS;
         let block_start = paired_suffix_start(
@@ -425,7 +685,8 @@ pub(super) fn load_transcript_indexed_items(transcript_path: &Path) -> Vec<(usiz
             .map(|(_, v)| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
             .sum()
     };
-    let max_chars = MAX_WINDOW_EST_TOKENS * 4;
+    let (_, max_window_est_tokens, _) = resolve_context_window_for_transcript(transcript_path);
+    let max_chars = max_window_est_tokens * 4;
     if est_chars(&history) > max_chars {
         let older_bound = (history.len() * 3) / 4;
         for (raw_idx, item) in &mut history[..older_bound] {
@@ -527,14 +788,16 @@ pub(super) fn maybe_emit_context_watermark_event(
     if has_watermark_in_window(input_items) {
         return;
     }
+    let (window_tokens, _, watermark_percent) =
+        resolve_context_window_for_transcript(transcript_path);
     let used_tokens = estimate_items_tokens(input_items);
-    let used_percent = (used_tokens * 100) / DEFAULT_CONTEXT_WINDOW_TOKENS.max(1);
+    let used_percent = (used_tokens * 100) / window_tokens.max(1);
     let item_count = input_items.len();
-    if used_percent >= CONTEXT_WATERMARK_PERCENT || item_count >= 120 {
+    if used_percent >= watermark_percent {
         let evt = json!({
             "role": "user",
             "content": format!(
-                "<context-event kind=\"context.watermark\" used_percent=\"{used_percent}\" active_items=\"{item_count}\">\nContext window watermark reached ({used_tokens} / {DEFAULT_CONTEXT_WINDOW_TOKENS} est. tokens, {item_count} active items). At your next coherent milestone, you can either:\n1. Call `context_edit` (`drop: [\"from-to\"]` or `replace: [{{\"range\": \"from-to\", \"with\": \"1-line note\"}}]`) to surgically prune obsolete turns or compress verbose tool outputs without writing a full summary (`Context Language Models`), OR\n2. Call `context_window_open` with a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) to open a fresh window.\n100% of raw turns remain searchable via `memory_recall`.\n</context-event>"
+                "<context-event kind=\"context.watermark\" used_percent=\"{used_percent}\" active_items=\"{item_count}\">\nContext window watermark reached ({used_tokens} / {window_tokens} est. tokens, {item_count} active items). At your next coherent milestone, you can either:\n1. Call `context_edit` (`drop: [\"from-to\"]` or `replace: [{{\"range\": \"from-to\", \"with\": \"1-line note\"}}]`) to surgically prune obsolete turns or compress verbose tool outputs without writing a full summary (`Context Language Models`), OR\n2. Call `context_window_open` with a structured `handoff` (`Goal`, `Verified Facts`, `Decisions`, `Next Action`) to open a fresh window.\n100% of raw turns remain searchable via `memory_recall`.\n</context-event>"
             ),
         });
         append_transcript_message(transcript_path, &evt);
@@ -837,11 +1100,13 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
     let raw_items = read_all_raw_transcript_items(transcript_path);
     let active_indexed = load_transcript_indexed_items(transcript_path);
     let active_items: Vec<Value> = active_indexed.iter().map(|(_, v)| v.clone()).collect();
+    let (window_tokens, _, watermark_percent) =
+        resolve_context_window_for_transcript(transcript_path);
     let used_tokens = estimate_items_tokens(&active_items);
-    let remaining_tokens = DEFAULT_CONTEXT_WINDOW_TOKENS.saturating_sub(used_tokens);
-    let used_percent = (used_tokens * 100) / DEFAULT_CONTEXT_WINDOW_TOKENS.max(1);
+    let remaining_tokens = window_tokens.saturating_sub(used_tokens);
+    let used_percent = (used_tokens * 100) / window_tokens.max(1);
     let remaining_percent = 100usize.saturating_sub(used_percent);
-    let handoff_due = used_percent >= CONTEXT_WATERMARK_PERCENT || active_items.len() >= 120;
+    let handoff_due = used_percent >= watermark_percent;
     let windows_opened = raw_items
         .iter()
         .filter(|item| item.raw.get("type").and_then(Value::as_str) == Some("context_window_open"))
@@ -852,12 +1117,12 @@ pub(super) fn execute_context_budget_read(transcript_path: &Path) -> String {
         .count();
 
     serde_json::to_string_pretty(&json!({
-        "window_tokens": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "window_tokens": window_tokens,
         "used_tokens": used_tokens,
         "remaining_tokens": remaining_tokens,
         "used_context_percent": used_percent,
         "remaining_context_percent": remaining_percent,
-        "handoff_threshold_percent": CONTEXT_WATERMARK_PERCENT,
+        "handoff_threshold_percent": watermark_percent,
         "handoff_due": handoff_due,
         "active_window_items": active_items.len(),
         "total_raw_transcript_items": raw_items.len(),
@@ -1365,21 +1630,26 @@ mod projection_tests {
     fn saved_parallel_call_shape_survives_real_request_builder_without_history_write() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("transcript.jsonl");
-        // Saved post-anchor/edit population: 512 items; the old stride dropped
-        // 400, leaving calls at 400/401 and a non-leading orphan at input[2].
-        let mut raw: Vec<Value> = (0..399)
+        // Saved post-anchor/edit population: 5 * WINDOW_STRIDE_ITEMS + 32 items;
+        // the old stride dropped 4 * WINDOW_STRIDE_ITEMS, leaving calls across the cut.
+        let cut_point = 4 * WINDOW_STRIDE_ITEMS;
+        let total_len = 5 * WINDOW_STRIDE_ITEMS + 32;
+        let mut raw: Vec<Value> = (0..(cut_point - 1))
             .map(|i| json!({"role": "user", "content": format!("message {i}")}))
             .collect();
         raw.extend([call(0), call(1), call(2), output(0), output(1), output(2)]);
-        raw.extend((405..512).map(|i| json!({"role": "user", "content": format!("message {i}")})));
-        assert_eq!(raw.len(), 512);
-        assert!(validate_responses_input(&raw[400..]).is_err());
+        raw.extend(
+            ((cut_point + 5)..total_len)
+                .map(|i| json!({"role": "user", "content": format!("message {i}")})),
+        );
+        assert_eq!(raw.len(), total_len);
+        assert!(validate_responses_input(&raw[cut_point..]).is_err());
         for item in raw {
             append_transcript_message(&path, &item);
         }
         let before = std::fs::read(&path).unwrap();
         let projected = load_transcript_input_items(&path);
-        assert_eq!(projected.len(), 113);
+        assert_eq!(projected.len(), WINDOW_STRIDE_ITEMS + 33);
         assert_eq!(projected[0], call(0));
         let request = crate::build_native_responses_request(
             "unchanged-model",

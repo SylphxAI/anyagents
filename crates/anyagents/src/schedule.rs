@@ -466,12 +466,33 @@ pub fn create_agent_schedule(
             watch_baseline: None,
         }
     } else if let Some(watch_str) = watch_opt {
-        let parsed = parse_watch_spec(watch_str)?;
+        let mut parsed = parse_watch_spec(watch_str)?;
+        let mut resolved_spec = watch_str.to_string();
+        if let WatchTarget::PathChanged { path } = &mut parsed {
+            let p = std::path::PathBuf::from(&*path);
+            let abs = if p.is_absolute() {
+                p
+            } else {
+                agent
+                    .workdir
+                    .as_ref()
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| anyagents_core::agent_work_dir(store.data_dir(), &agent.id))
+                    .join(p)
+            };
+            *path = abs.to_string_lossy().into_owned();
+            resolved_spec = format!("file:{path}");
+        }
         let baseline = initial_watch_baseline(store, health, &parsed, agent.id.as_str(), now);
+        if let Some(ref b) = baseline
+            && b.starts_with("probe_error:")
+        {
+            return Err(b.clone());
+        }
         NewSchedule {
             agent_id: agent.id.clone(),
             kind: "watch".to_string(),
-            spec: watch_str.to_string(),
+            spec: resolved_spec,
             prompt: clean_prompt.to_string(),
             interval_ms: None,
             next_fire_at_ms: None,
@@ -514,7 +535,7 @@ fn initial_watch_baseline(
     store: &Store,
     health: &HealthBoard,
     target: &WatchTarget,
-    agent_id: &str,
+    _agent_id: &str,
     now: i64,
 ) -> Option<String> {
     match target {
@@ -530,22 +551,7 @@ fn initial_watch_baseline(
                 None
             }
         }
-        WatchTarget::GitHubPr {
-            owner,
-            repo,
-            number,
-        } => {
-            if std::env::var_os("ANYAGENTS_GITHUB_API_BASE").is_none()
-                && let Some((_, state_desc)) =
-                    probe_github_pr_terminal(owner, repo, *number, agent_id, now)
-                && state_desc != "merged"
-                && state_desc != "closed"
-            {
-                Some(state_desc)
-            } else {
-                Some("pending".to_string())
-            }
-        }
+        WatchTarget::GitHubPr { .. } => Some("pending".to_string()),
         WatchTarget::GitHubCheck { .. } => Some("pending".to_string()),
         WatchTarget::ProcessExit { pid } => Some(
             if probe_process_alive(*pid) {
@@ -746,13 +752,19 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
                 }
             }
             "watch" => {
+                let eval = evaluate_watch(store, health, &sched, now);
                 if block.is_some() {
-                    // Defer evaluating one-shot event watches while the owning agent is busy,
-                    // paused, or quota-blocked so external APIs are not polled needlessly and
-                    // terminal events are delivered as soon as the agent becomes idle.
+                    // Record latest observation while the owning agent is busy/paused without
+                    // consuming a terminal transition or mutating the baseline.
+                    if eval.observed.is_some() {
+                        let _ = store.update_schedule_watch_observation(
+                            &sched.id,
+                            sched.watch_baseline.as_deref(),
+                            eval.observed.as_deref(),
+                        );
+                    }
                     continue;
                 }
-                let eval = evaluate_watch(store, health, &sched, now);
                 if !eval.triggered {
                     if eval.baseline.is_some() || eval.observed.is_some() {
                         let _ = store.update_schedule_watch_observation(
@@ -818,6 +830,15 @@ fn deliver_scheduled_wake_with_prompt(
     source_key: &str,
     now: i64,
 ) {
+    // A timer/watch may have been selected before an archive completed. Keep
+    // its fresh lifecycle check and delivery serialized with archive/wake.
+    let Ok(_lifecycle) = store.lock_agent_lifecycle(&agent.id) else {
+        return;
+    };
+    let Ok(agent) = store.agent(&agent.id) else {
+        return;
+    };
+    let agent = &agent;
     if agent.state == "paused"
         || agent.state == "archived"
         || crate::server::is_explicitly_archived(store.data_dir(), agent)
@@ -931,6 +952,9 @@ fn evaluate_watch(
             else {
                 return WatchEval::pending(sched.watch_baseline.clone(), None);
             };
+            if state_desc.starts_with("probe_error:") {
+                return WatchEval::pending(sched.watch_baseline.clone(), Some(state_desc));
+            }
             let prev = sched.watch_baseline.as_deref().unwrap_or("pending");
             if state_desc == "merged" || state_desc == "closed" {
                 return WatchEval {
@@ -948,6 +972,15 @@ fn evaluate_watch(
                     transition: Some("evicted".to_string()),
                     observed: Some(format!("evicted:{state_desc}")),
                     baseline: Some(state_desc),
+                };
+            }
+            if state_desc == "review_failed" && prev != "review_failed" {
+                return WatchEval {
+                    triggered: true,
+                    next_state: "active",
+                    transition: Some("review_failed".to_string()),
+                    observed: Some("review_failed".to_string()),
+                    baseline: Some("review_failed".to_string()),
                 };
             }
             if state_desc == "checks_completed" && prev != "checks_completed" {
@@ -990,6 +1023,9 @@ fn evaluate_watch(
         }
         WatchTarget::PathChanged { path } => {
             let current = probe_path_fingerprint(&path);
+            if current.starts_with("probe_error:") {
+                return WatchEval::pending(sched.watch_baseline.clone(), Some(current));
+            }
             match &sched.watch_baseline {
                 Some(base) => {
                     if &current != base {
@@ -1049,7 +1085,8 @@ fn probe_path_fingerprint(path: &str) -> String {
                 .unwrap_or(0);
             format!("exists:{mtime_ms}:{}", meta.len())
         }
-        Err(_) => "missing".to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => "missing".to_string(),
+        Err(e) => format!("probe_error:stat:{:?}", e.kind()),
     }
 }
 
@@ -1184,7 +1221,7 @@ fn probe_github_pr_terminal(
             "--repo",
             &format!("{owner}/{repo}"),
             "--json",
-            "state,mergedAt,statusCheckRollup,mergeQueueEntry",
+            "state,mergedAt,headRefOid,reviewDecision,statusCheckRollup",
         ])
         .output()
         .ok()?;
@@ -1193,7 +1230,10 @@ fn probe_github_pr_terminal(
             .ok()
             .and_then(|val| evaluate_pr_json(&val))
     } else {
-        None
+        Some((
+            false,
+            format!("probe_error:gh_exit:{}", out.status.code().unwrap_or(-1)),
+        ))
     };
     if let Ok(mut guard) = GH_PROBE_CACHE.lock() {
         guard.insert(cache_key, (now_ms, res.clone()));
@@ -1213,6 +1253,9 @@ fn evaluate_pr_json(val: &serde_json::Value) -> Option<(bool, String)> {
         .unwrap_or(false)
         || val
             .get("mergedAt")
+            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+        || val
+            .get("merged_at")
             .is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
     if merged || state == "MERGED" {
         return Some((true, "merged".to_string()));
@@ -1235,6 +1278,26 @@ fn evaluate_pr_json(val: &serde_json::Value) -> Option<(bool, String)> {
         .and_then(serde_json::Value::as_array)
         && !rollup.is_empty()
     {
+        let review_failed = rollup.iter().any(|item| {
+            let name = item
+                .get("name")
+                .or_else(|| item.get("context"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            let conc = item
+                .get("conclusion")
+                .or_else(|| item.get("state"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            name.to_ascii_lowercase().contains("review")
+                && matches!(
+                    conc.to_ascii_uppercase().as_str(),
+                    "FAILURE" | "ERROR" | "TIMED_OUT" | "ACTION_REQUIRED"
+                )
+        });
+        if review_failed {
+            return Some((false, "review_failed".to_string()));
+        }
         let all_done = rollup.iter().all(check_item_is_terminal);
         if all_done {
             return Some((true, "checks_completed".to_string()));
@@ -1828,6 +1891,52 @@ mod tests {
         let _ = server.join();
         unsafe {
             std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+        }
+    }
+    #[test]
+    fn selected_timer_and_watch_cannot_overwrite_a_fresh_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        for kind in ["timer", "watch"] {
+            let agent = store
+                .create_agent(NewAgent::new(format!("owner-{kind}"), "opencode"))
+                .unwrap();
+            store.set_agent_state(&agent.id, "running").unwrap();
+            let stale_agent = store.agent(&agent.id).unwrap();
+            let watch = format!("file:{}", dir.path().join("ready").display());
+            create_agent_schedule(
+                &store,
+                &health,
+                &stale_agent,
+                None,
+                if kind == "timer" { Some("1m") } else { None },
+                if kind == "watch" {
+                    Some(watch.as_str())
+                } else {
+                    None
+                },
+                "follow-up",
+            )
+            .unwrap();
+            store.set_agent_state(&agent.id, "archived").unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+            std::fs::create_dir_all(&cfg).unwrap();
+            std::fs::write(cfg.join(".anyagents-archived"), "archived").unwrap();
+            let schedule = store
+                .list_schedules(Some(&agent.id), true)
+                .unwrap()
+                .remove(0);
+            deliver_scheduled_wake(
+                &store,
+                &stale_agent,
+                &schedule,
+                kind,
+                anyagents_core::now_ms(),
+            );
+            assert_eq!(store.agent(&agent.id).unwrap().state, "archived");
+            assert!(cfg.join(".anyagents-archived").exists());
+            assert!(store.inbox(&agent.id, None).unwrap().is_empty());
         }
     }
 }

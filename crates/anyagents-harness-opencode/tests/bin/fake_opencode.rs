@@ -27,13 +27,17 @@ use std::time::Duration;
 fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("serve") => serve(),
+        Some("serve") => serve(&args[1..]),
         Some("api") => {
-            // `--server <url>` names the service; the scripted one ignores it,
-            // but it must accept it as the real CLI does.
+            // A missing explicit endpoint would discover a managed service.
+            // Refuse that in the fixture instead of masking isolation bugs.
             let mut rest: Vec<String> = args[1..].to_vec();
             if let Some(at) = rest.iter().position(|arg| arg == "--server") {
+                let endpoint = rest.get(at + 1).expect("server URL");
+                log(&format!("server:{endpoint}"));
                 rest.drain(at..(at + 2).min(rest.len()));
+            } else {
+                panic!("refusing managed service discovery");
             }
             api(&rest)
         }
@@ -43,8 +47,62 @@ fn main() {
 
 /// Hold the foreground like a service, forever, announcing the address and
 /// password exactly as the real CLI prints them. The adapter kills it.
-fn serve() {
-    let port = env::var("ANYAGENTS_FAKE_PORT").unwrap_or_else(|_| "0".into());
+fn serve(args: &[String]) {
+    log(&format!("serve:{}", args.join(" ")));
+    log(&format!(
+        "config-root:{}",
+        env::var("OPENCODE_CONFIG_DIR").unwrap_or_default()
+    ));
+    if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("no-announcement") {
+        return;
+    }
+    let port = args
+        .windows(2)
+        .find(|pair| pair[0] == "--port")
+        .expect("explicit port")[1]
+        .parse::<u16>()
+        .expect("port");
+    assert_ne!(port, 0, "a stable port, not an ephemeral request");
+    assert!(env::var_os("OPENCODE_PASSWORD").is_none());
+    assert!(env::var_os("OPENCODE_SERVER_PASSWORD").is_none());
+    let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_default();
+    if matches!(mode.as_str(), "bind-race" | "transient-bind-race") {
+        let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
+        let announced = state.join("first-serve-port");
+        if !announced.exists() {
+            std::fs::write(&announced, port.to_string()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !state.join("collision-bound").exists() {
+                assert!(std::time::Instant::now() < deadline, "collision barrier");
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+    }
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
+        .unwrap_or_else(|error| {
+            log(&format!("bind failed:{port}:{error}"));
+            eprintln!("{error}");
+            if mode == "transient-bind-race" {
+                let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
+                std::fs::write(state.join("collision-reported"), "reported").unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !state.join("collision-released").exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "release collision barrier"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            exit(1);
+        });
+    std::thread::spawn(move || {
+        for connection in listener.incoming() {
+            if connection.is_err() {
+                break;
+            }
+        }
+    });
     println!("server listening on http://127.0.0.1:{port}");
     println!("server password scripted-password");
     let _ = std::io::stdout().flush();

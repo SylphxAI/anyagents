@@ -464,6 +464,7 @@ pub fn describe_cmd(
         if rec.instructions.is_none() {
             rec = store.set_agent_instructions(&rec.id, Some(text))?;
         }
+        crate::telegram::sync_agent_telegram_bot_name(&store, data, &rec);
     }
     if rec.parent_id.is_none() {
         crate::create::sync_all_agent_instructions(&store, data);
@@ -590,6 +591,8 @@ pub fn delete_cmd(data: &Path, name: &str) -> Result<(), Error> {
     }
     let store = open(data)?;
     let found = store.agent_by_name(name)?;
+    let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
+    let found = store.agent(&found.id)?;
     let deleted = store.delete_agent(&found.id)?;
     let agent_dir = data.join("agents").join(deleted.id.as_str());
     let _ = std::fs::remove_dir_all(&agent_dir);
@@ -634,16 +637,18 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         .map_err(Error::Message)?;
         let view =
             answered.ok_or_else(|| Error::Message("the server answered nothing".to_string()))?;
-        if state == "archived"
-            && view.parent.is_some()
-            && let Ok(id) = AgentId::parse(&view.id)
-        {
-            server::reap_subagent_ephemeral_dirs(data, &id);
-        }
         return Ok(view);
     }
     let store = open(data)?;
     let found = store.agent_by_name(name)?;
+    let _lifecycle = store.lock_agent_lifecycle(&found.id)?;
+    let found = store.agent(&found.id)?;
+    if state == "archived" && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+        return Err(Error::Message(
+            "a standing domain mind (with a role) cannot be archived; clear its role first or use pause/harness instead"
+                .to_string(),
+        ));
+    }
     if state == "running" {
         let cfg = anyagents_core::agent_config_dir(data, &found.id);
         let work_dir = found
@@ -651,6 +656,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &found.id));
+        std::fs::create_dir_all(&work_dir)?;
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
         {
@@ -670,9 +676,15 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
     } else if state == "archived" {
-        server::mark_explicitly_archived(&store, data, &agent);
-        if found.parent_id.is_some() {
-            server::reap_subagent_ephemeral_dirs(data, &found.id);
+        let archived = server::mark_explicitly_archived_locked(&store, data, &agent);
+        // The offline path has no daemon maintenance worker. Keep the parent's
+        // lifecycle lock, taking descendant locks only downward as above.
+        for id in archived {
+            if id == agent.id {
+                server::reap_archived_agent_locked(&store, data, &id);
+            } else if let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&id) {
+                server::reap_archived_agent_locked(&store, data, &id);
+            }
         }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
@@ -680,12 +692,16 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
+    let scope_val = agent.scope().to_string();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
         role: agent.role,
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: scope_val,
+        relationship: None,
+        can_message: None,
         harness: agent.harness,
         model: agent.model,
         live_harness: None,
@@ -732,7 +748,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
             Err(err) => return Err(err),
         }
     }
-    let parsed: crate::api::CreateAgentRequest =
+    let mut parsed: crate::api::CreateAgentRequest =
         serde_json::from_value(body).map_err(|err| err.to_string())?;
     let store = open_with_key(data).map_err(|err| err.to_string())?;
     let parent_agent = match parsed.parent.as_deref() {
@@ -744,6 +760,7 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         ),
         None => None,
     };
+    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed);
     let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,
@@ -752,7 +769,10 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         parsed.model,
         parsed.profile,
     );
-    let agent = crate::create::create(
+    let explicit_description = parsed.description.clone();
+    let explicit_scope = parsed.scope.clone();
+    let explicit_public = parsed.public;
+    let mut agent = crate::create::create(
         &store,
         data,
         crate::create::CreateRequest {
@@ -771,6 +791,23 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         },
     )
     .map_err(|err| err.to_string())?;
+    if let Some(ref desc) = explicit_description {
+        let trimmed = desc.trim();
+        if !trimmed.is_empty() {
+            agent = store
+                .set_agent_description(&agent.id, Some(trimmed))
+                .map_err(|err| err.to_string())?;
+        }
+    }
+    if let Some(ref scope_val) = explicit_scope {
+        agent = store
+            .set_agent_scope_as(&agent.id, scope_val, "operator")
+            .map_err(|err| err.to_string())?;
+    } else if let Some(pub_val) = explicit_public {
+        agent = store
+            .set_agent_public_as(&agent.id, pub_val, "operator")
+            .map_err(|err| err.to_string())?;
+    }
     // A create is a new instance: its capability is minted so its harness
     // starts with one.
     crate::operator::mint(&store, &agent.id).map_err(|err| err.to_string())?;
@@ -789,12 +826,16 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
+    let scope_val = agent.scope().to_string();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
         role: agent.role,
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: scope_val,
+        relationship: None,
+        can_message: None,
         harness: agent.harness,
         model: agent.model,
         live_harness: None,
@@ -1276,12 +1317,16 @@ fn list_filtered(
         let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
         if pretty {
             let public_desc = agent.public_description();
+            let scope_val = agent.scope().to_string();
             fallback_views.push(AgentView {
                 id: agent.id.to_string(),
                 name: agent.name,
                 role: agent.role,
                 aliases,
                 parent: agent.parent_id.as_ref().map(ToString::to_string),
+                scope: scope_val,
+                relationship: None,
+                can_message: None,
                 harness: agent.harness,
                 model: agent.model,
                 live_harness: None,
@@ -1450,6 +1495,7 @@ pub fn join_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), Er
             action: "join".to_string(),
             group: group.to_string(),
             agent: Some(agent_id.to_string()),
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let _ = client::call::<GroupView>(
@@ -1471,6 +1517,7 @@ pub fn leave_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), E
             action: "leave".to_string(),
             group: group.to_string(),
             agent: Some(agent_id.to_string()),
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let _ = client::call::<GroupView>(
@@ -1493,6 +1540,7 @@ pub fn group_members(data: &Path, group: &str) -> Result<Vec<String>, Error> {
             action: "members".to_string(),
             group: group.to_string(),
             agent: None,
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let resp = client::call::<GroupView>(
@@ -1591,7 +1639,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 sender: message.sender.clone(),
                 reply_to: message.reply_to.clone(),
                 source_time_ms: message.source_time_ms,
-                context: anyagents_harness::Context::default(),
+                context: message.context.clone(),
             };
             match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
                 Ok(_) => {

@@ -65,9 +65,6 @@ pub fn run_with(
 
 #[derive(Clone)]
 pub(crate) struct AppState {
-    /// This deployment's idempotency namespace for one agent's sends. It never
-    /// leaves the process, so a key names one call of this server.
-    pub(crate) send_namespace: String,
     pub(crate) store: Arc<Store>,
     pub(crate) health: HealthBoard,
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
@@ -189,7 +186,6 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         crate::sandbox::share_socket_with_seats(&data.join("wake.sock"));
     }
     let state = AppState {
-        send_namespace: capability_key()?[..16].to_string(),
         store: Arc::clone(&store),
         health: supervisor.board(),
         sign_in,
@@ -202,12 +198,17 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() && !crate::sandbox::is_isolated_test_env()
     {
         let reaper_root = data.to_path_buf();
+        let reaper_store = Arc::clone(&store);
+        let reaper_health = state.health.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
             loop {
                 interval.tick().await;
                 let root = reaper_root.clone();
+                let store = Arc::clone(&reaper_store);
+                let health = reaper_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    reap_archived_agents(&store, &root, &health);
                     crate::browser::reap_idle_browsers(&root);
                     crate::create::sync_fresher_bound_agent_credentials(&root);
                     #[cfg(unix)]
@@ -481,6 +482,34 @@ fn spawn_admin_sylphx_delivery(
                 Ok(mut harness) => {
                     let mut had_err = false;
                     let mut completed_any = false;
+                    let mut recorded_usage = anyagents_harness::TurnUsage::default();
+                    let flush_harness_usage =
+                        |harness: &crate::vendor::VendorHarness,
+                         recorded: &mut anyagents_harness::TurnUsage| {
+                            let served = anyagents_harness::Harness::last_usage(harness);
+                            let diff = served.difference(recorded.clone());
+                            if diff.input_tokens > 0 || diff.output_tokens > 0 {
+                                let _ = store.record_usage(anyagents_core::NewUsage {
+                                    agent_id: agent.id.clone(),
+                                    harness: agent.harness.clone(),
+                                    model: agent.model.clone(),
+                                    input_tokens: i64::try_from(diff.input_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    output_tokens: i64::try_from(diff.output_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    cache_read_tokens: i64::try_from(diff.cache_read_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    cache_write_tokens: i64::try_from(diff.cache_write_tokens)
+                                        .unwrap_or(i64::MAX),
+                                    reported_cost_micros: diff.reported_cost_micros,
+                                    estimated_cost_micros: None,
+                                    billing_mode: anyagents_core::BillingMode::Subscription,
+                                    quota_state: None,
+                                    day: anyagents_core::utc_day(now_ms()),
+                                });
+                                *recorded = served;
+                            }
+                        };
                     while store.has_actionable_undelivered(&agent.id).unwrap_or(false) {
                         let Ok(Some(message)) = store.next_undelivered(&agent.id) else {
                             break;
@@ -525,6 +554,7 @@ fn spawn_admin_sylphx_delivery(
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
+                                flush_harness_usage(&harness, &mut recorded_usage);
                                 let turn_err = anyagents_harness::Harness::health(&harness)
                                     .sign_in_fault
                                     .or_else(|| {
@@ -554,6 +584,7 @@ fn spawn_admin_sylphx_delivery(
                                 crate::vendor::persist_last_error(&cfg, None, None);
                             }
                             Ok(_) => {
+                                flush_harness_usage(&harness, &mut recorded_usage);
                                 let _ = store.note_turn_completed(&agent.id);
                                 break;
                             }
@@ -595,7 +626,7 @@ fn spawn_admin_sylphx_delivery(
                                                 sender: steered.sender.clone(),
                                                 reply_to: steered.reply_to.clone(),
                                                 source_time_ms: steered.source_time_ms,
-                                                context: anyagents_harness::Context::default(),
+                                                context: steered.context.clone(),
                                             };
                                             if anyagents_harness::Harness::deliver(
                                                 &mut harness,
@@ -610,6 +641,7 @@ fn spawn_admin_sylphx_delivery(
                                         std::thread::sleep(std::time::Duration::from_millis(100));
                                     }
                                 }
+                                flush_harness_usage(&harness, &mut recorded_usage);
                                 let turn_err = anyagents_harness::Harness::health(&harness)
                                     .sign_in_fault
                                     .or_else(|| {
@@ -638,7 +670,9 @@ fn spawn_admin_sylphx_delivery(
                                     crate::vendor::persist_last_error(&cfg, None, None);
                                 }
                             }
-                            Ok(_) => {}
+                            Ok(_) => {
+                                flush_harness_usage(&harness, &mut recorded_usage);
+                            }
                             Err(err) => {
                                 had_err = true;
                                 let err_msg = err.to_string();
@@ -655,8 +689,13 @@ fn spawn_admin_sylphx_delivery(
                             }
                         }
                     }
-                    if completed_any && !had_err && agent.parent_id.is_some() {
-                        let _ = store.complete_idle_subagent(&agent.id);
+                    flush_harness_usage(&harness, &mut recorded_usage);
+                    if completed_any
+                        && !had_err
+                        && agent.parent_id.is_some()
+                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                    {
+                        reap_idle_subagent_caches(&data, &agent.id);
                     }
                 }
                 Err(reason) => {
@@ -870,19 +909,15 @@ pub(crate) fn is_explicitly_archived(data_dir: &Path, agent: &Agent) -> bool {
     agent.state == "archived" || has_explicit_archive_marker(data_dir, &agent.id)
 }
 
-pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
-    let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
-    let _ = std::fs::create_dir_all(&cfg);
-    let _ = std::fs::write(cfg.join(".anyagents-archived"), format!("{}\n", now_ms()));
-    if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
-        for sched in schedules {
-            let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
-        }
-    }
-    crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
-    if agent.parent_id.is_some() {
-        reap_subagent_ephemeral_dirs(data_dir, &agent.id);
-    }
+/// The caller holds this agent's lifecycle lock; descendant locks follow only
+/// downward, so a cascading archive cannot deadlock a direct child wake.
+pub(crate) fn mark_explicitly_archived_locked(
+    store: &Store,
+    data_dir: &Path,
+    agent: &Agent,
+) -> Vec<anyagents_core::AgentId> {
+    let mut archived = vec![agent.id.clone()];
+    mark_archive_generation_locked(store, data_dir, agent);
     if let Ok(all_agents) = store.list_agents() {
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(agent.id.clone());
@@ -895,24 +930,111 @@ pub(crate) fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &A
             {
                 if seen.insert(child.id.clone()) {
                     queue.push_back(child.id.clone());
-                    if child.state != "archived" {
-                        let _ = store.set_agent_state(&child.id, "archived");
-                    }
-                    let c_cfg = anyagents_core::agent_config_dir(data_dir, &child.id);
-                    let _ = std::fs::create_dir_all(&c_cfg);
-                    let _ = std::fs::write(
-                        c_cfg.join(".anyagents-archived"),
-                        format!("{}\n", now_ms()),
-                    );
-                    reap_subagent_ephemeral_dirs(data_dir, &child.id);
+                    let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&child.id) else {
+                        continue;
+                    };
+                    let Ok(child) = store.set_agent_state(&child.id, "archived") else {
+                        continue;
+                    };
+                    mark_archive_generation_locked(store, data_dir, &child);
+                    archived.push(child.id.clone());
                 }
             }
         }
+    }
+    archived
+}
+
+/// Reconciliation marks only this row: no descendant locks or filesystem reap
+/// may run while the global mail-reconciliation mutex is held.
+fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent) {
+    let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
+    let _ = std::fs::create_dir_all(&cfg);
+    let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
+    let _ = std::fs::write(
+        cfg.join(".anyagents-archived"),
+        format!("{}:{}\n", now_ms(), anyagents_core::AgentId::generate()),
+    );
+    if let Ok(schedules) = store.list_schedules(Some(&agent.id), true) {
+        for sched in schedules {
+            let _ = store.cancel_schedule(Some(&agent.id), &sched.id);
+        }
+    }
+    crate::telegram::detach_archived_agent_from_telegram_groups(store, data_dir, agent, true);
+}
+
+/// The caller holds the lifecycle lock. The marker identifies this archive,
+/// not directory existence: retained dirty worktrees are not pending cleanup.
+pub(crate) fn reap_archived_agent_locked(
+    store: &Store,
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) {
+    let Ok(agent) = store.agent(agent_id) else {
+        return;
+    };
+    if agent.state != "archived" || agent.parent_id.is_none() {
+        return;
+    }
+    let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
+    let archived = cfg.join(".anyagents-archived");
+    if std::fs::read(&archived).is_ok_and(|generation| generation.is_empty())
+        || std::fs::symlink_metadata(&archived)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    {
+        // Upgrade legacy or interrupted empty archive markers under the wake lock.
+        mark_archive_generation_locked(store, data_dir, &agent);
+    }
+    let Ok(generation) = std::fs::read(&archived) else {
+        return;
+    };
+    if generation.is_empty() {
+        return;
+    }
+    let reaped = cfg.join(".anyagents-reaped");
+    if std::fs::read(&reaped).is_ok_and(|done| done == generation) {
+        return;
+    }
+    if reap_subagent_ephemeral_dirs(data_dir, agent_id) {
+        let _ = std::fs::write(reaped, generation);
+    }
+}
+
+/// Existing independent maintenance workers run this at startup and each minute.
+/// Never take the global reconciliation mutex, and never wait for an agent lock.
+fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
+    let Ok(agents) = store.list_agents() else {
+        return;
+    };
+    for agent in agents {
+        if agent.parent_id.is_none() {
+            continue;
+        }
+        if agent.state == "idle" {
+            if !health.get(&agent.id).is_some_and(|live| live.process_alive) {
+                reap_idle_subagent_caches(data_dir, &agent.id);
+            }
+            continue;
+        }
+        if agent.state != "archived" {
+            continue;
+        }
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agent.id) else {
+            continue;
+        };
+        // A wake followed by a new self-archive may have started a process since
+        // the population read. Check current health only after taking the lock.
+        if health.get(&agent.id).is_some_and(|live| live.process_alive) {
+            continue;
+        }
+        // Re-read under the lock: this population may predate a direct wake.
+        reap_archived_agent_locked(store, data_dir, &agent.id);
     }
 }
 
 pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
     let cfg = anyagents_core::agent_config_dir(data_dir, agent_id);
+    let _ = std::fs::remove_file(cfg.join(".anyagents-reaped"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
 }
 
@@ -926,6 +1048,17 @@ fn reconcile_stopped_and_backed_off_agents(
     let Ok(agents) = store.list_agents() else {
         return;
     };
+    reconcile_agent_snapshot(store, health, data, reconcile, now_ms, agents);
+}
+
+fn reconcile_agent_snapshot(
+    store: &Store,
+    health: &HealthBoard,
+    data: &Path,
+    reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
+    now_ms: i64,
+    agents: Vec<Agent>,
+) {
     let mut guard = match reconcile.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -950,37 +1083,43 @@ fn reconcile_stopped_and_backed_off_agents(
     });
 
     for idx in ordered_indices {
-        let agent = &agents[idx];
+        let Ok(current) = store.agent(&agents[idx].id) else {
+            continue;
+        };
+        // Match cascade ordering: parent before child. This keeps the parent's
+        // archive/wake decision stable while applying it to this child.
+        let _parent_lifecycle = if let Some(ref parent_id) = current.parent_id {
+            let Ok(lock) = store.try_lock_agent_lifecycle(parent_id) else {
+                continue;
+            };
+            Some(lock)
+        } else {
+            None
+        };
+        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agents[idx].id) else {
+            continue;
+        };
+        // A send/wake may have changed this row since the population scan.
+        let Ok(agent) = store.agent(&agents[idx].id) else {
+            continue;
+        };
+        let agent = &agent;
         if agent.state == "archived" && !health.get(&agent.id).is_some_and(|l| l.process_alive) {
-            if agent.parent_id.is_some() {
-                let agent_dir = data.join("agents").join(agent.id.as_str());
-                if agent_dir.join("work").join(".git").exists()
-                    || agent_dir.join("config").join("shell-snapshots").exists()
-                    || agent_dir.join("config").join(".claude").exists()
-                    || agent_dir.join("config").join(".gemini").exists()
-                {
-                    reap_subagent_ephemeral_dirs(data, &agent.id);
-                }
-            }
             continue;
         }
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
         let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
-            agents
-                .iter()
-                .find(|p| &p.id == pid)
-                .is_some_and(|p| is_explicitly_archived(data, p))
+            store
+                .agent(pid)
+                .is_ok_and(|parent| is_explicitly_archived(data, &parent))
         });
         if parent_archived && agent.state != "archived" {
             let _ = store.set_agent_state(&agent.id, "archived");
-            mark_explicitly_archived(store, data, agent);
+            mark_archive_generation_locked(store, data, agent);
         }
         if is_explicitly_archived(data, agent) || parent_archived {
             if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
                 let _ = store.set_agent_state(&agent.id, "archived");
-                if agent.parent_id.is_some() {
-                    reap_subagent_ephemeral_dirs(data, &agent.id);
-                }
             }
             if agent.harness == "sylphx"
                 && !guard.flushing_sylphx.contains(agent.id.as_str())
@@ -1068,6 +1207,12 @@ fn reconcile_stopped_and_backed_off_agents(
                     }
                 }
             } else {
+                if agent.state == "idle"
+                    && agent.parent_id.is_some()
+                    && !health.get(&agent.id).is_some_and(|l| l.process_alive)
+                {
+                    reap_idle_subagent_caches(data, &agent.id);
+                }
                 guard.watermark_seq.insert(agent.id.to_string(), delivered);
             }
         } else if agent.state == "running" {
@@ -1083,6 +1228,7 @@ fn reconcile_stopped_and_backed_off_agents(
                         && agent.parent_id.is_some()
                         && store.complete_idle_subagent(&agent.id).unwrap_or(false)
                     {
+                        reap_idle_subagent_caches(data, &agent.id);
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
                             &agent.id,
@@ -1271,7 +1417,6 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let res = runtime.block_on(async move {
         let auth = deployment_mode(data);
-        let send_namespace = capability_key()?[..16].to_string();
         let path = data.join("admin.sock");
         if path.as_os_str().len() > MAX_SOCKET_PATH {
             return Err(Error::Message(format!(
@@ -1337,12 +1482,17 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             && !crate::sandbox::is_isolated_test_env()
         {
             let reaper_root = data.to_path_buf();
+            let reaper_store = Arc::clone(&store);
+            let reaper_health = health.clone();
             Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 loop {
                     interval.tick().await;
                     let root = reaper_root.clone();
+                    let store = Arc::clone(&reaper_store);
+                    let health = reaper_health.clone();
                     let _ = tokio::task::spawn_blocking(move || {
+                        reap_archived_agents(&store, &root, &health);
                         crate::browser::reap_idle_browsers(&root);
                         crate::create::sync_fresher_bound_agent_credentials(&root);
                         #[cfg(unix)]
@@ -1355,7 +1505,6 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             None
         };
         let state = AppState {
-            send_namespace,
             store: Arc::clone(&store),
             health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
@@ -1758,6 +1907,10 @@ async fn harness_route(
             body.profile.as_deref(),
         )
         .map_err(ApiError::from_store)?;
+        if let Some(mut live) = state.health.get(&found.id) {
+            live.last_error = None;
+            state.health.publish(&found.id, live);
+        }
         Ok(Json(out))
     })
     .await
@@ -2289,6 +2442,10 @@ async fn model_route(
                 body.profile.as_deref(),
             )
             .map_err(ApiError::from_store)?;
+            if let Some(mut live) = state.health.get(&agent.id) {
+                live.last_error = None;
+                state.health.publish(&agent.id, live);
+            }
             Ok(Json(out))
         })
         .await;
@@ -2551,6 +2708,10 @@ struct DescriptionRequest {
     #[serde(default)]
     role: Option<String>,
     #[serde(default)]
+    scope: Option<String>,
+    #[serde(default, alias = "allow_external")]
+    public: Option<bool>,
+    #[serde(default)]
     clear: Option<bool>,
 }
 
@@ -2578,17 +2739,7 @@ async fn get_description_route(
                 .agent_by_name(&name)
                 .map_err(ApiError::from_store)?
         };
-        let can_read_private = match &principal {
-            Principal::Operator => true,
-            Principal::Agent { agent_id, .. } => {
-                *agent_id == rec.id
-                    || rec.parent_id.as_ref() == Some(agent_id)
-                    || state
-                        .store
-                        .agent(agent_id)
-                        .is_ok_and(|caller| caller.is_admin)
-            }
-        };
+        let can_read_private = can_actor_read_agent_private(&state.store, &principal, &rec);
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         let system_prompt = if can_read_private {
@@ -2600,6 +2751,8 @@ async fn get_description_route(
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
+            "scope": rec.scope(),
+            "public": rec.is_public(),
             "harness": rec.harness,
             "model": rec.model,
             "aliases": aliases,
@@ -2625,6 +2778,8 @@ async fn set_description_route(
             && body.description.is_none()
             && body.instructions.is_none()
             && body.role.is_none()
+            && body.scope.is_none()
+            && body.public.is_none()
             && !body.clear.unwrap_or(false)
         {
             require_admin_or_operator(&state.store, &principal, "agents.sync_instructions", "all")?;
@@ -2653,9 +2808,9 @@ async fn set_description_route(
         };
         let is_self_or_parent = match &principal {
             Principal::Agent { agent_id, .. } => {
-                *agent_id == target.id || target.parent_id.as_ref() == Some(agent_id)
+                is_self_or_ancestor(&state.store, agent_id, &target)
             }
-            Principal::Operator => false,
+            Principal::Operator => true,
         };
         if !is_self_or_parent {
             require_admin_or_operator(
@@ -2665,9 +2820,38 @@ async fn set_description_route(
                 &target.name,
             )?;
         }
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { name, .. } => format!("agent:{name}"),
+        };
         let mut rec = target;
+        let is_ancestor = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                *agent_id != rec.id && is_self_or_ancestor(&state.store, agent_id, &rec)
+            }
+            Principal::Operator => true,
+        };
+        if let Some(ref scope_val) = body.scope {
+            if !is_ancestor {
+                require_admin_or_operator(&state.store, &principal, "agents.scope", &rec.name)?;
+            }
+            rec = state
+                .store
+                .set_agent_scope_as(&rec.id, scope_val, &actor)
+                .map_err(ApiError::from_store)?;
+        } else if let Some(pub_val) = body.public {
+            if !is_ancestor {
+                require_admin_or_operator(&state.store, &principal, "agents.public", &rec.name)?;
+            }
+            rec = state
+                .store
+                .set_agent_public_as(&rec.id, pub_val, &actor)
+                .map_err(ApiError::from_store)?;
+        }
         if let Some(ref role_str) = body.role {
-            require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+            if !is_ancestor {
+                require_admin_or_operator(&state.store, &principal, "agents.role", &rec.name)?;
+            }
             rec = state
                 .store
                 .set_agent_role(&rec.id, Some(role_str.as_str()))
@@ -2705,6 +2889,11 @@ async fn set_description_route(
                         .set_agent_instructions(&rec.id, clean_opt)
                         .map_err(ApiError::from_store)?;
                 }
+                crate::telegram::sync_agent_telegram_bot_name(
+                    &state.store,
+                    state.store.data_dir(),
+                    &rec,
+                );
             }
             if let Some(ref inst) = body.instructions {
                 let trimmed = inst.trim();
@@ -2723,16 +2912,13 @@ async fn set_description_route(
         }
         let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &rec.id);
         create::sync_agent_description_files(&state.store, &rec, &cfg);
-        if rec.parent_id.is_none()
-            && (body.description.is_some() || body.role.is_some() || body.clear.unwrap_or(false))
-        {
-            create::sync_all_agent_instructions(&state.store, state.store.data_dir());
-        }
         let aliases = state.store.agent_aliases(&rec.id).unwrap_or_default();
         Ok(Json(serde_json::json!({
             "id": rec.id.as_str(),
             "name": rec.name,
             "role": rec.role,
+            "scope": rec.scope(),
+            "public": rec.is_public(),
             "aliases": aliases,
             "description": rec.public_description(),
             "instructions": rec.instructions,
@@ -2764,16 +2950,89 @@ async fn channels_route(
     State(state): State<AppState>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     require_admin_or_operator(&state.store, &principal, "channels.list", "channels")?;
-    let channels: Vec<_> = state.store.list_channels().map_err(ApiError::from_store)?.into_iter().map(|c| serde_json::json!({"id": c.id.to_string(), "kind": c.kind, "agents": c.agents.iter().filter_map(|id| state.store.agent(id).ok().map(|a| a.name)).collect::<Vec<_>>()})).collect();
+    let channels: Vec<_> = state
+        .store
+        .list_channels()
+        .map_err(ApiError::from_store)?
+        .into_iter()
+        .map(|c| {
+            let mem = anyagents_channel_telegram::Memory::from_state(&c.state);
+            let bot_username = c
+                .identity
+                .clone()
+                .or_else(|| {
+                    mem.bot
+                        .as_deref()
+                        .and_then(|b| b.split_once(':').map(|(_, u)| u.to_string()))
+                })
+                .map(|u| {
+                    let clean = u.trim().trim_start_matches('@');
+                    format!("@{clean}")
+                });
+            let agents: Vec<String> = c
+                .agents
+                .iter()
+                .filter_map(|id| state.store.agent(id).ok().map(|a| a.name))
+                .collect();
+            serde_json::json!({
+                "id": c.id.to_string(),
+                "kind": c.kind,
+                "bot": bot_username,
+                "agents": agents,
+                "pending_managed_bots": mem.pending_managed_bots,
+            })
+        })
+        .collect();
     Ok(Json(serde_json::json!({"channels": channels})))
 }
 
+fn default_channel_kind() -> String {
+    "telegram".to_string()
+}
+
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ChannelRequest {
+    #[serde(default = "default_channel_kind")]
     kind: String,
     agent: String,
-    token: String,
+    #[serde(default)]
+    token: Option<String>,
+    #[serde(default, alias = "managed_bot_id", alias = "user_id")]
+    bot_id: Option<i64>,
+    #[serde(
+        default,
+        alias = "username",
+        alias = "suggested_username",
+        alias = "bot"
+    )]
+    bot_username: Option<String>,
+    #[serde(default)]
+    manager: Option<String>,
+    #[serde(default)]
+    replace_token: Option<bool>,
+}
+
+fn is_self_or_ancestor(
+    store: &Store,
+    caller_id: &anyagents_core::AgentId,
+    target: &anyagents_core::Agent,
+) -> bool {
+    if caller_id == &target.id {
+        return true;
+    }
+    let mut cursor = target.parent_id.clone();
+    let mut depth = 0usize;
+    while let Some(pid) = cursor {
+        if &pid == caller_id {
+            return true;
+        }
+        cursor = store.agent(&pid).ok().and_then(|a| a.parent_id);
+        depth += 1;
+        if depth > 16 {
+            break;
+        }
+    }
+    false
 }
 
 async fn add_channel_route(
@@ -2781,40 +3040,64 @@ async fn add_channel_route(
     State(state): State<AppState>,
     Json(body): Json<ChannelRequest>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
-    if body.kind != "telegram"
-        || body.token.trim().is_empty()
-        || body
-            .token
+    spawn_store(move || {
+        if body.kind != "telegram" {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "invalid channel kind",
+            ));
+        }
+        if let Some(ref tok) = body.token {
+            let trimmed = tok.trim();
+            if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c == '/') {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "invalid channel kind or token",
+                ));
+            }
+        }
+        let target_clean = body
+            .agent
             .trim()
-            .chars()
-            .any(|c| c.is_whitespace() || c == '/')
-    {
-        return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "invalid channel kind or token",
-        ));
-    }
-    let agent = state
-        .store
-        .agent_by_name(&body.agent)
-        .map_err(ApiError::from_store)?;
-    crate::channel::record(
-        &state.store,
-        state.store.data_dir(),
-        &body.kind,
-        &agent.id,
-        body.token.trim().as_bytes(),
-    )
-    .map_err(|_| {
-        ApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "could not record channel",
+            .strip_prefix("agent:")
+            .unwrap_or(body.agent.trim());
+        let agent = state
+            .store
+            .agent_by_name(target_clean)
+            .map_err(ApiError::from_store)?;
+        let caller_agent = match &principal {
+            Principal::Agent { agent_id, .. } => state.store.agent(agent_id).ok(),
+            Principal::Operator => None,
+        };
+        let authorized_by_lineage = match &principal {
+            Principal::Agent { agent_id, .. } => {
+                is_self_or_ancestor(&state.store, agent_id, &agent)
+            }
+            Principal::Operator => true,
+        };
+        if !authorized_by_lineage {
+            require_admin_or_operator(&state.store, &principal, "channels.add", &body.agent)?;
+        }
+        let result = crate::telegram::request_or_bind_telegram_channel(
+            &state.store,
+            state.store.data_dir(),
+            caller_agent.as_ref(),
+            &agent,
+            body.token.as_deref(),
+            body.bot_id,
+            body.bot_username.as_deref(),
+            body.manager.as_deref(),
+            body.replace_token.unwrap_or(false),
         )
-    })?;
-    Ok(Json(
-        serde_json::json!({"agent": agent.name, "kind": body.kind}),
-    ))
+        .map_err(|err| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("could not bind or request channel: {err}"),
+            )
+        })?;
+        Ok(Json(result))
+    })
+    .await
 }
 
 /// A loopback port the operating system picked, held open until the caller
@@ -3013,11 +3296,9 @@ async fn list_agents(
     principal: Principal,
     State(state): State<AppState>,
 ) -> Result<Json<AgentsResponse>, ApiError> {
-    // Any authenticated principal may see who is on the server. The operator
-    // sees the gateway origin; an agent learns it from its own start.
     let operator = principal.is_operator();
     spawn_store(move || {
-        let mut listed = list_agents_sync(&state)?;
+        let mut listed = list_agents_sync_for_principal(&state, &principal)?;
         if !operator {
             listed.0.gateway = None;
         }
@@ -3026,10 +3307,56 @@ async fn list_agents(
     .await
 }
 
-fn list_agents_sync(state: &AppState) -> Result<Json<AgentsResponse>, ApiError> {
+fn compute_caller_relationship(store: &Store, caller: &Agent, target: &Agent) -> String {
+    if caller.id == target.id {
+        "self".to_string()
+    } else if caller.parent_id.as_ref() == Some(&target.id) {
+        "parent".to_string()
+    } else if target.parent_id.as_ref() == Some(&caller.id) {
+        "child".to_string()
+    } else if caller.parent_id.is_some() && caller.parent_id == target.parent_id {
+        "sibling".to_string()
+    } else if is_self_or_ancestor(store, &target.id, caller) {
+        "ancestor".to_string()
+    } else if is_self_or_ancestor(store, &caller.id, target) {
+        "descendant".to_string()
+    } else if caller.parent_id.is_none() && target.parent_id.is_none() {
+        "peer".to_string()
+    } else {
+        "other".to_string()
+    }
+}
+
+fn list_agents_sync_for_principal(
+    state: &AppState,
+    principal: &Principal,
+) -> Result<Json<AgentsResponse>, ApiError> {
+    let caller_agent = match principal {
+        Principal::Operator => None,
+        Principal::Agent { agent_id, .. } => state.store.agent(agent_id).ok(),
+    };
     let mut agents = Vec::new();
     for agent in state.store.list_agents().map_err(ApiError::from_store)? {
-        agents.push(agent_view(&state.store, &state.health, &agent)?);
+        if let Some(ref caller) = caller_agent
+            && caller.is_isolated()
+            && !is_self_or_ancestor(&state.store, &caller.id, &agent)
+            && caller.parent_id.as_ref() != Some(&agent.id)
+            && !state.store.share_any_group_or_chat(&caller.id, &agent.id)
+        {
+            continue;
+        }
+        let mut view = agent_view(&state.store, &state.health, &agent)?;
+        if let Some(ref caller) = caller_agent {
+            view.relationship = Some(compute_caller_relationship(&state.store, caller, &agent));
+            view.can_message = Some(
+                can_actor_message_agent(&state.store, &Actor::Agent(caller.name.clone()), &agent)
+                    .is_ok(),
+            );
+            if !can_actor_read_agent_private(&state.store, principal, &agent) {
+                view.instructions = None;
+            }
+        }
+        agents.push(view);
     }
     Ok(Json(AgentsResponse {
         agents,
@@ -3102,7 +3429,16 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     ) = match health.get(&agent.id) {
         Some(live) if agent.harness != "sylphx" || live.process_alive => {
             let effective_quota = live.quota_reset_at_ms.or(session_quota);
-            let effective_err = live.last_error.clone().or(session_error);
+            let live_err = if live
+                .live_harness
+                .as_deref()
+                .is_some_and(|h| h != agent.harness)
+            {
+                None
+            } else {
+                live.last_error.clone()
+            };
+            let effective_err = live_err.or(session_error);
             let working = live.process_alive
                 && effective_quota.is_none()
                 && effective_err.is_none()
@@ -3218,6 +3554,9 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
         role: agent.role.clone(),
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: agent.scope().to_string(),
+        relationship: None,
+        can_message: None,
         harness: agent.harness.clone(),
         model: agent.model.clone(),
         live_harness,
@@ -3263,7 +3602,7 @@ fn install_state(store: &Store, agent: &Agent) -> String {
 async fn create_agent_route(
     principal: Principal,
     State(state): State<AppState>,
-    Json(body): Json<CreateAgentRequest>,
+    Json(mut body): Json<CreateAgentRequest>,
 ) -> Result<(StatusCode, Json<AgentView>), ApiError> {
     let caller_agent = match &principal {
         Principal::Operator => None,
@@ -3291,6 +3630,7 @@ async fn create_agent_route(
             }
             (None, None) => None,
         };
+        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body);
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
@@ -3326,6 +3666,38 @@ async fn create_agent_route(
                     .store
                     .set_agent_description(&agent.id, Some(trimmed))
                     .map_err(ApiError::from_store)?;
+            }
+        }
+        let actor = match &principal {
+            Principal::Operator => "operator".to_string(),
+            Principal::Agent { name, .. } => format!("agent:{name}"),
+        };
+        if let Some(ref scope_val) = body.scope {
+            agent = state
+                .store
+                .set_agent_scope_as(&agent.id, scope_val, &actor)
+                .map_err(ApiError::from_store)?;
+        } else if body.public == Some(true) {
+            agent = state
+                .store
+                .set_agent_public_as(&agent.id, true, &actor)
+                .map_err(ApiError::from_store)?;
+        } else if body.public == Some(false) {
+            agent = state
+                .store
+                .set_agent_public_as(&agent.id, false, &actor)
+                .map_err(ApiError::from_store)?;
+        }
+        if let Some(ref grp_raw) = body.group {
+            for g in grp_raw
+                .split(',')
+                .map(|s| s.trim().strip_prefix("group:").unwrap_or(s.trim()))
+                .filter(|s| !s.is_empty())
+            {
+                if let Some((ref caller_id, _)) = caller_agent {
+                    let _ = state.store.join_group(g, caller_id);
+                }
+                let _ = state.store.join_group(g, &agent.id);
             }
         }
         if !anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id)
@@ -3401,6 +3773,12 @@ async fn archive_agent_route(
         };
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
+        if found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "a standing domain mind (with a role) cannot be archived; clear its role first or use pause/harness instead",
+            ));
+        }
         if found.parent_id.is_none() {
             if is_self {
                 return Err(ApiError::new(
@@ -3421,11 +3799,15 @@ async fn archive_agent_route(
         ) {
             require_admin_or_operator(&state.store, &principal, "agents.archive", &found.name)?;
         }
+        let _lifecycle = state
+            .store
+            .lock_agent_lifecycle(&found.id)
+            .map_err(ApiError::from_store)?;
         let agent = state
             .store
             .set_agent_state(&found.id, "archived")
             .map_err(ApiError::from_store)?;
-        mark_explicitly_archived(&state.store, state.store.data_dir(), &agent);
+        mark_explicitly_archived_locked(&state.store, state.store.data_dir(), &agent);
         if !is_self {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while std::time::Instant::now() < deadline {
@@ -3439,15 +3821,63 @@ async fn archive_agent_route(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        if found.parent_id.is_some() {
-            reap_subagent_ephemeral_dirs(state.store.data_dir(), &found.id);
+        if state.health.get(&found.id).is_none_or(|live| !live.process_alive) {
+            reap_archived_agent_locked(&state.store, state.store.data_dir(), &found.id);
         }
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
 }
 
-pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents_core::AgentId) {
+pub(crate) fn reap_idle_subagent_caches(
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
+    const IDLE_EPHEMERAL_CACHE_DIRS: &[&str] = &[
+        "cache-home",
+        "cache",
+        ".cache",
+        ".npm",
+        ".bun",
+        ".cargo",
+        ".rustup",
+        ".tmp",
+        "tmp",
+        "shell-snapshots",
+    ];
+    let agent_root = data_dir.join("agents").join(agent_id.as_str());
+    let config_dir = agent_root.join("config");
+    let any_exists = IDLE_EPHEMERAL_CACHE_DIRS
+        .iter()
+        .any(|rel| std::fs::symlink_metadata(config_dir.join(rel)).is_ok());
+    if !any_exists {
+        return true;
+    }
+    let seat_ids =
+        detect_seat_ids(&config_dir).or_else(|| detect_seat_ids(&agent_root.join("work")));
+    let mut complete = true;
+    for rel in IDLE_EPHEMERAL_CACHE_DIRS {
+        let target = config_dir.join(rel);
+        complete &= remove_path_with_seat(&target, seat_ids);
+    }
+    complete
+}
+
+pub(crate) fn reap_subagent_ephemeral_dirs(
+    data_dir: &Path,
+    agent_id: &anyagents_core::AgentId,
+) -> bool {
+    let Ok(store) = Store::open(data_dir.join("state.db")) else {
+        return false;
+    };
+    let Ok(agents) = store.list_agents() else {
+        return false;
+    };
+    // Delete calls this after removing the row; all surviving references still
+    // protect their workdirs. A failed read must never mean no shared workdirs.
+    let agent = agents.iter().find(|agent| &agent.id == agent_id);
+    let parent_id = agent.and_then(|agent| agent.parent_id.as_ref());
+    let mut complete = true;
     let agent_root = data_dir.join("agents").join(agent_id.as_str());
     let config_dir = agent_root.join("config");
     let seat_ids =
@@ -3474,36 +3904,31 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
         "logs",
     ] {
         let target = config_dir.join(rel);
-        remove_path_with_seat(&target, seat_ids);
+        complete &= remove_path_with_seat(&target, seat_ids);
     }
-    remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
+    complete &= remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
     let _ = std::fs::remove_file(
         data_dir
             .join("locks")
             .join(format!("{}.lock", agent_id.as_str())),
     );
-    create::ensure_seat_environment(&config_dir);
     let mut shared_workdirs = std::collections::HashSet::new();
-    if let Ok(store) = Store::open(data_dir.join("state.db")) {
-        let parent_id = store.agent(agent_id).ok().and_then(|a| a.parent_id);
-        if parent_id.is_some()
-            && let Ok(agent) = store.agent(agent_id)
-        {
+    if let Some(agent) = agent {
+        let _ = crate::browser::stop_profile(data_dir, &agent.name);
+        if parent_id.is_some() && agent.role.as_deref().is_none_or(|r| r.trim().is_empty()) {
             let bp = data_dir.join("browser-profiles").join(&agent.name);
-            remove_path_with_seat(&bp, seat_ids);
+            complete &= remove_path_with_seat(&bp, seat_ids);
         }
-        if let Ok(agents) = store.list_agents() {
-            for other in agents {
-                let keep_protected = &other.id != agent_id
-                    && (other.state != "archived" || parent_id.as_ref() == Some(&other.id));
-                if keep_protected && let Some(wd) = other.workdir {
-                    let wd_path = PathBuf::from(&wd);
-                    if let Ok(abs) = std::path::absolute(&wd_path) {
-                        shared_workdirs.insert(abs);
-                    }
-                    shared_workdirs.insert(wd_path);
-                }
+    }
+    for other in &agents {
+        let keep_protected =
+            &other.id != agent_id && (other.state != "archived" || parent_id == Some(&other.id));
+        if keep_protected && let Some(wd) = &other.workdir {
+            let wd_path = PathBuf::from(&wd);
+            if let Ok(abs) = std::path::absolute(&wd_path) {
+                shared_workdirs.insert(abs);
             }
+            shared_workdirs.insert(wd_path);
         }
     }
     let marker_path = config_dir.join(".anyagents-managed-worktree.json");
@@ -3530,10 +3955,10 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
     if !shared_workdirs.contains(&work_dir) {
         if work_dir.join(".git").exists() {
             if is_git_worktree_safe_to_reap(&work_dir, initial_head.as_deref()) {
-                reap_git_worktree_cleanly(&work_dir, seat_ids);
+                complete &= reap_git_worktree_cleanly(&work_dir, seat_ids);
                 let _ = std::fs::remove_file(&marker_path);
             } else {
-                reap_build_outputs_in_worktree(&work_dir, seat_ids);
+                complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
             }
         } else {
             let mut preserved_dirty_child = false;
@@ -3542,47 +3967,54 @@ pub(crate) fn reap_subagent_ephemeral_dirs(data_dir: &Path, agent_id: &anyagents
                     let child_path = entry.path();
                     if child_path.is_dir() && child_path.join(".git").exists() {
                         if is_git_worktree_safe_to_reap(&child_path, None) {
-                            reap_git_worktree_cleanly(&child_path, seat_ids);
+                            complete &= reap_git_worktree_cleanly(&child_path, seat_ids);
                         } else {
-                            reap_build_outputs_in_worktree(&child_path, seat_ids);
+                            complete &= reap_build_outputs_in_worktree(&child_path, seat_ids);
                             preserved_dirty_child = true;
                         }
                     }
                 }
             }
             if !preserved_dirty_child {
-                remove_path_with_seat(&work_dir, seat_ids);
+                complete &= remove_path_with_seat(&work_dir, seat_ids);
                 if recorded_wt.as_ref().is_none_or(|p| !p.exists()) {
                     let _ = std::fs::remove_file(&marker_path);
                 }
             }
         }
     }
-    let _ = std::fs::create_dir_all(&work_dir);
-    if let Some((_, gid, _)) = seat_ids {
-        crate::sandbox::share_worktree_with_seat(&work_dir, gid);
-    }
+    complete
 }
 
-fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) {
+fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
+    let mut complete = true;
     const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
     for rel in BUILD_DIRS {
-        remove_path_with_seat(&wt_path.join(rel), seat_ids);
+        complete &= remove_path_with_seat(&wt_path.join(rel), seat_ids);
     }
     for container in ["apps", "packages", "crates", "services"] {
         let dir = wt_path.join(container);
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                complete &= error.kind() == std::io::ErrorKind::NotFound;
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let Ok(entry) = entry else {
+                complete = false;
+                continue;
+            };
             let path = entry.path();
             if path.is_dir() {
                 for rel in BUILD_DIRS {
-                    remove_path_with_seat(&path.join(rel), seat_ids);
+                    complete &= remove_path_with_seat(&path.join(rel), seat_ids);
                 }
             }
         }
     }
+    complete
 }
 
 pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, initial_head: Option<&str>) -> bool {
@@ -3644,7 +4076,7 @@ pub(crate) fn is_git_worktree_safe_to_reap(wt_path: &Path, initial_head: Option<
     false
 }
 
-fn reap_git_worktree_cleanly(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) {
+fn reap_git_worktree_cleanly(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
     let git_dir = std::process::Command::new("git")
         .args(["-c", "safe.directory=*", "-C"])
         .arg(wt_path)
@@ -3661,13 +4093,14 @@ fn reap_git_worktree_cleanly(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) 
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
-    remove_path_with_seat(wt_path, seat_ids);
+    let mut complete = remove_path_with_seat(wt_path, seat_ids);
     if let Some(gd) = git_dir
         && gd.components().any(|c| c.as_os_str() == "worktrees")
         && gd.exists()
     {
-        remove_path_with_seat(&gd, seat_ids);
+        complete &= remove_path_with_seat(&gd, seat_ids);
     }
+    complete
 }
 
 #[cfg(unix)]
@@ -3719,19 +4152,20 @@ fn detect_seat_ids(_config_dir: &Path) -> Option<(u32, u32, u32)> {
     None
 }
 
-fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) {
-    let Ok(meta) = std::fs::symlink_metadata(target) else {
-        return;
+fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
+    let meta = match std::fs::symlink_metadata(target) {
+        Ok(meta) => meta,
+        Err(error) => return error.kind() == std::io::ErrorKind::NotFound,
     };
     if meta.file_type().is_symlink() || meta.is_file() {
         if std::fs::remove_file(target).is_ok() {
-            return;
+            return true;
         }
     } else if meta.is_dir() && std::fs::remove_dir_all(target).is_ok() {
-        return;
+        return true;
     }
     if !Path::new("/usr/local/bin/anyagents-setpriv").is_file() {
-        return;
+        return false;
     }
     let mut candidate_seats = Vec::new();
     if let Some(ids) = seat_ids {
@@ -3767,11 +4201,16 @@ fn remove_path_with_seat(target: &Path, seat_ids: Option<(u32, u32, u32)>) {
             .arg(target)
             .stderr(std::process::Stdio::null())
             .status();
-        if std::fs::remove_dir_all(target).is_ok() || !target.exists() {
-            return;
+        if std::fs::remove_dir_all(target).is_ok()
+            || std::fs::symlink_metadata(target)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        {
+            return true;
         }
         let _ = std::fs::remove_file(target);
     }
+    std::fs::symlink_metadata(target)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 async fn pause_agent_route(
@@ -3829,6 +4268,11 @@ async fn delete_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
+        let _lifecycle = state
+            .store
+            .lock_agent_lifecycle(&found.id)
+            .map_err(ApiError::from_store)?;
+        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
         if found.parent_id.is_none() {
             if matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id) {
                 return Err(ApiError::new(
@@ -3882,7 +4326,7 @@ async fn delete_agent_route(
 }
 
 async fn wake_agent_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
 ) -> Result<Json<AgentView>, ApiError> {
@@ -3891,34 +4335,22 @@ async fn wake_agent_route(
             .store
             .agent_by_name(&name)
             .map_err(ApiError::from_store)?;
-        let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &found.id);
-        let work_dir = found
-            .workdir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| anyagents_core::agent_work_dir(state.store.data_dir(), &found.id));
-        if !work_dir.exists() {
-            let _ = std::fs::create_dir_all(&work_dir);
-        }
-        if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-            || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+        if let Principal::Agent {
+            name: ref caller_name,
+            ..
+        } = principal
         {
-            create::reconcile_agent_runtime_config(
-                &state.store,
-                state.store.data_dir(),
-                &found,
-                &cfg,
-                &work_dir,
-            )
-            .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()))?;
+            let actor = Actor::Agent(caller_name.clone());
+            if can_actor_message_agent(&state.store, &actor, &found).is_err() {
+                require_admin_or_operator(&state.store, &principal, "agents.wake", &found.name)?;
+            }
         }
-        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
-        let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
-        let _ = std::fs::write(
-            cfg.join(".anyagents-profile-rotated-ms"),
-            format!("{}\n", now_ms()),
-        );
-        clear_explicitly_archived(state.store.data_dir(), &found.id);
+        let _lifecycle = state
+            .store
+            .lock_agent_lifecycle(&found.id)
+            .map_err(ApiError::from_store)?;
+        let found = state.store.agent(&found.id).map_err(ApiError::from_store)?;
+        prepare_agent_wake(&state.store, &found)?;
         let agent = state
             .store
             .set_agent_state(&found.id, "running")
@@ -3927,6 +4359,35 @@ async fn wake_agent_route(
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
     })
     .await
+}
+
+/// Restore the same runtime and archive-marker state for an explicit wake or
+/// an intentional direct send. The caller commits `running` only after this
+/// succeeds; direct sends commit it atomically with their mailbox append.
+fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
+    let cfg = anyagents_core::agent_config_dir(store.data_dir(), &found.id);
+    let work_dir = found
+        .workdir
+        .as_deref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| anyagents_core::agent_work_dir(store.data_dir(), &found.id));
+    if !work_dir.exists() {
+        let _ = std::fs::create_dir_all(&work_dir);
+    }
+    if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
+        || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
+    {
+        create::reconcile_agent_runtime_config(store, store.data_dir(), found, &cfg, &work_dir)
+            .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()))?;
+    }
+    let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
+    let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
+    let _ = std::fs::write(
+        cfg.join(".anyagents-profile-rotated-ms"),
+        format!("{}\n", now_ms()),
+    );
+    clear_explicitly_archived(store.data_dir(), &found.id);
+    Ok(())
 }
 
 fn build_group_roster(store: &Store, members: &[String]) -> Vec<crate::api::GroupMemberView> {
@@ -3957,9 +4418,11 @@ async fn list_groups_route(
         let groups = rows
             .into_iter()
             .map(|(name, members)| {
+                let public = state.store.is_group_public(&name);
                 let roster = build_group_roster(&state.store, &members);
                 GroupView {
                     name,
+                    public,
                     members,
                     roster,
                 }
@@ -3992,6 +4455,49 @@ async fn group_action_route(
                 "group name is empty",
             ));
         }
+        let existing_members = state
+            .store
+            .room_members(&group)
+            .map_err(ApiError::from_store)?
+            .unwrap_or_default();
+        let is_group_pub = body
+            .public
+            .unwrap_or_else(|| state.store.is_group_public(&group));
+        let caller_is_insider = match &principal {
+            Principal::Operator => true,
+            Principal::Agent { agent_id, name } => {
+                if existing_members.is_empty() || existing_members.iter().any(|m| m == name) {
+                    true
+                } else {
+                    existing_members.iter().any(|m| {
+                        state
+                            .store
+                            .agent_by_name(m)
+                            .ok()
+                            .and_then(|ma| ma.parent_id)
+                            .as_ref()
+                            == Some(agent_id)
+                    })
+                }
+            }
+        };
+        let caller_authorized_for_private_group = match &principal {
+            Principal::Operator => true,
+            Principal::Agent { name, .. } => {
+                if caller_is_insider || is_group_pub {
+                    true
+                } else {
+                    let actor = Actor::Agent(name.clone());
+                    existing_members.iter().all(|m| {
+                        state
+                            .store
+                            .agent_by_name(m)
+                            .ok()
+                            .is_none_or(|ma| can_actor_message_agent(&state.store, &actor, &ma).is_ok())
+                    })
+                }
+            }
+        };
         let target_name = body
             .agent
             .as_deref()
@@ -4001,32 +4507,115 @@ async fn group_action_route(
             .or(default_agent);
         match body.action.trim() {
             "join" => {
-                let who = target_name.ok_or_else(|| {
+                if !caller_authorized_for_private_group {
+                    return Err(ApiError::forbidden(format!(
+                        "group `{group}` is private (`public: false`); only existing group members or their parent agent can add members"
+                    )));
+                }
+                let who_raw = target_name.ok_or_else(|| {
                     ApiError::new(StatusCode::BAD_REQUEST, "join needs an agent name")
                 })?;
-                let agent = state
-                    .store
-                    .agent_by_name(&who)
-                    .map_err(ApiError::from_store)?;
-                state
-                    .store
-                    .join_group(&group, &agent.id)
-                    .map_err(ApiError::from_store)?;
+                let targets: Vec<&str> = who_raw
+                    .split(',')
+                    .map(str::trim)
+                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if targets.is_empty() {
+                    return Err(ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "join needs an agent name",
+                    ));
+                }
+                let mut resolved_agents = Vec::with_capacity(targets.len());
+                for who in targets {
+                    let agent = if who.eq_ignore_ascii_case("self")
+                        && let Principal::Agent { ref agent_id, .. } = principal
+                    {
+                        state.store.agent(agent_id).map_err(ApiError::from_store)?
+                    } else {
+                        state
+                            .store
+                            .agent_by_name(who)
+                            .map_err(ApiError::from_store)?
+                    };
+                    if let Principal::Agent { ref name, .. } = principal {
+                        can_actor_message_agent(
+                            &state.store,
+                            &Actor::Agent(name.clone()),
+                            &agent,
+                        )?;
+                    }
+                    resolved_agents.push(agent);
+                }
+                // When an agent creates a brand-new group and adds another agent,
+                // automatically include the creator in the group as well so they immediately share it.
+                if existing_members.is_empty()
+                    && let Principal::Agent { ref agent_id, .. } = principal
+                    && resolved_agents.iter().any(|a| &a.id != agent_id)
+                {
+                    state
+                        .store
+                        .join_group(&group, agent_id)
+                        .map_err(ApiError::from_store)?;
+                }
+                for agent in resolved_agents {
+                    state
+                        .store
+                        .join_group(&group, &agent.id)
+                        .map_err(ApiError::from_store)?;
+                }
+                if let Some(pub_val) = body.public {
+                    state
+                        .store
+                        .set_group_public(&group, pub_val)
+                        .map_err(ApiError::from_store)?;
+                }
             }
             "leave" => {
-                let who = target_name.ok_or_else(|| {
+                let who_raw = target_name.ok_or_else(|| {
                     ApiError::new(StatusCode::BAD_REQUEST, "leave needs an agent name")
                 })?;
-                let agent = state
-                    .store
-                    .agent_by_name(&who)
-                    .map_err(ApiError::from_store)?;
-                state
-                    .store
-                    .leave_group(&group, &agent.id)
-                    .map_err(ApiError::from_store)?;
+                for who in who_raw
+                    .split(',')
+                    .map(str::trim)
+                    .map(|s| s.strip_prefix("agent:").unwrap_or(s))
+                    .filter(|s| !s.is_empty())
+                {
+                    let agent = if who.eq_ignore_ascii_case("self")
+                        && let Principal::Agent { ref agent_id, .. } = principal
+                    {
+                        state.store.agent(agent_id).map_err(ApiError::from_store)?
+                    } else {
+                        state
+                            .store
+                            .agent_by_name(who)
+                            .map_err(ApiError::from_store)?
+                    };
+                    state
+                        .store
+                        .leave_group(&group, &agent.id)
+                        .map_err(ApiError::from_store)?;
+                }
+                if let Some(pub_val) = body.public
+                    && caller_authorized_for_private_group
+                {
+                    let _ = state.store.set_group_public(&group, pub_val);
+                }
             }
-            "members" => {}
+            "members" => {
+                if let Some(pub_val) = body.public {
+                    if !caller_authorized_for_private_group {
+                        return Err(ApiError::forbidden(format!(
+                            "group `{group}` is private (`public: false`); only existing group members or their parent agent can change visibility"
+                        )));
+                    }
+                    state
+                        .store
+                        .set_group_public(&group, pub_val)
+                        .map_err(ApiError::from_store)?;
+                }
+            }
             other => {
                 return Err(ApiError::new(
                     StatusCode::BAD_REQUEST,
@@ -4034,6 +4623,7 @@ async fn group_action_route(
                 ));
             }
         }
+        let public = state.store.is_group_public(&group);
         let members = state
             .store
             .room_members(&group)
@@ -4042,6 +4632,7 @@ async fn group_action_route(
         let roster = build_group_roster(&state.store, &members);
         Ok(Json(GroupView {
             name: group,
+            public,
             members,
             roster,
         }))
@@ -4117,12 +4708,53 @@ async fn inbox(
 }
 
 async fn conversation_route(
-    _principal: Principal,
+    principal: Principal,
     State(state): State<AppState>,
     AxumPath(name): AxumPath<String>,
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
+        let mut effective_name = name.clone();
+        if let Principal::Agent { ref agent_id, .. } = principal
+            && let Ok(caller) = state.store.agent(agent_id)
+        {
+            if caller.is_isolated() {
+                if effective_name.eq_ignore_ascii_case("all")
+                    || effective_name == "*"
+                    || effective_name.eq_ignore_ascii_case("self")
+                {
+                    effective_name = caller.name.clone();
+                } else if let Ok(target) = state.store.agent_by_name(&effective_name)
+                    && !is_self_or_ancestor(&state.store, &caller.id, &target)
+                {
+                    return Err(ApiError::forbidden(format!(
+                        "isolated agent `{}` (`scope: isolated`) can only read its own or its descendants' conversation history",
+                        caller.name
+                    )));
+                }
+            } else if !effective_name.eq_ignore_ascii_case("all")
+                && effective_name != "*"
+                && !effective_name.eq_ignore_ascii_case("self")
+                && let Ok(target) = state.store.agent_by_name(&effective_name)
+                && !is_self_or_ancestor(&state.store, &caller.id, &target)
+            {
+                let allowed = !target.is_isolated()
+                    && (caller.parent_id.is_none()
+                        || (caller.allows_sibling_messages()
+                            && caller.parent_id == target.parent_id)
+                        || target.is_public()
+                        || state.store.share_any_group_or_chat(&caller.id, &target.id));
+                if !allowed {
+                    return Err(ApiError::forbidden(format!(
+                        "agent `{}` cannot read private conversation history of `{}` (`scope: {}`)",
+                        caller.name,
+                        target.name,
+                        target.scope()
+                    )));
+                }
+            }
+        }
+        let name = effective_name;
         let clean_q = query
             .query
             .as_deref()
@@ -4326,7 +4958,7 @@ async fn send(
         sender: Some(actor.as_address()),
         ..body
     };
-    let key = send_key(&state.send_namespace, &body);
+    let key = send_key(&body);
     let store = Arc::clone(&state.store);
     let principal_for_plan = principal.clone();
     let actor_for_plan = actor.clone();
@@ -4449,6 +5081,7 @@ fn interact_sync(
                     && peer.state != "archived"
                     && peer.state != "paused"
                     && !is_explicitly_archived(store.data_dir(), &peer)
+                    && can_actor_message_agent(store, &actor, &peer).is_ok()
                 {
                     let mut incoming = Incoming::new(summary.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
@@ -4522,6 +5155,7 @@ fn interact_sync(
                     && peer.state != "archived"
                     && peer.state != "paused"
                     && !is_explicitly_archived(store.data_dir(), &peer)
+                    && can_actor_message_agent(store, &actor, &peer).is_ok()
                 {
                     let mut incoming = Incoming::new(ballot.clone());
                     incoming.sender = Some(format!("agent:{actor_name}"));
@@ -4863,22 +5497,22 @@ impl SendPlan {
                 {
                     if let Actor::Agent(sender_name) = actor
                         && let Ok(sender) = store.agent_by_name(sender_name)
-                        && let Some(ref pid) = sender.parent_id
+                        && let Some(ref parent_id) = sender.parent_id
                     {
                         let siblings: Vec<_> = store
-                            .children_of(pid)
+                            .children_of(parent_id)
                             .map_err(ApiError::from_store)?
                             .into_iter()
-                            .filter(|s| {
-                                s.id != sender.id
-                                    && s.state != "archived"
-                                    && !is_explicitly_archived(store.data_dir(), s)
+                            .filter(|c| {
+                                c.id != sender.id
+                                    && c.state != "archived"
+                                    && !is_explicitly_archived(store.data_dir(), c)
+                                    && can_actor_message_agent(store, actor, c).is_ok()
                             })
                             .collect();
                         if siblings.is_empty() {
-                            return Err(ApiError::new(
-                                StatusCode::BAD_REQUEST,
-                                "this sub-agent has no active sibling sub-agents under the same parent",
+                            return Err(ApiError::forbidden(
+                                "no reachable sibling sub-agents (`public: true` or shared group); message your parent (`to: [\"parent\"]`) instead",
                             ));
                         }
                         for sib in siblings {
@@ -4898,22 +5532,22 @@ impl SendPlan {
                 {
                     if let Actor::Agent(sender_name) = actor
                         && let Ok(sender) = store.agent_by_name(sender_name)
-                        && let Some(ref pid) = sender.parent_id
+                        && let Some(ref parent_id) = sender.parent_id
                     {
                         let siblings: Vec<_> = store
-                            .children_of(pid)
+                            .children_of(parent_id)
                             .map_err(ApiError::from_store)?
                             .into_iter()
-                            .filter(|s| {
-                                s.id != sender.id
-                                    && s.state != "archived"
-                                    && !is_explicitly_archived(store.data_dir(), s)
+                            .filter(|c| {
+                                c.id != sender.id
+                                    && c.state != "archived"
+                                    && !is_explicitly_archived(store.data_dir(), c)
+                                    && can_actor_message_agent(store, actor, c).is_ok()
                             })
                             .collect();
                         if siblings.is_empty() {
-                            return Err(ApiError::new(
-                                StatusCode::BAD_REQUEST,
-                                "this sub-agent has no active sibling sub-agents under the same parent",
+                            return Err(ApiError::forbidden(
+                                "no reachable sibling sub-agents (`public: true` or shared group); message your parent (`to: [\"parent\"]`) instead",
                             ));
                         }
                         for sib in siblings {
@@ -5032,28 +5666,31 @@ impl SendPlan {
     }
 }
 
-fn root_ancestor_id(store: &Store, agent: &anyagents_core::Agent) -> anyagents_core::AgentId {
-    let mut current_id = agent.id.clone();
-    let mut next_parent = agent.parent_id.clone();
-    for _ in 0..16 {
-        let Some(pid) = next_parent else {
-            break;
-        };
-        current_id = pid.clone();
-        next_parent = store.agent(&pid).ok().and_then(|parent| parent.parent_id);
+fn can_actor_read_agent_private(
+    store: &Store,
+    principal: &Principal,
+    target: &anyagents_core::Agent,
+) -> bool {
+    match principal {
+        Principal::Operator => true,
+        Principal::Agent { agent_id, .. } => {
+            is_self_or_ancestor(store, agent_id, target)
+                || store
+                    .agent(agent_id)
+                    .is_ok_and(|caller| caller.is_admin && caller.parent_id.is_none())
+        }
     }
-    current_id
 }
 
-/// Enforces strict hierarchy & peer encapsulation (`Encapsulated Actor Hierarchy`):
-/// - Root agents (`parent_id == None`) can message any Root peer (`parent_id == None`) or any descendant inside their own hierarchy tree.
-/// - Sub-agents (`parent_id == Some(P)`) can message:
-///   1. Their own direct parent (`recipient.id == P`)
-///   2. Their own direct children (`recipient.parent_id == Some(sender.id)`)
-///   3. Their own sibling sub-agents under the same parent (`recipient.parent_id == Some(P)`)
-///   4. Any ancestor or descendant within the same Root agent's hierarchy tree (`root_ancestor_id(sender) == root_ancestor_id(recipient)`)
-///   5. Any Root agent (`recipient.parent_id == None`) for cross-domain escalation
-/// - Sending directly to **another Root agent's sub-agent** (`root_ancestor_id(sender) != root_ancestor_id(recipient)`) is refused unless the caller is the Operator. To hand over a sub-agent across parents, use `agents({ "action": "transfer", "name": "<subagent>", "parent": "<new-parent>" })`.
+/// Enforces sub-agent communication encapsulation across scopes (`isolated`, `private`, `siblings`, `public`):
+/// - An `isolated` sub-agent can only message itself, its direct parent, its own direct children, or a shared group/chat.
+/// - Otherwise, any agent can message:
+///   1. Itself (`sender.id == recipient.id`)
+///   2. Its own direct Child Sub-Agents (`recipient.parent_id == Some(sender.id)`)
+///   3. Its own direct Parent Agent (`sender.parent_id == Some(recipient.id)`)
+///   4. A Sibling Sub-Agent under the same Parent when both have `scope: "siblings"` or `"public"` (`allows_sibling_messages()`)
+///   5. Any Root Agent (when `sender.allows_sibling_messages()`) or Sub-Agent with `scope: "public"` (`recipient.is_public_subagent()`)
+///   6. Any agent with which it shares an internal virtual group (`group:<name>`) or external Telegram chat
 fn can_actor_message_agent(
     store: &Store,
     actor: &Actor,
@@ -5062,33 +5699,60 @@ fn can_actor_message_agent(
     let Actor::Agent(sender_name) = actor else {
         return Ok(());
     };
-    let Some(ref recip_parent_id) = recipient.parent_id else {
-        // Recipient is a Root agent: always reachable by Root peers and sub-agents.
-        return Ok(());
-    };
     let Ok(sender) = store.agent_by_name(sender_name) else {
         return Ok(());
     };
-    if sender.id == recipient.id {
-        return Ok(());
-    }
-    // Recipient is a sub-agent (`recip_parent_id`):
-    // Allowed if sender IS the recipient's direct parent, OR recipient IS the sender's direct parent,
-    // OR sender shares the exact same parent (`sibling`), OR both belong to the same Root hierarchy tree.
-    if &sender.id == recip_parent_id
+    if sender.id == recipient.id
+        || recipient.parent_id.as_ref() == Some(&sender.id)
         || sender.parent_id.as_ref() == Some(&recipient.id)
-        || sender.parent_id.as_ref() == Some(recip_parent_id)
-        || root_ancestor_id(store, &sender) == root_ancestor_id(store, recipient)
     {
         return Ok(());
     }
-    let owner_label = store
-        .agent(recip_parent_id)
-        .map(|p| p.name)
-        .unwrap_or_else(|_| recip_parent_id.as_str().to_string());
+    if sender.is_isolated() || recipient.is_isolated() {
+        let sender_parent = sender
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
+            .unwrap_or_else(|| "parent".to_string());
+        return Err(ApiError::forbidden(format!(
+            "sub-agent `{}` or `{}` is isolated (`scope: isolated`) and only communicates 1-to-1 with its direct parent and children; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
+            sender.name, recipient.name
+        )));
+    }
+    if store.share_any_group_or_chat(&sender.id, &recipient.id)
+        || store.has_messaged(recipient, &sender)
+    {
+        return Ok(());
+    }
+    let same_parent_siblings = sender.parent_id.is_some()
+        && sender.parent_id == recipient.parent_id
+        && sender.allows_sibling_messages()
+        && recipient.allows_sibling_messages();
+    if same_parent_siblings
+        || recipient.is_public_subagent()
+        || (recipient.parent_id.is_none() && sender.allows_sibling_messages())
+    {
+        return Ok(());
+    }
+    if recipient.parent_id.is_none() {
+        let sender_parent = sender
+            .parent_id
+            .as_ref()
+            .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
+            .unwrap_or_else(|| "parent".to_string());
+        return Err(ApiError::forbidden(format!(
+            "sub-agent `{}` is private (`public: false`) and cannot message root agent `{}` directly; report to your parent `agent:{sender_parent}` (`to: [\"parent\"]`) instead",
+            sender.name, recipient.name
+        )));
+    }
+    let owner_label = recipient
+        .parent_id
+        .as_ref()
+        .and_then(|pid| store.agent(pid).ok().map(|p| p.name))
+        .unwrap_or_else(|| "parent".to_string());
     Err(ApiError::forbidden(format!(
-        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}`; message `agent:{owner_label}` instead, or transfer custody first via `agents({{ \"action\": \"transfer\", \"name\": \"{}\", \"parent\": \"{}\" }})`",
-        recipient.name, recipient.name, sender.name
+        "cannot message sub-agent `{}` directly because it belongs to parent `agent:{owner_label}` and does not accept external messages (`public: false`); message `agent:{owner_label}` instead, ask `agent:{owner_label}` to set `public: true`, or collaborate in a shared group",
+        recipient.name
     )))
 }
 
@@ -5109,6 +5773,42 @@ fn check_targets(
             // Counted without writing, so an empty room fails the whole send
             // instead of silently delivering nothing.
             Target::Room(room) => {
+                let clean_room = room.strip_prefix("group:").unwrap_or(room);
+                if let Actor::Agent(sender_name) = actor
+                    && let Ok(sender) = store.agent_by_name(sender_name)
+                {
+                    if clean_room != "all"
+                        && clean_room != "peers"
+                        && !clean_room.starts_with("telegram:")
+                        && !store.is_group_public(clean_room)
+                        && !sender.is_admin
+                        && let Ok(Some(members)) = store.room_members(room)
+                    {
+                        let is_member_or_parent = members.iter().any(|m| {
+                            if m == &sender.name {
+                                return true;
+                            }
+                            store
+                                .agent_by_name(m)
+                                .ok()
+                                .and_then(|ma| ma.parent_id)
+                                .as_ref()
+                                == Some(&sender.id)
+                        });
+                        if !is_member_or_parent {
+                            return Err(ApiError::forbidden(format!(
+                                "cannot post to private group `{clean_room}` (`public: false`) because `{}` is not a member; join or ask a group member/parent to add you first",
+                                sender.name
+                            )));
+                        }
+                    } else if (clean_room == "all" || clean_room == "peers") && !sender.is_public()
+                    {
+                        return Err(ApiError::forbidden(format!(
+                            "private sub-agent `{}` (`public: false`) cannot broadcast to `{clean_room}`; message `parent`, `children`, or a shared `group:<name>` instead",
+                            sender.name
+                        )));
+                    }
+                }
                 if room_recipients(store, body, room).is_empty() {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -5177,7 +5877,16 @@ fn send_sync(
     for target in &plan.targets {
         match target {
             Target::Agent(name) => {
-                let d = deliver_agent(store, &body, name, key.as_deref())?;
+                // Only a single, explicitly named recipient of an authored
+                // send may unarchive. Resolved replies and fan-out aliases do
+                // not acquire that authority when expanded into agent targets.
+                let wake_archived = matches!(actor, Actor::Agent(_))
+                    || matches!(actor, Actor::Operator(sender) if sender == "operator");
+                let wake_archived = wake_archived
+                    && body.to.len() == 1
+                    && matches!(Address::parse(&body.to[0]), Ok(Address::Agent(ref name))
+                        if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"));
+                let d = deliver_agent(store, &body, name, key.as_deref(), wake_archived)?;
                 if let Some(ref sid) = sender_agent_id
                     && !d.duplicate
                 {
@@ -5249,8 +5958,10 @@ fn send_sync(
 
 /// The idempotency key of one call. The same call repeated after a lost
 /// answer keeps the key its tool call was given; two identical calls without
-/// one are two messages, so a key never comes from the text.
-fn send_key(namespace: &str, body: &SendRequest) -> Option<String> {
+/// one are two messages, so a key never comes from the text. Receipts live in
+/// one store and must not depend on process entropy: retries after restart or
+/// through the other server socket must retain their mailbox source key.
+fn send_key(body: &SendRequest) -> Option<String> {
     let idempotency = body.idempotency_key.as_deref()?.trim();
     if idempotency.is_empty() {
         return None;
@@ -5260,7 +5971,6 @@ fn send_key(namespace: &str, body: &SendRequest) -> Option<String> {
     let to_joined = body.to.join("\x1f");
     let mut bytes = Vec::new();
     for part in [
-        namespace,
         sender,
         idempotency,
         to_joined.as_str(),
@@ -5330,7 +6040,11 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter(|agent| agent.state == "running")
+        .filter(|agent| {
+            (agent.state == "running" || agent.state == "idle")
+                && !is_explicitly_archived(store.data_dir(), agent)
+        })
+        .filter(|agent| members.is_some() || agent.parent_id.is_none())
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
         .filter(|agent| {
             members
@@ -5354,7 +6068,9 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
             .into_iter()
             .filter(|agent| agent.parent_id.is_none())
             .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
-            .filter(|agent| agent.state != "running" && agent.state != "archived")
+            .filter(|agent| {
+                agent.state != "running" && agent.state != "idle" && agent.state != "archived"
+            })
             .map(|agent| crate::api::SkippedDelivery {
                 to: format!("agent:{}", agent.name),
                 reason: agent.state,
@@ -5371,7 +6087,7 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
         .into_iter()
         .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
         .filter(|agent| members.iter().any(|m| m == &agent.name))
-        .filter(|agent| agent.state != "running")
+        .filter(|agent| agent.state != "running" && agent.state != "idle")
         .map(|agent| crate::api::SkippedDelivery {
             to: format!("agent:{}", agent.name),
             reason: agent.state,
@@ -5423,32 +6139,56 @@ fn deliver_agent(
     body: &SendRequest,
     name: &str,
     key: Option<&str>,
+    wake_archived: bool,
 ) -> Result<Delivery, ApiError> {
     let agent = store.agent_by_name(name).map_err(ApiError::from_store)?;
+    let _lifecycle = store
+        .lock_agent_lifecycle(&agent.id)
+        .map_err(ApiError::from_store)?;
+    let agent = store.agent(&agent.id).map_err(ApiError::from_store)?;
+    // A crash may leave the mailbox row without a whole-send receipt. Check it
+    // before clearing markers/errors, not merely before the lifecycle SQL.
+    if let Some(key) = key
+        && let Some(message) = store
+            .message_by_source_key(&agent.id, key)
+            .map_err(ApiError::from_store)?
+    {
+        return Ok(Delivery {
+            to: format!("agent:{}", agent.name),
+            id: message.id.to_string(),
+            seq: message.seq,
+            duplicate: true,
+        });
+    }
+    if wake_archived && is_explicitly_archived(store.data_dir(), &agent) {
+        prepare_agent_wake(store, &agent)?;
+    }
     let trimmed = body.text.trim_start();
     let is_auto_subagent_lifecycle =
         trimmed.starts_with("[Sub-Agent Completed]") || trimmed.starts_with("[Sub-Agent Error]");
-    if (agent.state == "idle" || agent.state == "created")
+    if !wake_archived
+        && (agent.state == "idle" || agent.state == "created")
         && !is_explicitly_archived(store.data_dir(), &agent)
         && !(agent.parent_id.is_none() && is_auto_subagent_lifecycle)
     {
         let _ = store.set_agent_state(&agent.id, "running");
     }
-    let outcome = store
-        .receive(
-            &agent.id,
-            Incoming {
-                text: body.text.clone(),
-                sender: body.sender.clone(),
-                source_time_ms: None,
-                source_key: key.map(str::to_string),
-                reply_to: body.reply_to.clone(),
-                quote: body.quote.clone(),
-                origin: None,
-                received_at_ms: None,
-            },
-        )
-        .map_err(ApiError::from_store)?;
+    let incoming = Incoming {
+        text: body.text.clone(),
+        sender: body.sender.clone(),
+        source_time_ms: None,
+        source_key: key.map(str::to_string),
+        reply_to: body.reply_to.clone(),
+        quote: body.quote.clone(),
+        origin: None,
+        received_at_ms: None,
+    };
+    let outcome = if wake_archived {
+        store.receive_direct_send(&agent.id, incoming)
+    } else {
+        store.receive(&agent.id, incoming)
+    }
+    .map_err(ApiError::from_store)?;
     let (message, duplicate) = match outcome {
         ReceiveOutcome::New(message) => (message, false),
         ReceiveOutcome::Duplicate(message) => (message, true),
@@ -5798,6 +6538,127 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn describe_preserves_scope_and_audits_authorized_policy_updates() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("mind", "codex");
+        new.parent_id = Some(parent.id.clone());
+        new.role = Some("Mind".into());
+        let mind = store.create_agent(new).unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let caller = |agent: &Agent| Principal::Agent {
+            agent_id: agent.id.clone(),
+            name: agent.name.clone(),
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let mut expected_audit = Vec::new();
+            for (body, before, after, source) in [
+                (serde_json::json!({"scope":"siblings"}), "siblings", "siblings", "scope"),
+                (serde_json::json!({"description":"Public charter", "public":false}), "siblings", "siblings", "public"),
+                (serde_json::json!({"instructions":"Private instructions"}), "siblings", "siblings", ""),
+                (serde_json::json!({"role":"Updated Mind"}), "siblings", "siblings", ""),
+                (serde_json::json!({"public":true}), "siblings", "public", "public"),
+                (serde_json::json!({"public":false}), "public", "siblings", "public"),
+                (serde_json::json!({"scope":"isolated", "public":true}), "siblings", "isolated", "scope"),
+                (serde_json::json!({"public":false}), "isolated", "isolated", "public"),
+                (serde_json::json!({"scope":"private"}), "isolated", "private", "scope"),
+                (serde_json::json!({"public":false}), "private", "private", "public"),
+                (serde_json::json!({"scope":"siblings"}), "private", "siblings", "scope"),
+            ] {
+                let Json(updated) = set_description_route(
+                    caller(&parent), State(state.clone()), AxumPath("mind".into()),
+                    Json(serde_json::from_value(body).unwrap()),
+                ).await.unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert_eq!(updated["scope"], after);
+                if !source.is_empty() {
+                    expected_audit.push(("agent:parent".to_string(), before.to_string(), after.to_string(), source.to_string()));
+                }
+            }
+            let before = store.agent(&mind.id).unwrap();
+            let outsider = store.create_agent(anyagents_core::NewAgent::new("outsider", "codex")).unwrap();
+            let mut sibling_new = anyagents_core::NewAgent::new("sibling", "codex");
+            sibling_new.parent_id = Some(parent.id.clone());
+            let sibling = store.create_agent(sibling_new).unwrap();
+            for agent in [&outsider, &sibling] {
+                for body in [serde_json::json!({"scope":"public"}), serde_json::json!({"description":"Overwrite", "instructions":"Overwrite"})] {
+                    let err = set_description_route(caller(agent), State(state.clone()), AxumPath("mind".into()), Json(serde_json::from_value(body).unwrap()))
+                        .await.expect_err("unrelated caller must be refused");
+                    assert_eq!(err.status, StatusCode::FORBIDDEN);
+                    assert_eq!(store.agent(&mind.id).unwrap(), before);
+                }
+            }
+            let err = set_description_route(caller(&mind), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"public"})).unwrap()))
+                .await.expect_err("self cannot widen scope");
+            assert_eq!(err.status, StatusCode::FORBIDDEN);
+
+            // An admin's self update is allowed and has the same atomic audit.
+            store.set_agent_admin(&parent.id, true).unwrap();
+            let _ = set_description_route(caller(&parent), State(state.clone()), AxumPath("self".into()), Json(serde_json::from_value(serde_json::json!({"scope":"isolated"})).unwrap()))
+                .await.unwrap_or_else(|e| panic!("{}", e.message));
+            let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
+            let mut stmt = conn.prepare("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='mind' AND source IS NOT NULL ORDER BY id").unwrap();
+            let rows: Vec<(String,String,String,String)> = stmt.query_map([], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap().map(Result::unwrap).collect();
+            assert_eq!(rows, expected_audit);
+            let self_audit: (String,String,String,String) = conn.query_row("SELECT actor,before_scope,after_scope,source FROM admin_audit WHERE target='parent' AND source IS NOT NULL", [], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+            assert_eq!(self_audit, ("agent:parent".into(),"public".into(),"isolated".into(),"scope".into()));
+            assert_eq!(store.agent(&mind.id).unwrap().description.as_deref(), Some("Public charter"));
+            // Every runtime-config pass reads the store's policy; none owns it.
+            for _ in 0..2 {
+                let current = store.agent(&mind.id).unwrap();
+                let config = anyagents_core::agent_config_dir(dir.path(), &mind.id);
+                let work = anyagents_core::agent_work_dir(dir.path(), &mind.id);
+                create::reconcile_agent_runtime_config(&store, dir.path(), &current, &config, &work).unwrap();
+                let reloaded = Store::open(dir.path().join("state.db")).unwrap().agent(&mind.id).unwrap();
+                assert_eq!(reloaded.scope(), "siblings");
+                assert_eq!(reloaded.description, current.description);
+            }
+        });
+    }
+
+    #[test]
+    fn role_spawn_defaults_to_siblings_and_task_spawn_defaults_to_private() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {
+                let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
+                let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
+                assert_eq!(created.scope, scope);
+                let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":true})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
+                let _ = set_description_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), AxumPath(name.into()), Json(serde_json::from_value(serde_json::json!({"public":false})).unwrap())).await.unwrap_or_else(|e| panic!("{}",e.message));
+                assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
+            }
+        });
+    }
+
+    #[test]
     fn a_sign_in_streams_the_link_before_the_outcome() {
         let _env = env_lock();
         let data = tempfile::tempdir().unwrap();
@@ -5985,6 +6846,415 @@ pub(crate) mod tests {
         }
     }
 
+    fn archived_reap_fixture(store: &Store, name: &str, parent: &Agent) -> Agent {
+        let mut new = anyagents_core::NewAgent::new(name, "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let _lifecycle = store.lock_agent_lifecycle(&child.id).unwrap();
+        let child = store.set_agent_state(&child.id, "archived").unwrap();
+        mark_archive_generation_locked(store, store.data_dir(), &child);
+        child
+    }
+
+    #[test]
+    fn archive_reap_marker_survives_restart_and_is_invalidated_by_wake_and_rearchive() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        let generation = std::fs::read(cfg.join(".anyagents-archived")).unwrap();
+        std::fs::write(cfg.join(".anyagents-reaped"), b"foreign generation").unwrap();
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(!cfg.join(".claude").exists());
+        assert_eq!(
+            std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
+            generation
+        );
+        // A fresh process must use durable completion, not rescan retained dirs.
+        std::fs::create_dir_all(cfg.join("shell-snapshots")).unwrap();
+        let restarted = Store::open(&db).unwrap();
+        reap_archived_agents(&restarted, dir.path(), &HealthBoard::default());
+        assert!(cfg.join("shell-snapshots").exists());
+        let stale_child = restarted.agent(&child.id).unwrap();
+        authored_send(
+            &store,
+            &Actor::Agent(parent.name.clone()),
+            "worker",
+            "continue",
+            "wake-reaped",
+        );
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        assert!(!cfg.join(".anyagents-archived").exists());
+        {
+            let _lifecycle = restarted.lock_agent_lifecycle(&stale_child.id).unwrap();
+            reap_archived_agent_locked(&restarted, dir.path(), &stale_child.id);
+        }
+        assert!(
+            cfg.join("shell-snapshots").exists(),
+            "stale cleanup deleted running config"
+        );
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+        mark_explicitly_archived(&store, dir.path(), &child);
+        assert_ne!(
+            std::fs::read(cfg.join(".anyagents-archived")).unwrap(),
+            generation
+        );
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(!cfg.join("shell-snapshots").exists());
+        assert_eq!(
+            std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
+            std::fs::read(cfg.join(".anyagents-archived")).unwrap()
+        );
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archive_reap_repairs_empty_legacy_marker_and_retries_partial_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let other = archived_reap_fixture(&store, "other", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        let other_cfg = anyagents_core::agent_config_dir(dir.path(), &other.id);
+        std::fs::write(cfg.join(".anyagents-archived"), b"").unwrap();
+        let blocked = cfg.join(".cache");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("keep"), b"partial cleanup").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        // Restore access before asserting so failed tests don't leak fixtures.
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            !std::fs::read(cfg.join(".anyagents-archived"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !cfg.join(".anyagents-reaped").exists(),
+            "failed cleanup was marked complete"
+        );
+        assert!(
+            other_cfg.join(".anyagents-reaped").exists(),
+            "failure starved an independent archive"
+        );
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(!blocked.exists());
+        assert_eq!(
+            std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
+            std::fs::read(cfg.join(".anyagents-archived")).unwrap()
+        );
+    }
+
+    #[test]
+    fn archive_reap_waits_for_self_archived_process_to_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        let health = HealthBoard::default();
+        let (delivery_mode, steer_support) = declared(&child.harness);
+        let mut live = anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: anyagents_harness::TurnState::Idle,
+            delivery_mode,
+            steer_support,
+            quota_reset_at_ms: None,
+            restart_at_ms: None,
+            pid: None,
+            live_harness: Some(child.harness.clone()),
+            live_model: None,
+            process_started_at_ms: None,
+            last_error: None,
+        };
+        health.publish(&child.id, live.clone());
+        reap_archived_agents(&store, dir.path(), &health);
+        assert!(cfg.join(".claude").exists());
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        live.process_alive = false;
+        health.publish(&child.id, live);
+        reap_archived_agents(&store, dir.path(), &health);
+        assert!(!cfg.join(".claude").exists());
+        assert!(cfg.join(".anyagents-reaped").exists());
+    }
+
+    #[test]
+    fn archive_reap_failed_protection_read_preserves_work_and_delete_still_cleans() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("keep"), b"protected").unwrap();
+        // Simulate an unreadable/corrupt protection database, not an empty list.
+        let failed = tempfile::tempdir().unwrap();
+        let failed_work = anyagents_core::agent_work_dir(failed.path(), &child.id);
+        std::fs::create_dir_all(&failed_work).unwrap();
+        std::fs::write(failed_work.join("keep"), b"unknown references").unwrap();
+        std::fs::write(failed.path().join("state.db"), b"not a database").unwrap();
+        assert!(!reap_subagent_ephemeral_dirs(failed.path(), &child.id));
+        assert!(failed_work.join("keep").exists());
+        // A live sibling sharing this workdir protects it. Deleting the target
+        // row still invokes raw cleanup, but must retain surviving references.
+        let sibling = store
+            .create_agent(anyagents_core::NewAgent::new("sibling", "opencode"))
+            .unwrap();
+        store
+            .set_agent_running(&sibling.id, work.to_str().unwrap())
+            .unwrap();
+        store.delete_agent(&child.id).unwrap();
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(work.join("keep").exists());
+        store.delete_agent(&sibling.id).unwrap();
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(!work.exists());
+    }
+
+    #[test]
+    fn archive_reap_preserves_unpushed_and_external_worktrees() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=Kyle Tse",
+                    "-c",
+                    "user.email=hi@kylet.se",
+                    "-C",
+                ])
+                .arg(&work)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(work.join("source.rs"), b"unique committed source").unwrap();
+        std::fs::write(work.join(".gitignore"), b"/target/\n").unwrap();
+        git(&["add", "source.rs", ".gitignore"]);
+        git(&["commit", "-qm", "Initial source"]);
+        std::fs::create_dir_all(work.join("target/debug")).unwrap();
+        // A clean commit with no remote is not safe to delete.
+        assert!(!is_git_worktree_safe_to_reap(&work, None));
+        reap_archived_agents(&store, dir.path(), &HealthBoard::default());
+        assert!(work.join("source.rs").exists());
+        assert!(work.join(".git").exists());
+        assert!(!work.join("target").exists());
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        assert!(
+            cfg.join(".anyagents-reaped").exists(),
+            "retained source is not pending cleanup"
+        );
+        let external = dir.path().join("borrowed-worktree");
+        std::fs::create_dir_all(external.join("target/debug")).unwrap();
+        std::fs::write(external.join("source.rs"), b"borrowed source").unwrap();
+        std::fs::write(
+            cfg.join(".anyagents-managed-worktree.json"),
+            serde_json::to_vec(&serde_json::json!({"path": external})).unwrap(),
+        )
+        .unwrap();
+        assert!(reap_subagent_ephemeral_dirs(dir.path(), &child.id));
+        assert!(external.join("source.rs").exists());
+        assert!(external.join("target/debug").exists());
+    }
+
+    #[test]
+    fn archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let mut new = anyagents_core::NewAgent::new("grandchild", "opencode");
+        new.parent_id = Some(child.id.clone());
+        let grandchild = store.create_agent(new).unwrap();
+        store.set_agent_state(&parent.id, "archived").unwrap();
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
+        let descendant = store.lock_agent_lifecycle(&grandchild.id).unwrap();
+        let scanner_store = Store::open(&db).unwrap();
+        let data = dir.path().to_path_buf();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let scanner = std::thread::spawn(move || {
+            reconcile_stopped_and_backed_off_agents(
+                &scanner_store,
+                &HealthBoard::default(),
+                &data,
+                &Arc::new(Mutex::new(AdminReconcileState::default())),
+                now_ms(),
+            );
+            done_tx.send(()).unwrap();
+        });
+        let progressed = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        drop(descendant);
+        scanner.join().unwrap();
+        assert!(
+            progressed,
+            "reconciliation cascaded into a contended descendant"
+        );
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        assert!(
+            cfg.join(".claude").exists(),
+            "reconciliation performed cleanup"
+        );
+        assert!(!cfg.join(".anyagents-reaped").exists());
+        reconcile_stopped_and_backed_off_agents(
+            &store,
+            &HealthBoard::default(),
+            dir.path(),
+            &Arc::new(Mutex::new(AdminReconcileState::default())),
+            now_ms(),
+        );
+        assert_eq!(store.agent(&grandchild.id).unwrap().state, "archived");
+    }
+
+    #[test]
+    fn archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let child = archived_reap_fixture(&store, "slow-worker", &parent);
+        let work = anyagents_core::agent_work_dir(dir.path(), &child.id);
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        let recipient = store
+            .create_agent(anyagents_core::NewAgent::new("recipient", "opencode"))
+            .unwrap();
+        store
+            .receive(&recipient.id, anyagents_core::Incoming::new("pending mail"))
+            .unwrap();
+        store.set_agent_state(&recipient.id, "created").unwrap();
+        let entered = dir.path().join("git-entered");
+        let release = dir.path().join("git-release");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let git = bin.join("git");
+        std::fs::write(
+            &git,
+            format!(
+                r#"#!/bin/sh
+if [ "$4" = '{}' ] && [ "$5" = status ]; then
+    touch '{}'
+    n=0
+    while [ ! -e '{}' ] && [ "$n" -lt 1000 ]; do sleep 0.01; n=$((n+1)); done
+    exit 1
+fi
+exec /usr/bin/git "$@"
+"#,
+                work.display(),
+                entered.display(),
+                release.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let previous_path = std::env::var_os("PATH");
+        let path =
+            std::env::join_paths([bin, PathBuf::from("/usr/bin"), PathBuf::from("/bin")]).unwrap();
+        unsafe {
+            std::env::set_var("PATH", path);
+        }
+        let worker_store = Store::open(&db).unwrap();
+        let worker_data = dir.path().to_path_buf();
+        let worker = std::thread::spawn(move || {
+            reap_archived_agents(&worker_store, &worker_data, &HealthBoard::default())
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !entered.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let was_entered = entered.exists();
+        let owns_lifecycle = matches!(
+            store.try_lock_agent_lifecycle(&child.id),
+            Err(Error::AgentBusy)
+        );
+        let rec_store = Store::open(&db).unwrap();
+        let rec_data = dir.path().to_path_buf();
+        let reconcile = Arc::new(Mutex::new(AdminReconcileState::default()));
+        let rec = Arc::clone(&reconcile);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let scanner = std::thread::spawn(move || {
+            reconcile_stopped_and_backed_off_agents(
+                &rec_store,
+                &HealthBoard::default(),
+                &rec_data,
+                &rec,
+                now_ms(),
+            );
+            done_tx.send(()).unwrap();
+        });
+        let progressed_while_blocked = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        let recipient_running = store.agent(&recipient.id).unwrap().state == "running";
+        let mutex_free = reconcile.try_lock().is_ok();
+        std::fs::write(&release, b"release").unwrap();
+        worker.join().unwrap();
+        scanner.join().unwrap();
+        unsafe {
+            if let Some(path) = previous_path {
+                std::env::set_var("PATH", path);
+            } else {
+                std::env::remove_var("PATH");
+            }
+        }
+        assert!(was_entered, "reaper never reached the git barrier");
+        assert!(
+            owns_lifecycle,
+            "barrier did not observe reaper lifecycle ownership"
+        );
+        assert!(
+            progressed_while_blocked && recipient_running && mutex_free,
+            "unrelated mail reconciliation waited for blocked cleanup"
+        );
+    }
+
     #[test]
     fn reap_subagent_ephemeral_dirs_removes_gemini_tmp_and_dirty_worktree_build_outputs() {
         let data = tempfile::tempdir().unwrap();
@@ -6014,5 +7284,561 @@ pub(crate) mod tests {
         assert!(work_dir.join("dirty.rs").exists());
         assert!(!work_dir.join("target").exists());
         assert!(!work_dir.join("apps/web/node_modules").exists());
+    }
+    fn mark_explicitly_archived(store: &Store, data_dir: &Path, agent: &Agent) {
+        let Ok(_lifecycle) = store.lock_agent_lifecycle(&agent.id) else {
+            return;
+        };
+        let _ = store.set_agent_state(&agent.id, "archived");
+        mark_explicitly_archived_locked(store, data_dir, agent);
+    }
+
+    fn authored_send(
+        store: &Store,
+        actor: &Actor,
+        to: &str,
+        text: &str,
+        key: &str,
+    ) -> SendResponse {
+        let body = SendRequest {
+            sender: Some(actor.as_address()),
+            to: vec![to.to_string()],
+            text: text.to_string(),
+            idempotency_key: Some(key.to_string()),
+            ..Default::default()
+        };
+        let key = send_key(&body);
+        let plan = SendPlan::parse(store, actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
+        send_sync(store, actor, body, plan, key)
+            .unwrap_or_else(|e| panic!("{}", e.message))
+            .0
+    }
+
+    #[test]
+    fn direct_authored_sends_wake_archived_agents_once_in_mailbox_order_and_survive_reopen() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let actor = Actor::Agent(parent.name.clone());
+        store
+            .receive(&child.id, Incoming::new("queued before archive"))
+            .unwrap();
+        store.set_agent_state(&child.id, "archived").unwrap();
+        mark_explicitly_archived(&store, dir.path(), &child);
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
+        for file in [
+            ".anyagents-last-error.json",
+            ".anyagents-notified-parent-error.json",
+        ] {
+            std::fs::write(cfg.join(file), "old error").unwrap();
+        }
+        // An authored quotation of a lifecycle prefix is still a direct send:
+        // bodies are not the wake discriminator.
+        let sent = authored_send(
+            &store,
+            &actor,
+            "agent:worker",
+            "[Sub-Agent Completed] quoted in a follow-up",
+            "direct-1",
+        );
+        assert_eq!(sent.deliveries[0].seq, 2);
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+        assert!(!has_explicit_archive_marker(dir.path(), &child.id));
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
+        assert!(!cfg.join(".anyagents-notified-parent-error.json").exists());
+        assert!(anyagents_core::agent_work_dir(dir.path(), &child.id).exists());
+        let retried = authored_send(
+            &store,
+            &actor,
+            "agent:worker",
+            "[Sub-Agent Completed] quoted in a follow-up",
+            "direct-1",
+        );
+        assert_eq!(retried.deliveries[0].id, sent.deliveries[0].id);
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 2);
+        // Replay after a new archive is not a fresh wake instruction.
+        store.set_agent_state(&child.id, "archived").unwrap();
+        mark_explicitly_archived(&store, dir.path(), &child);
+        authored_send(
+            &store,
+            &actor,
+            "agent:worker",
+            "[Sub-Agent Completed] quoted in a follow-up",
+            "direct-1",
+        );
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        assert!(has_explicit_archive_marker(dir.path(), &child.id));
+        // Operator-authored direct sends also work by immutable id.
+        authored_send(
+            &store,
+            &Actor::Operator("operator".into()),
+            child.id.as_str(),
+            "operator follow-up",
+            "direct-2",
+        );
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+        assert!(!has_explicit_archive_marker(dir.path(), &child.id));
+        let inbox = store.inbox(&child.id, None).unwrap();
+        assert_eq!(
+            inbox.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert_eq!(inbox[2].text, "operator follow-up");
+        mark_explicitly_archived(&store, dir.path(), &child);
+        let replayed = authored_send(
+            &store,
+            &Actor::Operator("operator".into()),
+            child.id.as_str(),
+            "operator follow-up",
+            "direct-2",
+        );
+        assert_eq!(replayed.deliveries[0].seq, 3);
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        assert!(has_explicit_archive_marker(dir.path(), &child.id));
+        // Simulate a stop after mailbox commit but before whole-send receipt.
+        rusqlite::Connection::open(&db)
+            .unwrap()
+            .execute("DELETE FROM sends", [])
+            .unwrap();
+        std::fs::write(
+            cfg.join(".anyagents-last-error.json"),
+            "new error after archive",
+        )
+        .unwrap();
+        let replayed = authored_send(
+            &store,
+            &Actor::Operator("operator".into()),
+            child.id.as_str(),
+            "operator follow-up",
+            "direct-2",
+        );
+        assert!(replayed.deliveries[0].duplicate);
+        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        assert!(has_explicit_archive_marker(dir.path(), &child.id));
+        assert!(cfg.join(".anyagents-last-error.json").exists());
+        assert_eq!(store.inbox(&child.id, None).unwrap().len(), 3);
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archived_agents_stay_retired_on_channel_senders_aliases_groups_and_deleted_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
+            .unwrap();
+        store.set_agent_state(&parent.id, "running").unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        store.set_agent_state(&child.id, "archived").unwrap();
+        mark_explicitly_archived(&store, dir.path(), &child);
+        store.join_group("crew", &parent.id).unwrap();
+        store.join_group("crew", &child.id).unwrap();
+        let operator = Actor::Operator("operator".into());
+        for to in ["all", "group:all", "group:crew"] {
+            authored_send(&store, &operator, to, "broadcast", to);
+            assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+        }
+        let actor = Actor::Agent(parent.name.clone());
+        for to in ["children", "group:children", "siblings"] {
+            let body = SendRequest {
+                to: vec![to.into()],
+                ..Default::default()
+            };
+            assert!(SendPlan::parse(&store, &actor, &body).is_err());
+        }
+        for from in ["telegram:user:123", "telegram:chat:-456"] {
+            authored_send(
+                &store,
+                &Actor::parse(from).unwrap_or_else(|e| panic!("{}", e.message)),
+                "worker",
+                "channel update",
+                from,
+            );
+            assert_eq!(store.agent(&child.id).unwrap().state, "archived");
+            assert!(has_explicit_archive_marker(dir.path(), &child.id));
+        }
+        let deleted_id = child.id.clone();
+        store.delete_agent(&deleted_id).unwrap();
+        let body = SendRequest {
+            to: vec![deleted_id.to_string()],
+            ..Default::default()
+        };
+        let plan =
+            SendPlan::parse(&store, &actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
+        let error = send_sync(&store, &actor, body, plan, None).expect_err("deleted target");
+        assert_eq!(error.status, StatusCode::NOT_FOUND);
+        assert!(store.agent(&deleted_id).is_err());
+    }
+    #[test]
+    fn direct_send_and_archive_serialize_across_store_connections() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let recipient = store
+            .create_agent(anyagents_core::NewAgent::new("recipient", "opencode"))
+            .unwrap();
+        store.set_agent_state(&recipient.id, "running").unwrap();
+        let guard = store.lock_agent_lifecycle(&recipient.id).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = Store::open(&db).unwrap();
+        let sender = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let receipt = authored_send(
+                &other,
+                &Actor::Operator("operator".into()),
+                "recipient",
+                "follow-up",
+                "interleave",
+            );
+            done_tx.send(receipt).unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+        store.set_agent_state(&recipient.id, "archived").unwrap();
+        mark_explicitly_archived_locked(&store, dir.path(), &recipient);
+        drop(guard);
+        let receipt = done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        sender.join().unwrap();
+        assert_eq!(receipt.deliveries[0].seq, 1);
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "running");
+        assert!(!has_explicit_archive_marker(dir.path(), &recipient.id));
+        // The converse ordering leaves a coherent archive, not running+marker.
+        let guard = store.lock_agent_lifecycle(&recipient.id).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let other = Store::open(&db).unwrap();
+        let archived_id = recipient.id.clone();
+        let archive = std::thread::spawn(move || {
+            let recipient = other.agent(&archived_id).unwrap();
+            mark_explicitly_archived(&other, other.data_dir(), &recipient);
+            done_tx.send(()).unwrap();
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(30))
+                .is_err()
+        );
+        drop(guard);
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        archive.join().unwrap();
+        assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
+        assert!(has_explicit_archive_marker(dir.path(), &recipient.id));
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+    #[test]
+    fn stale_reconcile_population_cannot_rearchive_a_woken_parent_and_child() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        mark_explicitly_archived(&store, dir.path(), &parent);
+        let stale_population = store.list_agents().unwrap();
+        // Both wake operations happen after the population scan and before
+        // reconciliation takes their locks. The old parent row is not authority.
+        authored_send(
+            &store,
+            &Actor::Operator("operator".into()),
+            "parent-agent",
+            "continue",
+            "parent-wake",
+        );
+        authored_send(
+            &store,
+            &Actor::Agent(parent.name.clone()),
+            "worker",
+            "continue",
+            "child-wake",
+        );
+        reconcile_agent_snapshot(
+            &store,
+            &HealthBoard::default(),
+            dir.path(),
+            &Arc::new(Mutex::new(AdminReconcileState::default())),
+            now_ms(),
+            stale_population,
+        );
+        assert_eq!(store.agent(&parent.id).unwrap().state, "running");
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+        assert!(!has_explicit_archive_marker(dir.path(), &parent.id));
+        assert!(!has_explicit_archive_marker(dir.path(), &child.id));
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn standing_domain_mind_cannot_be_archived_and_harness_switch_clears_stale_error() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let hub = store
+            .create_agent(anyagents_core::NewAgent::new("argus", "codex"))
+            .unwrap();
+        store.set_agent_admin(&hub.id, true).unwrap();
+        let mut new_mind = anyagents_core::NewAgent::new("calliope", "sylphx");
+        new_mind.parent_id = Some(hub.id.clone());
+        new_mind.role = Some("Game Studio".into());
+        let mind = store.create_agent(new_mind).unwrap();
+        store.set_agent_state(&mind.id, "running").unwrap();
+        let mut new_runner = anyagents_core::NewAgent::new("calliope-sub-1", "opencode");
+        new_runner.parent_id = Some(mind.id.clone());
+        let runner = store.create_agent(new_runner).unwrap();
+        store.set_agent_state(&runner.id, "running").unwrap();
+
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            // Neither self, parent hub (`argus`), nor operator can archive `calliope` while its role is set.
+            for caller in [
+                Principal::Agent {
+                    agent_id: mind.id.clone(),
+                    name: mind.name.clone(),
+                },
+                Principal::Agent {
+                    agent_id: hub.id.clone(),
+                    name: hub.name.clone(),
+                },
+                Principal::Operator,
+            ] {
+                let err =
+                    archive_agent_route(caller, State(state.clone()), AxumPath("calliope".into()))
+                        .await
+                        .expect_err("standing domain mind with role must reject archive");
+                assert_eq!(err.status, StatusCode::BAD_REQUEST);
+                assert!(
+                    err.message
+                        .contains("a standing domain mind (with a role) cannot be archived"),
+                    "unexpected error: {}",
+                    err.message
+                );
+            }
+            assert_eq!(store.agent(&mind.id).unwrap().state, "running");
+            assert_eq!(store.agent(&runner.id).unwrap().state, "running");
+        });
+
+        // Offline CLI path also blocks archiving a standing domain mind with a role.
+        let cli_err = crate::agent::agents(
+            dir.path(),
+            crate::AgentsCommand::Archive {
+                name: "calliope".into(),
+            },
+        )
+        .expect_err("offline archive must also block standing domain mind");
+        assert!(
+            cli_err
+                .to_string()
+                .contains("a standing domain mind (with a role) cannot be archived")
+        );
+
+        // Persist a stale sylphx error and parent-error notification marker, then switch harness.
+        let cfg = anyagents_core::agent_config_dir(dir.path(), &mind.id);
+        std::fs::create_dir_all(&cfg).unwrap();
+        crate::vendor::persist_last_error(&cfg, Some("sylphx stream error 502"), None);
+        std::fs::write(cfg.join(".anyagents-notified-parent-error.json"), "{}").unwrap();
+        assert!(cfg.join(".anyagents-last-error.json").is_file());
+        assert!(cfg.join(".anyagents-notified-parent-error.json").is_file());
+
+        create::set_agent_harness(
+            &store,
+            dir.path(),
+            "agent:argus",
+            "calliope",
+            "codex",
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(!cfg.join(".anyagents-last-error.json").is_file());
+        assert!(!cfg.join(".anyagents-notified-parent-error.json").is_file());
+        let updated_mind = store.agent(&mind.id).unwrap();
+        let view = agent_view(&store, &state.health, &updated_mind)
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+        assert_eq!(view.harness, "codex");
+        assert_eq!(view.turn_state, "idle");
+        assert!(view.last_error.is_none());
+
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let parent_workdir = dir.path().join("repo");
+        let agents_dir = parent_workdir.join(".agents").join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("writer.md"),
+            "---\ndescription: \"Ephemeral worktree PR writer\"\nscope: isolated\nworkdir: private\nharness: codex\nmodel: gpt-5.4\n---\n# Writer Archetype\nAlways run cargo test before opening a PR.\n",
+        )
+        .unwrap();
+
+        let store = Arc::new(crate::agent::open_with_key(dir.path()).unwrap());
+        let mut new_parent = anyagents_core::NewAgent::new("lyra", "opencode");
+        new_parent.workdir = Some(parent_workdir.to_string_lossy().to_string());
+        let parent = store.create_agent(new_parent).unwrap();
+
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().to_path_buf(),
+            },
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let req: CreateAgentRequest = serde_json::from_value(serde_json::json!({
+                "name": "lyra-writer-1",
+                "type": "writer",
+                "instructions": "Fix issue #42."
+            }))
+            .unwrap();
+            let (status, Json(created)) = create_agent_route(
+                Principal::Agent {
+                    agent_id: parent.id.clone(),
+                    name: parent.name.clone(),
+                },
+                State(state.clone()),
+                Json(req),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+            assert_eq!(status, StatusCode::CREATED);
+            assert_eq!(
+                created.description.as_deref(),
+                Some("Ephemeral worktree PR writer")
+            );
+            assert_eq!(created.scope, "isolated");
+            assert_eq!(created.harness, "codex");
+            assert_eq!(created.model.as_deref(), Some("gpt-5.4"));
+            let inst = created.instructions.as_deref().unwrap_or("");
+            assert!(
+                inst.starts_with("# Writer Archetype\nAlways run cargo test before opening a PR.")
+            );
+            assert!(inst.ends_with("Fix issue #42."));
+        });
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn reap_idle_subagent_caches_removes_ephemeral_caches_preserving_sessions_and_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        let mut new_child = anyagents_core::NewAgent::new("sub-worker", "opencode");
+        new_child.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new_child).unwrap();
+
+        let agent_root = dir.path().join("agents").join(child.id.as_str());
+        let config_dir = agent_root.join("config");
+        let work_dir = agent_root.join("work");
+        for cache_rel in [
+            "cache-home",
+            "cache",
+            ".cache",
+            ".npm",
+            ".bun",
+            ".cargo",
+            ".rustup",
+            ".tmp",
+            "tmp",
+            "shell-snapshots",
+        ] {
+            let p = config_dir.join(cache_rel);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("blob.bin"), b"ephemeral").unwrap();
+        }
+        for keep_rel in [".claude", ".codex", ".gemini", "opencode", ".config"] {
+            let p = config_dir.join(keep_rel);
+            std::fs::create_dir_all(&p).unwrap();
+            std::fs::write(p.join("session.json"), b"{}").unwrap();
+        }
+        std::fs::create_dir_all(&work_dir).unwrap();
+        std::fs::write(work_dir.join("lib.rs"), b"pub fn ok() {}\n").unwrap();
+
+        assert!(reap_idle_subagent_caches(dir.path(), &child.id));
+
+        for cache_rel in [
+            "cache-home",
+            "cache",
+            ".cache",
+            ".npm",
+            ".bun",
+            ".cargo",
+            ".rustup",
+            ".tmp",
+            "tmp",
+            "shell-snapshots",
+        ] {
+            assert!(
+                !config_dir.join(cache_rel).exists(),
+                "expected ephemeral cache {cache_rel} to be removed"
+            );
+        }
+        for keep_rel in [".claude", ".codex", ".gemini", "opencode", ".config"] {
+            assert!(
+                config_dir.join(keep_rel).join("session.json").is_file(),
+                "expected session state {keep_rel} to be preserved"
+            );
+        }
+        assert!(work_dir.join("lib.rs").is_file());
     }
 }

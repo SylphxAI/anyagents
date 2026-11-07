@@ -29,7 +29,7 @@ Everything runs in one process, `anyagents serve`, with one embedded database. E
 An agent's identity, instructions, conversation history, mailbox, channels and credentials live in AnyAgents, never only in a vendor tool's local files. A vendor session is a working copy. So an agent can move to another harness or another model and keep its history, its mailbox and its Telegram bot.
 
 - **Transcript.** The server records every turn from the harness stream: the input messages, the assistant text, tool calls and results as the harness reports them, and usage. This transcript, not the vendor's session file, is the agent's history.
-- **Switching harness or model.** The vendor session id is kept per (agent, harness) and resumed while the agent stays on that harness. On a switch, the new harness starts a new vendor session primed from the transcript: the instructions, a summary of older turns, and the recent turns verbatim. A tool call in flight in the old harness is not carried across; the switch waits for the current turn to end or cancels it.
+- **Switching harness or model.** The supervisor applies changed configuration before its next dispatch when the retiring process is idle, faulted or dead. A healthy in-flight turn may finish at its normal boundary, with a 15-second maximum drain window; new mailbox messages wait in the store during that drain. Paused and archived agents launch the configured harness when explicitly woken. Replacement preserves identity, instructions, schedules, the delivery cursor and pending mail. Cross-harness continuity comes from the conversation store, not a copy of the retiring vendor transcript; already-delivered messages are not replayed. A tool call in flight in the old harness is not carried across.
 - **Credentials.** Each auth profile has its own config directory under the AnyAgents data directory, and the harness is started with its documented config-directory setting pointed there (for example `CLAUDE_CONFIG_DIR`, `CODEX_HOME`). The vendor tool writes its sign-in credential into that directory; AnyAgents owns where it lives, backs it up with the rest of its state, and never reads the token itself. API keys are kept in AnyAgents' secret store (below).
 
 ## Three axes: harness, model, auth
@@ -97,6 +97,25 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### Archived sub-agent cleanup
+
+An explicit archive creates a fresh `.anyagents-archived` generation in the
+agent's config directory. Successful ephemeral cleanup copies that generation
+to `.anyagents-reaped`; retained dirty, unpushed, external or shared worktrees do
+not cause cleanup to repeat. A wake clears both markers before the agent resumes.
+Missing or empty legacy archive generations are repaired under the lifecycle
+lock, and unsuccessful cleanup stays pending for a later pass.
+
+Both server modes run archive cleanup in their existing independent maintenance
+worker, immediately at startup and then every 60 seconds. Mail reconciliation
+never reaps directories or waits for a busy lifecycle lock: it skips that row
+and continues with unrelated agents. Explicit online archive waits for process
+down before cleaning the target; descendants remain pending until their
+processes stop. Offline archive performs cleanup without a daemon. Cleanup does
+not initialize seat skills or recreate an empty workdir; runtime preparation on
+wake does that. Credential propagation may independently recreate small auth
+directories, but their existence is not a cleanup trigger.
+
 ### The adapter contract
 
 One adapter per harness. A new harness is an adapter plus a catalog entry; the mailbox, channels, `send` and usage do not change.
@@ -146,6 +165,35 @@ fixtures, not a live authenticated Claude model test.
 No harness here uses `queue`: none of them is a one-shot run that must wait.
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
+
+### OpenCode service isolation
+
+Each OpenCode agent persists its service port in
+`<agent>/config/opencode-service-port`. Allocation probes loopback ports
+20000–29999, reuses the saved port when free, and reserves it while the child
+starts. An occupied saved port or a bind race selects a replacement, persists it,
+and logs the old and new numbers. Collision classification preserves a bounded,
+private stderr signal from the child, including when the holder has already
+released the port before a later bind probe. Raw stderr is not published.
+Stopping the harness releases its socket and
+in-process reservation; deleting the agent also removes the saved allocation
+with its config directory.
+
+The adapter uses `serve --hostname 127.0.0.1 --port <port>`, then points every
+`api --server <url>` call at that child's announced endpoint. It refuses to call
+`api` if the announcement is missing, so a failed startup cannot discover or
+start the machine's default managed service. Agent config, data and state roots
+are set before the first vendor command. Inherited server passwords are removed
+only from the service launch so OpenCode generates and announces its own private
+credential; subsequent API children receive that credential.
+
+OpenCode v2.1.4 source, read 2026-11-07 UTC at
+[`68bc26b`](https://github.com/anomalyco/opencode/tree/68bc26b7da1990ce10ffecfbc1e09eb13aa5d824),
+confirms the explicit port in `packages/cli/src/commands/handlers/serve.ts:9–14`
+and `packages/cli/src/server-process.ts:68–72`. The managed-service fallback is
+in `packages/cli/src/services/server-connection.ts:29–55`; service setters stop
+the managed service before writing (`services/service-config.ts:273–277`), so
+this adapter does not invoke a setter or edit shared service configuration.
 
 ### Antigravity and Muse
 
@@ -273,6 +321,44 @@ A subscription harness often reports tokens but no price; its record says `subsc
 - The operator's authority is its own token, never an agent's.
 - Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
 - On a deployment with an operator token, every harness runs in its own OS seat: a distinct managed uid, no new privileges, and no read of the server's files or a peer's config. A deployment without that seat refuses to start as the boundary.
+
+## Agent scope and metadata updates
+
+An explicit `scope` survives server restarts, runtime-config reconciliation,
+provider-route refreshes and unrelated metadata updates. SQLite is authoritative:
+`agents.launch_env` retains `ANYAGENTS_SCOPE` (and the legacy `ANYAGENTS_PUBLIC`
+marker); only the scope setter owns these keys. Harness-environment replacement
+merges them from the current row in the same write transaction.
+
+Without an explicit policy, roots are `public`, `*-assistant` children are
+`isolated`, other children with a nonempty `role` are `siblings`, and task
+children without a role are `private`. Description, instructions and role
+updates that omit both `scope` and `public` preserve the explicit policy.
+
+The legacy `public` boolean describes cross-tree reachability, not sibling
+access. `true` selects `public`. `false` preserves an existing nonpublic scope;
+for a public agent it restores the default above. An explicit `scope` takes
+precedence when both fields are supplied. To restrict a standing child to
+`private`, send `scope: "private"` explicitly.
+
+Agents may edit their own description and instructions. Changing scope or role
+requires an ancestor, a root admin or the operator; updating another agent's
+private metadata requires the same authority. Unrelated non-admin agents cannot
+overwrite it.
+
+Every accepted scope or legacy-public write, including an unchanged value,
+atomically records its authenticated `actor`, `before_scope`, `after_scope` and
+`source` (`scope` or `public`) in `admin_audit`. Internal store callers record
+`system`; API callers record `operator` or `agent:<name>`. An operator can trace
+policy changes with:
+
+```sql
+SELECT datetime(created_at / 1000, 'unixepoch') AS utc,
+       actor, target, before_scope, after_scope, source
+FROM admin_audit
+WHERE source IS NOT NULL AND target = 'agent-name'
+ORDER BY id;
+```
 
 ## Storage
 

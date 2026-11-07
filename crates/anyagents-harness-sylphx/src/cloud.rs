@@ -8,11 +8,11 @@ use std::sync::{Mutex, OnceLock};
 
 use serde_json::{Value, json};
 
-use super::auth::{DEFAULT_SYLPHX_API_URL, base64_encode, resolve_sylphx_api_key};
+use super::auth::{DEFAULT_SYLPHX_API_URL, resolve_sylphx_api_key};
 
 pub const DEFAULT_SYLPHX_SANDBOX_PARENT: &str = "orgs/org_fs01afbdccgn8xdk1ghj5y47w0vtph/projects/prj_fs01nh48z2cee2ccqddykqeys3rvc4/envs/env_fs014mk148yf5ngawpe4zcey9rvq89";
 pub const DEFAULT_SYLPHX_SANDBOX_SHAPE: &str = "linux-s";
-pub const CLOUD_WORKSPACE_DIR: &str = "/workspace/repository";
+pub const CLOUD_WORKSPACE_DIR: &str = "/home/user";
 
 #[derive(Debug, Clone, Default)]
 pub struct CloudWorktreeSpec {
@@ -95,48 +95,22 @@ pub fn resolve_sylphx_cloud_access_key(
     resolve_sylphx_api_key(config_dir, env)
 }
 
-fn is_pinned_commit_or_head(rev: &str) -> bool {
-    let t = rev.trim();
-    t == "HEAD" || (t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()))
-}
-
 /// Builds a declarative `sylphx.agents.v1.EnvironmentSpec` JSON object for `Sylphx Cloud Agents`
 /// (`POST /v1/{env}/agents` and `POST /v1/{env}/agent_sessions`) so the cloud runtime provisions
-/// the full Cloud Agent container (`template:agent`, `shape: "linux-s"`) with the agent's Git
-/// repository cloned at `/workspace/repository`.
-///
-/// Only passes `repo.revision` when it is a verified commit SHA or `"HEAD"` so newly created
-/// local branch names (`agent/...`) that have not yet been pushed to `origin` never cause
-/// `PREPARE_REPOSITORY` (`git rev-parse --verify "${revision}^{commit}"`) to fail on clone.
+/// a persistent, general-purpose Cloud Agent computer (`template:agent`, `shape: "linux-s"`,
+/// `idle_standby: "1800s"`) managed natively by `Sylphx Cloud`.
 pub fn build_cloud_environment_spec(
-    config_dir: &Path,
-    work_dir: Option<&Path>,
+    _config_dir: &Path,
+    _work_dir: Option<&Path>,
     env: &[(String, String)],
 ) -> Value {
-    let wt = resolve_agent_git_worktree_spec(config_dir, work_dir, env, None, None, None);
     let shape = resolve_sandbox_shape(env);
-    let mut spec = json!({
+    json!({
         "shape": shape,
         "template": "template:agent",
         "ttl": "1800s",
-        "idle_standby": "900s",
-    });
-    if let Some(uri) = wt.repo_url
-        && let Some(obj) = spec.as_object_mut()
-    {
-        let mut repo_obj = serde_json::Map::new();
-        repo_obj.insert("uri".to_string(), json!(uri));
-        if let Some(rev) = wt
-            .base
-            .as_deref()
-            .filter(|r| is_pinned_commit_or_head(r))
-            .or_else(|| wt.branch.as_deref().filter(|r| is_pinned_commit_or_head(r)))
-        {
-            repo_obj.insert("revision".to_string(), json!(rev.trim()));
-        }
-        obj.insert("repo".to_string(), Value::Object(repo_obj));
-    }
-    spec
+        "idle_standby": "1800s",
+    })
 }
 
 fn normalize_github_repo_url_and_slug(raw: &str) -> Option<(String, String)> {
@@ -430,46 +404,6 @@ pub(super) fn resolve_github_token(env: &[(String, String)]) -> Option<String> {
                 }
                 return Some(tok);
             }
-        }
-    }
-    None
-}
-
-pub(super) fn resolve_kubeconfig_b64(env: &[(String, String)]) -> Option<String> {
-    for (k, v) in env {
-        if k == "KUBECONFIG_B64" && !v.trim().is_empty() {
-            return Some(v.trim().to_string());
-        }
-    }
-    if let Ok(v) = std::env::var("KUBECONFIG_B64")
-        && !v.trim().is_empty()
-    {
-        return Some(v.trim().to_string());
-    }
-    let explicit_path = env
-        .iter()
-        .find(|(k, v)| k == "KUBECONFIG" && !v.trim().is_empty())
-        .map(|(_, v)| PathBuf::from(v.trim().split(':').next().unwrap_or("")))
-        .or_else(|| {
-            std::env::var("KUBECONFIG")
-                .ok()
-                .filter(|s| !s.trim().is_empty())
-                .map(|s| PathBuf::from(s.trim().split(':').next().unwrap_or("")))
-        });
-    if let Some(p) = explicit_path
-        && let Ok(bytes) = std::fs::read(&p)
-        && !bytes.is_empty()
-        && bytes.len() <= 65_536
-    {
-        return Some(base64_encode(&bytes));
-    }
-    if let Some(home) = crate::sandbox::host_home_dir() {
-        let kc = home.join(".kube/config");
-        if let Ok(bytes) = std::fs::read(&kc)
-            && !bytes.is_empty()
-            && bytes.len() <= 65_536
-        {
-            return Some(base64_encode(&bytes));
         }
     }
     None

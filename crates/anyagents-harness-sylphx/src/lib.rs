@@ -90,7 +90,7 @@ use std::time::{Duration, Instant};
 
 use anyagents_harness::{
     DeliverOutcome, DeliveryMode, Harness, HarnessError, HarnessHealth, OutboundMessage,
-    SteerSupport, TurnState, TurnUsage, marked_message,
+    SteerSupport, TurnState, TurnUsage, compose_message,
 };
 use serde_json::{Value, json};
 
@@ -215,6 +215,9 @@ pub fn resolve_cloud_agent_environment(
     config_dir: &Path,
     env: &[(String, String)],
 ) -> Option<String> {
+    if auth::is_external_chat_provider_model(None, config_dir) {
+        return None;
+    }
     if std::fs::read_to_string(config_dir.join("sylphx-workspace-placement.json"))
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -277,19 +280,43 @@ pub fn resolve_cloud_agent_environment(
     {
         return Some(normalize_cloud_env_slug(env_slug));
     }
-    if matches!(
-        sdk::SylphxExecutionMode::from_env(config_dir, env),
-        sdk::SylphxExecutionMode::CloudOnly
-    ) && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
+    let mode = sdk::SylphxExecutionMode::from_env(config_dir, env);
+    if (matches!(mode, sdk::SylphxExecutionMode::CloudOnly)
+        || (matches!(mode, sdk::SylphxExecutionMode::AutoCloudFirst)
+            && !crate::sandbox::is_isolated_test_env()))
+        && resolve_sylphx_cloud_access_key(config_dir, env).is_some()
     {
         return Some(DEFAULT_SYLPHX_SANDBOX_PARENT.to_string());
     }
     None
 }
 
+pub(crate) fn is_recoverable_cloud_session_lease_error(err: &str) -> bool {
+    err.contains("Paused sandbox lease could not be resumed")
+        || err.contains("Pinned repository preparation failed")
+        || err.contains("Sandbox lease is not ready")
+        || err.contains("already been released")
+        || err.contains("Existing sandbox lease could not be read")
+}
+
+pub(crate) fn is_retryable_cloud_turn_error(err: &str) -> bool {
+    is_recoverable_cloud_session_lease_error(err)
+        || err.contains("model_refused")
+        || err.contains("empty_model_response")
+        || err.contains("stalled in")
+}
+
+fn compose_text(message: &OutboundMessage) -> String {
+    let mut context = message.context.clone();
+    if context.sender.is_none() {
+        context.sender = message.sender.clone();
+    }
+    compose_message(&message.id, &context, &message.text)
+}
+
 impl Harness for SylphxHarness {
     fn deliver(&mut self, message: &OutboundMessage) -> Result<DeliverOutcome, HarnessError> {
-        let marked = marked_message(&message.id, &message.text);
+        let marked = compose_text(message);
         if let Some(ref log_path) = self.fake_log {
             let _ = std::fs::OpenOptions::new()
                 .create(true)
@@ -390,7 +417,7 @@ impl Harness for SylphxHarness {
 
         std::thread::spawn(move || {
             let outcome = if let Some(env_slug) = cloud_env {
-                match run_cloud_session_turn(
+                let first_try = run_cloud_session_turn(
                     &state,
                     &cancel_flag,
                     &config_dir,
@@ -401,12 +428,49 @@ impl Harness for SylphxHarness {
                     &mcp_args,
                     &env_slug,
                     &marked,
-                ) {
+                );
+                let resolved = match first_try {
+                    Ok(usage) => Ok(usage),
+                    Err(ref first_err)
+                        if is_retryable_cloud_turn_error(first_err)
+                            && !cancel_flag.load(Ordering::SeqCst) =>
+                    {
+                        clear_persisted_cloud_session(&config_dir);
+                        {
+                            let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                            g.cloud_agent_id = None;
+                            g.cloud_session_id = None;
+                        }
+                        run_cloud_session_turn(
+                            &state,
+                            &cancel_flag,
+                            &config_dir,
+                            &work_dir,
+                            model.as_deref(),
+                            &env,
+                            &mcp_command,
+                            &mcp_args,
+                            &env_slug,
+                            &marked,
+                        )
+                    }
+                    Err(first_err) => Err(first_err),
+                };
+                match resolved {
                     Ok(usage) => Ok(usage),
                     Err(cloud_err) => {
-                        if !crate::sandbox::is_isolated_test_env() {
+                        if matches!(
+                            sdk::SylphxExecutionMode::from_env(&config_dir, &env),
+                            sdk::SylphxExecutionMode::CloudOnly
+                        ) {
                             Err(cloud_err)
                         } else {
+                            clear_persisted_cloud_session(&config_dir);
+                            {
+                                let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                                g.cloud_agent_id = None;
+                                g.cloud_session_id = None;
+                            }
                             run_native_gateway_turn(
                                 &state,
                                 &cancel_flag,
@@ -597,7 +661,7 @@ impl Harness for SylphxHarness {
     }
 
     fn process_id(&self) -> Option<u32> {
-        Some(std::process::id())
+        None
     }
 
     fn watch_activity(&self, notify: Arc<dyn Fn() + Send + Sync>) {
@@ -656,6 +720,8 @@ fn is_cloud_client_coordination_tool(name: &str) -> bool {
             | "schedule"
             | "browser"
             | "goal"
+            | "sandbox"
+            | "activate_skill"
     )
 }
 
@@ -715,7 +781,6 @@ fn capture_cloud_turn_execution(
     api_key: &str,
     gateway_key: &str,
     repo_token: Option<&str>,
-    kubeconfig_b64: Option<&str>,
     sess_path: &str,
     turn: i64,
     has_repo: bool,
@@ -764,10 +829,23 @@ fn capture_cloud_turn_execution(
         json!({ "handle": inference_handle }),
     );
     if let Some(tok) = repo_token.filter(|s| !s.trim().is_empty()) {
-        if has_repo && let Some(repo_handle) = capture_one("execution", &["repository"], tok)? {
-            credentials.insert("repository".to_string(), json!({ "handle": repo_handle }));
+        let basic_auth = format!(
+            "Basic {}",
+            base64_encode(format!("x-access-token:{}", tok.trim()).as_bytes())
+        );
+        if has_repo
+            && let Some(repo_handle) = capture_one("execution", &["repository"], &basic_auth)?
+        {
+            credentials.insert(
+                "repository".to_string(),
+                json!({
+                    "handle": repo_handle,
+                    "placement": "header:authorization"
+                }),
+            );
         }
-        if let Ok(Some(gh_handle)) = capture_one("execution", &["sandbox", "GH_TOKEN"], tok) {
+        if let Ok(Some(gh_handle)) = capture_one("execution", &["sandbox", "GH_TOKEN"], tok.trim())
+        {
             credentials.insert("GH_TOKEN".to_string(), json!({ "handle": gh_handle }));
         }
     }
@@ -780,11 +858,6 @@ fn capture_cloud_turn_execution(
             json!({ "handle": sylphx_handle }),
         );
     }
-    if let Some(kc) = kubeconfig_b64.filter(|s| !s.trim().is_empty())
-        && let Ok(Some(kc_handle)) = capture_one("execution", &["sandbox", "KUBECONFIG_B64"], kc)
-    {
-        credentials.insert("KUBECONFIG_B64".to_string(), json!({ "handle": kc_handle }));
-    }
     Ok(Some(json!({
         "turn": turn,
         "runtime_credential_handle": runtime_handle,
@@ -794,7 +867,7 @@ fn capture_cloud_turn_execution(
 
 /// Runs a turn against the remote Sylphx Cloud Agents BaaS (`/v1/{env}/agent_sessions`),
 /// passing a declarative `EnvironmentSpec` (`shape: "linux-s"`, `template: "template:agent"`,
-/// `repo: { uri, revision }`), native cloud `builtin` tools (`shell`, `files`), and bridging
+/// `idle_standby: "1800s"`), native cloud `builtin` tools (`shell`, `files`), and bridging
 /// only AnyAgents coordination client tool calls (`send`, `agents`, `conversation`, `groups`,
 /// `schedule`, `browser`, `describe`, `archive`, `goal`) via `:submitToolResult`.
 #[allow(clippy::too_many_arguments)]
@@ -850,7 +923,7 @@ pub fn build_prior_transcript_continuity_block(transcript_path: &Path) -> Option
                 String::new()
             };
             let trimmed = text.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && !trimmed.contains("kind=\"context.window_opened\"") {
                 let bounded = truncate_tool_output_middle_utf8(trimmed.to_string(), 800, 350, 350);
                 lines.push(format!("[{role}]: {bounded}"));
             }
@@ -898,7 +971,6 @@ pub(crate) fn run_cloud_session_turn(
     let gateway_key =
         resolve_sylphx_gateway_key(config_dir, env).unwrap_or_else(|| api_key.clone());
     let repo_token = resolve_github_token(env);
-    let kubeconfig_b64 = resolve_kubeconfig_b64(env);
     let base = resolve_cloud_api_url(env);
     let canonical_env = normalize_cloud_env_slug(env_slug);
     let (model_id, _) = parse_sylphx_model_and_effort(model);
@@ -964,9 +1036,15 @@ pub(crate) fn run_cloud_session_turn(
                                 .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
                         })
                         .unwrap_or(0);
+                    let has_legacy_env = val
+                        .pointer("/environment/idle_standby")
+                        .and_then(Value::as_str)
+                        .is_none_or(|s| s.is_empty())
+                        || val.pointer("/environment/repo").is_some();
                     initial_last_seq = initial_last_seq.max(s_seq);
                     next_turn = tc.saturating_add(1);
-                    if status == "failed"
+                    if has_legacy_env
+                        || status == "failed"
                         || status == "session_state_failed"
                         || status == "terminated"
                         || status == "errored"
@@ -1070,38 +1148,50 @@ pub(crate) fn run_cloud_session_turn(
                 .filter(|s| !s.is_empty())
         })
         .unwrap_or_else(|| "google/gemini-3-flash".to_string());
+    let agent_short_name = config_dir
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or("anyagents-sylphx");
     let mut system_prompt = assemble_system_prompt(config_dir, work_dir);
-    if session_id.is_none()
-        && let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path)
-    {
-        system_prompt.push_str("\n\n");
-        system_prompt.push_str(&prior_block);
+    let mut initial_session_context = String::new();
+    if let Some(prior_block) = build_prior_transcript_continuity_block(&transcript_path) {
+        initial_session_context.push_str(&prior_block);
+    }
+    for state_md_candidate in [
+        work_dir.join("STATE.md"),
+        PathBuf::from(format!("/scratch/tmp/{agent_short_name}/STATE.md")),
+        PathBuf::from(format!("/scratch/tmp/owners/{agent_short_name}.md")),
+    ] {
+        if let Ok(state_md) = std::fs::read_to_string(&state_md_candidate) {
+            let trimmed = state_md.trim();
+            if !trimmed.is_empty() {
+                let bounded =
+                    truncate_tool_output_middle_utf8(trimmed.to_string(), 4_000, 1_800, 1_800);
+                if !initial_session_context.is_empty() {
+                    initial_session_context.push_str("\n\n");
+                }
+                initial_session_context.push_str(&format!(
+                    "<local_state_md>\nSnapshot of `STATE.md` from `{}`:\n{bounded}\n</local_state_md>",
+                    state_md_candidate.display()
+                ));
+                break;
+            }
+        }
     }
     let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
-    if let Some(repo_uri) = environment_spec
-        .pointer("/repo/uri")
-        .and_then(Value::as_str)
-    {
-        let worktree_spec =
-            resolve_agent_git_worktree_spec(config_dir, Some(work_dir), env, None, None, None);
-        let branch_hint = worktree_spec
-            .branch
-            .as_deref()
-            .filter(|b| !b.is_empty())
-            .map(|b| format!(" (target branch: `{b}`)"))
-            .unwrap_or_default();
-        system_prompt.push_str(&format!(
-            "\n\n<cloud_workspace>\nYou are running as a Whole Cloud Agent inside a Cloud Sandbox container.\nYour repository (`{repo_uri}`) is checked out at `{CLOUD_WORKSPACE_DIR}`{branch_hint}.\nRun all workspace commands (`bash`, `read_file`, `write_file`, `edit_file`, `git`) inside `{CLOUD_WORKSPACE_DIR}`.\n</cloud_workspace>"
-        ));
-    }
+    system_prompt.push_str(&format!(
+        "\n\n<cloud_workspace>\nYou are running on a general-purpose Linux computer (workspace `{CLOUD_WORKSPACE_DIR}`) whose files persist across turns.\n\
+Standard tools (`python3`, `node`, `git`, `gh`, `sylphx`, `curl`) are pre-installed and pre-authenticated.\n\
+Clone any Git repository you need directly (`git clone` / `gh repo clone`).\n\
+The local VM is lightweight (`1 vCPU / 2 GiB RAM`); whenever you need to run a CPU- or memory-intensive command of any kind, you can execute it on an on-demand 16-vCPU / 32-GiB remote machine and sync output files back via:\n\
+`sylphx build run --size large [--artifact \"<glob>\" --out .] -- <command>`\n\
+If a task requires host-local dev-machine resources (`/scratch`, `op` 1Password CLI, `kubectl`/`talosctl`, or `desk-*` wrappers), call `sandbox` with `action: \"placement\"` and `placement: \"local\"` to switch this session seamlessly to the local Sylphx harness.\n\
+</cloud_workspace>"
+    ));
 
     if agent_id.is_none() {
         let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
-        let agent_short_name = config_dir
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .unwrap_or("anyagents-sylphx");
         let spec_body = json!({
             "meta": {
                 "display_name": agent_short_name,
@@ -1185,15 +1275,19 @@ pub(crate) fn run_cloud_session_turn(
         &api_key,
         &gateway_key,
         repo_token.as_deref(),
-        kubeconfig_b64.as_deref(),
         &sess_path,
         next_turn,
         has_repo,
     )?;
     let send_url = format!("{base}/v1/{sess_path}:send");
+    let first_turn_text = if next_turn == 1 && !initial_session_context.is_empty() {
+        format!("{}\n\n{user_message}", initial_session_context.trim())
+    } else {
+        user_message.to_string()
+    };
     let mut send_body = json!({
         "message": {
-            "parts": [{ "text": user_message }]
+            "parts": [{ "text": first_turn_text }]
         }
     });
     if let (Some(exec_val), Some(obj)) = (execution_opt, send_body.as_object_mut()) {
@@ -1250,15 +1344,19 @@ pub(crate) fn run_cloud_session_turn(
                 &api_key,
                 &gateway_key,
                 repo_token.as_deref(),
-                kubeconfig_b64.as_deref(),
                 &sess_path,
                 1,
                 has_repo,
             )?;
             let new_send_url = format!("{base}/v1/{sess_path}:send");
+            let recreated_turn_text = if !initial_session_context.is_empty() {
+                format!("{}\n\n{user_message}", initial_session_context.trim())
+            } else {
+                user_message.to_string()
+            };
             let mut new_send_body = json!({
                 "message": {
-                    "parts": [{ "text": user_message }]
+                    "parts": [{ "text": recreated_turn_text }]
                 }
             });
             if let (Some(exec_val), Some(obj)) = (new_exec, new_send_body.as_object_mut()) {
@@ -1304,7 +1402,7 @@ pub(crate) fn run_cloud_session_turn(
     let mut last_progress = Instant::now();
 
     while !cancel_flag.load(Ordering::SeqCst) {
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(Duration::from_millis(1_200));
 
         // Poll session_events for client tool calls and assistant messages
         let poll_events_url = if last_seq > 0 {
@@ -1438,6 +1536,37 @@ pub(crate) fn run_cloud_session_turn(
                             }),
                         );
                         last_progress = Instant::now();
+                        if norm_fn == "sandbox"
+                            && !is_err
+                            && resolve_cloud_agent_environment(config_dir, env).is_none()
+                        {
+                            let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                            {
+                                let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                                g.cloud_agent_id = None;
+                                g.cloud_session_id = None;
+                            }
+                            let local_usage = run_native_gateway_turn(
+                                state,
+                                cancel_flag,
+                                config_dir,
+                                work_dir,
+                                model,
+                                env,
+                                mcp_command,
+                                mcp_args,
+                                user_message,
+                            )?;
+                            return Ok(TurnUsage {
+                                input_tokens: turn_in_tok.saturating_add(local_usage.input_tokens),
+                                output_tokens: turn_out_tok
+                                    .saturating_add(local_usage.output_tokens),
+                                cache_read_tokens: turn_cache_read_tok
+                                    .saturating_add(local_usage.cache_read_tokens),
+                                cache_write_tokens: local_usage.cache_write_tokens,
+                                ..TurnUsage::default()
+                            });
+                        }
                     }
                 } else if ev_type == "USAGE" {
                     let parse_u64 = |ptr: &str| -> u64 {
@@ -1473,7 +1602,9 @@ pub(crate) fn run_cloud_session_turn(
                             .pointer("/response/text")
                             .and_then(Value::as_str)
                             .unwrap_or("cloud turn failed");
-                        if err_text.contains("permanent") {
+                        if err_text.contains("permanent")
+                            || is_recoverable_cloud_session_lease_error(err_text)
+                        {
                             clear_persisted_cloud_session(config_dir);
                             let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
                             g.cloud_agent_id = None;
@@ -1503,6 +1634,33 @@ pub(crate) fn run_cloud_session_turn(
                     }
                 } else if ev_type == "ERROR" || ev_type == "TOOL_RESULT" || ev_type == "SANDBOX" {
                     last_progress = Instant::now();
+                    let err_candidate = if ev_type == "TOOL_RESULT" {
+                        if ev.pointer("/tool_result/error").and_then(Value::as_bool) == Some(true) {
+                            ev.pointer("/tool_result/output/error/message")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        } else {
+                            None
+                        }
+                    } else {
+                        Some(serde_json::to_string(ev).unwrap_or_default())
+                    };
+                    if let Some(ev_str) = err_candidate
+                        && is_recoverable_cloud_session_lease_error(&ev_str)
+                    {
+                        if ev_str.contains("Pinned repository preparation failed") {
+                            let _ = std::fs::write(
+                                config_dir.join(".anyagents-skip-pinned-repo"),
+                                "1\n",
+                            );
+                        }
+                        let _ = curl_post_json(&interrupt_url, Some(&api_key), &json!({}));
+                        clear_persisted_cloud_session(config_dir);
+                        let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
+                        g.cloud_agent_id = None;
+                        g.cloud_session_id = None;
+                        return Err(format!("cloud session turn error: {ev_str}"));
+                    }
                 }
             }
         }
@@ -1511,8 +1669,8 @@ pub(crate) fn run_cloud_session_turn(
             break;
         }
 
-        let (st_poll, raw_poll) = curl_get(&sess_url, Some(&api_key))?;
-        if (200..300).contains(&st_poll)
+        if let Ok((st_poll, raw_poll)) = curl_get(&sess_url, Some(&api_key))
+            && (200..300).contains(&st_poll)
             && let Ok(val) = serde_json::from_str::<Value>(&raw_poll)
         {
             let status = val
@@ -1641,7 +1799,12 @@ pub(crate) fn run_cloud_session_turn(
             last_seq,
         },
     );
-    Ok(TurnUsage::default())
+    Ok(TurnUsage {
+        input_tokens: turn_in_tok,
+        output_tokens: turn_out_tok,
+        cache_read_tokens: turn_cache_read_tok,
+        ..TurnUsage::default()
+    })
 }
 
 fn build_native_responses_request(
@@ -1664,6 +1827,198 @@ fn build_native_responses_request(
         body["reasoning"] = json!({ "effort": effort });
     }
     Ok(body)
+}
+
+fn build_chat_completions_request(
+    model: &str,
+    instructions: &str,
+    input: &[Value],
+    reasoning_effort: Option<&str>,
+) -> Result<Value, String> {
+    validate_responses_input(input)?;
+    let mut messages = Vec::with_capacity(input.len() + 1);
+    if !instructions.trim().is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": instructions,
+        }));
+    }
+    let mut idx = 0;
+    while idx < input.len() {
+        let item = &input[idx];
+        if item.get("type").and_then(Value::as_str) == Some("function_call") {
+            let mut tool_calls = Vec::new();
+            let mut reasoning_parts = Vec::new();
+            while idx < input.len()
+                && input[idx].get("type").and_then(Value::as_str) == Some("function_call")
+            {
+                let fc = &input[idx];
+                let cid = fc
+                    .get("call_id")
+                    .or_else(|| fc.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("call_0");
+                let fname = fc.get("name").and_then(Value::as_str).unwrap_or("");
+                let fargs = fc.get("arguments").and_then(Value::as_str).unwrap_or("{}");
+                if let Some(rc) = fc
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                {
+                    reasoning_parts.push(rc.to_string());
+                }
+                tool_calls.push(json!({
+                    "id": cid,
+                    "type": "function",
+                    "function": {
+                        "name": fname,
+                        "arguments": fargs,
+                    }
+                }));
+                idx += 1;
+            }
+            let mut assistant_msg = json!({
+                "role": "assistant",
+                "content": Value::Null,
+                "tool_calls": tool_calls,
+            });
+            if !reasoning_parts.is_empty() {
+                assistant_msg["reasoning_content"] = json!(reasoning_parts.join("\n"));
+            }
+            messages.push(assistant_msg);
+            continue;
+        }
+        if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+            let cid = item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("call_0");
+            let out = item.get("output").and_then(Value::as_str).unwrap_or("");
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": cid,
+                "content": out,
+            }));
+            idx += 1;
+            continue;
+        }
+        if let Some(role) = item.get("role").and_then(Value::as_str) {
+            let chat_role = match role {
+                "developer" | "system" => "system",
+                "assistant" => "assistant",
+                _ => "user",
+            };
+            if let Some(s) = item.get("content").and_then(Value::as_str) {
+                messages.push(json!({
+                    "role": chat_role,
+                    "content": s,
+                }));
+            } else if let Some(arr) = item.get("content").and_then(Value::as_array) {
+                let mut parts = Vec::new();
+                for p in arr {
+                    let ptype = p.get("type").and_then(Value::as_str).unwrap_or("");
+                    if matches!(ptype, "input_text" | "output_text" | "text")
+                        && let Some(t) = p.get("text").and_then(Value::as_str)
+                    {
+                        parts.push(json!({ "type": "text", "text": t }));
+                    } else if ptype == "input_image"
+                        && let Some(u) = p.get("image_url").and_then(Value::as_str)
+                    {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": { "url": u }
+                        }));
+                    }
+                }
+                if parts.len() == 1 && parts[0].get("type").and_then(Value::as_str) == Some("text")
+                {
+                    messages.push(json!({
+                        "role": chat_role,
+                        "content": parts[0].get("text").and_then(Value::as_str).unwrap_or(""),
+                    }));
+                } else if !parts.is_empty() {
+                    messages.push(json!({
+                        "role": chat_role,
+                        "content": parts,
+                    }));
+                }
+            }
+        }
+        idx += 1;
+    }
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "tools": build_tool_definitions(),
+    });
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort);
+    }
+    Ok(body)
+}
+
+fn chat_completions_to_responses_envelope(raw_resp: &Value) -> Result<Value, String> {
+    let Some(choices) = raw_resp.get("choices").and_then(Value::as_array) else {
+        return Err(format!(
+            "Chat Completions response missing `choices`: {}",
+            raw_resp
+        ));
+    };
+    let mut output = Vec::new();
+    if let Some(first) = choices.first()
+        && let Some(msg) = first.get("message")
+    {
+        let reasoning_content = msg
+            .get("reasoning_content")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty());
+        if let Some(text) = msg
+            .get("content")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            output.push(json!({
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": text }],
+            }));
+        }
+        if let Some(tcs) = msg.get("tool_calls").and_then(Value::as_array) {
+            for (i, tc) in tcs.iter().enumerate() {
+                let cid = tc.get("id").and_then(Value::as_str).unwrap_or("call_0");
+                let fname = tc
+                    .pointer("/function/name")
+                    .or_else(|| tc.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let fargs = tc
+                    .pointer("/function/arguments")
+                    .or_else(|| tc.get("arguments"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("{}");
+                let mut fc_item = json!({
+                    "type": "function_call",
+                    "call_id": cid,
+                    "name": fname,
+                    "arguments": fargs,
+                });
+                if i == 0
+                    && let Some(ref rc) = reasoning_content
+                {
+                    fc_item["reasoning_content"] = json!(rc);
+                }
+                output.push(fc_item);
+            }
+        }
+    }
+    Ok(json!({
+        "object": "response",
+        "status": "completed",
+        "output": output,
+        "usage": raw_resp.get("usage").cloned().unwrap_or(Value::Null),
+    }))
 }
 
 fn native_responses_output(response: &Value) -> Result<Vec<Value>, String> {
@@ -1766,6 +2121,222 @@ fn close_dangling_function_calls(transcript_path: &Path, input_items: &mut Vec<V
     *input_items = fixed;
 }
 
+/// Reconstruct unfinished inbound across failed turns/restarts. Snapshots live
+/// in the existing append-only transcript, not in mailbox/config state. Raw user
+/// messages after the latest snapshot cover a crash between append and snapshot.
+fn load_pending_native_messages(transcript_path: &Path, active: &[Value]) -> Vec<Value> {
+    let mut pending = Vec::new();
+    let mut tracked = false;
+    if let Ok(raw) = std::fs::read_to_string(transcript_path) {
+        for line in raw.lines() {
+            let Ok(item) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if item.get("type").and_then(Value::as_str) == Some("native_turn_state") {
+                if let Some(items) = item.get("pending_messages").and_then(Value::as_array) {
+                    pending = items.clone();
+                    tracked = true;
+                }
+            } else if tracked && is_pending_native_message(&item) {
+                pending.push(item);
+            }
+        }
+    }
+    if !tracked {
+        // Migration: there is no trustworthy completed-turn boundary in legacy
+        // transcripts. Preserve uncertain active inbound, never assume it done.
+        pending.extend(
+            active
+                .iter()
+                .filter(|item| is_pending_native_message(item))
+                .cloned(),
+        );
+    }
+    pending
+}
+
+fn is_pending_native_message(item: &Value) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("user")
+        && item
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim_start().starts_with("<context-event "))
+}
+
+fn record_pending_native_messages(transcript_path: &Path, pending: &[Value]) {
+    append_transcript_message(
+        transcript_path,
+        &json!({
+            "type": "native_turn_state", "pending_messages": pending,
+            "timestamp_ms": anyagents_core::now_ms(),
+        }),
+    );
+}
+
+/// Compact only between completed tool batches. Keep exact inbound messages and
+/// the latest tool batch; older material remains lossless in Raw-RAG. This does
+/// not touch identity, schedules, mailbox cursors, or execute any tool again.
+fn compact_native_context(
+    transcript_path: &Path,
+    input: &mut Vec<Value>,
+    pending_messages: &[Value],
+) {
+    let raw_count = std::fs::read_to_string(transcript_path)
+        .map(|raw| raw.lines().count())
+        .unwrap_or(0);
+    // Keep the last model-authored handoff once, not a recursively nested
+    // digest of our own automatic handoffs on every compaction.
+    let prior_handoff = std::fs::read_to_string(transcript_path)
+        .ok()
+        .and_then(|raw| {
+            raw.lines().rev().find_map(|line| {
+                let item: Value = serde_json::from_str(line).ok()?;
+                if item.get("type").and_then(Value::as_str) != Some("context_window_open") {
+                    return None;
+                }
+                item.get("prior_handoff")
+                    .or_else(|| item.get("handoff"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_default();
+    let mut suffix_start = None;
+    // Retain the full last batch, including interleaved calls/results, rather
+    // than a lone output or synthetic result. No tool is still running here.
+    if let Some(last_output) = input
+        .iter()
+        .rposition(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+    {
+        let mut start = last_output;
+        let mut needed = std::collections::HashSet::new();
+        for (idx, item) in input[..=last_output].iter().enumerate().rev() {
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call_output") => {
+                    if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
+                        needed.insert(cid);
+                    }
+                }
+                Some("function_call") => {
+                    if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
+                        needed.remove(cid);
+                    }
+                    if needed.is_empty() {
+                        start = idx;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        suffix_start = Some(start);
+    }
+    // Pending that a model-authored handoff removed from active input still
+    // precedes the retained suffix. Everything present retains its actual order:
+    // a steer received after a completed tool must not move before that tool.
+    let mut retained: Vec<Value> = pending_messages
+        .iter()
+        .filter(|item| !input.contains(item))
+        .cloned()
+        .collect();
+    retained.extend(
+        input
+            .iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                pending_messages.contains(item)
+                    || (suffix_start.is_some_and(|start| *idx >= start)
+                        && item.get("type").and_then(Value::as_str) != Some("reasoning"))
+            })
+            .map(|(_, item)| item.clone()),
+    );
+    let continuity = build_prior_transcript_continuity_block(transcript_path).unwrap_or_default();
+    let anchor = json!({
+        "type": "context_window_open",
+        "handoff": format!(
+            "Goal: continue the pending inbound work without replaying completed actions.\n\
+             Verified Facts: exact latest tool state and pending messages are retained below.\n\
+             Decisions: automatic pre-request compaction; no mailbox or lifecycle changes.\n\
+             Next Action: reconcile the retained results, then continue the pending work.\n\
+             Full prior history: transcript:0-{}. Use memory_recall before assuming older work is absent.\n\
+             {prior_handoff}\n{continuity}", raw_count.saturating_sub(1)),
+        "retained_items": retained,
+        "prior_handoff": prior_handoff,
+        "timestamp_ms": anyagents_core::now_ms(),
+    });
+    append_transcript_message(transcript_path, &anchor);
+    *input = load_transcript_input_items(transcript_path);
+}
+
+/// Budget the complete serialized wire request, not bytes/4 of history alone.
+/// One UTF-8 byte per token is deliberately conservative for byte-level model
+/// tokenizers; framing and output get independent reserves. This also counts
+/// inline images rather than silently ignoring their encoded payload.
+fn request_token_upper_bound(request: &Value) -> Result<usize, String> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|e| format!("cannot budget model request: {e}"))?
+        .len();
+    let messages = request
+        .get("input")
+        .or_else(|| request.get("messages"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Ok(bytes.saturating_add(messages.saturating_mul(32)))
+}
+
+fn prepare_budgeted_request(
+    transcript_path: &Path,
+    input: &mut Vec<Value>,
+    pending_messages: &[Value],
+    limits: &memory::ModelContextLimits,
+    force_compact: bool,
+    build: impl Fn(&[Value]) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let output_reserve = (limits.window_tokens / 20)
+        .max(1)
+        .min(limits.max_output_tokens.unwrap_or(usize::MAX));
+    let build_bounded = |items: &[Value]| -> Result<Value, String> {
+        let mut body = build(items)?;
+        let field = if body.get("messages").is_some() {
+            "max_tokens"
+        } else {
+            "max_output_tokens"
+        };
+        body[field] = json!(output_reserve);
+        Ok(body)
+    };
+    let mut body = build_bounded(input)?;
+    let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
+    let threshold = limits.window_tokens.saturating_mul(limits.compact_percent) / 100;
+    if force_compact || used >= threshold {
+        compact_native_context(transcript_path, input, pending_messages);
+        body = build_bounded(input)?;
+    }
+    let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
+    // Leave a further 5% for provider-specific framing/vision accounting. Never
+    // dispatch an oversized irreducible prompt, even after compaction.
+    if used > limits.window_tokens.saturating_mul(95) / 100 {
+        return Err(format!(
+            "context_request_too_large: compacted current work requires {used} conservative tokens; model window {}; request not sent; raw transcript and pending work preserved",
+            limits.window_tokens
+        ));
+    }
+    Ok(body)
+}
+
+fn is_context_overflow(status: u16, raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    matches!(status, 400 | 413 | 503)
+        && [
+            "context_length_exceeded",
+            "exceeds the model's context window",
+            "maximum context length",
+            "exceeded model token limit",
+        ]
+        .iter()
+        .any(|text| lower.contains(text))
+}
+
 /// Runs our native multi-step Sylphx Agent Runtime loop against Sylphx AI's
 /// canonical Responses API (`https://api.sylphx.com/v1/responses`), executing
 /// AnyAgents MCP tools (`agents`, `send`, `conversation`, `groups`, `schedule`,
@@ -1784,22 +2355,12 @@ pub(crate) fn run_native_gateway_turn(
     mcp_args: &[String],
     initial_user_message: &str,
 ) -> Result<TurnUsage, String> {
-    let api_key = resolve_sylphx_gateway_key(config_dir, env).ok_or_else(|| {
-        "missing Sylphx API key; run `anyagents sign-in sylphx` first".to_string()
-    })?;
-    let gateway_base = env
-        .iter()
-        .find(|(k, _)| k == "SYLPHX_GATEWAY_URL")
-        .map(|(_, v)| normalize_sylphx_gateway_url(v))
-        .or_else(|| {
-            std::env::var("SYLPHX_GATEWAY_URL")
-                .ok()
-                .map(|s| normalize_sylphx_gateway_url(&s))
-        })
-        .unwrap_or_else(|| DEFAULT_SYLPHX_GATEWAY_URL.to_string());
-    let responses_url = format!("{gateway_base}/responses");
-
-    let (model_id, reasoning_effort) = parse_sylphx_model_and_effort(model);
+    let endpoint = auth::resolve_upstream_endpoint(config_dir, env, model)?;
+    let api_key = endpoint.api_key;
+    let responses_url = endpoint.url;
+    let model_id = endpoint.model_id;
+    let reasoning_effort = endpoint.reasoning_effort;
+    let upstream_kind = endpoint.kind;
     let system_prompt = assemble_system_prompt(config_dir, work_dir);
     let transcript_path = config_dir.join("sylphx-transcript.jsonl");
 
@@ -1819,9 +2380,9 @@ pub(crate) fn run_native_gateway_turn(
                 || last.get("type").and_then(Value::as_str) == Some("function_call_output")
         });
     let already_appended_by_cloud = is_recovery_on_unanswered_tail
-        || input_items.last().is_some_and(|last| {
-            last.get("role").and_then(Value::as_str) == Some("user")
-                && last.get("content").and_then(Value::as_str) == Some(initial_user_message)
+        || input_items.iter().rev().take(16).any(|item| {
+            item.get("role").and_then(Value::as_str) == Some("user")
+                && item.get("content").and_then(Value::as_str) == Some(initial_user_message)
         });
     if !already_appended_by_cloud {
         let user_msg = json!({
@@ -1838,65 +2399,96 @@ pub(crate) fn run_native_gateway_turn(
         .unwrap_or_else(PoisonError::into_inner)
         .session_id
         .clone()
-        .unwrap_or_else(|| "sylphx_default_session".to_string());
+        .unwrap_or_else(|| {
+            let short = config_dir
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .unwrap_or("default");
+            format!("sylphx_ses_{short}")
+        });
     let usage_log_path = config_dir.join("sylphx-usage.jsonl");
     let mut total_in: u64 = 0;
     let mut total_out: u64 = 0;
     let mut total_cache_read: u64 = 0;
     let mut total_cache_write: u64 = 0;
-    let mut sent_any_reply = false;
+    let mut unanswered_reply_target: Option<String> = extract_envelope_sender(initial_user_message);
 
+    let limits = memory::resolve_model_context_limits(config_dir, &model_id, env);
+    if limits.source == memory::ContextLimitSource::ConservativeFallback {
+        let warning = json!({"role": "user", "content": format!(
+            "<context-event kind=\"context.limit_fallback\" model=\"{}\" window_tokens=\"{}\">Catalog limit unavailable; using conservative offline budget. No model or harness switch.</context-event>", model_id, limits.window_tokens)});
+        append_transcript_message(&transcript_path, &warning);
+        input_items.push(warning);
+    }
+    let mut pending_messages = load_pending_native_messages(&transcript_path, &input_items);
+    let initial = json!({"role": "user", "content": initial_user_message});
+    if !pending_messages.contains(&initial) {
+        pending_messages.push(initial);
+    }
+    record_pending_native_messages(&transcript_path, &pending_messages);
     let mut overflow_compacted_in_turn = false;
+    let mut force_compact = false;
     for step in 0usize.. {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
-        drain_steered_messages(state, &transcript_path, &mut input_items);
-        if input_items.len() > memory::WINDOW_MAX_ITEMS
-            || memory::estimate_items_tokens(&input_items) > memory::MAX_WINDOW_EST_TOKENS
-        {
-            input_items = load_transcript_input_items(&transcript_path);
-            close_dangling_function_calls(&transcript_path, &mut input_items);
+        let before_steer = input_items.len();
+        drain_steered_messages(
+            state,
+            &transcript_path,
+            &mut input_items,
+            &mut unanswered_reply_target,
+        );
+        if input_items.len() > before_steer {
+            pending_messages.extend_from_slice(&input_items[before_steer..]);
+            record_pending_native_messages(&transcript_path, &pending_messages);
         }
-
-        let req_body = build_native_responses_request(
-            &model_id,
-            &system_prompt,
-            &input_items,
-            &tools,
-            &session_cache_key,
-            reasoning_effort.as_deref(),
+        let custom_ua = match &upstream_kind {
+            auth::UpstreamGatewayKind::SylphxResponses => None,
+            auth::UpstreamGatewayKind::OpenAiChatCompletions { user_agent, .. } => {
+                user_agent.as_deref()
+            }
+        };
+        let req_body = prepare_budgeted_request(
+            &transcript_path,
+            &mut input_items,
+            &pending_messages,
+            &limits,
+            force_compact,
+            |items| match &upstream_kind {
+                auth::UpstreamGatewayKind::SylphxResponses => build_native_responses_request(
+                    &model_id,
+                    &system_prompt,
+                    items,
+                    &tools,
+                    &session_cache_key,
+                    reasoning_effort.as_deref(),
+                ),
+                auth::UpstreamGatewayKind::OpenAiChatCompletions { .. } => {
+                    build_chat_completions_request(
+                        &model_id,
+                        &system_prompt,
+                        items,
+                        reasoning_effort.as_deref(),
+                    )
+                }
+            },
         )?;
+        force_compact = false;
 
         let step_t0 = Instant::now();
-        let (status, raw) = curl_post_json(&responses_url, Some(&api_key), &req_body)?;
+        let (status, raw) = auth::curl_post_json_with_headers(
+            &responses_url,
+            Some(&api_key),
+            custom_ua,
+            &req_body,
+        )?;
         let step_elapsed_ms = step_t0.elapsed().as_millis() as u64;
         if !(200..300).contains(&status) {
-            let is_context_overflow = matches!(status, 400 | 413 | 503)
-                && (raw.contains("context_length_exceeded")
-                    || raw.contains("exceeds the model's context window")
-                    || raw.contains("maximum context length"));
-            if is_context_overflow && !overflow_compacted_in_turn {
+            if is_context_overflow(status, &raw) && !overflow_compacted_in_turn {
                 overflow_compacted_in_turn = true;
-                let continuity = build_prior_transcript_continuity_block(&transcript_path)
-                    .unwrap_or_else(|| "Prior turns preserved in raw transcript.".to_string());
-                let handoff = format!(
-                    "Auto-compacted after context window limit.\n{continuity}\nActive prompt:\n{}",
-                    truncate_tool_output_middle_utf8(
-                        initial_user_message.to_string(),
-                        4_000,
-                        1_800,
-                        1_800
-                    )
-                );
-                let anchor = json!({
-                    "type": "context_window_open",
-                    "handoff": handoff,
-                    "timestamp_ms": anyagents_core::now_ms(),
-                });
-                append_transcript_message(&transcript_path, &anchor);
-                input_items = load_transcript_input_items(&transcript_path);
-                close_dangling_function_calls(&transcript_path, &mut input_items);
+                force_compact = true;
                 continue;
             }
             return Err(format!(
@@ -1904,8 +2496,14 @@ pub(crate) fn run_native_gateway_turn(
                 raw.trim()
             ));
         }
-        let resp: Value = serde_json::from_str(&raw)
+        let raw_json: Value = serde_json::from_str(&raw)
             .map_err(|e| format!("invalid Sylphx responses API JSON: {e}"))?;
+        let resp = match &upstream_kind {
+            auth::UpstreamGatewayKind::SylphxResponses => raw_json,
+            auth::UpstreamGatewayKind::OpenAiChatCompletions { .. } => {
+                chat_completions_to_responses_envelope(&raw_json)?
+            }
+        };
 
         if let Some(usage) = resp.get("usage") {
             let step_in = usage
@@ -2024,8 +2622,10 @@ pub(crate) fn run_native_gateway_turn(
                 let parsed_args: Value =
                     serde_json::from_str(raw_args).unwrap_or_else(|_| json!({}));
                 let norm_fn = fn_name.strip_prefix("mcp__anyagents__").unwrap_or(&fn_name);
-                if norm_fn == "send" {
-                    sent_any_reply = true;
+                if norm_fn == "send"
+                    && send_args_satisfy_target(&parsed_args, unanswered_reply_target.as_deref())
+                {
+                    unanswered_reply_target = None;
                 }
                 if matches!(norm_fn, "context_edit" | "context_prune") {
                     did_context_edit = true;
@@ -2179,7 +2779,33 @@ pub(crate) fn run_native_gateway_turn(
             continue;
         }
 
-        if drain_steered_messages(state, &transcript_path, &mut input_items) {
+        let content_text = assistant_texts.join("\n\n");
+        let trimmed_content = content_text.trim();
+        if !trimmed_content.is_empty()
+            && !trimmed_content.eq_ignore_ascii_case("NO_REPLY")
+            && let Some(reply_to) = unanswered_reply_target.take()
+        {
+            let _ = call_anyagents_mcp_tool(
+                mcp_command,
+                mcp_args,
+                env,
+                "send",
+                &json!({
+                    "to": reply_to,
+                    "text": trimmed_content,
+                }),
+            );
+        }
+
+        let before_steer = input_items.len();
+        if drain_steered_messages(
+            state,
+            &transcript_path,
+            &mut input_items,
+            &mut unanswered_reply_target,
+        ) {
+            pending_messages.extend_from_slice(&input_items[before_steer..]);
+            record_pending_native_messages(&transcript_path, &pending_messages);
             continue;
         }
 
@@ -2189,29 +2815,18 @@ pub(crate) fn run_native_gateway_turn(
                 "content": goal_continuation,
             });
             append_transcript_message(&transcript_path, &cont_msg);
+            pending_messages.push(cont_msg.clone());
+            record_pending_native_messages(&transcript_path, &pending_messages);
             input_items.push(cont_msg);
             continue;
         }
 
-        let content_text = assistant_texts.join("\n\n");
-        if !sent_any_reply
-            && !content_text.trim().is_empty()
-            && let Some(reply_to) = extract_envelope_sender(initial_user_message)
-        {
-            let _ = call_anyagents_mcp_tool(
-                mcp_command,
-                mcp_args,
-                env,
-                "send",
-                &json!({
-                    "to": reply_to,
-                    "text": content_text.trim(),
-                }),
-            );
-        }
         break;
     }
 
+    if !cancel_flag.load(Ordering::SeqCst) {
+        record_pending_native_messages(&transcript_path, &[]);
+    }
     Ok(TurnUsage {
         input_tokens: total_in,
         output_tokens: total_out,
@@ -2387,9 +3002,18 @@ pub fn run_stdio_adapter(
                 ) {
                     Ok(usage) => Ok(usage),
                     Err(cloud_err) => {
-                        if !crate::sandbox::is_isolated_test_env() {
+                        if matches!(
+                            sdk::SylphxExecutionMode::from_env(&cfg_cl, &env_cl),
+                            sdk::SylphxExecutionMode::CloudOnly
+                        ) {
                             Err(cloud_err)
                         } else {
+                            clear_persisted_cloud_session(&cfg_cl);
+                            {
+                                let mut g = state_cl.lock().unwrap_or_else(PoisonError::into_inner);
+                                g.cloud_agent_id = None;
+                                g.cloud_session_id = None;
+                            }
                             run_native_gateway_turn(
                                 &state_cl,
                                 &cancel_cl,
@@ -2497,12 +3121,14 @@ fn drain_steered_messages(
     state: &Arc<Mutex<SharedState>>,
     transcript_path: &Path,
     messages: &mut Vec<Value>,
+    unanswered_reply_target: &mut Option<String>,
 ) -> bool {
     let mut g = state.lock().unwrap_or_else(PoisonError::into_inner);
     if g.steer_queue.is_empty() {
         return false;
     }
     while let Some(steered) = g.steer_queue.pop_front() {
+        update_unanswered_reply_target(unanswered_reply_target, &steered);
         let msg = json!({
             "role": "user",
             "content": steered,
@@ -2514,12 +3140,63 @@ fn drain_steered_messages(
     true
 }
 
+fn update_unanswered_reply_target(current: &mut Option<String>, incoming_text: &str) {
+    if let Some(new_target) = extract_envelope_sender(incoming_text)
+        && (new_target.starts_with("telegram:")
+            || current
+                .as_deref()
+                .is_none_or(|c| !c.starts_with("telegram:")))
+    {
+        *current = Some(new_target);
+    }
+}
+
+fn send_args_satisfy_target(parsed_args: &Value, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    if !expected.starts_with("telegram:") {
+        return true;
+    }
+    let chat_suffix = expected.rsplit(':').next().unwrap_or(expected);
+    let matches_addr = |s: &str| {
+        let t = s.trim();
+        t == expected
+            || t.starts_with("telegram:")
+            || (!chat_suffix.is_empty() && t.ends_with(chat_suffix))
+    };
+    if let Some(s) = parsed_args.get("to").and_then(Value::as_str)
+        && s.split(',').any(matches_addr)
+    {
+        return true;
+    }
+    if let Some(arr) = parsed_args.get("to").and_then(Value::as_array)
+        && arr
+            .iter()
+            .filter_map(Value::as_str)
+            .any(|s| s.split(',').any(matches_addr))
+    {
+        return true;
+    }
+    false
+}
+
 fn extract_envelope_sender(text: &str) -> Option<String> {
+    if let Some(idx) = text.find("answer_to=\"") {
+        let rest = &text[idx + 11..];
+        if let Some(end) = rest.find('"') {
+            let dest = rest[..end].trim();
+            if !dest.is_empty() {
+                return Some(dest.to_string());
+            }
+        }
+    }
     let idx = text.find("from=\"")?;
     let rest = &text[idx + 6..];
     let end = rest.find('"')?;
     let sender = rest[..end].trim();
-    (!sender.is_empty()).then(|| sender.to_string())
+    (!sender.is_empty() && !sender.starts_with("schedule:") && sender != "unknown")
+        .then(|| sender.to_string())
 }
 
 fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
@@ -2537,8 +3214,20 @@ fn read_workspace_agents_md(work_dir: &Path) -> Option<String> {
     None
 }
 
+fn extract_embedded_shared_agents_section(sys: &str) -> Option<String> {
+    let marker = "\n## 4. Shared Instructions (AGENTS.md)\n";
+    let start = sys.find(marker)?;
+    let after = &sys[start + marker.len()..];
+    let body = match after.find("\n# Cross-Harness Continuity") {
+        Some(cont_idx) => &after[..cont_idx],
+        None => after,
+    };
+    let trimmed = body.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
-    let mut candidates = vec![config_dir.join("AGENTS.md")];
+    let mut candidates = Vec::new();
     if let Some(data_dir) = config_dir
         .parent()
         .and_then(|p| p.parent())
@@ -2549,14 +3238,42 @@ fn read_shared_agents_md_for_config(config_dir: &Path) -> Option<String> {
     if let Some(parent) = config_dir.parent() {
         candidates.push(parent.join("AGENTS.md"));
     }
+    candidates.push(config_dir.join("AGENTS.md"));
     for cand in candidates {
-        if let Ok(text) = std::fs::read_to_string(&cand)
-            && !text.trim().is_empty()
-        {
+        if let Ok(text) = std::fs::read_to_string(&cand) {
+            let trimmed = text.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if trimmed.starts_with("# AnyAgents Identity & Environment Awareness") {
+                if let Some(extracted) = extract_embedded_shared_agents_section(trimmed) {
+                    return Some(extracted);
+                }
+                continue;
+            }
             return Some(text);
         }
     }
     None
+}
+
+fn strip_embedded_shared_agents_section(sys: &str) -> String {
+    let marker = "\n## 4. Shared Instructions (AGENTS.md)\n";
+    let Some(start) = sys.find(marker) else {
+        return sys.to_string();
+    };
+    let prefix = sys[..start].trim_end();
+    let after = &sys[start + marker.len()..];
+    if let Some(cont_idx) = after.find("\n# Cross-Harness Continuity") {
+        let continuity = after[cont_idx..].trim_start_matches('\n');
+        format!("{prefix}\n\n{continuity}")
+    } else {
+        prefix.to_string()
+    }
+}
+
+fn is_owner_root_agents_md(text: &str) -> bool {
+    text.trim_start().starts_with("# SylphxAI/owner")
 }
 
 pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
@@ -2564,19 +3281,52 @@ pub fn assemble_system_prompt(config_dir: &Path, work_dir: &Path) -> String {
     if let Ok(sys) = std::fs::read_to_string(config_dir.join("SYSTEM_PROMPT.md"))
         && !sys.trim().is_empty()
     {
-        parts.push(sys);
-    }
-    if let Some(shared_agents) = read_shared_agents_md_for_config(config_dir) {
-        let trimmed = shared_agents.trim();
-        if !trimmed.is_empty() && !parts.iter().any(|p| p.contains(trimmed)) {
-            parts.push(shared_agents);
+        let cleaned = strip_embedded_shared_agents_section(&sys);
+        if !cleaned.trim().is_empty() {
+            parts.push(cleaned);
         }
     }
-    if let Some(work_agents) = read_workspace_agents_md(work_dir) {
-        let trimmed = work_agents.trim();
-        if !trimmed.is_empty() && !parts.iter().any(|p| p.contains(trimmed)) {
-            parts.push(work_agents);
+    let shared_agents = read_shared_agents_md_for_config(config_dir).filter(|s| {
+        !s.trim().is_empty()
+            && !s
+                .trim_start()
+                .starts_with("# AnyAgents Identity & Environment Awareness")
+    });
+    let work_agents = read_workspace_agents_md(work_dir).filter(|s| !s.trim().is_empty());
+
+    match (shared_agents, work_agents) {
+        (Some(shared), Some(work)) => {
+            if is_owner_root_agents_md(&shared) && is_owner_root_agents_md(&work) {
+                let trimmed = work.trim();
+                if !parts.iter().any(|p| p.contains(trimmed)) {
+                    parts.push(format!(
+                        "## 4. Shared Instructions (AGENTS.md)\n\n{trimmed}"
+                    ));
+                }
+            } else {
+                let s_trim = shared.trim();
+                if !parts.iter().any(|p| p.contains(s_trim)) {
+                    parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{s_trim}"));
+                }
+                let w_trim = work.trim();
+                if !parts.iter().any(|p| p.contains(w_trim)) {
+                    parts.push(work);
+                }
+            }
         }
+        (Some(shared), None) => {
+            let s_trim = shared.trim();
+            if !parts.iter().any(|p| p.contains(s_trim)) {
+                parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{s_trim}"));
+            }
+        }
+        (None, Some(work)) => {
+            let w_trim = work.trim();
+            if !parts.iter().any(|p| p.contains(w_trim)) {
+                parts.push(format!("## 4. Shared Instructions (AGENTS.md)\n\n{w_trim}"));
+            }
+        }
+        (None, None) => {}
     }
     if parts.is_empty() {
         parts.push(
@@ -2609,10 +3359,22 @@ fn discover_skills_dirs(work_dir: &Path, config_dir: &Path) -> Vec<PathBuf> {
     for cand in [
         config_dir.join("skills"),
         config_dir.join(".agents/skills"),
+        work_dir.join("skills"),
         work_dir.join(".agents/skills"),
     ] {
         if cand.is_dir() && !dirs.contains(&cand) {
             dirs.push(cand);
+        }
+    }
+    if let Some(data_dir) = config_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+    {
+        for cand in [data_dir.join("skills"), data_dir.join(".agents/skills")] {
+            if cand.is_dir() && !dirs.contains(&cand) {
+                dirs.push(cand);
+            }
         }
     }
     for ancestor in work_dir.ancestors() {
@@ -2641,17 +3403,46 @@ fn parse_skill_frontmatter(content: &str) -> Option<(String, String)> {
     let end = rest.find("\n---")?;
     let fm = &rest[..end];
     let mut name = None;
-    let mut desc = None;
+    let mut desc_lines: Vec<String> = Vec::new();
+    let mut in_multiline_desc = false;
     for line in fm.lines() {
         if let Some(v) = line.strip_prefix("name:") {
+            in_multiline_desc = false;
             name = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
         } else if let Some(v) = line.strip_prefix("description:") {
-            desc = Some(v.trim().trim_matches('"').trim_matches('\'').to_string());
+            desc_lines.clear();
+            let raw_v = v.trim();
+            if matches!(raw_v, "|" | ">" | "|-" | ">-" | "") {
+                in_multiline_desc = true;
+            } else {
+                in_multiline_desc = true;
+                desc_lines.push(raw_v.trim_matches('"').trim_matches('\'').to_string());
+            }
+        } else if in_multiline_desc {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                let cont = line.trim();
+                if !cont.is_empty() {
+                    desc_lines.push(cont.trim_matches('"').trim_matches('\'').to_string());
+                }
+            } else {
+                in_multiline_desc = false;
+            }
         }
     }
-    Some((name?, desc.unwrap_or_default()))
+    let desc = desc_lines.join(" ");
+    Some((name?, desc))
 }
 
+/// Discovers all installed skills following the `agentskills.io` 3-stage progressive
+/// disclosure standard:
+/// - Tier 1 (System Prompt Catalog): Full YAML frontmatter `name` + `description` (preserving
+///   positive `"Use when..."` triggers and negative `"Do NOT use when..."` disambiguation
+///   clauses up to the `agentskills.io` 1,024-char specification limit) with a mandatory
+///   Turn-1 pre-execution activation gate.
+/// - Tier 2 (On-Demand Activation): `activate_skill(name)` loads the full `SKILL.md` body and
+///   lists `references/*.md`.
+/// - Tier 3 (Reference Drill-Down): `activate_skill(name, reference)` loads specific
+///   `references/<reference>.md` files on demand.
 fn discover_skills_index(work_dir: &Path, config_dir: &Path) -> String {
     let mut seen = std::collections::BTreeMap::new();
     for dir in discover_skills_dirs(work_dir, config_dir) {
@@ -2671,12 +3462,15 @@ fn discover_skills_index(work_dir: &Path, config_dir: &Path) -> String {
         return String::new();
     }
     let mut out = String::from(
-        "<skills>\nAvailable skills (call `activate_skill` with `name` to load full `SKILL.md` instructions and `references/*.md`):\n",
+        "<skills>\n\
+         You can use specialized 'skills' to help you with complex tasks. Each skill has a name and a description listed below.\n\
+         If a skill seems relevant to your current task, you MUST call `activate_skill` with its `name` to read its `SKILL.md` instructions BEFORE proceeding (and pass `reference` to read any relevant `references/*.md` file).\n\n\
+         Available skills:\n",
     );
     for (name, desc) in seen {
-        let short = desc.split(". ").next().unwrap_or(&desc);
-        let compact: String = short.chars().take(160).collect();
-        out.push_str(&format!("- {name}: {compact}\n"));
+        let normalized = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let bounded: String = normalized.chars().take(1_024).collect();
+        out.push_str(&format!("- {name}: {bounded}\n"));
     }
     out.push_str("</skills>");
     out
@@ -2741,9 +3535,24 @@ fn build_tool_definitions() -> Vec<Value> {
                         },
                         "text": { "type": "string", "description": "Message text." },
                         "reply_to": { "type": "string", "description": "Reply reference (`anyagents:reply:msg_...`)." },
+                        "media": { "type": "string", "description": "Local file path or HTTPS URL of an image/file/document to attach." },
+                        "media_paths": { "type": "array", "items": { "type": "string" }, "description": "Multiple local file paths or HTTPS URLs to attach." },
+                        "buttons": { "description": "Interactive inline buttons (array or 2D grid of `{text, callback_data, url}`)." },
+                        "poll": {
+                            "type": "object",
+                            "description": "Native poll (`{question, options, allows_multiple_answers, is_anonymous}`).",
+                            "properties": {
+                                "question": { "type": "string" },
+                                "options": { "type": "array", "items": { "type": "string" } },
+                                "allows_multiple_answers": { "type": "boolean" },
+                                "is_anonymous": { "type": "boolean" }
+                            }
+                        },
+                        "silent": { "type": "boolean", "description": "Deliver silently without notification sound." },
                         "action": { "type": "string", "description": "Interaction (`react`, `vote`, `edit`, `delete`, `pin`, `unpin`, `stop_poll`)." },
-                        "target": { "type": "string" },
-                        "emoji": { "type": "string" }
+                        "target": { "type": "string", "description": "Target message (`anyagents:reply:msg_...`, `msg_...`, or `telegram:chat:<chat_id>:<message_id>`)." },
+                        "emoji": { "type": "string", "description": "Emoji for `react` (empty string to remove reaction)." },
+                        "options": { "type": "array", "items": { "type": "integer" }, "description": "0-based option indices for `vote`." }
                     }
                 }
             }
@@ -2752,13 +3561,15 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "describe",
-                "description": "Read or update agent role/description (`agent`: `\"self\"` | `\"all\"` | `<name>`).",
+                "description": "Read or update agent public `description` (capabilities/expertise) or private `instructions` (`SYSTEM_PROMPT.md`) (`agent`: `\"self\"` | `\"all\"` | `<name>`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "agent": { "type": "string" },
-                        "description": { "type": "string" },
+                        "agent": { "type": "string", "description": "`\"self\"` (default), `\"all\"`, or agent name/`agt_...` ID." },
+                        "description": { "type": "string", "description": "Public role/capability summary." },
+                        "instructions": { "type": "string", "description": "Private system prompt (`SYSTEM_PROMPT.md`)." },
                         "role": { "type": "string" },
+                        "public": { "type": "boolean", "description": "Whether agents outside this agent's parent/children tree can message it directly." },
                         "clear": { "type": "boolean" }
                     }
                 }
@@ -2788,6 +3599,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "action": { "type": "string" },
                         "name": { "type": "string" },
                         "agent": { "type": "string" },
+                        "new_name": { "type": "string", "description": "Target name when `action` is `\"rename\"`." },
                         "parent": { "type": "string" },
                         "state": { "type": "string" },
                         "role": { "type": "string" },
@@ -2800,7 +3612,10 @@ fn build_tool_definitions() -> Vec<Value> {
                         "workdir": { "type": "string" },
                         "description": { "type": "string" },
                         "instructions": { "type": "string" },
-                        "prompt": { "type": "string" }
+                        "public": { "type": "boolean", "description": "Cross-tree reachability (`false` default for sub-agents)." },
+                        "prompt": { "type": "string" },
+                        "clear": { "type": "boolean" },
+                        "probe": { "type": "boolean" }
                     }
                 }
             }
@@ -2816,6 +3631,9 @@ fn build_tool_definitions() -> Vec<Value> {
                         "agent": { "type": "string" },
                         "query": { "type": "string" },
                         "with": { "type": "string" },
+                        "direction": { "type": "string", "description": "`\"all\"` (default), `\"in\"`, or `\"out\"`." },
+                        "before": { "type": "string", "description": "Exclusive upper bound cursor (`msg_...` ID or millisecond timestamp)." },
+                        "after": { "type": "string", "description": "Exclusive lower bound cursor (`msg_...` ID or millisecond timestamp)." },
                         "limit": { "type": "integer" }
                     }
                 }
@@ -2825,14 +3643,15 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "groups",
-                "description": "Manage agent groups (`list`, `create`, `delete`, `add_member`, `remove_member`).",
+                "description": "Manage agent groups (`action`: `\"list\"`, `\"members\"`, `\"join\"`, `\"leave\"`).",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string" },
-                        "name": { "type": "string" },
-                        "agent": { "type": "string" },
-                        "members": { "type": "array", "items": { "type": "string" } }
+                        "action": { "type": "string", "description": "`\"list\"` (default), `\"members\"`, `\"join\"` (create/join group), or `\"leave\"`." },
+                        "group": { "type": "string", "description": "Group name (e.g. `\"owners\"`, `\"review-team\"`)." },
+                        "agent": { "type": "string", "description": "Agent name(s) or `agt_...` ID(s) to add/remove (comma-separated, defaults to self)." },
+                        "agents": { "type": "array", "items": { "type": "string" }, "description": "Batch list of agent names or `agt_...` IDs to add/remove." },
+                        "public": { "type": "boolean", "description": "Visibility toggle: `false` (default Private/Invite-Only) or `true` (Public/Open)." }
                     }
                 }
             }
@@ -2860,18 +3679,46 @@ fn build_tool_definitions() -> Vec<Value> {
             "type": "function",
             "function": {
                 "name": "browser",
-                "description": "Drive Chromium (`goto`, `snapshot`, `click`, `fill`, `type`, `press`, `eval`, `text`, `html`, `pdf`, `screenshot`, `tabs`, `takeover`, `release_takeover`, `close`).",
+                "description": "Drive Chromium (`goto`, `snapshot`, `click`, `fill`, `type`, `press`, `eval`, `text`, `html`, `pdf`, `screenshot`, `cookies`, `set_cookies`, `tabs`, `wait`, `takeover`, `release_takeover`, `close`) with persistent per-agent profile and zero-trust 1Password `secret_ref` injection.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "action": { "type": "string" },
-                        "url": { "type": "string" },
-                        "selector": { "type": "string" },
-                        "value": { "type": "string" },
-                        "script": { "type": "string" },
-                        "path": { "type": "string" }
+                        "action": { "type": "string", "description": "`goto`, `snapshot`, `click`, `fill`, `type`, `press`, `eval`, `text`, `html`, `pdf`, `screenshot`, `cookies`, `set_cookies`, `tabs`, `wait`, `takeover`, `release_takeover`, `close`." },
+                        "profile": { "type": "string", "description": "Persistent browser profile name (defaults to agent name; pass lead's profile name when delegated)." },
+                        "url": { "type": "string", "description": "Target URL for `goto` (or initial URL when opening a tab)." },
+                        "selector": { "type": "string", "description": "Element ref (`\"@e1\"` from `snapshot`) or CSS selector." },
+                        "value": { "type": "string", "description": "Input value for `fill` / `type`." },
+                        "text": { "type": "string", "description": "Alias for `value` on `fill` / `type`." },
+                        "secret_ref": { "type": "string", "description": "Zero-trust 1Password secret or TOTP reference (`op://<vault>/<item>/<field>` or `op-otp://<vault>/<item>`) resolved in-process by the host daemon for `fill` / `type` without exposing the secret to LLM context." },
+                        "submit": { "type": "boolean", "description": "Press Enter after `fill` / `type`." },
+                        "key": { "type": "string", "description": "Key name for `press` (e.g. `\"Enter\"`, `\"Tab\"`, `\"Escape\"`)." },
+                        "keys": { "type": "array", "items": { "type": "string" } },
+                        "hold_ms": { "type": "integer" },
+                        "wait_ms": { "type": "integer", "description": "Wait duration in milliseconds." },
+                        "script": { "type": "string", "description": "JavaScript expression for `eval`." },
+                        "path": { "type": "string", "description": "Output file path for `screenshot` / `pdf`." },
+                        "full_page": { "type": "boolean", "description": "Capture full scrollable page in `screenshot`." },
+                        "tab_action": { "type": "string", "description": "`list`, `new`, `activate`, or `close` when `action` is `\"tabs\"`." },
+                        "target_id": { "type": "string", "description": "Target tab ID for `tabs`." },
+                        "cookies": { "type": "array", "items": { "type": "object" }, "description": "Cookies array for `set_cookies`." },
+                        "reason": { "type": "string", "description": "Reason for human `takeover`." },
+                        "tunnel": { "type": "boolean", "description": "Publish an HTTPS tunnel URL during `takeover`." }
                     },
                     "required": ["action"]
+                }
+            }
+        }),
+        json!({
+            "type": "function",
+            "function": {
+                "name": "sandbox",
+                "description": "Inspect or switch workspace execution placement (`action`: `\"placement\"` | `\"status\"`, `placement`: `\"local\"` | `\"cloud\"`). Use `placement: \"local\"` when a task needs host-local resources (`/scratch`, `op` 1Password CLI, `kubectl`/`talosctl`, `desk-*`).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["placement", "status"], "description": "`\"placement\"` to switch placement or `\"status\"` to inspect current placement." },
+                        "placement": { "type": "string", "enum": ["local", "cloud"], "description": "Target execution placement (`\"local\"` for host Sylphx harness, `\"cloud\"` for Sylphx Cloud Sandbox)." }
+                    }
                 }
             }
         }),
@@ -3171,6 +4018,92 @@ fn execute_sylphx_tool(
                 "note": "New KV-cached context window anchored with `handoff`. All prior raw transcript turns remain searchable via `memory_recall`.",
             }))
             .unwrap_or_default()
+        }
+        "sandbox" => {
+            let action = args
+                .get("action")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(if args.get("placement").is_some() {
+                    "placement"
+                } else {
+                    "status"
+                });
+            let allowed_raw = env
+                .iter()
+                .find(|(k, _)| k == "SYLPHX_WORKSPACE_PLACEMENTS")
+                .map(|(_, v)| v.clone())
+                .or_else(|| std::env::var("SYLPHX_WORKSPACE_PLACEMENTS").ok())
+                .unwrap_or_else(|| "local,cloud".to_string());
+            let allowed: Vec<String> = allowed_raw
+                .split(',')
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let placement_path = config_dir.join("sylphx-workspace-placement.json");
+            match action {
+                "placement" | "switch" | "set" => {
+                    let Some(target) = args
+                        .get("placement")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_ascii_lowercase())
+                        .filter(|s| !s.is_empty())
+                    else {
+                        return "error: `sandbox` with `action: \"placement\"` requires `placement: \"local\" | \"cloud\"`"
+                            .to_string();
+                    };
+                    if !matches!(target.as_str(), "local" | "cloud") {
+                        return format!(
+                            "error: unsupported placement `{target}` (expected `\"local\"` or `\"cloud\"`)"
+                        );
+                    }
+                    if !allowed.is_empty() && !allowed.iter().any(|a| a == &target) {
+                        return format!(
+                            "error: workspace placement `{target}` is not permitted by SYLPHX_WORKSPACE_PLACEMENTS (`{allowed_raw}`)"
+                        );
+                    }
+                    let doc = json!({
+                        "placement": target,
+                        "updated_at_ms": anyagents_core::now_ms(),
+                    });
+                    if let Err(e) = std::fs::write(
+                        &placement_path,
+                        serde_json::to_string_pretty(&doc).unwrap_or_default(),
+                    ) {
+                        return format!("error persisting workspace placement: {e}");
+                    }
+                    if target == "local" {
+                        clear_persisted_cloud_session(config_dir);
+                        let _ = std::fs::remove_file(config_dir.join("sylphx-sandbox-lease.json"));
+                    }
+                    serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "placement": target,
+                        "work_dir": work_dir.display().to_string(),
+                        "note": if target == "local" {
+                            "Switched workspace execution to host-local Sylphx harness (`work_dir`). Subsequent `bash`, `read_file`, `write_file`, `edit_file`, `grep`, `glob`, and `code_mode` calls execute directly on the host workspace."
+                        } else {
+                            "Switched workspace execution to Sylphx Cloud Sandbox."
+                        }
+                    }))
+                    .unwrap_or_default()
+                }
+                _ => {
+                    let current = if resolve_cloud_agent_environment(config_dir, env).is_some() {
+                        "cloud"
+                    } else {
+                        "local"
+                    };
+                    serde_json::to_string_pretty(&json!({
+                        "status": "ok",
+                        "placement": current,
+                        "allowed_placements": allowed,
+                        "work_dir": work_dir.display().to_string(),
+                    }))
+                    .unwrap_or_default()
+                }
+            }
         }
         "activate_skill" | "skill" => {
             let Some(skill_name) = args.get("name").and_then(Value::as_str).map(str::trim) else {
@@ -3549,83 +4482,101 @@ fn call_anyagents_mcp_tool(
 ) -> String {
     let normalized_args = normalize_mcp_tool_arguments(tool_name, arguments);
     let clean_cmd = clean_exe_path(mcp_command);
-    let mut cmd = Command::new(&clean_cmd);
-    cmd.args(mcp_args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        // Stderr is not part of the response. Do not let diagnostics fill a
-        // pipe while we wait for the tool's stdout response.
-        .stderr(Stdio::null());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let Ok(mut child) = cmd.spawn() else {
-        return format!("error: failed to spawn anyagents mcp for `{tool_name}`");
-    };
-    let init_req = json!({
-        "jsonrpc": "2.0",
-        "id": 0,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": { "name": "sylphx-harness", "version": "0.1.0" }
+    let mut last_err = String::new();
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_millis(120 * attempt as u64));
         }
-    });
-    let init_notif = json!({
-        "jsonrpc": "2.0",
-        "method": "notifications/initialized"
-    });
-    let call_req = json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "tools/call",
-        "params": {
-            "name": tool_name,
-            "arguments": normalized_args,
+        let mut cmd = Command::new(&clean_cmd);
+        cmd.args(mcp_args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Stderr is not part of the response. Do not let diagnostics fill a
+            // pipe while we wait for the tool's stdout response.
+            .stderr(Stdio::null());
+        for (k, v) in env {
+            cmd.env(k, v);
         }
-    });
-    let mut stdin = child.stdin.take().expect("piped MCP stdin");
-    let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped MCP stdout"));
-    let response = (|| -> Result<Value, String> {
-        for request in [init_req, init_notif, call_req] {
-            writeln!(stdin, "{request}").map_err(|err| format!("writing MCP request: {err}"))?;
+        let Ok(mut child) = cmd.spawn() else {
+            return format!("error: failed to spawn anyagents mcp for `{tool_name}`");
+        };
+        let init_req = json!({
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "sylphx-harness", "version": "0.1.0" }
+            }
+        });
+        let init_notif = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        let call_req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": normalized_args,
+            }
+        });
+        let mut stdin = child.stdin.take().expect("piped MCP stdin");
+        let mut stdout = std::io::BufReader::new(child.stdout.take().expect("piped MCP stdout"));
+        let mut saw_init_response = false;
+        let response = (|| -> Result<Value, String> {
+            for request in [init_req, init_notif, call_req] {
+                writeln!(stdin, "{request}")
+                    .map_err(|err| format!("writing MCP request: {err}"))?;
+            }
+            let _ = stdin.flush();
+            // EOF terminates rmcp's transport and cancels asynchronous tools. Keep
+            // stdin open until our response arrives, ignoring init and notifications.
+            for line in (&mut stdout).lines() {
+                let line = line.map_err(|err| format!("reading MCP response: {err}"))?;
+                if let Ok(value) = serde_json::from_str::<Value>(&line) {
+                    if value.get("id").and_then(Value::as_i64) == Some(0) {
+                        saw_init_response = true;
+                    } else if value.get("id").and_then(Value::as_i64) == Some(1) {
+                        return Ok(value);
+                    }
+                }
+            }
+            Err("MCP server closed stdout before tool response".to_string())
+        })();
+        drop(stdin);
+        if response.is_err() {
+            let _ = child.kill();
         }
-        // EOF terminates rmcp's transport and cancels asynchronous tools. Keep
-        // stdin open until our response arrives, ignoring init and notifications.
-        for line in (&mut stdout).lines() {
-            let line = line.map_err(|err| format!("reading MCP response: {err}"))?;
-            if let Ok(value) = serde_json::from_str::<Value>(&line)
-                && value.get("id").and_then(Value::as_i64) == Some(1)
-            {
-                return Ok(value);
+        // Drain any trailing output after closing stdin so shutdown cannot block on
+        // a full stdout pipe, then reap the server on success and failure alike.
+        let _ = std::io::copy(&mut stdout, &mut std::io::sink());
+        if child.wait().is_err() {
+            return format!("error: failed waiting on anyagents mcp for `{tool_name}`");
+        }
+        match response {
+            Ok(value) => {
+                if let Some(err) = value.pointer("/error/message").and_then(Value::as_str) {
+                    return format!("error: {err}");
+                }
+                let output = value
+                    .pointer("/result/content/0/text")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| value.to_string());
+                return truncate_tool_output_middle_utf8(output, 24_000, 11_000, 11_000);
+            }
+            Err(err) => {
+                last_err = err;
+                if saw_init_response {
+                    break;
+                }
             }
         }
-        Err("MCP server closed stdout before tool response".to_string())
-    })();
-    drop(stdin);
-    if response.is_err() {
-        let _ = child.kill();
     }
-    // Drain any trailing output after closing stdin so shutdown cannot block on
-    // a full stdout pipe, then reap the server on success and failure alike.
-    let _ = std::io::copy(&mut stdout, &mut std::io::sink());
-    if child.wait().is_err() {
-        return format!("error: failed waiting on anyagents mcp for `{tool_name}`");
-    }
-    let value = match response {
-        Ok(value) => value,
-        Err(err) => return format!("error: {err}"),
-    };
-    if let Some(err) = value.pointer("/error/message").and_then(Value::as_str) {
-        return format!("error: {err}");
-    }
-    let output = value
-        .pointer("/result/content/0/text")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| value.to_string());
-    truncate_tool_output_middle_utf8(output, 64_000, 30_000, 30_000)
+    format!("error: {last_err}")
 }
 
 #[cfg(test)]
@@ -3878,6 +4829,419 @@ mod tests {
         assert_eq!(prompt_before, prompt_after);
     }
 
+    fn context_preflight_limits(window_tokens: usize) -> memory::ModelContextLimits {
+        memory::ModelContextLimits {
+            window_tokens,
+            compact_percent: 85,
+            max_output_tokens: None,
+            source: memory::ContextLimitSource::Catalog,
+        }
+    }
+
+    fn context_preflight_build(input: &[Value]) -> Result<Value, String> {
+        build_native_responses_request(
+            "test/model",
+            "standing instructions",
+            input,
+            &[],
+            "unchanged-session",
+            None,
+        )
+    }
+
+    #[test]
+    fn context_preflight_compacts_before_request_and_preserves_pending_tool_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("sylphx-transcript.jsonl");
+        let initial = json!({"role":"user", "content":"pending inbox message #123"});
+        let steer = json!({"role":"user", "content":"steered update #124"});
+        let call =
+            json!({"type":"function_call", "call_id":"done", "name":"bash", "arguments":"{}"});
+        let result = json!({"type":"function_call_output", "call_id":"done", "output":"exit_code: 0; already deployed sha123"});
+        let mut input = vec![
+            json!({"role":"assistant", "content":"x".repeat(30_000)}),
+            initial.clone(),
+            call.clone(),
+            result.clone(),
+            steer.clone(),
+        ];
+        for item in &input {
+            append_transcript_message(&transcript, item);
+        }
+        let raw_before = std::fs::read_to_string(&transcript).unwrap();
+        let request = prepare_budgeted_request(
+            &transcript,
+            &mut input,
+            &[initial.clone(), steer.clone()],
+            &context_preflight_limits(24_000),
+            false,
+            context_preflight_build,
+        )
+        .unwrap();
+        assert!(
+            input[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("context.window_opened")
+        );
+        for retained in [&initial, &steer, &call, &result] {
+            assert_eq!(input.iter().filter(|item| *item == retained).count(), 1);
+        }
+        assert_eq!(&input[1..], &[initial, call, result, steer]);
+        assert_eq!(input, load_transcript_input_items(&transcript));
+        assert_eq!(request["prompt_cache_key"], "unchanged-session");
+        assert!(request_token_upper_bound(&request).unwrap() + 1_200 < 24_000);
+        assert!(
+            std::fs::read_to_string(&transcript)
+                .unwrap()
+                .starts_with(&raw_before)
+        );
+        assert!(execute_memory_recall(&transcript, &json!({"query":"sha123"})).contains("sha123"));
+        validate_responses_input(&input).unwrap();
+    }
+
+    #[test]
+    fn context_preflight_uses_active_models_catalog_window_and_offline_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("model-catalog-direct.json"), json!({"data":[
+            {"id":"context-test/small", "context_length":24_000},
+            {"id":"context-test/large", "limits":{"constraints":{"context_window_tokens":96_000}}}
+        ]}).to_string()).unwrap();
+        // A stale configured model must not override the dispatched model.
+        std::fs::write(
+            tmp.path().join("sylphx-agent.json"),
+            r#"{"model":"wrong/model"}"#,
+        )
+        .unwrap();
+        for (model, compact) in [("context-test/small", true), ("context-test/large", false)] {
+            let limits = memory::resolve_model_context_limits(tmp.path(), model, &[]);
+            assert_eq!(limits.source, memory::ContextLimitSource::Catalog);
+            assert_eq!(limits.window_tokens, if compact { 24_000 } else { 96_000 });
+            let transcript = tmp
+                .path()
+                .join(format!("{}.jsonl", if compact { "small" } else { "large" }));
+            let pending = json!({"role":"user", "content":"pending"});
+            let mut input = vec![
+                json!({"role":"assistant", "content":"x".repeat(30_000)}),
+                pending.clone(),
+            ];
+            for item in &input {
+                append_transcript_message(&transcript, item);
+            }
+            prepare_budgeted_request(
+                &transcript,
+                &mut input,
+                &[pending],
+                &limits,
+                false,
+                context_preflight_build,
+            )
+            .unwrap();
+            assert_eq!(
+                input[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("context.window_opened"),
+                compact
+            );
+        }
+        let fallback = memory::resolve_model_context_limits(tmp.path(), "unknown/model", &[]);
+        assert_eq!(
+            fallback.source,
+            memory::ContextLimitSource::ConservativeFallback
+        );
+        assert!(fallback.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn context_preflight_pending_inbound_survives_failed_turn_restart_and_snapshot_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("sylphx-transcript.jsonl");
+        let a = json!({"role":"user", "content":"unfinished inbox A"});
+        let steer = json!({"role":"user", "content":"steer after failure"});
+        let b = json!({"role":"user", "content":"new inbox B"});
+        append_transcript_message(&transcript, &a);
+        record_pending_native_messages(&transcript, std::slice::from_ref(&a));
+        // Failure means no completion/empty snapshot. A steer may have been
+        // appended just before a crash, without its updated snapshot.
+        append_transcript_message(&transcript, &steer);
+        append_transcript_message(&transcript, &b);
+        let mut input = load_transcript_input_items(&transcript);
+        let pending = load_pending_native_messages(&transcript, &input);
+        assert_eq!(pending, vec![a.clone(), steer.clone(), b.clone()]);
+        record_pending_native_messages(&transcript, &pending);
+        prepare_budgeted_request(
+            &transcript,
+            &mut input,
+            &pending,
+            &context_preflight_limits(24_000),
+            true,
+            context_preflight_build,
+        )
+        .unwrap();
+        assert_eq!(&input[1..], &[a, steer, b]);
+        assert_eq!(
+            load_pending_native_messages(&transcript, &load_transcript_input_items(&transcript)),
+            pending
+        );
+        // Metadata is not sent to the provider, and success closes the pending
+        // boundary so a later normal turn does not revive completed work.
+        assert!(!input.iter().any(|item| item["type"] == "native_turn_state"));
+        record_pending_native_messages(&transcript, &[]);
+        assert!(load_pending_native_messages(&transcript, &input).is_empty());
+    }
+
+    #[test]
+    fn context_preflight_catalog_cache_is_scoped_to_gateway_and_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("model-catalog-direct.json");
+        let write_catalog = |window| {
+            std::fs::write(
+                &catalog,
+                json!({"data":[{"id":"cache-scope/model", "context_window":window}]}).to_string(),
+            )
+            .unwrap()
+        };
+        let env_a = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-a.invalid/v1".into(),
+        )];
+        let env_b = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-b.invalid/v1".into(),
+        )];
+        write_catalog(1_048_576);
+        assert_eq!(
+            memory::resolve_model_context_limits(tmp.path(), "cache-scope/model", &env_a)
+                .window_tokens,
+            1_048_576
+        );
+        write_catalog(8_192);
+        assert_eq!(
+            memory::resolve_model_context_limits(tmp.path(), "cache-scope/model", &env_b)
+                .window_tokens,
+            8_192
+        );
+        // Both entries remain cached independently.
+        assert_eq!(
+            memory::resolve_model_context_limits(tmp.path(), "cache-scope/model", &env_a)
+                .window_tokens,
+            1_048_576
+        );
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join("model-catalog-direct.json"),
+            r#"{"data":[{"id":"cache-scope/model","context_window":16000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            memory::resolve_model_context_limits(other.path(), "cache-scope/model", &env_a)
+                .window_tokens,
+            16_000
+        );
+    }
+
+    #[test]
+    fn context_preflight_persisted_catalog_requires_matching_gateway_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".sylphx-remote-models.json"),
+            json!({
+                "gateway_base_url":"https://gateway-a.invalid/v1",
+                "catalog":{"data":[{"id":"disk-cache/model", "context_window":1_048_576}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let env_a = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-a.invalid/v1".into(),
+        )];
+        let env_b = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-b.invalid/v1".into(),
+        )];
+        let a = memory::resolve_model_context_limits(tmp.path(), "disk-cache/model", &env_a);
+        assert_eq!(a.window_tokens, 1_048_576);
+        let b = memory::resolve_model_context_limits(tmp.path(), "disk-cache/model", &env_b);
+        assert_eq!(b.source, memory::ContextLimitSource::ConservativeFallback);
+        assert!(b.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn context_preflight_guards_real_native_http_dispatch() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(cfg.join("model-catalog-direct.json"),
+            r#"{"data":[{"id":"preflight-http/model","context_length":128000,"limits":{"max_output_tokens":2000}}]}"#).unwrap();
+        let transcript = cfg.join("sylphx-transcript.jsonl");
+        append_transcript_message(
+            &transcript,
+            &json!({"role":"assistant", "content":"old verbose history".repeat(12_000)}),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway = format!("http://{}/v1", listener.local_addr().unwrap());
+        let transcript_at_dispatch = transcript.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            let (header_end, length) = loop {
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    assert!(headers.starts_with("post /v1/responses "));
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            let request: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            assert!(
+                request["input"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("context.window_opened")
+            );
+            assert!(
+                std::fs::read_to_string(transcript_at_dispatch)
+                    .unwrap()
+                    .contains("context_window_open")
+            );
+            assert_eq!(request["max_output_tokens"], 2000);
+            assert!(request_token_upper_bound(&request).unwrap() + 2000 < 128_000);
+            let body = r#"{"output":[],"usage":{"input_tokens":50,"output_tokens":0}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        });
+        let state = Arc::new(Mutex::new(SharedState::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let env = vec![
+            ("SYLPHX_GATEWAY_URL".into(), gateway),
+            ("SYLPHX_GATEWAY_KEY".into(), "fixture-key".into()),
+        ];
+        let usage = run_native_gateway_turn(
+            &state,
+            &cancel,
+            &cfg,
+            &work,
+            Some("preflight-http/model"),
+            &env,
+            Path::new("unused-mcp"),
+            &[],
+            "continue pending task #123",
+        )
+        .unwrap();
+        assert_eq!(usage.input_tokens, 50);
+        server.join().unwrap();
+        assert!(
+            load_pending_native_messages(&transcript, &load_transcript_input_items(&transcript))
+                .is_empty()
+        );
+        // With irreducible pending input, production returns before opening the
+        // HTTP connection. A listening socket proves this isn't a mock refusal.
+        let refused = TcpListener::bind("127.0.0.1:0").unwrap();
+        refused.set_nonblocking(true).unwrap();
+        let env = vec![
+            (
+                "SYLPHX_GATEWAY_URL".into(),
+                format!("http://{}/v1", refused.local_addr().unwrap()),
+            ),
+            ("SYLPHX_GATEWAY_KEY".into(), "fixture-key".into()),
+        ];
+        let irreducible = "irreducible pending task".repeat(20_000);
+        let result = run_native_gateway_turn(
+            &state,
+            &cancel,
+            &cfg,
+            &work,
+            Some("preflight-http/model"),
+            &env,
+            Path::new("unused-mcp"),
+            &[],
+            &irreducible,
+        );
+        assert!(result.unwrap_err().contains("request not sent"));
+        assert_eq!(
+            refused.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // Exercise persistence through the real failed invocation, then a
+        // restart/new inbound and another compaction. Completed prior inbound
+        // must stay completed; the exact failed inbound must remain pending.
+        let failed = json!({"role":"user", "content":irreducible});
+        let next = json!({"role":"user", "content":"next short inbound"});
+        append_transcript_message(&transcript, &next);
+        let mut restarted = load_transcript_input_items(&transcript);
+        let pending = load_pending_native_messages(&transcript, &restarted);
+        assert_eq!(pending, vec![failed.clone(), next.clone()]);
+        prepare_budgeted_request(
+            &transcript,
+            &mut restarted,
+            &pending,
+            &context_preflight_limits(1_048_576),
+            true,
+            context_preflight_build,
+        )
+        .unwrap();
+        assert_eq!(&restarted[1..], &[failed, next]);
+    }
+
+    #[test]
+    fn context_preflight_counts_system_tools_output_and_refuses_irreducible_work_unsent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("sylphx-transcript.jsonl");
+        let pending = json!({"role":"user", "content":"must not disappear".repeat(20_000)});
+        append_transcript_message(&transcript, &pending);
+        let mut input = vec![pending.clone()];
+        let result = prepare_budgeted_request(
+            &transcript,
+            &mut input,
+            std::slice::from_ref(&pending),
+            &context_preflight_limits(24_000),
+            false,
+            context_preflight_build,
+        );
+        assert!(result.unwrap_err().contains("request not sent"));
+        assert!(input.contains(&pending));
+        assert!(load_transcript_input_items(&transcript).contains(&pending));
+        let body = build_native_responses_request(
+            "test/model",
+            &"x".repeat(50_000),
+            &[],
+            &[json!({"name":"big", "description":"y".repeat(50_000)})],
+            "s",
+            None,
+        )
+        .unwrap();
+        assert!(request_token_upper_bound(&body).unwrap() >= 100_000);
+        assert!(is_context_overflow(
+            400,
+            r#"{"error":{"message":"Invalid request: Your request exceeded model token limit: 1048576 (requested: 1274676)","type":"invalid_request_error"}}"#
+        ));
+        assert!(!is_context_overflow(429, "quota exceeded"));
+    }
+
     #[test]
     fn context_window_open_and_raw_rag_memory_recall_preserve_full_history() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4008,7 +5372,9 @@ mod tests {
     fn block_aligned_stride_windowing_preserves_prefix_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let transcript = tmp.path().join("sylphx-transcript.jsonl");
-        for i in 0..165 {
+        // Exercise a real stride cut even when the configured window changes.
+        let initial_items = memory::WINDOW_MAX_ITEMS + 5;
+        for i in 0..initial_items {
             append_transcript_message(
                 &transcript,
                 &json!({ "role": "user", "content": format!("msg_{i}") }),
@@ -4017,12 +5383,22 @@ mod tests {
         let w1 = load_transcript_input_items(&transcript);
         append_transcript_message(
             &transcript,
-            &json!({ "role": "user", "content": "msg_165" }),
+            &json!({ "role": "user", "content": format!("msg_{initial_items}") }),
         );
         let w2 = load_transcript_input_items(&transcript);
-        // Item 0 must stay identical across consecutive turns between block strides!
+        // A cut occurred, it is stride-aligned, and appending one message does
+        // not change the pinned prefix between consecutive stride boundaries.
+        assert!(w1.len() <= memory::WINDOW_MAX_ITEMS);
+        let first_index = w1[0]["content"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("msg_")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(first_index > 0);
+        assert_eq!(first_index % memory::WINDOW_STRIDE_ITEMS, 0);
         assert_eq!(w1[0], w2[0]);
-        assert_eq!(w1[0]["content"], "msg_80");
     }
 
     #[test]
@@ -4071,18 +5447,10 @@ mod tests {
         let env_spec = build_cloud_environment_spec(cfg, None, &[]);
         assert_eq!(env_spec["shape"], "linux-s");
         assert_eq!(env_spec["template"], "template:agent");
+        assert_eq!(env_spec["ttl"], "1800s");
+        assert_eq!(env_spec["idle_standby"], "1800s");
         assert!(env_spec.get("workspace_dir").is_none());
-        assert_eq!(
-            env_spec["repo"]["uri"],
-            "https://github.com/SylphxAI/anyagents.git"
-        );
-        assert_eq!(
-            env_spec["repo"]["revision"],
-            "0123456789abcdef0123456789abcdef01234567"
-        );
-        assert!(env_spec["repo"].get("slug").is_none());
-        assert!(env_spec["repo"].get("branch").is_none());
-        assert!(env_spec["repo"].get("base").is_none());
+        assert!(env_spec.get("repo").is_none());
     }
 
     #[test]
@@ -4526,6 +5894,8 @@ mod tests {
             "schedule",
             "browser",
             "goal",
+            "sandbox",
+            "activate_skill",
         ] {
             assert!(
                 client_names.contains(&expected),
@@ -4543,12 +5913,10 @@ mod tests {
             "glob",
             "list_dir",
             "code_mode",
-            "sandbox",
             "memory_recall",
             "context_budget_read",
             "context_edit",
             "context_window_open",
-            "activate_skill",
         ] {
             assert!(
                 !client_names.contains(&forbidden),
@@ -4559,6 +5927,122 @@ mod tests {
         let all_cloud_tools = build_cloud_agent_tools();
         assert_eq!(all_cloud_tools.len(), client_tools.len());
         assert_eq!(all_cloud_tools[0]["client"]["timeout"], "600s");
+    }
+
+    #[test]
+    fn skills_index_preserves_full_agentskills_frontmatter_and_negative_triggers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let work = tmp.path().join("work");
+        let cfg = tmp.path().join("cfg");
+        let skill_dir = work.join(".agents/skills/self-challenge");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::create_dir_all(&cfg).unwrap();
+        let long_desc = "First-principles reasoning and disconfirmation check before non-trivial decisions. Use when designing architecture, diagnosing a root cause, or claiming an outcome is complete. Use `prove-it` for concrete verification commands; Do NOT use when answering a trivial factual lookup.";
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!("---\nname: self-challenge\ndescription: \"{long_desc}\"\n---\n# Body\n"),
+        )
+        .unwrap();
+
+        let index = discover_skills_index(&work, &cfg);
+        assert!(index.contains("MUST call `activate_skill`"));
+        assert!(
+            index.contains("Use when designing architecture"),
+            "positive trigger clause must not be truncated: {index}"
+        );
+        assert!(
+            index.contains("Do NOT use when answering a trivial factual lookup."),
+            "negative disambiguation clause must not be truncated: {index}"
+        );
+    }
+
+    #[test]
+    fn sandbox_tool_switches_placement_between_cloud_and_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let env = vec![
+            ("SYLPHX_API_KEY".to_string(), "sylphx_sk_test".to_string()),
+            ("SYLPHX_AGENT_ENV".to_string(), "org/proj/dev".to_string()),
+        ];
+        assert_eq!(
+            resolve_cloud_agent_environment(&cfg, &env).as_deref(),
+            Some("org/proj/dev")
+        );
+
+        let out = execute_sylphx_tool(
+            "sandbox",
+            &json!({ "action": "placement", "placement": "local" }),
+            &cfg,
+            &work,
+            &env,
+            Path::new("anyagents"),
+            &[],
+        );
+        let parsed: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["placement"], "local");
+        assert!(resolve_cloud_agent_environment(&cfg, &env).is_none());
+    }
+
+    #[test]
+    fn chat_completions_roundtrip_converts_tool_calls_and_reasoning_content() {
+        let input = vec![
+            json!({ "role": "user", "content": "Run uname" }),
+            json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "bash",
+                "arguments": "{\"command\":\"uname -s\"}",
+                "reasoning_content": "Need OS name"
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "Linux\n"
+            }),
+        ];
+        let req = build_chat_completions_request("k3", "System instructions", &input, None)
+            .expect("chat completions request");
+        let msgs = req["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[2]["role"], "assistant");
+        assert_eq!(msgs[2]["reasoning_content"], "Need OS name");
+        assert_eq!(msgs[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["tool_call_id"], "call_1");
+
+        let chat_resp = json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "The OS is Linux.",
+                    "reasoning_content": "Verified output",
+                    "tool_calls": [{
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "send",
+                            "arguments": "{\"to\":\"parent\",\"text\":\"Linux\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 120,
+                "completion_tokens": 30
+            }
+        });
+        let env_resp = chat_completions_to_responses_envelope(&chat_resp).unwrap();
+        let output = native_responses_output(&env_resp).unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(output[1]["call_id"], "call_2");
+        assert_eq!(output[1]["reasoning_content"], "Verified output");
     }
 
     // The fixture launcher never changes UID/groups or invokes setpriv. It only
@@ -4946,5 +6430,48 @@ exec "$@"
             SylphxExecutionMode::from_env(cfg, &[]),
             SylphxExecutionMode::LocalOnly
         );
+    }
+
+    #[test]
+    fn assemble_system_prompt_replaces_stale_embedded_agents_md_without_duplication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let cfg = data_dir.join("agents/agt_test/config");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+
+        let sys_doc = "# AnyAgents Identity & Environment Awareness\n\n\
+                       ## 1. Your Identity (Who You Are)\n\n\
+                       - **Agent Name**: `nova`\n\n\
+                       ## 4. Shared Instructions (AGENTS.md)\n\n\
+                       # SylphxAI/owner\n\n\
+                       Old stale rule v1.\n\n\
+                       # Cross-Harness Continuity\n\n\
+                       Prior turn summary.";
+        std::fs::write(cfg.join("SYSTEM_PROMPT.md"), sys_doc).unwrap();
+        std::fs::write(cfg.join("AGENTS.md"), sys_doc).unwrap();
+        std::fs::write(
+            data_dir.join("AGENTS.md"),
+            "# SylphxAI/owner\n\nShared rule v2.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            work.join("AGENTS.md"),
+            "# SylphxAI/owner\n\nLive workspace rule v3.\n",
+        )
+        .unwrap();
+
+        let assembled = assemble_system_prompt(&cfg, &work);
+        assert_eq!(
+            assembled.matches("# SylphxAI/owner").count(),
+            1,
+            "must inject exactly one copy of # SylphxAI/owner: {assembled}"
+        );
+        assert!(assembled.contains("Live workspace rule v3."));
+        assert!(!assembled.contains("Old stale rule v1."));
+        assert!(!assembled.contains("Shared rule v2."));
+        assert!(assembled.contains("# Cross-Harness Continuity"));
+        assert!(assembled.contains("Prior turn summary."));
     }
 }

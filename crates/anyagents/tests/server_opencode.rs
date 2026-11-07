@@ -230,3 +230,77 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     assert!(log.contains("anyagents-message:"), "{log}");
     drop(server);
 }
+
+#[test]
+fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port() {
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    support::operator_with_configured_seat(&data);
+    let _server = Server::start(&data);
+    std::thread::scope(|scope| {
+        let a = scope.spawn(|| create(&data, "alpha"));
+        let b = scope.spawn(|| create(&data, "beta"));
+        for created in [a.join().unwrap(), b.join().unwrap()] {
+            assert!(created.status.success(), "{created:?}");
+        }
+    });
+    let store = Store::open(data.join("state.db")).unwrap();
+    let configs: Vec<_> = ["alpha", "beta"]
+        .iter()
+        .map(|name| {
+            let agent = store.agent_by_name(name).unwrap();
+            data.join("agents").join(agent.id.as_str()).join("config")
+        })
+        .collect();
+    let ports: Vec<u16> = configs
+        .iter()
+        .map(|config| {
+            let file = config.join("opencode-service-port");
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&file) {
+                    let port = text.trim().parse().unwrap();
+                    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+                        break port;
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "service not bound: {}",
+                    file.display()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+        .collect();
+    assert_ne!(ports[0], ports[1]);
+    let deleted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .arg("--data")
+        .arg(&data)
+        .args(["agents", "delete", "alpha"])
+        .output()
+        .unwrap();
+    assert!(deleted.status.success(), "{deleted:?}");
+    assert!(
+        !configs[0].exists(),
+        "deletion removes the persisted allocation"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::net::TcpListener::bind(("127.0.0.1", ports[0])).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "deleted agent still owns port {}",
+            ports[0]
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", ports[1])).is_err(),
+        "deleting alpha must leave beta running"
+    );
+}

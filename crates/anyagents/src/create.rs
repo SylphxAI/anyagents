@@ -750,9 +750,15 @@ pub(crate) fn write_agent_instructions_with_continuity(
         ));
     }
     if let Some(parent) = parent_name {
-        doc.push_str(&format!(
-            "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `agents({{ \"action\": \"archive\" }})` to retire yourself.\n"
-        ));
+        if agent.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            doc.push_str(&format!(
+                "- **Role**: Standing Domain Sub-Agent under Parent `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). You are a permanent domain owner under `agent:{parent}` — **do not** archive yourself; stay active and spawn your own child sub-agents (`agents({{ \"action\": \"spawn\", ... }})`) to execute concrete tasks end-to-end.\n"
+            ));
+        } else {
+            doc.push_str(&format!(
+                "- **Role**: Sub-Agent spawned by `agent:{parent}` (addressable as `\"parent\"` or `\"agent:{parent}\"`). Stay `running` across as many turns as needed until your assigned goal is completely finished and verified; once you have sent your final report to `\"parent\"` via `send`, call `agents({{ \"action\": \"archive\" }})` to retire yourself.\n"
+            ));
+        }
     } else {
         doc.push_str("- **Role**: Root Agent\n");
     }
@@ -768,44 +774,28 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push('\n');
     }
 
-    if let Some(data_dir) = config
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-    {
-        let roster = anyagents_core::read_root_roster(data_dir);
-        if !roster.is_empty() {
-            doc.push_str(
-                "\n## 2.1 Team Roster & Multi-Agent Coordination (`description` vs. `instructions`)\n\n\
-                 - **Two-Layer Identity Architecture**:\n\
-                   - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in the Team Roster below and in `groups({ \"action\": \"list\" })` / `agents({ \"action\": \"describe\", \"name\": \"all\" })` so every peer knows who owns what without leaking full system prompts.\n\
-                   - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain private in Section 2 above so they never pollute other agents' context windows.\n\
-                 - **Three-Regime Group & Team Coordination Protocol (Goal-Driven Custody, Not Blind Racing)**:\n\
-                   - **Regime 1 — Single-Owner Match (Direct Execution & Peer Silence)**: When a group message or event clearly matches **one** agent's goal/domain (and was not explicitly addressed to you), only that owning agent answers and executes; all other agents stay silent (`NO_REPLY`) instead of racing or echoing.\n\
-                   - **Regime 2 — Multi-Goal Overlap (Coordinate Custody First)**: When a group topic genuinely spans **2–3 agents' goals** (or crosses domain boundaries), those relevant agents briefly coordinate in the group first to agree on single-writer custody (who owns what part) before mutating shared state.\n\
-                   - **Regime 3 — Out-of-Domain Discovery (Global Sensing, Specialized Handoff)**: Every agent keeps global situational awareness, not rigid tunnel vision. If you discover a blocker or incident outside your domain or capability (e.g., you own growth/users and spot a dead server or cluster failure), **do not** attempt to fix it yourself and **do not** ignore it — hand it off (`send` or `@mention` in the group) with your concrete evidence to the peer whose `description` owns that domain.\n\
-                 - **Active Root Agent Roster (`agent:<name>` — `role` — `description`)**:\n",
-            );
-            for (peer_name, peer_role, peer_desc) in &roster {
-                let marker = if peer_name == &agent.name {
-                    " *(you)*"
-                } else {
-                    ""
-                };
-                let role_str = peer_role
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .map(|r| format!(" [{r}]"))
-                    .unwrap_or_default();
-                let desc_str = peer_desc
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("(no public description set)");
-                doc.push_str(&format!(
-                    "  - `agent:{peer_name}`{role_str}{marker}: {desc_str}\n"
-                ));
-            }
-        }
+    doc.push_str(
+        "\n## 2.1 Hierarchy, Event-Driven Topology & Scope Encapsulation\n\n\
+         - **Two-Layer Identity Architecture (`description` vs. `instructions`)**:\n\
+           - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in `agents({ \"action\": \"describe\", \"name\": \"all\" })` without leaking private instructions.\n\
+           - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain strictly private in Section 2 above (visible only to you and your ancestor supervisors).\n\
+         - **Event-Driven Topology (100% Static System Prompt + User-Message `<topology>` Events)**:\n\
+           - To keep your LLM prompt prefix KV cache 100% stable, dynamic peer/sibling/sub-agent rosters are **never** injected into this System Prompt.\n\
+           - Instead, your initial relationship snapshot arrives on your first user message inside `<topology event=\"initial\" self=\"...\" scope=\"...\" parent=\"...\" siblings=\"...\" children=\"...\" groups=\"...\" />`, and any subsequent changes (when a sibling, peer, standing child, or group is added or removed) arrive as incremental inbox events `<topology event=\"delta\" changes=\"+sibling: ...; -sibling: ...\" />`.\n\
+           - Every incoming `<message ...>` also carries `sender_rel=\"parent|sibling|child|peer|external_user\"` and `sender_role=\"...\"`.\n\
+         - **Orthogonal Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`) & External Channels**:\n\
+           - **`\"isolated\"` *(External Partner / Personal Liaison Bots)*:** Confined strictly to direct `parent`, own `children`, and bound external channels (e.g. Telegram). Cannot message or read siblings or other roots.\n\
+           - **`\"private\"` *(Default for Task Sub-Agents)*:** Only direct `parent`, own `children`, or members of a shared `group:<name>` can message it; reports upward via `to: [\"parent\"]`.\n\
+           - **`\"siblings\"` *(Default for Standing Domain Sub-Agents with a `role`)*:** Can freely collaborate with and message direct `parent`, own `children`, and sibling domain sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`), without crossing into another root manager's tree.\n\
+           - **`\"public\"` *(Root Agents & Cross-Tree Shared Services)*:** Reachable across the workspace.\n\
+           - **Scope updates:** An explicit `scope` persists across restarts and reconciliation. Legacy `public: true` selects `public`; `public: false` only revokes public reachability, preserving nonpublic scopes (including `siblings`) or restoring the role-based default. Explicit `scope` wins when both are supplied.\n\
+           - **Downward-Only Supervision:** A parent/ancestor can inspect its descendants' `instructions` and `conversation` history, never the reverse (a child or sibling can never read its parent's or sibling's private instructions or private conversations).\n\
+           - **Group Chat Discipline:** When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
+    );
+    if let Some(parent) = parent_name {
+        doc.push_str(&format!(
+            "         - **Your Direct Parent Agent**: `agent:{parent}` (send upward via `to: [\"parent\"]` or `to: [\"agent:{parent}\"]`)\n"
+        ));
     }
 
     doc.push_str(
@@ -832,7 +822,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
            - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
-           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"sage\"]`, `[\"group:owners\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`).\n\
+           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Standing domain sub-agents (`scope: \"siblings\"`) can message their `parent`, `children`, and reachable `siblings`; task sub-agents (`scope: \"private\"`) and external liaison assistants (`scope: \"isolated\"`) report upward to `parent` (or shared `group:<name>`).\n\
            - **Reactions, Poll Votes & Edits**: Pass `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]`), `\"check\"` / `\"uncheck\"`, `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"` along with `target` (or `reply_to`: `anyagents:reply:msg_...`) on `send`.\n\
          - **3. Memory, History & Zero-Embedding Lexical + Structured Search (`conversation` & `search` MCP Tools)**:\n\
            - Incoming messages are pushed automatically to your session — never poll an inbox. Every historical and live turn across all agents is stored lossless in the append-only store (`Raw-RAG`).\n\
@@ -1096,26 +1086,28 @@ pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
 
 #[cfg(unix)]
 pub(crate) fn sync_canonical_skills(data_dir: &Path) {
-    let data_skills = data_dir.join("skills");
-    if let Ok(skills_dir) = std::fs::canonicalize(&data_skills)
-        && let Some(repo_root) = skills_dir.parent()
-        && repo_root.join(".git").exists()
-    {
-        let is_clean = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo_root)
-            .args(["status", "--porcelain"])
-            .output()
-            .ok()
-            .is_some_and(|o| o.status.success() && o.stdout.is_empty());
-        if is_clean {
-            let _ = std::process::Command::new("git")
+    for rel in ["skills", "AGENTS.md"] {
+        let target_path = data_dir.join(rel);
+        if let Ok(resolved) = std::fs::canonicalize(&target_path)
+            && let Some(repo_root) = resolved.parent()
+            && repo_root.join(".git").exists()
+        {
+            let is_clean = std::process::Command::new("git")
                 .arg("-C")
                 .arg(repo_root)
-                .args(["pull", "--ff-only", "--quiet", "origin", "main"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+                .args(["status", "--porcelain"])
+                .output()
+                .ok()
+                .is_some_and(|o| o.status.success() && o.stdout.is_empty());
+            if is_clean {
+                let _ = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(repo_root)
+                    .args(["pull", "--ff-only", "--quiet", "origin", "main"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+            }
         }
     }
 }
@@ -1523,6 +1515,13 @@ pub(crate) fn seed_harness_credentials(
             ".config/sylphx/context.json",
             ".config/sylphx/key",
             ".config/opencode/sylphx.key",
+            ".config/opencode/kimi-code-plan.key",
+            ".config/opencode/kimi.key",
+            ".config/opencode/qwen-token-plan.key",
+            ".config/opencode/qwen-coding-plan.key",
+            ".config/opencode/glm-code-plan.key",
+            ".config/opencode/minimax-code-plan.key",
+            ".config/opencode/openrouter.key",
             ".config/opencode/opencode.json",
             "sylphx-agent.json",
         ],
@@ -2041,6 +2040,18 @@ pub(crate) fn reconcile_agent_runtime_config(
             "--config".to_string(),
             config.display().to_string(),
         ];
+        for (other_harness, stale_file) in [
+            ("opencode", "opencode.json"),
+            ("codex", "config.toml"),
+            ("muse", "settings.json"),
+            ("claude-code", ".claude.json"),
+            ("claude-code", "mcp.json"),
+            ("sylphx", "sylphx-agent.json"),
+        ] {
+            if agent.harness != other_harness {
+                let _ = std::fs::remove_file(config.join(stale_file));
+            }
+        }
         match agent.harness.as_str() {
             "codex" => {
                 let codex_toml = config.join("config.toml");
@@ -2421,6 +2432,12 @@ pub(crate) fn configure_agent_runtime(
 ) -> Result<serde_json::Value, Error> {
     let existing = store.agent_by_name(name)?;
     let previous_harness = existing.harness.clone();
+    let resolved_model = model
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| existing.model.clone());
+    let config = agent_config_dir(data, &existing.id);
     let target_harness = match harness.map(str::trim) {
         Some("") => return Err(Error::Message("harness is empty".into())),
         Some("sylphx-agent" | "sylphx_agent") => "sylphx".to_string(),
@@ -2432,12 +2449,6 @@ pub(crate) fn configure_agent_runtime(
     {
         crate::install::record(data, &target_harness).map_err(Error::Message)?;
     }
-    let resolved_model = model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| existing.model.clone());
-    let config = agent_config_dir(data, &existing.id);
     let current_bound = bound_profile_name(&config);
 
     let (provider, profile_name) =
@@ -2580,7 +2591,8 @@ pub(crate) fn configure_agent_runtime(
         ".anyagents-profile",
         &format!("{normalized_profile}\n"),
     );
-    let _ = std::fs::remove_file(config.join(".anyagents-last-error.json"));
+    crate::vendor::persist_last_error(&config, None, None);
+    let _ = std::fs::remove_file(config.join(".anyagents-notified-parent-error.json"));
     if updated.harness == "agy" {
         clear_stale_agy_quota_error_steps(&config);
     }
@@ -3783,7 +3795,7 @@ pub(crate) fn default_kind_and_harnesses(provider: &str) -> (&'static str, Vec<S
         ),
         "qwen-token-plan" | "kimi-code-plan" | "glm-code-plan" | "minimax-code-plan" => (
             "coding-plan",
-            harnesses(&["opencode", "omp", "claude-code", "codex", "dsh"]),
+            harnesses(&["sylphx", "opencode", "omp", "claude-code", "codex", "dsh"]),
         ),
         "anthropic" => (
             "subscription",
@@ -4175,7 +4187,16 @@ pub(crate) fn sync_and_list_provider_profiles_with_options(
                         }
                     }
                 }
-                if provider == "sylphx" && !compatible_harnesses.iter().any(|h| h == "sylphx") {
+                if matches!(
+                    provider.as_str(),
+                    "sylphx"
+                        | "kimi-code-plan"
+                        | "qwen-token-plan"
+                        | "glm-code-plan"
+                        | "minimax-code-plan"
+                        | "openrouter"
+                ) && !compatible_harnesses.iter().any(|h| h == "sylphx")
+                {
                     compatible_harnesses.insert(0, "sylphx".to_string());
                 }
                 let (acct_email, acct_id) = extract_profile_account_identity(&prof_path, &provider);
@@ -7119,6 +7140,230 @@ pub(crate) fn save_subagent_defaults(
     Ok(())
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArchetypeTemplate {
+    pub description: Option<String>,
+    pub scope: Option<String>,
+    pub workdir: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub role: Option<String>,
+    pub profile: Option<String>,
+    pub body: String,
+}
+
+fn unquote_yaml_scalar(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if trimmed.starts_with('"') {
+            return inner
+                .replace("\\\"", "\"")
+                .replace("\\n", "\n")
+                .replace("\\\\", "\\");
+        }
+        return inner.to_string();
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn parse_archetype_markdown(raw: &str) -> ArchetypeTemplate {
+    let text = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let trimmed_start = text.trim_start_matches(['\r', '\n']);
+    let mut tpl = ArchetypeTemplate::default();
+    let Some(after_open) = trimmed_start
+        .strip_prefix("---\n")
+        .or_else(|| trimmed_start.strip_prefix("---\r\n"))
+    else {
+        tpl.body = text.trim().to_string();
+        return tpl;
+    };
+    let mut fm_lines = Vec::new();
+    let mut body_start_offset = None;
+    let mut cursor = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        let clean_line = line.trim_end_matches(['\r', '\n']).trim();
+        cursor += line.len();
+        if clean_line == "---" || clean_line == "..." {
+            body_start_offset = Some(cursor);
+            break;
+        }
+        fm_lines.push(line.trim_end_matches(['\r', '\n']));
+    }
+    let Some(offset) = body_start_offset else {
+        tpl.body = text.trim().to_string();
+        return tpl;
+    };
+    for line in fm_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = unquote_yaml_scalar(v);
+        if val.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "description" => tpl.description = Some(val),
+            "scope" => tpl.scope = Some(val),
+            "workdir" => tpl.workdir = Some(val),
+            "harness" => tpl.harness = Some(val),
+            "model" => tpl.model = Some(val),
+            "role" => tpl.role = Some(val),
+            "profile" => tpl.profile = Some(val),
+            _ => {}
+        }
+    }
+    tpl.body = after_open[offset..].trim().to_string();
+    tpl
+}
+
+pub(crate) fn resolve_archetype_template(
+    data_dir: &Path,
+    parent: Option<&Agent>,
+    explicit_workdir: Option<&str>,
+    archetype: &str,
+) -> Option<ArchetypeTemplate> {
+    let clean = archetype.trim();
+    let clean = clean.strip_suffix(".md").unwrap_or(clean).trim();
+    if clean.is_empty() || clean.contains('/') || clean.contains('\\') || clean.contains("..") {
+        return None;
+    }
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(wd) = explicit_workdir.map(str::trim).filter(|s| {
+        !s.is_empty()
+            && !s.eq_ignore_ascii_case("worktree")
+            && !s.eq_ignore_ascii_case("branch")
+            && !s.eq_ignore_ascii_case("private")
+            && !s.eq_ignore_ascii_case("inherit")
+    }) {
+        search_dirs.push(PathBuf::from(wd).join(".agents").join("agents"));
+    }
+    if let Some(parent_wd) = parent
+        .and_then(|p| p.workdir.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        search_dirs.push(PathBuf::from(parent_wd).join(".agents").join("agents"));
+    }
+    search_dirs.push(data_dir.join("archetypes"));
+    search_dirs.push(data_dir.join(".agents").join("agents"));
+    if let Some(ow) = crate::server::owner_workdir() {
+        search_dirs.push(ow.join(".agents").join("agents"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        search_dirs.push(PathBuf::from(home).join(".agents").join("agents"));
+    }
+
+    for dir in search_dirs {
+        for candidate in [
+            dir.join(format!("{clean}.md")),
+            dir.join(clean).join("agent.md"),
+            dir.join(clean).join("AGENT.md"),
+        ] {
+            if candidate.is_file()
+                && let Ok(content) = std::fs::read_to_string(&candidate)
+            {
+                return Some(parse_archetype_markdown(&content));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn apply_archetype_defaults(
+    data_dir: &Path,
+    parent: Option<&Agent>,
+    body: &mut crate::api::CreateAgentRequest,
+) {
+    let Some(arch) = body
+        .archetype
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(tpl) = resolve_archetype_template(data_dir, parent, body.workdir.as_deref(), arch)
+    else {
+        return;
+    };
+    if body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.description = tpl.description;
+    }
+    if body
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.scope = tpl.scope;
+    }
+    if body
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.workdir = tpl.workdir;
+    }
+    if body.harness.trim().is_empty()
+        && let Some(h) = tpl.harness
+    {
+        body.harness = h;
+    }
+    if body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.model = tpl.model;
+    }
+    if body
+        .role
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && tpl.role.is_some()
+    {
+        body.role = tpl.role;
+    }
+    if body
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && tpl.profile.is_some()
+    {
+        body.profile = tpl.profile;
+    }
+    if !tpl.body.is_empty() {
+        let merged = match body
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(caller_inst) => format!("{}\n\n{}", tpl.body, caller_inst),
+            None => tpl.body,
+        };
+        body.instructions = Some(merged);
+    }
+}
+
 /// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.
 pub(crate) fn resolve_subagent_defaults(
     data: &Path,
@@ -7701,6 +7946,9 @@ mod tests {
             seat_user: None,
             seat_uid: None,
             seat_gid: None,
+            scope: child.scope().to_string(),
+            relationship: None,
+            can_message: None,
             schedules: Vec::new(),
         }];
 
@@ -7890,8 +8138,8 @@ mod tests {
         //    - L2's worktree is clean and unmodified -> reaping L2 removes `l2_wt` cleanly.
         crate::server::reap_subagent_ephemeral_dirs(data, &l2.id);
         assert!(
-            !l2_wt.join(".git").exists() && !l2_wt.join("README.md").exists() && l2_wt.is_dir(),
-            "clean unmodified worktree should be reaped on archive while keeping empty work/ dir"
+            !l2_wt.exists(),
+            "clean unmodified worktree should be reaped without recreating empty work/ dir"
         );
 
         //    - Dirty L1's worktree with an uncommitted file -> reaping L1 MUST preserve `l1_wt`!

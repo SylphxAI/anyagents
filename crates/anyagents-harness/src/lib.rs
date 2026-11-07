@@ -35,17 +35,24 @@ pub fn ref_message(reference: &str) -> Option<&str> {
     (!id.is_empty() && !id.contains(':')).then_some(id)
 }
 
-/// The text one stored message becomes for every harness: the ID line, then a
-/// structured `<message>` XML envelope containing optional `<quoted_message>`
-/// context and the `<body>`.
+/// The text one stored message becomes for every harness: the ID line, then an
+/// optional `<topology>` event envelope (initial snapshot or incremental delta),
+/// followed by the structured `<message>` XML envelope containing optional
+/// `<quoted_message>` context and the `<body>`.
 pub fn compose_message(id: &str, context: &Context, body: &str) -> String {
     let (main_body, quoted_xml) = extract_quoted_xml(body, context.reply_to_author.as_deref());
     let open_tag = context.open_tag(id);
-    match quoted_xml {
-        Some(q) => format!(
+    match (context.topology.as_deref(), quoted_xml) {
+        (Some(topo), Some(q)) => format!(
+            "{MESSAGE_MARKER_PREFIX}{id}\n{topo}\n{open_tag}\n{q}\n<body>\n{main_body}\n</body>\n</message>"
+        ),
+        (Some(topo), None) => format!(
+            "{MESSAGE_MARKER_PREFIX}{id}\n{topo}\n{open_tag}\n<body>\n{main_body}\n</body>\n</message>"
+        ),
+        (None, Some(q)) => format!(
             "{MESSAGE_MARKER_PREFIX}{id}\n{open_tag}\n{q}\n<body>\n{main_body}\n</body>\n</message>"
         ),
-        None => format!(
+        (None, None) => format!(
             "{MESSAGE_MARKER_PREFIX}{id}\n{open_tag}\n<body>\n{main_body}\n</body>\n</message>"
         ),
     }
@@ -121,6 +128,12 @@ pub struct Context {
     /// Human-readable display name of the sender (e.g. `Kyle (@shtse8)`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_name: Option<String>,
+    /// Role label of the sender agent (e.g. `公司業務總管`), when the sender is an agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_role: Option<String>,
+    /// Structural relationship of the sender to the recipient (`parent`, `sibling`, `child`, `peer`, `external_user`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_rel: Option<String>,
     /// The recipient agent (`agent:<name>`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipient: Option<String>,
@@ -152,6 +165,10 @@ pub struct Context {
     /// Agents participating in this group or channel conversation (`name (role)`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<String>,
+    /// Event-driven topology snapshot (first user message) or incremental delta
+    /// when peers, siblings, children, or groups change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topology: Option<String>,
 }
 
 impl Context {
@@ -167,6 +184,15 @@ impl Context {
                 " sender_name=\"{}\"",
                 xml_attr_escape(sender_name)
             ));
+        }
+        if let Some(sender_role) = &self.sender_role {
+            out.push_str(&format!(
+                " sender_role=\"{}\"",
+                xml_attr_escape(sender_role)
+            ));
+        }
+        if let Some(sender_rel) = &self.sender_rel {
+            out.push_str(&format!(" sender_rel=\"{}\"", xml_attr_escape(sender_rel)));
         }
         if let Some(recipient) = &self.recipient {
             out.push_str(&format!(" to=\"{}\"", xml_attr_escape(recipient)));

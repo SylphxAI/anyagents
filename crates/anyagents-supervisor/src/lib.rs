@@ -749,6 +749,11 @@ impl<H: Harness + 'static> Session<H> {
                 continue;
             }
             self.publish();
+            // A changed configuration supersedes the old process's fault,
+            // quota hold or restart delay before any further dispatch.
+            if self.try_apply_pending_switch() {
+                continue;
+            }
             if self.quota_waiting() {
                 continue;
             }
@@ -1000,9 +1005,6 @@ impl<H: Harness + 'static> Session<H> {
     ///
     /// `true` when a second loop already holds the agent.
     fn deliver_once(&mut self) -> bool {
-        if self.try_apply_pending_switch() {
-            return false;
-        }
         if let Some(switch_started_at) = self.pending_switch_started_at {
             // A harness, model, or profile switch is pending while the old
             // process is mid-turn: hold new mailbox messages in SQLite for the
@@ -1089,14 +1091,19 @@ impl<H: Harness + 'static> Session<H> {
     /// When a running agent's configured harness, model, or profile changed,
     /// hold new incoming mailbox messages at the gate so they cannot extend
     /// an active turn on the retiring process, and replace the live process
-    /// immediately when idle or once `PENDING_SWITCH_DRAIN_MS` expires.
+    /// immediately when idle or faulted, or once `PENDING_SWITCH_DRAIN_MS`
+    /// expires. An errored turn cannot drain successfully on the old harness.
     fn try_apply_pending_switch(&mut self) -> bool {
-        let is_idle = {
+        let replaceable = {
             let Some(delivery) = self.delivery.as_ref() else {
                 self.pending_switch_started_at = None;
                 return false;
             };
-            delivery.harness().health().turn_state == TurnState::Idle
+            let health = delivery.harness().health();
+            health.turn_state == TurnState::Idle
+                || !health.process_alive
+                || health.sign_in_fault.is_some()
+                || self.last_error.is_some()
         };
         let Ok(fresh) = self.inner.store.agent(&self.id) else {
             return false;
@@ -1116,7 +1123,7 @@ impl<H: Harness + 'static> Session<H> {
         let now = self.inner.clock.now_ms();
         let started_at = *self.pending_switch_started_at.get_or_insert(now);
         let drain_expired = now.saturating_sub(started_at) >= PENDING_SWITCH_DRAIN_MS;
-        if !is_idle && !drain_expired {
+        if !replaceable && !drain_expired {
             return false;
         }
         self.pending_switch_started_at = None;
@@ -1184,6 +1191,11 @@ impl<H: Harness + 'static> Session<H> {
     /// to the sub-agent automatically wakes and resumes it.
     fn try_auto_archive_subagent(&mut self) -> bool {
         if self.agent.parent_id.is_none()
+            || self
+                .agent
+                .role
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty())
             || !self.completed_turn_in_session
             || self.last_error.is_some()
         {
@@ -1373,14 +1385,11 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     }
 }
 
-fn reap_ephemeral_dirs(config_dir: &std::path::Path, managed_work: &std::path::Path) {
+fn reap_ephemeral_dirs(config_dir: &std::path::Path, _managed_work: &std::path::Path) {
     let seat_ids = detect_seat_ids(config_dir);
     for rel in ["cache-home", "tmp", ".rustup", ".cargo"] {
         let target = config_dir.join(rel);
         remove_path_with_seat(&target, seat_ids);
-    }
-    if !managed_work.join(".git").exists() {
-        remove_path_with_seat(managed_work, seat_ids);
     }
 }
 

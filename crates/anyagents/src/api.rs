@@ -14,6 +14,15 @@ pub struct AgentView {
     pub aliases: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).
+    #[serde(default)]
+    pub scope: String,
+    /// Structural relationship of this agent to the authenticated caller (`"self"`, `"parent"`, `"sibling"`, `"child"`, `"descendant"`, `"ancestor"`, `"peer"`, `"other"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relationship: Option<String>,
+    /// Whether the authenticated caller is permitted to message this agent directly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_message: Option<bool>,
     pub harness: String,
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -102,7 +111,7 @@ impl From<anyagents_core::AgentSchedule> for ScheduleView {
 }
 
 fn default_harness() -> String {
-    "claude-code".to_string()
+    String::new()
 }
 
 /// Body of `POST /v1/agents`.
@@ -110,6 +119,14 @@ fn default_harness() -> String {
 pub struct CreateAgentRequest {
     #[serde(alias = "agent", alias = "id", alias = "agent_id", alias = "target")]
     pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
+    pub archetype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default = "default_harness")]
@@ -133,6 +150,16 @@ pub struct CreateAgentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "allow_external"
+    )]
+    pub public: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
 }
 
@@ -153,6 +180,8 @@ pub struct GroupMemberView {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GroupView {
     pub name: String,
+    #[serde(default)]
+    pub public: bool,
     pub members: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub roster: Vec<GroupMemberView>,
@@ -163,12 +192,18 @@ pub struct GroupsResponse {
     pub groups: Vec<GroupView>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct GroupActionRequest {
     pub action: String,
     pub group: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "allow_external"
+    )]
+    pub public: Option<bool>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -438,5 +473,24 @@ mod create_agent_tests {
         }
         let legacy: LegacyRequest = serde_json::from_value(serialized).unwrap();
         assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
+    }
+
+    #[test]
+    fn archetype_aliases_deserialize_and_omit_when_absent() {
+        for key in ["archetype", "type", "template", "preset"] {
+            let request: CreateAgentRequest = serde_json::from_value(json!({
+                "name": "worker",
+                key: "writer",
+            }))
+            .unwrap();
+            assert_eq!(request.archetype.as_deref(), Some("writer"));
+        }
+        let plain: CreateAgentRequest = serde_json::from_value(json!({
+            "name": "worker"
+        }))
+        .unwrap();
+        assert!(plain.archetype.is_none());
+        let serialized = serde_json::to_value(plain).unwrap();
+        assert!(serialized.get("archetype").is_none());
     }
 }
