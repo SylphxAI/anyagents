@@ -241,6 +241,11 @@ Missing memory, missing overlay, writable peer memory and writable global skills
 each refuse admission before the probe starts. Protected bytes are hashed before
 and after. The receipt records source/binary/script/launcher hashes, each case's
 exit and output, and confirmed fixture removal; CI prints it even after failure.
+A native-setpriv preflight checks every fixture ancestor's traversal permission
+with the actual UID/GID before admission. Production admission failures report
+the static failed check label without command output or capability contents;
+this separates fixture setup failures from a specific boundary refusal. Existing
+ancestor permissions are never changed to make a fixture pass.
 No account, ACL, real agent directory or daemon is changed.
 
 A non-root local invocation deliberately refuses before creating a fixture. It

@@ -151,6 +151,31 @@ echo PRIVATE_AND_GLOBAL_DENIED
                    ANYAGENTS_LAUNCHER=str(launcher))
         command = [str(binary), '--data', str(data), 'agent-run', '--config', str(config), '--',
                    '/bin/sh', str(program), str(data), str(args.uid), str(args.gid)]
+        # A private executor ancestor is not repaired by chmod on our own leaf.
+        # Diagnose traversal with the same real identity before invoking admission;
+        # never alter an existing ancestor or substitute a test launcher.
+        preflight = subprocess.run([
+            str(launcher), '--reuid', str(args.uid), '--regid', str(args.gid),
+            '--groups', f'{args.gid},{args.socket_gid}', '--no-new-privs', '--',
+            '/bin/sh', '-c', '''set -eu
+expected_uid=$1; expected_gid=$2; shift 2
+[ "$(id -u)" = "$expected_uid" ]
+[ "$(id -g)" = "$expected_gid" ]
+for path do
+  if [ ! -x "$path" ]; then
+    printf 'fixture ancestor is not traversable: %s\\n' "$path" >&2
+    exit 31
+  fi
+done
+echo REAL_UID_FIXTURE_TRAVERSAL_OK
+''', 'fixture-traversal', str(args.uid), str(args.gid),
+            *map(str, reversed(root.parents)), str(root), str(data), str(mine), str(config),
+        ], env=env, text=True, capture_output=True, timeout=30)
+        receipt['cases'].append({'name': 'real-uid-fixture-traversal',
+                                 'exit': preflight.returncode, 'stdout': preflight.stdout,
+                                 'stderr': preflight.stderr})
+        if preflight.returncode != 0 or 'REAL_UID_FIXTURE_TRAVERSAL_OK' not in preflight.stdout:
+            raise RuntimeError(f'real UID fixture traversal failed: {preflight.stderr}')
         def run_case(name, success):
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
             receipt['cases'].append({'name': name, 'exit': result.returncode,

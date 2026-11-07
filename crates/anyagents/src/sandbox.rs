@@ -1177,6 +1177,19 @@ struct Check {
     program: String,
 }
 
+fn admission_script(checks: impl IntoIterator<Item = Check>) -> String {
+    let mut script = String::from(
+        "set -e\ncheck='probe startup'\n\
+         trap 'status=$?; if [ \"$status\" -ne 0 ]; then printf \"boundary check failed: %s\\n\" \"$check\" >&2; fi' 0\n",
+    );
+    for check in checks {
+        // Labels are static diagnostic text, never a path, capability or command output.
+        let label = check.what.replace('\'', "'\\''");
+        script.push_str(&format!("check='{label}'\n{}\n", check.program));
+    }
+    script
+}
+
 fn checks(config: Option<&Path>, boundary: &Boundary, uid: u32, gid: u32) -> Vec<Check> {
     let data = PathBuf::from(&boundary.data_dir);
     let deny = |what: &'static str, path: String| Check {
@@ -1277,10 +1290,7 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
         )));
     }
     let groups = format!("{gid},{sock_gid}");
-    let mut script = String::from("set -e\n");
-    for check in checks(config, &boundary, uid, gid) {
-        script.push_str(&format!("# {}\n{}\n", check.what, check.program));
-    }
+    let script = admission_script(checks(config, &boundary, uid, gid));
     // The probe asserts every property of the boundary and then exits; the
     // agent's own command is not started unless it passes.
     let probe_ref = [
@@ -1355,6 +1365,43 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn admission_failure_names_its_check_without_running_later_commands() {
+        for program in ["false", "true; exit 9"] {
+            let script = admission_script([
+                Check {
+                    what: "the server's synthetic boundary",
+                    program: program.into(),
+                },
+                Check {
+                    what: "later check",
+                    program: "printf 'SHOULD_NOT_RUN\\n'".into(),
+                },
+            ]);
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8(output.stderr).unwrap(),
+                "boundary check failed: the server's synthetic boundary\n"
+            );
+        }
+        let script = admission_script([Check {
+            what: "successful boundary",
+            program: "true".into(),
+        }]);
+        let output = std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr.is_empty());
+    }
 
     #[test]
     fn an_unconfigured_seat_is_refused_before_anything_starts() {
