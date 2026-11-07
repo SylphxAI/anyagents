@@ -503,3 +503,136 @@ fn the_capability_file_of_one_agent_never_opens_another() {
     );
     assert!(op_only.starts_with("HTTP/1.1 403"), "{op_only}");
 }
+
+/// The health response describes each serving process even when the installed
+/// pathname is replaced while both processes remain alive.
+#[test]
+fn health_reports_each_running_image_and_survives_atomic_install() {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+    use std::os::unix::fs::PermissionsExt;
+
+    let _env = support::lock();
+    let source = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+        .unwrap();
+    assert!(source.status.success());
+    let expected_source = String::from_utf8(source.stdout).unwrap().trim().to_owned();
+    assert_eq!(env!("ANYAGENTS_SOURCE_SHA"), expected_source);
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).unwrap();
+    let image = dir.path().join("anyagents");
+    std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
+    let expected_hash = format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap()));
+    let earliest_start = anyagents_core::now_ms();
+    let start = |verb: &str, socket: &str| {
+        let child = Command::new(&image)
+            .arg("--data")
+            .arg(&data)
+            .arg(verb)
+            .env("ANYAGENTS_FAKE_MODE", "1")
+            .env("ANYAGENTS_TESTS", "own-seat")
+            .env("ANYAGENTS_WEBHOOK_LISTEN", "127.0.0.1:0")
+            // Build provenance must never be supplied by the runtime environment.
+            .env("ANYAGENTS_SOURCE_SHA", "not-the-built-source")
+            .env_remove("ANYAGENTS_OPERATOR_TOKEN_FILE")
+            .env_remove("ANYAGENTS_AGENT_UID")
+            .env_remove("ANYAGENTS_AGENT_GID")
+            .env_remove("ANYAGENTS_SOCKET_GID")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let server = Serve {
+            child,
+            socket: data.join(socket),
+        };
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
+            assert!(Instant::now() < deadline, "{verb} did not bind");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        server
+    };
+    let health = |socket: &Path| {
+        let raw = support::call_raw(socket, "GET", "/v1/webhooks/healthz", "", "");
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        assert!(
+            raw.to_ascii_lowercase().contains("cache-control: no-store"),
+            "{raw}"
+        );
+        serde_json::from_str::<Value>(raw.split_once("\r\n\r\n").unwrap().1).unwrap()
+    };
+    let serve = start("serve", "anyagents.sock");
+    let admin = start("serve-admin", "admin.sock");
+    let serving = health(&serve.socket);
+    let administering = health(&admin.socket);
+    for (value, pid) in [
+        (&serving, serve.child.id()),
+        (&administering, admin.child.id()),
+    ] {
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(value["source_sha"], expected_source);
+        assert_eq!(value["binary_sha256"], expected_hash);
+        assert_eq!(value["pid"], pid);
+        let started = value["process_started_at_ms"].as_i64().unwrap();
+        assert!(started >= earliest_start && started <= anyagents_core::now_ms());
+        assert_eq!(
+            value.as_object().unwrap().len(),
+            6,
+            "no private state in health"
+        );
+    }
+    assert_ne!(serving["pid"], administering["pid"]);
+
+    // Public health aliases report the same serve process, never admin's PID.
+    let addr = std::fs::read_to_string(data.join("webhook.addr")).unwrap();
+    for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
+        let mut stream = std::net::TcpStream::connect(addr.trim()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).unwrap();
+        assert!(raw.starts_with("HTTP/1.1 200"), "{raw}");
+        let value: Value = serde_json::from_str(raw.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(value, serving);
+    }
+
+    let replacement = dir.path().join("replacement");
+    std::fs::write(&replacement, b"different bytes installed after startup").unwrap();
+    std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::rename(replacement, &image).unwrap();
+    assert_ne!(
+        format!("{:x}", Sha256::digest(std::fs::read(&image).unwrap())),
+        expected_hash
+    );
+    assert_eq!(health(&serve.socket), serving);
+    assert_eq!(health(&admin.socket), administering);
+
+    // Restarting just the sidecar gets a new process identity; serve is stable.
+    let old_pid = admin.child.id();
+    drop(admin);
+    std::fs::copy(env!("CARGO_BIN_EXE_anyagents"), &image).unwrap();
+    // The old sidecar leaves its socket file, so remove only this test's file.
+    std::fs::remove_file(data.join("admin.sock")).unwrap();
+    let restarted = start("serve-admin", "admin.sock");
+    let identity = health(&restarted.socket);
+    assert_ne!(identity["pid"], old_pid);
+    assert_eq!(identity["pid"], restarted.child.id());
+    assert_eq!(identity["binary_sha256"], expected_hash);
+    assert!(
+        identity["process_started_at_ms"].as_i64().unwrap()
+            >= administering["process_started_at_ms"].as_i64().unwrap()
+    );
+    assert_eq!(health(&serve.socket), serving);
+}

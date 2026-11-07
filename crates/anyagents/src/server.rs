@@ -31,6 +31,7 @@ use crate::api::{
 };
 use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
+use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
@@ -54,10 +55,11 @@ pub fn run_with(
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), Error> {
+    let identity = Arc::new(ServingIdentity::capture()?);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner) => result,
+            result = serve(data, runner, identity) => result,
             _ = &mut stop => Ok(()),
         }
     })
@@ -69,6 +71,7 @@ pub(crate) struct AppState {
     pub(crate) health: HealthBoard,
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
+    pub(crate) identity: Arc<ServingIdentity>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -108,7 +111,11 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
-async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
+async fn serve(
+    data: &Path,
+    sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
+    identity: Arc<ServingIdentity>,
+) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let key = capability_key()?;
@@ -190,6 +197,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         health: supervisor.board(),
         sign_in,
         auth,
+        identity,
     };
     let _ = boundary;
     let listener = api_listener;
@@ -1392,6 +1400,7 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
 }
 
 pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let identity = Arc::new(ServingIdentity::capture()?);
     let _admin_lock = acquire_admin_lock(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
@@ -1489,6 +1498,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
             auth,
+            identity,
         };
         let app = Router::new()
             .route("/v1/agents", get(list_agents).post(create_agent_route))
@@ -1542,6 +1552,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             )
             .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
             .route("/v1/whoami", get(whoami))
+            .route("/v1/webhooks/healthz", get(webhook_healthz))
             .with_state(state);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1634,8 +1645,21 @@ async fn mint_capability(
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
 /// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
-async fn webhook_healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    #[derive(serde::Serialize)]
+    struct Health<'a> {
+        ok: bool,
+        #[serde(flatten)]
+        identity: &'a ServingIdentity,
+    }
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(Health {
+            ok: true,
+            identity: &state.identity,
+        }),
+    )
+        .into_response()
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
@@ -6480,6 +6504,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture().unwrap()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -6569,6 +6594,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture().unwrap()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -6612,6 +6638,10 @@ pub(crate) mod tests {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let started = Arc::new(Mutex::new(None));
         let outcome = Arc::clone(&started);
+        // This in-process fixture hashes the large debug test executable once,
+        // outside the sign-in readiness deadline. The integration test exercises
+        // cold startup of the shipping binary and both real listeners.
+        ServingIdentity::capture().unwrap();
         let server = std::thread::spawn(move || {
             let result = run_with(&data_path, runner, stop_rx);
             if let Err(err) = &result {
@@ -6712,6 +6742,10 @@ pub(crate) mod tests {
         let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
         let started = Arc::new(Mutex::new(None));
         let outcome = Arc::clone(&started);
+        // This in-process fixture hashes the large debug test executable once,
+        // outside the sign-in readiness deadline. The integration test exercises
+        // cold startup of the shipping binary and both real listeners.
+        ServingIdentity::capture().unwrap();
         let server = std::thread::spawn(move || {
             let result = run_with(&data_path, runner, stop_rx);
             if let Err(err) = &result {
