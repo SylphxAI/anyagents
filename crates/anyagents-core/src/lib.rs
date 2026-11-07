@@ -10,6 +10,7 @@ mod error;
 mod id;
 mod migrate;
 pub mod quote;
+pub mod redaction;
 mod secret;
 mod store;
 

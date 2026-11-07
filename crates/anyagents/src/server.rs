@@ -330,6 +330,10 @@ async fn serve(
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
+        .route(
+            "/v1/agents/{name}/conversation/redact",
+            post(redact_conversation_route),
+        )
         .route("/v1/agents/{name}/archive", post(archive_agent_route))
         .route("/v1/agents/{name}/pause", post(pause_agent_route))
         .route("/v1/agents/{name}/wake", post(wake_agent_route))
@@ -1543,6 +1547,10 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             .route("/v1/channels", get(channels_route).post(add_channel_route))
             .route("/v1/agents/{name}/inbox", get(inbox))
             .route("/v1/agents/{name}/conversation", get(conversation_route))
+            .route(
+                "/v1/agents/{name}/conversation/redact",
+                post(redact_conversation_route),
+            )
             .route("/v1/agents/{name}/archive", post(archive_agent_route))
             .route("/v1/agents/{name}/pause", post(pause_agent_route))
             .route("/v1/agents/{name}/wake", post(wake_agent_route))
@@ -4660,6 +4668,32 @@ async fn inbox(
     spawn_store(move || inbox_of(&state.store, &agent_id, query.since, query.limit)).await
 }
 
+/// `conversation.redact`: authenticated ancestors and admins only. The store
+/// repeats authorization inside the write transaction; peers and self are denied.
+async fn redact_conversation_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<anyagents_core::redaction::Request>,
+) -> Result<Json<anyagents_core::redaction::Receipt>, ApiError> {
+    spawn_store(move || {
+        let target = state
+            .store
+            .agent_by_name(name.strip_prefix("agent:").unwrap_or(&name))
+            .map_err(ApiError::from_store)?;
+        let actor = match principal {
+            Principal::Operator => anyagents_core::redaction::Actor::Operator,
+            Principal::Agent { agent_id, .. } => anyagents_core::redaction::Actor::Agent(agent_id),
+        };
+        state
+            .store
+            .redact_conversation(actor, &target.id, &request)
+            .map(Json)
+            .map_err(ApiError::from_store)
+    })
+    .await
+}
+
 async fn conversation_route(
     principal: Principal,
     State(state): State<AppState>,
@@ -6395,6 +6429,8 @@ impl ApiError {
 
     fn from_store(err: Error) -> Self {
         let status = match &err {
+            Error::PermissionDenied(_) => StatusCode::FORBIDDEN,
+            Error::AgentBusy => StatusCode::CONFLICT,
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
             Error::GroupForbidden { .. } => StatusCode::FORBIDDEN,
             Error::AgentExists(_) => StatusCode::CONFLICT,
