@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.1.2
+
+### Added
+
+- Explicit local or cloud workspace placement, isolated worktree lifecycles,
+  and nested agent collaboration within supervised scopes.
+- Mobile browser takeover controls and persistent takeover sessions.
+
+### Fixed
+
+- OpenCode agents keep independent service ports across restarts, replace
+  occupied ports, and retry transient bind collisions without discovering a
+  shared managed service.
+- Agent metadata and runtime refreshes preserve conversation scope. Archived
+  agents resume only for intentional direct messages.
+- Pending harness, model and profile switches can recover faulted turns;
+  scheduled messages wake idle local harnesses.
+- Sylphx context compaction respects the active model limit, preserves tool
+  pairs, and recovers from transient transport failures.
+- Telegram messages retain their group quote context and media attachments.
+
 ## 0.1.1
 
 ### Added
