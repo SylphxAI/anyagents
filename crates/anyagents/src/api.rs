@@ -172,6 +172,9 @@ pub struct GroupMemberView {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GroupView {
     pub name: String,
+    /// Immutable creator ID; absent means operator-owned (including legacy groups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
     #[serde(default)]
     pub public: bool,
     pub members: Vec<String>,

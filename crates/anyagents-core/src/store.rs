@@ -18,6 +18,9 @@ use crate::error::Error;
 use crate::id::{AgentId, ChannelId, MessageId, UsageId};
 use crate::quote::Quote;
 
+mod group_policy;
+pub use group_policy::{Group, GroupAction, GroupActor};
+
 /// A line's provider coordinates: the chat, the forum topic and the message id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Origin {
