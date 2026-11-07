@@ -30,7 +30,14 @@ fn machine_path(dir: &std::path::Path) -> std::ffi::OsString {
 }
 
 fn bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_anyagents"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_anyagents"));
+    // These commands act as the fixture's operator, not its executor's agent.
+    command
+        .env_remove("ANYAGENTS_AGENT_ID")
+        .env_remove("ANYAGENTS_AGENT_CONFIG")
+        .env_remove("ANYAGENTS_DATA")
+        .env_remove("ANYAGENTS_PARENT_NAME");
+    command
 }
 
 /// A command in a fresh data directory whose harness needs no download.
@@ -43,6 +50,34 @@ fn bin_in(dir: &std::path::Path) -> Command {
         .arg("--data")
         .arg(dir);
     command
+}
+
+#[test]
+fn operator_fixture_ignores_an_inherited_agent_session() {
+    let inherited = tempfile::tempdir().unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "create_send_inbox_and_usage", "--nocapture"])
+        .env(
+            "ANYAGENTS_AGENT_ID",
+            anyagents_core::AgentId::generate().as_str(),
+        )
+        .env("ANYAGENTS_AGENT_CONFIG", inherited.path().join("config"))
+        .env("ANYAGENTS_DATA", inherited.path().join("data"))
+        .env("ANYAGENTS_PARENT_NAME", "inherited-parent")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the operator fixture inherited an agent session:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+        "the nested operator fixture must execute, not select zero tests"
+    );
+    assert!(!inherited.path().join("data").exists());
+    assert!(!inherited.path().join("config").exists());
 }
 
 #[test]

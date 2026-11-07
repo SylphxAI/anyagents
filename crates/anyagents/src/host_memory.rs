@@ -216,24 +216,26 @@ mod tests {
         host_migration::{MigrationKind, MigrationStatus},
         learned_memory::sha256,
     };
-    // Lock-lifetime fixtures must create their files after exec. Otherwise an
-    // unrelated test's concurrent fork can retain a flock until its own exec,
-    // making immediate reacquisition legitimately return WouldBlock.
-    // Return true after the parent has verified the single-test child.
-    fn run_lock_fixture_child(test_name: &str) -> bool {
-        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_LOCK_FIXTURE_CHILD";
-        if std::env::var(CHILD).ok().as_deref() == Some(test_name) {
+    // Make fixture locks only after exec. An unrelated in-process test can
+    // otherwise fork while a flock is held and retain the descriptor until exec.
+    fn run_in_single_test_process(name: &str) -> bool {
+        const CHILD: &str = "ANYAGENTS_HOST_MEMORY_FIXTURE_CHILD";
+        if std::env::var(CHILD).as_deref() == Ok(name) {
             return false;
         }
+        let environment = std::env::vars_os()
+            .filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"ANYAGENTS_"));
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-            .env(CHILD, test_name)
+            .env_clear()
+            .envs(environment)
+            .env(CHILD, name)
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
             output.status.success() && stdout.contains("1 passed; 0 failed;"),
-            "lock fixture {test_name}: stdout={stdout} stderr={}",
+            "{name}: stdout={stdout} stderr={}",
             String::from_utf8_lossy(&output.stderr)
         );
         true
@@ -329,7 +331,7 @@ mod tests {
 
     #[test]
     fn active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches() {
-        if run_lock_fixture_child(
+        if run_in_single_test_process(
             "host_memory::tests::active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches",
         ) {
             return;
@@ -427,12 +429,12 @@ mod tests {
 
     #[test]
     fn discovery_failure_is_deferred_per_stopped_owner_and_retried() {
-        if run_lock_fixture_child(
+        use std::os::unix::fs::PermissionsExt;
+        if run_in_single_test_process(
             "host_memory::tests::discovery_failure_is_deferred_per_stopped_owner_and_retried",
         ) {
             return;
         }
-        use std::os::unix::fs::PermissionsExt;
         for block_page in [false, true] {
             let dir = crate::test_tempdir();
             let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -510,7 +512,7 @@ mod tests {
 
     #[test]
     fn busy_global_lock_defers_launch_and_startup_without_moving_sources() {
-        if run_lock_fixture_child(
+        if run_in_single_test_process(
             "host_memory::tests::busy_global_lock_defers_launch_and_startup_without_moving_sources",
         ) {
             return;
@@ -583,7 +585,7 @@ mod tests {
 
     #[test]
     fn daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw() {
-        if run_lock_fixture_child(
+        if run_in_single_test_process(
             "host_memory::tests::daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw",
         ) {
             return;

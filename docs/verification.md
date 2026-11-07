@@ -33,6 +33,19 @@ cargo test --workspace --locked
 npm test
 ```
 
+## Synthetic agent identities
+
+The shared server fixtures derive eight distinct nonzero synthetic agent UIDs
+while excluding the executor's real UID. `operator()` and the explicit identity-
+admission fixture use that same map; these numbers are fixture metadata, not
+host-account provisioning. `server_harnesses` covers every candidate collision,
+including real UID 2106, and runs the unchanged server against a deliberately
+matching UID (refused before socket creation) and the collision-free fixture
+(accepted). Both sides retain the same configured seat and launcher; protocol
+round-trip fixtures separately use the seat-free `contract_server()` helper.
+The strict product launch guard remains enabled; this startup check does not
+claim a real cross-UID launch.
+
 ## Seat Git configuration
 
 Seat Git configuration runs file-only edits in daemon-owned staging, with
@@ -386,6 +399,24 @@ fixture uses a newly created leaf under `/var/tmp`: the runner's private home
 ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
 The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
 No account, ACL, real agent directory or daemon is changed.
+
+An already-started native Sylphx harness refreshes the embedding host's registered
+peer principal inventory before every local workspace command. A child or sibling
+created mid-turn in the same seat is admitted by its resolved UID, GID and exact
+agent root, not directory group or mode. The unit regression creates a `02770`
+child after retaining a running turn's environment, proves the stale snapshot
+refuses, and exercises current-authority admission, wrong UID/GID refusal,
+unregistered-peer refusal and failed-refresh refusal without a file write. Its
+launcher mocks process-identity/procfs/stat reporting only; actual peer access
+checks run on fixture directories. Real `setpriv` enforcement remains covered by
+the managed-UID acceptance below.
+
+Host-memory migration fixtures that release and immediately reacquire `flock`
+locks run in single-test subprocesses with fixture directories created only after
+`exec`. This isolates active-append, stopped-owner retry and daemon-launch checks
+from concurrent test threads' forked descriptors on macOS without retrying or
+weakening any lock assertion.
+
 
 A required isolated Rust test invokes `vendor_launch` through the real Claude
 adapter and native setpriv, not the CLI route. It removes the executor's DAC

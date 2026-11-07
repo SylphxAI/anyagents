@@ -919,7 +919,7 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             "--config".to_string(),
             request.config_dir.display().to_string(),
         ];
-        let harness = SylphxHarness::start(
+        let mut harness = SylphxHarness::start(
             &request.config_dir,
             &request.work_dir,
             request.agent.model.as_deref(),
@@ -929,6 +929,14 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             &mcp_args,
         )
         .map_err(|err| err.to_string())?;
+        if seat_spec.is_some() {
+            let store = anyagents_core::Store::open(request.data_dir.join("state.db"))
+                .map_err(|e| format!("cannot refresh seat peers: {e}"))?;
+            harness.set_seat_peers_resolver(move || {
+                crate::sandbox::peer_principals(&store)
+                    .map_err(|e| format!("cannot refresh seat peers: {e}"))
+            });
+        }
         let vh = VendorHarness::Sylphx(
             Box::new(harness),
             request.config_dir.join("sylphx-session-id"),
