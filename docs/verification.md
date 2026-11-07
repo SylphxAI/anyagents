@@ -245,7 +245,10 @@ A native-setpriv preflight checks every fixture ancestor's traversal permission
 with the actual UID/GID before admission. Production admission failures report
 the static failed check label without command output or capability contents;
 this separates fixture setup failures from a specific boundary refusal. Existing
-ancestor permissions are never changed to make a fixture pass.
+ancestor permissions are never changed to make a fixture pass. The Linux CI
+fixture uses a newly created leaf under `/var/tmp`: the runner's private home
+ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
+The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
 No account, ACL, real agent directory or daemon is changed.
 
 A non-root local invocation deliberately refuses before creating a fixture. It

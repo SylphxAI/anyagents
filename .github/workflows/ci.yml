@@ -106,7 +106,10 @@ jobs:
           set -euo pipefail
           cargo build -p anyagents --bin anyagents --locked --message-format=json > "$RUNNER_TEMP/host-memory-build.json"
           binary=$(python3 -c 'import json,sys; a=[o for line in open(sys.argv[1]) if (o:=json.loads(line)).get("reason")=="compiler-artifact" and o.get("target",{}).get("name")=="anyagents" and not o.get("profile",{}).get("test") and o.get("executable")]; assert len(a)==1; print(a[0]["executable"])' "$RUNNER_TEMP/host-memory-build.json")
-          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$binary" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base "$RUNNER_TEMP" --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
+          # RUNNER_TEMP is below the runner's private home, inaccessible to the
+          # distinct UID. Only a new owned leaf under public /var/tmp is used;
+          # the script verifies ancestry and never changes existing ancestors.
+          sudo env ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1 python3 scripts/verify-host-memory-seat.py --binary "$binary" --source-sha "$GITHUB_SHA" --uid 24031 --gid 24032 --socket-gid 24033 --base /var/tmp --receipt "$RUNNER_TEMP/host-memory-seat-receipt.json"
       - name: Host memory managed-UID receipt
         if: always()
         run: |
