@@ -888,14 +888,41 @@ impl CdpSession {
             )));
         }
         let leftover = buf[header_end..].to_vec();
-        Ok(Self {
+        let connected = Self {
             port,
             stream,
             read_buf: leftover,
             next_id: 1,
             #[cfg(test)]
             events: Vec::new(),
-        })
+        };
+        #[cfg(test)]
+        connected.trace(serde_json::json!({"kind":"connect", "target": path}));
+        Ok(connected)
+    }
+
+    #[cfg(test)]
+    fn trace(&self, mut event: serde_json::Value) {
+        let Some(path) = std::env::var_os("ANYAGENTS_FOCUS_CDP_TRACE") else {
+            return;
+        };
+        event["at_us"] = serde_json::json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_micros() as u64
+        );
+        event["connection"] = serde_json::json!(self.stream.local_addr().unwrap().to_string());
+        event["port"] = serde_json::json!(self.port);
+        let mut line = event.to_string();
+        line.push('\n');
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
     }
 
     fn call(
@@ -922,6 +949,8 @@ impl CdpSession {
         if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
             msg["sessionId"] = serde_json::Value::String(sid.to_string());
         }
+        #[cfg(test)]
+        self.trace(serde_json::json!({"kind":"send", "message":msg}));
         let payload = msg.to_string();
         self.send_text_frame(payload.as_bytes())?;
         loop {
@@ -934,6 +963,11 @@ impl CdpSession {
                 self.events.push(val.clone());
             }
             if val.get("id").and_then(|v| v.as_u64()) == Some(id) {
+                #[cfg(test)]
+                self.trace(
+                    serde_json::json!({"kind":"response", "id":id, "method":method,
+                    "error":val.get("error"), "received":true}),
+                );
                 if let Some(err) = val.get("error") {
                     let msg = err
                         .get("message")
@@ -1032,6 +1066,13 @@ impl CdpSession {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CdpSession {
+    fn drop(&mut self) {
+        self.trace(serde_json::json!({"kind":"drop"}));
     }
 }
 
@@ -5715,11 +5756,15 @@ mod tests {
             )
             .unwrap();
             let output = std::env::var("TAKEOVER_EVIDENCE_DIR").unwrap();
-            let result = Command::new("node")
-                .arg(concat!(
+            let driver = std::env::var("ANYAGENTS_FOCUS_VIEWER_DRIVER").unwrap_or_else(|_| {
+                concat!(
                     env!("CARGO_MANIFEST_DIR"),
                     "/../../tests/browser-takeover-first-frame.mjs"
-                ))
+                )
+                .to_string()
+            });
+            let result = Command::new("node")
+                .arg(driver)
                 .args([&st.local_url, &output])
                 .env("ANYAGENTS_CHROMIUM", chromium_binary())
                 .status()
