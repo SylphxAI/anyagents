@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use anyagents_core::Error;
 use clap::{Parser, Subcommand};
 
 mod agent;
@@ -365,6 +366,26 @@ enum Command {
         /// Maximum number of turns to return (default 50, or 20 with `--query`).
         #[arg(long)]
         limit: Option<usize>,
+    },
+    /// Audited erasure (conversation.redact): ancestors/admin only; target must be quiescent.
+    Redact {
+        agent: String,
+        /// Inbound/outbound/tool id or transcript:<zero-based-line>.
+        #[arg(long, required_unless_present = "seq", conflicts_with = "seq")]
+        message_id: Option<String>,
+        /// Mailbox sequence (not a transcript line).
+        #[arg(long)]
+        seq: Option<i64>,
+        /// End-exclusive span start; omit the span to redact the whole body.
+        #[arg(long, requires_all = ["end", "unit"])]
+        start: Option<usize>,
+        #[arg(long, requires_all = ["start", "unit"])]
+        end: Option<usize>,
+        #[arg(long, value_parser = ["bytes", "chars"], requires_all = ["start", "end"])]
+        unit: Option<String>,
+        /// Audit reason; must not contain the sensitive text.
+        #[arg(long)]
+        reason: String,
     },
     /// Zero-Embedding Lexical + Structured search across historical and live conversations.
     Search {
@@ -1098,6 +1119,45 @@ fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
             limit,
             query.as_deref(),
         ),
+        Command::Redact {
+            agent,
+            message_id,
+            seq,
+            start,
+            end,
+            unit,
+            reason,
+        } => {
+            let span = match (start, end, unit) {
+                (Some(start), Some(end), Some(unit)) => {
+                    Some(api::RedactionSpan { start, end, unit }.try_into()?)
+                }
+                (None, None, None) => None,
+                _ => return Err(Error::Message("span needs start, end and unit".into())),
+            };
+            let request = anyagents_core::redaction::Request {
+                message_id,
+                seq,
+                span,
+                reason,
+            };
+            let body = serde_json::to_vec(&request).map_err(|e| Error::Message(e.to_string()))?;
+            let path = format!("/v1/agents/{agent}/conversation/redact");
+            let receipt: anyagents_core::redaction::Receipt =
+                client::call(&data, "POST", &path, Some(body), &client::authority(&data))
+                    .map_err(Error::Message)?
+                    .ok_or_else(|| {
+                        Error::Message(
+                            "redaction requires a running admin API; no offline bypass".into(),
+                        )
+                    })?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&receipt)
+                    .map_err(|e| Error::Message(e.to_string()))?
+            );
+            Ok(())
+        }
         Command::Search {
             query,
             agent,

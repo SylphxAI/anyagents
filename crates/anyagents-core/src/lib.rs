@@ -16,6 +16,7 @@ pub mod learned_memory;
 mod migrate;
 pub mod quote;
 pub mod raw_segment;
+pub mod redaction;
 mod secret;
 mod store;
 
