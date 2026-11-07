@@ -7186,10 +7186,70 @@ mod tests {
     }
 
     #[test]
+    fn relationship_discovery_includes_children_and_siblings_without_roles() {
+        let (dir, store) = setup();
+        let parent = agent(&store, "parent");
+        let mut new = NewAgent::new("first", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let first = store.create_agent(new).unwrap();
+        let mut new = NewAgent::new("second", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let second = store.create_agent(new).unwrap();
+        store.set_agent_scope(&first.id, "siblings").unwrap();
+        store.set_agent_scope(&second.id, "siblings").unwrap();
+        let roster = read_children_roster(dir.path(), &parent.id);
+        assert_eq!(
+            roster.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let ReceiveOutcome::New(parent_mail) =
+            store.receive(&parent.id, Incoming::new("check")).unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        let topology = parent_mail.context.topology.as_deref().unwrap();
+        assert!(topology.contains("agent:first"));
+        assert!(topology.contains("agent:second"));
+        let ReceiveOutcome::New(child_mail) =
+            store.receive(&first.id, Incoming::new("check")).unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        assert!(
+            child_mail
+                .context
+                .topology
+                .as_deref()
+                .unwrap()
+                .contains("agent:second")
+        );
+        // A private sibling remains hidden even though it has a label.
+        store
+            .set_agent_role(&second.id, Some("Researcher"))
+            .unwrap();
+        store.set_agent_scope(&second.id, "private").unwrap();
+        let ReceiveOutcome::New(changed) = store
+            .receive(&first.id, Incoming::new("check again"))
+            .unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        assert!(
+            changed
+                .context
+                .topology
+                .as_deref()
+                .unwrap()
+                .contains("-sibling: agent:second")
+        );
+    }
+
+    #[test]
     fn upgrade_materializes_legacy_effective_scopes_without_changing_work() {
         let (dir, store) = setup();
         let root = agent(&store, "root");
         let mut expected = Vec::new();
+        let mut schedules = Vec::new();
         for (name, role, env, scope) in [
             ("labelled", Some("Researcher"), vec![], "siblings"),
             ("plain", None, vec![], "private"),
@@ -7225,6 +7285,19 @@ mod tests {
             store.note_delivered(&agent.id, 1).unwrap();
             store.note_turn_completed(&agent.id).unwrap();
             store.receive(&agent.id, Incoming::new("pending")).unwrap();
+            schedules.push(
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: agent.id.clone(),
+                        kind: "at".into(),
+                        spec: "1h".into(),
+                        prompt: "Future work".into(),
+                        interval_ms: None,
+                        next_fire_at_ms: Some(now_ms() + 3_600_000),
+                        watch_baseline: None,
+                    })
+                    .unwrap(),
+            );
             let mut env = env;
             env.push(("CUSTOM".into(), "preserve".into()));
             // Write the exact pre-upgrade flat-array representation.
@@ -7239,6 +7312,12 @@ mod tests {
         }
         for _ in 0..2 {
             let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            for schedule in &schedules {
+                assert_eq!(
+                    reopened.get_schedule(&schedule.id).unwrap().as_ref(),
+                    Some(schedule)
+                );
+            }
             for (before, scope) in &expected {
                 let after = reopened.agent(&before.id).unwrap();
                 assert_eq!(after.scope(), *scope);

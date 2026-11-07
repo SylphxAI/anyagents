@@ -7025,6 +7025,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
