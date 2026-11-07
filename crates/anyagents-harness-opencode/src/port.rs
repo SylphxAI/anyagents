@@ -100,3 +100,64 @@ impl Drop for PortLease {
 fn failed(err: io::Error) -> HarnessError {
     HarnessError::Failed(format!("persist OpenCode port: {err}"))
 }
+
+/// Drain stderr without retaining or publishing vendor credentials. Keep only a
+/// bounded overlap so a diagnostic split across reads is still recognized.
+pub(super) fn watch_collision(
+    mut stderr: impl io::Read + Send + 'static,
+) -> std::sync::mpsc::Receiver<bool> {
+    let (events, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buffer = [0; 1024];
+        let mut tail = Vec::new();
+        let mut reported = false;
+        loop {
+            let count = match stderr.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            };
+            tail.extend_from_slice(&buffer[..count]);
+            let text = String::from_utf8_lossy(&tail).to_ascii_lowercase();
+            if !reported
+                && ["address already in use", "eaddrinuse", "addrinuse"]
+                    .iter()
+                    .any(|marker| text.contains(marker))
+            {
+                let _ = events.send(true);
+                reported = true;
+            }
+            if tail.len() > 128 {
+                tail.drain(..tail.len() - 128);
+            }
+        }
+        if !reported {
+            let _ = events.send(false);
+        }
+    });
+    receiver
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use std::time::Duration;
+
+    #[test]
+    fn collision_markers_survive_read_boundaries_without_forwarding_stderr() {
+        for marker in ["Address already in use", "EADDRINUSE", "AddrInUse"] {
+            let bytes = format!("{}{}{}", "x".repeat(1020), marker, "y".repeat(4096));
+            let events = watch_collision(Cursor::new(bytes));
+            assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok(true));
+            assert!(events.recv_timeout(Duration::from_secs(5)).is_err());
+        }
+    }
+
+    #[test]
+    fn unrelated_startup_errors_do_not_report_a_collision() {
+        let events = watch_collision(Cursor::new("configuration rejected\n".repeat(1024)));
+        assert_eq!(events.recv_timeout(Duration::from_secs(5)), Ok(false));
+    }
+}
