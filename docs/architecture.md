@@ -97,6 +97,25 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### Archived sub-agent cleanup
+
+An explicit archive creates a fresh `.anyagents-archived` generation in the
+agent's config directory. Successful ephemeral cleanup copies that generation
+to `.anyagents-reaped`; retained dirty, unpushed, external or shared worktrees do
+not cause cleanup to repeat. A wake clears both markers before the agent resumes.
+Missing or empty legacy archive generations are repaired under the lifecycle
+lock, and unsuccessful cleanup stays pending for a later pass.
+
+Both server modes run archive cleanup in their existing independent maintenance
+worker, immediately at startup and then every 60 seconds. Mail reconciliation
+never reaps directories or waits for a busy lifecycle lock: it skips that row
+and continues with unrelated agents. Explicit online archive waits for process
+down before cleaning the target; descendants remain pending until their
+processes stop. Offline archive performs cleanup without a daemon. Cleanup does
+not initialize seat skills or recreate an empty workdir; runtime preparation on
+wake does that. Credential propagation may independently recreate small auth
+directories, but their existence is not a cleanup trigger.
+
 ### The adapter contract
 
 One adapter per harness. A new harness is an adapter plus a catalog entry; the mailbox, channels, `send` and usage do not change.

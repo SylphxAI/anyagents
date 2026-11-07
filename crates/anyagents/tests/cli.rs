@@ -1,3 +1,6 @@
+#[path = "support/archive_reap.rs"]
+mod archive_reap;
+
 use std::process::Command;
 
 use anyagents_core::{BillingMode, NewUsage, Store};
