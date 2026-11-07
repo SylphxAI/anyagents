@@ -4732,6 +4732,8 @@ struct Since {
 
 #[derive(Deserialize)]
 struct ConversationQuery {
+    #[serde(default)]
+    scope: anyagents_core::host_index::MemoryScope,
     with: Option<String>,
     since_ms: Option<i64>,
     until_ms: Option<i64>,
@@ -4864,70 +4866,124 @@ async fn conversation_route(
             || query.sort.is_some()
             || query.radius.is_some_and(|r| r > 0);
         let is_all = name.eq_ignore_ascii_case("all") || name == "*";
-        let (agent_name, agent_id_str, raw_turns) = if has_structured_search {
-            let search_req = anyagents_core::HistorySearchQuery {
-                query: clean_q.map(str::to_string),
-                queries: extra_queries,
-                exclude: exclude_terms,
-                agent: Some(name.clone()),
-                with_peer: query.with.clone(),
-                direction: query.direction.clone(),
-                sender: query.sender.clone(),
-                include_tools: query.include_tools.unwrap_or(true),
-                only_tools: query.only_tools.unwrap_or(false),
-                tool_name: query.tool_name.clone(),
-                since_ms: query.since_ms,
-                until_ms: query.until_ms,
-                from_seq: query.from_seq,
-                to_seq: query.to_seq,
-                sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
-                radius: query.radius.unwrap_or(0),
-                limit: query.limit.unwrap_or(20),
-                visible_agent_ids: visible_agent_ids.clone(),
-            };
-            let turns = state
-                .store
-                .search_history(&search_req)
-                .map_err(ApiError::from_store)?;
-            let (aname, aid) = if is_all {
-                ("all".to_string(), "all".to_string())
-            } else if let Ok(a) = state.store.agent_by_name(&name) {
-                (a.name, a.id.to_string())
-            } else {
-                (name.clone(), name.clone())
-            };
-            (aname, aid, turns)
-        } else if is_all {
-            let turns = state
-                .store
-                .conversation_all_scoped(
-                    query.with.as_deref(),
-                    query.since_ms,
-                    query.limit,
-                    visible_agent_ids.as_deref(),
-                )
-                .map_err(ApiError::from_store)?;
-            ("all".to_string(), "all".to_string(), turns)
-        } else {
-            let agent = state
-                .store
-                .agent_by_name(&name)
-                .map_err(ApiError::from_store)?;
-            let turns = state
-                .store
-                .conversation_scoped(
-                    &agent.id,
-                    query.with.as_deref(),
-                    query.since_ms,
-                    query.limit,
-                    visible_agent_ids.as_deref(),
-                )
-                .map_err(ApiError::from_store)?;
-            (agent.name, agent.id.to_string(), turns)
+        let file_request = anyagents_core::HistorySearchQuery {
+            query: clean_q.map(str::to_string),
+            queries: extra_queries.clone(),
+            exclude: exclude_terms.clone(),
+            agent: Some(name.clone()),
+            with_peer: query.with.clone(),
+            direction: query.direction.clone(),
+            sender: query.sender.clone(),
+            include_tools: query.include_tools.unwrap_or(true),
+            only_tools: query.only_tools.unwrap_or(false),
+            tool_name: query.tool_name.clone(),
+            since_ms: query.since_ms,
+            until_ms: query.until_ms,
+            from_seq: query.from_seq,
+            to_seq: query.to_seq,
+            sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
+            radius: query.radius.unwrap_or(0),
+            limit: query
+                .limit
+                .unwrap_or(if has_structured_search { 20 } else { 50 })
+                .clamp(1, 200),
+            visible_agent_ids: visible_agent_ids.clone(),
         };
-        let turns = raw_turns
+        let authorized = match visible_agent_ids.as_ref() {
+            Some(ids) => ids.clone(),
+            None => state
+                .store
+                .list_agents()
+                .map_err(ApiError::from_store)?
+                .into_iter()
+                .map(|a| a.id.to_string())
+                .collect(),
+        };
+        let file_hits = state
+            .store
+            .search_host_files(&authorized, query.scope, &file_request)
+            .map_err(|e| ApiError::from_store(Error::Message(e.to_string())))?;
+
+        let (agent_name, agent_id_str, raw_turns) =
+            if query.scope == anyagents_core::host_index::MemoryScope::Memory {
+                if is_all {
+                    ("all".into(), "all".into(), Vec::new())
+                } else {
+                    let a = state
+                        .store
+                        .agent_by_name(&name)
+                        .map_err(ApiError::from_store)?;
+                    (a.name, a.id.to_string(), Vec::new())
+                }
+            } else if has_structured_search {
+                let search_req = anyagents_core::HistorySearchQuery {
+                    query: clean_q.map(str::to_string),
+                    queries: extra_queries,
+                    exclude: exclude_terms,
+                    agent: Some(name.clone()),
+                    with_peer: query.with.clone(),
+                    direction: query.direction.clone(),
+                    sender: query.sender.clone(),
+                    include_tools: query.include_tools.unwrap_or(true),
+                    only_tools: query.only_tools.unwrap_or(false),
+                    tool_name: query.tool_name.clone(),
+                    since_ms: query.since_ms,
+                    until_ms: query.until_ms,
+                    from_seq: query.from_seq,
+                    to_seq: query.to_seq,
+                    sort: anyagents_core::HistorySort::parse(query.sort.as_deref()),
+                    radius: query.radius.unwrap_or(0),
+                    limit: query.limit.unwrap_or(20),
+                    visible_agent_ids: visible_agent_ids.clone(),
+                };
+                let turns = state
+                    .store
+                    .search_history(&search_req)
+                    .map_err(ApiError::from_store)?;
+                let (aname, aid) = if is_all {
+                    ("all".to_string(), "all".to_string())
+                } else if let Ok(a) = state.store.agent_by_name(&name) {
+                    (a.name, a.id.to_string())
+                } else {
+                    (name.clone(), name.clone())
+                };
+                (aname, aid, turns)
+            } else if is_all {
+                let turns = state
+                    .store
+                    .conversation_all_scoped(
+                        query.with.as_deref(),
+                        query.since_ms,
+                        query.limit,
+                        visible_agent_ids.as_deref(),
+                    )
+                    .map_err(ApiError::from_store)?;
+                ("all".to_string(), "all".to_string(), turns)
+            } else {
+                let agent = state
+                    .store
+                    .agent_by_name(&name)
+                    .map_err(ApiError::from_store)?;
+                let turns = state
+                    .store
+                    .conversation_scoped(
+                        &agent.id,
+                        query.with.as_deref(),
+                        query.since_ms,
+                        query.limit,
+                        visible_agent_ids.as_deref(),
+                    )
+                    .map_err(ApiError::from_store)?;
+                (agent.name, agent.id.to_string(), turns)
+            };
+        let turns: Vec<_> = raw_turns
             .into_iter()
             .map(|t| ConversationTurnView {
+                source: Some("transcripts".into()),
+                raw: None,
+                window: None,
+                tool_name: None,
+                role: None,
                 id: t.id,
                 direction: t.direction,
                 from: t.from,
@@ -4937,6 +4993,60 @@ async fn conversation_route(
                 timestamp_ms: t.timestamp_ms,
             })
             .collect();
+        let mut ranked: Vec<_> = turns
+            .into_iter()
+            .enumerate()
+            .map(|(rank, t)| (1.0 / (30.0 + rank as f64), t))
+            .collect();
+        for (rank, (hit, bytes)) in file_hits.into_iter().enumerate() {
+            ranked.push((
+                1.0 / (30.0 + rank as f64),
+                ConversationTurnView {
+                    id: hit.id,
+                    direction: hit.metadata.direction,
+                    from: hit.metadata.sender,
+                    to: hit.metadata.destination,
+                    reply_to: None,
+                    text: String::from_utf8_lossy(&bytes).into_owned(),
+                    timestamp_ms: hit.metadata.timestamp_ms,
+                    source: Some(
+                        if hit.metadata.source == anyagents_core::host_index::MemoryScope::Memory {
+                            "memory"
+                        } else {
+                            "transcripts"
+                        }
+                        .into(),
+                    ),
+                    raw: Some(hit.raw.into()),
+                    window: Some(hit.window.into()),
+                    tool_name: hit.metadata.tool_name,
+                    role: hit.metadata.role,
+                },
+            ));
+        }
+        let lexical = clean_q.is_some() || !file_request.queries.is_empty();
+        if lexical
+            && file_request.sort == anyagents_core::HistorySort::Relevance
+            && file_request.radius == 0
+        {
+            ranked.sort_by(|a, b| {
+                b.0.total_cmp(&a.0)
+                    .then_with(|| b.1.timestamp_ms.cmp(&a.1.timestamp_ms))
+            });
+        } else {
+            ranked.sort_by_key(|(_, t)| t.timestamp_ms);
+            if file_request.sort == anyagents_core::HistorySort::Newest {
+                ranked.reverse();
+            }
+        }
+        if file_request.radius == 0 && ranked.len() > file_request.limit {
+            if !lexical && file_request.sort == anyagents_core::HistorySort::Relevance {
+                ranked.drain(..ranked.len() - file_request.limit);
+            } else {
+                ranked.truncate(file_request.limit);
+            }
+        }
+        let turns = ranked.into_iter().map(|(_, t)| t).collect();
         Ok(Json(ConversationResponse {
             agent: agent_name,
             agent_id: agent_id_str,
@@ -6583,6 +6693,54 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    #[test]
+    fn canonical_conversation_scopes_files_under_real_ancestor_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("history-parent", "sylphx"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("history-child", "sylphx");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        let peer = store
+            .create_agent(anyagents_core::NewAgent::new("history-peer", "sylphx"))
+            .unwrap();
+        for a in [&parent, &child, &peer] {
+            let root = dir.path().join("agents").join(a.id.as_str());
+            std::fs::create_dir_all(root.join("memory")).unwrap();
+            std::fs::create_dir_all(root.join("config")).unwrap();
+            std::fs::write(
+                root.join("memory/MEMORY.md"),
+                format!("{} canonicalneedle {}", "padding ".repeat(1700), a.name),
+            )
+            .unwrap();
+            std::fs::write(root.join("config/sylphx-transcript.jsonl"),serde_json::to_string(&serde_json::json!({"role":"tool","name":"browser","timestamp_ms":100,"content":format!("canonicalneedle {}",a.name)})).unwrap()+"\n").unwrap();
+        }
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let principal=||Principal::Agent {agent_id:parent.id.clone(),name:parent.name.clone()};
+            for (scope,count) in [("all",4),("memory",2),("transcripts",2)] {
+                let query=serde_json::from_value(serde_json::json!({"scope":scope,"query":"canonicalneedle"})).unwrap();
+                let Json(response)=conversation_route(principal(),State(state.clone()),AxumPath("all".into()),Query(query)).await.unwrap_or_else(|e|panic!("{}",e.message));
+                assert_eq!(response.turns.len(),count,"{scope}");assert!(response.turns.iter().all(|t|!t.text.contains("history-peer")));
+                assert!(response.turns.iter().all(|t|t.raw.is_some() && t.window.is_some()));
+                for t in &response.turns {let raw=t.raw.as_ref().unwrap();let bytes=std::fs::read(&raw.segment).unwrap();assert_eq!(anyagents_core::learned_memory::sha256(&bytes[raw.offset as usize..(raw.offset+raw.length) as usize]),raw.sha256);}
+            }
+            let denied=conversation_route(principal(),State(state.clone()),AxumPath(peer.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"memory"})).unwrap())).await.unwrap_err();assert_eq!(denied.status,StatusCode::FORBIDDEN);
+            let query=serde_json::from_value(serde_json::json!({"scope":"all","only_tools":true,"tool_name":"browser","from_seq":1,"to_seq":1})).unwrap();
+            let Json(response)=conversation_route(principal(),State(state),AxumPath("all".into()),Query(query)).await.unwrap_or_else(|e|panic!("{}",e.message));assert_eq!(response.turns.len(),2);assert!(response.turns.iter().all(|t|t.tool_name.as_deref()==Some("browser")));
+        });
+    }
 
     /// Answers one sign-in with two lines and records where it ran.
     struct Scripted {

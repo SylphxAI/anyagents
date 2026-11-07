@@ -9,6 +9,7 @@ pub mod boundary;
 mod error;
 pub mod host_index;
 pub mod host_migration;
+pub mod host_retrieval;
 pub mod host_session;
 pub mod host_skills;
 mod id;

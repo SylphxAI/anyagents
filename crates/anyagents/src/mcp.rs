@@ -392,6 +392,9 @@ struct SendArgs {
 
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 struct ConversationArgs {
+    /// Search both sources (default), only learned memory, or only transcripts.
+    #[serde(default)]
+    scope: Option<String>,
     /// Optional lexical + structured search query (`Raw-RAG`: SQLite FTS5 BM25 with hybrid
     /// ASCII identifier + CJK bigram tokenization, exact phrase boost, and substring fallback).
     /// When set, searches authorized historical and live turns without loading the
@@ -1011,6 +1014,12 @@ impl AgentMcp {
             .map(|s| s.strip_prefix("agent:").unwrap_or(s).to_string())
             .unwrap_or(default_agent);
         let mut query = Vec::new();
+        if let Some(scope) = args.scope {
+            if !["all", "memory", "transcripts"].contains(&scope.as_str()) {
+                return Err("scope must be all, memory or transcripts".into());
+            }
+            query.push(format!("scope={scope}"));
+        }
         if let Some(q) = clean_q {
             query.push(format!("query={}", urlencoding_simple(q)));
         }

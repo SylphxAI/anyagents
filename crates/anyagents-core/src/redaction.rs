@@ -441,6 +441,15 @@ impl Store {
             ));
         }
         let _process = self.try_lock_agent(target)?;
+        let host_index = self.data_dir().join(crate::host_retrieval::INDEX_FILE);
+        if host_index.exists() {
+            let mut index = crate::host_index::HostIndex::open(&host_index)
+                .map_err(|e| invalid(&e.to_string()))?;
+            index
+                .retain_agent_documents(target.as_str(), &HashSet::new())
+                .map_err(|e| invalid(&e.to_string()))?;
+            index.checkpoint().map_err(|e| invalid(&e.to_string()))?;
+        }
         let config = agent_config_dir(self.data_dir(), target);
         let mut sessions = Vec::new();
         let mut unscrubbed = Vec::new();

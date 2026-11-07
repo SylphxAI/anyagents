@@ -158,10 +158,65 @@ impl RawSegment {
     }
 }
 
+/// Open retained bytes without following a symlink at any path component.
+/// Descriptor-relative traversal closes the check/open race with a live seat.
+pub fn open_readonly(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        use std::{
+            ffi::CString,
+            os::fd::{AsRawFd, FromRawFd},
+            os::unix::{ffi::OsStrExt, fs::MetadataExt},
+        };
+        let absolute = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            std::env::current_dir()?.join(path)
+        };
+        let parts: Vec<_> = absolute
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::RootDir => None,
+                std::path::Component::Normal(s) => Some(Ok(s)),
+                _ => Some(Err(io::Error::other("unsupported raw path component"))),
+            })
+            .collect::<io::Result<_>>()?;
+        let mut directory = File::open("/")?;
+        for (i, part) in parts.iter().enumerate() {
+            let name = CString::new(part.as_bytes()).map_err(io::Error::other)?;
+            let final_part = i + 1 == parts.len();
+            let flags = libc::O_RDONLY
+                | libc::O_NOFOLLOW
+                | libc::O_CLOEXEC
+                | if final_part { 0 } else { libc::O_DIRECTORY };
+            let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let file = unsafe { File::from_raw_fd(fd) };
+            if final_part {
+                let meta = file.metadata()?;
+                if !meta.is_file() || meta.nlink() != 1 {
+                    return Err(io::Error::other(
+                        "raw source must be a single-link regular file",
+                    ));
+                }
+                return Ok(file);
+            }
+            directory = file;
+        }
+        Err(io::Error::other("raw source needs a file path"))
+    }
+    #[cfg(not(unix))]
+    {
+        File::open(path)
+    }
+}
+
 /// Read-only indexing entry point for a still-active native JSONL writer.
 /// Incomplete final bytes are left untouched and retried on the next scan.
 pub fn retained_jsonl_records(path: &Path) -> io::Result<Vec<RawCoordinate>> {
-    let mut file = File::open(path)?;
+    let mut file = open_readonly(path)?;
     scan_jsonl(&mut file, path, true)
 }
 
@@ -484,7 +539,7 @@ fn scan_jsonl(
 /// Exact raw bytes; callers must authorize the owning agent before using a
 /// coordinate. Coordinates come from the trusted host index, not tool arguments.
 pub fn read_raw(coordinate: &RawCoordinate) -> io::Result<Vec<u8>> {
-    let mut file = File::open(&coordinate.segment)?;
+    let mut file = open_readonly(&coordinate.segment)?;
     file.seek(SeekFrom::Start(coordinate.offset))?;
     let mut bytes = Vec::new();
     file.take(coordinate.length).read_to_end(&mut bytes)?;
@@ -499,6 +554,26 @@ pub fn read_raw(coordinate: &RawCoordinate) -> io::Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_descriptor_walk_refuses_linked_files_and_ancestors() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        fs::write(plain.join("event"), b"exact").unwrap();
+        let mut bytes = Vec::new();
+        open_readonly(&plain.join("event"))
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"exact");
+        std::os::unix::fs::symlink(&plain, dir.path().join("alias")).unwrap();
+        assert!(open_readonly(&dir.path().join("alias/event")).is_err());
+        fs::hard_link(plain.join("event"), dir.path().join("linked")).unwrap();
+        let error = open_readonly(&dir.path().join("linked")).unwrap_err();
+        assert!(error.to_string().contains("single-link"));
+    }
 
     #[test]
     fn append_restart_and_exact_range_read() {

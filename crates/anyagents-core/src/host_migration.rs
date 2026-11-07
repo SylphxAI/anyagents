@@ -571,10 +571,10 @@ fn tree_files(root: &Path) -> io::Result<Vec<PathBuf>> {
 }
 fn has_symlink_component(path: &Path, boundary: &Path) -> io::Result<bool> {
     for ancestor in path.ancestors() {
-        if let Ok(meta) = fs::symlink_metadata(ancestor) {
-            if meta.file_type().is_symlink() {
-                return Ok(true);
-            }
+        if let Ok(meta) = fs::symlink_metadata(ancestor)
+            && meta.file_type().is_symlink()
+        {
+            return Ok(true);
         }
         if ancestor == boundary {
             break;
@@ -708,7 +708,9 @@ mod tests {
         write(&pages.join("sage.md"), b"progress never in prompt\n");
         write(&pages.join("unknown.md"), b"unknown stays\n");
         let mut migration = HostMigration::open(dir.path()).unwrap();
-        migration.discover(&[agent.clone()], &pages).unwrap();
+        migration
+            .discover(std::slice::from_ref(&agent), &pages)
+            .unwrap();
         migration.stage(&HashSet::new()).unwrap();
         assert!(memory.exists());
         let stopped = HashSet::from([agent.id.to_string()]);
@@ -770,7 +772,7 @@ mod tests {
         let destination = root.join("memory/MEMORY.md");
         let mut migration = HostMigration::open(dir.path()).unwrap();
         migration
-            .discover(&[agent.clone()], &dir.path().join("owners"))
+            .discover(std::slice::from_ref(&agent), &dir.path().join("owners"))
             .unwrap();
         let fp = fingerprint(&source).unwrap();
         let idx = migration
@@ -797,7 +799,7 @@ mod tests {
         write(&other, b"unique old");
         write(&root.join("memory/other.md"), b"unique new");
         migration
-            .discover(&[agent.clone()], &dir.path().join("owners"))
+            .discover(std::slice::from_ref(&agent), &dir.path().join("owners"))
             .unwrap();
         migration
             .stage(&HashSet::from([agent.id.to_string()]))
@@ -828,7 +830,7 @@ mod tests {
         write(&source.with_file_name("fact.md"), b"original\n");
         let mut migration = HostMigration::open(dir.path()).unwrap();
         migration
-            .discover(&[agent.clone()], &dir.path().join("owners"))
+            .discover(std::slice::from_ref(&agent), &dir.path().join("owners"))
             .unwrap();
         let stopped = HashSet::from([agent.id.to_string()]);
         migration.stage(&stopped).unwrap();

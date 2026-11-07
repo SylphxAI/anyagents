@@ -6,7 +6,6 @@ use rusqlite::{Connection, OptionalExtension, params, params_from_iter, types::V
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::Path,
 };
@@ -73,7 +72,7 @@ impl HostIndex {
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
             CREATE TABLE IF NOT EXISTS host_documents (
                 id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, source TEXT NOT NULL,
                 timestamp_ms INTEGER NOT NULL, direction TEXT NOT NULL,
@@ -89,7 +88,44 @@ impl HostIndex {
             CREATE TRIGGER IF NOT EXISTS host_windows_delete AFTER DELETE ON host_windows BEGIN
                 DELETE FROM host_fts WHERE rowid=old.id;
             END;")?;
+        conn.execute(
+            "INSERT INTO host_fts(host_fts,rank) VALUES('secure-delete',1)",
+            [],
+        )?;
         Ok(Self { conn })
+    }
+
+    /// Delete stale filesystem coordinates after a complete authorized scan.
+    pub fn retain_agent_documents(
+        &mut self,
+        owner: &str,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), IndexError> {
+        let ids = self
+            .conn
+            .prepare("SELECT id FROM host_documents WHERE agent_id=?1")?
+            .query_map([owner], |r| r.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let tx = self.conn.transaction()?;
+        for id in ids {
+            if !keep.contains(&id) {
+                tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn checkpoint(&self) -> Result<(), IndexError> {
+        let result: (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                })?;
+        if result.0 != 0 {
+            return Err(io::Error::other("host index reader prevented secure checkpoint").into());
+        }
+        Ok(())
     }
 
     /// Idempotently index a trusted coordinate. Invalid/changed bytes never
@@ -165,7 +201,7 @@ impl HostIndex {
                 raw.seq
             ],
         )?;
-        let mut file = File::open(&raw.segment)?;
+        let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
         let mut relative = 0u64;
         let mut json_state = JsonProjection::default();
         let mut bytes = [0u8; WINDOW_BYTES];
@@ -264,11 +300,25 @@ impl HostIndex {
             push("d.direction=?", direction.to_owned().into());
         }
         if let Some(sender) = &query.sender {
-            push("d.sender=?", sender.clone().into());
+            push(
+                "instr(lower(d.sender),lower(?))>0",
+                sender.trim().to_owned().into(),
+            );
         }
         if let Some(peer) = &query.with_peer {
-            push("(d.sender=? OR d.destination=?)", peer.clone().into());
-            values.push(peer.clone().into());
+            let peer = peer.trim();
+            let address = if peer.contains(':') {
+                peer.to_owned()
+            } else {
+                format!("agent:{peer}")
+            };
+            push(
+                "(d.sender=? OR d.destination=? OR d.sender=? OR d.destination=?)",
+                peer.to_owned().into(),
+            );
+            values.push(peer.to_owned().into());
+            values.push(address.clone().into());
+            values.push(address.into());
         }
         // Tool filters apply identically to both sources; memory does not gain
         // a bypass merely because it is a filesystem document.
@@ -279,8 +329,8 @@ impl HostIndex {
             where_sql.push_str(" AND d.tool_name IS NULL");
         }
         if let Some(tool) = &query.tool_name {
-            where_sql.push_str(" AND d.tool_name=?");
-            values.push(tool.clone().into());
+            where_sql.push_str(" AND lower(d.tool_name)=lower(?)");
+            values.push(tool.trim().to_owned().into());
         }
         for (clause, value) in [
             ("d.timestamp_ms>?", query.since_ms),
@@ -396,7 +446,7 @@ impl HostIndex {
                 );
                 neighbors.limit = 21;
                 for neighbor in self.search_in_segment(
-                    &[hit.metadata.agent_id.clone()],
+                    std::slice::from_ref(&hit.metadata.agent_id),
                     scope,
                     &neighbors,
                     Some(&hit.raw.segment),
@@ -488,7 +538,7 @@ impl JsonProjection {
 }
 
 fn verify_coordinate(raw: &RawCoordinate) -> io::Result<()> {
-    let mut file = File::open(&raw.segment)?;
+    let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
     file.seek(SeekFrom::Start(raw.offset))?;
     let mut reader = file.take(raw.length);
     let mut hash = Sha256::new();
@@ -521,7 +571,7 @@ fn has_excluded_text(raw: &RawCoordinate, excludes: &[String]) -> io::Result<boo
         return Ok(false);
     }
     let overlap = terms.iter().map(String::len).max().unwrap_or_default() + 4;
-    let mut file = File::open(&raw.segment)?;
+    let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
     file.seek(SeekFrom::Start(raw.offset))?;
     let mut reader = file.take(raw.length);
     let mut buffer = [0u8; WINDOW_BYTES];
