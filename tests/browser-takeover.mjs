@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, mkdir, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { stopProcessGroup } from './browser-process-group.mjs';
 const [url, remoteWs, output] = process.argv.slice(2);
 assert.ok(url && remoteWs && output, 'usage: node browser-takeover.mjs URL REMOTE_WS OUTPUT');
 await mkdir(output, { recursive: true });
@@ -32,7 +33,7 @@ class Cdp {
   close() { this.ws.close(); }
 }
 const dir = await mkdtemp(path.join(tmpdir(), 'takeover-viewer-'));
-const chrome = spawn(process.env.ANYAGENTS_CHROMIUM || '/usr/bin/chromium', ['--headless=new', '--no-sandbox', '--disable-gpu', '--remote-debugging-port=0', '--user-data-dir=' + dir, 'about:blank'], { stdio: 'ignore' });
+const chrome = spawn(process.env.ANYAGENTS_CHROMIUM || '/usr/bin/chromium', ['--headless=new', '--no-sandbox', '--disable-gpu', '--remote-debugging-port=0', '--user-data-dir=' + dir, 'about:blank'], { stdio: 'ignore', detached: true });
 let viewer, remote;
 const logs = [];
 try {
@@ -307,9 +308,9 @@ try {
   console.log(JSON.stringify({passed:true, viewports:4, clicks:logs.length, screenshots:output}));
   }
 } finally {
-  viewer?.close(); remote?.close(); chrome.kill('SIGTERM');
-  await new Promise(resolve => { if (chrome.exitCode !== null) resolve(); else chrome.once('exit', resolve); });
-  // Chromium helpers may finish profile writes after the browser parent exits.
-  // Retry only idempotent cleanup; never rerun the interaction assertions.
-  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+  viewer?.close(); remote?.close();
+  // Parent exit does not establish helper exit. Refuse deletion while any
+  // process in this fixture's group can still write the disposable profile.
+  await stopProcessGroup(chrome);
+  await rm(dir, { recursive: true, force: true });
 }

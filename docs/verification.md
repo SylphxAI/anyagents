@@ -120,12 +120,15 @@ No typed or pasted text is returned in input acknowledgements.
 keyboard regressions in the ordinary native suite when Chromium is available.
 The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
 copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
-export denial. Viewer teardown retries only recursive deletion of its disposable
-profile (five retries, 100 ms linear backoff), because Chromium helpers can finish
-profile writes after the browser parent exits. An exhausted cleanup retry still
-fails the fixture; interaction assertions are never retried. This addresses the
-Linux `ENOTEMPTY` cleanup failure in CI run 42334433646 after all clipboard
-assertions passed.
+export denial. The viewer starts in a dedicated process group. Teardown signals
+the whole group, waits up to 5 seconds for graceful exit, then uses SIGKILL and
+waits up to 5 more seconds if necessary. It removes the disposable profile only
+after no non-zombie group members remain; zombies cannot write the profile. A
+timeout fails cleanup and preserves the profile. There are no deletion or
+interaction retries. This replaces the deletion-retry workaround for the Linux
+`ENOTEMPTY` failure in CI run 42334433646, where Chromium helpers could still
+write after the browser parent exited. `npm test` includes deterministic live-
+descendant and graceful-exit controls; both Linux and macOS CI execute them.
 
 Actual iPhone Safari keyboard and long-press menus require a
 post-deployment device check; Chromium emulation does not certify those OS menus.
