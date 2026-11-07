@@ -1435,11 +1435,29 @@ fn load_takeover_state(data: &Path, profile: &str) -> Option<BrowserTakeoverStat
 }
 
 fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
+    static NEXT_WRITE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = profile_dir(data, &state.profile);
-    let _ = std::fs::create_dir_all(&dir);
-    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
-        let _ = std::fs::write(dir.join("takeover.json"), bytes);
-    }
+    let seq = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".takeover.{}.{seq}.json", std::process::id()));
+    let publish = || -> Result<(), Error> {
+        std::fs::create_dir_all(&dir)?;
+        let bytes = serde_json::to_vec_pretty(state)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&tmp)?;
+        file.write_all(&bytes)?;
+        // Readers include the listener's liveness loop. Never truncate the live
+        // file: a partial JSON read looks like a missing session and stops it.
+        std::fs::rename(&tmp, dir.join("takeover.json"))?;
+        Ok(())
+    };
+    let _ = publish();
+    let _ = std::fs::remove_file(tmp);
 }
 
 fn is_human_takeover_active(data: &Path, profile: &str, now: i64) -> bool {
@@ -5245,6 +5263,53 @@ mod tests {
         );
     }
     #[test]
+    fn takeover_state_publication_preserves_in_flight_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = start_or_reuse_takeover_session(
+            dir.path(),
+            "publication",
+            None,
+            Some("first"),
+            Some(60_000),
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        // Opening a reader before publication deterministically exercises the
+        // same inode a concurrent listener read would hold during a save.
+        let mut reader = std::fs::File::open(takeover_path(dir.path(), "publication")).unwrap();
+        let mut next = first.clone();
+        next.reason = Some("next".repeat(1024));
+        save_takeover_state(dir.path(), &next);
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        let previous: BrowserTakeoverState = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            previous.reason, first.reason,
+            "an in-flight reader must retain its complete snapshot"
+        );
+        assert_eq!(
+            load_takeover_state(dir.path(), "publication")
+                .unwrap()
+                .reason,
+            next.reason
+        );
+        assert!(is_human_takeover_active(
+            dir.path(),
+            "publication",
+            now_ms()
+        ));
+        let (code, _) = raw_http_call(
+            first.port,
+            "GET",
+            &format!("/takeover/{}/state", first.token),
+            None,
+        );
+        assert_eq!(code, 200, "publication must not stop the active listener");
+        cleanup_takeover_session(dir.path(), "publication").unwrap();
+    }
+
+    #[test]
     fn takeover_viewport_preserves_identity_and_restores_every_exit() {
         if !Path::new(&chromium_binary()).exists() {
             return;
@@ -5342,10 +5407,10 @@ mod tests {
 
         begin();
         enable();
-        let mut st = load_takeover_state(dir.path(), "viewport").unwrap();
-        st.expires_at_ms = now_ms() - 1;
-        save_takeover_state(dir.path(), &st);
-        reap_expired_takeover(dir.path(), "viewport", now_ms());
+        let st = load_takeover_state(dir.path(), "viewport").unwrap();
+        // Advance only the explicit reaper clock, not the stored deadline. The
+        // listener's real-time reaper must not race this forced expiry.
+        reap_expired_takeover(dir.path(), "viewport", st.expires_at_ms);
         assert_restored(&mut cdp);
         assert!(
             set_takeover_viewport(dir.path(), "viewport", &serde_json::json!({"enabled":true}))
@@ -5357,10 +5422,23 @@ mod tests {
 
         begin();
         enable();
-        let mut st = load_takeover_state(dir.path(), "viewport").unwrap();
-        st.viewport_heartbeat_ms = Some(now_ms() - 10_001);
-        save_takeover_state(dir.path(), &st);
-        reap_disconnected_takeover_viewport(dir.path(), "viewport", now_ms());
+        let st = load_takeover_state(dir.path(), "viewport").unwrap();
+        let heartbeat = st.viewport_heartbeat_ms.unwrap();
+        reap_disconnected_takeover_viewport(dir.path(), "viewport", heartbeat + 10_000);
+        assert!(
+            load_takeover_state(dir.path(), "viewport")
+                .unwrap()
+                .original_viewport
+                .is_some(),
+            "a live heartbeat must retain phone layout through the lease boundary"
+        );
+        reap_expired_takeover(dir.path(), "viewport", heartbeat + 10_001);
+        assert!(is_human_takeover_active(
+            dir.path(),
+            "viewport",
+            heartbeat + 10_001
+        ));
+        reap_disconnected_takeover_viewport(dir.path(), "viewport", heartbeat + 10_001);
         assert_restored(&mut cdp);
         assert!(
             !load_takeover_state(dir.path(), "viewport")
