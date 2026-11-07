@@ -925,6 +925,17 @@ fn reconcile_stopped_and_backed_off_agents(
     let Ok(agents) = store.list_agents() else {
         return;
     };
+    reconcile_agent_snapshot(store, health, data, reconcile, now_ms, agents);
+}
+
+fn reconcile_agent_snapshot(
+    store: &Store,
+    health: &HealthBoard,
+    data: &Path,
+    reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
+    now_ms: i64,
+    agents: Vec<Agent>,
+) {
     let mut guard = match reconcile.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
@@ -949,6 +960,19 @@ fn reconcile_stopped_and_backed_off_agents(
     });
 
     for idx in ordered_indices {
+        let Ok(current) = store.agent(&agents[idx].id) else {
+            continue;
+        };
+        // Match cascade ordering: parent before child. This keeps the parent's
+        // archive/wake decision stable while applying it to this child.
+        let _parent_lifecycle = if let Some(ref parent_id) = current.parent_id {
+            let Ok(lock) = store.lock_agent_lifecycle(parent_id) else {
+                continue;
+            };
+            Some(lock)
+        } else {
+            None
+        };
         let Ok(_lifecycle) = store.lock_agent_lifecycle(&agents[idx].id) else {
             continue;
         };
@@ -972,10 +996,9 @@ fn reconcile_stopped_and_backed_off_agents(
         }
         let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
         let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
-            agents
-                .iter()
-                .find(|p| &p.id == pid)
-                .is_some_and(|p| is_explicitly_archived(data, p))
+            store
+                .agent(pid)
+                .is_ok_and(|parent| is_explicitly_archived(data, &parent))
         });
         if parent_archived && agent.state != "archived" {
             let _ = store.set_agent_state(&agent.id, "archived");
@@ -6335,6 +6358,54 @@ pub(crate) mod tests {
         archive.join().unwrap();
         assert_eq!(store.agent(&recipient.id).unwrap().state, "archived");
         assert!(has_explicit_archive_marker(dir.path(), &recipient.id));
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+    #[test]
+    fn stale_reconcile_population_cannot_rearchive_a_woken_parent_and_child() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
+            .unwrap();
+        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
+        new.parent_id = Some(parent.id.clone());
+        let child = store.create_agent(new).unwrap();
+        mark_explicitly_archived(&store, dir.path(), &parent);
+        let stale_population = store.list_agents().unwrap();
+        // Both wake operations happen after the population scan and before
+        // reconciliation takes their locks. The old parent row is not authority.
+        authored_send(
+            &store,
+            &Actor::Operator("operator".into()),
+            "parent-agent",
+            "continue",
+            "parent-wake",
+        );
+        authored_send(
+            &store,
+            &Actor::Agent(parent.name.clone()),
+            "worker",
+            "continue",
+            "child-wake",
+        );
+        reconcile_agent_snapshot(
+            &store,
+            &HealthBoard::default(),
+            dir.path(),
+            &Arc::new(Mutex::new(AdminReconcileState::default())),
+            now_ms(),
+            stale_population,
+        );
+        assert_eq!(store.agent(&parent.id).unwrap().state, "running");
+        assert_eq!(store.agent(&child.id).unwrap().state, "running");
+        assert!(!has_explicit_archive_marker(dir.path(), &parent.id));
+        assert!(!has_explicit_archive_marker(dir.path(), &child.id));
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
