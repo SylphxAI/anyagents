@@ -110,7 +110,7 @@ Desktop takeover accepts native modifier chords, including select-all, copy,
 cut, paste and undo. Paste inserts local clipboard text into the remote focus;
 copy and cut export the remote selection only after checking that the focus is
 not a password field. The viewer keeps new-tab, close-tab and address-bar
-shortcuts local. The floating pill also exposes Paste, Copy, All, Tab and Esc;
+shortcuts local. The floating pill also exposes Paste, Copy, Select all, Tab and Esc;
 clipboard permission refusal displays a prompt instead of silently losing input.
 On touch devices the native keyboard input overlays the remote field and tracks
 its position through zoom and pan, so the device's Paste menu works in place.

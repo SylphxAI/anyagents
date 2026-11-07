@@ -88,6 +88,10 @@ try {
     await viewer.call('Emulation.setTouchEmulationEnabled', {enabled:width<700});
     await viewer.call('Page.navigate', {url});
     await until(() => viewer.eval(`!!document.querySelector('#screen') && document.querySelector('#connection').hidden`), 'clipboard viewer connected');
+    assert.equal(await viewer.eval(`document.querySelector('#select-all-btn').textContent`),'Select all');
+    assert.equal(await viewer.eval(`document.querySelector('#select-all-btn').getAttribute('aria-label')`),'Select all');
+    const pillBounds=await viewer.eval(`[...document.querySelectorAll('#hud-bar button')].map(el=>{const r=el.getBoundingClientRect();return {left:r.left,right:r.right,width:r.width,height:r.height}})`);
+    assert.ok(pillBounds.every(r=>r.left>=0&&r.right<=width&&r.width>=44&&r.height>=44),JSON.stringify(pillBounds));
     await remote.eval(`document.querySelector('#entry').value='';document.querySelector('#entry2').value=''`);
     await remoteField('entry');
     await api('/input',{type:'paste',text:'undo fixture'});
