@@ -3623,7 +3623,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "agent": { "type": "string", "description": "`\"self\"` (default), `\"all\"`, or agent name/`agt_...` ID." },
                         "description": { "type": "string", "description": "Public role/capability summary." },
                         "instructions": { "type": "string", "description": "Private system prompt (`SYSTEM_PROMPT.md`)." },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "public": { "type": "boolean", "description": "Whether agents outside this agent's parent/children tree can message it directly." },
                         "clear": { "type": "boolean" }
                     }
@@ -3657,7 +3657,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "new_name": { "type": "string", "description": "Target name when `action` is `\"rename\"`." },
                         "parent": { "type": "string" },
                         "state": { "type": "string" },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "harness": { "type": "string" },
                         "model": { "type": "string" },
                         "profile": { "type": "string" },
@@ -5235,9 +5235,98 @@ mod tests {
         assert!(b.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
     }
 
+    // Both HTTP fakes consume a complete framed request before replying. One
+    // TCP read may return just part of a header or body; closing with unread
+    // bytes can reset the client and consume a scripted retry response.
+    fn read_gateway_request(reader: &mut impl std::io::Read) -> std::io::Result<Value> {
+        use std::io::{Error, ErrorKind};
+        const MAX_REQUEST_BYTES: usize = 2 * 1024 * 1024;
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, length) = loop {
+            let n = reader.read(&mut buffer)?;
+            if n == 0 {
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "gateway HTTP headers truncated",
+                ));
+            }
+            bytes.extend_from_slice(&buffer[..n]);
+            if bytes.len() > MAX_REQUEST_BYTES {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "gateway HTTP request too large",
+                ));
+            }
+            if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                if !headers.starts_with("post /v1/responses ") {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "unexpected gateway HTTP route",
+                    ));
+                }
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .ok_or_else(|| {
+                        Error::new(ErrorKind::InvalidData, "gateway Content-Length missing")
+                    })?;
+                break (end + 4, length);
+            }
+        };
+        let total = header_end
+            .checked_add(length)
+            .filter(|total| *total <= MAX_REQUEST_BYTES)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "gateway HTTP request too large"))?;
+        if bytes.len() < total {
+            let received = bytes.len();
+            bytes.resize(total, 0);
+            reader.read_exact(&mut bytes[received..])?;
+        }
+        serde_json::from_slice(&bytes[header_end..total])
+            .map_err(|error| Error::new(ErrorKind::InvalidData, error))
+    }
+
+    #[test]
+    fn gateway_http_fixture_reads_fragmented_headers_and_large_bodies_completely() {
+        use std::io::{Cursor, Read as _};
+        let expected =
+            json!({"input": [{"role": "user", "content": "fragmented 中 payload ".repeat(1500)}]});
+        let body = serde_json::to_vec(&expected).unwrap();
+        assert!(body.len() > 8192);
+        let headers = format!(
+            "POST /v1/responses HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut fragments = Cursor::new(&headers.as_bytes()[..17])
+            .chain(Cursor::new(&headers.as_bytes()[17..headers.len() - 1]))
+            .chain(Cursor::new(&headers.as_bytes()[headers.len() - 1..]))
+            .chain(Cursor::new(&body[..13]))
+            .chain(Cursor::new(&body[13..]));
+        assert_eq!(read_gateway_request(&mut fragments).unwrap(), expected);
+    }
+
+    #[test]
+    fn gateway_http_fixture_refuses_truncated_or_oversized_bodies() {
+        let mut truncated = &b"POST /v1/responses HTTP/1.1\r\nContent-Length: 10\r\n\r\n{}"[..];
+        assert_eq!(
+            read_gateway_request(&mut truncated).unwrap_err().kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
+        let mut oversized = &b"POST /v1/responses HTTP/1.1\r\nContent-Length: 2097152\r\n\r\n"[..];
+        assert_eq!(
+            read_gateway_request(&mut oversized).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
+
     #[test]
     fn context_preflight_guards_real_native_http_dispatch() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
@@ -5267,32 +5356,7 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
-            let mut bytes = Vec::new();
-            let mut buffer = [0; 4096];
-            let (header_end, length) = loop {
-                let n = stream.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
-                    assert!(headers.starts_with("post /v1/responses "));
-                    let length = headers
-                        .lines()
-                        .find_map(|line| {
-                            line.strip_prefix("content-length:")
-                                .and_then(|value| value.trim().parse::<usize>().ok())
-                        })
-                        .unwrap();
-                    break (end + 4, length);
-                }
-            };
-            while bytes.len() < header_end + length {
-                let n = stream.read(&mut buffer).unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buffer[..n]);
-            }
-            let request: Value =
-                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            let request = read_gateway_request(&mut stream).unwrap();
             assert!(
                 request["input"][0]["content"]
                     .as_str()
@@ -6017,7 +6081,7 @@ mod tests {
 
     #[test]
     fn transient_503_model_unavailable_retries_and_persistent_503_surfaces_fault() {
-        use std::io::{Read as _, Write as _};
+        use std::io::Write as _;
         use std::net::TcpListener;
         use std::sync::atomic::AtomicUsize;
 
@@ -6029,8 +6093,10 @@ mod tests {
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
                 let mut stream = stream;
-                let mut buf = [0u8; 8192];
-                let _ = stream.read(&mut buf);
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let _request = read_gateway_request(&mut stream).unwrap();
                 let n = hits_cl.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
                     // 1st attempt: transient 503 model_unavailable
