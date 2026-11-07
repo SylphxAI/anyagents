@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+## 0.1.4
+
+### Fixed
+
+- GitHub schedule watches can use rotating, owner-scoped installation credentials
+  without consuming the interactive GitHub CLI token. Configured credentials fail
+  closed, and one owner's authentication failure does not stop other owners.
+- Shared watch probes preserve conditional validators, back off on unchanged
+  responses, refresh newly registered watches, and stop polling settled targets.
+- Primary rate-limit reserves and secondary limits pause all probe pages until
+  recovery, then spread target admission across a bounded recovery window.
+- Credential-file validation refuses symlinks, special files, unsafe permissions,
+  and ambiguous owner names without blocking on a FIFO writer.
+
+### Release verification
+
+- The [release CI audit](docs/releases/v0.1.4-ci-audit.json) records the sole PR
+  merged after v0.1.3 through source `571738c133d15c2cf1533a428fbdb23991d5c13c`.
+- The release candidate still requires its own full Linux/macOS and exact-head
+  `ci-ok` gates; publication and daemon activation are separate receipts.
+
+### Included pull requests
+
+- [#127](https://github.com/SylphxAI/anyagents/pull/127): Protect GitHub watch polling with dedicated credentials and quota holds.
+
 ## 0.1.3
 
 ### Added

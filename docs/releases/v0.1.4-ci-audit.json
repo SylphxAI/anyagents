@@ -1,0 +1,43 @@
+{
+  "read_at_utc": "2026-11-07T07:34:29.777866+00:00",
+  "base_tag": "v0.1.3",
+  "cut_source_sha": "571738c133d15c2cf1533a428fbdb23991d5c13c",
+  "release_candidate_branch": "agent/lyra-anyagents-release-0.1.4",
+  "release_gate": "Full Linux, macOS, exact-head ci-ok and independent exact-head PASS on the release candidate before the normal merge queue. Publication and daemon activation require separate receipts.",
+  "pull_requests": [
+    {
+      "number": 127,
+      "title": "Protect GitHub watch polling with dedicated credentials and quota holds",
+      "head_sha": "302a80b74202f56b7f87f4f91c122978f029bab2",
+      "merge_sha": "571738c133d15c2cf1533a428fbdb23991d5c13c",
+      "merged_at": "2026-11-07T07:31:05Z",
+      "ci_ok": [
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-11-07T06:59:34Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42349049978/job/128333946983",
+          "name": "ci-ok",
+          "startedAt": "2026-11-07T06:59:32Z",
+          "status": "COMPLETED",
+          "workflowName": "ci"
+        },
+        {
+          "__typename": "CheckRun",
+          "completedAt": "2026-11-07T07:10:16Z",
+          "conclusion": "SUCCESS",
+          "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42349844367/job/128336265629",
+          "name": "ci-ok",
+          "startedAt": "2026-11-07T07:10:12Z",
+          "status": "COMPLETED",
+          "workflowName": "ci"
+        }
+      ],
+      "disposition": "included"
+    }
+  ],
+  "excluded_open_pull_requests": [
+    108,
+    124
+  ]
+}
