@@ -1142,7 +1142,6 @@ fn a_healthy_turn_defers_switch_until_the_boundary_without_replaying_mail() {
 }
 
 #[test]
-#[ignore = "Prior fixture turn remains open; deterministic switch fixture repair tracked in https://github.com/SylphxAI/anyagents/issues/95"]
 fn a_faulted_idle_process_switches_without_replaying_mail() {
     switch_at_dispatch("running", RetiringTurn::FaultedIdle, false);
 }
