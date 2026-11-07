@@ -4381,6 +4381,14 @@ fn rebalance_provider_profiles(
                 .unwrap_or_else(|| "default".to_string());
             bound.entry(prof_name).or_default().push(a.name.clone());
         }
+        // Working seats still contribute load, but automatic maintenance must
+        // not rewrite their credentials or request a process rotation mid-turn.
+        // Read the durable turn state afresh rather than trusting the census.
+        let can_move = |name: &str| {
+            store
+                .agent_by_name(name)
+                .is_ok_and(|agent| store.has_open_turn(&agent.id).is_ok_and(|open| !open))
+        };
         // Step 1: evacuate exhausted profiles (0% left) onto any profile with remaining quota (> 0% left).
         let prof_keys: Vec<String> = bound.keys().cloned().collect();
         for src_prof in &prof_keys {
@@ -4390,6 +4398,9 @@ fn rebalance_provider_profiles(
             }
             let to_move = bound.get(src_prof).cloned().unwrap_or_default();
             for agent_name in to_move {
+                if !can_move(&agent_name) {
+                    continue;
+                }
                 let mut best_dst: Option<(String, i64, i64)> = None;
                 for (cand_prof, &cand_pct) in &prof_rem {
                     if cand_prof == src_prof || cand_pct <= 0 {
@@ -4432,7 +4443,7 @@ fn rebalance_provider_profiles(
             let mut best_move: Option<(String, String, i64)> = None;
             for (src_prof, src_agents) in &bound {
                 let src_len = src_agents.len() as i64;
-                if src_len < 2 {
+                if src_len < 2 || !src_agents.iter().any(|name| can_move(name)) {
                     continue;
                 }
                 let src_pct = prof_rem.get(src_prof).copied().unwrap_or(0);
@@ -4466,8 +4477,11 @@ fn rebalance_provider_profiles(
             let Some((src_prof, dst_prof, _)) = best_move else {
                 break;
             };
-            let Some(agent_name) = bound.get(&src_prof).and_then(|v| v.last().cloned()) else {
-                break;
+            let Some(agent_name) = bound
+                .get(&src_prof)
+                .and_then(|agents| agents.iter().rev().find(|name| can_move(name)).cloned())
+            else {
+                continue;
             };
             let target = format!("{provider}/{dst_prof}");
             if configure_agent_runtime(
@@ -7434,6 +7448,72 @@ mod tests {
                 Some("openai/healthy"),
                 "is_child={is_child}"
             );
+        }
+    }
+
+    #[test]
+    fn rebalance_provider_profiles_defers_open_turns_but_counts_their_load() {
+        for busy_pct in [0, 50] {
+            for is_child in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let data = tmp.path();
+                let store = Store::open(data.join("state.db")).unwrap();
+                let entries = rebalance_test_profiles(data, busy_pct);
+                let parent = store
+                    .create_agent(NewAgent::new("parent", "claude-code"))
+                    .unwrap();
+                let idle = rebalance_test_agent(&store, "a-idle", is_child.then_some(&parent));
+                let working =
+                    rebalance_test_agent(&store, "z-working", is_child.then_some(&parent));
+                for agent in [&idle, &working] {
+                    store
+                        .set_agent_running(&agent.id, &data.join(&agent.name).display().to_string())
+                        .unwrap();
+                }
+                store
+                    .receive(&working.id, anyagents_core::Incoming::new("active turn"))
+                    .unwrap();
+                let message = store.next_undelivered(&working.id).unwrap().unwrap();
+                store.note_delivered(&working.id, message.seq).unwrap();
+                assert!(store.has_open_turn(&working.id).unwrap());
+                let cfg = agent_config_dir(data, &working.id);
+                write_profile_marker(&cfg, ".anyagents-profile-rotated-ms", "123\n");
+
+                rebalance_provider_profiles(&store, data, &store.list_agents().unwrap(), &entries);
+
+                assert_eq!(
+                    bound_profile_name(&cfg).as_deref(),
+                    Some("openai/busy"),
+                    "busy_pct={busy_pct}, is_child={is_child}"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms")).unwrap(),
+                    "123\n"
+                );
+                assert!(store.has_open_turn(&working.id).unwrap());
+                assert_eq!(store.delivered_cursor(&working.id).unwrap(), message.seq);
+                // The working seat still contributes load. An idle seat moves
+                // even though the alphabetically last seat cannot be moved.
+                assert_eq!(
+                    bound_profile_name(&agent_config_dir(data, &idle.id)).as_deref(),
+                    Some("openai/healthy")
+                );
+
+                if busy_pct == 0 {
+                    store.note_turn_completed(&working.id).unwrap();
+                    rebalance_provider_profiles(
+                        &store,
+                        data,
+                        &store.list_agents().unwrap(),
+                        &entries,
+                    );
+                    assert_eq!(bound_profile_name(&cfg).as_deref(), Some("openai/healthy"));
+                    assert_ne!(
+                        std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms")).unwrap(),
+                        "123\n"
+                    );
+                }
+            }
         }
     }
 

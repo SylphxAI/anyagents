@@ -913,6 +913,249 @@ fn a_model_or_harness_change_drains_and_cuts_over_even_when_turn_never_ends_and_
     drop(supervisor);
 }
 
+// Observe the worker reaching its blocking wait, not an arbitrary sleep:
+// the assertion must run after it has processed the advanced clock.
+struct ObservedClock {
+    clock: ManualClock,
+    waits: std::sync::mpsc::Sender<(i64, Option<i64>)>,
+}
+impl Clock for ObservedClock {
+    fn now_ms(&self) -> i64 {
+        self.clock.now_ms()
+    }
+    fn wait(&self, deadline: Option<i64>, woken: &std::sync::atomic::AtomicBool) {
+        self.waits.send((self.now_ms(), deadline)).unwrap();
+        self.clock.wait(deadline, woken);
+    }
+    fn poke(&self) {
+        self.clock.poke();
+    }
+}
+
+#[test]
+fn profile_rotation_preserves_an_in_turn_child_past_the_drain_deadline() {
+    use anyagents_harness::TurnState;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let parent = store
+        .create_agent(NewAgent::new("parent", "claude-code"))
+        .unwrap();
+    let mut spec = NewAgent::new("working-child", "claude-code");
+    spec.parent_id = Some(parent.id);
+    let agent = store.create_agent(spec).unwrap();
+    let work = dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let release = dir.path().join("finish-turn");
+    let log = dir.path().join("vendor.log");
+    let program = dir.path().join("controlled-claude");
+    // The real ClaudeHarness owns this process. Only the explicit release file
+    // can finish its turn; a replacement/drop would kill it prematurely.
+    std::fs::write(&program, r#"#!/bin/sh
+while IFS= read -r line; do
+    printf '%s:%s\n' "$$" "$line" >> "$PROBE_LOG"
+    while [ ! -f "$RELEASE_TURN" ]; do sleep 0.01; done
+    printf '%s\n' '{"type":"result","subtype":"success","session_id":"rotation-test","usage":{"input_tokens":1,"output_tokens":1}}'
+done
+"#).unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let clock = ManualClock::new(1_700_000_000_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(ObservedClock {
+            clock: clock.clone(),
+            waits: tx,
+        }),
+        Arc::new(move |request: LaunchRequest| {
+            let release = release.to_string_lossy();
+            let log = log.to_string_lossy();
+            ClaudeHarness::start_in(
+                program.to_str().unwrap(),
+                None,
+                &[
+                    ("RELEASE_TURN", release.as_ref()),
+                    ("PROBE_LOG", log.as_ref()),
+                ],
+                Some(&request.work_dir),
+            )
+            .map_err(|err| err.to_string())
+        }),
+        Vec::new(),
+    )
+    .unwrap();
+    store
+        .receive(&agent.id, Incoming::new("initial-long-turn"))
+        .unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some_and(
+        |live| live.process_alive && live.turn_state == TurnState::InTurn
+    ) && log_contains(
+        &dir.path().join("vendor.log"),
+        "initial-long-turn"
+    )));
+    let first_pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
+    let before_cursor = store.delivered_cursor(&agent.id).unwrap();
+    let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+    std::fs::write(
+        config.join(".anyagents-profile-rotated-ms"),
+        format!("{}\n", clock.now_ms() + 1),
+    )
+    .unwrap();
+    store
+        .receive(&agent.id, Incoming::new("queued-for-new-profile"))
+        .unwrap();
+    // Pending rotation uses the 1s review wait, rather than the 250ms idle wait.
+    loop {
+        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if deadline == Some(now + 1_000) {
+            break;
+        }
+    }
+    for elapsed in [15_001, 30_001] {
+        let now = 1_700_000_000_000 + elapsed;
+        clock.set_ms(now);
+        loop {
+            let (observed, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
+            if observed == now {
+                break;
+            }
+        }
+        let live = supervisor.live(&agent.id).unwrap();
+        assert_eq!(
+            live.pid,
+            Some(first_pid),
+            "active child replaced at {elapsed}ms"
+        );
+        assert_eq!(live.turn_state, TurnState::InTurn);
+        assert!(live.process_alive);
+        assert!(
+            std::process::Command::new("kill")
+                .args(["-0", &first_pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), before_cursor);
+        assert!(!log_contains(
+            &dir.path().join("vendor.log"),
+            "queued-for-new-profile"
+        ));
+    }
+    std::fs::write(dir.path().join("finish-turn"), "done\n").unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some_and(
+        |live| live.process_alive && live.pid.is_some() && live.pid != Some(first_pid)
+    ) && log_contains(
+        &dir.path().join("vendor.log"),
+        "queued-for-new-profile"
+    )));
+    assert!(store.delivered_cursor(&agent.id).unwrap() > before_cursor);
+    let log = std::fs::read_to_string(dir.path().join("vendor.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("initial-long-turn"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("queued-for-new-profile"))
+            .count(),
+        1
+    );
+    assert!(
+        log.lines()
+            .find(|line| line.contains("queued-for-new-profile"))
+            .unwrap()
+            .starts_with(&format!(
+                "{}:",
+                supervisor.live(&agent.id).unwrap().pid.unwrap()
+            ))
+    );
+    drop(supervisor);
+}
+
+#[test]
+fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
+    use anyagents_harness::TurnState;
+    use std::sync::Mutex;
+
+    // Unlike Claude's rejected-turn rate-limit event, an adapter may report a
+    // quota hold while its turn is still active. Exercise that independent
+    // replacement entrypoint without changing the real-child fixture's state.
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let agent = store
+        .create_agent(NewAgent::new("quota-turn", "codex"))
+        .unwrap();
+    store
+        .set_agent_running(&agent.id, &dir.path().display().to_string())
+        .unwrap();
+    let clock = ManualClock::new(1_700_000_000_000);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(ObservedClock {
+            clock: clock.clone(),
+            waits: tx,
+        }),
+        {
+            let probes = Arc::clone(&probes);
+            Arc::new(move |_: LaunchRequest| {
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                probes.lock().unwrap().push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some()));
+    let old = Arc::clone(&probes.lock().unwrap()[0]);
+    {
+        let mut probe = old.lock().unwrap();
+        probe.health.turn_state = TurnState::InTurn;
+        probe.health.quota_reset_at_ms = Some(clock.now_ms() + 60_000);
+    }
+    let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+    std::fs::write(
+        config.join(".anyagents-profile-rotated-ms"),
+        format!("{}\n", clock.now_ms() + 1),
+    )
+    .unwrap();
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    loop {
+        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if deadline == Some(now + 1_000) {
+            break;
+        }
+    }
+    clock.set_ms(clock.now_ms() + 30_001);
+    loop {
+        let (now, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
+        if now == clock.now_ms() {
+            break;
+        }
+    }
+    assert_eq!(probes.lock().unwrap().len(), 1);
+    assert_eq!(
+        supervisor.live(&agent.id).unwrap().turn_state,
+        TurnState::InTurn
+    );
+    old.lock().unwrap().health.turn_state = TurnState::Idle;
+    store.poke(Wake::Agent {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| probes.lock().unwrap().len() == 2));
+    drop(supervisor);
+}
+
 /// A controllable adapter keeps replacement and delivery as separate observable
 /// boundaries. A replacement starts empty; only the mailbox supplies its input.
 struct SwitchHarness {
