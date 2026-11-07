@@ -608,8 +608,8 @@ pub fn share_capability_with_seat(path: &Path, gid: u32) -> std::io::Result<()> 
     Ok(())
 }
 
-/// Give one agent's config directory and the work directory beside it to its
-/// seat group, so the seat reads and writes its own files and no peer's.
+/// Give one agent's config directory to its seat. Workdirs have their own
+/// fail-closed sharing and admission before the agent becomes running.
 #[allow(dead_code)]
 pub fn share_config_with_seat(config_dir: &Path, gid: u32) {
     let uid = host_seat_users()
@@ -635,118 +635,38 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             eprintln!("seat: cannot share {}: {err}", config_dir.display());
         }
     }
-    let work_dir = config_dir.with_file_name("work");
-    if work_dir.is_dir() {
-        share_worktree_with_seat(&work_dir, eff_gid);
-    }
 }
 
-/// Share a worktree or explicit working directory (and its git metadata dir when
-/// present) with the target seat group (`gid`), falling back to `anyagents-sock`
-/// (`sock_gid_for()`) so both the server user and every `seat-*` user can write
-/// and commit inside the worktree without `EPERM`.
-pub fn share_worktree_with_seat(path: &Path, gid: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        if is_isolated_test_env() {
-            return;
-        }
-        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let normal_depth = canon
-            .components()
-            .filter(|c| matches!(c, std::path::Component::Normal(_)))
-            .count();
-        if normal_depth < 3
-            || host_home_dir().is_some_and(|h| canon == h || canon == h.join("workspace"))
-            || matches!(
-                canon.to_str(),
-                Some(
-                    "/" | "/workspace-data"
-                        | "/workspace-data/workspace"
-                        | "/workspace-data/workspace/.worktrees"
-                        | "/workspace-data/build-targets"
-                        | "/scratch"
-                        | "/scratch/wt"
-                        | "/scratch/wt/owners-main"
-                        | "/home"
-                )
+/// Share a working directory and both per-worktree and common Git metadata.
+/// A protected shared root or failed permission change is a typed refusal.
+pub fn share_worktree_with_seat(path: &Path, gid: u32) -> Result<(), Error> {
+    let canon = std::fs::canonicalize(path).map_err(|error| Error::WorkdirPermission {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })?;
+    let depth = canon
+        .components()
+        .filter(|c| matches!(c, std::path::Component::Normal(_)))
+        .count();
+    if depth < 3
+        || host_home_dir().is_some_and(|h| canon == h || canon == h.join("workspace"))
+        || matches!(
+            canon.to_str(),
+            Some(
+                "/scratch/wt"
+                    | "/scratch/wt/owners-main"
+                    | "/workspace-data/workspace"
+                    | "/workspace-data/workspace/.worktrees"
             )
-            || canon.starts_with("/workspace-data/build-targets")
-        {
-            return;
-        }
-        let _ = chown_to_seat_group(path, gid);
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o2775));
-        let apply_recursive = |target: &Path| {
-            let mut chgrp_ok = false;
-            if server_user_in_group_db(gid) && launcher().is_file() {
-                let me = current_uid().to_string();
-                let my_gid = server_gid().to_string();
-                let target_gid = gid.to_string();
-                if let Ok(st) = std::process::Command::new(launcher())
-                    .args([
-                        "--reuid",
-                        &me,
-                        "--regid",
-                        &my_gid,
-                        "--groups",
-                        &target_gid,
-                        "--no-new-privs",
-                        "--",
-                        "chgrp",
-                        "-R",
-                        &target_gid,
-                    ])
-                    .arg(target)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                {
-                    chgrp_ok = st.success();
-                }
-            }
-            if !chgrp_ok {
-                let fallback_gid = sock_gid_for().unwrap_or(gid).to_string();
-                let _ = std::process::Command::new("chgrp")
-                    .args(["-R", &fallback_gid])
-                    .arg(target)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-            let _ = std::process::Command::new("chmod")
-                .args(["-R", "g+rwX"])
-                .arg(target)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let _ = std::process::Command::new("find")
-                .arg(target)
-                .args(["-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        };
-        apply_recursive(path);
-        if path.join(".git").exists()
-            && let Ok(gd_out) = std::process::Command::new("git")
-                .arg("-C")
-                .arg(path)
-                .args(["rev-parse", "--path-format=absolute", "--git-dir"])
-                .output()
-            && gd_out.status.success()
-        {
-            let gd = PathBuf::from(String::from_utf8_lossy(&gd_out.stdout).trim());
-            if gd.is_dir() {
-                apply_recursive(&gd);
-            }
-        }
-    }
-    #[cfg(not(unix))]
+        )
+        || canon.starts_with("/workspace-data/build-targets")
     {
-        let _ = (path, gid);
+        return Err(Error::WorkdirPermission {
+            path: path.display().to_string(),
+            message: "refusing recursive permission changes to a shared root".into(),
+        });
     }
+    crate::worktree_access::share(path, gid)
 }
 
 /// Share a Unix socket (`anyagents.sock` or `wake.sock`) with the deployment's

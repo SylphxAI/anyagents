@@ -49,6 +49,18 @@ fn create_with_consumer(
     request: CreateRequest,
     consumer: &crate::worktree::Consumer,
 ) -> Result<Agent, Error> {
+    create_with_seat(store, data, request, consumer, None)
+}
+
+type WorkdirSeat = (String, u32, u32, Option<String>);
+
+fn create_with_seat(
+    store: &Store,
+    data: &Path,
+    request: CreateRequest,
+    consumer: &crate::worktree::Consumer,
+    seat_override: Option<WorkdirSeat>,
+) -> Result<Agent, Error> {
     let normalized_harness = match request.harness.trim() {
         "sylphx-agent" | "sylphx_agent" => "sylphx".to_string(),
         other => other.to_string(),
@@ -129,10 +141,6 @@ fn create_with_consumer(
             "private" | "sandbox" | "self" | "cloud" | "cloud-agent"
         );
         let wd_is_inherit_keyword = matches!(wd_lower.as_str(), "inherit" | "parent");
-        let wd_is_legacy_external = !crate::sandbox::is_isolated_test_env()
-            && (wd_str.starts_with("/scratch/wt")
-                || wd_str.starts_with("/scratch/tmp")
-                || wd_str.starts_with("/workspace-data/desk-repair-prep"));
         let effective_repo = request
             .repo
             .as_deref()
@@ -140,11 +148,6 @@ fn create_with_consumer(
             .filter(|s| !s.is_empty())
             .or(if wd_is_worktree_keyword {
                 Some("inherit")
-            } else if wd_is_legacy_external
-                && Path::new(wd_str).is_dir()
-                && is_git_repo_dir(Path::new(wd_str))
-            {
-                Some(wd_str)
             } else {
                 None
             });
@@ -152,7 +155,6 @@ fn create_with_consumer(
             || wd_is_worktree_keyword
             || wd_is_private_keyword
             || wd_is_inherit_keyword
-            || wd_is_legacy_external
         {
             None
         } else {
@@ -220,15 +222,18 @@ fn create_with_consumer(
                 .and_then(|p| p.workdir)
                 .map(PathBuf::from)
                 .filter(|p| p.is_dir());
-            if let Some(parent_wd) = inherited_parent_wd {
-                std::path::absolute(&parent_wd)?
-            } else {
-                managed_abs.clone()
-            }
+            let parent_wd = inherited_parent_wd.ok_or_else(|| Error::WorkdirPermission {
+                path: wd_str.into(),
+                message: "parent has no accessible workdir to inherit".into(),
+            })?;
+            std::path::absolute(&parent_wd)?
         } else {
             match &explicit_workdir {
                 Some(path) => {
-                    std::fs::create_dir_all(path)?;
+                    std::fs::create_dir_all(path).map_err(|error| Error::WorkdirPermission {
+                        path: path.display().to_string(),
+                        message: error.to_string(),
+                    })?;
                     let abs = std::path::absolute(path)?;
                     if agent.parent_id.is_some()
                         && abs.join(".git").is_file()
@@ -268,20 +273,31 @@ fn create_with_consumer(
                 }
             }
         };
+        if let Some((_, uid, gid, launch)) = seat_override
+            .clone()
+            .or_else(|| resolved_agent_seat_info(store, &agent))
+        {
+            if workdir_created || cwd == managed_abs {
+                crate::sandbox::share_worktree_with_seat(&cwd, gid)?;
+            }
+            crate::worktree_access::verify(&cwd, uid, gid, launch.as_deref())?;
+        } else {
+            if workdir_created || cwd == managed_abs {
+                crate::sandbox::share_worktree_with_seat(&cwd, crate::sandbox::server_gid())?;
+            }
+            crate::worktree_access::verify(
+                &cwd,
+                crate::sandbox::server_uid(),
+                crate::sandbox::server_gid(),
+                None,
+            )?;
+        }
         let _ = crate::operator::mint(store, &agent.id);
         store.set_agent_launch_env(&agent.id, &pairs)?;
         let mut pre_running = agent.clone();
         pre_running.workdir = Some(cwd.display().to_string());
         reconcile_agent_runtime_config(store, &data, &pre_running, &config, &cwd)?;
         let running = store.set_agent_running(&agent.id, &cwd.display().to_string())?;
-        let should_share_cwd =
-            (workdir_created || cwd == managed_abs || explicit_workdir.is_some())
-                && cwd != Path::new("/scratch/wt/owners-main")
-                && cwd != Path::new("/scratch/wt");
-        if should_share_cwd && let Some((_, _, gid, _)) = resolved_agent_seat_info(store, &running)
-        {
-            crate::sandbox::share_worktree_with_seat(&cwd, gid);
-        }
         Ok(running)
     })();
     if finish.is_err() {
@@ -301,7 +317,7 @@ fn provision_managed_worktree(
     branch_opt: Option<&str>,
     base_opt: Option<&str>,
     target_wt: &Path,
-    parent_name: Option<&str>,
+    _parent_name: Option<&str>,
 ) -> Result<(), Error> {
     if target_wt.exists() {
         let is_empty = std::fs::read_dir(target_wt)
@@ -358,14 +374,6 @@ fn provision_managed_worktree(
         .arg(target_wt)
         .args(["config", "--local", "user.email", "hi@kylet.se"])
         .status();
-
-    #[cfg(unix)]
-    if let Some((_, _, gid, _)) = resolved_agent_seat_info(store, agent).or_else(|| {
-        crate::sandbox::seat_for_agent_with_hint(&agent.name, parent_name)
-            .map(|(u, uid, gid, _)| (u, uid, gid, None))
-    }) {
-        crate::sandbox::share_worktree_with_seat(target_wt, gid);
-    }
 
     record_managed_worktree_marker(config, target_wt, repo_raw, Some(&branch));
     Ok(())
@@ -2020,14 +2028,7 @@ pub(crate) fn reconcile_agent_runtime_config(
             ensure_seat_op_config(config, spec);
         }
         crate::sandbox::share_config_with_seat_uid(config, uid, gid);
-        if work_dir != Path::new("/scratch/wt/owners-main")
-            && work_dir != Path::new("/scratch/wt")
-            && (agent.parent_id.is_some()
-                || work_dir.starts_with("/scratch/tmp")
-                || work_dir.starts_with(data))
-        {
-            crate::sandbox::share_worktree_with_seat(work_dir, gid);
-        }
+        crate::worktree_access::verify(work_dir, uid, gid, spec_opt.as_deref())?;
         if agent.harness == "muse"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
@@ -7490,6 +7491,8 @@ mod tests {
     fn set_agent_harness_preserves_identity_history_and_refuses_incompatible() {
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path();
+        let owner_workdir = data.join("owner-workdir");
+        std::fs::create_dir(&owner_workdir).unwrap();
         std::fs::create_dir_all(data.join("profiles/sylphx/default")).unwrap();
         let store = Store::open(data.join("state.db")).unwrap();
         let parent = store
@@ -7498,7 +7501,7 @@ mod tests {
                 role: None,
                 harness: "codex".to_string(),
                 model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
-                workdir: Some("/scratch/wt/owners-main".to_string()),
+                workdir: Some(owner_workdir.display().to_string()),
                 description: Some("Root coordinator".to_string()),
                 instructions: Some("Root coordinator".to_string()),
                 parent_id: None,
@@ -7510,7 +7513,7 @@ mod tests {
                 role: None,
                 harness: "opencode".to_string(),
                 model: Some("sylphx/openai/gpt-6.1-sol#xhigh".to_string()),
-                workdir: Some("/scratch/wt/owners-main".to_string()),
+                workdir: Some(owner_workdir.display().to_string()),
                 description: Some("Product Owner for AnyMD. Paused scope.".to_string()),
                 instructions: Some("Product Owner for AnyMD. Paused scope.".to_string()),
                 parent_id: Some(parent.id.clone()),
@@ -7849,6 +7852,250 @@ mod tests {
             instructions: None,
             parent_id: None,
         }
+    }
+
+    #[test]
+    fn explicit_workdir_is_honoured_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let f = crate::worktree::tests::Fixture::new(&data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let explicit = dir.path().join("explicit");
+        std::fs::create_dir(&explicit).unwrap();
+        let mut request = worktree_request("explicit", None);
+        request.workdir = Some(explicit.clone());
+        let agent = create_with_consumer(&store, &data, request, &f.consumer).unwrap();
+        assert_eq!(agent.workdir.as_deref(), explicit.to_str());
+        assert!(!f.log.exists());
+    }
+
+    #[test]
+    fn explicit_unwritable_workdir_is_a_typed_refusal_without_repair() {
+        if crate::sandbox::server_uid() == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        let f = crate::worktree::tests::Fixture::new(&data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let explicit = dir.path().join("explicit");
+        std::fs::create_dir(&explicit).unwrap();
+        let blocked = explicit.join("blocked");
+        std::fs::write(&blocked, "preserve").unwrap();
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let mut request = worktree_request("blocked", None);
+        request.workdir = Some(explicit.clone());
+        let err = create_with_consumer(&store, &data, request, &f.consumer).unwrap_err();
+        assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
+        assert!(err.to_string().contains(blocked.to_str().unwrap()), "{err}");
+        assert!(store.agent_by_name("blocked").is_err());
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserve");
+        assert_eq!(
+            std::fs::metadata(&blocked).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    }
+
+    #[test]
+    fn missing_inherited_workdir_is_refused_without_default_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let mut request = worktree_request("missing-inherit", None);
+        request.workdir = Some("inherit".into());
+        let err = create_with_consumer(&store, dir.path(), request, &f.consumer).unwrap_err();
+        assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
+        assert!(err.to_string().contains("parent has no accessible workdir"), "{err}");
+        assert!(store.agent_by_name("missing-inherit").is_err());
+        assert!(!f.log.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn privileged_cross_uid_spawn_can_create_commit_and_status() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command;
+        let caps = std::fs::read_to_string("/proc/self/status").unwrap();
+        let effective = caps
+            .lines()
+            .find_map(|l| l.strip_prefix("CapEff:\t"))
+            .and_then(|n| u64::from_str_radix(n, 16).ok())
+            .unwrap_or(0);
+        let required = (1 << 0) | (1 << 6) | (1 << 7); // CHOWN, SETGID, SETUID
+        if effective & required != required || crate::sandbox::server_uid() != 0 {
+            assert!(
+                std::env::var_os("ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST").is_none(),
+                "requires privilege: CAP_CHOWN, CAP_SETGID and CAP_SETUID"
+            );
+            eprintln!(
+                "requires privilege: CAP_CHOWN, CAP_SETGID and CAP_SETUID; A→B worktree acceptance not executed"
+            );
+            return;
+        }
+        if std::env::var_os("ANYAGENTS_PRIVILEGED_WORKER").is_none() {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "create::tests::privileged_cross_uid_spawn_can_create_commit_and_status",
+                    "--nocapture",
+                ])
+                .env("ANYAGENTS_PRIVILEGED_WORKER", "1")
+                .env("GIT_CONFIG_COUNT", "1")
+                .env("GIT_CONFIG_KEY_0", "safe.directory")
+                .env("GIT_CONFIG_VALUE_0", "*")
+                .output()
+                .unwrap();
+            eprintln!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "privileged worktree worker failed");
+            return;
+        }
+        struct Users(Vec<String>);
+        impl Drop for Users {
+            fn drop(&mut self) {
+                for user in &self.0 {
+                    let _ = Command::new("userdel").arg(user).status();
+                }
+            }
+        }
+        let mut users = Users(Vec::new());
+        let mut ids = Vec::new();
+        for suffix in ["a", "b"] {
+            let name = format!("aa-wt-{}-{suffix}", std::process::id());
+            assert!(
+                Command::new("useradd")
+                    .args(["--no-create-home", "--user-group", &name])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            users.0.push(name.clone());
+            let id = |flag: &str| {
+                String::from_utf8(
+                    Command::new("id")
+                        .args([flag, &name])
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .unwrap()
+                .trim()
+                .parse::<u32>()
+                .unwrap()
+            };
+            ids.push((id("-u"), id("-g")));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let f = crate::worktree::tests::Fixture::new(&data);
+        let (a_uid, a_gid) = ids[0];
+        let (b_uid, b_gid) = ids[1];
+        assert!(
+            Command::new("chown")
+                .args(["-R", &format!("{a_uid}:{a_gid}")])
+                .arg(&data)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let authority = data.join("consumer-authority");
+        std::fs::rename(data.join("consumer"), &authority).unwrap();
+        std::fs::write(data.join("consumer"), format!("#!/bin/sh\nexec /usr/bin/setpriv --reuid {a_uid} --regid {a_gid} --clear-groups -- env HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev/null {:?} \"$@\"\n", authority)).unwrap();
+        std::fs::set_permissions(
+            data.join("consumer"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let parent = store
+            .create_agent(NewAgent::new("parent-a", "codex"))
+            .unwrap();
+        store
+            .set_agent_running(&parent.id, f.source.to_str().unwrap())
+            .unwrap();
+        let target = dir.path().join("checkout");
+        // The consumer executes as A and must be able to create the checkout.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let mut request = worktree_request("child-b", Some("inherit".into()));
+        request.parent_id = Some(parent.id);
+        request.workdir = Some(target.clone());
+        let agent = create_with_seat(
+            &store,
+            &data,
+            request,
+            &f.consumer,
+            Some((users.0[1].clone(), b_uid, b_gid, None)),
+        )
+        .unwrap();
+        assert_eq!(agent.workdir.as_deref(), target.to_str());
+        let out = Command::new("/usr/bin/setpriv")
+            .env("HOME", "/nonexistent")
+            .env("XDG_CONFIG_HOME", "/nonexistent")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["--reuid", &b_uid.to_string(), "--regid", &b_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
+                "set -eu; cd \"$1\"; printf child > src/child; git -c safe.directory=\"$1\" add src/child; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Child commit'; git -c safe.directory=\"$1\" status --porcelain", "child-seat"])
+            .arg(&target).output().unwrap();
+        assert!(
+            out.status.success(),
+            "B create/commit/status: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(target.join("src/child")).unwrap(),
+            "child"
+        );
+        // Existing explicit workdirs are checked as B without rewriting them.
+        let mut explicit = worktree_request("explicit-b", None);
+        explicit.workdir = Some(target.clone());
+        let accepted = create_with_seat(
+            &store,
+            &data,
+            explicit,
+            &f.consumer,
+            Some((users.0[1].clone(), b_uid, b_gid, None)),
+        )
+        .unwrap();
+        assert_eq!(accepted.workdir.as_deref(), target.to_str());
+        let blocked = target.join("src/parent-only");
+        std::fs::write(&blocked, "preserve").unwrap();
+        assert!(
+            Command::new("chown")
+                .arg(format!("{a_uid}:{a_gid}"))
+                .arg(&blocked)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let mut explicit = worktree_request("refused-b", None);
+        explicit.workdir = Some(target.clone());
+        let err = create_with_seat(
+            &store,
+            &data,
+            explicit,
+            &f.consumer,
+            Some((users.0[1].clone(), b_uid, b_gid, None)),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
+        assert!(err.to_string().contains(blocked.to_str().unwrap()), "{err}");
+        assert!(store.agent_by_name("refused-b").is_err());
+        assert_eq!(
+            std::fs::metadata(&blocked).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        eprintln!(
+            "A→B worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}; create, commit, status passed"
+        );
     }
 
     #[test]

@@ -211,6 +211,15 @@ agent manager. Fetch, checkout, and executable-launch failures refuse the spawn
 with the consumer's diagnostic; there is no automatic clone, direct-worktree,
 or non-desk fallback.
 
+Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, are
+honoured or refused, never replaced by the default directory. Before an agent
+becomes running, its execution seat must be able to write and traverse its
+working tree, the per-worktree Git directory and the common objects/refs
+storage, and create lock files. New worktrees are shared with that seat's group;
+failed permission changes are typed refusals. Existing explicit directories are
+validated without rewriting their permissions. Sharing does not follow symlinks
+or alter hard-linked files that require permission changes.
+
 For inherit/local sources, AnyAgents selects a GitHub remote (preferring
 `origin`), reads its live advertised branches and tags, and requires both the
 source HEAD and requested base to be reachable from them. Push unpublished

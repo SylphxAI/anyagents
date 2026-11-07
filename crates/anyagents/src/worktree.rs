@@ -261,7 +261,16 @@ pub(crate) mod tests {
             std::fs::write(source.join("excluded/large"), "excluded\n").unwrap();
             git(&source, &["add", "."]);
             git(&source, &["commit", "-m", "Initial commit"]);
-            git(&source, &["clone", "--bare", ".", remote.to_str().unwrap()]);
+            git(
+                &source,
+                &[
+                    "clone",
+                    "--bare",
+                    "--no-hardlinks",
+                    ".",
+                    remote.to_str().unwrap(),
+                ],
+            );
             git(
                 &source,
                 &[

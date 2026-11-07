@@ -36,6 +36,8 @@ pub enum Error {
         source_repo: String,
         message: String,
     },
+    #[error("workdir `{path}` is not writable by its seat: {message}")]
+    WorkdirPermission { path: String, message: String },
     #[error("{0}")]
     Message(String),
 }

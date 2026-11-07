@@ -468,8 +468,14 @@ fn spawn_admin_sylphx_delivery(
         {
             create::ensure_seat_environment(&cfg);
             let _ = std::fs::create_dir_all(&work_dir);
-            if let Some((_, gid, _)) = detect_seat_ids(&cfg) {
-                crate::sandbox::share_worktree_with_seat(&work_dir, gid);
+            if let Some((_, gid, _)) = detect_seat_ids(&cfg)
+                && let Err(error) = crate::sandbox::share_worktree_with_seat(&work_dir, gid)
+            {
+                crate::vendor::persist_last_error(&cfg, Some(&error.to_string()), None);
+                create::maybe_notify_parent_on_error(&store, &agent, &cfg, &error.to_string());
+                let mut guard = reconcile.lock().unwrap_or_else(|p| p.into_inner());
+                guard.flushing_sylphx.remove(agent.id.as_str());
+                return;
             }
             let req = anyagents_supervisor::LaunchRequest {
                 agent: agent.clone(),
@@ -6481,6 +6487,7 @@ impl ApiError {
             | Error::Message(_)
             | Error::WorktreeSourceUnpublished { .. } => StatusCode::BAD_REQUEST,
             Error::WorktreeProvisioning { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            Error::WorkdirPermission { .. } => StatusCode::FORBIDDEN,
             Error::NotImplemented(_) => StatusCode::NOT_IMPLEMENTED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

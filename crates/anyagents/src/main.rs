@@ -34,6 +34,7 @@ mod telegram;
 mod ui;
 mod vendor;
 mod worktree;
+mod worktree_access;
 
 #[derive(Parser)]
 #[command(
