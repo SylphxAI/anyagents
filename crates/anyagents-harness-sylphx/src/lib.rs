@@ -6090,6 +6090,26 @@ mod tests {
         )
         .unwrap();
 
+        let (activity_tx, activity_rx) = std::sync::mpsc::channel();
+        harness.watch_activity(Arc::new(move || {
+            let _ = activity_tx.send(());
+        }));
+        let wait_for_completion = |harness: &SylphxHarness| {
+            // A progress ceiling, not a retry latency requirement. CI run
+            // 42345118559 failed the count assertion after a 1.6 s poll limit.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while harness.health().turn_state != TurnState::Idle {
+                assert!(
+                    activity_rx
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .is_ok(),
+                    "turn did not complete: health={:?}, HTTP requests={}",
+                    harness.health(),
+                    hits.load(Ordering::SeqCst),
+                );
+            }
+        };
+
         // Turn 1: first request gets 503, retries automatically, and succeeds on 2nd request!
         let msg1 = OutboundMessage {
             id: "msg_retry_ok".to_string(),
@@ -6101,13 +6121,9 @@ mod tests {
             context: Context::default(),
         };
         harness.deliver(&msg1).unwrap();
-        for _ in 0..80 {
-            if harness.health().turn_state == TurnState::Idle {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_completion(&harness);
         assert_eq!(harness.turns_served(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
         assert!(harness.health().sign_in_fault.is_none());
         assert!(!cfg.join(".anyagents-last-error.json").exists());
 
@@ -6122,13 +6138,9 @@ mod tests {
             context: Context::default(),
         };
         harness.deliver(&msg2).unwrap();
-        for _ in 0..80 {
-            if harness.health().turn_state == TurnState::Idle {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        wait_for_completion(&harness);
         assert_eq!(harness.turns_served(), 1);
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
         let fault = harness
             .health()
             .sign_in_fault
