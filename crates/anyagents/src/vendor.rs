@@ -1469,6 +1469,89 @@ mod tests {
         assert_eq!(output.stdout, b"1:kept");
     }
 
+    // Used by the real seat and the unprivileged refusal controls below.
+    // Inspect only link metadata; never read or traverse a credential target.
+    const NATIVE_FIXTURE_OWNER_CLEANUP: &str = r#"
+set -eu
+[ "$(readlink "$1/skills")" = "$2" ]
+for name in service-account-token connect-token; do
+    path="$3/$name"
+    [ -L "$path" ] || [ ! -e "$path" ]
+done
+for name in service-account-token connect-token; do
+    path="$3/$name"
+    if [ -L "$path" ]; then
+        rm -- "$path"
+    fi
+done
+rmdir -- "$3"
+rm -- "$1/skills"
+rmdir -- "$1"
+"#;
+
+    #[test]
+    fn native_fixture_owner_cleanup_removes_only_expected_links() {
+        for case in ["empty", "links", "regular-token", "unexpected-entry"] {
+            let temp = crate::test_tempdir();
+            let root = temp.path();
+            let agy = root.join("config/.agy");
+            let op = root.join("config/.config/op");
+            let outside = root.join("outside");
+            std::fs::create_dir_all(&agy).unwrap();
+            std::fs::create_dir_all(&op).unwrap();
+            std::fs::create_dir(&outside).unwrap();
+            std::fs::write(outside.join("sentinel"), b"preserved").unwrap();
+            std::os::unix::fs::symlink(&outside, agy.join("skills")).unwrap();
+            match case {
+                "links" => {
+                    std::os::unix::fs::symlink(&outside, op.join("service-account-token")).unwrap();
+                    std::os::unix::fs::symlink(root.join("absent"), op.join("connect-token"))
+                        .unwrap();
+                }
+                "regular-token" => {
+                    std::fs::write(op.join("service-account-token"), b"not a link").unwrap();
+                    std::os::unix::fs::symlink(&outside, op.join("connect-token")).unwrap();
+                }
+                "unexpected-entry" => {
+                    std::os::unix::fs::symlink(&outside, op.join("unexpected")).unwrap();
+                }
+                "empty" => {}
+                _ => unreachable!(),
+            }
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", NATIVE_FIXTURE_OWNER_CLEANUP, "fixture-owner-cleanup"])
+                .arg(&agy)
+                .arg(&outside)
+                .arg(&op)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                matches!(case, "empty" | "links"),
+                "{case}: {output:?}"
+            );
+            assert_eq!(
+                std::fs::read(outside.join("sentinel")).unwrap(),
+                b"preserved"
+            );
+            if output.status.success() {
+                assert!(!agy.exists(), "{case}");
+                assert!(!op.exists(), "{case}");
+            } else {
+                assert!(agy.join("skills").is_symlink(), "{case}");
+                if case == "regular-token" {
+                    assert_eq!(
+                        std::fs::read(op.join("service-account-token")).unwrap(),
+                        b"not a link"
+                    );
+                    assert!(op.join("connect-token").is_symlink());
+                } else {
+                    assert!(op.join("unexpected").is_symlink());
+                }
+            }
+        }
+    }
+
     /// Required by the Linux native-UID lane, never counted as a green skip.
     /// The executor drops DAC override so a seat-owned 0700 vendor parent really
     /// denies the daemon and exercises the owner projection fallback.
@@ -2003,10 +2086,20 @@ done
         std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
         assert_eq!(snapshot(), before, "protected bytes or permissions changed");
         println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
-        // The daemon has no DAC override and is not in the private parent's
-        // group. Its owner removes only the proven managed link and empty
-        // parent; neither widening modes nor recursive foreign-link traversal
-        // belongs in this fixture teardown.
+        // Native launch also creates a private op leaf. Prove that the reduced-
+        // DAC daemon cannot enumerate it before its actual owner removes only
+        // known token links and the empty directory. Do not widen private modes
+        // or recursively traverse any foreign link during fixture teardown.
+        let op = config.join(".config/op");
+        let metadata = std::fs::symlink_metadata(&op).unwrap();
+        assert!(metadata.is_dir());
+        assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+        assert_eq!(metadata.mode() & 0o7777, 0o700);
+        assert_eq!(
+            std::fs::read_dir(&op).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        println!("NATIVE_VENDOR_PRIVATE_OP_DENIED_BEFORE_OWNER_CLEANUP");
         let output = std::process::Command::new("/usr/bin/setpriv")
             .args([
                 "--reuid",
@@ -2018,15 +2111,17 @@ done
                 "--",
                 "/bin/sh",
                 "-c",
-                "set -eu; [ \"$(readlink \"$1/skills\")\" = \"$2\" ]; rm -- \"$1/skills\"; rmdir -- \"$1\"",
+                NATIVE_FIXTURE_OWNER_CLEANUP,
                 "fixture-owner-cleanup",
             ])
             .arg(config.join(".agy"))
             .arg(root.join("skills-view"))
+            .arg(&op)
             .output()
             .unwrap();
         assert!(output.status.success(), "owner fixture cleanup: {output:?}");
         assert!(!config.join(".agy").exists());
+        assert!(!op.exists());
         // Global read-only fixtures are daemon-owned, but deletion still
         // requires owner write permission after all preservation assertions.
         for path in [data.join("skills/global"), data.join("skills")] {
