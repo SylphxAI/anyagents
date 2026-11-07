@@ -293,6 +293,44 @@ A subscription harness often reports tokens but no price; its record says `subsc
 - Secrets (channel tokens, API keys, the capability itself) live in the OS keychain or a 0600 file, never in the database, logs, tool arguments or usage records.
 - On a deployment with an operator token, every harness runs in its own OS seat: a distinct managed uid, no new privileges, and no read of the server's files or a peer's config. A deployment without that seat refuses to start as the boundary.
 
+## Agent scope and metadata updates
+
+An explicit `scope` survives server restarts, runtime-config reconciliation,
+provider-route refreshes and unrelated metadata updates. SQLite is authoritative:
+`agents.launch_env` retains `ANYAGENTS_SCOPE` (and the legacy `ANYAGENTS_PUBLIC`
+marker); only the scope setter owns these keys. Harness-environment replacement
+merges them from the current row in the same write transaction.
+
+Without an explicit policy, roots are `public`, `*-assistant` children are
+`isolated`, other children with a nonempty `role` are `siblings`, and task
+children without a role are `private`. Description, instructions and role
+updates that omit both `scope` and `public` preserve the explicit policy.
+
+The legacy `public` boolean describes cross-tree reachability, not sibling
+access. `true` selects `public`. `false` preserves an existing nonpublic scope;
+for a public agent it restores the default above. An explicit `scope` takes
+precedence when both fields are supplied. To restrict a standing child to
+`private`, send `scope: "private"` explicitly.
+
+Agents may edit their own description and instructions. Changing scope or role
+requires an ancestor, a root admin or the operator; updating another agent's
+private metadata requires the same authority. Unrelated non-admin agents cannot
+overwrite it.
+
+Every accepted scope or legacy-public write, including an unchanged value,
+atomically records its authenticated `actor`, `before_scope`, `after_scope` and
+`source` (`scope` or `public`) in `admin_audit`. Internal store callers record
+`system`; API callers record `operator` or `agent:<name>`. An operator can trace
+policy changes with:
+
+```sql
+SELECT datetime(created_at / 1000, 'unixepoch') AS utc,
+       actor, target, before_scope, after_scope, source
+FROM admin_audit
+WHERE source IS NOT NULL AND target = 'agent-name'
+ORDER BY id;
+```
+
 ## Storage
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
