@@ -309,5 +309,7 @@ try {
 } finally {
   viewer?.close(); remote?.close(); chrome.kill('SIGTERM');
   await new Promise(resolve => { if (chrome.exitCode !== null) resolve(); else chrome.once('exit', resolve); });
-  await rm(dir, { recursive: true, force: true });
+  // Chromium helpers may finish profile writes after the browser parent exits.
+  // Retry only idempotent cleanup; never rerun the interaction assertions.
+  await rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
 }

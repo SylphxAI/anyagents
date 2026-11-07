@@ -120,7 +120,14 @@ No typed or pasted text is returned in input acknowledgements.
 keyboard regressions in the ordinary native suite when Chromium is available.
 The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
 copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
-export denial. Actual iPhone Safari keyboard and long-press menus require a
+export denial. Viewer teardown retries only recursive deletion of its disposable
+profile (five retries, 100 ms linear backoff), because Chromium helpers can finish
+profile writes after the browser parent exits. An exhausted cleanup retry still
+fails the fixture; interaction assertions are never retried. This addresses the
+Linux `ENOTEMPTY` cleanup failure in CI run 42334433646 after all clipboard
+assertions passed.
+
+Actual iPhone Safari keyboard and long-press menus require a
 post-deployment device check; Chromium emulation does not certify those OS menus.
 
 Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
