@@ -1,7 +1,7 @@
 {
-  "read_at_utc": "2026-11-07T05:09:45.154818+00:00",
+  "read_at_utc": "2026-11-07T06:00:25.052680+00:00",
   "base_tag": "v0.1.2",
-  "cut_source_sha": "5382dfda23877f5cd3b69dfa3cd6316cb58f1e2b",
+  "cut_source_sha": "b81109f4914acdf852fdee950a7706c2d06f04ba",
   "release_candidate_branch": "agent/lyra-anyagents-release-0.1.3",
   "release_gate": "Full Linux, macOS and exact-head ci-ok must pass on the release candidate before the normal merge queue.",
   "pull_requests": [
@@ -142,6 +142,20 @@
         "conclusion": "SUCCESS",
         "status": "COMPLETED",
         "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42339604413/job/128304988128"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 126,
+      "merge_sha": "b81109f4914acdf852fdee950a7706c2d06f04ba",
+      "title": "test(supervisor): wait for durable turn completion before restart (#126)",
+      "head_sha": "f7a55a2f2a32442f91c89cd507f56a303eaed055",
+      "merged_at": "2026-11-07T05:55:29Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42343485538/job/128317003648"
       },
       "disposition": "included"
     }
