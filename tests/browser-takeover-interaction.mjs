@@ -32,6 +32,12 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     const p = await localPoint(r.x, r.y);
     if (mobile) { await touch('touchStart',[[p.x,p.y]]); await touch('touchEnd',[]); }
     else { await mouse('mousePressed',p); await mouse('mouseReleased',p,0); }
+    // CDP only acknowledges delivery to the viewer. The remote click and its
+    // editable-focus reply still travel over HTTP; IME requires that reply.
+    await until(()=>remote.eval(`document.activeElement.id===${JSON.stringify(id)}`),'remote click '+id);
+    if (['entry','password'].includes(id)) {
+      await until(()=>viewer.eval(`document.activeElement.id==='keyboard-proxy' && document.activeElement.type===${JSON.stringify(id==='password'?'password':'text')}`),'editable proxy '+id);
+    }
   }
   for (const [width,height] of [[1440,900],[834,1194],[390,844]]) {
     const mobile=width<700;

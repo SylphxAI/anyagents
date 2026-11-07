@@ -309,6 +309,32 @@ try {
   await writeFile(path.join(output, 'remote-click-log.json'), JSON.stringify(logs, null, 2));
   console.log(JSON.stringify({passed:true, viewports:4, clicks:logs.length, screenshots:output}));
   }
+} catch (error) {
+  // Keep the original failure even if diagnostics or teardown also fail. These
+  // pages contain only disposable fixture values, never a user's browser data.
+  const evidence = { passed:false, error:String(error), stack:error.stack };
+  async function capture(name, operation) {
+    let timer;
+    try {
+      evidence[name] = await Promise.race([operation(), new Promise((_, reject) => {
+        timer=setTimeout(()=>reject(new Error('diagnostic timeout')),2000);
+      })]);
+    } catch (failure) { evidence[name] = { error:String(failure) }; }
+    finally { clearTimeout(timer); }
+  }
+  if (viewer) {
+    await capture('viewer',()=>viewer.eval(`({active:document.activeElement.id,proxyType:document.querySelector('#keyboard-proxy')?.type,proxyLength:document.querySelector('#keyboard-proxy')?.value.length,status:document.querySelector('#connection')?.textContent})`));
+    await capture('screenshot',async()=>{
+      const shot=await viewer.call('Page.captureScreenshot',{format:'png',captureBeyondViewport:false});
+      await writeFile(path.join(output,'failure.png'),Buffer.from(shot.data,'base64'));
+      return 'failure.png';
+    });
+  }
+  if (remote) await capture('remote',()=>remote.eval(`({active:document.activeElement.id,entry:document.querySelector('#entry')?.value,passwordLength:document.querySelector('#password')?.value.length,trajectory:window.trajectory})`));
+  try { await writeFile(path.join(output,'failure.json'),JSON.stringify(evidence,null,2)); }
+  catch (failure) { console.error('could not retain failure evidence',failure); }
+  console.error('acceptance failure evidence',JSON.stringify(evidence));
+  throw error;
 } finally {
   viewer?.close(); remote?.close();
   // Parent exit does not establish helper exit. Refuse deletion while any
