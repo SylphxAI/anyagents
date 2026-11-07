@@ -109,7 +109,9 @@ for line in sys.stdin:
         let config = data.join("config");
         let work = data.join("work");
         std::fs::create_dir_all(config.join(".agents/skills")).unwrap();
-        std::fs::create_dir_all(&work).unwrap();
+        let real_work = data.join("work-real");
+        std::fs::create_dir_all(&real_work).unwrap();
+        std::os::unix::fs::symlink(&real_work, &work).unwrap();
         let mut spec = NewAgent::new("protocol-probe", harness_name);
         spec.model = Some("sylphx/openai/gpt-6.1-sol#xhigh".into());
         spec.workdir = Some(work.display().to_string());
@@ -242,7 +244,13 @@ for line in sys.stdin:
                 .collect();
         assert_eq!(launches.len(), 2);
         for launch in launches {
-            assert_eq!(launch["cwd"], work.display().to_string());
+            // getcwd resolves directory aliases (including macOS /var ->
+            // /private/var). CLI arguments must retain the configured path,
+            // while the child's effective directory has filesystem identity.
+            assert_eq!(
+                launch["cwd"],
+                work.canonicalize().unwrap().display().to_string()
+            );
             assert_eq!(launch["home"], config.display().to_string());
             let args: Vec<&str> = launch["args"]
                 .as_array()
