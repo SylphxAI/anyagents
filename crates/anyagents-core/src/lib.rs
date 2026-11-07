@@ -8,8 +8,10 @@ mod address;
 pub mod boundary;
 mod error;
 mod id;
+pub mod learned_memory;
 mod migrate;
 pub mod quote;
+pub mod raw_segment;
 mod secret;
 mod store;
 
