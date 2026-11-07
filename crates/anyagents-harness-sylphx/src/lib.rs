@@ -5306,7 +5306,7 @@ mod tests {
         // The newly enlarged fixture also retains its completed tool pair
         // when it fits. Only the failed/new inbound remains pending; completed
         // context may remain visible without being revived as pending work.
-        assert!(&restarted[restarted.len() - 2..] == &[failed, next]);
+        assert!(restarted[restarted.len() - 2..] == [failed, next]);
         assert!(load_pending_native_messages(&transcript, &restarted) == pending);
         validate_responses_input(&restarted).unwrap();
     }
@@ -5361,6 +5361,55 @@ mod tests {
             r#"{"error":{"message":"Invalid request: Your request exceeded model token limit: 1048576 (requested: 1274676)","type":"invalid_request_error"}}"#
         ));
         assert!(!is_context_overflow(429, "quota exceeded"));
+    }
+
+    #[test]
+    fn native_transcript_file_reads_share_recall_cap_cursor_and_active_suppression() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        let transcript = cfg.join("sylphx-transcript.jsonl");
+        let text = "raw file original 中文\n\"".repeat(4_000);
+        let inbound = json!({"role":"user", "content":text});
+        append_transcript_message(&transcript, &inbound);
+        append_transcript_message(
+            &transcript,
+            &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[inbound]}),
+        );
+        let read = |args: &Value| {
+            execute_sylphx_tool("read_file", args, cfg, cfg, &[], Path::new("unused"), &[])
+        };
+        let mut args = json!({"path":"sylphx-transcript.jsonl", "start_line":1, "end_line":1});
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("sylphx-transcript.jsonl", cfg.join("raw-alias.jsonl"))
+                .unwrap();
+            args["path"] = json!("raw-alias.jsonl");
+        }
+        let active = read(&args);
+        assert!(active.len() <= memory::MEMORY_RECALL_MAX_BYTES);
+        assert!(active.contains("Already present in active context"));
+        assert!(!active.contains("raw file original"));
+        append_transcript_message(
+            &transcript,
+            &json!({"type":"context_window_open", "handoff":"evicted", "retained_items":[]}),
+        );
+        let mut combined = String::new();
+        loop {
+            let page = read(&args);
+            assert!(page.len() <= memory::MEMORY_RECALL_MAX_BYTES);
+            let parsed: Value = serde_json::from_str(&page).unwrap();
+            assert_eq!(parsed["mode"], "page");
+            combined.push_str(parsed["content"].as_str().unwrap());
+            let Some(cursor) = parsed["next_cursor"].as_str() else {
+                break;
+            };
+            args["cursor"] = json!(cursor);
+        }
+        let recovered: Value = serde_json::from_str(&combined).unwrap();
+        assert!(recovered["items"][0]["content"] == format!("[user] {text}"));
+        // Ordinary file reads retain their public line-numbered format.
+        std::fs::write(cfg.join("plain.txt"), "unchanged normal read").unwrap();
+        assert!(read(&json!({"path":"plain.txt"})).contains("   1: unchanged normal read"));
     }
 
     #[test]
