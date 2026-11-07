@@ -167,6 +167,7 @@ impl HostIndex {
         )?;
         let mut file = File::open(&raw.segment)?;
         let mut relative = 0u64;
+        let mut json_state = JsonProjection::default();
         let mut bytes = [0u8; WINDOW_BYTES];
         while relative < raw.length {
             let length = (raw.length - relative).min(WINDOW_BYTES as u64) as usize;
@@ -174,9 +175,22 @@ impl HostIndex {
             file.read_exact(&mut bytes[..length])?;
             // Lossy projection is only for search over binary tool outputs.
             // The stored coordinate and the returned range remain exact bytes.
-            let tokens =
-                crate::tokenize_hybrid_search_tokens(&String::from_utf8_lossy(&bytes[..length]))
-                    .join(" ");
+            let mut tokens =
+                crate::tokenize_hybrid_search_tokens(&String::from_utf8_lossy(&bytes[..length]));
+            // Decode string escapes without materializing an unbounded JSON event.
+            // Raw and decoded projections share the original exact-byte window.
+            let mut window_state = json_state.clone();
+            let decoded = window_state.feed(&bytes[..length]);
+            tokens.extend(crate::tokenize_hybrid_search_tokens(
+                &String::from_utf8_lossy(&decoded),
+            ));
+            let tokens = tokens.join(" ");
+            let step = if relative + length as u64 == raw.length {
+                length
+            } else {
+                length - OVERLAP_BYTES
+            };
+            json_state.feed(&bytes[..step]);
             tx.execute(
                 "INSERT INTO host_windows(document_id,offset,length,sha256) VALUES(?1,?2,?3,?4)",
                 params![
@@ -228,6 +242,9 @@ impl HostIndex {
             where_sql.push_str(clause);
             values.push(value);
         };
+        if let Some(agent) = query.agent.as_deref().filter(|a| *a != "all") {
+            push("d.agent_id=?", agent.to_owned().into());
+        }
         if let Some(source) = scope.source() {
             push("d.source=?", source.to_owned().into());
         }
@@ -246,7 +263,7 @@ impl HostIndex {
         if query.only_tools {
             where_sql.push_str(" AND d.tool_name IS NOT NULL");
         }
-        if !query.include_tools {
+        if !query.include_tools && !query.only_tools && query.tool_name.is_none() {
             where_sql.push_str(" AND d.tool_name IS NULL");
         }
         if let Some(tool) = &query.tool_name {
@@ -276,9 +293,10 @@ impl HostIndex {
                     .into(),
             );
         }
-        let order = if !lexical || query.sort == HistorySort::Oldest {
+        let tail_default = !lexical && query.sort == HistorySort::Relevance;
+        let order = if query.sort == HistorySort::Oldest {
             "d.timestamp_ms ASC,d.seq ASC,d.id ASC"
-        } else if query.sort == HistorySort::Newest {
+        } else if tail_default || query.sort == HistorySort::Newest {
             "d.timestamp_ms DESC,d.seq DESC,d.id DESC"
         } else {
             "score ASC,d.timestamp_ms DESC,d.seq DESC"
@@ -341,7 +359,114 @@ impl HostIndex {
                 break;
             }
         }
+        if tail_default {
+            hits.reverse();
+        }
+        if query.radius > 0 {
+            let mut expanded = hits.clone();
+            let mut ids: std::collections::HashSet<_> =
+                expanded.iter().map(|h| h.id.clone()).collect();
+            for hit in &hits {
+                let mut neighbors = query.clone();
+                neighbors.query = None;
+                neighbors.queries.clear();
+                neighbors.radius = 0;
+                neighbors.sort = HistorySort::Oldest;
+                let radius = query.radius.min(10) as i64;
+                let seq = hit.raw.seq as i64;
+                neighbors.from_seq =
+                    Some(query.from_seq.unwrap_or(0).max(seq.saturating_sub(radius)));
+                neighbors.to_seq = Some(
+                    query
+                        .to_seq
+                        .unwrap_or(i64::MAX)
+                        .min(seq.saturating_add(radius)),
+                );
+                neighbors.limit = 21;
+                for neighbor in self.search(&[hit.metadata.agent_id.clone()], scope, &neighbors)? {
+                    // Sequence coordinates are local to one segment.
+                    if neighbor.raw.segment == hit.raw.segment && ids.insert(neighbor.id.clone()) {
+                        expanded.push(neighbor);
+                    }
+                }
+            }
+            expanded.sort_by(|a, b| {
+                (a.metadata.timestamp_ms, a.raw.seq, &a.id).cmp(&(
+                    b.metadata.timestamp_ms,
+                    b.raw.seq,
+                    &b.id,
+                ))
+            });
+            return Ok(expanded);
+        }
         Ok(hits)
+    }
+}
+
+/// Streaming JSON-string projection; raw coverage remains independent. State
+/// survives window boundaries, including escapes and UTF-16 surrogate pairs.
+#[derive(Clone, Default)]
+struct JsonProjection {
+    in_string: bool,
+    escaped: bool,
+    unicode: Option<(u16, u8)>,
+    high: Option<u16>,
+}
+impl JsonProjection {
+    fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for &b in bytes {
+            if let Some((value, n)) = self.unicode {
+                if let Some(digit) = (b as char).to_digit(16) {
+                    let value = (value << 4) | digit as u16;
+                    if n == 3 {
+                        self.unicode = None;
+                        if (0xd800..=0xdbff).contains(&value) {
+                            self.high = Some(value);
+                        } else {
+                            let code = if (0xdc00..=0xdfff).contains(&value) {
+                                self.high.take().map(|high| {
+                                    0x10000
+                                        + (((high as u32 - 0xd800) << 10) | (value as u32 - 0xdc00))
+                                })
+                            } else {
+                                self.high = None;
+                                Some(value as u32)
+                            };
+                            if let Some(ch) = code.and_then(char::from_u32) {
+                                let mut buffer = [0; 4];
+                                out.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+                            }
+                        }
+                    } else {
+                        self.unicode = Some((value, n + 1));
+                    }
+                } else {
+                    self.unicode = None;
+                    out.push(b' ');
+                }
+                continue;
+            }
+            if self.escaped {
+                self.escaped = false;
+                match b {
+                    b'u' => self.unicode = Some((0, 0)),
+                    b'n' | b'r' | b't' | b'b' | b'f' => out.push(b' '),
+                    b'"' | b'\\' | b'/' => out.push(b),
+                    _ => out.push(b' '),
+                }
+                continue;
+            }
+            if b == b'"' {
+                self.in_string = !self.in_string;
+                out.push(b' ');
+            } else if self.in_string && b == b'\\' {
+                self.escaped = true;
+            } else if self.in_string {
+                out.push(b);
+            }
+        }
+        out
     }
 }
 
@@ -416,6 +541,127 @@ mod tests {
             tool_name: None,
             role: Some("user".into()),
         }
+    }
+    #[test]
+    fn serialized_json_escapes_are_searchable_with_exact_raw_coordinates() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        let event = serde_json::json!({"tool":"browser","output":format!("{}prefix\nsuffixneedle\ttabneedle 繁體中文","padding ".repeat(1800))});
+        let bytes = serde_json::to_vec(&event).unwrap();
+        let escaped = br#"{"unicode":"\u7e41\u9ad4\u4e2d\u6587","surrogate":"\ud83d\ude00"}"#;
+        assert!(serde_json::from_slice::<serde_json::Value>(escaped).is_ok());
+        index
+            .index(
+                "escaped",
+                &metadata("a", MemoryScope::Transcripts, 0),
+                &segment.append(escaped).unwrap(),
+            )
+            .unwrap();
+        let raw = segment.append(&bytes).unwrap();
+        index
+            .index("json", &metadata("a", MemoryScope::Transcripts, 1), &raw)
+            .unwrap();
+        for term in ["suffixneedle", "tabneedle", "繁體中文"] {
+            let q = HistorySearchQuery {
+                query: Some(term.into()),
+                ..Default::default()
+            };
+            let hits = index.search(&["a".into()], MemoryScope::All, &q).unwrap();
+            assert_eq!(hits.len(), if term == "繁體中文" { 2 } else { 1 }, "{term}");
+            assert_eq!(
+                read_raw(&hits.iter().find(|h| h.id == "json").unwrap().raw).unwrap(),
+                bytes
+            );
+        }
+        let q = HistorySearchQuery {
+            query: Some("absentneedle".into()),
+            ..Default::default()
+        };
+        assert!(
+            index
+                .search(&["a".into()], MemoryScope::All, &q)
+                .unwrap()
+                .is_empty()
+        );
+        let mut state = JsonProjection::default();
+        let mut decoded = Vec::new();
+        for part in br#"{"x":"\u7e41\u9ad4\ud83d\ude00\nsuffix"}"#.chunks(3) {
+            decoded.extend(state.feed(part));
+        }
+        assert!(
+            String::from_utf8(decoded)
+                .unwrap()
+                .contains("繁體😀 suffix")
+        );
+    }
+    #[test]
+    fn latest_tail_explicit_order_tool_precedence_and_neighbor_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
+        let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
+        for (i, owner, tool, text) in [
+            (1, "a", None, "first"),
+            (2, "a", Some("browser"), "matchneedle"),
+            (3, "private", Some("browser"), "secret neighbor"),
+            (4, "a", Some("browser"), "last"),
+        ] {
+            let mut m = metadata(owner, MemoryScope::Transcripts, i);
+            m.tool_name = tool.map(str::to_owned);
+            index
+                .index(
+                    &i.to_string(),
+                    &m,
+                    &segment.append(text.as_bytes()).unwrap(),
+                )
+                .unwrap();
+        }
+        let visible = vec!["a".into()];
+        let mut q = HistorySearchQuery {
+            limit: 2,
+            ..Default::default()
+        };
+        let ids = |hits: Vec<IndexHit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        assert_eq!(
+            ids(index.search(&visible, MemoryScope::All, &q).unwrap()),
+            ["2", "4"]
+        );
+        q.sort = HistorySort::Newest;
+        assert_eq!(
+            ids(index.search(&visible, MemoryScope::All, &q).unwrap()),
+            ["4", "2"]
+        );
+        q.sort = HistorySort::Oldest;
+        assert_eq!(
+            ids(index.search(&visible, MemoryScope::All, &q).unwrap()),
+            ["1", "2"]
+        );
+        q.include_tools = false;
+        q.only_tools = true;
+        assert_eq!(
+            ids(index.search(&visible, MemoryScope::All, &q).unwrap()),
+            ["2", "4"]
+        );
+        q.only_tools = false;
+        q.tool_name = Some("browser".into());
+        assert_eq!(
+            ids(index.search(&visible, MemoryScope::All, &q).unwrap()),
+            ["2", "4"]
+        );
+        q.query = Some("matchneedle".into());
+        q.radius = 2;
+        q.limit = 1;
+        assert_eq!(
+            ids(index.search(&visible, MemoryScope::All, &q).unwrap()),
+            ["2", "4"]
+        );
+        q.agent = Some("private".into());
+        assert!(
+            index
+                .search(&visible, MemoryScope::All, &q)
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn full_window_coverage_exact_readback_restart_and_idempotence() {
