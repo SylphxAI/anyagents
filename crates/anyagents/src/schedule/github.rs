@@ -442,6 +442,13 @@ fn request(base: &str, path: &str, etag: Option<&str>, agent_id: &str) -> Result
     }
     // Keep authentication in gh's authorized credential adapter; never read a
     // token into arguments, retained output, or the watch cache. No GraphQL.
+    gh_command(path, etag, agent_id)
+        .output()
+        .map_err(|_| Error::Transport)
+        .and_then(|output| parse_response(&output.stdout))
+}
+
+fn gh_command(path: &str, etag: Option<&str>, agent_id: &str) -> std::process::Command {
     let mut command = std::process::Command::new("timeout");
     command.env("ANYAGENTS_AGENT_ID", agent_id).args([
         "15s",
@@ -454,13 +461,18 @@ fn request(base: &str, path: &str, etag: Option<&str>, agent_id: &str) -> Result
         "Accept: application/vnd.github+json",
         "-H",
         "X-GitHub-Api-Version: 2022-11-28",
+        // Own revalidation at this boundary, including cold starts. An outer
+        // gh cache may otherwise restore a body under 304 headers without our
+        // pagination metadata. Custom headers keep gh adapters in passthrough.
+        "-H",
+        "Cache-Control: no-cache",
     ]);
     if let Some(etag) = etag {
         command.args(["-H", &format!("If-None-Match: {etag}")]);
     }
-    let output = command.arg(path).output().map_err(|_| Error::Transport)?;
+    command.arg(path);
     // gh exits nonzero for 403/429; stdout still carries HTTP headers + body.
-    parse_response(&output.stdout)
+    command
 }
 
 fn parse_response(bytes: &[u8]) -> Result<Response, Error> {
@@ -876,6 +888,25 @@ mod tests {
             super::super::parse_rfc3339_ms("2026-11-07T03:00:00Z")
         );
         assert_eq!(retry_after("invalid", 0), None);
+    }
+
+    #[test]
+    fn gh_adapter_owns_cold_and_warm_conditional_requests() {
+        for etag in [None, Some("W/\"v1\"")] {
+            let command = gh_command("repos/o/r/pulls/42", etag, "agent");
+            let args: Vec<_> = command.get_args().map(|v| v.to_str().unwrap()).collect();
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair == ["-H", "Cache-Control: no-cache"])
+            );
+            assert!(args.windows(2).any(|pair| pair == ["--method", "GET"]));
+            assert!(args.contains(&"--include"));
+            assert_eq!(
+                args.iter().any(|arg| arg.starts_with("If-None-Match:")),
+                etag.is_some()
+            );
+            assert_eq!(args.last(), Some(&"repos/o/r/pulls/42"));
+        }
     }
 
     #[test]
