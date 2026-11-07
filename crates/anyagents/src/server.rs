@@ -31,6 +31,7 @@ use crate::api::{
 };
 use crate::auth::{self, Principal};
 use crate::create::{self, CreateRequest};
+use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
@@ -52,12 +53,21 @@ pub fn run(data: &Path) -> Result<(), Error> {
 pub fn run_with(
     data: &Path,
     runner: Arc<Mutex<dyn CommandRunner + Send>>,
+    stop: tokio::sync::oneshot::Receiver<()>,
+) -> Result<(), Error> {
+    run_with_identity(data, runner, stop, Arc::new(ServingIdentity::capture()))
+}
+
+fn run_with_identity(
+    data: &Path,
+    runner: Arc<Mutex<dyn CommandRunner + Send>>,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    identity: Arc<ServingIdentity>,
 ) -> Result<(), Error> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         tokio::select! {
-            result = serve(data, runner) => result,
+            result = serve(data, runner, identity) => result,
             _ = &mut stop => Ok(()),
         }
     })
@@ -69,6 +79,7 @@ pub(crate) struct AppState {
     pub(crate) health: HealthBoard,
     pub(crate) sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
     pub(crate) auth: auth::Mode,
+    pub(crate) identity: Arc<ServingIdentity>,
 }
 
 /// This process's capability key. Tests name one so a server and the fixture
@@ -108,7 +119,11 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
     Ok(file)
 }
 
-async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
+async fn serve(
+    data: &Path,
+    sign_in: Arc<Mutex<dyn CommandRunner + Send>>,
+    identity: Arc<ServingIdentity>,
+) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
     let key = capability_key()?;
@@ -172,6 +187,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
     prepare_socket(&path)?;
     let api_listener = tokio::net::UnixListener::bind(&path)?;
     set_socket_mode(&path)?;
+    identity.start_hash();
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&path);
     }
@@ -190,6 +206,7 @@ async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Re
         health: supervisor.board(),
         sign_in,
         auth,
+        identity,
     };
     let _ = boundary;
     let listener = api_listener;
@@ -1392,6 +1409,7 @@ fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
 }
 
 pub fn run_admin(data: &Path) -> Result<(), Error> {
+    let identity = Arc::new(ServingIdentity::capture());
     let _admin_lock = acquire_admin_lock(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
@@ -1406,6 +1424,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
         prepare_socket(&path)?;
         let listener = tokio::net::UnixListener::bind(&path)?;
         set_socket_mode(&path)?;
+        identity.start_hash();
         if auth.is_confined() {
             crate::sandbox::share_socket_with_seats(&path);
         }
@@ -1489,6 +1508,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             health,
             sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
             auth,
+            identity,
         };
         let app = Router::new()
             .route("/v1/agents", get(list_agents).post(create_agent_route))
@@ -1542,6 +1562,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             )
             .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
             .route("/v1/whoami", get(whoami))
+            .route("/v1/webhooks/healthz", get(admin_healthz))
             .with_state(state);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1634,8 +1655,21 @@ async fn mint_capability(
 
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
 /// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
-async fn webhook_healthz() -> Json<serde_json::Value> {
-    Json(serde_json::json!({ "ok": true }))
+async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.identity.status(false)),
+    )
+}
+
+/// Process-local details are available only on the admin Unix socket, never
+/// through the internet-reachable webhook listener or its primary API aliases.
+async fn admin_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(state.identity.status(true)),
+    )
+        .into_response()
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
@@ -6440,6 +6474,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().to_path_buf(),
             },
@@ -6529,6 +6564,7 @@ pub(crate) mod tests {
             store: Arc::clone(&store),
             health: HealthBoard::default(),
             sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
             auth: auth::Mode::Trusted {
                 data_dir: dir.path().into(),
             },
@@ -6543,6 +6579,138 @@ pub(crate) mod tests {
                 assert_eq!(store.agent_by_name(name).unwrap().scope(),scope);
             }
         });
+    }
+
+    #[test]
+    fn readiness_answers_while_the_once_only_image_hash_is_blocked() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+        let _env = env_lock();
+        let data = tempfile::tempdir().unwrap();
+        let token = data.path().join("operator-token");
+        std::fs::write(&token, "an-operator-token-0123456789abcdef\n").unwrap();
+        let settings = [
+            (
+                "ANYAGENTS_OPERATOR_TOKEN_FILE",
+                token.to_string_lossy().into_owned(),
+            ),
+            ("ANYAGENTS_AGENT_UID", unsafe { libc::getuid() }.to_string()),
+            ("ANYAGENTS_AGENT_GID", unsafe { libc::getgid() }.to_string()),
+            (
+                "ANYAGENTS_SOCKET_GID",
+                unsafe { libc::getgid() }.to_string(),
+            ),
+            ("ANYAGENTS_FAKE_MODE", "1".into()),
+        ];
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    // SAFETY: this fixture holds env_lock until its server stops.
+                    unsafe {
+                        if let Some(value) = value {
+                            std::env::set_var(key, value);
+                        } else {
+                            std::env::remove_var(key);
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            settings
+                .iter()
+                .map(|(key, _)| (*key, std::env::var_os(key)))
+                .collect(),
+        );
+        for (key, value) in settings {
+            // SAFETY: every server fixture uses env_lock.
+            unsafe {
+                std::env::set_var(key, value);
+            }
+        }
+        let image = data.path().join("image");
+        std::fs::write(&image, b"abc").unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, running) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&calls);
+        let identity = Arc::new(ServingIdentity::with_hasher(move || {
+            use sha2::{Digest, Sha256};
+            observed.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            blocked.recv().unwrap();
+            Ok(format!("{:x}", Sha256::digest(std::fs::read(image)?)))
+        }));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let path = data.path().to_path_buf();
+        let serving = Arc::clone(&identity);
+        let server = std::thread::spawn(move || {
+            run_with_identity(&path, Arc::new(Mutex::new(ProcessRunner)), stopped, serving)
+        });
+        struct Stop(
+            Option<tokio::sync::oneshot::Sender<()>>,
+            Option<std::thread::JoinHandle<Result<(), Error>>>,
+        );
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+                self.1.take().unwrap().join().unwrap().unwrap();
+            }
+        }
+        let _server = Stop(Some(stop), Some(server));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let socket = socket_path(data.path());
+        loop {
+            if std::os::unix::net::UnixStream::connect(&socket).is_ok() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "readiness waited for the image hash"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        running.recv_timeout(Duration::from_secs(5)).unwrap();
+        let health = || {
+            let mut stream = std::os::unix::net::UnixStream::connect(&socket).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            write!(
+                stream,
+                "GET /v1/webhooks/healthz HTTP/1.1\r\nHost: local\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            serde_json::from_str::<serde_json::Value>(response.split_once("\r\n\r\n").unwrap().1)
+                .unwrap()
+        };
+        let computing = health();
+        assert_eq!(computing["binary_sha256_state"], "computing");
+        assert!(computing["binary_sha256"].is_null());
+        assert_eq!(computing["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(computing["source_sha"], env!("ANYAGENTS_SOURCE_SHA"));
+        identity.start_hash();
+        identity.clone().start_hash();
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let ready = health();
+            if ready["binary_sha256_state"] == "ready" {
+                // SHA-256 of the exact bytes written to the fixture image.
+                assert_eq!(
+                    ready["binary_sha256"],
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline, "{ready}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 
     #[test]
