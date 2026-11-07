@@ -536,7 +536,7 @@ struct AgentsArgs {
     /// Optional starting Git ref/branch when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
-    /// Optional working directory or workspace mode when `action` is `"spawn"` or `"create"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default for sub-agents when `repo` is omitted: shares parent's `workdir`).
+    /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
     #[serde(default)]
     workdir: Option<String>,
     /// Concise public role/mission summary (`description`, Layer 1 — visible to all peers and group rosters) when `action` is `"spawn"`, `"create"`, or `"describe"`.
@@ -610,7 +610,7 @@ struct SpawnArgs {
     /// Optional starting Git ref/branch for the managed worktree when `repo` is provided (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
-    /// Optional working directory or workspace mode: an explicit path, `"worktree"` / `"branch"` (provisions an isolated Git worktree branched from the parent's repo at `<data>/agents/<id>/work`), `"private"` (clean isolated directory at `<data>/agents/<id>/work`), or `"inherit"` (default when `repo` is omitted: inherits the parent agent's `workdir`).
+    /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
     #[serde(default)]
     workdir: Option<String>,
     /// Optional concise public description (`description`, Layer 1) for the spawned agent.
@@ -703,7 +703,7 @@ struct SubagentsArgs {
     /// Optional starting Git ref/branch when `action = "spawn"` and `repo` is set (defaults to `origin/HEAD` or parent `HEAD`).
     #[serde(default)]
     base: Option<String>,
-    /// Optional working directory or workspace mode when `action = "spawn"`: an explicit path, `"worktree"` / `"branch"` (isolated Git worktree branched from parent's repo), `"private"` (clean isolated directory), or `"inherit"` (default when `repo` is omitted: shares parent's `workdir`).
+    /// Optional workspace path or mode: `"worktree"` / `"branch"` (isolated Git worktree from the parent repo), `"private"` (clean isolated `<data>/agents/<id>/work`), or `"inherit"` (explicit parent directory sharing). When both `repo` and `workdir` are omitted, a sub-agent gets its own private directory. Root creation may use the operator-configured working directory.
     #[serde(default)]
     workdir: Option<String>,
     /// Optional concise public description when `action = "spawn"`.
@@ -1694,7 +1694,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git worktree at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or default `\"inherit\"`); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
+        description = "Unified cross-harness sub-agent manager (`action`: `list` | `inspect` | `spawn` | `steer` | `wake` | `pause` | `archive` | `delete`, supporting multi-level sub-agent trees). Use `list` (default) to view your sub-agents and their live status (`running`, `paused`, `archived`, `turn_state`); use `inspect` with `agent` to view live status AND recent conversation turns; use `spawn` to launch a sub-agent on any harness (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`), model, profile, and workspace (`repo`: `\"<org>/<repo>\"` or `\"inherit\"` for an isolated Git worktree at `<data>/agents/<id>/work`; `workdir`: path, `\"worktree\"`, `\"private\"`, or `\"inherit\"` for explicit parent sharing; omitting both `repo` and `workdir` gives a private directory); use `steer` to send follow-up instructions; use `pause`, `archive` (auto-reaps clean/pushed managed worktrees while preserving dirty ones), `wake`, or `delete` to control its lifecycle."
     )]
     async fn subagents(
         &self,
