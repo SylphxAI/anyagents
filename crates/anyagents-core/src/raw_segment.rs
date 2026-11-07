@@ -8,6 +8,7 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
+    sync::Mutex,
 };
 
 const MAGIC_V1: &[u8; 8] = b"AARAW001";
@@ -35,6 +36,13 @@ enum SegmentFormat {
 pub struct RawSegment {
     path: PathBuf,
     format: SegmentFormat,
+    append_cursor: Mutex<Option<AppendCursor>>,
+    #[cfg(test)]
+    full_validations: std::sync::atomic::AtomicUsize,
+}
+struct AppendCursor {
+    stamp: crate::host_cursor::FileStamp,
+    next_seq: u64,
 }
 
 struct LockedFile(File);
@@ -66,11 +74,15 @@ impl RawSegment {
         let segment = Self {
             path: path.to_owned(),
             format,
+            append_cursor: Mutex::new(None),
+            #[cfg(test)]
+            full_validations: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut file = segment.lock()?;
         // Validate the acknowledged prefix, recover complete synced events,
         // and quarantine/read back an uncertain suffix before any truncation.
-        segment.recover(&mut file.0)?;
+        let records = segment.recover(&mut file.0)?;
+        segment.cache_append_cursor(&file.0, records.last().map_or(1, |r| r.seq + 1))?;
         Ok(segment)
     }
 
@@ -84,13 +96,20 @@ impl RawSegment {
         let segment = Self {
             path: path.to_owned(),
             format: SegmentFormat::Jsonl,
+            append_cursor: Mutex::new(None),
+            #[cfg(test)]
+            full_validations: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut file = segment.lock()?;
-        scan(&mut file.0, &segment.path, segment.format, false)?;
+        let records = scan(&mut file.0, &segment.path, segment.format, false)?;
+        segment.cache_append_cursor(&file.0, records.last().map_or(1, |r| r.seq + 1))?;
         Ok(segment)
     }
 
     fn recover(&self, file: &mut File) -> io::Result<Vec<RawCoordinate>> {
+        #[cfg(test)]
+        self.full_validations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.format == SegmentFormat::Jsonl {
             return scan_jsonl(file, &self.path, false);
         }
@@ -140,21 +159,62 @@ impl RawSegment {
         Ok(LockedFile(file))
     }
 
+    fn cache_append_cursor(&self, file: &File, next_seq: u64) -> io::Result<()> {
+        *self
+            .append_cursor
+            .lock()
+            .map_err(|_| io::Error::other("raw append cursor poisoned"))? = Some(AppendCursor {
+            stamp: crate::host_cursor::FileStamp::read(file)?,
+            next_seq,
+        });
+        Ok(())
+    }
     pub fn append(&self, payload: &[u8]) -> io::Result<RawCoordinate> {
         let mut file = self.lock()?;
-        match self.format {
-            SegmentFormat::Jsonl => append_jsonl(&mut file.0, &self.path, payload),
+        let stamp = crate::host_cursor::FileStamp::read(&file.0)?;
+        let cached = self
+            .append_cursor
+            .lock()
+            .map_err(|_| io::Error::other("raw append cursor poisoned"))?
+            .take();
+        // A frontier is authenticated on every framed append, even on a genuine
+        // eligible cache hit. A corrupt acknowledgement never enters recovery.
+        let frontier = if self.format == SegmentFormat::Jsonl {
+            stamp.len
+        } else {
+            read_frontier(&self.path, stamp.len)?
+        };
+        let next_seq = if let Some(cursor) = cached
+            && cursor.stamp == stamp
+            && frontier == stamp.len
+        {
+            cursor.next_seq
+        } else {
+            self.recover(&mut file.0)?.last().map_or(1, |r| r.seq + 1)
+        };
+        let coordinate = match self.format {
+            SegmentFormat::Jsonl => append_jsonl(&mut file.0, &self.path, payload, next_seq)?,
             SegmentFormat::FramedV1 | SegmentFormat::FramedV2 => {
-                self.recover(&mut file.0)?;
-                let coordinate = append_framed(&mut file.0, &self.path, self.format, payload)?;
+                let coordinate =
+                    append_framed(&mut file.0, &self.path, self.format, payload, next_seq)?;
                 write_frontier(&self.path, file.0.metadata()?.len())?;
-                Ok(coordinate)
+                coordinate
             }
-        }
+        };
+        self.cache_append_cursor(&file.0, coordinate.seq + 1)?;
+        Ok(coordinate)
     }
 
     pub fn records(&self) -> io::Result<Vec<RawCoordinate>> {
-        self.recover(&mut self.lock()?.0)
+        let mut file = self.lock()?;
+        // Explicit enumeration validates all acknowledged history, not a cache.
+        *self
+            .append_cursor
+            .lock()
+            .map_err(|_| io::Error::other("raw append cursor poisoned"))? = None;
+        let records = self.recover(&mut file.0)?;
+        self.cache_append_cursor(&file.0, records.last().map_or(1, |r| r.seq + 1))?;
+        Ok(records)
     }
 }
 
@@ -325,12 +385,8 @@ fn append_framed(
     path: &Path,
     format: SegmentFormat,
     payload: &[u8],
+    seq: u64,
 ) -> io::Result<RawCoordinate> {
-    // Scan with recovery enabled before calculating the next sequence. For v2,
-    // only a checksum-valid torn payload can be truncated; metadata corruption is an
-    // error and leaves the acknowledged prefix untouched.
-    let records = scan(file, path, format, true)?;
-    let seq = records.last().map_or(1, |r| r.seq + 1);
     let start = file.seek(SeekFrom::End(0))?;
     let hash = Sha256::digest(payload);
     let mut header = [0u8; HEADER_V2 as usize];
@@ -365,8 +421,12 @@ fn append_framed(
     })
 }
 
-fn append_jsonl(file: &mut File, path: &Path, payload: &[u8]) -> io::Result<RawCoordinate> {
-    let records = scan_jsonl(file, path, false)?;
+fn append_jsonl(
+    file: &mut File,
+    path: &Path,
+    payload: &[u8],
+    seq: u64,
+) -> io::Result<RawCoordinate> {
     // A handoff may append only after the native writer has committed a whole
     // line. Never turn an unacknowledged partial line into a different event.
     let end = file.seek(SeekFrom::End(0))?;
@@ -401,7 +461,7 @@ fn append_jsonl(file: &mut File, path: &Path, payload: &[u8]) -> io::Result<RawC
         offset: start,
         length: line.len() as u64,
         sha256: format!("{hash:x}"),
-        seq: records.last().map_or(1, |r| r.seq + 1),
+        seq,
     })
 }
 
@@ -576,6 +636,43 @@ mod tests {
     }
 
     #[test]
+    fn append_cursor_skips_unchanged_history_but_revalidates_other_writers_and_ack() {
+        use std::sync::atomic::Ordering;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw");
+        let segment = RawSegment::open(&path).unwrap();
+        assert_eq!(segment.full_validations.load(Ordering::Relaxed), 1);
+        for seq in 1..=20 {
+            assert_eq!(segment.append(b"stable").unwrap().seq, seq);
+        }
+        assert_eq!(segment.full_validations.load(Ordering::Relaxed), 1);
+        let other = RawSegment::open(&path).unwrap();
+        assert_eq!(other.append(b"other writer").unwrap().seq, 21);
+        assert_eq!(segment.append(b"after other").unwrap().seq, 22);
+        assert_eq!(segment.full_validations.load(Ordering::Relaxed), 2);
+        let before = fs::read(&path).unwrap();
+        // This is a genuine eligible runtime cache hit; corrupt only the ack.
+        fs::write(frontier_path(&path), b"corrupt acknowledgement").unwrap();
+        assert!(
+            segment
+                .append(b"must not append")
+                .unwrap_err()
+                .to_string()
+                .contains("frontier integrity mismatch")
+        );
+        assert_eq!(fs::read(&path).unwrap(), before);
+        write_frontier(&path, before.len() as u64).unwrap();
+        assert_eq!(segment.append(b"after ack repair").unwrap().seq, 23);
+        // Rewriting acknowledged bytes invalidates metadata even at same size.
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start(HEADER_V2)).unwrap();
+        file.write_all(b"broken").unwrap();
+        let damaged = fs::read(&path).unwrap();
+        assert!(segment.append(b"must preserve corruption").is_err());
+        assert_eq!(fs::read(&path).unwrap(), damaged);
+    }
+
+    #[test]
     fn append_restart_and_exact_range_read() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("segments/first.raw");
@@ -720,6 +817,7 @@ mod tests {
             &path,
             SegmentFormat::FramedV2,
             b"only captured tool result",
+            first.seq + 1,
         )
         .unwrap();
         let before = fs::read(&path).unwrap();
