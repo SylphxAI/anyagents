@@ -96,15 +96,25 @@ impl OpenCodeHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
-        Self::start_with(program, session_id, environment, work_dir, None)
+        Self::start_with(
+            program,
+            session_id,
+            environment,
+            work_dir,
+            None,
+            port::PortLease::acquire,
+        )
     }
 
+    // Keep reservation injection private: tests can transfer an already-owned
+    // socket through the real child startup path without a public test setting.
     fn start_with(
         program: impl Into<PathBuf>,
         session_id: Option<&str>,
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
         config_dir: Option<&Path>,
+        acquire: impl FnMut(Option<&Path>, Option<u16>) -> Result<port::PortLease, HarnessError>,
     ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             program: program.into(),
@@ -135,7 +145,7 @@ impl OpenCodeHarness {
             }
         }
         harness.lock().session = session_id.map(str::to_string);
-        harness.begin()?;
+        harness.begin(acquire)?;
         Ok(harness)
     }
 
@@ -147,7 +157,14 @@ impl OpenCodeHarness {
         work_dir: Option<&Path>,
         config_dir: &Path,
     ) -> Result<Self, HarnessError> {
-        Self::start_with(program, session_id, environment, work_dir, Some(config_dir))
+        Self::start_with(
+            program,
+            session_id,
+            environment,
+            work_dir,
+            Some(config_dir),
+            port::PortLease::acquire,
+        )
     }
 
     /// Also watch `queue` for lines a channel pushed between model steps.
@@ -192,15 +209,15 @@ impl OpenCodeHarness {
     }
 
     /// Start the service, wait until it answers, and resume the session.
-    fn begin(&mut self) -> Result<(), HarnessError> {
+    fn begin(
+        &mut self,
+        mut acquire: impl FnMut(Option<&Path>, Option<u16>) -> Result<port::PortLease, HarnessError>,
+    ) -> Result<(), HarnessError> {
         // Keep a stable private port across restarts; never use the managed
         // service default or allow `api` to discover a different service.
         for attempt in 0..3 {
             let previous = self.port.take().map(|lease| lease.port);
-            self.port = Some(port::PortLease::acquire(
-                self.config_dir.as_deref(),
-                previous,
-            )?);
+            self.port = Some(acquire(self.config_dir.as_deref(), previous)?);
             let port = self.port.as_ref().expect("allocated port").port;
             let (announced, collision) = self.launch_service(port)?;
             if announced {
@@ -870,3 +887,6 @@ fn text_of(message: &Value) -> String {
     }
     text.trim().to_string()
 }
+
+#[cfg(test)]
+mod collision_tests;

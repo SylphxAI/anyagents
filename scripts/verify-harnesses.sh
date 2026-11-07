@@ -9,6 +9,10 @@ for adapter in claude codex opencode agy muse omp; do
     cargo test --locked -p "anyagents-harness-$adapter" --test protocol
 done
 
+echo '== OpenCode owned-reservation collision and allocation boundaries =='
+# The protocol target above builds fake_opencode before these internal seams run.
+cargo test --locked -p anyagents-harness-opencode --lib
+
 echo '== Shared stream/RPC implementation (including dsh and grok) =='
 cargo test --locked -p anyagents-harness-stream
 
