@@ -25,6 +25,8 @@ pub enum Error {
     },
     #[error("agent is already running")]
     AgentBusy,
+    #[error("group `{group}`: {reason}")]
+    GroupForbidden { group: String, reason: &'static str },
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
     #[error("{0}")]
