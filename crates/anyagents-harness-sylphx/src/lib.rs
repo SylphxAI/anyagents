@@ -4037,7 +4037,48 @@ fn build_tool_definitions() -> Vec<Value> {
     ]
 }
 
+/// The sole tool-result ingress: every execution route yields complete text here.
+/// Mask before any size projection, then expose only this value to local/cloud
+/// consumers. Producers must not truncate text before returning to this boundary.
 fn execute_sylphx_tool(
+    name: &str,
+    args: &Value,
+    config_dir: &Path,
+    work_dir: &Path,
+    env: &[(String, String)],
+    mcp_command: &Path,
+    mcp_args: &[String],
+) -> String {
+    let raw = execute_sylphx_tool_raw(name, args, config_dir, work_dir, env, mcp_command, mcp_args);
+    let masked = anyagents_core::masking::mask_known_secrets(&raw).into_owned();
+    let normalized = name.strip_prefix("mcp__anyagents__").unwrap_or(name);
+    // Preserve the existing producer-specific observation bounds. Binary image
+    // attachments and native recall retain their own structured representations.
+    let limits = match normalized {
+        "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
+        | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" => {
+            Some((24_000, 11_000, 11_000))
+        }
+        "bash" | "shell" | "code_mode" | "grep" | "glob" => Some((30_000, 14_000, 14_000)),
+        "list_dir" if workspace::delegated(env) => Some((30_000, 14_000, 14_000)),
+        "read_file"
+            if args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(image_mime_for_path)
+                .is_none() =>
+        {
+            Some((64_000, 30_000, 30_000))
+        }
+        _ => None,
+    };
+    match limits {
+        Some((max, head, tail)) => truncate_tool_output_middle_utf8(masked, max, head, tail),
+        None => masked,
+    }
+}
+
+fn execute_sylphx_tool_raw(
     name: &str,
     args: &Value,
     config_dir: &Path,
@@ -4318,7 +4359,7 @@ fn execute_sylphx_tool(
             let script = format!(
                 "rg -n --max-count 100{glob_arg} -- '{escaped_pat}' '{escaped_path}' | head -n 200"
             );
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4336,7 +4377,7 @@ fn execute_sylphx_tool(
             let escaped_pat = pat.replace('\'', "'\\''");
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("rg --files -g '{escaped_pat}' '{escaped_path}' | head -n 200");
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4353,7 +4394,7 @@ fn execute_sylphx_tool(
             }
             let escaped_path = path.replace('\'', "'\\''");
             let script = format!("ls -la '{escaped_path}' | head -n 200");
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": script }),
                 config_dir,
@@ -4372,7 +4413,7 @@ fn execute_sylphx_tool(
                 .and_then(Value::as_u64)
                 .unwrap_or(120_000);
             let wrapped = build_code_mode_command(code_str, config_dir, mcp_command, mcp_args);
-            execute_sylphx_tool(
+            execute_sylphx_tool_raw(
                 "bash",
                 &json!({ "command": wrapped, "timeout_ms": timeout_ms }),
                 config_dir,
@@ -4641,7 +4682,7 @@ fn call_anyagents_mcp_tool(
                     .and_then(Value::as_str)
                     .map(str::to_string)
                     .unwrap_or_else(|| value.to_string());
-                return truncate_tool_output_middle_utf8(output, 24_000, 11_000, 11_000);
+                return output;
             }
             Err(err) => {
                 last_err = err;

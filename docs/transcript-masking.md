@@ -1,11 +1,18 @@
 # Tool-output masking
 
-Native Sylphx transcript appends and tool-history indexing share the deterministic
-`anyagents_core::masking` boundary. It replaces recognized credential values with
-`[redacted]` before serialization or indexing. The append operation also returns
-the masked record, so sequential and parallel tool results enter active context
-in the same form that is stored. Nested native-turn snapshots pass through the
-same append boundary. Existing records are not rewritten by this change.
+Native Sylphx tool dispatch and tool-history indexing share the deterministic
+`anyagents_core::masking` implementation. The common dispatch boundary masks each
+complete tool result before applying its observation size limit. Bash, file-read
+and MCP producers return complete text to that boundary, so middle truncation
+cannot separate a recognized credential's label from its value. Both native
+sequential/parallel model requests and Cloud Agent `:submitToolResult` submissions
+consume only the masked dispatch result.
+
+Transcript appends and tool-history indexing also sanitize their inputs before
+serialization or indexing. Appends return the masked record for active context;
+nested native-turn snapshots use the same append boundary. These persistence
+checks remain a defense for records produced outside tool dispatch. Existing
+records are not rewritten by this change.
 
 The masker recognizes explicit `password`, `passwd`, `api_key`, `apikey`,
 `access_token`, `refresh_token`, `client_secret` and `authorization` assignments,
@@ -26,7 +33,8 @@ for masking diagnostics.
 Regression tests exercise the actual transcript file, nested snapshots, returned
 active-context records, persisted tool-history text and search, with Unicode,
 quoted values, credential references and byte-identical non-secret controls.
-A loopback Responses API fixture also runs real file-read tools through both the
-sequential and parallel native tool paths, then verifies the next HTTP request
-and persisted transcript contain only masked results with intact call ids and
-actionable diagnostics. No external model or provider is called by that fixture.
+Loopback Responses API and Cloud Agent fixtures verify actual next-request and
+`:submitToolResult` payloads, persisted transcripts, intact call ids and actionable
+diagnostics. Large bash, file-read and MCP results include a credential straddling
+the old middle-truncation boundary. No external model or provider is called by
+these fixtures.
