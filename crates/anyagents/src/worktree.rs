@@ -110,12 +110,19 @@ impl Consumer {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(), Error> {
+        crate::worktree_access::validate_git_config(source)?;
         let refuse = |message: String| Error::WorktreeSourceUnpublished {
             source_repo: source.display().to_string(),
             message,
         };
         let git = |args: &[&str]| -> Result<String, Error> {
             let out = Command::new("git")
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
                 .arg("-C")
                 .arg(source)
                 .args(args)
@@ -155,6 +162,12 @@ impl Consumer {
                     }
                     let reachable = tip == commit
                         || Command::new("git")
+                            .args([
+                                "-c",
+                                "core.fsmonitor=false",
+                                "-c",
+                                "core.hooksPath=/dev/null",
+                            ])
                             .arg("-C")
                             .arg(source)
                             .args(["merge-base", "--is-ancestor", commit, tip])

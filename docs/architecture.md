@@ -217,8 +217,9 @@ becomes running, its execution seat must be able to write and traverse its
 working tree, the per-worktree Git directory and the common objects/refs
 storage, and create lock files. New worktrees are shared with that seat's group.
 On Linux, additive POSIX ACLs grant writes only to shared `objects/`, `refs/`,
-`logs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
-The common root and `worktrees/` are traversal-only with no default ACLs; defaults
+`logs/refs/`, an existing `packed-refs`, and the child's private `worktrees/<name>/`.
+The common root, `worktrees/` and `logs/` are traversal-only with no default ACLs;
+the main worktree's `logs/HEAD` stays child-unwritable. Defaults
 exist only inside the shared content subtrees and the private gitdir, preserving
 both seats on future writes without admitting a child to sibling metadata.
 Common `config`, `hooks/` and `info/` are not child-writable. A parent-owned sticky
@@ -227,7 +228,16 @@ private gitdir protects `config.worktree` (and its unlink/rename), `commondir` a
 Shared refs remain a same-repository integrity boundary: a child can move another
 branch ref. This is not hostile-repository isolation, and AnyAgents does not
 intercept arbitrary harness commit/push commands or provide a branch-tip guard.
-A server-owned grant journal is written before sharing. Archive, reap and failed
+AnyAgents production code never runs `git commit` or `git push`; the supported
+source-publication path uses desk-git-hub and desk-publish. Its Git metadata reads, skill sync and cleanup
+commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
+and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
+Shared common and worktree configs refuse `include`/`includeIf` rather than
+following a potentially child-controlled configuration graph.
+A server-owned grant journal is file- and directory-synced before sharing. Its
+serialized transitions preserve bindings needed by another active agent on the
+same OS seat; retiring one agent revokes its private metadata without removing
+the surviving agent's shared-store access. Archive, reap and failed
 admission revoke the seat's named group/user ACL entries and defaults through
 opened descriptors, read the result back, and retain the journal on failure.
 Revocation runs even when dirty or external checkout bytes must be retained.

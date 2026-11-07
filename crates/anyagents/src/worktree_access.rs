@@ -39,6 +39,73 @@ fn git_dirs(path: &Path) -> Result<Vec<PathBuf>, Error> {
     Ok(dirs)
 }
 
+/// Includes can redirect otherwise protected configuration to child-writable
+/// files. Reject the graph at admission and before local-source Git reads.
+pub(crate) fn validate_git_config(path: &Path) -> Result<(), Error> {
+    let dirs = git_dirs(path)?;
+    if let Some(common) = dirs.last() {
+        validate_config_files(&dirs[0], common)?;
+    }
+    Ok(())
+}
+
+fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::OpenOptionsExt;
+    for path in [
+        common.join("config"),
+        common.join("config.worktree"),
+        private.join("config.worktree"),
+    ] {
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(refusal(&path, e)),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(refusal(&path, "Git configuration is not a regular file"));
+        }
+        // --file - and --no-includes inspect only the opened input. Never
+        // follow the include or print config values in a diagnostic.
+        let out = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+                "config",
+                "--no-includes",
+                "--file",
+                "-",
+                "--name-only",
+                "--get-regexp",
+                "^(include\\.path|includeif\\..*\\.path)$",
+            ])
+            .stdin(file)
+            .output()
+            .map_err(|e| refusal(&path, e))?;
+        match out.status.code() {
+            Some(1) => {}
+            Some(0) => {
+                return Err(refusal(
+                    &path,
+                    "Git include/includeIf is unsupported for shared worktrees",
+                ));
+            }
+            _ => {
+                return Err(refusal(
+                    &path,
+                    "cannot validate Git configuration without includes",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The journal lives under the server-owned data directory, outside the seat's
 /// config/worktree. Persist it before granting anything so partial admission can
 /// always revoke, even if the checkout or its .git pointer later disappears.
@@ -58,6 +125,7 @@ pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
 
 pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
     let journal = grant_path(data, id);
+    let _lock = lock_journals(&journal).map_err(|e| refusal(&journal, e))?;
     let bytes = match std::fs::read(&journal) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -67,7 +135,9 @@ pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Resu
     if !grant.active {
         return Ok(());
     }
-    revoke_common(&grant.common, grant.uid, grant.gid).map_err(|e| refusal(&grant.common, e))?;
+    let retained = other_active_grants(&journal, &grant).map_err(|e| refusal(&journal, e))?;
+    revoke_common(&grant.common, grant.uid, grant.gid, &retained)
+        .map_err(|e| refusal(&grant.common, e))?;
     grant.active = false;
     write_grant(&journal, &grant).map_err(|e| refusal(&journal, e))
 }
@@ -84,12 +154,75 @@ fn write_grant(journal: &Path, grant: &Grant) -> std::io::Result<()> {
         .open(&temporary)?;
     file.write_all(&serde_json::to_vec(grant)?)?;
     file.sync_all()?;
-    std::fs::rename(temporary, journal)
+    std::fs::rename(temporary, journal)?;
+    std::fs::File::open(journal.parent().unwrap())?.sync_all()
 }
 
-fn revoke_common(common: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    walk_tree(common, false, &|_| {}, &|file, _| {
-        update_metadata_acl(file, gid, None, false, Some(uid))
+fn lock_journals(journal: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+    let directory = journal.parent().unwrap();
+    std::fs::create_dir_all(directory)?;
+    std::fs::File::open(directory.parent().unwrap())?.sync_all()?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(directory.join(".lock"))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(lock) // closing the descriptor releases the lock, including on refusal
+}
+
+fn other_active_grants(journal: &Path, grant: &Grant) -> std::io::Result<Vec<Grant>> {
+    let mut retained = Vec::new();
+    for entry in std::fs::read_dir(journal.parent().unwrap())? {
+        let path = entry?.path();
+        if path == journal || path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let other: Grant = serde_json::from_slice(&std::fs::read(path)?)?;
+        if other.active && other.common == grant.common {
+            retained.push(other);
+        }
+    }
+    Ok(retained)
+}
+
+fn retained_path(common: &Path, path: &Path, grant: &Grant) -> bool {
+    path == common
+        || path == common.join("worktrees")
+        || path == common.join("logs")
+        || path == common.join("config")
+        || path == common.join("HEAD")
+        || ["objects", "refs", "logs/refs", "packed-refs"]
+            .iter()
+            .any(|name| path.starts_with(common.join(name)))
+        || path.starts_with(&grant.private)
+}
+
+fn revoke_common(common: &Path, uid: u32, gid: u32, retained: &[Grant]) -> std::io::Result<()> {
+    walk_tree(common, false, &|_| {}, &|file, path| {
+        // Group and named-user bindings have independent lifetimes. Preserve
+        // either only where another active journal still needs that binding.
+        let keep_group = retained
+            .iter()
+            .any(|g| g.gid == gid && retained_path(common, path, g));
+        let keep_user = retained
+            .iter()
+            .any(|g| g.uid == uid && retained_path(common, path, g));
+        if keep_group && keep_user {
+            return Ok(());
+        }
+        if keep_group {
+            // The reserved ID cannot be a POSIX named group. This removes only
+            // the expired named-user binding when a different UID shares a GID.
+            return update_metadata_acl(file, u32::MAX, None, false, (!keep_user).then_some(uid));
+        }
+        update_metadata_acl(file, gid, None, false, (!keep_user).then_some(uid))
     })
 }
 
@@ -128,6 +261,7 @@ pub(crate) fn share(path: &Path, uid: u32, gid: u32, journal: &Path) -> Result<(
 /// the server's recorded metadata paths, never a child-editable .git pointer.
 pub(crate) fn restore_recorded(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
     let journal = grant_path(data, id);
+    let _lock = lock_journals(&journal).map_err(|e| refusal(&journal, e))?;
     let bytes = match std::fs::read(&journal) {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -137,7 +271,7 @@ pub(crate) fn restore_recorded(data: &Path, id: &anyagents_core::AgentId) -> Res
     if grant.active || !grant.checkout.join(".git").exists() {
         return Ok(());
     }
-    share_known(
+    share_known_locked(
         &grant.checkout,
         &grant.private,
         &grant.common,
@@ -155,21 +289,39 @@ fn share_known(
     gid: u32,
     journal: &Path,
 ) -> Result<(), Error> {
-    write_grant(
-        journal,
-        &Grant {
-            common: common.to_path_buf(),
-            gid,
-            uid,
-            private: private.to_path_buf(),
-            checkout: path.to_path_buf(),
-            active: true,
-        },
-    )
-    .map_err(|e| refusal(journal, e))?;
+    let _lock = lock_journals(journal).map_err(|e| refusal(journal, e))?;
+    share_known_locked(path, private, common, uid, gid, journal)
+}
+
+fn share_known_locked(
+    path: &Path,
+    private: &Path,
+    common: &Path,
+    uid: u32,
+    gid: u32,
+    journal: &Path,
+) -> Result<(), Error> {
+    validate_config_files(private, common)?;
+    let grant = Grant {
+        common: common.to_path_buf(),
+        gid,
+        uid,
+        private: private.to_path_buf(),
+        checkout: path.to_path_buf(),
+        active: true,
+    };
+    let retained = other_active_grants(journal, &grant).map_err(|e| refusal(journal, e))?;
+    write_grant(journal, &grant).map_err(|e| refusal(journal, e))?;
     // Clear any legacy broad grants/defaults for this seat before the allowlist.
-    revoke_common(common, uid, gid).map_err(|e| refusal(common, e))?;
-    for root in [common.to_path_buf(), common.join("worktrees")] {
+    revoke_common(common, uid, gid, &retained).map_err(|e| refusal(common, e))?;
+    for root in [
+        common.to_path_buf(),
+        common.join("worktrees"),
+        common.join("logs"),
+    ]
+    .into_iter()
+    .filter(|root| root.exists())
+    {
         with_directory(&root, &|file| {
             restrict_others(file)?;
             clear_default_acl(file)?;
@@ -177,7 +329,9 @@ fn share_known(
         })
         .map_err(|e| refusal(&root, e))?;
     }
-    for name in ["objects", "refs", "logs", "packed-refs"] {
+    // The main worktree's logs/HEAD is the publisher's independent baseline,
+    // not shared content. Only branch/tag reflogs belong in the write set.
+    for name in ["objects", "refs", "logs/refs", "packed-refs"] {
         let root = common.join(name);
         if root.exists() {
             walk_tree(&root, false, &|_| {}, &|file, _| {
@@ -250,7 +404,7 @@ fn restrict_others(file: &std::fs::File) -> std::io::Result<()> {
         ));
     }
     let mode = meta.mode() & 0o7777 & !0o007;
-    if unsafe { libc::fchmod(file.as_raw_fd(), mode) } != 0 {
+    if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     if file.metadata()?.mode() & 7 != 0 {
@@ -302,7 +456,8 @@ fn protect_private_gitdir(private: &Path, uid: u32, gid: u32) -> std::io::Result
                     "private gitdir must remain parent-owned",
                 ));
             }
-            if unsafe { libc::fchmod(file.as_raw_fd(), (meta.mode() & 0o7777) | 0o1000) } != 0 {
+            let sticky_mode = ((meta.mode() & 0o7777) | 0o1000) as libc::mode_t;
+            if unsafe { libc::fchmod(file.as_raw_fd(), sticky_mode) } != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             if file.metadata()?.mode() & 0o1000 == 0 {
@@ -1026,7 +1181,11 @@ mod tests {
         let id = anyagents_core::AgentId::generate();
         let journal = grant_path(dir.path(), &id);
         share_known(&target, private, common, uid, gid, &journal).unwrap();
-        for root in [common.clone(), common.join("worktrees")] {
+        for root in [
+            common.clone(),
+            common.join("worktrees"),
+            common.join("logs"),
+        ] {
             assert!(acl(&root, c"system.posix_acl_default").is_empty());
             assert!(acl(&root, c"system.posix_acl_access").contains(&(8, 1, gid)));
         }
@@ -1046,6 +1205,12 @@ mod tests {
                 .iter()
                 .any(|e| e.0 == 8 && e.2 == gid)
         );
+        assert!(
+            !acl(&common.join("logs/HEAD"), c"system.posix_acl_access")
+                .iter()
+                .any(|e| e.0 == 8 && e.2 == gid)
+        );
+        assert!(acl(&common.join("logs/refs"), c"system.posix_acl_access").contains(&(8, 7, gid)));
         let sibling = dir.path().join("sibling");
         f.consumer
             .remote("SylphxAI/demo", &sibling, "sibling", None)
@@ -1080,6 +1245,107 @@ mod tests {
         restore_recorded(dir.path(), &id).unwrap();
         assert!(acl(private, c"system.posix_acl_access").contains(&(8, 7, gid)));
         revoke_recorded(dir.path(), &id).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn same_seat_journals_preserve_survivor_and_revoke_last_binding() {
+        use std::os::fd::AsRawFd;
+        let group_permission = |path: &Path, gid: u32| {
+            let file = std::fs::File::open(path).unwrap();
+            let mut bytes = [0u8; 65536];
+            let len = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    c"system.posix_acl_access".as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if len < 0 {
+                return None;
+            }
+            bytes[4..len as usize]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .find_map(|b| {
+                    (u16::from_le_bytes(b[..2].try_into().unwrap()) == 8
+                        && u32::from_le_bytes(b[4..].try_into().unwrap()) == gid)
+                        .then(|| u16::from_le_bytes(b[2..4].try_into().unwrap()))
+                })
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let uid = crate::sandbox::server_uid();
+        let gid = crate::sandbox::server_gid().wrapping_add(100000);
+        let mut records = Vec::new();
+        for name in ["b1", "b2"] {
+            let target = dir.path().join(name);
+            f.consumer
+                .remote("SylphxAI/demo", &target, name, None)
+                .unwrap();
+            let dirs = git_dirs(&target).unwrap();
+            let id = anyagents_core::AgentId::generate();
+            share_known(
+                &target,
+                &dirs[0],
+                dirs.last().unwrap(),
+                uid,
+                gid,
+                &grant_path(dir.path(), &id),
+            )
+            .unwrap();
+            records.push((id, dirs));
+        }
+        let (b1, first) = &records[0];
+        let (b2, second) = &records[1];
+        let objects = first.last().unwrap().join("objects");
+        assert_eq!(group_permission(&first[0], gid), Some(7));
+        assert_eq!(group_permission(&second[0], gid), Some(7));
+        let config = first.last().unwrap().join("config");
+        assert_eq!(group_permission(&config, gid), Some(4));
+        revoke_recorded(dir.path(), b1).unwrap();
+        assert_eq!(group_permission(&first[0], gid), None);
+        assert_eq!(group_permission(&second[0], gid), Some(7));
+        assert_eq!(group_permission(&objects, gid), Some(7));
+        assert_eq!(group_permission(&config, gid), Some(4));
+        revoke_recorded(dir.path(), b2).unwrap();
+        assert_eq!(group_permission(&second[0], gid), None);
+        assert_eq!(group_permission(&objects, gid), None);
+        assert_eq!(group_permission(&config, gid), None);
+    }
+
+    #[test]
+    fn shared_config_refuses_includes_without_following_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("SylphxAI/demo", &target, "child", None)
+            .unwrap();
+        let dirs = git_dirs(&target).unwrap();
+        let common = dirs.last().unwrap();
+        let config = common.join("config");
+        let original = std::fs::read(&config).unwrap();
+        validate_git_config(&target).unwrap();
+        for header in ["include", "includeIf \"gitdir:**\""] {
+            let mut bytes = original.clone();
+            bytes.extend_from_slice(
+                format!("\n[{header}]\npath = /nonexistent/child-controlled\n").as_bytes(),
+            );
+            std::fs::write(&config, bytes).unwrap();
+            let err = validate_git_config(&target).unwrap_err();
+            assert!(err.to_string().contains("include/includeIf"), "{err}");
+        }
+        std::fs::write(&config, original).unwrap();
+        std::fs::write(
+            dirs[0].join("config.worktree"),
+            "[include]\npath = /nonexistent/child-controlled\n",
+        )
+        .unwrap();
+        let err = validate_git_config(&target).unwrap_err();
+        assert!(err.to_string().contains("include/includeIf"), "{err}");
     }
 
     #[test]

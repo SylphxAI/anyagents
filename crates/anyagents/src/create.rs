@@ -381,11 +381,23 @@ fn provision_managed_worktree(
     }
 
     let _ = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .arg("-C")
         .arg(target_wt)
         .args(["config", "--local", "user.name", "Kyle Tse"])
         .status();
     let _ = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .arg("-C")
         .arg(target_wt)
         .args(["config", "--local", "user.email", "hi@kylet.se"])
@@ -397,6 +409,12 @@ fn provision_managed_worktree(
 
 fn is_git_repo_dir(path: &Path) -> bool {
     std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .arg("-C")
         .arg(path)
         .args(["rev-parse", "--git-dir"])
@@ -439,6 +457,12 @@ fn provision_cloud_sandbox_worktree_marker(
             .filter(|p| p.is_dir())
         {
             if let Ok(out) = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
                 .arg("-C")
                 .arg(&parent_wd)
                 .args(["config", "--get", "remote.origin.url"])
@@ -452,6 +476,12 @@ fn provision_cloud_sandbox_worktree_marker(
             }
             if initial_head.is_empty()
                 && let Ok(out) = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                    ])
                     .arg("-C")
                     .arg(&parent_wd)
                     .args(["rev-parse", "HEAD"])
@@ -502,6 +532,12 @@ fn provision_cloud_sandbox_worktree_marker(
     } else if Path::new(&resolved_repo).is_dir() {
         let local_repo = Path::new(&resolved_repo);
         if let Ok(out) = std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
             .arg("-C")
             .arg(local_repo)
             .args(["config", "--get", "remote.origin.url"])
@@ -540,6 +576,12 @@ fn record_managed_worktree_marker(
     branch: Option<&str>,
 ) {
     let initial_head = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .arg("-C")
         .arg(target_wt)
         .args(["rev-parse", "HEAD"])
@@ -554,6 +596,12 @@ fn record_managed_worktree_marker(
     ) || Path::new(repo_raw).is_dir()
     {
         std::process::Command::new("git")
+            .args([
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
             .arg("-C")
             .arg(target_wt)
             .args(["config", "--get", "remote.origin.url"])
@@ -958,6 +1006,12 @@ pub(crate) fn sync_canonical_skills(data_dir: &Path) {
             && repo_root.join(".git").exists()
         {
             let is_clean = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
                 .arg("-C")
                 .arg(repo_root)
                 .args(["status", "--porcelain"])
@@ -966,6 +1020,12 @@ pub(crate) fn sync_canonical_skills(data_dir: &Path) {
                 .is_some_and(|o| o.status.success() && o.stdout.is_empty());
             if is_clean {
                 let _ = std::process::Command::new("git")
+                    .args([
+                        "-c",
+                        "core.fsmonitor=false",
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                    ])
                     .arg("-C")
                     .arg(repo_root)
                     .args(["pull", "--ff-only", "--quiet", "origin", "main"])
@@ -7794,6 +7854,11 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(&data);
         let (a_uid, a_gid) = ids[0];
         let (b_uid, b_gid) = ids[1];
+        std::fs::set_permissions(
+            f.source.join(".git/config"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
         assert!(
             Command::new("chown")
                 .args(["-R", &format!("{a_uid}:{a_gid}")])
@@ -7910,6 +7975,9 @@ if rm "$3/config.worktree"; then exit 17; fi
 printf evil > "$3/child-config"
 if mv "$3/child-config" "$3/config.worktree"; then exit 18; fi
 if printf evil >> "$3/commondir"; then exit 19; fi
+test -f "$2/logs/HEAD"
+if printf evil >> "$2/logs/HEAD"; then exit 27; fi
+if rm "$2/logs/HEAD"; then exit 28; fi
 "#,
             &[&target, common, &private],
         );
@@ -7972,6 +8040,10 @@ if printf evil >> "$3/commondir"; then exit 19; fi
             std::fs::metadata(&blocked).unwrap().permissions().mode() & 0o777,
             0o600
         );
+        assert_eq!(std::fs::read_to_string(&blocked).unwrap(), "preserve");
+        // End this refusal scenario before the independent wake positive.
+        // Restore must not widen access to a later parent-only checkout file.
+        std::fs::remove_file(&blocked).unwrap();
         assert!(
             !target.join("hook-executed").exists(),
             "parent must ignore B's planted hook"
@@ -8004,6 +8076,21 @@ if printf evil >> "$3/commondir"; then exit 19; fi
             r#"set -eu; if cat "$1/HEAD"; then exit 23; fi"#,
             &[&c_private],
         );
+        // Concurrent agents commonly share one OS seat. B2 admission and B1
+        // archive must not revoke either live workspace's effective bindings.
+        let b2_target = dir.path().join("checkout-b2");
+        let mut request = worktree_request("child-b2", Some("SylphxAI/demo".into()));
+        request.workdir = Some(b2_target.clone());
+        let b2 = create_with_seat(
+            &store,
+            &data,
+            request,
+            &f.consumer,
+            Some((users.0[1].clone(), b_uid, b_gid, None)),
+        )
+        .unwrap();
+        crate::worktree_access::verify(&target, b_uid, b_gid, None).unwrap();
+        crate::worktree_access::verify(&b2_target, b_uid, b_gid, None).unwrap();
         // Archive a dirty external checkout: preserve its bytes but revoke the
         // common-store grant before any clean-worktree deletion decision.
         store.set_agent_state(&agent.id, "archived").unwrap();
@@ -8014,8 +8101,14 @@ if printf evil >> "$3/commondir"; then exit 19; fi
         run_as(
             b_uid,
             b_gid,
-            r#"set -eu; if cat "$1/HEAD"; then exit 24; fi; if mkdir "$2/revoked"; then exit 25; fi"#,
+            r#"set -eu; if cat "$1/HEAD"; then exit 24; fi; mkdir "$2/same-seat-live"; rmdir "$2/same-seat-live""#,
             &[&private, &objects],
+        );
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; cd "$1"; printf survivor > src/survivor; git -c safe.directory="$1" add src/survivor; git -c safe.directory="$1" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Survivor commit'; git -c safe.directory="$1" status --porcelain"#,
+            &[&b2_target],
         );
         let receipt: serde_json::Value = serde_json::from_slice(
             &std::fs::read(crate::worktree_access::grant_path(&data, &agent.id)).unwrap(),
@@ -8026,6 +8119,15 @@ if printf evil >> "$3/commondir"; then exit 19; fi
         crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
         crate::worktree_access::verify(&target, b_uid, b_gid, None).unwrap();
         crate::worktree_access::revoke_recorded(&data, &agent.id).unwrap();
+        crate::worktree_access::verify(&b2_target, b_uid, b_gid, None).unwrap();
+        store.set_agent_state(&b2.id, "archived").unwrap();
+        assert!(crate::server::reap_subagent_ephemeral_dirs(&data, &b2.id));
+        run_as(
+            b_uid,
+            b_gid,
+            r#"set -eu; if mkdir "$1/revoked"; then exit 25; fi"#,
+            &[&objects],
+        );
         // C still works after B's revocation (separate principals, same store).
         crate::worktree_access::verify(
             Path::new(c.workdir.as_deref().unwrap()),
@@ -8057,7 +8159,7 @@ if printf evil >> "$3/commondir"; then exit 19; fi
             &[&objects],
         );
         eprintln!(
-            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree, sticky rename denial, sibling metadata denial, archive/reap/rollback revocation and parent hook pin passed"
+            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation and parent hook pin passed"
         );
     }
 

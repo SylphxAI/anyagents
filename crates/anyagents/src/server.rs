@@ -7145,6 +7145,26 @@ pub(crate) mod tests {
     #[test]
     fn archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail() {
         use std::os::unix::fs::PermissionsExt;
+        // PATH is process-global. Keep this temporary Git replacement out of
+        // concurrently executing worktree fixtures, including their children.
+        if std::env::var_os("ANYAGENTS_GIT_BARRIER_WORKER").is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "server::tests::archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail",
+                    "--nocapture",
+                ])
+                .env("ANYAGENTS_GIT_BARRIER_WORKER", "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "Git-barrier worker failed: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("state.db");
