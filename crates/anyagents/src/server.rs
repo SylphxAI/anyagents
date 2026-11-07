@@ -6484,13 +6484,13 @@ pub(crate) mod tests {
         runtime.block_on(async {
             let mut expected_audit = Vec::new();
             for (body, before, after, source) in [
-                (serde_json::json!({"scope":"siblings"}), "siblings", "siblings", "scope"),
+                (serde_json::json!({"scope":"siblings"}), "private", "siblings", "scope"),
                 (serde_json::json!({"description":"Public charter", "public":false}), "siblings", "siblings", "public"),
                 (serde_json::json!({"instructions":"Private instructions"}), "siblings", "siblings", ""),
                 (serde_json::json!({"role":"Updated Mind"}), "siblings", "siblings", ""),
                 (serde_json::json!({"public":true}), "siblings", "public", "public"),
-                (serde_json::json!({"public":false}), "public", "siblings", "public"),
-                (serde_json::json!({"scope":"isolated", "public":true}), "siblings", "isolated", "scope"),
+                (serde_json::json!({"public":false}), "public", "private", "public"),
+                (serde_json::json!({"scope":"isolated", "public":true}), "private", "isolated", "scope"),
                 (serde_json::json!({"public":false}), "isolated", "isolated", "public"),
                 (serde_json::json!({"scope":"private"}), "isolated", "private", "scope"),
                 (serde_json::json!({"public":false}), "private", "private", "public"),
@@ -6547,7 +6547,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn role_spawn_defaults_to_siblings_and_task_spawn_defaults_to_private() {
+    fn spawn_defaults_to_private_regardless_of_role() {
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -6567,7 +6567,7 @@ pub(crate) mod tests {
             },
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {
+            for (name, role, scope) in [("labelled", Some("Researcher"), "private"), ("task", None, "private")] {
                 let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
                 let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
                 assert_eq!(created.scope, scope);
@@ -7011,6 +7011,65 @@ pub(crate) mod tests {
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn roots_and_role_bearing_children_can_self_archive_without_losing_browser_profiles() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, parent_id, role) in [
+                ("root", None, Some("Researcher")),
+                (
+                    "labelled-child",
+                    Some(parent.id.clone()),
+                    Some("Researcher"),
+                ),
+                ("plain-child", Some(parent.id.clone()), None),
+            ] {
+                let mut new = anyagents_core::NewAgent::new(name, "codex");
+                new.parent_id = parent_id;
+                new.role = role.map(str::to_string);
+                let agent = store.create_agent(new).unwrap();
+                let profile = dir.path().join("browser-profiles").join(name);
+                std::fs::create_dir_all(&profile).unwrap();
+                std::fs::write(profile.join("login"), b"preserved session").unwrap();
+                let caller = Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: name.into(),
+                };
+                let Json(archived) =
+                    archive_agent_route(caller, State(state.clone()), AxumPath("self".into()))
+                        .await
+                        .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert_eq!(archived.state, "archived");
+                assert_eq!(store.agent(&agent.id).unwrap().role, agent.role);
+                assert_eq!(
+                    std::fs::read(profile.join("login")).unwrap(),
+                    b"preserved session"
+                );
+                let _ = delete_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    AxumPath(name.into()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert!(!profile.exists(), "delete must remove the profile");
+            }
+        });
     }
 
     #[test]

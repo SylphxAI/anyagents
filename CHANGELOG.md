@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Keep role labels methodology-neutral: roots and labelled children can self-archive
+  and release idle processes under the same rules. Preserve legacy effective scopes
+  on upgrade, default all new children to private, and retain browser profiles until
+  deletion. Discovery and generated lifecycle instructions no longer depend on roles.
+
 All notable changes to this project are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),

@@ -3568,7 +3568,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "agent": { "type": "string", "description": "`\"self\"` (default), `\"all\"`, or agent name/`agt_...` ID." },
                         "description": { "type": "string", "description": "Public role/capability summary." },
                         "instructions": { "type": "string", "description": "Private system prompt (`SYSTEM_PROMPT.md`)." },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "public": { "type": "boolean", "description": "Whether agents outside this agent's parent/children tree can message it directly." },
                         "clear": { "type": "boolean" }
                     }
@@ -3602,7 +3602,7 @@ fn build_tool_definitions() -> Vec<Value> {
                         "new_name": { "type": "string", "description": "Target name when `action` is `\"rename\"`." },
                         "parent": { "type": "string" },
                         "state": { "type": "string" },
-                        "role": { "type": "string" },
+                        "role": { "type": "string", "description": "Display-only role label; never selects lifecycle, scope or execution instructions." },
                         "harness": { "type": "string" },
                         "model": { "type": "string" },
                         "profile": { "type": "string" },

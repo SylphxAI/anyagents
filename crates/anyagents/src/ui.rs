@@ -828,27 +828,12 @@ pub fn print_agents_table_with_options(
         roots.retain(|r| stats_memo.get(r.id.as_str()).is_some_and(|s| s.total > 0));
     }
 
-    // Sort roots: active Core Leads (with role) first, then active standalone roots, then archived containers.
+    // Sort by lifecycle and name, never by role labels.
     roots.sort_by(|a, b| {
         let a_archived = u8::from(a.state == "archived");
         let b_archived = u8::from(b.state == "archived");
-        let a_has_role = u8::from(
-            a.role
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none(),
-        );
-        let b_has_role = u8::from(
-            b.role
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .is_none(),
-        );
         a_archived
             .cmp(&b_archived)
-            .then_with(|| a_has_role.cmp(&b_has_role))
             .then_with(|| {
                 state_rank(&a.state, &a.process, &a.turn_state).cmp(&state_rank(
                     &b.state,

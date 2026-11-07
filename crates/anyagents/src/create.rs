@@ -818,7 +818,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
            - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
            - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
          - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
-           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Standing domain sub-agents (`scope: \"siblings\"`) can message their `parent`, `children`, and reachable `siblings`; task sub-agents (`scope: \"private\"`) and external liaison assistants (`scope: \"isolated\"`) report upward to `parent` (or shared `group:<name>`).\n\
+           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Agents with `scope: \"siblings\"` can message their `parent`, `children`, and reachable `siblings`; agents with `scope: \"private\"` or `scope: \"isolated\"` report upward to `parent` (or shared `group:<name>`).\n\
            - **Reactions, Poll Votes & Edits**: Pass `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]`), `\"check\"` / `\"uncheck\"`, `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"` along with `target` (or `reply_to`: `anyagents:reply:msg_...`) on `send`.\n\
          - **3. Memory, History & Zero-Embedding Lexical + Structured Search (`conversation` & `search` MCP Tools)**:\n\
            - Incoming messages are pushed automatically to your session — never poll an inbox. Every historical and live turn across all agents is stored lossless in the append-only store (`Raw-RAG`).\n\
@@ -7548,6 +7548,42 @@ mod tests {
             reconcile_agent_runtime_config(&store, data, &updated_desc, &cfg, &work_dir).unwrap();
             let healed_reconcile = std::fs::metadata(&cfg).unwrap().permissions().mode() & 0o7777;
             assert_eq!(healed_reconcile & 0o0700, 0o0700);
+        }
+    }
+
+    #[test]
+    fn role_label_does_not_select_execution_or_lifecycle_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut new = NewAgent::new("worker", "codex");
+        new.instructions = Some("Follow the project's explicit task instructions.".into());
+        let mut agent = store.create_agent(new).unwrap();
+        let config = dir.path().join("prompt");
+        std::fs::create_dir_all(&config).unwrap();
+        for parent in [None, Some("parent")] {
+            agent.role = None;
+            write_agent_instructions(&config, &agent, parent);
+            let plain = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+            agent.role = Some("Researcher".into());
+            write_agent_instructions(&config, &agent, parent);
+            let labelled = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+            assert_eq!(
+                labelled.replace("- **Role Label**: `Researcher`\n", ""),
+                plain
+            );
+            assert!(plain.contains("Follow the project's explicit task instructions."));
+            assert!(plain.contains("Any agent may call"));
+            for unwanted in [
+                "permanent domain owner",
+                "do not** archive yourself",
+                "Standing Domain",
+                "Hub · Mind · Runner",
+            ] {
+                assert!(
+                    !labelled.contains(unwanted),
+                    "unexpected lifecycle instruction: {unwanted}"
+                );
+            }
         }
     }
 

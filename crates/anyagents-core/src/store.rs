@@ -6201,9 +6201,9 @@ mod tests {
         let (_dir, store) = setup();
         let parent = agent(&store, "parent");
         for (name, role, default) in [
-            ("mind", Some("Mind"), "siblings"),
+            ("labelled", Some("Researcher"), "private"),
             ("task", None, "private"),
-            ("liaison-assistant", Some("Liaison"), "isolated"),
+            ("liaison-assistant", Some("Liaison"), "private"),
         ] {
             let mut new = NewAgent::new(name, "codex");
             new.parent_id = Some(parent.id.clone());
@@ -7153,6 +7153,127 @@ mod tests {
     }
 
     #[test]
+    fn idle_release_preserves_pending_work_and_role_independent_identity() {
+        let (_dir, store) = setup();
+        let parent = agent(&store, "parent");
+        for (name, parent_id, role) in [
+            ("root", None, Some("Researcher")),
+            ("labelled", Some(parent.id.clone()), Some("Researcher")),
+            ("plain", Some(parent.id.clone()), None),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = parent_id;
+            new.role = role.map(str::to_string);
+            new.instructions = Some("Keep serving future requests.".into());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
+            store.receive(&agent.id, Incoming::new("task")).unwrap();
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+            store.note_delivered(&agent.id, 1).unwrap();
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+            store.note_turn_completed(&agent.id).unwrap();
+            assert!(store.complete_idle_agent(&agent.id).unwrap());
+            let idle = store.agent(&agent.id).unwrap();
+            assert_eq!(idle.role, agent.role);
+            assert_eq!(idle.instructions, agent.instructions);
+            assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 1);
+            store
+                .receive(&agent.id, Incoming::new("follow-up"))
+                .unwrap();
+            assert_eq!(store.agent(&agent.id).unwrap().state, "running");
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn upgrade_materializes_legacy_effective_scopes_without_changing_work() {
+        let (dir, store) = setup();
+        let root = agent(&store, "root");
+        let mut expected = Vec::new();
+        for (name, role, env, scope) in [
+            ("labelled", Some("Researcher"), vec![], "siblings"),
+            ("plain", None, vec![], "private"),
+            ("liaison-assistant", Some("Liaison"), vec![], "isolated"),
+            (
+                "explicit",
+                Some("Researcher"),
+                vec![("ANYAGENTS_SCOPE".into(), "private".into())],
+                "private",
+            ),
+            (
+                "legacy-public",
+                Some("Researcher"),
+                vec![("ANYAGENTS_PUBLIC".into(), "1".into())],
+                "public",
+            ),
+            (
+                "invalid-scope",
+                Some("Researcher"),
+                vec![("ANYAGENTS_SCOPE".into(), "unknown".into())],
+                "siblings",
+            ),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = Some(root.id.clone());
+            new.role = role.map(str::to_string);
+            new.instructions = Some("User-authored instructions".into());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
+            store
+                .receive(&agent.id, Incoming::new("completed"))
+                .unwrap();
+            store.note_delivered(&agent.id, 1).unwrap();
+            store.note_turn_completed(&agent.id).unwrap();
+            store.receive(&agent.id, Incoming::new("pending")).unwrap();
+            let mut env = env;
+            env.push(("CUSTOM".into(), "preserve".into()));
+            // Write the exact pre-upgrade flat-array representation.
+            store
+                .conn()
+                .execute(
+                    "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+                    params![encode_env(&env), agent.id.as_str()],
+                )
+                .unwrap();
+            expected.push((store.agent(&agent.id).unwrap(), scope));
+        }
+        for _ in 0..2 {
+            let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            for (before, scope) in &expected {
+                let after = reopened.agent(&before.id).unwrap();
+                assert_eq!(after.scope(), *scope);
+                assert!(
+                    after
+                        .launch_env
+                        .contains(&("ANYAGENTS_SCOPE".into(), scope.to_string()))
+                );
+                assert!(
+                    after
+                        .launch_env
+                        .contains(&("CUSTOM".into(), "preserve".into()))
+                );
+                let mut normalized = after.clone();
+                normalized.launch_env = before.launch_env.clone();
+                assert_eq!(&normalized, before);
+                assert_eq!(reopened.delivered_cursor(&before.id).unwrap(), 1);
+                assert_eq!(
+                    reopened.next_undelivered(&before.id).unwrap().unwrap().text,
+                    "pending"
+                );
+            }
+        }
+        let new = store
+            .create_agent(NewAgent {
+                name: "new-child".into(),
+                parent_id: Some(root.id),
+                role: Some("Researcher".into()),
+                ..NewAgent::new("unused", "codex")
+            })
+            .unwrap();
+        assert_eq!(new.scope(), "private");
+    }
+
+    #[test]
     fn subagent_scales_to_idle_when_done_wakes_on_message_and_stays_archived_when_retired() {
         let (_dir, store) = setup();
         let root = agent(&store, "root");
@@ -7517,8 +7638,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(argus.scope(), "public");
-        assert_eq!(helios.scope(), "siblings");
-        assert_eq!(plutus.scope(), "siblings");
+        store.set_agent_scope(&helios.id, "siblings").unwrap();
+        store.set_agent_scope(&plutus.id, "siblings").unwrap();
 
         // 1. First message to helios from argus -> emits `<topology event="initial" ... />`
         let mut m1 = Incoming::new("Start sprint");
@@ -7565,6 +7686,7 @@ mod tests {
                 parent_id: Some(argus.id.clone()),
             })
             .unwrap();
+        store.set_agent_scope(&sage.id, "siblings").unwrap();
         let mut m3 = Incoming::new("Design sync");
         m3.sender = Some("agent:argus".to_string());
         let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
@@ -7598,7 +7720,7 @@ mod tests {
             "topo4={topo4}"
         );
 
-        // 5. External liaison `stanley-assistant` defaults to `scope = "isolated"` and sees no siblings
+        // 5. Explicitly isolated agents see no siblings regardless of name or role
         let stanley = store
             .create_agent(NewAgent {
                 name: "stanley-assistant".to_string(),
@@ -7611,7 +7733,7 @@ mod tests {
                 parent_id: Some(argus.id.clone()),
             })
             .unwrap();
-        assert_eq!(stanley.scope(), "isolated");
+        store.set_agent_scope(&stanley.id, "isolated").unwrap();
         let mut m5 = Incoming::new("Hello Stanley");
         m5.sender = Some("agent:argus".to_string());
         let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {

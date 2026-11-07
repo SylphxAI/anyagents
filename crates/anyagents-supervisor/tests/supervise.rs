@@ -724,6 +724,20 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
 
 #[test]
 fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail() {
+    assert_finished_agent_scales_to_zero(false, None);
+}
+
+#[test]
+fn a_role_bearing_subagent_scales_to_zero_and_wakes_on_follow_up_mail() {
+    assert_finished_agent_scales_to_zero(false, Some("Researcher"));
+}
+
+#[test]
+fn a_role_bearing_root_scales_to_zero_and_wakes_on_follow_up_mail() {
+    assert_finished_agent_scales_to_zero(true, Some("Researcher"));
+}
+
+fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
     let dir = short_dir();
     let log = dir.path().join("vendor.log");
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -732,7 +746,8 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
         .unwrap();
     let mut sub_new = NewAgent::new("alpha-worker", "claude-code");
     sub_new.model = Some("sonnet".to_string());
-    sub_new.parent_id = Some(root.id.clone());
+    sub_new.parent_id = (!is_root).then(|| root.id.clone());
+    sub_new.role = role.map(str::to_string);
     let sub = store.create_agent(sub_new).unwrap();
     let work = dir.path().join("work-sub");
     std::fs::create_dir_all(&work).unwrap();
