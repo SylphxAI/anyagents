@@ -77,14 +77,32 @@ impl Drop for Admin {
 }
 
 fn admin(data: &Path, home: &Path, stderr: &Path) -> Admin {
-    Admin(
+    let mut admin = Admin(
         command(data, home)
             .arg("serve-admin")
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(stderr).unwrap())
             .spawn()
             .unwrap(),
-    )
+    );
+    // Hashing the cold debug executable is startup work, not maintenance.
+    // Give it its own readiness deadline; keep the five-second first-pass
+    // maintenance assertion below unchanged.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while std::os::unix::net::UnixStream::connect(data.join("admin.sock")).is_err() {
+        assert!(
+            admin.0.try_wait().unwrap().is_none(),
+            "admin exited: {}",
+            std::fs::read_to_string(stderr).unwrap()
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "admin did not bind: {}",
+            std::fs::read_to_string(stderr).unwrap()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    admin
 }
 
 fn wait_for_reap(admin: &mut Admin, cfg: &Path, stderr: &Path, stage: &str) {

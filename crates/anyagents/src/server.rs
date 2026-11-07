@@ -1552,7 +1552,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             )
             .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
             .route("/v1/whoami", get(whoami))
-            .route("/v1/webhooks/healthz", get(webhook_healthz))
+            .route("/v1/webhooks/healthz", get(admin_healthz))
             .with_state(state);
         let mut terminate =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1646,6 +1646,20 @@ async fn mint_capability(
 /// `GET /v1/webhooks/healthz`: unauthenticated readiness probe for the public
 /// webhook listener (`https://webhooks.example.com/v1/webhooks/healthz`).
 async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "ok": true,
+            "version": state.identity.version,
+            "source_sha": state.identity.source_sha,
+            "binary_sha256": state.identity.binary_sha256,
+        })),
+    )
+}
+
+/// Process-local details are available only on the admin Unix socket, never
+/// through the internet-reachable webhook listener or its primary API aliases.
+async fn admin_healthz(State(state): State<AppState>) -> impl IntoResponse {
     #[derive(serde::Serialize)]
     struct Health<'a> {
         ok: bool,

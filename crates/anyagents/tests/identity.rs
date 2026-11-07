@@ -570,26 +570,26 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     let admin = start("serve-admin", "admin.sock");
     let serving = health(&serve.socket);
     let administering = health(&admin.socket);
-    for (value, pid) in [
-        (&serving, serve.child.id()),
-        (&administering, admin.child.id()),
-    ] {
+    for value in [&serving, &administering] {
         assert_eq!(value["ok"], true);
         assert_eq!(value["version"], env!("CARGO_PKG_VERSION"));
         assert_eq!(value["source_sha"], expected_source);
         assert_eq!(value["binary_sha256"], expected_hash);
-        assert_eq!(value["pid"], pid);
-        let started = value["process_started_at_ms"].as_i64().unwrap();
-        assert!(started >= earliest_start && started <= anyagents_core::now_ms());
-        assert_eq!(
-            value.as_object().unwrap().len(),
-            6,
-            "no private state in health"
-        );
     }
-    assert_ne!(serving["pid"], administering["pid"]);
+    assert!(serving.get("pid").is_none());
+    assert!(serving.get("process_started_at_ms").is_none());
+    assert_eq!(serving.as_object().unwrap().len(), 4);
+    assert_eq!(administering["pid"], admin.child.id());
+    assert_ne!(administering["pid"], serve.child.id());
+    let started = administering["process_started_at_ms"].as_i64().unwrap();
+    assert!(started >= earliest_start && started <= anyagents_core::now_ms());
+    assert_eq!(
+        administering.as_object().unwrap().len(),
+        6,
+        "no private state in health"
+    );
 
-    // Public health aliases report the same serve process, never admin's PID.
+    // Public health aliases report the same image with no process-local details.
     let addr = std::fs::read_to_string(data.join("webhook.addr")).unwrap();
     for path in ["/", "/healthz", "/v1/webhooks/healthz"] {
         let mut stream = std::net::TcpStream::connect(addr.trim()).unwrap();
