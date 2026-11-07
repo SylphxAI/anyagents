@@ -5575,14 +5575,22 @@ mod tests {
         if !Path::new(&chromium_binary()).exists() {
             return;
         }
+        let events = r#"<script>
+            window.events=[];
+            for (const type of ['pointerdown','mousedown','mouseup','click','focus','blur'])
+                document.addEventListener(type,e=>window.events.push({type,target:e.target.id||e.target.tagName,
+                    trusted:e.isTrusted,x:e.clientX,y:e.clientY,at:performance.now()}),true);
+        </script>"#;
         let child = spawn_html_server(
             "127.0.0.2",
-            "<style>body{margin:0}input{width:240px;height:44px}</style><input id='entry'>".into(),
+            format!(
+                "<style>body{{margin:0}}input{{width:240px;height:44px}}</style><input id='entry'>{events}"
+            ),
         );
         let parent = spawn_html_server(
             "127.0.0.1",
             format!(
-                "<style>body{{margin:0}}iframe{{position:absolute;left:60px;top:80px;border:0;width:400px;height:200px}}</style><iframe src='http://127.0.0.2:{child}'></iframe>"
+                "<style>body{{margin:0}}iframe{{position:absolute;left:60px;top:80px;border:0;width:400px;height:200px}}</style><iframe src='http://127.0.0.2:{child}'></iframe>{events}"
             ),
         );
         let dir = tempfile::tempdir().unwrap();
@@ -5604,6 +5612,20 @@ mod tests {
             &serde_json::json!({"type":"click","x":100,"y":100}),
         )
         .unwrap();
+        if response["focus"]["editable"] != true {
+            eprintln!("FIRST CLICK: {response}");
+            let mut rt = load_runtime(dir.path(), "frame-focus").unwrap();
+            let target = select_page_target(dir.path(), &mut rt, None).unwrap();
+            let mut cdp = CdpSession::connect(rt.cdp_port, &target.ws_url.unwrap()).unwrap();
+            let diag = "({url:location.href,ready:document.readyState,focus:document.hasFocus(),active:document.activeElement?.outerHTML,hit:document.elementFromPoint(40,20)?.outerHTML,events:window.events})";
+            eprintln!("PARENT: {:?}", eval_js(&mut cdp, diag));
+            for frame in discover_child_frames(&mut cdp) {
+                eprintln!(
+                    "CHILD {frame:?}: {:?}",
+                    eval_js_in_frame(&mut cdp, Some(&frame.frame_id), diag)
+                );
+            }
+        }
         let _ = stop_profile(dir.path(), "frame-focus");
         assert_eq!(response["focus"]["editable"], true, "{response}");
         assert_eq!(response["focus"]["rect"]["x"], 60.0);
