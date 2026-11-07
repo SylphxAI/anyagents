@@ -3727,11 +3727,14 @@ async fn create_agent_route(
         };
         create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body)
             .map_err(ApiError::from_store)?;
+        if let Some(scope) = body.scope.as_deref() {
+            anyagents_core::parse_agent_scope(scope).map_err(ApiError::from_store)?;
+        }
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
             parent_agent.as_ref(),
-            &body.harness,
+            body.harness.as_deref().unwrap_or("claude-code"),
             body.model,
             body.profile,
         );
@@ -7890,6 +7893,43 @@ exec /usr/bin/git "$@"
         }
     }
 
+    #[test]
+    fn archetype_absence_preserves_http_harness_defaults_and_explicit_inheritance() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = archetype_validation_state(dir.path());
+        let parent = state
+            .store
+            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
+            .unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, parent_ref, harness, role, expected) in [
+                ("root-default", "root", None, None, "claude-code"),
+                ("child-default", parent.id.as_str(), None, None, "claude-code"),
+                ("unmatched-label", parent.id.as_str(), None, Some("nonexistent-display-label-134"), "claude-code"),
+                ("child-empty", parent.id.as_str(), Some(""), None, "opencode"),
+                ("child-inherit", parent.id.as_str(), Some("inherit"), None, "opencode"),
+                ("child-explicit", parent.id.as_str(), Some("codex"), None, "codex"),
+            ] {
+                let mut body = serde_json::json!({"name": name, "parent": parent_ref, "workdir": dir.path().join(name), "scope": "team"});
+                if let Some(harness) = harness { body["harness"] = serde_json::json!(harness); }
+                if let Some(role) = role { body["role"] = serde_json::json!(role); }
+                let (status, Json(created)) = create_agent_route(
+                    Principal::Operator, State(state.clone()), Json(serde_json::from_value(body).unwrap()),
+                ).await.unwrap_or_else(|e| panic!("{}", e.message));
+                assert_eq!(status, StatusCode::CREATED);
+                assert_eq!(created.harness, expected, "{name}");
+                assert_eq!(created.scope, "siblings");
+            }
+        });
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
     fn archetype_validation_state(data: &Path) -> AppState {
         let store = Arc::new(Store::open(data.join("state.db")).unwrap());
         store
@@ -8049,6 +8089,11 @@ exec /usr/bin/git "$@"
                 )
                 .await;
             }
+            assert_archetype_create_refused(
+                &state,
+                serde_json::json!({"name": "rejected-template-agent", "scope": "invalid-request-scope", "workdir": work}),
+                "invalid scope `invalid-request-scope`",
+            ).await;
             for name in [
                 ".",
                 "..",
@@ -8068,6 +8113,14 @@ exec /usr/bin/git "$@"
             }
             for (raw, expected) in [
                 ("---\ndescription: unclosed", "unclosed YAML frontmatter"),
+                (
+                    "---\nscpoe: isolated\n---\nUNKNOWN_KEY_BODY",
+                    "unknown archetype template frontmatter key \"scpoe\"",
+                ),
+                (
+                    "---\nscope: invalid-review-scope\n---\nINVALID_SCOPE_BODY",
+                    "invalid scope `invalid-review-scope`",
+                ),
                 (
                     "---\ndescription broken\n---\nBody.",
                     "malformed YAML frontmatter",

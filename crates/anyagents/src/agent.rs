@@ -789,11 +789,14 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     };
     crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed)
         .map_err(|err| err.to_string())?;
+    if let Some(scope) = parsed.scope.as_deref() {
+        anyagents_core::parse_agent_scope(scope).map_err(|err| err.to_string())?;
+    }
     let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,
         parent_agent.as_ref(),
-        &parsed.harness,
+        parsed.harness.as_deref().unwrap_or("claude-code"),
         parsed.model,
         parsed.profile,
     );
@@ -1773,4 +1776,50 @@ pub fn usage(data: &Path, agent: Option<&str>, by: Option<&str>) -> Result<(), U
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod archetype_tests {
+    use super::*;
+
+    #[test]
+    fn archetype_offline_validation_refuses_before_persistence() {
+        let _env = crate::server::tests::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let templates = dir.path().join("archetypes");
+        std::fs::create_dir_all(&templates).unwrap();
+        for (raw, expected) in [
+            (
+                "---\nscpoe: isolated\n---\nUNKNOWN_KEY_BODY",
+                "unknown archetype template frontmatter key \"scpoe\"",
+            ),
+            (
+                "---\nscope: invalid-review-scope\n---\nINVALID_SCOPE_BODY",
+                "invalid scope `invalid-review-scope`",
+            ),
+        ] {
+            std::fs::write(templates.join("broken.md"), raw).unwrap();
+            let error = create(
+                dir.path(),
+                serde_json::json!({
+                    "name": "rejected-template-agent", "archetype": "broken",
+                }),
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+        }
+        let error = create(
+            dir.path(),
+            serde_json::json!({
+                "name": "rejected-template-agent", "scope": "invalid-request-scope",
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("invalid scope `invalid-request-scope`"),
+            "{error}"
+        );
+        assert!(open(dir.path()).unwrap().list_agents().unwrap().is_empty());
+        assert!(!dir.path().join("agents").exists());
+    }
 }

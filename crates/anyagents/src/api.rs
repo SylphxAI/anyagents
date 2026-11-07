@@ -110,10 +110,6 @@ impl From<anyagents_core::AgentSchedule> for ScheduleView {
     }
 }
 
-fn default_harness() -> String {
-    String::new()
-}
-
 /// Body of `POST /v1/agents`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
@@ -129,8 +125,10 @@ pub struct CreateAgentRequest {
     pub archetype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default = "default_harness")]
-    pub harness: String,
+    /// Omitted HTTP harness retains the legacy `claude-code` default. An explicit
+    /// empty string or `inherit` lets sub-agent defaults select the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -492,7 +490,7 @@ mod create_agent_tests {
             let req: CreateAgentRequest =
                 serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
             assert_eq!(req.archetype.as_deref(), Some("writer"));
-            assert_eq!(req.harness, "");
+            assert!(req.harness.is_none());
         }
         let absent: CreateAgentRequest = serde_json::from_value(json!({
             "name": "worker"

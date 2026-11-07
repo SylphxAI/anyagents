@@ -45,6 +45,19 @@ fn is_scope_env_key(key: &str) -> bool {
     matches!(key, "ANYAGENTS_SCOPE" | "ANYAGENTS_PUBLIC")
 }
 
+/// Validate and normalize an agent scope without persisting any state.
+pub fn parse_agent_scope(scope: &str) -> Result<&'static str, Error> {
+    match scope.trim().to_ascii_lowercase().as_str() {
+        "isolated" | "none" => Ok("isolated"),
+        "private" | "false" | "0" => Ok("private"),
+        "siblings" | "sibling" | "team" => Ok("siblings"),
+        "public" | "org" | "all" | "true" | "1" => Ok("public"),
+        other => Err(Error::Message(format!(
+            "invalid scope `{other}`; expected `isolated`, `private`, `siblings`, or `public`"
+        ))),
+    }
+}
+
 fn scope_env(agent: &Agent, scope: &str) -> Vec<(String, String)> {
     let mut env = agent.launch_env.clone();
     env.retain(|(key, _)| !is_scope_env_key(key));
@@ -3398,17 +3411,7 @@ impl Store {
         scope: &str,
         actor: &str,
     ) -> Result<Agent, Error> {
-        let normalized = match scope.trim().to_ascii_lowercase().as_str() {
-            "isolated" | "none" => "isolated",
-            "private" | "false" | "0" => "private",
-            "siblings" | "sibling" | "team" => "siblings",
-            "public" | "org" | "all" | "true" | "1" => "public",
-            other => {
-                return Err(Error::Message(format!(
-                    "invalid scope `{other}`; expected `isolated`, `private`, `siblings`, or `public`"
-                )));
-            }
-        };
+        let normalized = parse_agent_scope(scope)?;
         self.update_agent_launch_env(agent_id, Some((actor, "scope")), |current| {
             scope_env(current, normalized)
         })

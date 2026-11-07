@@ -7331,13 +7331,17 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
             }
             match key.to_ascii_lowercase().as_str() {
                 "description" | "summary" => tpl.description = Some(value.to_string()),
-                "scope" => tpl.scope = Some(value.to_string()),
+                "scope" => tpl.scope = Some(anyagents_core::parse_agent_scope(value)?.to_string()),
                 "workdir" | "workspace" => tpl.workdir = Some(value.to_string()),
                 "harness" => tpl.harness = Some(value.to_string()),
                 "model" => tpl.model = Some(value.to_string()),
                 "role" => tpl.role = Some(value.to_string()),
                 "profile" => tpl.profile = Some(value.to_string()),
-                _ => {}
+                _ => {
+                    return Err(Error::Message(format!(
+                        "unknown archetype template frontmatter key {key:?}"
+                    )));
+                }
             }
         }
         &rest[end..]
@@ -7632,10 +7636,10 @@ pub(crate) fn apply_archetype_defaults(
     {
         body.workdir = Some(wd);
     }
-    if body.harness.trim().is_empty()
+    if body.harness.as_deref().is_none_or(|h| h.trim().is_empty())
         && let Some(h) = tpl.harness
     {
-        body.harness = h;
+        body.harness = Some(h);
     }
     if body
         .model
@@ -9201,6 +9205,25 @@ mod archetype_tests {
             parse_archetype_markdown("Plain markdown.").unwrap().body,
             "Plain markdown."
         );
+    }
+
+    #[test]
+    fn archetype_frontmatter_rejects_unknown_keys_and_invalid_scope() {
+        for (raw, expected) in [
+            (
+                "---\nscpoe: isolated\n---\nUNKNOWN_KEY_BODY",
+                "unknown archetype template frontmatter key \"scpoe\"",
+            ),
+            (
+                "---\nscope: invalid-review-scope\n---\nINVALID_SCOPE_BODY",
+                "invalid scope `invalid-review-scope`",
+            ),
+        ] {
+            let error = parse_archetype_markdown(raw).unwrap_err().to_string();
+            assert!(error.contains(expected), "{error}");
+        }
+        let template = parse_archetype_markdown("---\nscope: team\n---\nBody.").unwrap();
+        assert_eq!(template.scope.as_deref(), Some("siblings"));
     }
 
     #[cfg(unix)]
