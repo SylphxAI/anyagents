@@ -7,6 +7,7 @@
 mod address;
 pub mod boundary;
 mod error;
+pub mod host_index;
 pub mod host_session;
 mod id;
 pub mod learned_memory;
