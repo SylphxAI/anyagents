@@ -66,6 +66,9 @@ if (typeof document !== 'undefined') {
   let frameRevision = 0, lastFrame = 0;
   const pointers = new Map();
   let gesture = null, pressed = null, touchPan = false, motion = null, motionFrame = 0, pairFrame = 0;
+  let touchTimer = 0, focusSequence = 0;
+  // Proxy focus is an acknowledgement of remote ownership, not a new choice.
+  document.addEventListener('focusin', e => { if (e.target !== proxy) focusSequence++; });
   const size = () => ({ width: stage.clientWidth, height: stage.clientHeight });
   const extent = () => remoteExtent(canvas.width, canvas.height, metrics);
   const fitScale = () => Math.min(size().width / extent().width, size().height / extent().height);
@@ -96,6 +99,14 @@ if (typeof document !== 'undefined') {
   }
   const dispatcher = inputDispatcher(payload => completed ? null : request('/input', payload), reconnect);
   const sendInput = payload => dispatcher.send(payload);
+  function sendWithFocus(payload) {
+    // Capture ownership when the action is accepted, not when its queue drains.
+    const sequence = focusSequence;
+    return sendInput(payload).then(result => {
+      if (!completed && sequence === focusSequence && result?.focus) focusField(result.focus);
+      return result;
+    });
+  }
   function flushMotion() {
     cancelAnimationFrame(motionFrame); motionFrame = 0;
     if (motion) { sendInput(motion).catch(reconnect); motion = null; }
@@ -145,26 +156,33 @@ if (typeof document !== 'undefined') {
     flushMotion();
     if (!pressed) return;
     const p = pressed; pressed = null;
-    sendInput({ type: 'mouse', event_type: 'mouseReleased', ...p.point, button: p.button, buttons: 0 })
-      .then(res => focusField(res?.focus)).catch(reconnect);
+    sendWithFocus({ type: 'mouse', event_type: 'mouseReleased', ...p.point, button: p.button, buttons: 0 }).catch(reconnect);
+  }
+  function cancelTouchTimer() { clearTimeout(touchTimer); touchTimer = 0; }
+  function pressPointer(g) {
+    cancelTouchTimer();
+    if (g.pointerType !== 'mouse' && matchMedia('(pointer: coarse)').matches) openKeyboard();
+    else canvas.focus({ preventScroll: true });
+    pressed = { point: g.point, button: g.button, buttons: g.buttons };
+    sendInput({ type: 'mouse', event_type: 'mousePressed', ...pressed.point, button: pressed.button, buttons: pressed.buttons }).catch(reconnect);
   }
   stage.addEventListener('pointerdown', e => {
     if (!ready || completed) return;
     e.preventDefault(); stage.setPointerCapture(e.pointerId);
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (pointers.size === 2) {
+      cancelTouchTimer();
       releasePointer();
       gesture = { kind: 'pair', ...pair(), last: pair(), view: { ...view } };
     } else if (pointers.size === 1) {
-      // Single finger operates the remote page, including slider CAPTCHAs.
-      // Two fingers scroll/pinch; explicit pan mode moves only the local view.
-      gesture = { kind: 'single', x: e.clientX, y: e.clientY, view: { ...view } };
-      if (e.pointerType !== 'mouse' && touchPan) return;
-      if (e.pointerType !== 'mouse' && matchMedia('(pointer: coarse)').matches) openKeyboard();
-      else canvas.focus({ preventScroll: true });
+      // Touch remains undecided for 180ms / 8 CSS px. A second finger
+      // inside that window discards it without a remote press or release.
       const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
-      pressed = { point: point(e.clientX, e.clientY), button, buttons: e.pointerType === 'mouse' ? e.buttons : 1 };
-      sendInput({ type: 'mouse', event_type: 'mousePressed', ...pressed.point, button, buttons: pressed.buttons }).catch(reconnect);
+      const g = gesture = { kind: 'single', x: e.clientX, y: e.clientY, view: { ...view },
+        point: point(e.clientX, e.clientY), button, buttons: e.pointerType === 'mouse' ? e.buttons : 1, pointerType: e.pointerType };
+      if (e.pointerType !== 'mouse' && touchPan) return;
+      if (e.pointerType === 'mouse') pressPointer(g);
+      else touchTimer = setTimeout(() => { if (gesture === g) pressPointer(g); }, 180);
     }
   });
   function flushPairMotion() {
@@ -189,16 +207,21 @@ if (typeof document !== 'undefined') {
       // Pointer Events deliver each finger separately. Evaluate one native
       // sample together, or a parallel translation looks like a false pinch.
       if (!pairFrame) pairFrame = requestAnimationFrame(flushPairMotion);
-    } else if (pressed) {
-      pressed.point = point(e.clientX, e.clientY);
-      move({ type: 'mouse', event_type: 'mouseMoved', ...pressed.point, button: pressed.button, buttons: pressed.buttons });
-    } else if (gesture?.kind === 'single' && touchPan) {
-      view.x = gesture.view.x + e.clientX - gesture.x; view.y = gesture.view.y + e.clientY - gesture.y; paintView();
+    } else {
+      if (!pressed && gesture?.kind === 'single' && !touchPan && Math.hypot(e.clientX - gesture.x, e.clientY - gesture.y) >= 8) pressPointer(gesture);
+      if (pressed) {
+        pressed.point = point(e.clientX, e.clientY);
+        move({ type: 'mouse', event_type: 'mouseMoved', ...pressed.point, button: pressed.button, buttons: pressed.buttons });
+      } else if (gesture?.kind === 'single' && touchPan) {
+        view.x = gesture.view.x + e.clientX - gesture.x; view.y = gesture.view.y + e.clientY - gesture.y; paintView();
+      }
     }
   });
   function endPointer(e) {
     if (!pointers.has(e.pointerId)) return;
     flushPairMotion();
+    cancelTouchTimer();
+    if (!pressed && gesture?.kind === 'single' && !touchPan && e.type === 'pointerup') pressPointer(gesture);
     if (pressed) pressed.point = point(e.clientX, e.clientY);
     releasePointer(); pointers.delete(e.pointerId);
     // The remaining finger after a two-finger gesture cannot click/drag.
@@ -207,7 +230,7 @@ if (typeof document !== 'undefined') {
   stage.addEventListener('pointerup', endPointer);
   stage.addEventListener('pointercancel', endPointer);
   stage.addEventListener('lostpointercapture', endPointer);
-  addEventListener('blur', () => { flushPairMotion(); releasePointer(); pointers.clear(); gesture = null; });
+  addEventListener('blur', () => { focusSequence++; cancelTouchTimer(); flushPairMotion(); releasePointer(); pointers.clear(); gesture = null; });
   stage.addEventListener('contextmenu', e => e.preventDefault());
   stage.addEventListener('wheel', e => {
     e.preventDefault();
@@ -241,13 +264,13 @@ if (typeof document !== 'undefined') {
   }
   function pasteText(text) {
     $('clipboard-status').textContent = '';
-    return sendInput({ type: 'paste', text }).then(result => { if (result?.focus) focusField(result.focus); });
+    return sendWithFocus({ type: 'paste', text });
   }
   let pendingPaste = null;
   document.addEventListener('paste', e => {
     if (!remoteTarget(e.target) || completed) return;
     e.preventDefault();
-    if (pendingPaste && performance.now() - pendingPaste.at < 500) {
+    if (e.isTrusted && pendingPaste && performance.now() - pendingPaste.at < 500) {
       if (pendingPaste.inserted) return;
       pendingPaste.inserted = true;
     }
@@ -283,8 +306,7 @@ if (typeof document !== 'undefined') {
     if (e.target === proxy && !shortcut && e.key.length === 1) return;
     if (['Control', 'Meta', 'Shift', 'Alt'].includes(e.key)) return;
     e.preventDefault();
-    sendInput({ type: 'key', key: e.key, modifiers: modifiers(e), commands: shortcut && key === 'a' ? ['selectAll'] : [] })
-      .then(result => { if (result?.focus) focusField(result.focus); }).catch(reconnect);
+    sendWithFocus({ type: 'key', key: e.key, modifiers: modifiers(e), commands: shortcut && key === 'a' ? ['selectAll'] : [] }).catch(reconnect);
   }
   window.addEventListener('keydown', remoteKey);
   canvas.focus({ preventScroll: true });
@@ -306,7 +328,7 @@ if (typeof document !== 'undefined') {
   };
   $('copy-btn').onclick = () => clipboardOut();
   $('select-all-btn').onclick = () => sendInput({ type: 'key', key: 'a', modifiers: 2, commands: ['selectAll'] }).catch(reconnect);
-  $('tab-btn').onclick = () => sendInput({ type: 'key', key: 'Tab' }).then(result => focusField(result?.focus)).catch(reconnect);
+  $('tab-btn').onclick = () => sendWithFocus({ type: 'key', key: 'Tab' }).catch(reconnect);
   $('esc-btn').onclick = () => sendInput({ type: 'key', key: 'Escape' }).catch(reconnect);
   $('hud-toggle').onclick = () => {
     const expanded = $('hud-panel').hidden;

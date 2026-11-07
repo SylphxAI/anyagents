@@ -8,9 +8,11 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
   const results = [], latency = [];
   await remote.eval(`(() => {
     const fixture = document.createElement('section'); fixture.id='interaction-fixture';
-    fixture.innerHTML='<button id="signin" style="position:fixed;left:400px;top:30px;width:200px;height:50px">Sign in</button><div id="paint-marker" style="position:fixed;left:650px;top:30px;width:60px;height:60px;background:rgb(240,0,240)"></div><div id="track" style="position:fixed;left:400px;top:200px;width:320px;height:50px;background:#aaa"><div id="slider" style="width:40px;height:50px;background:#06c;position:absolute;left:0"></div></div><div id="scrollbox" style="position:fixed;left:400px;top:320px;width:320px;height:120px;overflow:auto;background:#fff"><div style="height:2000px">Scroll here</div></div>';
+    fixture.innerHTML='<button id="signin" style="position:fixed;left:400px;top:30px;width:200px;height:50px">Sign in</button><div id="paint-marker" style="position:fixed;left:650px;top:30px;width:60px;height:60px;background:rgb(240,0,240)"></div><div id="track" style="position:fixed;left:400px;top:200px;width:320px;height:50px;background:#aaa"><div id="slider" style="width:40px;height:50px;background:#06c;position:absolute;left:0"></div></div><div id="scrollbox" style="position:fixed;left:400px;top:320px;width:320px;height:120px;overflow:auto;background:#fff"><div style="height:2000px"><button id="scroll-button" style="width:320px;height:60px">Scroll starting here</button></div></div>';
     document.body.append(fixture);
-    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];
+    window.signins=0;window.trajectory=[];window.remoteInputs=0;window.wheelHistory=[];window.scrollButtonClicks=0;window.signinEvents=[];
+    document.querySelector('#scroll-button').onclick=()=>window.scrollButtonClicks++;
+    for(const type of ['mousedown','mouseup'])document.querySelector('#signin').addEventListener(type,e=>window.signinEvents.push({type:e.type,trusted:e.isTrusted}));
     document.addEventListener('wheel',e=>window.wheelHistory.push({x:e.clientX,y:e.clientY,dy:e.deltaY,target:e.target.id,trusted:e.isTrusted}));
     document.querySelector('#entry').addEventListener('input',()=>window.remoteInputs++);
     document.querySelector('#signin').onclick=e=>{
@@ -102,7 +104,14 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     await key('v','KeyV',86,2);
     await until(()=>viewer.eval(`document.querySelector('#type-input').value==='local only'`),'local paste remains local');
     assert.equal(await remote.eval(`document.querySelector('#entry').value`),'fallback once');
-    await viewer.eval(`document.querySelector('#hud-panel').hidden=true;document.querySelector('#type-input').value=''`);
+    // A response is obsolete even if focus subsequently leaves the local input
+    // for a non-editable HUD control (the current-active-element check misses it).
+    await viewer.eval(`window.inputReplyHeld=false;window.fetch=async(...args)=>{const response=await window.originalFetch(...args);if(String(args[0]).endsWith('/input')&&args[1]?.body&&JSON.parse(args[1].body).key==='ArrowLeft'){window.inputReplyHeld=true;await new Promise(resolve=>window.releaseInputReply=resolve)}return response};document.querySelector('#screen').focus()`);
+    await key('ArrowLeft','ArrowLeft',37);
+    await until(()=>viewer.eval('window.inputReplyHeld'),'key focus response held');
+    await viewer.eval(`document.querySelector('#type-input').focus();document.querySelector('#hud-toggle').focus();window.releaseInputReply();new Promise(resolve=>setTimeout(resolve,80))`);
+    assert.equal(await viewer.eval('document.activeElement.id'),'hud-toggle','obsolete reply cannot reclaim HUD focus');
+    await viewer.eval(`window.fetch=window.originalFetch;document.querySelector('#hud-panel').hidden=true;document.querySelector('#type-input').value=''`);
     await clickRemote('password',mobile);
     await until(()=>viewer.eval(`document.activeElement.id==='keyboard-proxy'`),'password keyboard focused');
     await viewer.eval(`navigator.clipboard.writeText('fixture-not-a-real-password')`);
@@ -137,15 +146,22 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     await remote.eval(`document.querySelector('#scrollbox').scrollTop=0`);
     const scroll=await localPoint(540,380);
     if(mobile) {
-      await touch('touchStart',[[scroll.x-20,scroll.y],[scroll.x+20,scroll.y]]);
-      await touch('touchMove',[[scroll.x-20,scroll.y-40],[scroll.x+20,scroll.y-40]]);
+      const button=await localPoint(540,350);
+      await remote.eval('window.scrollButtonClicks=0');
+      // Separate starts preserve the real first-finger undecided interval.
+      await touch('touchStart',[[button.x-12,button.y]]);
+      await touch('touchStart',[[button.x-12,button.y],[button.x+12,button.y]]);
+      await touch('touchMove',[[button.x-12,button.y-40],[button.x+12,button.y-40]]);
       await touch('touchEnd',[]);
     } else await viewer.call('Input.dispatchMouseEvent',{type:'mouseWheel',...scroll,deltaX:0,deltaY:240});
     await until(()=>remote.eval(`document.querySelector('#scrollbox').scrollTop>0`),'wheel/two-finger scroll');
+    if(mobile) assert.equal(await remote.eval('window.scrollButtonClicks'),0,'two-finger scroll starting on a button must not click');
     await viewer.eval(`document.querySelector('#reset-btn').click()`);
     const before=await remote.eval('window.signins');
+    await remote.eval('window.signinEvents=[]');
     await clickRemote('signin',mobile);
     await until(()=>remote.eval(`window.signins===${before+1} && window.lastSigninTrusted`),'trusted sign-in click');
+    assert.deepEqual(await remote.eval('window.signinEvents'),[{type:'mousedown',trusted:true},{type:'mouseup',trusted:true}],'single tap sends one trusted press and release');
     // Deliberately overlap actual screenshot/state requests with input.
     const reads=[api('/state'),fetch(url+'/frame.jpg').then(r=>r.arrayBuffer())];
     const began=performance.now();
