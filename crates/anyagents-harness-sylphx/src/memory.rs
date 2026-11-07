@@ -836,9 +836,11 @@ pub(super) fn maybe_emit_context_watermark_event(
     }
 }
 
-pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) {
-    let Ok(line) = serde_json::to_string(msg) else {
-        return;
+pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) -> Value {
+    let mut msg = msg.clone();
+    anyagents_core::masking::mask_json_strings(&mut msg);
+    let Ok(line) = serde_json::to_string(&msg) else {
+        return msg;
     };
     match std::fs::OpenOptions::new()
         .create(true)
@@ -907,6 +909,7 @@ pub(super) fn append_transcript_message(transcript_path: &Path, msg: &Value) {
         }
         Err(_) => {}
     }
+    msg
 }
 
 #[derive(Clone, Debug)]
@@ -1990,6 +1993,35 @@ mod projection_tests {
             validate_responses_input(&projected).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn append_masks_tool_output_and_nested_snapshots_before_disk_and_returns_safe_context() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sylphx-transcript.jsonl");
+        let raw = json!({"type":"function_call_output", "call_id":"fixture", "output":"password=fixturecanaryappend keep"});
+        let safe = append_transcript_message(&path, &raw);
+        assert_eq!(safe["output"], "password=[redacted] keep");
+        append_transcript_message(
+            &path,
+            &json!({"type":"native_turn_state", "pending_messages":[raw]}),
+        );
+        let stored = std::fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("fixturecanaryappend"));
+        assert_eq!(stored.lines().count(), 2);
+        for line in stored.lines() {
+            serde_json::from_str::<Value>(line).unwrap();
+        }
+        let ordinary = json!({"type":"function_call_output", "call_id":"fixture-control", "output":"exit_code: 7\nnovel long actionable diagnostic 測試🙂"});
+        assert_eq!(append_transcript_message(&path, &ordinary), ordinary);
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap(),
+            serde_json::to_string(&ordinary).unwrap()
+        );
     }
 
     #[test]
