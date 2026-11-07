@@ -158,6 +158,77 @@ mod tests {
     }
 
     #[test]
+    fn active_append_and_unreadable_bundle_do_not_block_startup_or_other_launches() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::{
+            io::Write,
+            sync::{
+                Arc,
+                atomic::{AtomicBool, Ordering},
+            },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let active = store.create_agent(NewAgent::new("live", "sylphx")).unwrap();
+        let selected = store
+            .create_agent(NewAgent::new("selected", "sylphx"))
+            .unwrap();
+        let root = |id: &AgentId| dir.path().join("agents").join(id.as_str());
+        let active_config = root(&active.id).join("config");
+        let memory = active_config.join("projects/live/memory");
+        fs::create_dir_all(&memory).unwrap();
+        let unreadable = memory.join("MEMORY.md");
+        fs::write(&unreadable, b"writer-owned facts").unwrap();
+        // If preflight opens this unrelated live file, the real startup fails.
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+        let raw = active_config.join("sylphx-transcript.jsonl");
+        let mut writer = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&raw)
+            .unwrap();
+        writer
+            .write_all(b"{\"role\":\"user\",\"content\":\"before\"}\n")
+            .unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = stop.clone();
+        let thread = std::thread::spawn(move || {
+            let mut n = 0;
+            while !done.load(Ordering::Relaxed) {
+                writer
+                    .write_all(b"{\"role\":\"assistant\",\"content\":\"live append\"}\n")
+                    .unwrap();
+                n += 1;
+                std::thread::yield_now();
+            }
+            n
+        });
+        let live_guard = store.try_lock_agent(&active.id).unwrap();
+        let startup = on_start_from(&store, &dir.path().join("owners"));
+        let launch = before_launch_from(dir.path(), &selected.id, &dir.path().join("owners"));
+        stop.store(true, Ordering::Relaxed);
+        let appends = thread.join().unwrap();
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+        drop(live_guard);
+        startup.unwrap();
+        launch.unwrap();
+        assert!(appends > 0);
+        let migration = HostMigration::open(dir.path()).unwrap();
+        for entry in migration
+            .manifest
+            .entries
+            .iter()
+            .filter(|e| e.agent_id.as_deref() == Some(active.id.as_str()))
+        {
+            assert_eq!(entry.status, MigrationStatus::RetainedActiveWriter);
+            assert!(entry.source_fingerprint.is_none());
+            assert!(entry.reason.as_ref().unwrap().contains("deferred"));
+        }
+        assert!(!root(&active.id).join("memory/MEMORY.md").exists());
+        assert!(fs::metadata(&raw).unwrap().len() > 0);
+    }
+
+    #[test]
     fn daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();

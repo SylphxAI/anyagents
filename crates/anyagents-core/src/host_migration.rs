@@ -291,12 +291,36 @@ impl HostMigration {
         stopped_agents: &HashSet<String>,
         selected: Option<&HashSet<String>>,
     ) -> io::Result<()> {
-        self.preflight_memory_bundles()?;
+        self.preflight_memory_bundles(stopped_agents, selected)?;
         for idx in 0..self.manifest.entries.len() {
             let entry = self.manifest.entries[idx].clone();
             if selected
                 .is_some_and(|ids| !entry.agent_id.as_ref().is_some_and(|id| ids.contains(id)))
             {
+                continue;
+            }
+            // Never fingerprint a live writer: even an ordinary append is not
+            // stable input and must not prevent the daemon from binding sockets.
+            if entry
+                .agent_id
+                .as_ref()
+                .is_some_and(|id| !stopped_agents.contains(id))
+            {
+                if matches!(
+                    entry.status,
+                    MigrationStatus::Planned
+                        | MigrationStatus::Prepared
+                        | MigrationStatus::PendingRawHandoff
+                        | MigrationStatus::RetainedActiveWriter
+                ) {
+                    self.manifest.entries[idx].status = MigrationStatus::RetainedActiveWriter;
+                    self.manifest.entries[idx].source_fingerprint = None;
+                    self.manifest.entries[idx].reason = Some(
+                        "active/busy writer deferred; retry at a quiescent lifecycle boundary"
+                            .into(),
+                    );
+                    self.save()?;
+                }
                 continue;
             }
             if matches!(
@@ -351,16 +375,6 @@ impl HostMigration {
             if entry.kind == MigrationKind::RawTranscript {
                 self.manifest.entries[idx].source_fingerprint = Some(current);
                 self.manifest.entries[idx].status = MigrationStatus::PendingRawHandoff;
-                self.save()?;
-                continue;
-            }
-            if !entry
-                .agent_id
-                .as_ref()
-                .is_some_and(|id| stopped_agents.contains(id))
-            {
-                self.manifest.entries[idx].source_fingerprint = Some(current);
-                self.manifest.entries[idx].status = MigrationStatus::RetainedActiveWriter;
                 self.save()?;
                 continue;
             }
@@ -424,10 +438,19 @@ impl HostMigration {
     }
     /// Refuse a whole Claude memory bundle before any per-file rename if its
     /// destinations collide. Retained relative index/fact references stay valid.
-    fn preflight_memory_bundles(&mut self) -> io::Result<()> {
+    fn preflight_memory_bundles(
+        &mut self,
+        stopped: &HashSet<String>,
+        selected: Option<&HashSet<String>>,
+    ) -> io::Result<()> {
         let mut destinations: BTreeMap<PathBuf, Vec<(usize, Fingerprint)>> = BTreeMap::new();
         let mut refused = HashSet::new();
         for (idx, entry) in self.manifest.entries.iter().enumerate() {
+            if !entry.agent_id.as_ref().is_some_and(|id| {
+                stopped.contains(id) && selected.is_none_or(|ids| ids.contains(id))
+            }) {
+                continue;
+            }
             if entry.kind != MigrationKind::LearnedMemory
                 || !matches!(
                     entry.status,

@@ -23,17 +23,20 @@ impl Store {
         scope: MemoryScope,
         query: &HistorySearchQuery,
     ) -> Result<Vec<(IndexHit, Vec<u8>)>, IndexError> {
+        let selected = query
+            .agent
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| *s != "*" && !s.eq_ignore_ascii_case("all"))
+            .map(|s| self.agent_by_name(s).map(|a| a.id))
+            .transpose()
+            .map_err(|e| io::Error::other(e.to_string()))?;
         let mut agents: Vec<Agent> = self
             .list_agents()
             .map_err(|e| io::Error::other(e.to_string()))?
             .into_iter()
             .filter(|a| authorized.contains(&a.id.to_string()))
-            .filter(|a| {
-                query
-                    .agent
-                    .as_deref()
-                    .is_none_or(|id| id == "all" || id == a.id.as_str() || id == a.name)
-            })
+            .filter(|a| selected.as_ref().is_none_or(|id| id == &a.id))
             .collect();
         agents.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
         let mut guards = Vec::new();
@@ -51,7 +54,29 @@ impl Store {
                 continue;
             }
             let mut ids = HashSet::new();
+            // The durable redactor is the only text mutation authority. A
+            // pending/failed copy excludes precisely that path and descendants;
+            // an unrelated unsupported store does not hide scrubbed local data.
+            let unresolved = self
+                .conn()
+                .prepare("SELECT receipt FROM conversation_redactions WHERE agent_id=?1")?
+                .query_map([agent.id.as_str()], |r| r.get::<_, String>(0))?
+                .map(|raw| -> Result<_, IndexError> {
+                    let receipt: crate::redaction::Receipt = serde_json::from_str(&raw?)?;
+                    Ok(receipt
+                        .unscrubbed
+                        .into_iter()
+                        .map(|f| PathBuf::from(f.path))
+                        .collect::<Vec<_>>())
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
             for path in regular_files(&root.join("memory"), true)? {
+                if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
+                    continue;
+                }
                 let raw = document_coordinate(&path)?;
                 let id = format!(
                     "memory:{}:{}",
@@ -71,28 +96,26 @@ impl Store {
                 index.index(&id, &metadata, &raw)?;
                 ids.insert(id);
             }
-            // A failed/incomplete redaction must never expose a surviving local
-            // copy. Successful scrubs are reindexed from current verified bytes.
-            let blocked: bool = self.conn().query_row("SELECT EXISTS(SELECT 1 FROM conversation_redactions WHERE agent_id=?1 AND json_extract(receipt,'$.full_scrub') != 1)", [agent.id.as_str()], |r| r.get(0))?;
-            if !blocked {
-                for path in native_transcripts(&root)? {
-                    for raw in retained_jsonl_records(&path)? {
-                        use std::io::{Read, Seek, SeekFrom};
-                        let mut file = crate::raw_segment::open_readonly(&path)?;
-                        file.seek(SeekFrom::Start(raw.offset))?;
-                        // Unknown content/output fields are skipped by the JSON
-                        // visitor, not materialized as an unbounded Value.
-                        let header: EventHeader = serde_json::from_reader(file.take(raw.length))?;
-                        let metadata = event_metadata(agent, &header, modified_ms(&path)?);
-                        let id = format!(
-                            "transcript:{}:{}:{}",
-                            agent.id,
-                            sha256(path.as_os_str().as_encoded_bytes()),
-                            raw.seq
-                        );
-                        index.index(&id, &metadata, &raw)?;
-                        ids.insert(id);
-                    }
+            for path in native_transcripts(&root)? {
+                if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
+                    continue;
+                }
+                for raw in retained_jsonl_records(&path)? {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let mut file = crate::raw_segment::open_readonly(&path)?;
+                    file.seek(SeekFrom::Start(raw.offset))?;
+                    // Unknown content/output fields are skipped by the JSON
+                    // visitor, not materialized as an unbounded Value.
+                    let header: EventHeader = serde_json::from_reader(file.take(raw.length))?;
+                    let metadata = event_metadata(agent, &header, modified_ms(&path)?);
+                    let id = format!(
+                        "transcript:{}:{}:{}",
+                        agent.id,
+                        sha256(path.as_os_str().as_encoded_bytes()),
+                        raw.seq
+                    );
+                    index.index(&id, &metadata, &raw)?;
+                    ids.insert(id);
                 }
             }
             index.retain_agent_documents(agent.id.as_str(), &ids)?;
@@ -290,7 +313,10 @@ mod tests {
                 .len(),
             1
         );
-        let receipt = store
+        // An unrelated unsupported binary copy produces a partial receipt but
+        // must not hide the successfully scrubbed local transcript.
+        fs::write(root.join("config/unrelated.sqlite"), b"unmodified binary").unwrap();
+        let mut receipt = store
             .redact_conversation(
                 crate::redaction::Actor::Operator,
                 &agent.id,
@@ -306,7 +332,13 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(receipt.full_scrub, "{receipt:?}");
+        assert!(!receipt.full_scrub, "{receipt:?}");
+        assert!(
+            receipt
+                .unscrubbed
+                .iter()
+                .any(|f| f.path.ends_with("unrelated.sqlite"))
+        );
         assert!(
             store
                 .search_host_files(&ids, MemoryScope::Transcripts, &q)
@@ -319,6 +351,27 @@ mod tests {
             .unwrap();
         assert_eq!(hits.len(), 1);
         assert!(String::from_utf8_lossy(&hits[0].1).contains("[redacted]"));
+        // Persisted pending directory exclusions survive a Store reopen and
+        // apply to descendants, not merely exact filenames.
+        receipt.unscrubbed.push(crate::redaction::CopyFailure {
+            path: root.join("config").display().to_string(),
+            error: "scrub pending/interrupted".into(),
+        });
+        store
+            .conn()
+            .execute(
+                "UPDATE conversation_redactions SET receipt=?1 WHERE id=?2",
+                rusqlite::params![serde_json::to_string(&receipt).unwrap(), receipt.audit_id],
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        assert!(
+            store
+                .search_host_files(&ids, MemoryScope::Transcripts, &q)
+                .unwrap()
+                .is_empty()
+        );
         #[cfg(unix)]
         {
             let foreign = dir.path().join("foreign");
@@ -329,6 +382,53 @@ mod tests {
             assert!(
                 store
                     .search_host_files(&ids, MemoryScope::All, &q)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn host_selection_normalizes_wildcards_names_and_historical_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("old-name", "sylphx"))
+            .unwrap();
+        store.rename_agent(&agent.id, "new-name").unwrap();
+        let root = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("memory");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("MEMORY.md"), "positivehostneedle").unwrap();
+        let ids = [agent.id.to_string()];
+        for selector in [
+            "*",
+            "ALL",
+            "all",
+            "old-name",
+            "new-name",
+            "agent:old-name",
+            agent.id.as_str(),
+        ] {
+            let q = HistorySearchQuery {
+                query: Some("positivehostneedle".into()),
+                agent: Some(selector.into()),
+                ..Default::default()
+            };
+            assert_eq!(
+                store
+                    .search_host_files(&ids, MemoryScope::Memory, &q)
+                    .unwrap()
+                    .len(),
+                1,
+                "{selector}"
+            );
+            assert!(
+                store
+                    .search_host_files(&[], MemoryScope::Memory, &q)
                     .unwrap()
                     .is_empty()
             );
