@@ -268,7 +268,15 @@ must receive its projection through the narrow owner fallback without widening
 that parent. It also checks legacy SQLite ownership handoff with exact bytes,
 a second registered agent on the same UID/GID, writable foreign-seat
 memory/skills/config refusals before vendor execution, protected bytes/modes,
-and fixture removal. Same-seat exceptions require the host-resolved principal
+and fixture removal. The same required test exercises the real Muse workspace
+session initializer with a fresh marker: each writable peer tree refuses before
+any vendor process starts, while a valid boundary admits one initializer and
+reuses its saved marker. It also launches the real Codex adapter with a preserved
+foreign `.claude` parent and with a foreign `.claude/skills` mount. Personal bytes
+remain unchanged and the active `.agents` skills remain readable. Admission
+honors these intentionally preserved foreign projections rather than requiring
+unrelated host names through them; ordinary host-managed views still must read.
+Same-seat exceptions require the host-resolved principal
 and exact registered root, not merely ownership of a directory. Local unprivileged
 tests separately exercise deterministic directory-to-symlink replacement during
 descriptor-bound permission sharing. Passing CLI controls alone does not certify

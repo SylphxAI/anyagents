@@ -253,11 +253,22 @@ fn checks_with_principals(
                     continue;
                 }
                 for mirror in [".claude/skills", ".agents/skills", ".agy/skills"] {
+                    let target = config.join(mirror);
+                    let parent = quote(target.parent().unwrap())?;
+                    let skill = quote(&target.join(entry.file_name()).join("SKILL.md"))?;
+                    let target = quote(&target)?;
+                    // Mounting deliberately preserves a foreign vendor parent
+                    // or skills link. Evaluate that same distinction as the
+                    // seat, including owner-private parents the host cannot
+                    // inspect. An ordinary missing/broken host view still fails.
                     list.push(Check {
                         what: "mounted host skills are readable by the agent",
                         program: format!(
-                            "[ -r {} ]",
-                            quote(&config.join(mirror).join(entry.file_name()).join("SKILL.md"))?
+                            "if [ ! -L {parent} ] && {{ [ ! -L {target} ] || \
+                             [ \"$(readlink {target})\" = {view} ] || \
+                             [ \"$(readlink {target})\" = {global} ]; }}; then [ -r {skill} ]; fi",
+                            view = quote(&root.join("skills-view"))?,
+                            global = quote(&data.join("skills"))?,
                         ),
                     });
                 }
@@ -354,6 +365,67 @@ mod tests {
             std::fs::remove_dir(path).unwrap();
             assert!(run().status.success(), "restored absent peer {name}");
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn mirror_checks_preserve_foreign_parents_and_mounts_but_require_host_views() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("agents/one");
+        let config = root.join("config");
+        let global = dir.path().join("skills");
+        std::fs::create_dir_all(global.join("shared")).unwrap();
+        std::fs::write(global.join("shared/SKILL.md"), "shared").unwrap();
+        for mirror in [".claude", ".agents", ".agy"] {
+            std::fs::create_dir_all(config.join(mirror).join("skills/shared")).unwrap();
+            std::fs::write(config.join(mirror).join("skills/shared/SKILL.md"), "shared").unwrap();
+        }
+        let run = || {
+            let script = admission_script(
+                checks(Some(&config), dir.path(), 2100, 2100)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|c| c.what == "mounted host skills are readable by the agent"),
+            );
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                .output()
+                .unwrap()
+        };
+        assert!(run().status.success());
+        std::fs::remove_dir_all(config.join(".claude")).unwrap();
+        let personal = dir.path().join("personal");
+        std::fs::create_dir(&personal).unwrap();
+        symlink(&personal, config.join(".claude")).unwrap();
+        assert!(
+            run().status.success(),
+            "foreign parent is deliberately preserved"
+        );
+        assert!(!personal.join("skills").exists());
+        std::fs::remove_file(config.join(".claude")).unwrap();
+        std::fs::create_dir(config.join(".claude")).unwrap();
+        symlink(&personal, config.join(".claude/skills")).unwrap();
+        assert!(
+            run().status.success(),
+            "foreign mount is deliberately preserved"
+        );
+        std::fs::remove_file(config.join(".claude/skills")).unwrap();
+        symlink(root.join("skills-view"), config.join(".claude/skills")).unwrap();
+        let refused = run();
+        assert!(
+            !refused.status.success(),
+            "a broken host view is not foreign"
+        );
+        assert_eq!(
+            refused.stderr,
+            b"boundary check failed: mounted host skills are readable by the agent\n"
+        );
+        std::fs::remove_file(config.join(".claude/skills")).unwrap();
+        assert!(
+            !run().status.success(),
+            "missing ordinary mirror must still refuse"
+        );
     }
 
     #[test]

@@ -1483,7 +1483,9 @@ mod tests {
         let uid = 24031;
         let gid = 24032;
         let directory = |path: &Path, mode, owner, group| {
-            std::fs::create_dir_all(path).unwrap();
+            std::fs::create_dir_all(path).unwrap_or_else(|error| {
+                panic!("create fixture directory {}: {error}", path.display())
+            });
             let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
             assert_eq!(unsafe { libc::chown(c.as_ptr(), owner, group) }, 0);
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1580,14 +1582,20 @@ mod tests {
             file(&data.join(name), "host-private\n", 0o600, 0);
             protected.push(data.join(name));
         }
-        directory(&data.join("skills"), 0o555, 0, 0);
-        directory(&data.join("skills/global"), 0o555, 0, 0);
+        // The executor deliberately has no DAC override. Populate the new
+        // fixture before sealing both directories, exactly as a real publisher
+        // does; read-only must not mean an impossible setup that never launches.
+        directory(&data.join("skills"), 0o755, 0, 0);
+        directory(&data.join("skills/global"), 0o755, 0, 0);
         file(
             &data.join("skills/global/SKILL.md"),
             "# global preserved\n",
             0o444,
             0,
         );
+        for path in [data.join("skills/global"), data.join("skills")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
         protected.push(data.join("skills/global/SKILL.md"));
         // Daemon cannot traverse this exact legitimate owner-private parent.
         directory(&config.join(".agy"), 0o700, uid, gid);
@@ -1733,6 +1741,179 @@ cat >/dev/null
                 .unwrap();
             println!("NATIVE_VENDOR_WRITABLE_PEER_{name}_REFUSED_BEFORE_COMMAND");
         }
+        // The workspace-session initializer runs before normal Muse adapter
+        // launch, including on explicit wake. A fresh marker must not conceal
+        // its exceptional process-construction route from admission.
+        let muse_report = config.join("muse-initializer-processes");
+        let muse_probe = fixture.join("muse-initializer.sh");
+        file(
+            &muse_probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
+[ -z "${ANYAGENTS_SEAT_LAUNCH+x}" ]; [ -z "${ANYAGENTS_SEAT_PEERS+x}" ]
+printf 'started\n' >> "$ANYAGENTS_AGENT_CONFIG/muse-initializer-processes"
+read -r initialize
+printf '{"jsonrpc":"2.0","id":1,"result":{}}\n'
+read -r initialized
+read -r start
+printf '{"jsonrpc":"2.0","id":2,"result":{"session":{"sessionId":"synthetic-muse-session"}}}\n'
+"#,
+            0o555,
+            0,
+        );
+        let seat_environment = vec![
+            (
+                anyagents_harness::SEAT_LAUNCH_ENV.into(),
+                format!("/usr/bin/setpriv\t{uid}\t{gid}\t{gid},24033"),
+            ),
+            (
+                anyagents_harness::SEAT_PEERS_ENV.into(),
+                crate::sandbox::peer_principals(&store).unwrap(),
+            ),
+        ];
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+            std::env::set_var("ANYAGENTS_MUSE_BIN", &muse_probe);
+        }
+        let initialize_muse = || {
+            crate::muse_config::ensure_workspace_session(
+                &data,
+                agent.id.as_str(),
+                &config,
+                &root.join("work"),
+                None,
+                &seat_environment,
+            )
+        };
+        let sid = config.join("muse-session-id");
+        let marker = config.join(".anyagents-muse-workspace-session");
+        for name in ["memory", "skills", "config"] {
+            assert!(
+                !sid.exists() && !marker.exists(),
+                "must exercise a fresh Muse session"
+            );
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let error = initialize_muse().unwrap_err().to_string();
+            assert!(
+                error.contains(
+                    "agent not started: boundary check failed: peer seats' private trees are denied"
+                ),
+                "{error}"
+            );
+            assert!(
+                !muse_report.exists(),
+                "Muse initializer started before refusal"
+            );
+            assert!(
+                !sid.exists() && !marker.exists(),
+                "refusal must not publish a session"
+            );
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            println!("NATIVE_MUSE_FRESH_SESSION_PEER_{name}_REFUSED_ZERO_PROCESSES");
+        }
+        initialize_muse().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&sid).unwrap(),
+            "synthetic-muse-session\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            format!("synthetic-muse-session\t{}\n", root.join("work").display())
+        );
+        initialize_muse().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&muse_report).unwrap(),
+            "started\n",
+            "valid marker reuses exactly one admitted initializer"
+        );
+        println!("NATIVE_MUSE_INITIALIZER_ADMITTED_AND_MARKER_REUSED");
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+
+        // Use the actual Codex adapter, not a Claude command with a different
+        // label. Its active .agents view works while unused .claude projections
+        // are deliberately preserved by the production mount implementation.
+        let personal = fixture.join("personal-skills");
+        directory(&personal, 0o755, 0, 0);
+        directory(&personal.join("private"), 0o755, 0, 0);
+        file(
+            &personal.join("private/SKILL.md"),
+            "personal preserved\n",
+            0o444,
+            0,
+        );
+        let codex_probe = fixture.join("codex-foreign-projection.sh");
+        file(
+            &codex_probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
+grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/.agents/skills/global/SKILL.md"
+grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/.agents/skills/local/SKILL.md"
+printf 'codex-started\n' > "$ANYAGENTS_AGENT_CONFIG/codex-foreign-report"
+while IFS= read -r request; do
+  id=$(printf '%s\n' "$request" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{"thread":{"id":"foreign-projection-fixture"}}}\n' "$id"; fi
+done
+"#,
+            0o555,
+            0,
+        );
+        unsafe {
+            std::env::set_var("ANYAGENTS_CODEX_BIN", &codex_probe);
+        }
+        std::fs::rename(config.join(".claude"), config.join(".claude-host-held")).unwrap();
+        for foreign_parent in [true, false] {
+            if foreign_parent {
+                std::os::unix::fs::symlink(&personal, config.join(".claude")).unwrap();
+            } else {
+                directory(&config.join(".claude"), 0o2770, 0, gid);
+                std::os::unix::fs::symlink(&personal, config.join(".claude/skills")).unwrap();
+            }
+            crate::create::ensure_seat_skills(&config, &fixture);
+            let mut codex = agent.clone();
+            codex.harness = "codex".into();
+            let harness = vendor_launch(LaunchRequest {
+                agent: codex,
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            })
+            .unwrap();
+            assert_eq!(
+                std::fs::read_to_string(config.join("codex-session-id"))
+                    .unwrap()
+                    .trim(),
+                "foreign-projection-fixture"
+            );
+            assert_eq!(
+                std::fs::read_to_string(config.join("codex-foreign-report")).unwrap(),
+                "codex-started\n"
+            );
+            assert_eq!(
+                std::fs::read_to_string(personal.join("private/SKILL.md")).unwrap(),
+                "personal preserved\n"
+            );
+            assert!(!personal.join("skills").exists() && !personal.join("global").exists());
+            drop(harness);
+            std::fs::remove_file(config.join("codex-foreign-report")).unwrap();
+            if foreign_parent {
+                std::fs::remove_file(config.join(".claude")).unwrap();
+            } else {
+                std::fs::remove_file(config.join(".claude/skills")).unwrap();
+                std::fs::remove_dir(config.join(".claude")).unwrap();
+            }
+            println!(
+                "NATIVE_CODEX_PRESERVED_FOREIGN_{}_LAUNCH_OK",
+                if foreign_parent { "PARENT" } else { "MOUNT" }
+            );
+        }
+        std::fs::rename(config.join(".claude-host-held"), config.join(".claude")).unwrap();
         assert_eq!(snapshot(), before, "protected bytes or permissions changed");
         println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
         // Cleanup needs DAC override only for this fixture's private seat parent;

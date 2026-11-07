@@ -2232,14 +2232,22 @@ pub(crate) fn reconcile_agent_runtime_config(
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
         {
+            let mut seat_environment = Vec::new();
+            if let Some(spec) = spec_opt {
+                seat_environment.push((anyagents_harness::SEAT_LAUNCH_ENV.into(), spec));
+                seat_environment.push((
+                    anyagents_harness::SEAT_PEERS_ENV.into(),
+                    crate::sandbox::peer_principals(store)?,
+                ));
+            }
             muse_config::ensure_workspace_session(
                 data,
                 agent.id.as_str(),
                 config,
                 work_dir,
                 agent.model.as_deref(),
-                spec_opt.as_deref(),
-            );
+                &seat_environment,
+            )?;
         }
     } else {
         #[cfg(unix)]
