@@ -799,8 +799,14 @@ fn contended_migration_publishes_wait_without_pin_or_dispatch_then_retries() {
     let data = dir.path();
     support::operator_with_configured_seat(data);
     let store = Store::open(data.join("state.db")).unwrap();
+    let parent = store
+        .create_agent(NewAgent::new("waiting-parent", "claude-code"))
+        .unwrap();
     let agent = store
-        .create_agent(NewAgent::new("launch-waits", "claude-code"))
+        .create_agent(NewAgent {
+            parent_id: Some(parent.id.clone()),
+            ..NewAgent::new("launch-waits", "claude-code")
+        })
         .unwrap();
     store.set_agent_state(&agent.id, "running").unwrap();
     let config = data.join("agents").join(agent.id.as_str()).join("config");
@@ -871,6 +877,11 @@ exec /bin/cat
             .find(|row| row["id"] == agent.id.as_str())
             .unwrap();
         if row["block_reason"] == "memory_migration_wait" {
+            assert_eq!(row["turn_state"], "idle", "{row}");
+            assert!(
+                store.next_undelivered(&parent.id).unwrap().is_none(),
+                "wait emitted terminal alert"
+            );
             assert!(
                 row["last_error"]
                     .as_str()

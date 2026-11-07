@@ -2349,7 +2349,7 @@ pub(crate) fn maybe_notify_parent_on_error(
         return;
     };
     let trimmed = err_msg.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || crate::host_memory::is_migration_wait(trimmed) {
         return;
     }
     let rotated_ms = std::fs::read_to_string(config.join(".anyagents-profile-rotated-ms"))

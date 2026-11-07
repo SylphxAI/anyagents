@@ -3463,7 +3463,7 @@ pub(crate) fn compute_block_reason(
     }
     if let Some(err) = last_error.map(str::trim).filter(|s| !s.is_empty()) {
         let lower = err.to_ascii_lowercase();
-        if lower.starts_with("memory_migration_wait:") {
+        if crate::host_memory::is_migration_wait(err) {
             return Some("memory_migration_wait".to_string());
         }
         if lower.contains("quota")
@@ -3611,7 +3611,11 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     }
     if (agent.state == "running" || agent.state == "idle") && quota.is_none_or(|ms| ms <= now) {
         if let Some(ref err_msg) = last_error {
-            turn_state = "errored";
+            turn_state = if crate::host_memory::is_migration_wait(err_msg) {
+                "idle"
+            } else {
+                "errored"
+            };
             create::maybe_notify_parent_on_error(store, agent, &cfg, err_msg);
         } else {
             let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));

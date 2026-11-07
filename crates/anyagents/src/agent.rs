@@ -1099,7 +1099,12 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             && view.quota_reset_at_ms.is_none_or(|ms| ms <= now)
         {
             if let Some(ref err_msg) = view.last_error {
-                view.turn_state = "errored".to_string();
+                view.turn_state = if crate::host_memory::is_migration_wait(err_msg) {
+                    "idle"
+                } else {
+                    "errored"
+                }
+                .to_owned();
                 if let Ok(agent_rec) = store.agent(&id) {
                     crate::create::maybe_notify_parent_on_error(&store, &agent_rec, &cfg, err_msg);
                 }

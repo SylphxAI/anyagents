@@ -6,6 +6,15 @@ use anyagents_core::{
 };
 use std::{collections::HashSet, fs, path::Path};
 
+/// Expected launch admission wait, not a failed vendor turn. Retain this reason
+/// for diagnostics/retry without projecting a terminal error to the parent.
+pub(crate) fn is_migration_wait(error: &str) -> bool {
+    error
+        .trim()
+        .to_ascii_lowercase()
+        .starts_with("memory_migration_wait:")
+}
+
 /// The caller owns this agent's process lock and has not started a vendor yet.
 /// The global migration lock serializes receipt publication across agents.
 pub(crate) fn before_launch(data: &Path, agent: &AgentId) -> Result<(), Error> {
