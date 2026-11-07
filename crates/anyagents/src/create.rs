@@ -7662,6 +7662,32 @@ mod tests {
     }
 
     #[test]
+    fn existing_git_target_is_not_adopted_or_modified() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let fixture = crate::worktree::tests::Fixture::new(data);
+        let store = Store::open(data.join("state.db")).unwrap();
+        let before = crate::worktree::tests::git(&fixture.source, &["rev-parse", "HEAD"]);
+        let mut request = worktree_request("existing", Some("SylphxAI/demo".into()));
+        request.workdir = Some(fixture.source.clone());
+        let err = create_with_consumer(&store, data, request, &fixture.consumer).unwrap_err();
+        assert!(
+            matches!(err, Error::Message(ref message) if message.contains("already exists and is not empty")),
+            "{err}"
+        );
+        assert_eq!(
+            crate::worktree::tests::git(&fixture.source, &["rev-parse", "HEAD"]),
+            before
+        );
+        assert!(fixture.source.join("excluded/large").is_file());
+        assert!(!fixture.log.exists());
+        assert!(matches!(
+            store.agent_by_name("existing"),
+            Err(Error::AgentNotFound(_))
+        ));
+    }
+
+    #[test]
     fn local_repo_spawn_uses_consumer_and_refuses_unpushed_head() {
         let dir = tempfile::tempdir().unwrap();
         let data = dir.path();
