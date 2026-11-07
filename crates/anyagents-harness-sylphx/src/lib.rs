@@ -923,7 +923,7 @@ pub fn build_prior_transcript_continuity_block(transcript_path: &Path) -> Option
                 String::new()
             };
             let trimmed = text.trim();
-            if !trimmed.is_empty() {
+            if !trimmed.is_empty() && !trimmed.contains("kind=\"context.window_opened\"") {
                 let bounded = truncate_tool_output_middle_utf8(trimmed.to_string(), 800, 350, 350);
                 lines.push(format!("[{role}]: {bounded}"));
             }
@@ -2121,6 +2121,222 @@ fn close_dangling_function_calls(transcript_path: &Path, input_items: &mut Vec<V
     *input_items = fixed;
 }
 
+/// Reconstruct unfinished inbound across failed turns/restarts. Snapshots live
+/// in the existing append-only transcript, not in mailbox/config state. Raw user
+/// messages after the latest snapshot cover a crash between append and snapshot.
+fn load_pending_native_messages(transcript_path: &Path, active: &[Value]) -> Vec<Value> {
+    let mut pending = Vec::new();
+    let mut tracked = false;
+    if let Ok(raw) = std::fs::read_to_string(transcript_path) {
+        for line in raw.lines() {
+            let Ok(item) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if item.get("type").and_then(Value::as_str) == Some("native_turn_state") {
+                if let Some(items) = item.get("pending_messages").and_then(Value::as_array) {
+                    pending = items.clone();
+                    tracked = true;
+                }
+            } else if tracked && is_pending_native_message(&item) {
+                pending.push(item);
+            }
+        }
+    }
+    if !tracked {
+        // Migration: there is no trustworthy completed-turn boundary in legacy
+        // transcripts. Preserve uncertain active inbound, never assume it done.
+        pending.extend(
+            active
+                .iter()
+                .filter(|item| is_pending_native_message(item))
+                .cloned(),
+        );
+    }
+    pending
+}
+
+fn is_pending_native_message(item: &Value) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("user")
+        && item
+            .get("content")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim_start().starts_with("<context-event "))
+}
+
+fn record_pending_native_messages(transcript_path: &Path, pending: &[Value]) {
+    append_transcript_message(
+        transcript_path,
+        &json!({
+            "type": "native_turn_state", "pending_messages": pending,
+            "timestamp_ms": anyagents_core::now_ms(),
+        }),
+    );
+}
+
+/// Compact only between completed tool batches. Keep exact inbound messages and
+/// the latest tool batch; older material remains lossless in Raw-RAG. This does
+/// not touch identity, schedules, mailbox cursors, or execute any tool again.
+fn compact_native_context(
+    transcript_path: &Path,
+    input: &mut Vec<Value>,
+    pending_messages: &[Value],
+) {
+    let raw_count = std::fs::read_to_string(transcript_path)
+        .map(|raw| raw.lines().count())
+        .unwrap_or(0);
+    // Keep the last model-authored handoff once, not a recursively nested
+    // digest of our own automatic handoffs on every compaction.
+    let prior_handoff = std::fs::read_to_string(transcript_path)
+        .ok()
+        .and_then(|raw| {
+            raw.lines().rev().find_map(|line| {
+                let item: Value = serde_json::from_str(line).ok()?;
+                if item.get("type").and_then(Value::as_str) != Some("context_window_open") {
+                    return None;
+                }
+                item.get("prior_handoff")
+                    .or_else(|| item.get("handoff"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+        })
+        .unwrap_or_default();
+    let mut suffix_start = None;
+    // Retain the full last batch, including interleaved calls/results, rather
+    // than a lone output or synthetic result. No tool is still running here.
+    if let Some(last_output) = input
+        .iter()
+        .rposition(|item| item.get("type").and_then(Value::as_str) == Some("function_call_output"))
+    {
+        let mut start = last_output;
+        let mut needed = std::collections::HashSet::new();
+        for (idx, item) in input[..=last_output].iter().enumerate().rev() {
+            match item.get("type").and_then(Value::as_str) {
+                Some("function_call_output") => {
+                    if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
+                        needed.insert(cid);
+                    }
+                }
+                Some("function_call") => {
+                    if let Some(cid) = item.get("call_id").and_then(Value::as_str) {
+                        needed.remove(cid);
+                    }
+                    if needed.is_empty() {
+                        start = idx;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        suffix_start = Some(start);
+    }
+    // Pending that a model-authored handoff removed from active input still
+    // precedes the retained suffix. Everything present retains its actual order:
+    // a steer received after a completed tool must not move before that tool.
+    let mut retained: Vec<Value> = pending_messages
+        .iter()
+        .filter(|item| !input.contains(item))
+        .cloned()
+        .collect();
+    retained.extend(
+        input
+            .iter()
+            .enumerate()
+            .filter(|(idx, item)| {
+                pending_messages.contains(item)
+                    || (suffix_start.is_some_and(|start| *idx >= start)
+                        && item.get("type").and_then(Value::as_str) != Some("reasoning"))
+            })
+            .map(|(_, item)| item.clone()),
+    );
+    let continuity = build_prior_transcript_continuity_block(transcript_path).unwrap_or_default();
+    let anchor = json!({
+        "type": "context_window_open",
+        "handoff": format!(
+            "Goal: continue the pending inbound work without replaying completed actions.\n\
+             Verified Facts: exact latest tool state and pending messages are retained below.\n\
+             Decisions: automatic pre-request compaction; no mailbox or lifecycle changes.\n\
+             Next Action: reconcile the retained results, then continue the pending work.\n\
+             Full prior history: transcript:0-{}. Use memory_recall before assuming older work is absent.\n\
+             {prior_handoff}\n{continuity}", raw_count.saturating_sub(1)),
+        "retained_items": retained,
+        "prior_handoff": prior_handoff,
+        "timestamp_ms": anyagents_core::now_ms(),
+    });
+    append_transcript_message(transcript_path, &anchor);
+    *input = load_transcript_input_items(transcript_path);
+}
+
+/// Budget the complete serialized wire request, not bytes/4 of history alone.
+/// One UTF-8 byte per token is deliberately conservative for byte-level model
+/// tokenizers; framing and output get independent reserves. This also counts
+/// inline images rather than silently ignoring their encoded payload.
+fn request_token_upper_bound(request: &Value) -> Result<usize, String> {
+    let bytes = serde_json::to_vec(request)
+        .map_err(|e| format!("cannot budget model request: {e}"))?
+        .len();
+    let messages = request
+        .get("input")
+        .or_else(|| request.get("messages"))
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    Ok(bytes.saturating_add(messages.saturating_mul(32)))
+}
+
+fn prepare_budgeted_request(
+    transcript_path: &Path,
+    input: &mut Vec<Value>,
+    pending_messages: &[Value],
+    limits: &memory::ModelContextLimits,
+    force_compact: bool,
+    build: impl Fn(&[Value]) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let output_reserve = (limits.window_tokens / 20)
+        .max(1)
+        .min(limits.max_output_tokens.unwrap_or(usize::MAX));
+    let build_bounded = |items: &[Value]| -> Result<Value, String> {
+        let mut body = build(items)?;
+        let field = if body.get("messages").is_some() {
+            "max_tokens"
+        } else {
+            "max_output_tokens"
+        };
+        body[field] = json!(output_reserve);
+        Ok(body)
+    };
+    let mut body = build_bounded(input)?;
+    let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
+    let threshold = limits.window_tokens.saturating_mul(limits.compact_percent) / 100;
+    if force_compact || used >= threshold {
+        compact_native_context(transcript_path, input, pending_messages);
+        body = build_bounded(input)?;
+    }
+    let used = request_token_upper_bound(&body)?.saturating_add(output_reserve);
+    // Leave a further 5% for provider-specific framing/vision accounting. Never
+    // dispatch an oversized irreducible prompt, even after compaction.
+    if used > limits.window_tokens.saturating_mul(95) / 100 {
+        return Err(format!(
+            "context_request_too_large: compacted current work requires {used} conservative tokens; model window {}; request not sent; raw transcript and pending work preserved",
+            limits.window_tokens
+        ));
+    }
+    Ok(body)
+}
+
+fn is_context_overflow(status: u16, raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    matches!(status, 400 | 413 | 503)
+        && [
+            "context_length_exceeded",
+            "exceeds the model's context window",
+            "maximum context length",
+            "exceeded model token limit",
+        ]
+        .iter()
+        .any(|text| lower.contains(text))
+}
+
 /// Runs our native multi-step Sylphx Agent Runtime loop against Sylphx AI's
 /// canonical Responses API (`https://api.sylphx.com/v1/responses`), executing
 /// AnyAgents MCP tools (`agents`, `send`, `conversation`, `groups`, `schedule`,
@@ -2198,48 +2414,68 @@ pub(crate) fn run_native_gateway_turn(
     let mut total_cache_write: u64 = 0;
     let mut unanswered_reply_target: Option<String> = extract_envelope_sender(initial_user_message);
 
+    let limits = memory::resolve_model_context_limits(config_dir, &model_id, env);
+    if limits.source == memory::ContextLimitSource::ConservativeFallback {
+        let warning = json!({"role": "user", "content": format!(
+            "<context-event kind=\"context.limit_fallback\" model=\"{}\" window_tokens=\"{}\">Catalog limit unavailable; using conservative offline budget. No model or harness switch.</context-event>", model_id, limits.window_tokens)});
+        append_transcript_message(&transcript_path, &warning);
+        input_items.push(warning);
+    }
+    let mut pending_messages = load_pending_native_messages(&transcript_path, &input_items);
+    let initial = json!({"role": "user", "content": initial_user_message});
+    if !pending_messages.contains(&initial) {
+        pending_messages.push(initial);
+    }
+    record_pending_native_messages(&transcript_path, &pending_messages);
     let mut overflow_compacted_in_turn = false;
+    let mut force_compact = false;
     for step in 0usize.. {
         if cancel_flag.load(Ordering::SeqCst) {
             break;
         }
+        let before_steer = input_items.len();
         drain_steered_messages(
             state,
             &transcript_path,
             &mut input_items,
             &mut unanswered_reply_target,
         );
-        let (_, max_window_est_tokens, _) =
-            memory::resolve_context_window_for_transcript(&transcript_path);
-        if input_items.len() > memory::WINDOW_MAX_ITEMS
-            || memory::estimate_items_tokens(&input_items) > max_window_est_tokens
-        {
-            input_items = load_transcript_input_items(&transcript_path);
-            close_dangling_function_calls(&transcript_path, &mut input_items);
+        if input_items.len() > before_steer {
+            pending_messages.extend_from_slice(&input_items[before_steer..]);
+            record_pending_native_messages(&transcript_path, &pending_messages);
         }
-
-        let (req_body, custom_ua) = match &upstream_kind {
-            auth::UpstreamGatewayKind::SylphxResponses => (
-                build_native_responses_request(
+        let custom_ua = match &upstream_kind {
+            auth::UpstreamGatewayKind::SylphxResponses => None,
+            auth::UpstreamGatewayKind::OpenAiChatCompletions { user_agent, .. } => {
+                user_agent.as_deref()
+            }
+        };
+        let req_body = prepare_budgeted_request(
+            &transcript_path,
+            &mut input_items,
+            &pending_messages,
+            &limits,
+            force_compact,
+            |items| match &upstream_kind {
+                auth::UpstreamGatewayKind::SylphxResponses => build_native_responses_request(
                     &model_id,
                     &system_prompt,
-                    &input_items,
+                    items,
                     &tools,
                     &session_cache_key,
                     reasoning_effort.as_deref(),
-                )?,
-                None,
-            ),
-            auth::UpstreamGatewayKind::OpenAiChatCompletions { user_agent, .. } => (
-                build_chat_completions_request(
-                    &model_id,
-                    &system_prompt,
-                    &input_items,
-                    reasoning_effort.as_deref(),
-                )?,
-                user_agent.as_deref(),
-            ),
-        };
+                ),
+                auth::UpstreamGatewayKind::OpenAiChatCompletions { .. } => {
+                    build_chat_completions_request(
+                        &model_id,
+                        &system_prompt,
+                        items,
+                        reasoning_effort.as_deref(),
+                    )
+                }
+            },
+        )?;
+        force_compact = false;
 
         let step_t0 = Instant::now();
         let (status, raw) = auth::curl_post_json_with_headers(
@@ -2250,31 +2486,9 @@ pub(crate) fn run_native_gateway_turn(
         )?;
         let step_elapsed_ms = step_t0.elapsed().as_millis() as u64;
         if !(200..300).contains(&status) {
-            let is_context_overflow = matches!(status, 400 | 413 | 503)
-                && (raw.contains("context_length_exceeded")
-                    || raw.contains("exceeds the model's context window")
-                    || raw.contains("maximum context length"));
-            if is_context_overflow && !overflow_compacted_in_turn {
+            if is_context_overflow(status, &raw) && !overflow_compacted_in_turn {
                 overflow_compacted_in_turn = true;
-                let continuity = build_prior_transcript_continuity_block(&transcript_path)
-                    .unwrap_or_else(|| "Prior turns preserved in raw transcript.".to_string());
-                let handoff = format!(
-                    "Auto-compacted after context window limit.\n{continuity}\nActive prompt:\n{}",
-                    truncate_tool_output_middle_utf8(
-                        initial_user_message.to_string(),
-                        4_000,
-                        1_800,
-                        1_800
-                    )
-                );
-                let anchor = json!({
-                    "type": "context_window_open",
-                    "handoff": handoff,
-                    "timestamp_ms": anyagents_core::now_ms(),
-                });
-                append_transcript_message(&transcript_path, &anchor);
-                input_items = load_transcript_input_items(&transcript_path);
-                close_dangling_function_calls(&transcript_path, &mut input_items);
+                force_compact = true;
                 continue;
             }
             return Err(format!(
@@ -2583,12 +2797,15 @@ pub(crate) fn run_native_gateway_turn(
             );
         }
 
+        let before_steer = input_items.len();
         if drain_steered_messages(
             state,
             &transcript_path,
             &mut input_items,
             &mut unanswered_reply_target,
         ) {
+            pending_messages.extend_from_slice(&input_items[before_steer..]);
+            record_pending_native_messages(&transcript_path, &pending_messages);
             continue;
         }
 
@@ -2598,6 +2815,8 @@ pub(crate) fn run_native_gateway_turn(
                 "content": goal_continuation,
             });
             append_transcript_message(&transcript_path, &cont_msg);
+            pending_messages.push(cont_msg.clone());
+            record_pending_native_messages(&transcript_path, &pending_messages);
             input_items.push(cont_msg);
             continue;
         }
@@ -2605,6 +2824,9 @@ pub(crate) fn run_native_gateway_turn(
         break;
     }
 
+    if !cancel_flag.load(Ordering::SeqCst) {
+        record_pending_native_messages(&transcript_path, &[]);
+    }
     Ok(TurnUsage {
         input_tokens: total_in,
         output_tokens: total_out,
@@ -4605,6 +4827,419 @@ mod tests {
         );
         let prompt_after = assemble_system_prompt(&cfg, &work);
         assert_eq!(prompt_before, prompt_after);
+    }
+
+    fn context_preflight_limits(window_tokens: usize) -> memory::ModelContextLimits {
+        memory::ModelContextLimits {
+            window_tokens,
+            compact_percent: 85,
+            max_output_tokens: None,
+            source: memory::ContextLimitSource::Catalog,
+        }
+    }
+
+    fn context_preflight_build(input: &[Value]) -> Result<Value, String> {
+        build_native_responses_request(
+            "test/model",
+            "standing instructions",
+            input,
+            &[],
+            "unchanged-session",
+            None,
+        )
+    }
+
+    #[test]
+    fn context_preflight_compacts_before_request_and_preserves_pending_tool_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("sylphx-transcript.jsonl");
+        let initial = json!({"role":"user", "content":"pending inbox message #123"});
+        let steer = json!({"role":"user", "content":"steered update #124"});
+        let call =
+            json!({"type":"function_call", "call_id":"done", "name":"bash", "arguments":"{}"});
+        let result = json!({"type":"function_call_output", "call_id":"done", "output":"exit_code: 0; already deployed sha123"});
+        let mut input = vec![
+            json!({"role":"assistant", "content":"x".repeat(30_000)}),
+            initial.clone(),
+            call.clone(),
+            result.clone(),
+            steer.clone(),
+        ];
+        for item in &input {
+            append_transcript_message(&transcript, item);
+        }
+        let raw_before = std::fs::read_to_string(&transcript).unwrap();
+        let request = prepare_budgeted_request(
+            &transcript,
+            &mut input,
+            &[initial.clone(), steer.clone()],
+            &context_preflight_limits(24_000),
+            false,
+            context_preflight_build,
+        )
+        .unwrap();
+        assert!(
+            input[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("context.window_opened")
+        );
+        for retained in [&initial, &steer, &call, &result] {
+            assert_eq!(input.iter().filter(|item| *item == retained).count(), 1);
+        }
+        assert_eq!(&input[1..], &[initial, call, result, steer]);
+        assert_eq!(input, load_transcript_input_items(&transcript));
+        assert_eq!(request["prompt_cache_key"], "unchanged-session");
+        assert!(request_token_upper_bound(&request).unwrap() + 1_200 < 24_000);
+        assert!(
+            std::fs::read_to_string(&transcript)
+                .unwrap()
+                .starts_with(&raw_before)
+        );
+        assert!(execute_memory_recall(&transcript, &json!({"query":"sha123"})).contains("sha123"));
+        validate_responses_input(&input).unwrap();
+    }
+
+    #[test]
+    fn context_preflight_uses_active_models_catalog_window_and_offline_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("model-catalog-direct.json"), json!({"data":[
+            {"id":"context-test/small", "context_length":24_000},
+            {"id":"context-test/large", "limits":{"constraints":{"context_window_tokens":96_000}}}
+        ]}).to_string()).unwrap();
+        // A stale configured model must not override the dispatched model.
+        std::fs::write(
+            tmp.path().join("sylphx-agent.json"),
+            r#"{"model":"wrong/model"}"#,
+        )
+        .unwrap();
+        for (model, compact) in [("context-test/small", true), ("context-test/large", false)] {
+            let limits = memory::resolve_model_context_limits(tmp.path(), model, &[]);
+            assert_eq!(limits.source, memory::ContextLimitSource::Catalog);
+            assert_eq!(limits.window_tokens, if compact { 24_000 } else { 96_000 });
+            let transcript = tmp
+                .path()
+                .join(format!("{}.jsonl", if compact { "small" } else { "large" }));
+            let pending = json!({"role":"user", "content":"pending"});
+            let mut input = vec![
+                json!({"role":"assistant", "content":"x".repeat(30_000)}),
+                pending.clone(),
+            ];
+            for item in &input {
+                append_transcript_message(&transcript, item);
+            }
+            prepare_budgeted_request(
+                &transcript,
+                &mut input,
+                &[pending],
+                &limits,
+                false,
+                context_preflight_build,
+            )
+            .unwrap();
+            assert_eq!(
+                input[0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("context.window_opened"),
+                compact
+            );
+        }
+        let fallback = memory::resolve_model_context_limits(tmp.path(), "unknown/model", &[]);
+        assert_eq!(
+            fallback.source,
+            memory::ContextLimitSource::ConservativeFallback
+        );
+        assert!(fallback.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn context_preflight_pending_inbound_survives_failed_turn_restart_and_snapshot_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("sylphx-transcript.jsonl");
+        let a = json!({"role":"user", "content":"unfinished inbox A"});
+        let steer = json!({"role":"user", "content":"steer after failure"});
+        let b = json!({"role":"user", "content":"new inbox B"});
+        append_transcript_message(&transcript, &a);
+        record_pending_native_messages(&transcript, std::slice::from_ref(&a));
+        // Failure means no completion/empty snapshot. A steer may have been
+        // appended just before a crash, without its updated snapshot.
+        append_transcript_message(&transcript, &steer);
+        append_transcript_message(&transcript, &b);
+        let mut input = load_transcript_input_items(&transcript);
+        let pending = load_pending_native_messages(&transcript, &input);
+        assert_eq!(pending, vec![a.clone(), steer.clone(), b.clone()]);
+        record_pending_native_messages(&transcript, &pending);
+        prepare_budgeted_request(
+            &transcript,
+            &mut input,
+            &pending,
+            &context_preflight_limits(24_000),
+            true,
+            context_preflight_build,
+        )
+        .unwrap();
+        assert_eq!(&input[1..], &[a, steer, b]);
+        assert_eq!(
+            load_pending_native_messages(&transcript, &load_transcript_input_items(&transcript)),
+            pending
+        );
+        // Metadata is not sent to the provider, and success closes the pending
+        // boundary so a later normal turn does not revive completed work.
+        assert!(!input.iter().any(|item| item["type"] == "native_turn_state"));
+        record_pending_native_messages(&transcript, &[]);
+        assert!(load_pending_native_messages(&transcript, &input).is_empty());
+    }
+
+    #[test]
+    fn context_preflight_catalog_cache_is_scoped_to_gateway_and_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let catalog = tmp.path().join("model-catalog-direct.json");
+        let write_catalog = |window| {
+            std::fs::write(
+                &catalog,
+                json!({"data":[{"id":"cache-scope/model", "context_window":window}]}).to_string(),
+            )
+            .unwrap()
+        };
+        let env_a = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-a.invalid/v1".into(),
+        )];
+        let env_b = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-b.invalid/v1".into(),
+        )];
+        write_catalog(1_048_576);
+        assert_eq!(
+            memory::resolve_model_context_limits(tmp.path(), "cache-scope/model", &env_a)
+                .window_tokens,
+            1_048_576
+        );
+        write_catalog(8_192);
+        assert_eq!(
+            memory::resolve_model_context_limits(tmp.path(), "cache-scope/model", &env_b)
+                .window_tokens,
+            8_192
+        );
+        // Both entries remain cached independently.
+        assert_eq!(
+            memory::resolve_model_context_limits(tmp.path(), "cache-scope/model", &env_a)
+                .window_tokens,
+            1_048_576
+        );
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(
+            other.path().join("model-catalog-direct.json"),
+            r#"{"data":[{"id":"cache-scope/model","context_window":16000}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            memory::resolve_model_context_limits(other.path(), "cache-scope/model", &env_a)
+                .window_tokens,
+            16_000
+        );
+    }
+
+    #[test]
+    fn context_preflight_persisted_catalog_requires_matching_gateway_provenance() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".sylphx-remote-models.json"),
+            json!({
+                "gateway_base_url":"https://gateway-a.invalid/v1",
+                "catalog":{"data":[{"id":"disk-cache/model", "context_window":1_048_576}]}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let env_a = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-a.invalid/v1".into(),
+        )];
+        let env_b = vec![(
+            "SYLPHX_GATEWAY_URL".into(),
+            "https://gateway-b.invalid/v1".into(),
+        )];
+        let a = memory::resolve_model_context_limits(tmp.path(), "disk-cache/model", &env_a);
+        assert_eq!(a.window_tokens, 1_048_576);
+        let b = memory::resolve_model_context_limits(tmp.path(), "disk-cache/model", &env_b);
+        assert_eq!(b.source, memory::ContextLimitSource::ConservativeFallback);
+        assert!(b.window_tokens <= memory::DEFAULT_CONTEXT_WINDOW_TOKENS);
+    }
+
+    #[test]
+    fn context_preflight_guards_real_native_http_dispatch() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("cfg");
+        let work = tmp.path().join("work");
+        std::fs::create_dir_all(&cfg).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(cfg.join("model-catalog-direct.json"),
+            r#"{"data":[{"id":"preflight-http/model","context_length":128000,"limits":{"max_output_tokens":2000}}]}"#).unwrap();
+        let transcript = cfg.join("sylphx-transcript.jsonl");
+        append_transcript_message(
+            &transcript,
+            &json!({"role":"assistant", "content":"old verbose history".repeat(12_000)}),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let gateway = format!("http://{}/v1", listener.local_addr().unwrap());
+        let transcript_at_dispatch = transcript.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let mut buffer = [0; 4096];
+            let (header_end, length) = loop {
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+                if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    assert!(headers.starts_with("post /v1/responses "));
+                    let length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("content-length:")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap();
+                    break (end + 4, length);
+                }
+            };
+            while bytes.len() < header_end + length {
+                let n = stream.read(&mut buffer).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&buffer[..n]);
+            }
+            let request: Value =
+                serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+            assert!(
+                request["input"][0]["content"]
+                    .as_str()
+                    .unwrap()
+                    .contains("context.window_opened")
+            );
+            assert!(
+                std::fs::read_to_string(transcript_at_dispatch)
+                    .unwrap()
+                    .contains("context_window_open")
+            );
+            assert_eq!(request["max_output_tokens"], 2000);
+            assert!(request_token_upper_bound(&request).unwrap() + 2000 < 128_000);
+            let body = r#"{"output":[],"usage":{"input_tokens":50,"output_tokens":0}}"#;
+            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).unwrap();
+        });
+        let state = Arc::new(Mutex::new(SharedState::default()));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let env = vec![
+            ("SYLPHX_GATEWAY_URL".into(), gateway),
+            ("SYLPHX_GATEWAY_KEY".into(), "fixture-key".into()),
+        ];
+        let usage = run_native_gateway_turn(
+            &state,
+            &cancel,
+            &cfg,
+            &work,
+            Some("preflight-http/model"),
+            &env,
+            Path::new("unused-mcp"),
+            &[],
+            "continue pending task #123",
+        )
+        .unwrap();
+        assert_eq!(usage.input_tokens, 50);
+        server.join().unwrap();
+        assert!(
+            load_pending_native_messages(&transcript, &load_transcript_input_items(&transcript))
+                .is_empty()
+        );
+        // With irreducible pending input, production returns before opening the
+        // HTTP connection. A listening socket proves this isn't a mock refusal.
+        let refused = TcpListener::bind("127.0.0.1:0").unwrap();
+        refused.set_nonblocking(true).unwrap();
+        let env = vec![
+            (
+                "SYLPHX_GATEWAY_URL".into(),
+                format!("http://{}/v1", refused.local_addr().unwrap()),
+            ),
+            ("SYLPHX_GATEWAY_KEY".into(), "fixture-key".into()),
+        ];
+        let irreducible = "irreducible pending task".repeat(20_000);
+        let result = run_native_gateway_turn(
+            &state,
+            &cancel,
+            &cfg,
+            &work,
+            Some("preflight-http/model"),
+            &env,
+            Path::new("unused-mcp"),
+            &[],
+            &irreducible,
+        );
+        assert!(result.unwrap_err().contains("request not sent"));
+        assert_eq!(
+            refused.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        // Exercise persistence through the real failed invocation, then a
+        // restart/new inbound and another compaction. Completed prior inbound
+        // must stay completed; the exact failed inbound must remain pending.
+        let failed = json!({"role":"user", "content":irreducible});
+        let next = json!({"role":"user", "content":"next short inbound"});
+        append_transcript_message(&transcript, &next);
+        let mut restarted = load_transcript_input_items(&transcript);
+        let pending = load_pending_native_messages(&transcript, &restarted);
+        assert_eq!(pending, vec![failed.clone(), next.clone()]);
+        prepare_budgeted_request(
+            &transcript,
+            &mut restarted,
+            &pending,
+            &context_preflight_limits(1_048_576),
+            true,
+            context_preflight_build,
+        )
+        .unwrap();
+        assert_eq!(&restarted[1..], &[failed, next]);
+    }
+
+    #[test]
+    fn context_preflight_counts_system_tools_output_and_refuses_irreducible_work_unsent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transcript = tmp.path().join("sylphx-transcript.jsonl");
+        let pending = json!({"role":"user", "content":"must not disappear".repeat(20_000)});
+        append_transcript_message(&transcript, &pending);
+        let mut input = vec![pending.clone()];
+        let result = prepare_budgeted_request(
+            &transcript,
+            &mut input,
+            std::slice::from_ref(&pending),
+            &context_preflight_limits(24_000),
+            false,
+            context_preflight_build,
+        );
+        assert!(result.unwrap_err().contains("request not sent"));
+        assert!(input.contains(&pending));
+        assert!(load_transcript_input_items(&transcript).contains(&pending));
+        let body = build_native_responses_request(
+            "test/model",
+            &"x".repeat(50_000),
+            &[],
+            &[json!({"name":"big", "description":"y".repeat(50_000)})],
+            "s",
+            None,
+        )
+        .unwrap();
+        assert!(request_token_upper_bound(&body).unwrap() >= 100_000);
+        assert!(is_context_overflow(
+            400,
+            r#"{"error":{"message":"Invalid request: Your request exceeded model token limit: 1048576 (requested: 1274676)","type":"invalid_request_error"}}"#
+        ));
+        assert!(!is_context_overflow(429, "quota exceeded"));
     }
 
     #[test]
