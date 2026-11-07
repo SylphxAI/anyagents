@@ -10,8 +10,8 @@ import subprocess
 import sys
 import tomllib
 from urllib.error import HTTPError
-from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 REPOSITORY = "SylphxAI/anyagents"
 CI = {"id": 388622800, "path": ".github/workflows/ci.yml", "name": "ci"}
@@ -19,6 +19,18 @@ PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-x64-gnu", "linux-arm64-gnu")
 PACKAGE = "@sylphx/anyagents"
 SHA = re.compile(r"[a-f0-9]{40}")
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+
+
+class OriginBoundRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        old, new = urlsplit(req.full_url), urlsplit(newurl)
+        if (old.scheme, old.netloc) != (new.scheme, new.netloc):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+urlopen = build_opener(OriginBoundRedirect()).open
 
 
 def require(condition, reason):

@@ -255,6 +255,18 @@ class PublicationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "digest mismatch"):
             self.inspect()
 
+    def test_redirect_keeps_credentials_on_same_origin_only(self):
+        request = release.Request("https://api.github.com/repos/example",
+                                  headers={"Authorization": "Bearer synthetic-token"})
+        handler = release.OriginBoundRedirect()
+        same = handler.redirect_request(request, None, 302, "Found", {},
+                                        "https://api.github.com/repos/moved")
+        self.assertEqual(same.get_header("Authorization"), "Bearer synthetic-token")
+        for target in ("https://release-assets.githubusercontent.com/asset", "http://api.github.com/asset"):
+            with self.subTest(target=target):
+                redirected = handler.redirect_request(request, None, 302, "Found", {}, target)
+                self.assertIsNone(redirected.get_header("Authorization"))
+
     def test_only_404_is_absence_without_retry(self):
         for code in (403, 429, 500, 404):
             error = HTTPError("https://registry.npmjs.org/test", code, "failed", {}, None)
