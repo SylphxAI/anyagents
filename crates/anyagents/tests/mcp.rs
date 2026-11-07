@@ -1,3 +1,5 @@
+mod support;
+
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
