@@ -672,3 +672,177 @@ fn partial_stderr_prefix_is_withheld_until_eof_and_uncertainty_keeps_exit_diagno
     assert!(error.contains("exit status: 1"));
     assert!(error.contains("failed to parse config.toml"));
 }
+
+#[cfg(unix)]
+fn immediate_receipt_harness() -> super::StreamHarness {
+    super::StreamHarness::launch(super::Launch {
+        spec: StreamSpec {
+            name: "immediate-receipt".into(),
+            args: vec![],
+            resume_flag: "--session",
+            start_line: "user",
+            cancel: "cancel",
+            protocol: LineProtocol::AcknowledgedResult,
+        },
+        program: "/usr/bin/python3".into(),
+        args: vec![
+            "-u".into(),
+            "-c".into(),
+            r#"
+import json,sys
+first=None
+for line in sys.stdin:
+ m=json.loads(line)
+ if m['type']=='cancel':
+  print(json.dumps({'type':'result','request_id':first,'status':'completed'}),flush=True)
+ elif m['request_id']=='refused':
+  print(json.dumps({'type':'rejected','request_id':'refused','code':'fixture-refusal'}),flush=True)
+ elif m['request_id']=='self-ack':
+  print(json.dumps({'type':'accepted','request_id':'self-ack'}),flush=True)
+ elif first is None:
+  first=m['request_id']
+  print(json.dumps({'type':'accepted','request_id':first}),flush=True)
+ else:
+  print(json.dumps({'type':'steer_ack','request_id':m['request_id'],'accepted':True,'turn_id':first}),flush=True)
+"#
+            .into(),
+        ],
+        environment: vec![],
+        work_dir: None,
+        session_id: None,
+        mode: anyagents_harness::DeliveryMode::Steer,
+        steer: anyagents_harness::SteerSupport::Yes,
+    })
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn await_receipt_before_post_write(
+    harness: &mut super::StreamHarness,
+    received: impl Fn(&super::State) -> bool + Send + 'static,
+) {
+    let shared = std::sync::Arc::clone(&harness.shared);
+    let wake = std::sync::Arc::clone(&harness.wake);
+    harness.after_write = Some(Box::new(move || {
+        // The pipe write has returned, but deliver has not re-locked shared
+        // state. Only the production stdout reader can satisfy this predicate.
+        let state = super::lock(&shared);
+        let (state, _) = wake
+            .wait_timeout_while(state, std::time::Duration::from_secs(3), |state| {
+                !received(state)
+            })
+            .unwrap();
+        assert!(
+            received(&state),
+            "peer receipt was not processed before post-write decision"
+        );
+    }));
+}
+
+#[cfg(unix)]
+fn receipt_message(id: &str) -> anyagents_harness::OutboundMessage {
+    anyagents_harness::OutboundMessage {
+        id: id.into(),
+        seq: 1,
+        text: id.into(),
+        sender: None,
+        reply_to: None,
+        source_time_ms: None,
+        context: Default::default(),
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_steer_ack_before_post_write_keeps_custody_until_terminal_receipt() {
+    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
+    let mut harness = immediate_receipt_harness();
+    let first = receipt_message("first");
+    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
+    assert_eq!(
+        harness
+            .deliver(&first, &json!({"type":"user","request_id":"first"}))
+            .unwrap(),
+        Accepted {
+            turn_finished: false
+        },
+        "an acknowledged initial input remains an allowed control"
+    );
+    let steer = receipt_message("steer");
+    let line = json!({"type":"user","request_id":"steer"});
+    await_receipt_before_post_write(&mut harness, |state| {
+        state.acknowledged.contains("steer")
+            && state
+                .input_turns
+                .get("steer")
+                .is_some_and(|turn| turn == "first")
+    });
+    assert_eq!(
+        harness.deliver(&steer, &line).unwrap(),
+        Deferred,
+        "first write cannot accept a busy steer even when its ack wins the lock"
+    );
+    assert_eq!(harness.deliver(&steer, &line).unwrap(), Deferred);
+    assert_eq!(harness.written_ids(), ["first", "steer"]);
+    harness.cancel(&json!({"type":"cancel"})).unwrap();
+    assert!(harness.wait_finished("steer", std::time::Duration::from_secs(3)));
+    assert_eq!(
+        harness.deliver(&steer, &line).unwrap(),
+        Accepted {
+            turn_finished: true
+        }
+    );
+    assert_eq!(
+        harness.written_ids(),
+        ["first", "steer"],
+        "no replay after completion"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_rejection_before_post_write_is_a_typed_failure_without_replay() {
+    let mut harness = immediate_receipt_harness();
+    let message = receipt_message("refused");
+    let line = json!({"type":"user","request_id":"refused"});
+    await_receipt_before_post_write(&mut harness, |state| state.rejected.contains_key("refused"));
+    for _ in 0..2 {
+        let error = harness.deliver(&message, &line).unwrap_err();
+        assert!(
+            matches!(error, anyagents_harness::HarnessError::Failed(ref reason)
+            if reason == "controller rejected input: fixture-refusal"),
+            "{error:?}"
+        );
+    }
+    assert_eq!(harness.written_ids(), ["refused"]);
+}
+
+#[test]
+#[cfg(unix)]
+fn immediate_self_ack_cannot_release_an_input_behind_an_open_turn() {
+    use anyagents_harness::DeliverOutcome::{Accepted, Deferred};
+    let mut harness = immediate_receipt_harness();
+    await_receipt_before_post_write(&mut harness, |state| state.acknowledged.contains("first"));
+    assert_eq!(
+        harness
+            .deliver(
+                &receipt_message("first"),
+                &json!({"type":"user","request_id":"first"})
+            )
+            .unwrap(),
+        Accepted {
+            turn_finished: false
+        }
+    );
+    await_receipt_before_post_write(&mut harness, |state| {
+        state
+            .input_turns
+            .get("self-ack")
+            .is_some_and(|turn| turn == "self-ack")
+    });
+    let message = receipt_message("self-ack");
+    let line = json!({"type":"user","request_id":"self-ack"});
+    assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
+    assert_eq!(harness.deliver(&message, &line).unwrap(), Deferred);
+    assert_eq!(harness.written_ids(), ["first", "self-ack"]);
+}

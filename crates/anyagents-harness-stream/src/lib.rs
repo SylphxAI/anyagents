@@ -249,6 +249,8 @@ pub struct StreamHarness {
     reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
     pending: Option<PendingWrite>,
+    #[cfg(test)]
+    after_write: Option<Box<dyn FnOnce() + Send>>,
     #[cfg(target_os = "linux")]
     readiness: Option<JoinHandle<()>>,
 }
@@ -327,6 +329,8 @@ impl StreamHarness {
             reader: None,
             stderr_reader: None,
             pending: None,
+            #[cfg(test)]
+            after_write: None,
             #[cfg(target_os = "linux")]
             readiness: None,
         };
@@ -633,19 +637,7 @@ impl StreamHarness {
                     return Err(HarnessError::Failed(reason.clone()));
                 }
                 if state.seen.contains(&message.id) {
-                    if self.spec.protocol == LineProtocol::AcknowledgedResult
-                        && (!state.acknowledged.contains(&message.id)
-                            || (state
-                                .input_turns
-                                .get(&message.id)
-                                .is_some_and(|turn| turn != &message.id)
-                                && !state.finished.contains(&message.id)))
-                    {
-                        return Ok(DeliverOutcome::Deferred);
-                    }
-                    return Ok(DeliverOutcome::Accepted {
-                        turn_finished: state.finished.contains(&message.id),
-                    });
+                    return state.written_outcome(self.spec.protocol, &message.id);
                 }
                 if let Some(reset_at_ms) = state.quota_reset_at_ms {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
@@ -849,6 +841,12 @@ impl StreamHarness {
         // nonblocking: backpressure returns custody to the mailbox immediately.
         let pending = self.pending.as_mut().expect("reserved above");
         let result = write_pending(&self.stdin, pending);
+        // Tests can hold the writer here until the real stdout reader has
+        // processed a receipt, making the earliest-receipt interleaving exact.
+        #[cfg(test)]
+        if let Some(after_write) = self.after_write.take() {
+            after_write();
+        }
         let mut state = lock(&self.shared);
         if state.generation != pending.generation || !state.alive {
             return Err(HarnessError::Dead);
@@ -864,15 +862,7 @@ impl StreamHarness {
                 let pending = self.pending.take().expect("completed write");
                 state.seen.insert(pending.id.clone());
                 state.written.push(pending.id);
-                if self.spec.protocol == LineProtocol::AcknowledgedResult
-                    && !state.acknowledged.contains(&message.id)
-                {
-                    Ok(DeliverOutcome::Deferred)
-                } else {
-                    Ok(DeliverOutcome::Accepted {
-                        turn_finished: state.finished.contains(&message.id),
-                    })
-                }
+                state.written_outcome(self.spec.protocol, &message.id)
             }
             Err(_) => {
                 state.alive = false;
@@ -1184,6 +1174,38 @@ impl BoundedStderr {
 }
 
 impl State {
+    // Both a fresh pipe write and an already-written retry consult the same
+    // receipt state. Transport acknowledgement alone never commits a busy steer.
+    fn written_outcome(
+        &self,
+        protocol: LineProtocol,
+        id: &str,
+    ) -> Result<DeliverOutcome, HarnessError> {
+        if self.unconfirmed {
+            return Ok(DeliverOutcome::Deferred);
+        }
+        if let Some(reset_at_ms) = self.quota_reset_at_ms
+            && !self.finished.contains(id)
+        {
+            return Ok(DeliverOutcome::Quota { reset_at_ms });
+        }
+        if let Some(reason) = self.rejected.get(id) {
+            return Err(HarnessError::Failed(reason.clone()));
+        }
+        let finished = self.finished.contains(id);
+        if protocol == LineProtocol::AcknowledgedResult
+            && (!self.acknowledged.contains(id)
+                || ((self.input_turns.get(id).is_some_and(|turn| turn != id)
+                    || self.open.first().is_some_and(|turn| turn != id))
+                    && !finished))
+        {
+            return Ok(DeliverOutcome::Deferred);
+        }
+        Ok(DeliverOutcome::Accepted {
+            turn_finished: finished,
+        })
+    }
+
     fn failure(&self) -> Option<String> {
         let diagnostic = self
             .exit_fault
