@@ -2500,7 +2500,8 @@ pub(crate) fn configure_agent_runtime(
         ".anyagents-profile",
         &format!("{normalized_profile}\n"),
     );
-    let _ = std::fs::remove_file(config.join(".anyagents-last-error.json"));
+    crate::vendor::persist_last_error(&config, None, None);
+    let _ = std::fs::remove_file(config.join(".anyagents-notified-parent-error.json"));
     if updated.harness == "agy" {
         clear_stale_agy_quota_error_steps(&config);
     }
@@ -7046,6 +7047,230 @@ pub(crate) fn save_subagent_defaults(
     let text = serde_json::to_string_pretty(cfg).map_err(|err| Error::Message(err.to_string()))?;
     std::fs::write(path, format!("{text}\n"))?;
     Ok(())
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ArchetypeTemplate {
+    pub description: Option<String>,
+    pub scope: Option<String>,
+    pub workdir: Option<String>,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub role: Option<String>,
+    pub profile: Option<String>,
+    pub body: String,
+}
+
+fn unquote_yaml_scalar(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.len() >= 2
+        && ((trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        let inner = &trimmed[1..trimmed.len() - 1];
+        if trimmed.starts_with('"') {
+            return inner
+                .replace("\\\"", "\"")
+                .replace("\\n", "\n")
+                .replace("\\\\", "\\");
+        }
+        return inner.to_string();
+    }
+    trimmed.to_string()
+}
+
+pub(crate) fn parse_archetype_markdown(raw: &str) -> ArchetypeTemplate {
+    let text = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let trimmed_start = text.trim_start_matches(['\r', '\n']);
+    let mut tpl = ArchetypeTemplate::default();
+    let Some(after_open) = trimmed_start
+        .strip_prefix("---\n")
+        .or_else(|| trimmed_start.strip_prefix("---\r\n"))
+    else {
+        tpl.body = text.trim().to_string();
+        return tpl;
+    };
+    let mut fm_lines = Vec::new();
+    let mut body_start_offset = None;
+    let mut cursor = 0usize;
+    for line in after_open.split_inclusive('\n') {
+        let clean_line = line.trim_end_matches(['\r', '\n']).trim();
+        cursor += line.len();
+        if clean_line == "---" || clean_line == "..." {
+            body_start_offset = Some(cursor);
+            break;
+        }
+        fm_lines.push(line.trim_end_matches(['\r', '\n']));
+    }
+    let Some(offset) = body_start_offset else {
+        tpl.body = text.trim().to_string();
+        return tpl;
+    };
+    for line in fm_lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((k, v)) = trimmed.split_once(':') else {
+            continue;
+        };
+        let key = k.trim().to_ascii_lowercase();
+        let val = unquote_yaml_scalar(v);
+        if val.is_empty() {
+            continue;
+        }
+        match key.as_str() {
+            "description" => tpl.description = Some(val),
+            "scope" => tpl.scope = Some(val),
+            "workdir" => tpl.workdir = Some(val),
+            "harness" => tpl.harness = Some(val),
+            "model" => tpl.model = Some(val),
+            "role" => tpl.role = Some(val),
+            "profile" => tpl.profile = Some(val),
+            _ => {}
+        }
+    }
+    tpl.body = after_open[offset..].trim().to_string();
+    tpl
+}
+
+pub(crate) fn resolve_archetype_template(
+    data_dir: &Path,
+    parent: Option<&Agent>,
+    explicit_workdir: Option<&str>,
+    archetype: &str,
+) -> Option<ArchetypeTemplate> {
+    let clean = archetype.trim();
+    let clean = clean.strip_suffix(".md").unwrap_or(clean).trim();
+    if clean.is_empty() || clean.contains('/') || clean.contains('\\') || clean.contains("..") {
+        return None;
+    }
+    let mut search_dirs: Vec<PathBuf> = Vec::new();
+    if let Some(wd) = explicit_workdir.map(str::trim).filter(|s| {
+        !s.is_empty()
+            && !s.eq_ignore_ascii_case("worktree")
+            && !s.eq_ignore_ascii_case("branch")
+            && !s.eq_ignore_ascii_case("private")
+            && !s.eq_ignore_ascii_case("inherit")
+    }) {
+        search_dirs.push(PathBuf::from(wd).join(".agents").join("agents"));
+    }
+    if let Some(parent_wd) = parent
+        .and_then(|p| p.workdir.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        search_dirs.push(PathBuf::from(parent_wd).join(".agents").join("agents"));
+    }
+    search_dirs.push(data_dir.join("archetypes"));
+    search_dirs.push(data_dir.join(".agents").join("agents"));
+    if let Some(ow) = crate::server::owner_workdir() {
+        search_dirs.push(ow.join(".agents").join("agents"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        search_dirs.push(PathBuf::from(home).join(".agents").join("agents"));
+    }
+
+    for dir in search_dirs {
+        for candidate in [
+            dir.join(format!("{clean}.md")),
+            dir.join(clean).join("agent.md"),
+            dir.join(clean).join("AGENT.md"),
+        ] {
+            if candidate.is_file()
+                && let Ok(content) = std::fs::read_to_string(&candidate)
+            {
+                return Some(parse_archetype_markdown(&content));
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn apply_archetype_defaults(
+    data_dir: &Path,
+    parent: Option<&Agent>,
+    body: &mut crate::api::CreateAgentRequest,
+) {
+    let Some(arch) = body
+        .archetype
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let Some(tpl) = resolve_archetype_template(data_dir, parent, body.workdir.as_deref(), arch)
+    else {
+        return;
+    };
+    if body
+        .description
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.description = tpl.description;
+    }
+    if body
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.scope = tpl.scope;
+    }
+    if body
+        .workdir
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.workdir = tpl.workdir;
+    }
+    if body.harness.trim().is_empty()
+        && let Some(h) = tpl.harness
+    {
+        body.harness = h;
+    }
+    if body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+    {
+        body.model = tpl.model;
+    }
+    if body
+        .role
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && tpl.role.is_some()
+    {
+        body.role = tpl.role;
+    }
+    if body
+        .profile
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty)
+        && tpl.profile.is_some()
+    {
+        body.profile = tpl.profile;
+    }
+    if !tpl.body.is_empty() {
+        let merged = match body
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(caller_inst) => format!("{}\n\n{}", tpl.body, caller_inst),
+            None => tpl.body,
+        };
+        body.instructions = Some(merged);
+    }
 }
 
 /// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.

@@ -65,7 +65,8 @@ fn serve(args: &[String]) {
     assert_ne!(port, 0, "a stable port, not an ephemeral request");
     assert!(env::var_os("OPENCODE_PASSWORD").is_none());
     assert!(env::var_os("OPENCODE_SERVER_PASSWORD").is_none());
-    if env::var("ANYAGENTS_FAKE_MODE").as_deref() == Ok("bind-race") {
+    let mode = env::var("ANYAGENTS_FAKE_MODE").unwrap_or_default();
+    if matches!(mode.as_str(), "bind-race" | "transient-bind-race") {
         let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
         let announced = state.join("first-serve-port");
         if !announced.exists() {
@@ -80,6 +81,19 @@ fn serve(args: &[String]) {
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port))
         .unwrap_or_else(|error| {
             log(&format!("bind failed:{port}:{error}"));
+            eprintln!("{error}");
+            if mode == "transient-bind-race" {
+                let state = std::path::PathBuf::from(env::var("ANYAGENTS_FAKE_STATE").unwrap());
+                std::fs::write(state.join("collision-reported"), "reported").unwrap();
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !state.join("collision-released").exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "release collision barrier"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
             exit(1);
         });
     std::thread::spawn(move || {
