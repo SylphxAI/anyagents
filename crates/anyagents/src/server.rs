@@ -3812,6 +3812,11 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let config_dir = agent_root.join("config");
     let seat_ids =
         detect_seat_ids(&config_dir).or_else(|| detect_seat_ids(&agent_root.join("work")));
+    // Quarantine protects recovery evidence, including build-output paths that
+    // would otherwise be removed after a failed Git cleanliness check.
+    if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+        return false;
+    }
     // Revoke before any deletion, including dirty/externally located checkouts.
     // A failed revoke retains the journal and makes the reap incomplete.
     if let Err(error) = crate::worktree_access::revoke_recorded(data_dir, agent_id) {
@@ -3904,6 +3909,9 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
                 complete &= reap_git_worktree_cleanly(data_dir, agent_id, &work_dir, seat_ids);
                 let _ = std::fs::remove_file(&marker_path);
             } else {
+                if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+                    return false;
+                }
                 complete &= reap_build_outputs_in_worktree(&work_dir, seat_ids);
             }
         } else {
@@ -3920,6 +3928,9 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
                                 seat_ids,
                             );
                         } else {
+                            if crate::worktree_access::reaping_blocked(data_dir, agent_id) {
+                                return false;
+                            }
                             complete &= reap_build_outputs_in_worktree(&child_path, seat_ids);
                             preserved_dirty_child = true;
                         }
@@ -7170,6 +7181,11 @@ pub(crate) mod tests {
 
     #[test]
     fn archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants() {
+        if single_test_worker(
+            "archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants",
+        ) {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("state.db");
         let store = Store::open(&db).unwrap();

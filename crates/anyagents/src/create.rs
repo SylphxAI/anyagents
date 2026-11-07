@@ -8128,6 +8128,51 @@ if rm "$2/logs/HEAD"; then exit 28; fi
             r#"set -eu; if cat "$1/HEAD"; then exit 23; fi"#,
             &[&c_private],
         );
+        // A's ordinary Git writes replace common/config with a fresh 0600
+        // inode. Launch and wake refresh every active reader, never an ancestor
+        // default ACL or a sibling's private metadata.
+        for (edit, wake) in [
+            (
+                r#"git -c safe.directory="$1" -C "$1" config test.replacement refreshed"#,
+                false,
+            ),
+            (
+                r#"git -c safe.directory="$1" -C "$1" remote add refresh-proof /nonexistent/refresh-proof"#,
+                true,
+            ),
+        ] {
+            let before = std::fs::metadata(&common_config).unwrap().ino();
+            run_as(a_uid, a_gid, edit, &[&f.source]);
+            assert_ne!(std::fs::metadata(&common_config).unwrap().ino(), before);
+            if wake {
+                crate::worktree_access::restore_recorded(&data, &agent.id).unwrap();
+            } else {
+                crate::worktree_access::ensure_launchable(&data, &agent.id).unwrap();
+            }
+            for (uid, gid, checkout, sibling) in [
+                (b_uid, b_gid, target.as_path(), &c_private),
+                (
+                    c_uid,
+                    c_gid,
+                    Path::new(c.workdir.as_deref().unwrap()),
+                    &private,
+                ),
+            ] {
+                run_as(
+                    uid,
+                    gid,
+                    r#"set -eu; test -r "$2/config"; git -c safe.directory="$1" -C "$1" status --porcelain; if printf evil >> "$2/config"; then exit 41; fi; if printf evil >> "$2/hooks/pre-commit"; then exit 42; fi; if printf evil > "$2/info/refresh-leak"; then exit 43; fi; if cat "$3/index"; then exit 44; fi"#,
+                    &[checkout, common, sibling],
+                );
+            }
+            assert_eq!(std::fs::metadata(&common_config).unwrap().uid(), a_uid);
+            run_as(
+                a_uid,
+                a_gid,
+                r#"set -eu; test -r "$1"; test -w "$1""#,
+                &[&common_config],
+            );
+        }
         // Vesta's same-size clean-filter payload: merely disabling hooks and
         // fsmonitor does not stop `status` executing a configured clean driver.
         let original_dotgit = std::fs::read(target.join(".git")).unwrap();
@@ -8248,11 +8293,13 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             ),
         )
         .unwrap();
-        crate::worktree::tests::git(
-            &f.source,
-            &["config", "filter.trusted.clean", filter.to_str().unwrap()],
+        run_as(
+            a_uid,
+            a_gid,
+            r#"set -eu; git -c safe.directory="$1" -C "$1" config filter.trusted.clean "$2"; git -c safe.directory="$1" -C "$1" config filter.trusted.required true"#,
+            &[&f.source, &filter],
         );
-        crate::worktree::tests::git(&f.source, &["config", "filter.trusted.required", "true"]);
+        crate::worktree_access::ensure_launchable(&data, &agent.id).unwrap();
         run_as(
             b_uid,
             b_gid,
@@ -8338,7 +8385,12 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         );
         // Keep both the trusted config and driver unchanged through the checks;
         // remove them only after the owner-UID and interrupted-check proofs.
-        crate::worktree::tests::git(&f.source, &["config", "--remove-section", "filter.trusted"]);
+        run_as(
+            a_uid,
+            a_gid,
+            r#"git -c safe.directory="$1" -C "$1" config --remove-section filter.trusted"#,
+            &[&f.source],
+        );
         // Concurrent agents commonly share one OS seat. B2 admission and B1
         // archive must not revoke either live workspace's effective bindings.
         let b2_target = dir.path().join("checkout-b2");
@@ -8421,8 +8473,65 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             r#"set -eu; if mkdir "$1/rollback-leak"; then exit 26; fi"#,
             &[&objects],
         );
+        // A real child seat can take flock(LOCK_EX) through a read-only HEAD
+        // descriptor. Inspection cleanup must fail closed without waiting for
+        // that child; the fresh-server matrix proves both startup entrypoints.
+        let mut request = worktree_request("locked-b", Some("SylphxAI/demo".into()));
+        request.workdir = Some(dir.path().join("locked-checkout"));
+        let locked = create_with_seat(
+            &store,
+            &data,
+            request,
+            &f.consumer,
+            Some((users.0[1].clone(), b_uid, b_gid, None)),
+        )
+        .unwrap();
+        let locked_checkout = Path::new(locked.workdir.as_deref().unwrap());
+        let record =
+            crate::worktree_access::RecordedWorktree::load(&data, &locked.id, locked_checkout)
+                .unwrap();
+        crate::worktree_access::revoke_recorded(&data, &locked.id).unwrap();
+        let ready = dir.path().join("seat-flock-ready");
+        struct Locker(std::process::Child);
+        impl Drop for Locker {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut locker = None;
+        let started = std::time::Instant::now();
+        let inspection = record.inspect(|| {
+            locker = Some(Locker(Command::new("/usr/bin/setpriv")
+                .current_dir(dir.path())
+                .args(["--reuid", &b_uid.to_string(), "--regid", &b_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
+                    r#"exec 9< "$1/HEAD"; /usr/bin/flock -n -x 9 || exit; : > "$2"; read ignored"#, "seat-flock"])
+                .arg(record.private()).arg(&ready)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()?));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !ready.exists() {
+                assert!(locker.as_mut().unwrap().0.try_wait()?.is_none()
+                    && std::time::Instant::now() < deadline, "seat did not acquire the read-only HEAD flock");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(())
+        });
+        assert!(inspection.is_err());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "seat flock blocked inspection recovery"
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(crate::worktree_access::grant_path(&data, &locked.id)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["quarantined"], true);
+        assert!(crate::worktree_access::ensure_launchable(&data, &locked.id).is_err());
+        drop(locker);
         eprintln!(
-            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, planted-filter cleanup/foreign-seat denial, trusted-config filter owner-UID execution, and SIGKILL inspection-grant recovery passed"
+            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, planted-filter cleanup/foreign-seat denial, trusted-config filter owner-UID execution, config/remote inode-replacement launch/wake refresh, SIGKILL inspection-grant recovery, and read-only HEAD-flock bounded quarantine passed"
         );
     }
 

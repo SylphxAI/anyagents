@@ -339,6 +339,7 @@ pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
 /// A quarantined checkout must not run even if its lifecycle row says running.
 pub(crate) fn ensure_launchable(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
     let journal = grant_path(data, id);
+    let _lock = lock_journals(&journal).map_err(|error| refusal(&journal, error))?;
     let bytes = match std::fs::read(&journal) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -351,20 +352,44 @@ pub(crate) fn ensure_launchable(data: &Path, id: &anyagents_core::AgentId) -> Re
             "worktree is quarantined or has incomplete ACL recovery",
         ));
     }
+    if grant.active {
+        RecordedWorktree {
+            grant,
+            journal: journal.clone(),
+        }
+        .refresh_config_readers()
+        .map_err(|error| refusal(&journal, error))?;
+    }
     Ok(())
+}
+
+/// Quarantine preserves the whole checkout, including nominal build outputs.
+/// An unreadable or malformed recovery record is uncertainty, not permission
+/// to delete. Only an absent journal establishes that no recovery is pending.
+pub(crate) fn reaping_blocked(data: &Path, id: &anyagents_core::AgentId) -> bool {
+    match std::fs::read(grant_path(data, id)) {
+        Ok(bytes) => serde_json::from_slice::<Grant>(&bytes)
+            .map_or(true, |grant| grant.quarantined || grant.inspection),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
 }
 
 // st_mode's group bits are the POSIX ACL mask, not the owning-group entry.
 // A preserved named-owner rw grant can make that mask writable while every
 // foreign principal remains read-only. Inspect effective entries instead.
 fn writable_by_untrusted(path: &Path, owners: &[u32]) -> std::io::Result<bool> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    #[cfg(not(target_os = "linux"))]
-    let _ = owners; // Named-user POSIX ACL classification below is Linux-only.
+    use std::os::unix::fs::OpenOptionsExt;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?;
+    writable_file_by_untrusted(&file, owners)
+}
+
+fn writable_file_by_untrusted(file: &std::fs::File, owners: &[u32]) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(not(target_os = "linux"))]
+    let _ = owners; // Named-user POSIX ACL classification below is Linux-only.
     let meta = file.metadata()?;
     #[cfg(target_os = "linux")]
     {
@@ -490,6 +515,43 @@ impl RecordedWorktree {
         validate_config_files(&g.private, &g.common).map_err(std::io::Error::other)
     }
 
+    /// Git config/remote/push updates replace common/config through lock+rename.
+    /// Refresh its current inode at launch/wake/inspection, not through a default
+    /// ACL on the mixed common directory (which would expose future metadata).
+    /// The caller holds the journal transition lock.
+    fn refresh_config_readers(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        self.validate()?;
+        let g = &self.grant;
+        let config = g.common.join("config");
+        let file = open_nofollow(&config)?;
+        let before = file.metadata()?;
+        let owner = std::fs::symlink_metadata(&g.private)?.uid();
+        let owners = [owner, crate::sandbox::server_uid()];
+        if !before.is_file()
+            || before.nlink() != 1
+            || !owners.contains(&before.uid())
+            || writable_file_by_untrusted(&file, &owners)?
+        {
+            return Err(std::io::Error::other(
+                "untrusted replacement Git configuration",
+            ));
+        }
+        let retained = other_active_grants(&self.journal, g)?;
+        for reader in std::iter::once(g).chain(retained.iter()) {
+            if reader.active && !reader.quarantined && !reader.inspection {
+                update_metadata_acl(&file, reader.gid, Some(4), false, None)?;
+            }
+        }
+        let after = std::fs::symlink_metadata(&config)?;
+        if after.dev() != before.dev() || after.ino() != before.ino() {
+            return Err(std::io::Error::other(
+                "Git configuration changed during refresh",
+            ));
+        }
+        Ok(())
+    }
+
     /// Archive revokes all metadata access before reaping. Temporarily grant
     /// only read/traverse, never write or inheritance, while the owner's Git
     /// inspects its recorded checkout. Serialize ACL changes, not the Git
@@ -516,6 +578,9 @@ impl RecordedWorktree {
             ));
         }
         if current.active || g.uid == crate::sandbox::server_uid() {
+            if current.active {
+                self.refresh_config_readers()?;
+            }
             drop(lock);
             return read();
         }
@@ -969,7 +1034,15 @@ pub(crate) fn restore_recorded(data: &Path, id: &anyagents_core::AgentId) -> Res
             "worktree is quarantined after incomplete ACL recovery",
         ));
     }
-    if grant.active || !grant.checkout.join(".git").exists() {
+    if grant.active {
+        return RecordedWorktree {
+            grant,
+            journal: journal.clone(),
+        }
+        .refresh_config_readers()
+        .map_err(|error| refusal(&journal, error));
+    }
+    if !grant.checkout.join(".git").exists() {
         return Ok(());
     }
     share_known_locked(
@@ -1465,7 +1538,9 @@ fn update_metadata_acl(
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
     // Serialize read/modify/write ACL grants across simultaneous spawns.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    // A seat can flock even a read-only metadata descriptor. Never let that
+    // advisory lock hold startup recovery or another seat's lifecycle hostage.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
     struct Unlock(i32);
@@ -1915,7 +1990,7 @@ mod tests {
             store.set_agent_state(&good_agent.id, "paused").unwrap();
             let bad = bad_agent.id.clone();
             let good = good_agent.id.clone();
-            let checkout = dir.path().join("bad");
+            let checkout = anyagents_core::agent_work_dir(dir.path(), &bad);
             let survivor = dir.path().join("good");
             for (id, path, group, branch) in [
                 (&bad, &checkout, gid, "bad"),
@@ -1942,14 +2017,29 @@ mod tests {
             let mut grant: Grant =
                 serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
             let common = grant.common.clone();
-            let hostile = common.join("objects/inspection-hostile");
+            let hostile = if kind == "flock" {
+                bad_record.private().join("HEAD")
+            } else {
+                common.join("objects/inspection-hostile")
+            };
             let after = common.join("objects/inspection-after");
             let paths = vec![target(&hostile, gid), target(&after, gid)];
             grant.inspection = true;
             grant.inspection_paths = exact.then_some(paths);
             write_grant(&journal, &grant).unwrap();
             let outside = dir.path().join("outside");
+            let mut held_lock = None;
             match kind {
+                "flock" => {
+                    // flock(2) permits an exclusive lock on a read-only fd.
+                    let file = std::fs::File::open(&hostile).unwrap();
+                    assert_eq!(
+                        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                        0
+                    );
+                    held_lock = Some(file);
+                    std::fs::write(&outside, "outside content\n").unwrap();
+                }
                 "fifo" => {
                     std::fs::remove_file(&hostile).unwrap();
                     let name =
@@ -1967,6 +2057,9 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+            let build_output = checkout.join("target/debug/preserve-after-quarantine");
+            std::fs::create_dir_all(build_output.parent().unwrap()).unwrap();
+            std::fs::write(&build_output, "unique build evidence").unwrap();
             let outside_bytes = std::fs::read(&outside).unwrap();
             let outside_acl = acl(&outside);
             let survivor_dirs = git_dirs(&survivor).unwrap();
@@ -2099,7 +2192,27 @@ mod tests {
                         .contains("quarantined worktree journal")
                 );
             }
+            // Even after releasing a transient lock, quarantine is not cleared
+            // by reaping: no build output or recovery evidence may be removed.
+            drop(held_lock);
+            assert!(!crate::server::reap_subagent_ephemeral_dirs(
+                dir.path(),
+                &bad
+            ));
+            assert_eq!(
+                std::fs::read(&build_output).unwrap(),
+                b"unique build evidence"
+            );
+            let retained: Grant =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert!(retained.quarantined && retained.inspection);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn locked_head_inspection_recovery_starts_both_servers_and_preserves_build_outputs() {
+        recovery_quarantines_hostile_entry("flock");
     }
 
     #[cfg(target_os = "linux")]
@@ -2535,6 +2648,85 @@ mod tests {
                 .iter()
                 .any(|e| e.0 == 8 && e.2 == gid)
         );
+        // Real Git lock+rename discards the old inode's named ACL. The two
+        // lifecycle entries and active cleanup must restore all live readers,
+        // without granting defaults, config writes or unrelated metadata.
+        let config = common.join("config");
+        for refresh in ["launch", "wake", "inspect"] {
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let before = std::fs::metadata(&config).unwrap().ino();
+            crate::worktree::tests::git(&f.source, &["config", "test.replacement", refresh]);
+            assert_ne!(std::fs::metadata(&config).unwrap().ino(), before);
+            assert!(
+                !acl(&config, c"system.posix_acl_access")
+                    .iter()
+                    .any(|e| e.0 == 8)
+            );
+            match refresh {
+                "launch" => ensure_launchable(dir.path(), &id).unwrap(),
+                "wake" => restore_recorded(dir.path(), &id).unwrap(),
+                "inspect" => RecordedWorktree::load(dir.path(), &id, &target)
+                    .unwrap()
+                    .inspect(|| Ok(()))
+                    .unwrap(),
+                _ => unreachable!(),
+            }
+            let access = acl(&config, c"system.posix_acl_access");
+            assert!(access.contains(&(8, 4, gid)));
+            assert!(access.contains(&(8, 4, gid + 1)));
+            for root in [
+                common.clone(),
+                common.join("worktrees"),
+                common.join("logs"),
+            ] {
+                assert!(acl(&root, c"system.posix_acl_default").is_empty());
+            }
+            for protected in [
+                common.join("hooks/pre-commit"),
+                sibling_dirs[0].join("index"),
+            ] {
+                assert!(
+                    !acl(&protected, c"system.posix_acl_access")
+                        .iter()
+                        .any(|e| e.0 == 8 && e.2 == gid)
+                );
+            }
+        }
+        // No refresh may follow an outside symlink or change a hard-linked
+        // replacement. The original outside bytes, owner, mode and ACL survive.
+        let saved = common.join("config.saved");
+        std::fs::rename(&config, &saved).unwrap();
+        let outside = dir.path().join("outside-config");
+        std::fs::write(&outside, b"[core]\nrepositoryformatversion = 0\n").unwrap();
+        let outside_meta = std::fs::metadata(&outside).unwrap();
+        let outside_acl = acl(&outside, c"system.posix_acl_access");
+        for hardlink in [false, true] {
+            if hardlink {
+                std::fs::hard_link(&outside, &config).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&outside, &config).unwrap();
+            }
+            assert!(ensure_launchable(dir.path(), &id).is_err());
+            assert!(restore_recorded(dir.path(), &id).is_err());
+            assert!(
+                RecordedWorktree::load(dir.path(), &id, &target)
+                    .unwrap()
+                    .inspect(|| Ok(()))
+                    .is_err()
+            );
+            let after = std::fs::metadata(&outside).unwrap();
+            assert_eq!(
+                (after.uid(), after.gid(), after.mode()),
+                (outside_meta.uid(), outside_meta.gid(), outside_meta.mode())
+            );
+            assert_eq!(acl(&outside, c"system.posix_acl_access"), outside_acl);
+            assert_eq!(
+                std::fs::read(&outside).unwrap(),
+                b"[core]\nrepositoryformatversion = 0\n"
+            );
+            std::fs::remove_file(&config).unwrap();
+        }
+        std::fs::rename(saved, config).unwrap();
         revoke_recorded(dir.path(), &id).unwrap();
         walk_tree(common, false, &|_| {}, &|_, path| {
             for name in [c"system.posix_acl_access", c"system.posix_acl_default"] {
