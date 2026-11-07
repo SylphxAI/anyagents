@@ -635,6 +635,31 @@ pub fn share_config_with_seat_uid(config_dir: &Path, uid: u32, gid: u32) {
             eprintln!("seat: cannot share {}: {err}", config_dir.display());
         }
     }
+    // Learned facts and agent-authored skills are the only writable host
+    // authority outside config/work. Session pins, raw history and migration
+    // receipts remain owned by the daemon. Never follow an overlay symlink.
+    for name in ["memory", "skills"] {
+        let path = config_dir.with_file_name(name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(meta) if !meta.is_dir() || meta.file_type().is_symlink() => {
+                eprintln!(
+                    "seat: refusing non-directory host overlay {}",
+                    path.display()
+                );
+                continue;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if std::fs::create_dir_all(&path).is_err() {
+                    continue;
+                }
+            }
+            Err(_) => continue,
+            _ => (),
+        }
+        if let Err(error) = give_tree(&path, eff_uid, eff_gid) {
+            eprintln!("seat: cannot share {}: {error}", path.display());
+        }
+    }
     let work_dir = config_dir.with_file_name("work");
     if work_dir.is_dir() {
         share_worktree_with_seat(&work_dir, eff_gid);
@@ -1200,6 +1225,14 @@ fn checks(config: Option<&Path>, boundary: &Boundary, uid: u32, gid: u32) -> Vec
         list.push(Check {
             what: "the agent's own config is writable by it",
             program: format!("[ -w {mine} ]"),
+        });
+        list.push(Check {
+            what: "host memory and skills are writable only in the agent's own tree",
+            program: "root=${MINE%/config}; [ -w \"$root/memory\" ] && [ -w \"$root/skills\" ]; \
+                      for d in \"$DATA\"/agents/*; do [ \"$d\" = \"$root\" ] && continue; \
+                      for n in memory skills; do [ ! -w \"$d/$n\" ] || exit 1; done; done; \
+                      [ ! -w \"$DATA/skills\" ]"
+                .to_string(),
         });
         list.push(Check {
             what: "its capability is readable by its own seat only",

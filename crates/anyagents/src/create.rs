@@ -1114,19 +1114,11 @@ pub(crate) fn sync_canonical_skills(data_dir: &Path) {
 
 #[cfg(unix)]
 pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
-    let data_skills = data_dir_from_config(target_config)
-        .map(|d| d.join("skills"))
-        .filter(|p| p.is_dir())
-        .or_else(|| {
-            target_config
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|d| d.join("skills"))
-                .filter(|p| p.is_dir())
-        });
-    let Some(skills_root) = data_skills else {
+    // An absent shared library must not disable the agent's own overlay.
+    let Some(data) = data_dir_from_config(target_config) else {
         return;
     };
+    let skills_root = data.join("skills");
     if let Some(root) = target_config.parent()
         && let Err(error) = anyagents_core::host_skills::mount(root, &skills_root, target_config)
     {
@@ -7519,6 +7511,23 @@ pub(crate) fn resolve_subagent_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(unix)]
+    fn seat_skill_wrapper_mounts_overlay_without_shared_library() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("agents/agent-id/config");
+        let skill = dir.path().join("agents/agent-id/skills/private/SKILL.md");
+        std::fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(&skill, "---\nname: private\n---\nexact overlay").unwrap();
+        ensure_seat_skills(&config, dir.path());
+        assert_eq!(
+            std::fs::read(config.join(".claude/skills/private/SKILL.md")).unwrap(),
+            std::fs::read(skill).unwrap()
+        );
+        assert!(!dir.path().join("skills").exists());
+    }
 
     #[test]
     fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {

@@ -58,6 +58,25 @@ impl VendorHarness {
             let trimmed = id.trim();
             if !trimmed.is_empty() {
                 let existing = std::fs::read_to_string(path).ok();
+                if let Some(root) = path.parent().and_then(Path::parent) {
+                    let harness = match self {
+                        Self::Claude(..) => "claude-code",
+                        Self::Codex(..) => "codex",
+                        Self::Agy(..) => "agy",
+                        Self::Muse(..) => "muse",
+                        Self::Omp(..) => "omp",
+                        Self::Dsh(..) => "dsh",
+                        Self::Grok(..) => "grok",
+                        Self::Sylphx(..) => "sylphx",
+                        _ => unreachable!(),
+                    };
+                    if let Err(error) =
+                        anyagents_core::host_session::bind_vendor(root, harness, trimmed)
+                    {
+                        eprintln!("host session alias refused: {error}");
+                        return;
+                    }
+                }
                 if existing.as_deref().map(str::trim) != Some(trimmed) {
                     let _ = std::fs::write(path, format!("{trimmed}\n"));
                 }
@@ -363,6 +382,9 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 }
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    // The supervisor owns the agent process lock. Allocate the host generation
+    // before any vendor can consume its instructions, never from a late marker.
+    prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
@@ -387,6 +409,38 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
         }
     }
     res
+}
+
+fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
+    let root = request.config_dir.parent().ok_or("agent root missing")?;
+    let previous = anyagents_core::host_session::active(root).map_err(|e| e.to_string())?;
+    let switched = previous
+        .as_ref()
+        .is_some_and(|s| s.harness != request.agent.harness);
+    if switched {
+        // Deliberate harness cutover starts a native session too. Keep its raw
+        // history in place; only retire the pointer, not its transcript/state.
+        if let Some(file) = crate::create::harness_session_filename(&request.agent.harness) {
+            match std::fs::remove_file(request.config_dir.join(file)) {
+                Ok(()) => (),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        anyagents_core::host_session::new_session(root, &request.agent.harness)
+    } else {
+        anyagents_core::host_session::ensure_active(root, &request.agent.harness)
+    }
+    .map_err(|e| format!("host session pin failed: {e}"))?;
+    if let Some(file) = crate::create::harness_session_filename(&request.agent.harness)
+        && let Some(id) = session_from_file(&request.config_dir, file)
+    {
+        anyagents_core::host_session::bind_vendor(root, &request.agent.harness, &id)
+            .map_err(|e| format!("host session alias failed: {e}"))?;
+    }
+    // Also render in contract-test mode, exercising the shipping launch boundary.
+    crate::create::write_agent_instructions(&request.config_dir, &request.agent, None);
+    Ok(())
 }
 
 fn read_muse_exit_error(config_dir: &Path) -> Option<String> {
@@ -1341,6 +1395,59 @@ fn session_from_file(config_dir: &Path, file_name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipping_launch_boundary_pins_before_marker_and_refreshes_only_on_cutover() {
+        use anyagents_core::{NewAgent, Store, host_session};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(NewAgent::new("launch-pin", "claude-code"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "before dispatch").unwrap();
+        let request = |agent| LaunchRequest {
+            agent,
+            data_dir: dir.path().to_owned(),
+            config_dir: config.clone(),
+            work_dir: root.join("work"),
+            extra_env: vec![],
+        };
+        prepare_host_session(&request(agent.clone())).unwrap();
+        let first = host_session::active(root).unwrap().unwrap();
+        assert!(
+            std::fs::read_to_string(config.join("CLAUDE.md"))
+                .unwrap()
+                .contains(&first.memory.section)
+        );
+        std::fs::write(root.join("memory/MEMORY.md"), "next session only").unwrap();
+        std::fs::write(config.join("claude-session-id"), "late-marker").unwrap();
+        prepare_host_session(&request(agent.clone())).unwrap();
+        agent.model = Some("changed model".into());
+        prepare_host_session(&request(agent.clone())).unwrap();
+        assert_eq!(host_session::active(root).unwrap().unwrap(), first);
+        assert_eq!(
+            host_session::resume_vendor(root, "claude-code", "late-marker").unwrap(),
+            first
+        );
+        agent.harness = "codex".into();
+        std::fs::write(config.join("codex-session-id"), "old-codex-resume-pointer").unwrap();
+        prepare_host_session(&request(agent.clone())).unwrap();
+        let next = host_session::active(root).unwrap().unwrap();
+        assert_ne!(next.generation, first.generation);
+        assert!(next.memory.section.contains("next session only"));
+        assert!(!config.join("codex-session-id").exists());
+        assert!(
+            std::fs::read_to_string(config.join("AGENTS.md"))
+                .unwrap()
+                .contains(&next.memory.section)
+        );
+        prepare_host_session(&request(agent)).unwrap();
+        assert_eq!(host_session::active(root).unwrap().unwrap(), next);
+    }
 
     #[test]
     fn ensure_agy_steering_settings_populates_permissions_and_trusted_workspaces() {

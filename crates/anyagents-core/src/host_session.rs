@@ -5,6 +5,20 @@ use crate::learned_memory::{MemoryPin, atomic_write, pin_session, read_pin};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fs, io, path::Path};
 
+// Serialize host transitions and late vendor aliases across daemon threads and
+// restarts. This lock is host-only, outside the writable learned-memory tree.
+fn lock(root: &Path) -> io::Result<fs::File> {
+    fs::create_dir_all(root.join("sessions"))?;
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(root.join("sessions/registry.lock"))?;
+    file.lock()?;
+    Ok(file)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Session {
     generation: String,
@@ -62,19 +76,25 @@ pub fn active(root: &Path) -> io::Result<Option<HostSession>> {
 /// Allocate before first dispatch only when there is no host session yet.
 /// A different configured harness alone cannot silently discard the saved pin.
 pub fn ensure_active(root: &Path, harness: &str) -> io::Result<HostSession> {
+    let _lock = lock(root)?;
     let registry = read(root)?;
     match registry.active {
         Some(session) if session.harness == harness => materialize(root, &session),
         Some(_) => Err(io::Error::other(
             "host session requires explicit harness switch",
         )),
-        None => new_session(root, harness),
+        None => new_session_unlocked(root, harness),
     }
 }
 
 /// Only an explicit reset/new-session or deliberate harness-switch lifecycle
 /// transition may call this. Ordinary config updates and compaction do not.
 pub fn new_session(root: &Path, harness: &str) -> io::Result<HostSession> {
+    let _lock = lock(root)?;
+    new_session_unlocked(root, harness)
+}
+
+fn new_session_unlocked(root: &Path, harness: &str) -> io::Result<HostSession> {
     if harness.trim().is_empty() {
         return Err(io::Error::other("empty session harness"));
     }
@@ -99,6 +119,7 @@ pub fn new_session(root: &Path, harness: &str) -> io::Result<HostSession> {
 /// Bind a late vendor marker to the ALREADY pinned generation. A marker change
 /// is only a new alias and does not start or refresh the host session.
 pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<HostSession> {
+    let _lock = lock(root)?;
     let mut registry = read(root)?;
     let session = registry
         .active
@@ -114,6 +135,13 @@ pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<Ho
         ));
     }
     let result = materialize(root, &session)?;
+    if registry
+        .aliases
+        .get(&key)
+        .is_some_and(|s| s.generation == session.generation)
+    {
+        return Ok(result); // frequent health checks never rewrite the registry
+    }
     registry.aliases.insert(key, session);
     write(root, &registry)?;
     Ok(result)
@@ -121,6 +149,7 @@ pub fn bind_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<Ho
 
 /// An explicit resume reuses the original pin, including after a harness switch.
 pub fn resume_vendor(root: &Path, harness: &str, vendor_id: &str) -> io::Result<HostSession> {
+    let _lock = lock(root)?;
     let mut registry = read(root)?;
     let session = registry
         .aliases
