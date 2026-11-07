@@ -227,7 +227,7 @@ impl Store {
                     let metadata = IndexMetadata {
                         agent_id: agent.id.to_string(),
                         source: MemoryScope::Memory,
-                        timestamp_ms: modified_ms(&path)?,
+                        timestamp_ms: Some(modified_ms(&path)?),
                         direction: "in".into(),
                         sender: format!("agent:{}", agent.name),
                         destination: format!("agent:{}", agent.name),
@@ -259,7 +259,7 @@ impl Store {
                     let metadata = IndexMetadata {
                         agent_id: agent.id.to_string(),
                         source: MemoryScope::Transcripts,
-                        timestamp_ms: modified_ms(&path)?,
+                        timestamp_ms: None,
                         direction: "in".into(),
                         sender: format!("agent:{}", agent.name),
                         destination: format!("agent:{}", agent.name),
@@ -361,7 +361,7 @@ fn refresh_native_at(
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
     let stamp = FileStamp::read(&open_readonly(path)?)?;
-    let policy = format!("native-jsonl-v2:{}:{}", agent.id, agent.name);
+    let policy = format!("native-jsonl-v3:{}:{}", agent.id, agent.name);
     let old = index
         .source_cursor(agent.id.as_str(), path)?
         .filter(|old| old.policy == policy);
@@ -383,7 +383,7 @@ fn refresh_native_at(
             let mut file = open_readonly(path)?;
             file.seek(SeekFrom::Start(raw.offset))?;
             let header: EventHeader = serde_json::from_reader(file.take(raw.length))?;
-            let metadata = event_metadata(agent, &header, modified_ms(path)?);
+            let metadata = event_metadata(agent, &header);
             let id = format!(
                 "transcript:{}:{}:{}",
                 agent.id,
@@ -545,12 +545,13 @@ struct EventHeader {
     sender: Option<String>,
     destination: Option<String>,
     timestamp_ms: Option<i64>,
+    timestamp: Option<String>,
 }
 #[derive(Default, serde::Deserialize)]
 struct EventRole {
     role: Option<String>,
 }
-fn event_metadata(agent: &Agent, value: &EventHeader, fallback_time: i64) -> IndexMetadata {
+fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
     let role = value
         .role
         .as_deref()
@@ -570,7 +571,13 @@ fn event_metadata(agent: &Agent, value: &EventHeader, fallback_time: i64) -> Ind
     IndexMetadata {
         agent_id: agent.id.to_string(),
         source: MemoryScope::Transcripts,
-        timestamp_ms: value.timestamp_ms.unwrap_or(fallback_time),
+        timestamp_ms: value.timestamp_ms.or_else(|| {
+            value
+                .timestamp
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|time| time.timestamp_millis())
+        }),
         direction: direction.into(),
         sender: value.sender.clone().unwrap_or_else(|| role.into()),
         destination: value
@@ -586,6 +593,77 @@ fn event_metadata(agent: &Agent, value: &EventHeader, fallback_time: i64) -> Ind
 mod tests {
     use super::*;
     use crate::NewAgent;
+    #[test]
+    fn native_times_preserve_explicit_values_and_leave_absent_or_invalid_unknown() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("native-time", "sylphx"))
+            .unwrap();
+        let path = dir
+            .path()
+            .join("agents")
+            .join(agent.id.as_str())
+            .join("config/sylphx-transcript.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        // Source-shaped synthetic fixtures, not captured runtime transcripts.
+        fs::write(&path, concat!(
+            "{\"role\":\"user\",\"timestamp\":\"2026-11-07T04:00:00.123Z\",\"content\":\"timefixture iso\"}\n",
+            "{\"role\":\"user\",\"timestamp_ms\":0,\"content\":\"timefixture epoch\"}\n",
+            "{\"role\":\"user\",\"content\":\"timefixture absent\"}\n",
+            "{\"role\":\"user\",\"timestamp\":\"invalid\",\"content\":\"timefixture invalid\"}\n"
+        )).unwrap();
+        let ids = [agent.id.to_string()];
+        let query = HistorySearchQuery {
+            query: Some("timefixture".into()),
+            sort: crate::HistorySort::Oldest,
+            ..Default::default()
+        };
+        let hits = store
+            .search_host_files(&ids, MemoryScope::Transcripts, &query)
+            .unwrap();
+        assert_eq!(hits.len(), 4);
+        for (needle, expected) in [
+            ("iso", Some(1794024000123)),
+            ("epoch", Some(0)),
+            ("absent", None),
+            ("invalid", None),
+        ] {
+            let hit = hits
+                .iter()
+                .find(|(_, b)| String::from_utf8_lossy(b).contains(needle))
+                .unwrap();
+            assert_eq!(hit.0.metadata.timestamp_ms, expected, "{needle}");
+        }
+        drop(store);
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let filtered = store
+            .search_host_files(
+                &ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery {
+                    since_ms: Some(-1),
+                    until_ms: Some(1),
+                    ..query
+                },
+            )
+            .unwrap();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].0.metadata.timestamp_ms, Some(0));
+        assert_eq!(
+            serde_json::to_value(
+                &hits
+                    .iter()
+                    .find(|(h, _)| h.metadata.timestamp_ms.is_none())
+                    .unwrap()
+                    .0
+                    .metadata
+            )
+            .unwrap()["timestamp_ms"],
+            serde_json::Value::Null
+        );
+    }
+
     #[test]
     fn reconciled_non_jsonl_history_is_full_text_scoped_and_read_back_losslessly() {
         let dir = tempfile::tempdir().unwrap();
@@ -852,7 +930,7 @@ mod tests {
         let metadata = IndexMetadata {
             agent_id: "owner".into(),
             source: MemoryScope::Memory,
-            timestamp_ms: 0,
+            timestamp_ms: Some(0),
             direction: "in".into(),
             sender: "owner".into(),
             destination: "owner".into(),
@@ -1076,7 +1154,7 @@ mod tests {
                 let raw = document_coordinate(&path)?;
                 index.index(
                     "uncommitted-batch",
-                    &event_metadata(&agent, &EventHeader::default(), 0),
+                    &event_metadata(&agent, &EventHeader::default()),
                     &raw,
                 )?;
                 let mut advanced: SourceCursor =

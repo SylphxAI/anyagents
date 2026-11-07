@@ -1571,7 +1571,9 @@ pub fn print_conversation_pretty(
     };
     println!("\n  {}\n", bold_cyan(&header));
     for turn in turns {
-        let ts = dim(&format_timestamp_ms(turn.timestamp_ms));
+        let ts = dim(&turn
+            .timestamp_ms
+            .map_or_else(|| "unknown".into(), format_timestamp_ms));
         let dir = if turn.direction == "out" {
             bold_green("→ out")
         } else {

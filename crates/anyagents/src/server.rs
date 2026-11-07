@@ -5117,7 +5117,7 @@ async fn conversation_route(
                 to: t.to,
                 reply_to: t.reply_to,
                 text: t.text,
-                timestamp_ms: t.timestamp_ms,
+                timestamp_ms: Some(t.timestamp_ms),
             })
             .collect();
         let mut ranked: Vec<_> = turns
@@ -6949,6 +6949,15 @@ pub(crate) mod tests {
                 assert!(response.turns.iter().all(|t|t.raw.is_some() && t.window.is_some()));
                 for t in &response.turns {let raw=t.raw.as_ref().unwrap();let bytes=std::fs::read(&raw.segment).unwrap();assert_eq!(anyagents_core::learned_memory::sha256(&bytes[raw.offset as usize..(raw.offset+raw.length) as usize]),raw.sha256);}
             }
+            // Native records lacking time must remain null at the canonical
+            // surface, never inherit a recent filesystem timestamp.
+            let native = dir.path().join("agents").join(child.id.as_str()).join("config/sylphx-transcript.jsonl");
+            use std::io::Write;
+            std::fs::OpenOptions::new().append(true).open(native).unwrap().write_all(b"{\"role\":\"user\",\"content\":\"untimedcanonical\"}\n").unwrap();
+            let Json(untimed)=conversation_route(principal(),State(state.clone()),AxumPath(child.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"transcripts","query":"untimedcanonical"})).unwrap())).await.unwrap_or_else(|e|panic!("{}", e.message));
+            assert_eq!(untimed.turns.len(), 1);
+            assert!(untimed.turns[0].timestamp_ms.is_none());
+            assert!(serde_json::to_value(&untimed).unwrap()["turns"][0]["timestamp_ms"].is_null());
             let denied=conversation_route(principal(),State(state.clone()),AxumPath(peer.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"memory"})).unwrap())).await.unwrap_err();assert_eq!(denied.status,StatusCode::FORBIDDEN);
             let query=serde_json::from_value(serde_json::json!({"scope":"all","only_tools":true,"tool_name":"browser","from_seq":1,"to_seq":1})).unwrap();
             let Json(response)=conversation_route(principal(),State(state),AxumPath("all".into()),Query(query)).await.unwrap_or_else(|e|panic!("{}",e.message));assert_eq!(response.turns.len(),2);assert!(response.turns.iter().all(|t|t.tool_name.as_deref()==Some("browser")));

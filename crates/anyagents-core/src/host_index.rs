@@ -46,7 +46,8 @@ pub struct IndexMetadata {
     /// Stable agent ID, never a caller-supplied display name.
     pub agent_id: String,
     pub source: MemoryScope,
-    pub timestamp_ms: i64,
+    /// Native events without a source timestamp are explicitly unknown.
+    pub timestamp_ms: Option<i64>,
     pub direction: String,
     pub sender: String,
     pub destination: String,
@@ -72,10 +73,38 @@ impl HostIndex {
     pub fn open(path: &Path) -> Result<Self, IndexError> {
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;
-            CREATE TABLE IF NOT EXISTS host_documents (
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;",
+        )?;
+        // This index is a rebuildable projection, not a raw-history authority.
+        // Early unreleased PR1 caches used mandatory mtime fallbacks. Invalidate
+        // those projections rather than presenting guessed historical times.
+        let old_required_time = conn
+            .prepare("PRAGMA table_info(host_documents)")?
+            .query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?)))?
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .any(|(name, required)| name == "timestamp_ms" && required != 0);
+        if old_required_time {
+            // Serialize and recheck the disposable-schema upgrade: another
+            // process may have rebuilt it after the first metadata read.
+            conn.execute_batch("BEGIN IMMEDIATE;")?;
+            let still_required: i64 = conn.query_row(
+                "SELECT coalesce(max([notnull]),0) FROM pragma_table_info('host_documents') WHERE name='timestamp_ms'", [], |r| r.get(0))?;
+            if still_required != 0 {
+                conn.execute_batch(
+                    "
+                DROP TRIGGER IF EXISTS host_windows_delete;
+                DROP TABLE IF EXISTS host_windows;
+                DROP TABLE IF EXISTS host_documents;
+                DROP TABLE IF EXISTS host_sources;
+                DROP TABLE IF EXISTS host_fts;",
+                )?;
+            }
+        }
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS host_documents (
                 id TEXT PRIMARY KEY, agent_id TEXT NOT NULL, source TEXT NOT NULL,
-                timestamp_ms INTEGER NOT NULL, direction TEXT NOT NULL,
+                timestamp_ms INTEGER, direction TEXT NOT NULL,
                 sender TEXT NOT NULL, destination TEXT NOT NULL, tool_name TEXT,
                 role TEXT, segment TEXT NOT NULL, offset INTEGER NOT NULL,
                 length INTEGER NOT NULL, sha256 TEXT NOT NULL, seq INTEGER NOT NULL);
@@ -95,6 +124,9 @@ impl HostIndex {
             "INSERT INTO host_fts(host_fts,rank) VALUES('secure-delete',1)",
             [],
         )?;
+        if old_required_time {
+            conn.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")?;
+        }
         Ok(Self { conn })
     }
 
@@ -160,7 +192,7 @@ impl HostIndex {
             })
             .collect::<Result<Vec<_>, _>>()?;
         due.retain(|(_, _, c)| {
-            c.policy.starts_with("native-jsonl-v2:")
+            c.policy.starts_with("native-jsonl-v3:")
                 && c.full_verified_ms <= now_ms.saturating_sub(3_600_000)
         });
         due.sort_by(|a, b| {
@@ -803,7 +835,7 @@ mod tests {
         IndexMetadata {
             agent_id: owner.into(),
             source,
-            timestamp_ms: time,
+            timestamp_ms: Some(time),
             direction: "in".into(),
             sender: "user".into(),
             destination: owner.into(),
@@ -811,6 +843,29 @@ mod tests {
             role: Some("user".into()),
         }
     }
+    #[test]
+    fn required_time_cache_is_invalidated_without_touching_raw_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let raw = dir.path().join("source.jsonl");
+        std::fs::write(&raw, b"{\"content\":\"authoritative history\"}\n").unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE host_documents (timestamp_ms INTEGER NOT NULL); INSERT INTO host_documents VALUES (123);").unwrap();
+        drop(conn);
+        let index = HostIndex::open(&path).unwrap();
+        let required: i64 = index.conn.query_row("SELECT [notnull] FROM pragma_table_info('host_documents') WHERE name='timestamp_ms'", [], |r| r.get(0)).unwrap();
+        assert_eq!(required, 0);
+        let journal: String = index
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal, "wal");
+        assert_eq!(
+            std::fs::read(&raw).unwrap(),
+            b"{\"content\":\"authoritative history\"}\n"
+        );
+    }
+
     #[test]
     fn serialized_json_escapes_are_searchable_with_exact_raw_coordinates() {
         let dir = tempfile::tempdir().unwrap();

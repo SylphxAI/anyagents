@@ -280,7 +280,8 @@ pub struct ConversationTurnView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub text: String,
-    pub timestamp_ms: i64,
+    /// Null when the native historical event has no source timestamp.
+    pub timestamp_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
