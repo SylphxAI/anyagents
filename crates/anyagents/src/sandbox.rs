@@ -270,12 +270,13 @@ pub fn seat_for_agent_with_hint(
         return Some((agent_name.to_string(), uid, gid, sock_gid));
     }
     if pinned_uid(agent_name).is_some() && std::env::var_os("ANYAGENTS_TESTS").is_some() {
-        // A test machine is its own single seat.
+        // A test machine is its own single seat. Its primary group need not
+        // have the same numeric ID as its user (for example, on macOS).
         return Some((
             agent_name.to_string(),
             current_uid(),
-            current_uid(),
-            current_uid(),
+            server_gid(),
+            server_gid(),
         ));
     }
     if let Some(uid) = pinned_uid(agent_name)
@@ -1242,6 +1243,38 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_own_seat_test_uses_the_process_group_not_its_uid() {
+        let _env = crate::server::tests::env_lock();
+        // SAFETY: under the server test lock, restored before releasing it.
+        let names = ["ANYAGENTS_TESTS", "ANYAGENTS_AGENTS", "ANYAGENTS_FAKE_MODE"];
+        let previous = names.map(|name| std::env::var_os(name));
+        unsafe {
+            std::env::set_var("ANYAGENTS_TESTS", "own-seat");
+            std::env::set_var("ANYAGENTS_AGENTS", "own-seat=2101");
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+        let seat = seat_for_agent("own-seat");
+        // SAFETY: as above.
+        unsafe {
+            for (name, value) in names.into_iter().zip(previous) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        assert_eq!(
+            seat,
+            Some((
+                "own-seat".to_string(),
+                current_uid(),
+                server_gid(),
+                server_gid(),
+            ))
+        );
+    }
 
     #[test]
     fn an_unconfigured_seat_is_refused_before_anything_starts() {
