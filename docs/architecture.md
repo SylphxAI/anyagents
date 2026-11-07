@@ -355,11 +355,13 @@ require an authenticated server rather than an offline database fallback.
 - `inbox(since?)` reads this agent's own mailbox. It never sends.
 - `conversation(...)` / `search(...)` and the native `sylphx` harness `memory_recall(...)` tool run **Zero-Embedding Lossless Lexical + Structured Agentic History Search (`Raw-RAG`)**:
   - **Read authorization:** Non-admin agents read only their own and descendant mailboxes/transcripts. `agent: "all"` and `"*"` mean that authorized tree, not the workspace. Messaging scope, public reachability and shared groups do not grant private history access; explicit parent/sibling/peer reads return forbidden. `with`, sender, range and radius can only narrow the authorized rows. Operator and explicitly privileged root-admin reads are unrestricted and audited. Agent CLI reads require the authenticated server, without an offline SQLite fallback.
-  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation.
+  - **No vector embeddings and no LLM-written memory mutations:** History stays 100% lossless in the append-only transcript and SQLite `rag_chunks_fts` (`unicode61` over raw text + hybrid ASCII identifier sub-tokens + CJK unigrams & bigrams). There is zero embedding API cost, zero embedding latency, and zero model-lock degradation. Exceptional erasure uses the permissioned, audited [redaction operation](redaction.md), preserving ids/order and replacing only explicitly selected content; ordinary recall/compaction remains lossless.
   - **Multi-query & negative filtering:** `query` plus `queries: [...]` (OR-combined keyword/synonym sets) and `exclude: [...]` (negative filters).
   - **Tool history toggles:** `include_tools` (default `true`; `false` restricts search to messages without tool/system noise), `only_tools` (`true` restricts search to tool calls and outputs), and `tool_name` (filters tool history to a specific tool such as `"bash"`, `"browser"`, `"agents"`, `"schedule"`, `"send"`).
   - **Structured filters & ordering:** Filter by `with` (peer/channel/group), `direction` (`"in"` / `"out"`), `sender`, `role` (`"user"` / `"assistant"` / `"tool"`), `since_ms` / `until_ms`, and order by `sort = "relevance"` (BM25 + CJK bigram + exact-match boost + query coverage + recency), `"newest"` (`timestamp DESC`), or `"oldest"` (`timestamp ASC`).
-  - **Range reads & contiguous episode windows:** Read verbatim transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
+  - **Range reads & contiguous episode windows:** Read transcript ranges (`range = "seq:<from>-<to>"` or `"transcript:<from>-<to>"`, or `from_seq` / `to_seq`) and expand `radius` (`0..=10`) contiguous neighboring events around each hit to preserve causal paths `P(path | result)`.
+  - **Bounded native transcript recall:** Native `memory_recall` returns at most 32,768 serialized UTF-8 bytes per call. Large range, filter and query results return `mode: "page"`, `format: "json_fragment"`, `content` and `next_cursor`. Repeat the original arguments with that cursor and concatenate `content` fragments to recover the result document; later transcript appends do not change its snapshot. Items already present verbatim in active context return raw pointers instead of replaying their contents. Once evicted, their original ranges remain recoverable. Native `read_file` reads of the current session's transcript, including filesystem aliases, use this same boundary; its line coordinates remain 1-based.
+  - **Budgeted native compaction:** Before dispatch, the native harness budgets the complete serialized request, output reserve and framing margin. It tests in-memory candidates that retain the latest completed tool batch, replace bulky results with original raw-range pointers, or evict completed context while preserving exact pending inbound. Only a candidate that fits commits a new window. If fixed instructions/tools and pending inbound alone cannot fit, preflight refuses without dispatch or a new compaction anchor; repeating the same attempt does not grow its context.
 - `agents()` lists the agents on the server with their harness, state and lag, so agents can see each other.
 
 ## Usage and cost
@@ -384,16 +386,17 @@ provider-route refreshes and unrelated metadata updates. SQLite is authoritative
 marker); only the scope setter owns these keys. Harness-environment replacement
 merges them from the current row in the same write transaction.
 
-Without an explicit policy, roots are `public`, `*-assistant` children are
-`isolated`, other children with a nonempty `role` are `siblings`, and task
-children without a role are `private`. Description, instructions and role
-updates that omit both `scope` and `public` preserve the explicit policy.
+New roots default to `public`; all new children default to `private`, regardless
+of name or role. The store upgrade materializes each existing agent's effective
+scope explicitly, including legacy name/role defaults and legacy public markers.
+Description, instructions and role updates that omit both `scope` and `public`
+preserve that explicit policy.
 
 The legacy `public` boolean describes cross-tree reachability, not sibling
 access. `true` selects `public`. `false` preserves an existing nonpublic scope;
 for a public agent it restores the default above. An explicit `scope` takes
-precedence when both fields are supplied. To restrict a standing child to
-`private`, send `scope: "private"` explicitly.
+precedence when both fields are supplied. To enable sibling collaboration, send
+`scope: "siblings"` explicitly.
 
 Agents may edit their own description and instructions. Changing scope or role
 requires an ancestor, a root admin or the operator; updating another agent's
@@ -417,3 +420,26 @@ ORDER BY id;
 ## Storage
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
+
+## Methodology-neutral roles and lifecycle
+
+`role` is an optional display label. It does not select a prompt, communication
+policy, discovery membership or process lifetime. Private `instructions` define
+an agent's responsibilities, reporting conventions and decision to archive.
+AnyAgents ships no company hierarchy, standing-agent policy or role templates.
+Role labels are not interpreted as template names; callers that manage templates
+supply their contents through `instructions`.
+
+Every agent, including a root or role-bearing child, may archive itself.
+Archive is reversible: an intentional direct message wakes the identity again;
+passive notifications do not. Archive preserves the browser profile and login
+state; only `delete` removes the agent's browser profile. Existing clean/pushed
+managed-worktree cleanup still applies, while dirty or unpushed work is retained.
+
+After a completed turn, any agent releases its process to `idle` when its mailbox
+is drained, its latest accepted turn is complete, it has no running children or
+in-flight background commands, and it has no active error. An idle agent wakes
+on new mail. Its ID, role, instructions, scope, session, mailbox cursor, pending
+deliveries and schedules remain intact. There is no role-based residency flag.
+Topology and child discovery follow relationships and explicit scope, never the
+presence of a role label. The default CLI depth limit applies equally to all roles.

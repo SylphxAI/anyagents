@@ -470,3 +470,34 @@ mod create_agent_tests {
         assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
     }
 }
+
+/// End-exclusive coordinates in decoded body text, not serialized JSON bytes.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionSpan {
+    /// `bytes` (UTF-8 boundaries required) or `chars` (Unicode scalar values).
+    pub unit: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TryFrom<RedactionSpan> for anyagents_core::redaction::Span {
+    type Error = anyagents_core::Error;
+    fn try_from(span: RedactionSpan) -> Result<Self, Self::Error> {
+        use anyagents_core::redaction::SpanUnit;
+        let unit = match span.unit.as_str() {
+            "bytes" => SpanUnit::Bytes,
+            "chars" => SpanUnit::Chars,
+            _ => {
+                return Err(anyagents_core::Error::Message(
+                    "span unit must be bytes or chars".into(),
+                ));
+            }
+        };
+        Ok(Self {
+            unit,
+            start: span.start,
+            end: span.end,
+        })
+    }
+}

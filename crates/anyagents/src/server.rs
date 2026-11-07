@@ -330,6 +330,10 @@ async fn serve(
         .route("/v1/channels", get(channels_route).post(add_channel_route))
         .route("/v1/agents/{name}/inbox", get(inbox))
         .route("/v1/agents/{name}/conversation", get(conversation_route))
+        .route(
+            "/v1/agents/{name}/conversation/redact",
+            post(redact_conversation_route),
+        )
         .route("/v1/agents/{name}/archive", post(archive_agent_route))
         .route("/v1/agents/{name}/pause", post(pause_agent_route))
         .route("/v1/agents/{name}/wake", post(wake_agent_route))
@@ -707,8 +711,8 @@ fn spawn_admin_sylphx_delivery(
                         }
                     }
                     flush_harness_usage(&harness, &mut recorded_usage);
-                    if completed_any && !had_err && agent.parent_id.is_some() {
-                        let _ = store.complete_idle_subagent(&agent.id);
+                    if completed_any && !had_err {
+                        let _ = store.complete_idle_agent(&agent.id);
                     }
                 }
                 Err(reason) => {
@@ -1223,8 +1227,7 @@ fn reconcile_agent_snapshot(
                 if !guard.flushing_sylphx.contains(agent.id.as_str()) {
                     if !has_pending_work
                         && persisted_err.is_none()
-                        && agent.parent_id.is_some()
-                        && store.complete_idle_subagent(&agent.id).unwrap_or(false)
+                        && store.complete_idle_agent(&agent.id).unwrap_or(false)
                     {
                         let (delivery_mode, steer_support) = declared(&agent.harness);
                         health.publish(
@@ -1543,6 +1546,10 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
             .route("/v1/channels", get(channels_route).post(add_channel_route))
             .route("/v1/agents/{name}/inbox", get(inbox))
             .route("/v1/agents/{name}/conversation", get(conversation_route))
+            .route(
+                "/v1/agents/{name}/conversation/redact",
+                post(redact_conversation_route),
+            )
             .route("/v1/agents/{name}/archive", post(archive_agent_route))
             .route("/v1/agents/{name}/pause", post(pause_agent_route))
             .route("/v1/agents/{name}/wake", post(wake_agent_route))
@@ -3858,24 +3865,13 @@ async fn archive_agent_route(
         };
         let is_self =
             matches!(&principal, Principal::Agent { agent_id, .. } if agent_id == &found.id);
-        if found.parent_id.is_none() {
-            if is_self {
-                return Err(ApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "a root agent cannot archive itself; pass a target agent name or id in `agent`",
-                ));
-            }
+        if found.parent_id.is_none() && !is_self {
             require_admin_or_operator(
                 &state.store,
                 &principal,
                 "agents.archive_root",
                 &found.name,
             )?;
-        } else if is_self && found.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            return Err(ApiError::new(
-                StatusCode::BAD_REQUEST,
-                "a standing domain sub-agent (with a role) cannot archive itself; report completion to `parent` instead",
-            ));
         } else if matches!(
             &principal,
             Principal::Agent { agent_id, .. }
@@ -3905,7 +3901,11 @@ async fn archive_agent_route(
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        if state.health.get(&found.id).is_none_or(|live| !live.process_alive) {
+        if state
+            .health
+            .get(&found.id)
+            .is_none_or(|live| !live.process_alive)
+        {
             reap_archived_agent_locked(&state.store, state.store.data_dir(), &found.id);
         }
         Ok(Json(agent_view(&state.store, &state.health, &agent)?))
@@ -3965,10 +3965,6 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
     let mut shared_workdirs = std::collections::HashSet::new();
     if let Some(agent) = agent {
         let _ = crate::browser::stop_profile(data_dir, &agent.name);
-        if parent_id.is_some() && agent.role.as_deref().is_none_or(|r| r.trim().is_empty()) {
-            let bp = data_dir.join("browser-profiles").join(&agent.name);
-            complete &= remove_path_with_seat(&bp, seat_ids);
-        }
     }
     for other in &agents {
         let keep_protected =
@@ -4360,6 +4356,15 @@ async fn delete_agent_route(
             .join("agents")
             .join(deleted.id.as_str());
         let seat_ids = detect_seat_ids(&agent_dir.join("config"));
+        let _ = crate::browser::stop_profile(state.store.data_dir(), &deleted.name);
+        remove_path_with_seat(
+            &state
+                .store
+                .data_dir()
+                .join("browser-profiles")
+                .join(&deleted.name),
+            seat_ids,
+        );
         reap_subagent_ephemeral_dirs(state.store.data_dir(), &deleted.id);
         remove_path_with_seat(&agent_dir.join("config"), seat_ids);
         if !agent_dir.join("work").exists() {
@@ -4658,6 +4663,32 @@ async fn inbox(
         }
     };
     spawn_store(move || inbox_of(&state.store, &agent_id, query.since, query.limit)).await
+}
+
+/// `conversation.redact`: authenticated ancestors and admins only. The store
+/// repeats authorization inside the write transaction; peers and self are denied.
+async fn redact_conversation_route(
+    principal: Principal,
+    State(state): State<AppState>,
+    AxumPath(name): AxumPath<String>,
+    Json(request): Json<anyagents_core::redaction::Request>,
+) -> Result<Json<anyagents_core::redaction::Receipt>, ApiError> {
+    spawn_store(move || {
+        let target = state
+            .store
+            .agent_by_name(name.strip_prefix("agent:").unwrap_or(&name))
+            .map_err(ApiError::from_store)?;
+        let actor = match principal {
+            Principal::Operator => anyagents_core::redaction::Actor::Operator,
+            Principal::Agent { agent_id, .. } => anyagents_core::redaction::Actor::Agent(agent_id),
+        };
+        state
+            .store
+            .redact_conversation(actor, &target.id, &request)
+            .map(Json)
+            .map_err(ApiError::from_store)
+    })
+    .await
 }
 
 async fn conversation_route(
@@ -6395,6 +6426,8 @@ impl ApiError {
 
     fn from_store(err: Error) -> Self {
         let status = match &err {
+            Error::PermissionDenied(_) => StatusCode::FORBIDDEN,
+            Error::AgentBusy => StatusCode::CONFLICT,
             Error::AgentNotFound(_) => StatusCode::NOT_FOUND,
             Error::GroupForbidden { .. } => StatusCode::FORBIDDEN,
             Error::AgentExists(_) => StatusCode::CONFLICT,
@@ -6487,13 +6520,13 @@ pub(crate) mod tests {
         runtime.block_on(async {
             let mut expected_audit = Vec::new();
             for (body, before, after, source) in [
-                (serde_json::json!({"scope":"siblings"}), "siblings", "siblings", "scope"),
+                (serde_json::json!({"scope":"siblings"}), "private", "siblings", "scope"),
                 (serde_json::json!({"description":"Public charter", "public":false}), "siblings", "siblings", "public"),
                 (serde_json::json!({"instructions":"Private instructions"}), "siblings", "siblings", ""),
                 (serde_json::json!({"role":"Updated Mind"}), "siblings", "siblings", ""),
                 (serde_json::json!({"public":true}), "siblings", "public", "public"),
-                (serde_json::json!({"public":false}), "public", "siblings", "public"),
-                (serde_json::json!({"scope":"isolated", "public":true}), "siblings", "isolated", "scope"),
+                (serde_json::json!({"public":false}), "public", "private", "public"),
+                (serde_json::json!({"scope":"isolated", "public":true}), "private", "isolated", "scope"),
                 (serde_json::json!({"public":false}), "isolated", "isolated", "public"),
                 (serde_json::json!({"scope":"private"}), "isolated", "private", "scope"),
                 (serde_json::json!({"public":false}), "private", "private", "public"),
@@ -6550,7 +6583,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn role_spawn_defaults_to_siblings_and_task_spawn_defaults_to_private() {
+    fn spawn_defaults_to_private_regardless_of_role() {
         let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -6570,7 +6603,7 @@ pub(crate) mod tests {
             },
         };
         tokio::runtime::Runtime::new().unwrap().block_on(async {
-            for (name, role, scope) in [("standing", Some("Mind"), "siblings"), ("task", None, "private")] {
+            for (name, role, scope) in [("labelled", Some("Researcher"), "private"), ("task", None, "private")] {
                 let body = serde_json::from_value(serde_json::json!({"name":name,"role":role,"harness":"codex","model":"test-model","workdir":"private"})).unwrap();
                 let (_, Json(created)) = create_agent_route(Principal::Agent { agent_id: parent.id.clone(), name: parent.name.clone() }, State(state.clone()), Json(body)).await.unwrap_or_else(|e| panic!("{}: {}",e.status,e.message));
                 assert_eq!(created.scope, scope);
@@ -7014,6 +7047,66 @@ pub(crate) mod tests {
             std::fs::read(cfg.join(".anyagents-reaped")).unwrap(),
             std::fs::read(cfg.join(".anyagents-archived")).unwrap()
         );
+    }
+
+    #[test]
+    fn roots_and_role_bearing_children_can_self_archive_without_losing_browser_profiles() {
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let parent = store
+            .create_agent(anyagents_core::NewAgent::new("parent", "codex"))
+            .unwrap();
+        let state = AppState {
+            store: Arc::clone(&store),
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
+            auth: auth::Mode::Trusted {
+                data_dir: dir.path().into(),
+            },
+        };
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (name, parent_id, role) in [
+                ("root", None, Some("Researcher")),
+                (
+                    "labelled-child",
+                    Some(parent.id.clone()),
+                    Some("Researcher"),
+                ),
+                ("plain-child", Some(parent.id.clone()), None),
+            ] {
+                let mut new = anyagents_core::NewAgent::new(name, "codex");
+                new.parent_id = parent_id;
+                new.role = role.map(str::to_string);
+                let agent = store.create_agent(new).unwrap();
+                let profile = dir.path().join("browser-profiles").join(name);
+                std::fs::create_dir_all(&profile).unwrap();
+                std::fs::write(profile.join("login"), b"preserved session").unwrap();
+                let caller = Principal::Agent {
+                    agent_id: agent.id.clone(),
+                    name: name.into(),
+                };
+                let Json(archived) =
+                    archive_agent_route(caller, State(state.clone()), AxumPath("self".into()))
+                        .await
+                        .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert_eq!(archived.state, "archived");
+                assert_eq!(store.agent(&agent.id).unwrap().role, agent.role);
+                assert_eq!(
+                    std::fs::read(profile.join("login")).unwrap(),
+                    b"preserved session"
+                );
+                let _ = delete_agent_route(
+                    Principal::Operator,
+                    State(state.clone()),
+                    AxumPath(name.into()),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("{}: {}", e.status, e.message));
+                assert!(!profile.exists(), "delete must remove the profile");
+            }
+        });
     }
 
     #[test]
