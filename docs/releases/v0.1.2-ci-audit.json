@@ -1,9 +1,10 @@
 {
-  "read_at_utc": "2026-11-07T03:18:29.249492+00:00",
+  "read_at_utc": "2026-11-07T03:50:28.408671+00:00",
   "base_tag": "v0.1.1",
-  "cut_source_sha": "9ff55feb01baa2b063ec11cbb1c0883e2d780162",
+  "cut_source_sha": "7a44952c42afc0a5d89cf1b29421109c6b6f5541",
+  "cut_deadline_utc": "2026-11-07T03:50:00Z",
   "release_candidate_pr": "https://github.com/SylphxAI/anyagents/pull/90",
-  "release_gate": "Full Linux, macOS and exact-head ci-ok must pass on the release candidate before merge.",
+  "release_gate": "Full Linux, macOS and exact-head ci-ok must pass on the release candidate before the normal merge queue.",
   "pull_requests": [
     {
       "number": 59,
@@ -400,18 +401,18 @@
       "disposition": "included"
     },
     {
-      "number": 89,
+      "number": 98,
       "merge_sha": "b2b0e55a8960509c2a1fe80d251b96de1ff53e7d",
       "title": "Revert \"feat(agents): add archetype templates, list query/pagination, idle cache dehydration, and domain mind archive guard (#89)\" (#98)",
-      "head_sha": "8a1f987f25fdf71cf4137f9eff6254e703832711",
-      "merged_at": "2026-11-07T02:43:56Z",
+      "head_sha": "52c2b838023f1fcbf5d7a29500130138a3e09ad0",
+      "merged_at": "2026-11-07T03:05:01Z",
       "ci_ok": {
         "name": "ci-ok",
         "conclusion": "SUCCESS",
         "status": "COMPLETED",
-        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42330322101/job/128275979364"
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42331735387/job/128280462153"
       },
-      "disposition": "reverted by #98; not shipped"
+      "disposition": "included"
     },
     {
       "number": 96,
@@ -438,6 +439,118 @@
         "conclusion": "SUCCESS",
         "status": "COMPLETED",
         "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42332786105/job/128283728952"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 104,
+      "merge_sha": "7a2178e1745e4bd72f2ef0d7cdf1f91e05e539ca",
+      "title": "test: quarantine Chromium focus startup race (#104)",
+      "head_sha": "6950b453ffa36750a3623aa5656ef5606c418f2f",
+      "merged_at": "2026-11-07T03:18:08Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333030254/job/128284482313"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 87,
+      "merge_sha": "b85b77419d15229d53ef63dc3caccf76de3b6261",
+      "title": "[review] Restrict conversation history to the caller\u2019s supervised tree (#87)",
+      "head_sha": "6a71e96a48f2a9076e4f850c65c244344680d2b5",
+      "merged_at": "2026-11-07T03:28:40Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333289766/job/128285279493"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 105,
+      "merge_sha": "09017e0b807fbc01bf37c58b6ad91976ec01569a",
+      "title": "fix(supervisor): keep recovery behind undelivered mail (#105)",
+      "head_sha": "1c7aa235a981689ce6f815ff63aa93b729ab5904",
+      "merged_at": "2026-11-07T03:31:24Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333560014/job/128286185281"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 99,
+      "merge_sha": "9b5a8ce1e8a9879b72574aaa0374de7b4b320378",
+      "title": "fix(schedule): share conditional REST probes for GitHub watches (#99)",
+      "head_sha": "71a5e5468f9ed04db66a0bda4fca5da0bc54482a",
+      "merged_at": "2026-11-07T03:32:36Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333787628/job/128286865612"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 100,
+      "merge_sha": "c900a560dd0fb7fea9a8194f5ac5237fa525eed5",
+      "title": "fix(test): control rollout freshness in error notification fixture (#100)",
+      "head_sha": "643183933c119325fb737a404f6cfba5f8ca6f34",
+      "merged_at": "2026-11-07T03:32:37Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42333486586/job/128286072013"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 107,
+      "merge_sha": "e5118b0f583f9d8c995c47cd6e7a842586d0b932",
+      "title": "docs: describe the required merge queue (#107)",
+      "head_sha": "659805d05812a75c50b8d1155fd18e1e47dbd280",
+      "merged_at": "2026-11-07T03:32:38Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42334229954/job/128287450060"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 101,
+      "merge_sha": "c926b48c198d237b98508e44b4e36c06b53cd0a2",
+      "title": "fix(auth): keep HTTP fallback credentials out of argv (#101)",
+      "head_sha": "2c6b596d45aef16446919e0661342fe59e820b3e",
+      "merged_at": "2026-11-07T03:42:36Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42332731362/job/128283538778"
+      },
+      "disposition": "included"
+    },
+    {
+      "number": 91,
+      "merge_sha": "7a44952c42afc0a5d89cf1b29421109c6b6f5541",
+      "title": "feat(browser): support native takeover clipboard and keyboard shortcuts (#91)",
+      "head_sha": "3b7401298a2bc171827d16734986ff11961646de",
+      "merged_at": "2026-11-07T03:46:58Z",
+      "ci_ok": {
+        "name": "ci-ok",
+        "conclusion": "SUCCESS",
+        "status": "COMPLETED",
+        "detailsUrl": "https://github.com/SylphxAI/anyagents/actions/runs/42334878508/job/128290125998"
       },
       "disposition": "included"
     }

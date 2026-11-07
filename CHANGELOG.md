@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Next release
 
-- Conversation-history isolation (#87) and native browser takeover clipboard
-  and keyboard shortcuts (#91) were not merged at the 0.1.2 cut.
+- Serving-process identity read-back (#106) did not pass its exact-head CI gate
+  by the 0.1.2 cut and remains for the next release.
 
 ## 0.1.2
 
@@ -18,10 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Explicit local or cloud workspace placement, isolated worktree lifecycles,
   and nested agent collaboration within supervised scopes.
-- Mobile browser takeover controls and persistent takeover sessions.
+- Mobile browser takeover controls, persistent takeover sessions, and native
+  clipboard and keyboard shortcuts.
+- Conditional GitHub REST probes shared across schedule watches.
 
 ### Fixed
 
+- Conversation-history reads remain within the caller's supervised tree.
+- Recovery stays behind undelivered mailbox entries. Error notification fixtures
+  control rollout freshness, and HTTP fallback credentials stay out of argv.
 - OpenCode agents keep independent service ports across restarts, replace
   occupied ports, and retry transient bind collisions without discovering a
   shared managed service.
@@ -71,6 +76,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [#97](https://github.com/SylphxAI/anyagents/pull/97): fix(test): complete the runtime switch replay control.
 - [#96](https://github.com/SylphxAI/anyagents/pull/96): test: quarantine nondeterministic archive partial-cleanup fixture.
 - [#102](https://github.com/SylphxAI/anyagents/pull/102): fix(core): release lifecycle flock when its guard drops.
+- [#104](https://github.com/SylphxAI/anyagents/pull/104): test: quarantine Chromium focus startup race.
+- [#87](https://github.com/SylphxAI/anyagents/pull/87): Restrict conversation history to the caller’s supervised tree.
+- [#105](https://github.com/SylphxAI/anyagents/pull/105): fix(supervisor): keep recovery behind undelivered mail.
+- [#99](https://github.com/SylphxAI/anyagents/pull/99): fix(schedule): share conditional REST probes for GitHub watches.
+- [#100](https://github.com/SylphxAI/anyagents/pull/100): fix(test): control rollout freshness in error notification fixture.
+- [#107](https://github.com/SylphxAI/anyagents/pull/107): docs: describe the required merge queue.
+- [#101](https://github.com/SylphxAI/anyagents/pull/101): fix(auth): keep HTTP fallback credentials out of argv.
+- [#91](https://github.com/SylphxAI/anyagents/pull/91): feat(browser): support native takeover clipboard and keyboard shortcuts.
 
 ### Verification and exclusions
 
