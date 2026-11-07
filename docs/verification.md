@@ -140,3 +140,27 @@ Set `TAKEOVER_GOOGLE_ACCEPTANCE=1` for the additional network-dependent,
 unauthenticated `accounts.google.com` phone-layout captures. No credentials are
 entered. This is separate from the deterministic local fixture and does not
 certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
+
+## Host memory under a managed UID
+
+The required public Linux CI lane builds the shipping `anyagents` binary and
+runs `scripts/verify-host-memory-seat.py` with native `/usr/bin/setpriv`. The
+entrypoint is `anyagents --data <synthetic-data> agent-run --config <own-config>
+-- <probe>`: production `sandbox::run` executes its memory/skills and identity
+admission checks before launching the probe. No test launcher substitutes for
+those checks. The agent's actual UID 24031 and primary GID 24032 are asserted
+independently; supplementary socket group 24033 is not a primary-GID proxy.
+
+The disposable, invocation-owned fixture proves learned-memory read/write and
+readback, discovery/read through all three skill projections, writable own skill
+overlay, and denied global/peer/host-private reads or writes as appropriate.
+Missing memory, missing overlay, writable peer memory and writable global skills
+each refuse admission before the probe starts. Protected bytes are hashed before
+and after. The receipt records source/binary/script/launcher hashes, each case's
+exit and output, and confirmed fixture removal; CI prints it even after failure.
+No account, ACL, real agent directory or daemon is changed.
+
+A non-root local invocation deliberately refuses before creating a fixture. It
+is not a skipped pass or actual alternate-UID evidence: acceptance requires the
+required Linux job's receipt for the tested head. The CI invocation is documented
+in `.github/workflows/ci.yml`; it never falls back when privilege is missing.
