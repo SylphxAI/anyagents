@@ -67,14 +67,20 @@ if it has drifted, the operation refuses instead of presenting a stale receipt a
 proof of erasure. Replays still require a quiescent target. Coordinates are
 otherwise relative to the body's current version.
 
-An inbound redaction also binds its recipient and provider `(chat_id, message_id)`
-when present. Later deliveries or edits with those coordinates return the existing
-redacted row without changing its body, metadata, edit baseline, index or audit,
-regardless of source key, relay/direct delivery, or age. Any redacted mailbox row
-is excluded from duplicate body enrichment. This freezes the selected message,
-including after a partial-span redaction; new provider edits are not accepted as
-permission to overwrite it. Other recipients, chats and provider message ids
-remain independent.
+An inbound redaction binds its recipient and **every retained provider origin and
+source-key alias**, not only the row's current `(chat_id, message_id)`. Ingress
+retains both sides of source deduplication, relay/direct coalescence and origin
+promotion, including intentional late-quote redelivery. Later deliveries or edits
+using any known alias return the selected redacted row without changing its body,
+metadata, edit baseline, index or audit, regardless of age. A known alias can add
+another routing identity without accepting its content. All matching edit
+baselines under retained origins are scrubbed. A redacted identity is excluded
+from duplicate body enrichment, including after partial-span erasure; a new edit
+is not permission to overwrite it. Other recipients, chats and independent
+provider messages remain independent; a separate existing mailbox entry is not
+erased implicitly. Rows created by an older binary retain their still-available
+origin/source key on first use, but aliases already discarded before this release
+cannot be reconstructed.
 
 Read `full_scrub`, `scrubbed_paths` and `unscrubbed` in the returned receipt.
 Unreadable/invalid JSONL, symlinked/hard-linked sessions, known binary harness

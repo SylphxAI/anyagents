@@ -23,3 +23,35 @@ CREATE TABLE conversation_redactions (
 
 CREATE INDEX conversation_redactions_origin
     ON conversation_redactions(agent_id, origin_chat_id, origin_message_id);
+
+-- A canonical mailbox row can coalesce several provider/local source ids.
+-- Preserve them before promotion changes messages.origin/source_key. These
+-- tables contain routing identities only, never message content or its hash.
+-- A late quote can intentionally receive a second mailbox seq. Both rows
+-- still represent the same provider identity and share the complete alias set.
+CREATE TABLE message_identities (
+    agent_id TEXT NOT NULL,
+    target_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    identity_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    PRIMARY KEY (agent_id, target_id)
+);
+CREATE INDEX message_identities_lookup ON message_identities(agent_id, identity_id);
+
+CREATE TABLE message_origin_aliases (
+    agent_id TEXT NOT NULL,
+    identity_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    chat_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    PRIMARY KEY (agent_id, identity_id, chat_id, message_id)
+);
+CREATE INDEX message_origin_aliases_lookup
+    ON message_origin_aliases(agent_id, chat_id, message_id);
+
+CREATE TABLE message_source_aliases (
+    agent_id TEXT NOT NULL,
+    identity_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    source_key TEXT NOT NULL,
+    PRIMARY KEY (agent_id, identity_id, source_key)
+);
+CREATE INDEX message_source_aliases_lookup
+    ON message_source_aliases(agent_id, source_key);

@@ -1697,20 +1697,27 @@ impl Store {
         // group relays and rows outside the normal bounded origin scan. Refuse
         // resurrection before source dedup, quote/mention enrichment, baseline
         // writes, mailbox allocation or indexing can retain the incoming text.
-        if let Some(origin) = incoming.origin
-            && let (Some(chat_id), Some(message_id)) = (
-                origin.chat_id,
-                origin
-                    .message_id
-                    .or_else(|| parse_edited_message_text(&incoming.text).map(|(id, _)| id)),
-            )
-            && let Some(existing) = redacted_message_by_origin(&tx, agent_id, chat_id, message_id)?
+        let ingress_origin = incoming.origin.map(|mut origin| {
+            origin.message_id = origin
+                .message_id
+                .or_else(|| parse_edited_message_text(&incoming.text).map(|(id, _)| id));
+            origin
+        });
+        if let Some(existing) =
+            redacted_message_by_ingress(&tx, agent_id, ingress_origin, source_key.as_deref())?
         {
+            // A known alias can reveal another route (for example a new source
+            // key on a known origin). Retain that link without changing the
+            // canonical message or audit, so a source-only retry stays erased.
+            retain_message_aliases(&tx, &existing, ingress_origin, source_key.as_deref())?;
+            tx.commit()?;
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
         if let Some(key) = &source_key
             && let Some(existing) = message_by_source(&tx, agent_id, key)?
         {
+            retain_message_aliases(&tx, &existing, ingress_origin, Some(key))?;
+            tx.commit()?;
             return Ok(ReceiveOutcome::Duplicate(existing));
         }
         if let Some(ref mut quote) = incoming.quote {
@@ -1745,6 +1752,7 @@ impl Store {
                 body = crate::quote::compose(&incoming.text, Some(&synth_quote));
             }
         }
+        let mut redelivery_identity = None;
         if let Some(origin) = incoming.origin
             && let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id)
             && !incoming.text.starts_with("[Edited ")
@@ -1758,6 +1766,7 @@ impl Store {
                 &body,
                 source_key.as_deref(),
                 reply_to_author.as_deref(),
+                &mut redelivery_identity,
             )?
         {
             tx.commit()?;
@@ -1789,6 +1798,12 @@ impl Store {
                         && let Some(existing) =
                             latest_message_for_origin(&tx, agent_id, chat_id, msg_id)?
                     {
+                        retain_message_aliases(
+                            &tx,
+                            &existing,
+                            ingress_origin,
+                            source_key.as_deref(),
+                        )?;
                         tx.commit()?;
                         return Ok(ReceiveOutcome::Duplicate(existing));
                     }
@@ -1963,6 +1978,13 @@ impl Store {
                 serde_json::to_string(&message.context).ok(),
             ],
         )?;
+        if let Some(identity_id) = redelivery_identity {
+            tx.execute(
+                "INSERT INTO message_identities (agent_id, target_id, identity_id) VALUES (?1, ?2, ?3)",
+                params![agent_id.as_str(), message.id.as_str(), identity_id],
+            )?;
+        }
+        retain_message_aliases(&tx, &message, ingress_origin, message.source_key.as_deref())?;
         let is_passive_reaction = message.context.event.as_deref() == Some("reaction_passive");
         let woke_agent = if wake_archived {
             tx.execute(
@@ -4870,21 +4892,77 @@ fn message_by_source(
     found.transpose()
 }
 
-/// Resolve only explicitly redacted provider origins, with no bounded history
-/// scan or body-based matching. A missing canonical row is a storage error, not
-/// permission to append the original again.
-fn redacted_message_by_origin(
+/// Retain both sides of every coalescence before an origin/source promotion.
+/// This also lazily seeds a pre-upgrade row's still-available canonical identity.
+/// Callers share ingress/redaction's IMMEDIATE transaction; errors roll it back.
+fn retain_message_aliases(
+    conn: &Connection,
+    message: &Message,
+    incoming_origin: Option<Origin>,
+    incoming_source_key: Option<&str>,
+) -> Result<String, Error> {
+    conn.execute(
+        "INSERT INTO message_identities (agent_id, target_id, identity_id) VALUES (?1, ?2, ?2) ON CONFLICT DO NOTHING",
+        params![message.agent_id.as_str(), message.id.as_str()],
+    )?;
+    let identity_id: String = conn.query_row(
+        "SELECT identity_id FROM message_identities WHERE agent_id = ?1 AND target_id = ?2",
+        params![message.agent_id.as_str(), message.id.as_str()],
+        |r| r.get(0),
+    )?;
+    for origin in [message.origin, incoming_origin].into_iter().flatten() {
+        if let (Some(chat_id), Some(message_id)) = (origin.chat_id, origin.message_id) {
+            conn.execute(
+                "INSERT INTO message_origin_aliases (agent_id, identity_id, chat_id, message_id)
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                params![message.agent_id.as_str(), identity_id, chat_id, message_id],
+            )?;
+        }
+    }
+    for key in [message.source_key.as_deref(), incoming_source_key]
+        .into_iter()
+        .flatten()
+        .filter(|key| !key.is_empty())
+    {
+        conn.execute(
+            "INSERT INTO message_source_aliases (agent_id, identity_id, source_key)
+             VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+            params![message.agent_id.as_str(), identity_id, key],
+        )?;
+    }
+    Ok(identity_id)
+}
+
+/// Resolve every retained origin/source alias of an explicitly redacted row,
+/// before any ordinary writer. No bounded history scan or body matching. A
+/// missing canonical row is a storage error, not permission to append plaintext.
+fn redacted_message_by_ingress(
     conn: &Connection,
     agent_id: &AgentId,
-    chat_id: i64,
-    message_id: i64,
+    origin: Option<Origin>,
+    source_key: Option<&str>,
 ) -> Result<Option<Message>, Error> {
     let target_id: Option<String> = conn
         .query_row(
-            "SELECT target_id FROM conversation_redactions
+            "SELECT r.target_id FROM message_origin_aliases a
+         JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
+         JOIN conversation_redactions r ON r.agent_id = i.agent_id AND r.target_id = i.target_id
+         WHERE a.agent_id = ?1 AND a.chat_id = ?2 AND a.message_id = ?3
+         UNION ALL
+         SELECT r.target_id FROM message_source_aliases a
+         JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id
+         JOIN conversation_redactions r ON r.agent_id = i.agent_id AND r.target_id = i.target_id
+         WHERE a.agent_id = ?1 AND a.source_key = ?4
+         UNION ALL
+         SELECT target_id FROM conversation_redactions
          WHERE agent_id = ?1 AND origin_chat_id = ?2 AND origin_message_id = ?3
-         ORDER BY created_at_ms DESC, id DESC LIMIT 1",
-            params![agent_id.as_str(), chat_id, message_id],
+         LIMIT 1",
+            params![
+                agent_id.as_str(),
+                origin.and_then(|o| o.chat_id),
+                origin.and_then(|o| o.message_id),
+                source_key
+            ],
             |r| r.get(0),
         )
         .optional()?;
@@ -4910,6 +4988,7 @@ fn message_by_origin(
     incoming_body: &str,
     incoming_source_key: Option<&str>,
     incoming_reply_to_author: Option<&str>,
+    redelivery_identity: &mut Option<String>,
 ) -> Result<Option<Message>, Error> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {MESSAGE_COLS} FROM messages
@@ -4958,16 +5037,34 @@ fn message_by_origin(
                 _ => (now_ms() - msg.received_at_ms).abs() <= 15_000,
             };
         if matched_by_id || matched_by_group_relay {
-            // Guard BOTH body UPDATE paths below by canonical identity as well
-            // as the ingress origin binding. This check and every caller's
-            // enrichment writes share receive_with_wake's IMMEDIATE transaction,
-            // serialized with redaction, so an audit cannot race this decision.
-            let redacted: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM conversation_redactions WHERE agent_id = ?1 AND target_id = ?2)",
-                params![agent_id.as_str(), msg.id.as_str()], |r| r.get(0),
+            // Keep BOTH the old and incoming route before promotion clears the
+            // source key or replaces the canonical origin, even without a body
+            // change and before the late-quote redelivery branch returns None.
+            let identity_id = retain_message_aliases(
+                conn,
+                &msg,
+                Some(Origin {
+                    chat_id: Some(chat_id),
+                    message_id: Some(message_id),
+                    thread_id: origin.thread_id,
+                }),
+                incoming_source_key,
             )?;
-            if redacted {
-                return Ok(Some(msg));
+            // This canonical identity (including intentional late-quote
+            // redeliveries) may have been redacted. Re-resolve after retaining
+            // the new alias and return the actual frozen row before either
+            // body UPDATE. This shares ingress/redaction's IMMEDIATE transaction.
+            if let Some(redacted) = redacted_message_by_ingress(
+                conn,
+                agent_id,
+                Some(Origin {
+                    chat_id: Some(chat_id),
+                    message_id: Some(message_id),
+                    thread_id: origin.thread_id,
+                }),
+                incoming_source_key,
+            )? {
+                return Ok(Some(redacted));
             }
             let was_unquoted = !has_quoted_block(&msg.text) && has_quoted_block(incoming_body);
             let best_body = if was_unquoted || incoming_body.len() > msg.text.len() {
@@ -4986,7 +5083,7 @@ fn message_by_origin(
                     updated_context.reply_to_author = Some(rta.to_string());
                 }
                 let new_body = best_body.as_deref().unwrap_or(&msg.text);
-                let _ = conn.execute(
+                conn.execute(
                     "UPDATE messages SET origin = ?1, context = ?2, source_key = NULL, body = ?3 WHERE id = ?4",
                     params![
                         serde_json::to_string(&updated_origin).unwrap_or_default(),
@@ -4994,7 +5091,7 @@ fn message_by_origin(
                         new_body,
                         msg.id.as_str(),
                     ],
-                );
+                )?;
                 msg.origin = Some(updated_origin);
                 msg.context = updated_context;
                 msg.source_key = None;
@@ -5011,20 +5108,21 @@ fn message_by_origin(
                     updated_context.reply_to_author = Some(rta.to_string());
                 }
                 let new_body = best_body.as_deref().unwrap_or(&msg.text);
-                let _ = conn.execute(
+                conn.execute(
                     "UPDATE messages SET body = ?1, context = ?2 WHERE id = ?3",
                     params![
                         new_body,
                         serde_json::to_string(&updated_context).ok(),
                         msg.id.as_str(),
                     ],
-                );
+                )?;
                 msg.context = updated_context;
                 if let Some(b) = best_body {
                     msg.text = b;
                 }
             }
             if was_unquoted && cursor(conn, agent_id).unwrap_or(0) >= msg.seq {
+                *redelivery_identity = Some(identity_id);
                 return Ok(None);
             }
             return Ok(Some(msg));

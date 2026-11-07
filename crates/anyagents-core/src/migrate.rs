@@ -122,6 +122,14 @@ mod tests {
             .unwrap();
         conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
             .unwrap();
+        conn.prepare(
+            "SELECT agent_id, identity_id, chat_id, message_id FROM message_origin_aliases",
+        )
+        .unwrap();
+        conn.prepare("SELECT agent_id, identity_id, source_key FROM message_source_aliases")
+            .unwrap();
+        conn.prepare("SELECT agent_id, target_id, identity_id FROM message_identities")
+            .unwrap();
         migrate(&mut conn).unwrap();
         assert_eq!(current_version(&conn).unwrap(), 23);
     }

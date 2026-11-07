@@ -593,6 +593,30 @@ impl Store {
             unscrubbed,
             full_scrub: false,
         };
+        // Seed still-available identities for a row created before alias
+        // retention shipped. Already retained aliases are never replaced.
+        // Old aliases discarded by an older binary cannot be reconstructed.
+        tx.execute(
+            "INSERT INTO message_identities (agent_id, target_id, identity_id)
+             SELECT agent_id, id, id FROM messages WHERE agent_id = ?1 AND id = ?2 ON CONFLICT DO NOTHING",
+            params![target.as_str(), id],
+        )?;
+        tx.execute(
+            "INSERT INTO message_origin_aliases (agent_id, identity_id, chat_id, message_id)
+             SELECT m.agent_id, i.identity_id, json_extract(m.origin, '$.chat_id'), json_extract(m.origin, '$.message_id') FROM messages m
+             JOIN message_identities i ON i.agent_id = m.agent_id AND i.target_id = m.id
+             WHERE m.agent_id = ?1 AND m.id = ?2 AND json_extract(m.origin, '$.chat_id') IS NOT NULL AND json_extract(m.origin, '$.message_id') IS NOT NULL
+             ON CONFLICT DO NOTHING",
+            params![target.as_str(), id],
+        )?;
+        tx.execute(
+            "INSERT INTO message_source_aliases (agent_id, identity_id, source_key)
+             SELECT m.agent_id, i.identity_id, m.source_key FROM messages m
+             JOIN message_identities i ON i.agent_id = m.agent_id AND i.target_id = m.id
+             WHERE m.agent_id = ?1 AND m.id = ?2 AND m.source_key IS NOT NULL AND m.source_key != ''
+             ON CONFLICT DO NOTHING",
+            params![target.as_str(), id],
+        )?;
         // Pending paths are durable before touching any copy: an interruption is
         // never mistaken for success on replay, and no sensitive recovery payload is stored.
         for file in &prepared {
@@ -617,7 +641,7 @@ impl Store {
             // Telegram's edit baseline is a second body copy for this same
             // provider message, not a separate mailbox entry. Preserve its keys/time.
             let versions: Vec<(i64, i64, String)> = tx.prepare(
-                "SELECT v.chat_id, v.message_id, v.body FROM message_versions v JOIN messages m ON m.agent_id = v.agent_id AND json_extract(m.origin, '$.chat_id') = v.chat_id AND json_extract(m.origin, '$.message_id') = v.message_id WHERE m.agent_id = ?1 AND m.id = ?2")?
+                "SELECT v.chat_id, v.message_id, v.body FROM message_versions v JOIN message_origin_aliases a ON a.agent_id = v.agent_id AND a.chat_id = v.chat_id AND a.message_id = v.message_id JOIN message_identities i ON i.agent_id = a.agent_id AND i.identity_id = a.identity_id WHERE i.agent_id = ?1 AND i.target_id = ?2")?
                 .query_map(params![target.as_str(), id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<Result<_, _>>()?;
             for (chat, message, body) in versions {
@@ -642,9 +666,10 @@ impl Store {
                 [],
             )?;
         }
-        // Bind erasure to the provider identity in the same IMMEDIATE transaction
-        // as the body/index rewrite. Ingress checks this before any enrichment or
-        // edit-baseline write; neither a new source key nor an aged-out row escapes.
+        // The audit's target_id freezes its complete retained alias set in the
+        // same IMMEDIATE transaction as the body/index rewrite. The primary
+        // origin columns remain a direct-coordinate fallback, not the alias set.
+        // Ingress joins all aliases to this audit before any ordinary writer.
         tx.execute("INSERT INTO conversation_redactions (
                 id, agent_id, target_id, request_key, actor, permission, reason,
                 created_at_ms, span_unit, span_start, span_end, removed_bytes,
