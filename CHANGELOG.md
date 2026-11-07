@@ -28,13 +28,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quarantined rather than retried.
 - The completed-turn restart fixture waits for durable turn completion before
   killing the vendor process; usage accounting alone is not completion.
+- The native retry fixture waits for completed turns before checking success or
+  persistent failure, preserving exact retry-request and error assertions.
 
 ### Release verification
 
 - Publication is bound to the release commit's exact successful push/main CI;
   package metadata and all platform identity files are read back after publish.
-- The [release CI audit](docs/releases/v0.1.3-ci-audit.json) records all eleven PRs
-  merged after v0.1.2 through source `b81109f4914acdf852fdee950a7706c2d06f04ba`.
+- The [release CI audit](docs/releases/v0.1.3-ci-audit.json) records all twelve PRs
+  merged after v0.1.2 through source `648de67161412e2bda27b70f6f2239b57d23ef77`.
 - #113 already shipped in v0.1.2's merge-queue base. #108, #115, #120, #121 and
   #122 were not merged at this cut and are not included.
 
@@ -51,6 +53,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - [#92](https://github.com/SylphxAI/anyagents/pull/92): feat: add audited conversation redaction.
 - [#114](https://github.com/SylphxAI/anyagents/pull/114): fix(test): wait for the Telegram batch checkpoint.
 - [#126](https://github.com/SylphxAI/anyagents/pull/126): test(supervisor): synchronize the completed-turn restart fixture.
+- [#128](https://github.com/SylphxAI/anyagents/pull/128): test(sylphx): await retry turn completion before assertions.
 
 ## 0.1.2
 
