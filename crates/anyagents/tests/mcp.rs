@@ -259,7 +259,7 @@ fn error_text(result: &CallToolResult) -> String {
 
 #[tokio::test]
 async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let bytes = b"mcprawneedle \0\xff exact binary tail";
     for name in ["range-own", "range-peer"] {
         let created = bin()
@@ -321,7 +321,7 @@ async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket()
 
 #[tokio::test]
 async fn mcp_tools_use_the_server_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let socket = dir.path().join("anyagents.sock");
     assert!(
         socket.as_os_str().len() <= 107,
@@ -1053,7 +1053,7 @@ async fn mcp_tools_use_the_server_socket() {
 #[tokio::test]
 async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
     use anyagents_core::{NewAgent, Store, agent_config_dir};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let root = store
         .create_agent(NewAgent::new("redaction-root", "sylphx"))
@@ -1142,7 +1142,7 @@ async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
 #[tokio::test]
 async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
     use anyagents_core::{NewAgent, Store, host_session};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let store = Store::open(dir.path().join("state.db")).unwrap();
     let parent = store
         .create_agent(NewAgent::new("session-parent", "sylphx"))
@@ -1244,7 +1244,7 @@ async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
 
 #[tokio::test]
 async fn describe_preserves_config_permissions_without_vendor_restart_writers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let created = bin()
         .env("PATH", machine_path(dir.path()))
         .arg("--data")
@@ -1293,7 +1293,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
 #[tokio::test]
 async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     use anyagents_core::{Incoming, Store};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     for name in ["argus", "lyra", "helios", "runner"] {
         let created = bin()
             .env("PATH", machine_path(dir.path()))

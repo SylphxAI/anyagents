@@ -6328,7 +6328,7 @@ mod tests {
     use super::*;
 
     fn setup() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         (dir, store)
     }
@@ -6680,7 +6680,7 @@ mod tests {
     /// cursor that still points at a row that exists.
     #[test]
     fn upgrading_a_two_cursor_store_keeps_one_cursor_and_drops_the_answer_rows() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("state.db");
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(

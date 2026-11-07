@@ -145,7 +145,7 @@ mod tests {
     }
     #[test]
     fn overlay_preserves_global_bytes_and_local_skills_across_all_mirrors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let root = dir.path().join("agents/a");
         let config = root.join("config");
         let global = dir.path().join("skills");
@@ -191,7 +191,7 @@ mod tests {
     }
     #[test]
     fn foreign_mount_and_symlink_parent_are_not_mutated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let root = dir.path().join("agents/a");
         let config = root.join("config");
         let global = dir.path().join("skills");

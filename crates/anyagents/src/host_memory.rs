@@ -199,7 +199,7 @@ mod tests {
     };
     #[test]
     fn deploy_population_migrates_archived_and_defers_active_writer() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let archived = store
             .create_agent(NewAgent::new("never-launches", "claude-code"))
@@ -259,7 +259,7 @@ mod tests {
                 atomic::{AtomicBool, Ordering},
             },
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let active = store.create_agent(NewAgent::new("live", "sylphx")).unwrap();
         let selected = store
@@ -346,7 +346,7 @@ mod tests {
     fn discovery_failure_is_deferred_per_stopped_owner_and_retried() {
         use std::os::unix::fs::PermissionsExt;
         for block_page in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_tempdir();
             let store = Store::open(dir.path().join("state.db")).unwrap();
             let bad = store
                 .create_agent(NewAgent::new("unreadable", "sylphx"))
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn busy_global_lock_defers_launch_and_startup_without_moving_sources() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("selected", "sylphx"))
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("known-owner", "sylphx"))

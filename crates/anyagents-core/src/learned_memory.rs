@@ -196,7 +196,7 @@ mod tests {
     }
     #[test]
     fn pin_survives_edits_restart_and_missing_source() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir();
         fs::create_dir(root.path().join("memory")).unwrap();
         let source = root.path().join("memory/MEMORY.md");
         fs::write(&source, "old fact\n").unwrap();
@@ -211,7 +211,7 @@ mod tests {
     }
     #[test]
     fn corrupt_pin_fails_instead_of_refreshing() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tempdir();
         pin_session(root.path(), "one").unwrap();
         let path = root
             .path()

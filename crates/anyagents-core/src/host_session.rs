@@ -332,7 +332,7 @@ mod tests {
     }
     #[test]
     fn explicit_reset_retires_only_pointer_and_resumes_prepared_intent_without_repin() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let root = dir.path();
         fs::create_dir_all(root.join("config")).unwrap();
         memory(root, "old pinned fact");
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn late_marker_restart_reset_switch_and_explicit_resume() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let root = dir.path();
         memory(root, "initial fact");
         let initial = ensure_active(root, "claude-code").unwrap();
@@ -470,7 +470,7 @@ mod tests {
     }
     #[test]
     fn corrupt_registry_and_foreign_alias_fail_without_refresh() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let root = dir.path();
         let initial = ensure_active(root, "sylphx").unwrap();
         bind_vendor(root, "sylphx", "id").unwrap();
@@ -487,7 +487,7 @@ mod tests {
     }
     #[test]
     fn missing_known_pin_refuses_without_reading_changed_memory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let root = dir.path();
         memory(root, "old");
         let initial = ensure_active(root, "sylphx").unwrap();

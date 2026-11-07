@@ -6743,7 +6743,7 @@ pub(crate) mod tests {
     #[test]
     fn reset_session_requires_management_authority_and_quiescence_before_any_pin_change() {
         use anyagents_core::host_session;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let parent = store
             .create_agent(anyagents_core::NewAgent::new("reset-parent", "opencode"))
@@ -6857,7 +6857,7 @@ pub(crate) mod tests {
 
     #[test]
     fn canonical_raw_ranges_bind_owned_digest_and_return_bounded_exact_bytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let parent = store
             .create_agent(anyagents_core::NewAgent::new("range-parent", "sylphx"))
@@ -6943,7 +6943,7 @@ pub(crate) mod tests {
 
     #[test]
     fn canonical_conversation_scopes_files_under_real_ancestor_authority() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
         let parent = store
             .create_agent(anyagents_core::NewAgent::new("history-parent", "sylphx"))

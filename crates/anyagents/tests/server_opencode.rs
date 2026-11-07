@@ -127,7 +127,7 @@ fn call(socket: &Path, request: &str) -> Value {
 #[test]
 fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -256,7 +256,7 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
 #[test]
 fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);

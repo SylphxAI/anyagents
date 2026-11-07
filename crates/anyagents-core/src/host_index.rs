@@ -914,7 +914,7 @@ mod tests {
     }
     #[test]
     fn required_time_cache_is_invalidated_without_touching_raw_history() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("index.db");
         let raw = dir.path().join("source.jsonl");
         std::fs::write(&raw, b"{\"content\":\"authoritative history\"}\n").unwrap();
@@ -937,7 +937,7 @@ mod tests {
 
     #[test]
     fn serialized_json_escapes_are_searchable_with_exact_raw_coordinates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
         let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
         let event = serde_json::json!({"tool":"browser","output":format!("{}prefix\nsuffixneedle\ttabneedle 繁體中文","padding ".repeat(1800))});
@@ -990,7 +990,7 @@ mod tests {
     }
     #[test]
     fn decoded_exclusion_and_crowded_segment_neighbors_keep_same_semantics() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
         for i in 0..25 {
             let segment = RawSegment::open(&dir.path().join(format!("old-{i}.raw"))).unwrap();
@@ -1047,7 +1047,7 @@ mod tests {
     }
     #[test]
     fn latest_tail_explicit_order_tool_precedence_and_neighbor_acl() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
         let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
         for (i, owner, tool, text) in [
@@ -1115,7 +1115,7 @@ mod tests {
     }
     #[test]
     fn full_window_coverage_exact_readback_restart_and_idempotence() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let db = dir.path().join("index.db");
         let raw = RawSegment::open(&dir.path().join("events.raw")).unwrap();
         let text = format!(
@@ -1161,7 +1161,7 @@ mod tests {
     }
     #[test]
     fn visibility_scope_filters_chronology_and_full_record_exclusion() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
         let segment = RawSegment::open(&dir.path().join("events.raw")).unwrap();
         for (id, owner, source, time, tool, text) in [
@@ -1239,7 +1239,7 @@ mod tests {
     }
     #[test]
     fn changed_metadata_reindexes_but_tampered_bytes_and_owner_do_not_publish() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
         let path = dir.path().join("memory.md");
         std::fs::write(&path, b"original learned fact").unwrap();

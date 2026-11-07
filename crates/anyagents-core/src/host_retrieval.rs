@@ -617,7 +617,7 @@ mod tests {
     #[test]
     fn native_tool_correlation_survives_reopen_and_is_scoped_atomic_and_rebuildable() {
         use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let db = dir.path().join("state.db");
         let store = Store::open(&db).unwrap();
         let own = store
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn native_times_preserve_explicit_values_and_leave_absent_or_invalid_unknown() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("native-time", "sylphx"))
@@ -866,7 +866,7 @@ mod tests {
 
     #[test]
     fn reconciled_non_jsonl_history_is_full_text_scoped_and_read_back_losslessly() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let own = store
             .create_agent(NewAgent::new("page-owner", "sylphx"))
@@ -928,7 +928,7 @@ mod tests {
     #[test]
     fn boundary_fast_path_reads_bounded_prefix_and_periodic_verifier_recovers_older_edits() {
         use std::io::{Seek, SeekFrom, Write};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("boundary-owner", "sylphx"))
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn periodic_verifier_rotates_failed_sources_without_advancing_their_frontier() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("verifier-owner", "sylphx"))
@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn memory_changed_during_publication_rolls_back_documents_and_cursor() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("MEMORY.md");
         let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
         let metadata = IndexMetadata {
@@ -1196,7 +1196,7 @@ mod tests {
 
     #[test]
     fn scoped_refresh_ignores_unrelated_failures_and_preserves_other_class() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("scoped-owner", "sylphx"))
@@ -1257,7 +1257,7 @@ mod tests {
     #[test]
     fn persistent_cursor_reuses_unchanged_and_authenticates_append_edit_replace_and_tail() {
         use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("cursor-owner", "sylphx"))
@@ -1397,7 +1397,7 @@ mod tests {
 
     #[test]
     fn indexed_native_history_cannot_bypass_redaction_or_symlink_privacy() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("redaction-owner", "sylphx"))
@@ -1566,7 +1566,7 @@ mod tests {
 
     #[test]
     fn host_selection_normalizes_wildcards_names_and_historical_aliases() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let agent = store
             .create_agent(NewAgent::new("old-name", "sylphx"))
@@ -1613,7 +1613,7 @@ mod tests {
 
     #[test]
     fn authorized_full_text_native_in_place_and_memory_share_filters() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let own = store.create_agent(NewAgent::new("own", "sylphx")).unwrap();
         let hidden = store

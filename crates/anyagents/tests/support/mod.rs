@@ -253,3 +253,13 @@ pub fn wait_for(mut ready: impl FnMut() -> bool, why: &str) {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// Use physical paths for fixtures exercising descriptor no-follow readers.
+pub fn physical_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary root"),
+    )
+    .expect("owned temporary fixture")
+}

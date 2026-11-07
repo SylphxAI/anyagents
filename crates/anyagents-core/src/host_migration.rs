@@ -140,6 +140,21 @@ impl HostMigration {
             reason: reason.map(str::to_owned),
         });
     }
+    fn record_global_exclusions(&mut self, home: &Path) {
+        for relative in [".claude/projects", ".codex/memories"] {
+            let path = home.join(relative);
+            self.add(
+                None,
+                path.clone(),
+                None,
+                MigrationKind::LearnedMemory,
+                Some("UNRESOLVED/UNTOUCHED: personal/global namespace; contents not inspected"),
+            );
+            if let Some(entry) = self.manifest.entries.iter_mut().find(|e| e.source == path) {
+                entry.status = MigrationStatus::UnresolvedUntouched;
+            }
+        }
+    }
     /// Enumerates only per-agent config roots plus the explicitly authorized
     /// owners-page directory. Unknown and multiply claimed pages are inventoried
     /// but never moved. Nested symlinks are inventoried, not followed.
@@ -155,22 +170,12 @@ impl HostMigration {
         owners_pages: &Path,
         selected: Option<&HashSet<String>>,
     ) -> io::Result<()> {
-        for path in ["/home/kyle/.claude/projects", "/home/kyle/.codex/memories"] {
-            self.add(
-                None,
-                PathBuf::from(path),
-                None,
-                MigrationKind::LearnedMemory,
-                Some("UNRESOLVED/UNTOUCHED: personal/global namespace; contents not inspected"),
-            );
-            if let Some(entry) = self
-                .manifest
-                .entries
-                .iter_mut()
-                .find(|e| e.source == Path::new(path))
-            {
-                entry.status = MigrationStatus::UnresolvedUntouched;
-            }
+        // Report only the host's declared personal namespace; do not discover,
+        // open or mutate anything under it. An absent/relative HOME grants none.
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+            && home.is_absolute()
+        {
+            self.record_global_exclusions(&home);
         }
         for agent in agents {
             if selected.is_some_and(|ids| !ids.contains(agent.id.as_str())) {
@@ -739,8 +744,52 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
     #[test]
+    fn personal_inventory_records_declared_paths_without_inspection_or_mutation() {
+        let dir = crate::test_tempdir();
+        let home = dir.path().join("declared-home");
+        let projects = home.join(".claude/projects");
+        let memories = home.join(".codex/memories");
+        write(&projects.join("retained.bin"), b"personal\x00\xff");
+        fs::create_dir_all(memories.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("absent-target"), &memories).unwrap();
+        #[cfg(not(unix))]
+        fs::write(&memories, b"not a directory").unwrap();
+        let mut migration = HostMigration::open(&dir.path().join("state")).unwrap();
+        migration.record_global_exclusions(&home);
+        migration.record_global_exclusions(&home);
+        migration.stage(&HashSet::new()).unwrap();
+        drop(migration);
+        let migration = HostMigration::open(&dir.path().join("state")).unwrap();
+        assert_eq!(migration.manifest.entries.len(), 2);
+        for (entry, expected) in migration
+            .manifest
+            .entries
+            .iter()
+            .zip([projects.clone(), memories.clone()])
+        {
+            assert_eq!(entry.source, expected);
+            assert_eq!(entry.status, MigrationStatus::UnresolvedUntouched);
+            assert!(entry.agent_id.is_none());
+            assert!(entry.destination.is_none());
+            assert!(entry.source_fingerprint.is_none());
+            assert!(entry.readback.is_none());
+        }
+        assert_eq!(
+            fs::read(projects.join("retained.bin")).unwrap(),
+            b"personal\x00\xff"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read_link(memories).unwrap(),
+            dir.path().join("absent-target")
+        );
+        #[cfg(not(unix))]
+        assert_eq!(fs::read(memories).unwrap(), b"not a directory");
+    }
+    #[test]
     fn discovery_moves_exact_facts_stages_complete_state_and_keeps_active_raw() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let agent = AgentOwnership {
             id: AgentId::generate(),
             aliases: vec!["sage".into()],
@@ -813,7 +862,7 @@ mod tests {
     }
     #[test]
     fn interrupted_rename_resumes_and_conflicting_destination_preserves_both() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let agent = AgentOwnership {
             id: AgentId::generate(),
             aliases: vec![],
@@ -884,7 +933,7 @@ mod tests {
     }
     #[test]
     fn completed_receipt_allows_host_edits_and_collisions_retain_whole_project_bundles() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let agent = AgentOwnership {
             id: AgentId::generate(),
             aliases: vec![],
@@ -967,7 +1016,7 @@ mod tests {
     }
     #[test]
     fn raw_handoff_cannot_split_active_writer_and_preserves_same_file_history() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let source = dir.path().join("native.jsonl");
         let dest = dir.path().join("host/retained.jsonl");
         let bytes = b"{\"old\":1}\n";

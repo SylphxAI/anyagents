@@ -46,3 +46,15 @@ pub fn authenticate_presentation(token: Option<&str>) -> Option<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_string)
 }
+
+/// Physical fixture roots keep system aliases (for example a temporary-root
+/// symlink) outside the boundary. Product readers still refuse all symlinks.
+#[cfg(test)]
+pub(crate) fn test_tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("physical temporary root"),
+    )
+    .expect("owned temporary fixture")
+}

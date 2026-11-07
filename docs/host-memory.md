@@ -100,7 +100,8 @@ not a terminal sub-agent error. Migration errors cannot prevent daemon/admin
 socket binding, and one owner's discovery failure does not block another owner.
 
 Personal/global Claude projects, `.codex/memories` and Codex SQLite state remain
-untouched. Native goals, continuation/session, placement and usage state remain
+untouched. The exclusion inventory derives paths only from an absolute declared
+`HOME`; it never discovers, opens, fingerprints or stages their contents. Native goals, continuation/session, placement and usage state remain
 with their current writer; staged snapshots do not claim final catch-up. The
 raw-segment append/restart/checksum/quarantine and rename-handoff primitives are
 tested, but native raw writer cutover and raw rename are **not activated** here.

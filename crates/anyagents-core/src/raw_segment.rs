@@ -678,7 +678,7 @@ mod tests {
 
     #[test]
     fn raw_range_authenticates_whole_event_and_bounds_exact_binary_output() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("binary");
         let bytes: Vec<u8> = (0..200_000).map(|n| (n % 256) as u8).collect();
         fs::write(&path, &bytes).unwrap();
@@ -732,7 +732,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn readonly_descriptor_walk_refuses_linked_files_and_ancestors() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let plain = dir.path().join("plain");
         fs::create_dir(&plain).unwrap();
         fs::write(plain.join("event"), b"exact").unwrap();
@@ -752,7 +752,7 @@ mod tests {
     #[test]
     fn append_cursor_skips_unchanged_history_but_revalidates_other_writers_and_ack() {
         use std::sync::atomic::Ordering;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("raw");
         let segment = RawSegment::open(&path).unwrap();
         assert_eq!(segment.full_validations.load(Ordering::Relaxed), 1);
@@ -788,7 +788,7 @@ mod tests {
 
     #[test]
     fn append_restart_and_exact_range_read() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("segments/first.raw");
         let segment = RawSegment::open(&path).unwrap();
         let first = segment.append(b"{\"tool\":\"browser\"}\n\x00\xff").unwrap();
@@ -813,7 +813,7 @@ mod tests {
 
     #[test]
     fn torn_tail_recovers_but_complete_corruption_does_not() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("raw");
         let first = RawSegment::open(&path).unwrap().append(b"safe").unwrap();
         OpenOptions::new()
@@ -863,7 +863,7 @@ mod tests {
 
     #[test]
     fn complete_frame_length_mutation_preserves_all_bytes_and_refuses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("raw");
         let first = RawSegment::open(&path)
             .unwrap()
@@ -888,7 +888,7 @@ mod tests {
 
     #[test]
     fn renamed_jsonl_is_indexed_and_appended_without_reframing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let source = dir.path().join("native.jsonl");
         fs::write(&source, b"{\"seq\":1}\n{\"seq\":2}\n").unwrap();
         let destination = dir.path().join("host/segments/history.jsonl");
@@ -909,7 +909,7 @@ mod tests {
 
     #[test]
     fn jsonl_partial_final_line_is_preserved_and_not_split() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("native.jsonl");
         fs::write(&path, b"{\"complete\":true}\npartial").unwrap();
         let before = fs::read(&path).unwrap();
@@ -921,7 +921,7 @@ mod tests {
     }
     #[test]
     fn synced_event_before_frontier_crash_is_recovered_not_discarded() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("raw");
         let segment = RawSegment::open(&path).unwrap();
         let first = segment.append(b"acknowledged").unwrap();
@@ -945,7 +945,7 @@ mod tests {
     }
     #[test]
     fn damaged_magic_cannot_downgrade_an_acknowledged_frame_to_jsonl() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("raw");
         RawSegment::open(&path)
             .unwrap()
@@ -963,7 +963,7 @@ mod tests {
     }
     #[test]
     fn read_only_native_indexing_keeps_partial_tail_and_never_creates_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("native.jsonl");
         fs::write(&path, b"{\"event\":1}\n{\"event\":").unwrap();
         let before = fs::read(&path).unwrap();
@@ -977,7 +977,7 @@ mod tests {
     }
     #[test]
     fn acknowledged_payload_corruption_is_never_quarantined_or_truncated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let path = dir.path().join("raw");
         let coordinate = RawSegment::open(&path)
             .unwrap()

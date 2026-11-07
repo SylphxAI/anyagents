@@ -11,7 +11,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let root = store.create_agent(NewAgent::new("root", "sylphx")).unwrap();
         let mut child = NewAgent::new("child", "sylphx");

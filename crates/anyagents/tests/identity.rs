@@ -93,7 +93,7 @@ fn create(data: &Path, name: &str) -> String {
 #[test]
 fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -212,7 +212,7 @@ fn owner_authority_is_explicit_live_revocable_and_never_inherited() {
 #[test]
 fn a_session_acts_as_its_own_agent_and_nothing_else() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -408,7 +408,7 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
 #[test]
 fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -462,7 +462,7 @@ fn each_agents_capability_reads_only_own_mailbox_not_peer_history() {
 #[test]
 fn the_capability_file_of_one_agent_never_opens_another() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -519,7 +519,7 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
     assert!(source.status.success());
     let expected_source = String::from_utf8(source.stdout).unwrap().trim().to_owned();
     assert_eq!(env!("ANYAGENTS_SOURCE_SHA"), expected_source);
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir(&data).unwrap();
     let image = dir.path().join("anyagents");
@@ -654,7 +654,7 @@ fn health_reports_each_running_image_and_survives_atomic_install() {
 fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
     use anyagents_core::{AgentId, Incoming, Store};
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -843,7 +843,7 @@ fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
     let _env = support::lock();
     for command in ["serve", "serve-admin"] {
         for busy in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = support::physical_tempdir();
             let data = dir.path();
             support::operator_with_configured_seat(data);
             let store = Store::open(data.join("state.db")).unwrap();
@@ -946,7 +946,7 @@ fn contended_migration_publishes_wait_without_pin_or_dispatch_then_retries() {
     assert_eq!(anyagents_supervisor::restart_delay_ms(1, 0), 200);
     assert_eq!(anyagents_supervisor::restart_delay_ms(1, 39), 297);
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path();
     support::operator_with_configured_seat(data);
     let store = Store::open(data.join("state.db")).unwrap();
@@ -1078,7 +1078,7 @@ exec /bin/cat
 #[test]
 fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -1306,7 +1306,7 @@ fn group_permissions_bind_ownership_and_refuse_both_reported_payloads_atomically
 #[test]
 fn agent_group_cli_mutations_refuse_offline_database_fallback() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     let store = anyagents_core::Store::open(data.join("state.db")).unwrap();
@@ -1368,7 +1368,7 @@ fn agent_group_cli_mutations_refuse_offline_database_fallback() {
 fn offline_session_reset_refuses_agent_self_and_peer_but_allows_operator() {
     use anyagents_core::{NewAgent, Store, host_session};
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path();
     let store = Store::open(data.join("state.db")).unwrap();
     let own = store

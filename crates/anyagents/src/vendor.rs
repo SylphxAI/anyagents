@@ -1446,7 +1446,7 @@ mod tests {
     #[test]
     fn shipping_launch_boundary_pins_before_marker_and_refreshes_only_on_cutover() {
         use anyagents_core::{NewAgent, Store, host_session};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let mut agent = store
             .create_agent(NewAgent::new("launch-pin", "claude-code"))
@@ -1498,7 +1498,7 @@ mod tests {
 
     #[test]
     fn ensure_agy_steering_settings_populates_permissions_and_trusted_workspaces() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tempdir();
         let config_dir = dir.path().join("config");
         let work_dir = dir.path().join("work");
         std::fs::create_dir_all(&config_dir).unwrap();
