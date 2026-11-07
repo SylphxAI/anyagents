@@ -79,6 +79,9 @@ impl HostIndex {
                 sender TEXT NOT NULL, destination TEXT NOT NULL, tool_name TEXT,
                 role TEXT, segment TEXT NOT NULL, offset INTEGER NOT NULL,
                 length INTEGER NOT NULL, sha256 TEXT NOT NULL, seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS host_sources (
+                agent_id TEXT NOT NULL, segment TEXT NOT NULL, cursor TEXT NOT NULL,
+                PRIMARY KEY(agent_id,segment));
             CREATE INDEX IF NOT EXISTS host_documents_owner ON host_documents(agent_id,source,timestamp_ms);
             CREATE TABLE IF NOT EXISTS host_windows (
                 id INTEGER PRIMARY KEY, document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
@@ -112,8 +115,89 @@ impl HostIndex {
                 tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
             }
         }
+        tx.execute(
+            "DELETE FROM host_sources WHERE agent_id=?1 AND segment NOT IN
+            (SELECT segment FROM host_documents WHERE agent_id=?1)",
+            [owner],
+        )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub(crate) fn source_cursor(
+        &self,
+        owner: &str,
+        path: &Path,
+    ) -> Result<Option<crate::host_cursor::SourceCursor>, IndexError> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT cursor FROM host_sources WHERE agent_id=?1 AND segment=?2",
+                params![owner, path.to_string_lossy()],
+                |r| r.get(0),
+            )
+            .optional()?;
+        raw.map(|s| serde_json::from_str(&s).map_err(IndexError::from))
+            .transpose()
+    }
+    pub(crate) fn source_documents(
+        &self,
+        owner: &str,
+        path: &Path,
+    ) -> Result<Vec<String>, IndexError> {
+        Ok(self
+            .conn
+            .prepare("SELECT id FROM host_documents WHERE agent_id=?1 AND segment=?2")?
+            .query_map(params![owner, path.to_string_lossy()], |r| r.get(0))?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    pub(crate) fn clear_source(&self, owner: &str, path: &Path) -> Result<(), IndexError> {
+        self.conn.execute(
+            "DELETE FROM host_documents WHERE agent_id=?1 AND segment=?2",
+            params![owner, path.to_string_lossy()],
+        )?;
+        self.conn.execute(
+            "DELETE FROM host_sources WHERE agent_id=?1 AND segment=?2",
+            params![owner, path.to_string_lossy()],
+        )?;
+        Ok(())
+    }
+    pub(crate) fn save_source(
+        &self,
+        owner: &str,
+        path: &Path,
+        cursor: &crate::host_cursor::SourceCursor,
+    ) -> Result<(), IndexError> {
+        self.conn.execute(
+            "INSERT INTO host_sources VALUES(?1,?2,?3)
+            ON CONFLICT(agent_id,segment) DO UPDATE SET cursor=excluded.cursor",
+            params![
+                owner,
+                path.to_string_lossy(),
+                serde_json::to_string(cursor)?
+            ],
+        )?;
+        Ok(())
+    }
+    /// A source frontier and all its documents/windows publish together. Nested
+    /// document savepoints cannot advance a cursor after an interrupted batch.
+    pub(crate) fn refresh_source<T>(
+        &mut self,
+        apply: impl FnOnce(&mut Self) -> Result<T, IndexError>,
+    ) -> Result<T, IndexError> {
+        self.conn.execute_batch("SAVEPOINT host_source_refresh")?;
+        match apply(self) {
+            Ok(value) => {
+                self.conn.execute_batch("RELEASE host_source_refresh")?;
+                Ok(value)
+            }
+            Err(error) => {
+                self.conn.execute_batch(
+                    "ROLLBACK TO host_source_refresh; RELEASE host_source_refresh",
+                )?;
+                Err(error)
+            }
+        }
     }
 
     pub fn checkpoint(&self) -> Result<(), IndexError> {
@@ -180,7 +264,7 @@ impl HostIndex {
         {
             return Ok(false);
         }
-        let tx = self.conn.transaction()?;
+        let tx = self.conn.savepoint()?;
         tx.execute("DELETE FROM host_documents WHERE id=?1", [id])?;
         tx.execute(
             "INSERT INTO host_documents VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",

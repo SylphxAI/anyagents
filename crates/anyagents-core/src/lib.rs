@@ -7,6 +7,7 @@
 mod address;
 pub mod boundary;
 mod error;
+mod host_cursor;
 pub mod host_index;
 pub mod host_migration;
 pub mod host_retrieval;

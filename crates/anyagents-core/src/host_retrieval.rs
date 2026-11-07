@@ -2,9 +2,10 @@
 //! active native JSONL is read in place and never handed off or rewritten here.
 use crate::{
     Agent, HistorySearchQuery, Store,
+    host_cursor::{FileStamp, SourceCursor},
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
     learned_memory::sha256,
-    raw_segment::{RawCoordinate, read_raw, retained_jsonl_records},
+    raw_segment::{RawCoordinate, open_readonly, read_raw},
 };
 use std::{
     collections::HashSet,
@@ -77,7 +78,6 @@ impl Store {
                 if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                     continue;
                 }
-                let raw = document_coordinate(&path)?;
                 let id = format!(
                     "memory:{}:{}",
                     agent.id,
@@ -93,30 +93,14 @@ impl Store {
                     tool_name: None,
                     role: Some("memory".into()),
                 };
-                index.index(&id, &metadata, &raw)?;
+                refresh_document(&mut index, &id, &metadata, &path)?;
                 ids.insert(id);
             }
             for path in native_transcripts(&root)? {
                 if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
                     continue;
                 }
-                for raw in retained_jsonl_records(&path)? {
-                    use std::io::{Read, Seek, SeekFrom};
-                    let mut file = crate::raw_segment::open_readonly(&path)?;
-                    file.seek(SeekFrom::Start(raw.offset))?;
-                    // Unknown content/output fields are skipped by the JSON
-                    // visitor, not materialized as an unbounded Value.
-                    let header: EventHeader = serde_json::from_reader(file.take(raw.length))?;
-                    let metadata = event_metadata(agent, &header, modified_ms(&path)?);
-                    let id = format!(
-                        "transcript:{}:{}:{}",
-                        agent.id,
-                        sha256(path.as_os_str().as_encoded_bytes()),
-                        raw.seq
-                    );
-                    index.index(&id, &metadata, &raw)?;
-                    ids.insert(id);
-                }
+                ids.extend(refresh_native(&mut index, agent, &path)?.documents);
             }
             index.retain_agent_documents(agent.id.as_str(), &ids)?;
         }
@@ -133,6 +117,115 @@ impl Store {
             })
             .collect()
     }
+}
+
+#[derive(Default)]
+pub struct RefreshStats {
+    pub documents: Vec<String>,
+    pub prefix_verified_bytes: u64,
+    pub suffix_scanned_bytes: u64,
+    pub indexed_records: usize,
+}
+fn refresh_document(
+    index: &mut HostIndex,
+    id: &str,
+    metadata: &IndexMetadata,
+    path: &Path,
+) -> Result<(), IndexError> {
+    let stamp = FileStamp::read(&open_readonly(path)?)?;
+    let policy = serde_json::to_string(metadata)?;
+    if index
+        .source_cursor(&metadata.agent_id, path)?
+        .is_some_and(|old| old.stamp == stamp && old.policy == policy)
+    {
+        return Ok(());
+    }
+    let raw = document_coordinate(path)?;
+    index.refresh_source(|index| {
+        index.index(id, metadata, &raw)?;
+        if FileStamp::read(&open_readonly(path)?)? == stamp {
+            index.save_source(
+                &metadata.agent_id,
+                path,
+                &SourceCursor {
+                    stamp,
+                    policy,
+                    end: raw.length,
+                    next_seq: 2,
+                    prefix_sha256: raw.sha256.clone(),
+                },
+            )?;
+        }
+        Ok(())
+    })
+}
+fn refresh_native(
+    index: &mut HostIndex,
+    agent: &Agent,
+    path: &Path,
+) -> Result<RefreshStats, IndexError> {
+    let stamp = FileStamp::read(&open_readonly(path)?)?;
+    let policy = format!("native-jsonl-v1:{}:{}", agent.id, agent.name);
+    let old = index
+        .source_cursor(agent.id.as_str(), path)?
+        .filter(|old| old.policy == policy);
+    if old.as_ref().is_some_and(|old| old.stamp == stamp) {
+        return Ok(RefreshStats {
+            documents: index.source_documents(agent.id.as_str(), path)?,
+            ..Default::default()
+        });
+    }
+    let scan = crate::host_cursor::scan_jsonl(path, &stamp, old.as_ref())?;
+    index.refresh_source(|index| {
+        if scan.replace {
+            index.clear_source(agent.id.as_str(), path)?;
+        }
+        // There cannot be committed documents beyond the atomically published
+        // frontier. An interrupted outer transaction is rolled back by SQLite.
+        for raw in &scan.records {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = open_readonly(path)?;
+            file.seek(SeekFrom::Start(raw.offset))?;
+            let header: EventHeader = serde_json::from_reader(file.take(raw.length))?;
+            let metadata = event_metadata(agent, &header, modified_ms(path)?);
+            let id = format!(
+                "transcript:{}:{}:{}",
+                agent.id,
+                sha256(path.as_os_str().as_encoded_bytes()),
+                raw.seq
+            );
+            index.index(&id, &metadata, raw)?;
+        }
+        // A live append racing this snapshot is not corruption. Do not advance
+        // the frontier; the next refresh revalidates and retries that suffix.
+        if FileStamp::read(&open_readonly(path)?)? == stamp {
+            index.save_source(
+                agent.id.as_str(),
+                path,
+                &SourceCursor {
+                    stamp,
+                    policy,
+                    end: scan.end,
+                    next_seq: scan.next_seq,
+                    prefix_sha256: scan.prefix_sha256.clone(),
+                },
+            )?;
+        } else {
+            // Roll back the whole publication, leaving the prior committed
+            // frontier and documents consistent for the next snapshot.
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "native source changed during refresh; retry",
+            )
+            .into());
+        }
+        Ok(RefreshStats {
+            documents: index.source_documents(agent.id.as_str(), path)?,
+            prefix_verified_bytes: scan.prefix_verified_bytes,
+            suffix_scanned_bytes: scan.suffix_scanned_bytes,
+            indexed_records: scan.records.len(),
+        })
+    })
 }
 
 fn safe_components(root: &Path, target: &Path) -> io::Result<bool> {
@@ -287,6 +380,147 @@ mod tests {
     use super::*;
     use crate::NewAgent;
     #[test]
+    fn persistent_cursor_reuses_unchanged_and_authenticates_append_edit_replace_and_tail() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("cursor-owner", "sylphx"))
+            .unwrap();
+        let path = dir.path().join("native.jsonl");
+        let prefix = b"{\"role\":\"user\",\"content\":\"originalneedle\"}\n{\"role\":\"assistant\",\"content\":\"secondneedle\"}\n";
+        let tail = b"{\"role\":\"tool\",\"content\":\"partial";
+        fs::write(&path, [prefix.as_slice(), tail.as_slice()].concat()).unwrap();
+        let index_path = dir.path().join("index.db");
+        let mut index = HostIndex::open(&index_path).unwrap();
+        let first = refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(first.indexed_records, 2);
+        assert_eq!(first.prefix_verified_bytes, 0);
+        assert_eq!(
+            first.suffix_scanned_bytes,
+            (prefix.len() + tail.len()) as u64
+        );
+        assert_eq!(
+            index
+                .source_cursor(agent.id.as_str(), &path)
+                .unwrap()
+                .unwrap()
+                .end,
+            prefix.len() as u64
+        );
+        drop(index);
+        let mut index = HostIndex::open(&index_path).unwrap();
+        let warm = refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(
+            (
+                warm.prefix_verified_bytes,
+                warm.suffix_scanned_bytes,
+                warm.indexed_records
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(warm.documents.len(), 2);
+        let suffix = b"needle\"}\n{\"role\":\"user\",\"content\":\"newneedle\"}\n";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(suffix)
+            .unwrap();
+        let appended = refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(appended.prefix_verified_bytes, prefix.len() as u64);
+        assert_eq!(
+            appended.suffix_scanned_bytes,
+            (tail.len() + suffix.len()) as u64
+        );
+        assert_eq!(appended.indexed_records, 2);
+        assert_eq!(appended.documents.len(), 4);
+        // A middle/prefix edit followed by append must not look append-only.
+        let edited = String::from_utf8(fs::read(&path).unwrap())
+            .unwrap()
+            .replace("originalneedle", "rewrittenneedle")
+            + "{\"content\":\"fifthneedle\"}\n";
+        fs::write(&path, &edited).unwrap();
+        let changed = refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(changed.indexed_records, 5);
+        assert_eq!(changed.suffix_scanned_bytes, edited.len() as u64);
+        let search = |index: &HostIndex, term: &str| {
+            index
+                .search(
+                    &[agent.id.to_string()],
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        query: Some(term.into()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        assert!(search(&index, "originalneedle").is_empty());
+        assert_eq!(search(&index, "rewrittenneedle").len(), 1);
+        let replacement = dir.path().join("replacement");
+        fs::write(&replacement, b"{\"content\":\"replacementneedle\"}\n").unwrap();
+        fs::rename(replacement, &path).unwrap();
+        let replaced = refresh_native(&mut index, &agent, &path).unwrap();
+        assert_eq!(replaced.indexed_records, 1);
+        assert_eq!(replaced.prefix_verified_bytes, 0);
+        assert_eq!(replaced.documents.len(), 1);
+        assert!(search(&index, "rewrittenneedle").is_empty());
+        assert_eq!(
+            read_raw(&search(&index, "replacementneedle")[0].raw).unwrap(),
+            fs::read(&path).unwrap()
+        );
+        // A batch can write both documents and its cursor before an injected
+        // interruption; the outer transaction must roll all of them back.
+        let before =
+            serde_json::to_string(&index.source_cursor(agent.id.as_str(), &path).unwrap()).unwrap();
+        let failure = index
+            .refresh_source(|index| -> Result<(), IndexError> {
+                index.clear_source(agent.id.as_str(), &path)?;
+                let raw = document_coordinate(&path)?;
+                index.index(
+                    "uncommitted-batch",
+                    &event_metadata(&agent, &EventHeader::default(), 0),
+                    &raw,
+                )?;
+                let mut advanced: SourceCursor =
+                    serde_json::from_str::<Option<SourceCursor>>(&before)?.unwrap();
+                advanced.next_seq = 999;
+                index.save_source(agent.id.as_str(), &path, &advanced)?;
+                Err(io::Error::other("injected before source publication").into())
+            })
+            .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("injected before source publication")
+        );
+        assert_eq!(
+            serde_json::to_string(&index.source_cursor(agent.id.as_str(), &path).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(search(&index, "replacementneedle").len(), 1);
+        index
+            .retain_agent_documents(agent.id.as_str(), &HashSet::new())
+            .unwrap();
+        assert!(
+            index
+                .source_cursor(agent.id.as_str(), &path)
+                .unwrap()
+                .is_none()
+        );
+        assert!(search(&index, "replacementneedle").is_empty());
+        refresh_native(&mut index, &agent, &path).unwrap();
+        fs::write(&path, b"").unwrap();
+        assert!(
+            refresh_native(&mut index, &agent, &path)
+                .unwrap()
+                .documents
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn indexed_native_history_cannot_bypass_redaction_or_symlink_privacy() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
@@ -313,6 +547,14 @@ mod tests {
                 .len(),
             1
         );
+        let native = root.join("config/sylphx-transcript.jsonl");
+        assert!(
+            HostIndex::open(&dir.path().join(INDEX_FILE))
+                .unwrap()
+                .source_cursor(agent.id.as_str(), &native)
+                .unwrap()
+                .is_some()
+        );
         // An unrelated unsupported binary copy produces a partial receipt but
         // must not hide the successfully scrubbed local transcript.
         fs::write(root.join("config/unrelated.sqlite"), b"unmodified binary").unwrap();
@@ -333,6 +575,13 @@ mod tests {
             )
             .unwrap();
         assert!(!receipt.full_scrub, "{receipt:?}");
+        assert!(
+            HostIndex::open(&dir.path().join(INDEX_FILE))
+                .unwrap()
+                .source_cursor(agent.id.as_str(), &native)
+                .unwrap()
+                .is_none()
+        );
         assert!(
             receipt
                 .unscrubbed
