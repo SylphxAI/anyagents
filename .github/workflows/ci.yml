@@ -92,6 +92,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Release cut policy
+        run: node --test tests/release-cut.test.mjs
       - name: Takeover geometry
         run: node --test tests/browser-takeover-geometry.test.mjs
       - name: Test
