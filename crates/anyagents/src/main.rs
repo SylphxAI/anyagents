@@ -605,15 +605,37 @@ enum HarnessesCommand {
 
 #[derive(Subcommand)]
 enum ChannelsCommand {
-    /// Copy a token and record the channel that uses it.
+    /// Bind a Telegram bot token, Managed Bot ID (`getManagedBotToken`), or request a new Managed Bot for an agent.
     Add {
         /// Channel kind. Only `telegram` is supported.
+        #[arg(default_value = "telegram")]
         kind: String,
         #[arg(long)]
         agent: String,
         /// File holding the bot token. The token is not an argument.
         #[arg(long)]
-        token_file: PathBuf,
+        token_file: Option<PathBuf>,
+        /// Telegram bot user ID for a Managed Bot (`getManagedBotToken`).
+        #[arg(long = "bot-id")]
+        bot_id: Option<i64>,
+        /// Suggested Telegram `@username` (or existing spare bot `@username`).
+        #[arg(long = "username", alias = "bot")]
+        bot_username: Option<String>,
+        /// Optional manager agent or bot name when requesting/fetching a Managed Bot.
+        #[arg(long)]
+        manager: Option<String>,
+    },
+    /// Generate a Telegram Bot API 9.6 `https://t.me/newbot/<manager>/<bot>?name=...` creation link and register pending auto-binding for `--agent`.
+    #[command(visible_alias = "new-bot", alias = "request_bot")]
+    RequestBot {
+        #[arg(long)]
+        agent: String,
+        /// Suggested Telegram `@username` for the new bot.
+        #[arg(long = "username", alias = "bot")]
+        bot_username: Option<String>,
+        /// Optional manager agent or bot name.
+        #[arg(long)]
+        manager: Option<String>,
     },
     /// List channels. No secret is printed.
     List,
@@ -2277,12 +2299,16 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                     let seat_info = create::resolved_agent_seat_info(&store, &a);
                     let aliases = store.agent_aliases(&a.id).unwrap_or_default();
                     let public_desc = a.public_description();
+                    let scope_val = a.scope().to_string();
                     fallback.push(api::AgentView {
                         id: a.id.to_string(),
                         name: a.name,
                         role: a.role,
                         aliases,
                         parent: a.parent_id.map(|p| p.to_string()),
+                        scope: scope_val,
+                        relationship: None,
+                        can_message: None,
                         harness: a.harness,
                         model: a.model,
                         live_harness: None,

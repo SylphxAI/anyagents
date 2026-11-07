@@ -959,12 +959,12 @@ pub fn print_agents_table_with_options(
         max_depth: Option<usize>,
         out: &mut Vec<RenderedNode<'a>>,
     ) {
+        let role_tag = node
+            .role
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
         let display_name = if depth == 0 {
-            let role_tag = node
-                .role
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty());
             match (node.state.as_str(), role_tag) {
                 ("running", Some(r)) => format!("{} {}", bold(&node.name), dim(&format!("· {r}"))),
                 ("running", None) => bold(&node.name),
@@ -987,10 +987,12 @@ pub fn print_agents_table_with_options(
             } else {
                 prefix.push_str("├─ ");
             }
-            let kid_name = if node.state == "archived" || node.state == "idle" {
-                dim(&node.name)
-            } else {
-                node.name.clone()
+            let kid_name = match (node.state.as_str(), role_tag) {
+                ("archived" | "idle", Some(r)) => dim(&format!("{} · {r}", node.name)),
+                ("archived" | "idle", None) => dim(&node.name),
+                ("running", Some(r)) => format!("{} {}", bold(&node.name), dim(&format!("· {r}"))),
+                (_, Some(r)) => format!("{} {}", node.name, dim(&format!("· {r}"))),
+                (_, None) => node.name.clone(),
             };
             format!("{}{kid_name}", dim(&prefix))
         };
@@ -1002,13 +1004,23 @@ pub fn print_agents_table_with_options(
             parent_runtime,
         });
 
-        if max_depth.is_some_and(|m| depth >= m) {
-            return;
-        }
+        let stop_here = max_depth.is_some_and(|m| depth >= m);
         if let Some(kids) = children_by_parent.get(node.id.as_str()) {
-            let count = kids.len();
+            let visible_kids: Vec<&'a AgentView> = if stop_here {
+                if depth == 0 && max_depth == Some(0) {
+                    kids.iter()
+                        .copied()
+                        .filter(|k| k.role.as_deref().is_some_and(|r| !r.trim().is_empty()))
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                kids.clone()
+            };
+            let count = visible_kids.len();
             let my_runtime = Some((node.harness.as_str(), node.model.as_deref()));
-            for (idx, &kid) in kids.iter().enumerate() {
+            for (idx, &kid) in visible_kids.iter().enumerate() {
                 let child_is_last = idx + 1 == count;
                 ancestors_have_more.push(!child_is_last);
                 walk_tree(

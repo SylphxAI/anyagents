@@ -1240,9 +1240,14 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     if state.open.is_empty() {
         return;
     }
-    for id in state.open.drain(..) {
+    for (idx, id) in state.open.drain(..).enumerate() {
         state.finished.insert(id.clone());
-        state.usages.push((id, usage.clone()));
+        let item_usage = if idx == 0 {
+            usage.clone()
+        } else {
+            TurnUsage::default()
+        };
+        state.usages.push((id, item_usage));
     }
     if !state.followups.is_empty() {
         state.turns_started += 1;

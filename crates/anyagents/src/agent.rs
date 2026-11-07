@@ -464,6 +464,7 @@ pub fn describe_cmd(
         if rec.instructions.is_none() {
             rec = store.set_agent_instructions(&rec.id, Some(text))?;
         }
+        crate::telegram::sync_agent_telegram_bot_name(&store, data, &rec);
     }
     if rec.parent_id.is_none() {
         crate::create::sync_all_agent_instructions(&store, data);
@@ -678,12 +679,16 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
+    let scope_val = agent.scope().to_string();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
         role: agent.role,
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: scope_val,
+        relationship: None,
+        can_message: None,
         harness: agent.harness,
         model: agent.model,
         live_harness: None,
@@ -787,12 +792,16 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
     let aliases = store.agent_aliases(&agent.id).unwrap_or_default();
     let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
     let public_desc = agent.public_description();
+    let scope_val = agent.scope().to_string();
     Ok(AgentView {
         id: agent.id.to_string(),
         name: agent.name,
         role: agent.role,
         aliases,
         parent: agent.parent_id.as_ref().map(ToString::to_string),
+        scope: scope_val,
+        relationship: None,
+        can_message: None,
         harness: agent.harness,
         model: agent.model,
         live_harness: None,
@@ -1274,12 +1283,16 @@ fn list_filtered(
         let seat_info = crate::create::resolved_agent_seat_info(&store, &agent);
         if pretty {
             let public_desc = agent.public_description();
+            let scope_val = agent.scope().to_string();
             fallback_views.push(AgentView {
                 id: agent.id.to_string(),
                 name: agent.name,
                 role: agent.role,
                 aliases,
                 parent: agent.parent_id.as_ref().map(ToString::to_string),
+                scope: scope_val,
+                relationship: None,
+                can_message: None,
                 harness: agent.harness,
                 model: agent.model,
                 live_harness: None,
@@ -1448,6 +1461,7 @@ pub fn join_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), Er
             action: "join".to_string(),
             group: group.to_string(),
             agent: Some(agent_id.to_string()),
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let _ = client::call::<GroupView>(
@@ -1469,6 +1483,7 @@ pub fn leave_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), E
             action: "leave".to_string(),
             group: group.to_string(),
             agent: Some(agent_id.to_string()),
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let _ = client::call::<GroupView>(
@@ -1491,6 +1506,7 @@ pub fn group_members(data: &Path, group: &str) -> Result<Vec<String>, Error> {
             action: "members".to_string(),
             group: group.to_string(),
             agent: None,
+            public: None,
         })
         .map_err(|err| Error::Message(err.to_string()))?;
         let resp = client::call::<GroupView>(
@@ -1589,7 +1605,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
                 sender: message.sender.clone(),
                 reply_to: message.reply_to.clone(),
                 source_time_ms: message.source_time_ms,
-                context: anyagents_harness::Context::default(),
+                context: message.context.clone(),
             };
             match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
                 Ok(_) => {
