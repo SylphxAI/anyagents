@@ -554,14 +554,30 @@ fn load_transcript_indexed_items_before(transcript_path: &Path, end: usize) -> V
             continue;
         };
         if m.get("type").and_then(Value::as_str) == Some("context_window_open") {
-            history.clear();
+            // Retained items are copies of earlier active positions, not new
+            // tool results at the anchor's line. Match the ordered projection
+            // backwards so repeated identical items keep distinct raw origins.
+            let projected = project_context_anchor(&m);
+            let mut source_end = history.len();
+            let mut retained = Vec::with_capacity(projected.len());
+            for (index, item) in projected.into_iter().enumerate().rev() {
+                let source = (index != 0)
+                    .then(|| {
+                        history[..source_end]
+                            .iter()
+                            .rposition(|(_, prior)| prior == &item)
+                    })
+                    .flatten();
+                let origin = source.map_or(raw_idx, |position| {
+                    source_end = position;
+                    history[position].0
+                });
+                retained.push((origin, item));
+            }
+            retained.reverse();
+            history = retained;
             budget_managed_window = m.get("retained_items").is_some();
             pruned_open_calls.clear();
-            history.extend(
-                project_context_anchor(&m)
-                    .into_iter()
-                    .map(|item| (raw_idx, item)),
-            );
             continue;
         }
         if m.get("type").and_then(Value::as_str) == Some("context_edit") {
@@ -1705,6 +1721,34 @@ fn render_memory_recall(
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+
+    #[test]
+    fn retained_identical_tool_occurrences_keep_distinct_raw_origins_across_anchors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("sylphx-transcript.jsonl");
+        let call =
+            json!({"type":"function_call", "call_id":"reused", "name":"bash", "arguments":"{}"});
+        let output = json!({"type":"function_call_output", "call_id":"reused", "output":"same exact output"});
+        for item in [&call, &output, &call, &output] {
+            append_transcript_message(&path, item);
+        }
+        for _ in 0..3 {
+            let indexed = load_transcript_indexed_items(&path);
+            assert_eq!(
+                indexed
+                    .iter()
+                    .filter(|(_, item)| item == &output)
+                    .map(|(raw_idx, _)| *raw_idx)
+                    .collect::<Vec<_>>(),
+                [1, 3]
+            );
+            let retained: Vec<_> = indexed.into_iter().map(|(_, item)| item).collect();
+            append_transcript_message(
+                &path,
+                &json!({"type":"context_window_open", "handoff":"keep both occurrences", "retained_items":retained}),
+            );
+        }
+    }
 
     fn recall_pages(path: &Path, mut args: Value) -> String {
         let mut combined = String::new();

@@ -2254,8 +2254,9 @@ fn compact_native_context(
     if level >= 1 {
         // Results are replaceable context, not pending work. Preserve call IDs
         // and a pointer to the original raw line, never to a nested anchor copy.
-        let raw = std::fs::read_to_string(transcript_path).unwrap_or_default();
-        for item in &mut retained {
+        let indexed = load_transcript_indexed_items(transcript_path);
+        let mut source_end = indexed.len();
+        for item in retained.iter_mut().rev() {
             if item.get("type").and_then(Value::as_str) != Some("function_call_output")
                 || item
                     .get("output")
@@ -2264,15 +2265,15 @@ fn compact_native_context(
             {
                 continue;
             }
-            let cid = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-            let index = raw.lines().enumerate().find_map(|(idx, line)| {
-                let original: Value = serde_json::from_str(line).ok()?;
-                let matches = (original.get("type").and_then(Value::as_str)
-                    == Some("function_call_output")
-                    && original.get("call_id").and_then(Value::as_str) == Some(cid))
-                    || (original.get("role").and_then(Value::as_str) == Some("tool")
-                        && original.get("tool_call_id").and_then(Value::as_str) == Some(cid));
-                matches.then_some(idx)
+            // A provider may reuse a call_id after its earlier pair completed.
+            // Resolve this occurrence in the ordered active projection, whose
+            // raw coordinates survive anchors and legacy tool normalization.
+            let position = indexed[..source_end]
+                .iter()
+                .rposition(|(_, original)| original == item);
+            let index = position.map(|position| {
+                source_end = position;
+                indexed[position].0
             });
             let range = index.map_or_else(
                 || format!("transcript:0-{}", raw_count.saturating_sub(1)),
@@ -4970,6 +4971,100 @@ mod tests {
         );
         assert!(execute_memory_recall(&transcript, &json!({"query":"sha123"})).contains("sha123"));
         validate_responses_input(&input).unwrap();
+    }
+
+    // Adapted from the independent review's duplicate-completed-ID probe.
+    #[test]
+    fn review_reused_completed_call_id_pointer_must_recover_latest_result() {
+        for legacy in [false, true] {
+            for anchored in [false, true] {
+                let tmp = tempfile::tempdir().unwrap();
+                let transcript = tmp.path().join("sylphx-transcript.jsonl");
+                let call = json!({"type":"function_call", "call_id":"reused", "name":"bash", "arguments":"{}"});
+                let old = "older result A";
+                let latest = "LATEST result B 中文".repeat(5_000);
+                let pending = json!({"role":"user", "content":"continue"});
+                for output in [old, latest.as_str()] {
+                    if legacy {
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"role":"assistant", "tool_calls":[
+                                {"id":"reused", "type":"function", "function":{"name":"bash", "arguments":"{}"}}
+                            ]}),
+                        );
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"role":"tool", "tool_call_id":"reused", "content":output}),
+                        );
+                    } else {
+                        append_transcript_message(&transcript, &call);
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"type":"function_call_output", "call_id":"reused", "output":output}),
+                        );
+                    }
+                }
+                append_transcript_message(&transcript, &pending);
+                let mut input = load_transcript_input_items(&transcript);
+                validate_responses_input(&input).unwrap();
+                if anchored {
+                    // The loader must retain each original raw position through
+                    // repeated anchors, not point to an anchor's handoff text.
+                    for _ in 0..2 {
+                        append_transcript_message(
+                            &transcript,
+                            &json!({"type":"context_window_open", "handoff":"keep current work", "retained_items":input}),
+                        );
+                        input = load_transcript_input_items(&transcript);
+                    }
+                }
+                prepare_budgeted_request(
+                    &transcript,
+                    &mut input,
+                    &[pending],
+                    &context_preflight_limits(24_000),
+                    false,
+                    context_preflight_build,
+                )
+                .unwrap();
+                let pointer = input
+                    .iter()
+                    .find(|v| v["type"] == "function_call_output")
+                    .unwrap()["output"]
+                    .as_str()
+                    .unwrap();
+                assert!(
+                    pointer.contains("transcript:3-3"),
+                    "legacy={legacy}, anchored={anchored}: {pointer}"
+                );
+                assert!(!pointer.contains("transcript:1-1"));
+                let mut args = json!({"range":"transcript:3-3"});
+                let mut recovered_json = String::new();
+                loop {
+                    let page = execute_memory_recall(&transcript, &args);
+                    assert!(page.len() <= 32_768);
+                    let parsed: Value = serde_json::from_str(&page).unwrap();
+                    assert_eq!(parsed["mode"], "page");
+                    recovered_json.push_str(parsed["content"].as_str().unwrap());
+                    let Some(cursor) = parsed["next_cursor"].as_str() else {
+                        break;
+                    };
+                    args["cursor"] = json!(cursor);
+                }
+                let recovered: Value = serde_json::from_str(&recovered_json).unwrap();
+                assert_eq!(recovered["items"][0]["index"], 3);
+                let prefix = if legacy {
+                    "[tool] "
+                } else {
+                    "[tool_output:bash:reused] "
+                };
+                assert_eq!(
+                    recovered["items"][0]["content"],
+                    format!("{prefix}{latest}")
+                );
+                validate_responses_input(&input).unwrap();
+            }
+        }
     }
 
     #[test]
