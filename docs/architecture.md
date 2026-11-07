@@ -97,6 +97,20 @@ Each agent is one long-lived vendor process in its programmatic mode, run under 
 - A quota or rate-limit answer from the vendor (for example an HTTP 429 with a reset time) is a health state with its reset time, not a crash and not a restart loop.
 - A process that has gone is replaced after its backoff, resuming the session, and the lines after the one cursor go to the new process. A line already taken is never written twice: each adapter remembers the ids its session holds.
 
+### New-agent workspace selection
+
+`create::create` resolves workspace defaults for every spawn route. A new
+sub-agent with neither `repo` nor `workdir` gets a private
+`<data>/agents/<id>/work` directory, not its parent's directory. Each sibling
+gets a different directory. `workdir: "private"` selects this explicitly;
+`workdir: "inherit"` shares an existing parent directory only when requested.
+An explicit path is honoured. `repo: "inherit"` or `workdir: "worktree"`
+creates an isolated Git worktree instead of sharing the parent's worktree.
+
+Root creation can receive the operator's `workdir_default`; without that
+operator override it also uses its own managed directory. These defaults apply
+only to newly created agents: stored workdirs are not migrated or rewritten.
+
 ### GitHub event watches
 
 `github:pr:owner/repo#number` and `github:check:owner/repo@ref` use REST
@@ -372,16 +386,17 @@ provider-route refreshes and unrelated metadata updates. SQLite is authoritative
 marker); only the scope setter owns these keys. Harness-environment replacement
 merges them from the current row in the same write transaction.
 
-Without an explicit policy, roots are `public`, `*-assistant` children are
-`isolated`, other children with a nonempty `role` are `siblings`, and task
-children without a role are `private`. Description, instructions and role
-updates that omit both `scope` and `public` preserve the explicit policy.
+New roots default to `public`; all new children default to `private`, regardless
+of name or role. The store upgrade materializes each existing agent's effective
+scope explicitly, including legacy name/role defaults and legacy public markers.
+Description, instructions and role updates that omit both `scope` and `public`
+preserve that explicit policy.
 
 The legacy `public` boolean describes cross-tree reachability, not sibling
 access. `true` selects `public`. `false` preserves an existing nonpublic scope;
 for a public agent it restores the default above. An explicit `scope` takes
-precedence when both fields are supplied. To restrict a standing child to
-`private`, send `scope: "private"` explicitly.
+precedence when both fields are supplied. To enable sibling collaboration, send
+`scope: "siblings"` explicitly.
 
 Agents may edit their own description and instructions. Changing scope or role
 requires an ancestor, a root admin or the operator; updating another agent's
@@ -405,3 +420,26 @@ ORDER BY id;
 ## Storage
 
 One embedded SQLite database in WAL mode under the data directory holds every resource, the mailboxes and the usage records. A message is `received` when its insert has committed. Schema changes are versioned migrations applied at server start.
+
+## Methodology-neutral roles and lifecycle
+
+`role` is an optional display label. It does not select a prompt, communication
+policy, discovery membership or process lifetime. Private `instructions` define
+an agent's responsibilities, reporting conventions and decision to archive.
+AnyAgents ships no company hierarchy, standing-agent policy or role templates.
+Role labels are not interpreted as template names; callers that manage templates
+supply their contents through `instructions`.
+
+Every agent, including a root or role-bearing child, may archive itself.
+Archive is reversible: an intentional direct message wakes the identity again;
+passive notifications do not. Archive preserves the browser profile and login
+state; only `delete` removes the agent's browser profile. Existing clean/pushed
+managed-worktree cleanup still applies, while dirty or unpushed work is retained.
+
+After a completed turn, any agent releases its process to `idle` when its mailbox
+is drained, its latest accepted turn is complete, it has no running children or
+in-flight background commands, and it has no active error. An idle agent wakes
+on new mail. Its ID, role, instructions, scope, session, mailbox cursor, pending
+deliveries and schedules remain intact. There is no role-based residency flag.
+Topology and child discovery follow relationships and explicit scope, never the
+presence of a role label. The default CLI depth limit applies equally to all roles.
