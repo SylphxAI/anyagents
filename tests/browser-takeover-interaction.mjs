@@ -76,15 +76,27 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
       await until(()=>remote.eval(`document.querySelector('#entry').value===''`),'Ctrl+Y redo');
       results.push({width,owner,globalClipboard:true,undoRedo:true});
     }
+    // Hold only the real response: the independent CDP input driver and Rust
+    // mutation still run. A late editable-focus acknowledgement cannot steal
+    // focus after the person switches to the viewer's local text field.
+    await viewer.eval(`window.inputReplyHeld=false;window.originalFetch=window.fetch;window.fetch=async(...args)=>{const response=await window.originalFetch(...args);if(String(args[0]).endsWith('/input')&&args[1]?.body&&JSON.parse(args[1].body).text==='fallback once'){window.inputReplyHeld=true;await new Promise(resolve=>window.releaseInputReply=resolve)}return response}`);
     // The key gesture must work even when no native paste reaches the viewer.
     await viewer.eval(`navigator.clipboard.writeText('fallback once');window.suppressPaste=e=>{e.preventDefault();e.stopImmediatePropagation()};document.addEventListener('paste',window.suppressPaste,{capture:true})`);
     await remote.eval(`window.remoteInputs=0`);
     await key('v','KeyV',86,4);
     await until(()=>remote.eval(`document.querySelector('#entry').value==='fallback once'`),'Cmd+V fallback');
     assert.equal(await remote.eval('window.remoteInputs'),1);
+    await until(()=>viewer.eval('window.inputReplyHeld'),'real paste response held');
     await viewer.eval(`document.removeEventListener('paste',window.suppressPaste,{capture:true})`);
     // Local HUD text remains local, including select-all and native paste.
-    await viewer.eval(`document.querySelector('#hud-panel').hidden=false;document.querySelector('#type-input').focus();navigator.clipboard.writeText('local only')`);
+    await viewer.eval(`document.querySelector('#hud-panel').hidden=false;document.querySelector('#type-input').focus();navigator.clipboard.writeText('local only');window.releaseInputReply();new Promise(resolve=>setTimeout(resolve,80))`);
+    assert.equal(await viewer.eval('document.activeElement.id'),'type-input','late remote reply preserves local editable focus');
+    // This is a real viewport resize, not a synthetic visualViewport event.
+    await viewer.call('Emulation.setDeviceMetricsOverride',{width,height:height-80,deviceScaleFactor:1,mobile});
+    await until(()=>viewer.eval(`visualViewport.height<=${height-80}`),'local keyboard viewport resize');
+    assert.equal(await viewer.eval('document.activeElement.id'),'type-input','viewport resize preserves local editable focus');
+    await viewer.call('Emulation.setDeviceMetricsOverride',{width,height,deviceScaleFactor:1,mobile});
+    await viewer.eval('window.fetch=window.originalFetch');
     await key('v','KeyV',86,2);
     await until(()=>viewer.eval(`document.querySelector('#type-input').value==='local only'`),'local paste remains local');
     assert.equal(await remote.eval(`document.querySelector('#entry').value`),'fallback once');

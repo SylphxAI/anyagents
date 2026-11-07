@@ -106,7 +106,7 @@ if (typeof document !== 'undefined') {
   }
   function placeKeyboard() {
     const r = remoteFocus?.rect;
-    const active = !!r && remoteFocus.editable && matchMedia('(pointer: coarse)').matches;
+    const active = !!r && remoteFocus.editable && remoteTarget(document.activeElement) && matchMedia('(pointer: coarse)').matches;
     proxy.style.pointerEvents = active ? 'auto' : 'none';
     if (!active) return;
     proxy.style.left = (view.x + r.x * view.scale) + 'px';
@@ -123,6 +123,11 @@ if (typeof document !== 'undefined') {
   }
   function focusField(focus) {
     remoteFocus = focus;
+    // An HTTP acknowledgement can arrive after the person chose local text.
+    // Update remote metadata, but never move their new editable focus away.
+    if (!remoteTarget(document.activeElement)) {
+      keyboardActive = false; proxy.style.pointerEvents = 'none'; return;
+    }
     if (!focus?.editable) { keyboardActive = false; proxy.style.pointerEvents = 'none'; proxy.blur(); return; }
     openKeyboard();
     if (!matchMedia('(pointer: coarse)').matches) return;
@@ -333,7 +338,7 @@ if (typeof document !== 'undefined') {
   if (window.visualViewport) visualViewport.addEventListener('resize', () => {
     const vv = visualViewport;
     $('hud').style.bottom = `calc(${Math.max(0, innerHeight - vv.height - vv.offsetTop) + 10}px + env(safe-area-inset-bottom))`;
-    if (keyboardActive && remoteFocus?.editable) focusField(remoteFocus);
+    if (document.activeElement === proxy && keyboardActive && remoteFocus?.editable) focusField(remoteFocus);
   });
   async function pollFrame() {
     if (completed) return;
