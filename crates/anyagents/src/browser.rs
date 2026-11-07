@@ -959,7 +959,10 @@ impl CdpSession {
                 continue;
             };
             #[cfg(test)]
-            if val.get("method").and_then(|v| v.as_str()) == Some("Target.attachedToTarget") {
+            if matches!(
+                val.get("method").and_then(|v| v.as_str()),
+                Some("Target.attachedToTarget" | "Tracing.tracingComplete")
+            ) {
                 self.events.push(val.clone());
             }
             if val.get("id").and_then(|v| v.as_u64()) == Some(id) {
@@ -5745,6 +5748,72 @@ mod tests {
             },
         );
     }
+    // Disposable experiment only: native browser trace, never shipped/enrolled.
+    fn native_focus_trace_start(port: u16) -> Option<CdpSession> {
+        std::env::var_os("ANYAGENTS_FOCUS_NATIVE_TRACE")?;
+        let version: serde_json::Value =
+            serde_json::from_slice(&cdp_http_get(port, "/json/version").unwrap()).unwrap();
+        let mut cdp =
+            CdpSession::connect(port, version["webSocketDebuggerUrl"].as_str().unwrap()).unwrap();
+        cdp.call("Tracing.start", serde_json::json!({
+            "transferMode":"ReturnAsStream", "streamFormat":"proto", "streamCompression":"none",
+            "categories":"blink,blink.user_timing,devtools.timeline,devtools,toplevel,mojom,mojom.flow,toplevel.flow,navigation,content,input,renderer_host",
+            "options":"record-until-full", "bufferUsageReportingInterval":1000
+        })).unwrap();
+        Some(cdp)
+    }
+
+    fn native_focus_trace_end(cdp: &mut CdpSession) {
+        let path = std::env::var_os("ANYAGENTS_FOCUS_NATIVE_TRACE").unwrap();
+        cdp.call("Tracing.end", serde_json::json!({})).unwrap();
+        let started = std::time::Instant::now();
+        let stream = loop {
+            if let Some(event) = cdp
+                .events
+                .iter()
+                .find(|e| e["method"] == "Tracing.tracingComplete")
+            {
+                assert_ne!(
+                    event["params"]["dataLossOccurred"], true,
+                    "native trace lost data"
+                );
+                break event["params"]["stream"].as_str().unwrap().to_string();
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(30),
+                "native trace completion deadline"
+            );
+            let event: serde_json::Value =
+                serde_json::from_str(&cdp.read_text_message().unwrap()).unwrap();
+            cdp.events.push(event);
+        };
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut bytes = 0usize;
+        loop {
+            let part = cdp
+                .call(
+                    "IO.read",
+                    serde_json::json!({"handle":stream,"size":262144}),
+                )
+                .unwrap();
+            let data = part["data"].as_str().unwrap();
+            let data = if part["base64Encoded"] == true {
+                decode_base64(data).unwrap()
+            } else {
+                data.as_bytes().to_vec()
+            };
+            bytes += data.len();
+            assert!(bytes <= 64 * 1024 * 1024, "native trace exceeds 64MiB");
+            file.write_all(&data).unwrap();
+            if part["eof"] == true {
+                break;
+            }
+        }
+        cdp.call("IO.close", serde_json::json!({"handle":stream}))
+            .unwrap();
+        eprintln!("NATIVE TRACE: retained {bytes} bytes");
+    }
+
     #[test]
     #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md; fix owner: lyra-anyagents-takeover-test-race after #91"]
     fn takeover_focus_finds_cross_origin_input() {
@@ -5761,6 +5830,7 @@ mod tests {
                         related:e.relatedTarget?.outerHTML||null,active:document.activeElement?.outerHTML,
                         focused:document.hasFocus(),stack:new Error('event '+type).stack});
                     window.events.push(event);
+                    performance.mark('focus-probe:'+type+':'+event.target+':active='+document.activeElement.tagName+':hasFocus='+document.hasFocus());
                 },true);
         </script>"#;
         let child = spawn_html_server(
@@ -5794,6 +5864,7 @@ mod tests {
             assert_eq!(rt.display_mode, "xvfb-headed");
             assert!(!rt.headless);
         }
+        let mut native_trace = native_focus_trace_start(rt.cdp_port);
         let response = if std::env::var("ANYAGENTS_FOCUS_PATH").as_deref() == Ok("viewer") {
             let st = start_or_reuse_takeover_session(
                 dir.path(),
@@ -5850,6 +5921,9 @@ mod tests {
                     eval_js_in_frame(&mut cdp, Some(&frame.frame_id), diag)
                 );
             }
+        }
+        if let Some(trace) = native_trace.as_mut() {
+            native_focus_trace_end(trace);
         }
         let _ = stop_profile(dir.path(), "frame-focus");
         assert_eq!(response["focus"]["editable"], true, "{response}");
