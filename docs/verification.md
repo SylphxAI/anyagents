@@ -36,12 +36,34 @@ npm test
 ## Synthetic agent identities
 
 The shared server fixtures derive eight distinct nonzero synthetic agent UIDs
-while excluding the executor's real UID. Both `operator()` and explicit server
-launches use that same map; these numbers are fixture metadata, not host-account
-provisioning. `server_harnesses` covers every candidate collision, including
-real UID 2106, and runs the unchanged server against a deliberately matching UID
-(refused before socket creation) and the collision-free fixture (accepted).
-The strict product launch guard remains enabled.
+while excluding the executor's real UID. `operator()` and the explicit identity-
+admission fixture use that same map; these numbers are fixture metadata, not
+host-account provisioning. `server_harnesses` covers every candidate collision,
+including real UID 2106, and runs the unchanged server against a deliberately
+matching UID (refused before socket creation) and the collision-free fixture
+(accepted). Both sides retain the same configured seat and launcher; protocol
+round-trip fixtures separately use the seat-free `contract_server()` helper.
+The strict product launch guard remains enabled; this startup check does not
+claim a real cross-UID launch.
+
+## Seat Git configuration
+
+Seat Git configuration runs file-only edits in daemon-owned staging, with
+`GIT_DIR=/dev/null` and inherited Git repository/parameter routing removed.
+An absolute `git config --file` argument alone still allows Git to inspect the
+caller's checkout. That checkout can be malformed or inaccessible after the
+native test drops DAC override. The explicit non-repository metadata path also
+supports data roots containing `:`, unlike Unix path-list discovery ceilings.
+
+`cargo test -p anyagents --bin anyagents seat_git_configuration --locked` exercises
+`ensure_seat_environment` from an unrelated malformed repository in isolated
+subprocesses, including separate explicit Git routing controls and a colon-bearing
+data root. It verifies exact trust for a synthetic non-repository workdir,
+preserved caller settings, and refusal without replacement when the seat's own
+configuration is invalid. The ordinary vendor suite does not execute the ignored
+native-UID case: the Linux managed-UID lane must additionally verify that the
+actual seat reads only its exact Git trust root alongside the existing memory,
+skill and cross-seat isolation checks.
 
 ## OpenCode port-collision fixtures
 
@@ -65,7 +87,9 @@ cargo test -p anyagents --test cli archive_reap --locked
 The unit cases verify mail progress while cleanup is blocked in a git probe,
 nonblocking descendant reconciliation, durable completion across restart,
 wake/rearchive invalidation, failed cleanup retry, and preservation of shared,
-external and unpushed work. The CLI cases execute the production binary with a
+external and unpushed work. Worktree admission also retains managed-config
+provenance after the last reader retires and its private gitdir is removed,
+without restoring retired access or accepting a replacement config link. The CLI cases execute the production binary with a
 cleared environment and synthetic host home. They verify archive cleanup does
 not recreate seat skill directories and real `serve-admin` maintenance reaps a
 legacy archive only once across restart. Unit-test isolation disables host-home
@@ -105,6 +129,29 @@ capabilities are **not** an OS security sandbox. Container/Pod/user isolation
 requires a configured runtime boundary and a separate execution check on that
 runtime. This script does not certify Docker, Kubernetes, cross-user isolation,
 or live authentication. See [ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md).
+
+## Telegram batch checkpoints and replay
+
+```sh
+cargo test -p anyagents --test telegram --locked
+```
+
+Telegram ingestion commits mailbox rows before saving the batch's channel
+checkpoint (`offset` and `chats`). A reader can therefore see the entire inbox
+while the persisted offset still names the previous batch. The DM/topic
+acceptance test waits for both the mailbox rows and the completed checkpoint
+before asserting channel state; it does not assume those separate commits are
+atomic. A disposable two-second pause immediately before the checkpoint write
+reproduced CI run 42335689725's `offset = 0` versus `12` failure in the original
+test. No pause or test retry belongs in the shipped ingestion path.
+
+`a_restart_before_the_offset_checkpoint_replays_without_duplicate_mail` uses a
+fixture-only SQLite trigger to reject the offset write while allowing inbox
+commits. It kills the server with two messages stored and offset zero, removes
+the trigger, and starts a fresh server with the same Telegram updates. The
+checkpoint must advance to 12 without changing the two mailbox IDs or provider
+origins. This verifies replay after an interrupted checkpoint without relying
+on a sleep to hit the crash window.
 
 ## Browser takeover on phones
 
@@ -210,3 +257,125 @@ Set `TAKEOVER_GOOGLE_ACCEPTANCE=1` for the additional network-dependent,
 unauthenticated `accounts.google.com` phone-layout captures. No credentials are
 entered. This is separate from the deterministic local fixture and does not
 certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
+
+## Host memory under a managed UID
+
+The required public Linux CI lane builds the shipping `anyagents` binary and
+runs `scripts/verify-host-memory-seat.py` with native `/usr/bin/setpriv`. The
+entrypoints are `anyagents --data <synthetic-data> agent-run --config
+<own-config> -- <probe>` and the real `vendor_launch` adapter path with a scripted
+vendor child. Both use the same shared harness admission primitive that also
+starts native workspace commands; a refused probe never returns a command to
+its caller. No test launcher substitutes for those checks. The agent's actual UID 24031 and primary GID 24032 are asserted
+independently; supplementary socket group 24033 is not a primary-GID proxy.
+
+The CLI fixture proves learned-memory read/write and
+readback, discovery/read through all three skill projections, writable own skill
+overlay, and denied global/peer/host-private reads or writes as appropriate.
+Missing memory, missing overlay, writable peer memory/skills/config and writable
+global skills each refuse admission before the probe starts. The agent parent
+remains traverse-only (`0711`) and the probe asserts it cannot be listed by the
+seat. Production admission enumerates the complete peer inventory as the server
+before dropping UID, then checks exact shell-quoted paths; seat-side glob
+expansion is not accepted as evidence that no accessible peer exists. Inventory
+errors refuse admission, except confirmed absence for a config-less boundary
+that has no agent layout. Each admission check runs as a standalone subshell,
+so a false left operand of `&&` cannot be hidden by a later passing check under
+shell `errexit`. Protected bytes are hashed before and after. The receipt records source/binary/script/launcher hashes, each case's
+exit and output, and confirmed fixture removal; CI prints it even after failure.
+A native-setpriv preflight checks every fixture ancestor's traversal permission
+with the actual UID/GID before admission. Production admission failures report
+the static failed check label without command output or capability contents;
+this separates fixture setup failures from a specific boundary refusal. Existing
+ancestor permissions are never changed to make a fixture pass. The Linux CI
+fixture uses a newly created leaf under `/var/tmp`: the runner's private home
+ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
+The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
+No account, ACL, real agent directory or daemon is changed.
+
+A required isolated Rust test invokes `vendor_launch` through the real Claude
+adapter and native setpriv, not the CLI route. It removes the executor's DAC
+override/read-search capabilities while retaining UID/GID transitions, mounts
+skills under daemon umask `077`, and requires reads through the actual
+`.claude`, `.agents` and `.agy` projections. A seat-owned `0700` vendor parent
+must receive its projection through the narrow owner fallback without widening
+that parent. It also checks legacy SQLite ownership handoff with exact bytes,
+a second registered agent on the same UID/GID, writable foreign-seat
+memory/skills/config refusals before vendor execution, search-only (`0711`)
+foreign-tree refusal despite a known readable file, protected bytes/modes,
+and fixture removal. The same required test exercises the real Muse workspace
+session initializer with a fresh marker: each writable peer tree refuses before
+any vendor process starts, while a valid boundary admits one initializer and
+reuses its saved marker. It also launches the real Codex adapter with a preserved
+foreign `.claude` parent and with a foreign `.claude/skills` mount. Personal bytes
+remain unchanged and the active `.agents` skills remain readable. Admission
+checks all three folders, not just the active harness. It honors intentionally
+preserved personal projections outside foreign managed-seat roots rather than
+requiring unrelated host names through them. Symlinked parents and mounts are
+resolved under the admitted identity and refuse foreign managed-seat roots or
+unresolvable targets; ordinary host-managed views still must read.
+Same-seat exceptions require the host-resolved principal
+and exact registered root, not merely ownership of a directory. Local unprivileged
+tests separately exercise deterministic directory-to-symlink replacement during
+descriptor-bound permission sharing. Passing CLI controls alone does not certify
+this vendor proof or real vendor subscriptions.
+
+A non-root local invocation deliberately refuses before creating a fixture. It
+is not a skipped pass or actual alternate-UID evidence: acceptance requires the
+required Linux job's receipt for the tested head. The CI invocation is documented
+in `.github/workflows/ci.yml`; it never falls back when privilege is missing.
+
+### Cross-seat worktree permission boundary
+
+The Linux CI `Cross-seat worktree writes` step runs
+`create::tests::privileged_cross_uid_spawn_can_create_commit_and_status` with
+`ANYAGENTS_REQUIRE_PRIVILEGED_WORKTREE_TEST=1`. It creates three real OS users:
+A provisions B, B commits, A still writes B-created Git content and commits using
+an explicit protected hooks path. B cannot write common config/hooks/info,
+write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
+its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
+B's ordinary status, commit and local bare-remote push use its generated seat
+config, with no `-c user.*` or author/committer environment overrides; the commit
+records the exact Kyle author and committer. A's common config retains its owner,
+inode, content and owner read access during adoption. Parent config, remote-add
+and `git push -u` each replace the target inode while retaining the managed link;
+both active child UIDs must immediately read common config and run status, with
+no launch, wake or inspection call between the write and probe. They still cannot
+write/unlink config or create its lock, access sibling private metadata or write
+hooks/info; an unrecorded UID cannot read config. Default ACL readbacks remain
+confined to the dedicated config directory, and survivor/last-reader revocation
+is tested across another parent rewrite. Adoption regressions cover an existing
+Git config lock, interrupted publication with original bytes retained, and
+replacement of the journal-pinned directory or link. A same-size clean-filter positive control
+executes as B, then a forged `.git` pointer cannot execute that filter during
+journal-pinned server cleanup or A/C seat commands in the foreign checkout.
+A second payload selects a trusted common-config driver through B's checkout
+and staged attributes after archive revocation. Cleanup must execute the driver
+only as B; a B-readable execution receipt records that UID while a root-only
+marker remains absent. An inspection worker is SIGKILLed mid-check without unwinding;
+the durable open intent and read-only ACL are observed before startup recovery
+removes the grant, reads it back and preserves the dirty checkout on a fresh check.
+The temporary grant cannot write parent-owned common config or create objects.
+A non-privileged counterpart requires pinned status to execute successfully,
+checks the marker stays absent and rejects included or writable metadata config.
+A cleanup regression snapshots every checkout and private-registration file and
+requires byte-for-byte retention for an unpushed HEAD and for another unpushed
+local branch beside a published detached HEAD; publishing both permits removal.
+The same snapshot case removes or breaks the journaled checkout's `.git` pointer
+with an unpushed HEAD and a report under `target/`: every checkout and private
+registration byte must survive, without falling back to non-Git deletion.
+Archive immediately revokes B's common-store access while preserving its external
+checkout bytes; reap is idempotent and C remains admitted. A separate post-sharing
+admission failure verifies rollback revocation. ACL readbacks cover every changed
+object. A missing privilege is an explicit local skip, never the CI acceptance:
+the required environment flag makes a privilege skip fail.
+
+Three Linux recovery regressions plant a FIFO, a hard link or an outside-target
+symlink during a durably open inspection. Each covers legacy and exact-object
+journals through both primary and admin HTTP servers: the affected worktree is
+quarantined, wake/reap/automatic harness launch refuse it, remaining targets and
+an independent interrupted inspection are revoked, an active same-common seat's
+ACLs remain unchanged, and outside-link contents and ACLs are preserved.
+
+Shared refs are intentionally writable within one repository. These checks do not
+claim branch-tip integrity for arbitrary agent shell commits or pushes.

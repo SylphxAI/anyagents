@@ -26,14 +26,14 @@ struct Server {
 
 impl Server {
     fn start(dir: &Path, harness_bin: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             .env("ANYAGENTS_HARNESS_BIN", harness_bin)
             .arg("--data")
             .arg(dir)
             .arg("serve")
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(dir.join("shared.log")).unwrap())
-            .env("ANYAGENTS_FAKE_LOG", dir.join("shared.log"))
+            .env("ANYAGENTS_SHARED_LOG", dir.join("shared.log"))
             .spawn()
             .expect("server");
         let socket = dir.join("anyagents.sock");
@@ -141,10 +141,29 @@ fn the_real_server_refuses_a_matching_uid_but_accepts_the_fixture() {
     assert!(!data.join("anyagents.sock").exists());
     drop(refused);
 
-    // Only the synthetic map differs; the same strict product guard now admits
-    // startup without a fake-mode bypass or a change to the executor's UID.
-    let _server = Server::start(&data, Path::new(env!("CARGO_BIN_EXE_anyagents")));
-    assert!(data.join("anyagents.sock").exists());
+    // Keep the configured seat and launcher on both sides. The protocol-only
+    // Server::start helper intentionally removes those declarations and would
+    // not distinguish a corrected map from an absent launch boundary.
+    let accepted_log = data.join("distinct-uid.log");
+    let child = bin()
+        .env("ANYAGENTS_AGENTS", support::agents_line())
+        .arg("--data")
+        .arg(&data)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(std::fs::File::create(&accepted_log).unwrap())
+        .spawn()
+        .unwrap();
+    let mut accepted = Server { child };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !data.join("anyagents.sock").exists() {
+        assert!(
+            accepted.child.try_wait().unwrap().is_none() && Instant::now() < deadline,
+            "the corrected fixture was not admitted: {}",
+            std::fs::read_to_string(&accepted_log).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// A `PATH` where creating an agent installs nothing: `npm` answers a version
@@ -227,6 +246,27 @@ fn create_asker(dir: &Path) {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    // This agent is a mailbox, not another model. Keep it out of the
+    // supervisor's eager launch population: only responders have an adapter.
+    let paused = bin()
+        .arg("--data")
+        .arg(dir)
+        .args(["agents", "pause", "kind"])
+        .output()
+        .unwrap();
+    assert!(
+        paused.status.success(),
+        "{}",
+        String::from_utf8_lossy(&paused.stderr)
+    );
+    assert_eq!(
+        Store::open(dir.join("state.db"))
+            .unwrap()
+            .agent_by_name("kind")
+            .unwrap()
+            .state,
+        "paused"
+    );
 }
 
 fn call(socket: &Path, request: &str) -> Value {
@@ -277,6 +317,7 @@ fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
             "duplicate replies to {sent_id}: {answers:?}"
         );
         if !answers.is_empty() {
+            assert_eq!(store.agent_by_name("kind").unwrap().state, "paused");
             break;
         }
         assert!(

@@ -351,7 +351,7 @@ impl RpcChild {
     }
 
     fn spawn(&mut self) -> Result<(), HarnessError> {
-        let mut command = spawn_command(&self.program, &self.environment);
+        let mut command = spawn_command(&self.program, &self.environment)?;
         crate::close_inherited_files(&mut command);
         command
             .args(&self.args)
@@ -360,9 +360,6 @@ impl RpcChild {
             .stderr(Stdio::null());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            command.env(key, value);
         }
         let mut child = command
             .spawn()

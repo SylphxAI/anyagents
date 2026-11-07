@@ -1,3 +1,5 @@
+mod support;
+
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Child, Command, Stdio};
@@ -114,6 +116,19 @@ impl Drop for Serve {
     }
 }
 
+/// A live stdin-consuming Claude fixture: an exited no-op is a real process
+/// failure and must not be hidden by the production error-reporting path.
+fn claude_double(data: &std::path::Path) -> std::path::PathBuf {
+    let probe = data.join("bin").join("fixture-claude");
+    std::fs::write(
+        &probe,
+        "#!/bin/sh\nprintf '%s\\n' \"$0\" > \"$CLAUDE_CONFIG_DIR/fixture-claude-started\"\nwhile IFS= read -r line; do :; done\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    probe
+}
+
 fn start_server(data: &std::path::Path) -> Serve {
     start_server_mode(data, "serve")
 }
@@ -124,7 +139,7 @@ fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
         .arg(data)
         .arg(mode)
         .env("PATH", machine_path(data))
-        .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+        .env("ANYAGENTS_CLAUDE_CODE_BIN", claude_double(data))
         .env("ANYAGENTS_CODEX_BIN", "/bin/true")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -258,8 +273,70 @@ fn error_text(result: &CallToolResult) -> String {
 }
 
 #[tokio::test]
+async fn canonical_conversation_raw_range_crosses_mcp_and_authenticated_socket() {
+    let dir = support::physical_tempdir();
+    let bytes = b"mcprawneedle \0\xff exact binary tail";
+    for name in ["range-own", "range-peer"] {
+        let created = bin()
+            .env("PATH", machine_path(dir.path()))
+            .arg("--data")
+            .arg(dir.path())
+            .args(["agents", "create", name])
+            .output()
+            .unwrap();
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let root = dir
+            .path()
+            .join("agents")
+            .join(created_id(dir.path(), name))
+            .join("memory");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("MEMORY.md"), bytes).unwrap();
+    }
+    let _server = start_server(dir.path());
+    let own = connect(dir.path(), "range-own").await;
+    let peer = connect(dir.path(), "range-peer").await;
+    let found: serde_json::Value = ok_json(
+        call(
+            &own,
+            "conversation",
+            serde_json::json!({"scope":"memory","query":"mcprawneedle"}),
+        )
+        .await,
+    );
+    assert_eq!(found["turns"].as_array().unwrap().len(), 1);
+    let hit = &found["turns"][0];
+    let read: serde_json::Value = ok_json(call(&own, "conversation", serde_json::json!({
+        "scope":"memory", "raw_id":hit["id"], "raw_sha256":hit["raw"]["sha256"], "raw_offset":12, "raw_length":8
+    })).await);
+    let actual: Vec<u8> = serde_json::from_value(read["turns"][0]["raw_bytes"].clone()).unwrap();
+    assert_eq!(actual, bytes[12..20]);
+    assert_eq!(read["turns"][0]["window"]["length"], 8);
+    assert_eq!(read["turns"][0]["raw"]["length"], bytes.len());
+    let peer_found: serde_json::Value = ok_json(
+        call(
+            &peer,
+            "conversation",
+            serde_json::json!({"scope":"memory","query":"mcprawneedle"}),
+        )
+        .await,
+    );
+    let peer_hit = &peer_found["turns"][0];
+    let denied = call(&own, "conversation", serde_json::json!({"scope":"memory", "raw_id":peer_hit["id"], "raw_sha256":peer_hit["raw"]["sha256"], "raw_length":8})).await;
+    assert!(error_text(&denied).contains("raw document not found in authorized scope"));
+    let stale = call(&own, "conversation", serde_json::json!({"scope":"memory", "raw_id":hit["id"], "raw_sha256":"0".repeat(64), "raw_length":8})).await;
+    assert!(error_text(&stale).contains("raw document changed since search"));
+    own.cancel().await.unwrap();
+    peer.cancel().await.unwrap();
+}
+
+#[tokio::test]
 async fn mcp_tools_use_the_server_socket() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let socket = dir.path().join("anyagents.sock");
     assert!(
         socket.as_os_str().len() <= 107,
@@ -502,6 +579,39 @@ async fn mcp_tools_use_the_server_socket() {
     assert_eq!(spawned.name, "worker-1");
     assert_eq!(spawned.parent.as_deref(), Some(alpha_id.as_str()));
     assert_eq!(spawned.state, "running");
+
+    // Prove the canonical override selected the live fixture through the actual
+    // server launch path, rather than an inherited override or PATH fallback.
+    let marker = dir
+        .path()
+        .join("agents")
+        .join(&spawned.id)
+        .join("config")
+        .join("fixture-claude-started");
+    support::wait_for(
+        || marker.is_file(),
+        "canonical Claude fixture was not launched",
+    );
+    assert_eq!(
+        std::fs::read_to_string(&marker).unwrap().trim(),
+        dir.path().join("bin/fixture-claude").to_str().unwrap()
+    );
+    let live: AgentsResponse = ok_json(
+        call(
+            &alpha,
+            "agents",
+            serde_json::json!({"action":"list", "state":"all"}),
+        )
+        .await,
+    );
+    assert_eq!(
+        live.agents
+            .iter()
+            .find(|row| row.id == spawned.id)
+            .unwrap()
+            .process,
+        "alive"
+    );
 
     // Parent can read sub-agent's conversation by `agt_...` ID.
     let worker_conv: ConversationResponse = ok_json(
@@ -989,8 +1099,200 @@ async fn mcp_tools_use_the_server_socket() {
 }
 
 #[tokio::test]
+async fn redaction_mcp_and_cli_share_authenticated_audited_api() {
+    use anyagents_core::{NewAgent, Store, agent_config_dir};
+    let dir = support::physical_tempdir();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let root = store
+        .create_agent(NewAgent::new("redaction-root", "sylphx"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("redaction-peer", "sylphx"))
+        .unwrap();
+    let mut input = NewAgent::new("redaction-child", "sylphx");
+    input.parent_id = Some(root.id.clone());
+    let child = store.create_agent(input).unwrap();
+    for agent in [&root, &peer, &child] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let config = agent_config_dir(dir.path(), &child.id);
+    std::fs::create_dir_all(&config).unwrap();
+    let transcript = config.join("sylphx-transcript.jsonl");
+    std::fs::write(&transcript, "{\"type\":\"function_call_output\",\"call_id\":\"call_1\",\"output\":\"prefix syntheticcanary suffix\"}\n").unwrap();
+    let _server = start_server(dir.path());
+    let root_mcp = connect(dir.path(), &root.name).await;
+    let peer_mcp = connect(dir.path(), &peer.name).await;
+    let args = serde_json::json!({"action":"redact", "name":child.name, "message_id":"transcript:0", "span":{"unit":"chars","start":7,"end":22}, "reason":"accidental synthetic capture"});
+    let denied = call(&peer_mcp, "agents", args.clone()).await;
+    assert_eq!(denied.is_error, Some(true), "{denied:?}");
+    assert!(
+        serde_json::to_string(&denied)
+            .unwrap()
+            .contains("requires a target ancestor"),
+        "{denied:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&transcript)
+            .unwrap()
+            .contains("syntheticcanary")
+    );
+    let receipt: serde_json::Value = ok_json(call(&root_mcp, "agents", args).await);
+    assert_eq!(receipt["permission"], "conversation.redact");
+    assert_eq!(receipt["full_scrub"], true);
+    assert!(
+        !std::fs::read_to_string(&transcript)
+            .unwrap()
+            .contains("syntheticcanary")
+    );
+    let cli = bin()
+        .env("ANYAGENTS_AGENT_ID", root.id.as_str())
+        .env(
+            "ANYAGENTS_AGENT_CONFIG",
+            agent_config_dir(dir.path(), &root.id),
+        )
+        .arg("--data")
+        .arg(dir.path())
+        .args([
+            "redact",
+            &child.name,
+            "--message-id",
+            "transcript:0",
+            "--start",
+            "7",
+            "--end",
+            "22",
+            "--unit",
+            "chars",
+            "--reason",
+            "same request replay",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let replay: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    assert_eq!(replay["audit_id"], receipt["audit_id"]);
+    let invalid = call(&root_mcp, "agents", serde_json::json!({"action":"redact", "name":child.name,"message_id":"transcript:0","span":{"unit":"bytes","start":0,"end":9999},"reason":"invalid span check"})).await;
+    assert_eq!(invalid.is_error, Some(true));
+    assert!(
+        serde_json::to_string(&invalid)
+            .unwrap()
+            .contains("span out of range"),
+        "{invalid:?}"
+    );
+    root_mcp.cancel().await.unwrap();
+    peer_mcp.cancel().await.unwrap();
+}
+
+#[tokio::test]
+async fn session_reset_mcp_and_cli_share_quiescent_authorized_api() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    let dir = support::physical_tempdir();
+    let store = Store::open(dir.path().join("state.db")).unwrap();
+    let parent = store
+        .create_agent(NewAgent::new("session-parent", "sylphx"))
+        .unwrap();
+    let peer = store
+        .create_agent(NewAgent::new("session-peer", "sylphx"))
+        .unwrap();
+    let mut input = NewAgent::new("session-child", "sylphx");
+    input.parent_id = Some(parent.id.clone());
+    let child = store.create_agent(input).unwrap();
+    for agent in [&parent, &peer, &child] {
+        store.set_agent_state(&agent.id, "paused").unwrap();
+    }
+    let root = dir.path().join("agents").join(child.id.as_str());
+    std::fs::create_dir_all(root.join("config")).unwrap();
+    std::fs::create_dir_all(root.join("memory")).unwrap();
+    std::fs::write(root.join("memory/MEMORY.md"), "first pin").unwrap();
+    let old = host_session::ensure_active(&root, "sylphx").unwrap();
+    std::fs::write(root.join("config/sylphx-session-id"), "old-vendor\n").unwrap();
+    std::fs::write(
+        root.join("config/sylphx-transcript.jsonl"),
+        "retained raw bytes",
+    )
+    .unwrap();
+    std::fs::write(root.join("memory/MEMORY.md"), "second pin").unwrap();
+    let server = start_server(dir.path());
+    let parent_mcp = connect(dir.path(), &parent.name).await;
+    let peer_mcp = connect(dir.path(), &peer.name).await;
+    let before = std::fs::read(root.join("sessions/registry.json")).unwrap();
+    let denied = call(
+        &peer_mcp,
+        "agents",
+        serde_json::json!({"action":"reset_session","name":child.name}),
+    )
+    .await;
+    assert_eq!(denied.is_error, Some(true));
+    assert_eq!(
+        std::fs::read(root.join("sessions/registry.json")).unwrap(),
+        before
+    );
+    let process = store.try_lock_agent(&child.id).unwrap();
+    let busy = call(
+        &parent_mcp,
+        "agents",
+        serde_json::json!({"action":"new_session","name":child.name}),
+    )
+    .await;
+    assert_eq!(busy.is_error, Some(true));
+    assert_eq!(
+        std::fs::read(root.join("sessions/registry.json")).unwrap(),
+        before
+    );
+    assert_eq!(
+        std::fs::read(root.join("config/sylphx-session-id")).unwrap(),
+        b"old-vendor\n"
+    );
+    drop(process);
+    let result: serde_json::Value = ok_json(
+        call(
+            &parent_mcp,
+            "agents",
+            serde_json::json!({"action":"reset_session","name":child.name}),
+        )
+        .await,
+    );
+    let second = host_session::active(&root).unwrap().unwrap();
+    assert_eq!(result["generation"], second.generation);
+    assert_ne!(second.generation, old.generation);
+    assert!(second.memory.section.contains("second pin"));
+    std::fs::write(root.join("memory/MEMORY.md"), "third pin").unwrap();
+    let cli = bin()
+        .arg("--data")
+        .arg(dir.path())
+        .args(["agents", "new-session", &child.name])
+        .output()
+        .unwrap();
+    assert!(
+        cli.status.success(),
+        "{}",
+        String::from_utf8_lossy(&cli.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&cli.stdout).unwrap();
+    let third = host_session::active(&root).unwrap().unwrap();
+    assert_eq!(result["generation"], third.generation);
+    assert_ne!(third.generation, second.generation);
+    assert!(third.memory.section.contains("third pin"));
+    assert_eq!(
+        std::fs::read(root.join("config/sylphx-transcript.jsonl")).unwrap(),
+        b"retained raw bytes"
+    );
+    assert_eq!(
+        host_session::resume_vendor(&root, "sylphx", "old-vendor").unwrap(),
+        old
+    );
+    parent_mcp.cancel().await.unwrap();
+    peer_mcp.cancel().await.unwrap();
+    drop(server);
+}
+
+#[tokio::test]
 async fn describe_preserves_config_permissions_without_vendor_restart_writers() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let created = bin()
         .env("PATH", machine_path(dir.path()))
         .arg("--data")
@@ -1039,7 +1341,7 @@ async fn describe_preserves_config_permissions_without_vendor_restart_writers() 
 #[tokio::test]
 async fn history_search_defaults_and_all_never_escape_a_private_childs_tree() {
     use anyagents_core::{Incoming, Store};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     for name in ["argus", "lyra", "helios", "runner"] {
         let created = bin()
             .env("PATH", machine_path(dir.path()))

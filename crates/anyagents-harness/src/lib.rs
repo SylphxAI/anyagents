@@ -5,6 +5,7 @@
 //! the mailbox id on the first line of the user text as `anyagents-message:<id>`.
 
 mod fake;
+mod seat;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -17,6 +18,14 @@ pub use fake::FakeHarness;
 /// carries `<launcher>\t<uid>\t<gid>\t<groups>` and is removed from the child's
 /// environment before it starts, so a harness never passes it on.
 pub const SEAT_LAUNCH_ENV: &str = "ANYAGENTS_SEAT_LAUNCH";
+/// Host-resolved agent-root principals; never inherited by vendor children.
+pub const SEAT_PEERS_ENV: &str = "ANYAGENTS_SEAT_PEERS";
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SeatPeer {
+    pub root: std::path::PathBuf,
+    pub uid: u32,
+    pub gid: u32,
+}
 
 /// The line that names the mailbox message a bare answer reaches, in the user
 /// text every harness shows its model. The server writes it from the record it
@@ -292,6 +301,7 @@ impl Context {
 /// operator's token path, the capability key and the seat configuration.
 pub const SERVER_ONLY_ENV: &[&str] = &[
     SEAT_LAUNCH_ENV,
+    SEAT_PEERS_ENV,
     "ANYAGENTS_OPERATOR_TOKEN_FILE",
     "ANYAGENTS_CAPABILITY_KEY",
     "ANYAGENTS_AGENT_UID",
@@ -307,55 +317,24 @@ pub const SERVER_ONLY_ENV: &[&str] = &[
 pub fn spawn_command(
     program: &std::path::Path,
     environment: &[(String, String)],
-) -> std::process::Command {
-    let seat = environment
+) -> Result<std::process::Command, HarnessError> {
+    let mut command = match environment
         .iter()
+        .rev()
         .find(|(key, _)| key == SEAT_LAUNCH_ENV)
-        .map(|(_, value)| value.as_str());
-    let mut command = match seat {
-        Some(spec) => match spec.split('\t').collect::<Vec<_>>().as_slice() {
-            [launcher, uid, gid, groups] => {
-                #[cfg(unix)]
-                let already_in_seat = {
-                    unsafe extern "C" {
-                        fn geteuid() -> u32;
-                    }
-                    unsafe { geteuid() }.to_string() == *uid
-                };
-                #[cfg(not(unix))]
-                let already_in_seat = false;
-                if already_in_seat {
-                    std::process::Command::new(program)
-                } else {
-                    let mut command = std::process::Command::new(launcher);
-                    command.args([
-                        "--reuid",
-                        uid,
-                        "--regid",
-                        gid,
-                        "--groups",
-                        groups,
-                        "--no-new-privs",
-                        "--",
-                    ]);
-                    command.arg(program);
-                    command
-                }
-            }
-            _ => std::process::Command::new(program),
-        },
+    {
+        Some((_, spec)) => seat::admitted_command(program, spec, environment)?,
         None => std::process::Command::new(program),
     };
+    for (key, value) in environment {
+        if !SERVER_ONLY_ENV.contains(&key.as_str()) {
+            command.env(key, value);
+        }
+    }
     for key in SERVER_ONLY_ENV {
         command.env_remove(key);
     }
-    for (key, value) in environment {
-        if key == SEAT_LAUNCH_ENV {
-            continue;
-        }
-        command.env(key, value);
-    }
-    command
+    Ok(command)
 }
 
 /// Send `signal` (e.g. `"-TERM"` or `"-KILL"`) to a harness child process PID,
@@ -561,6 +540,12 @@ pub trait Harness: Send {
     /// Put the held messages back for the next step, except `keep`, which an
     /// `inject` is still holding. Called when `inject` cannot take them now.
     fn release_steer(&mut self, _keep: &str) {}
+
+    /// Secret-safe process-exit evidence, never unfiltered vendor output.
+    /// Kept separate from sign-in state and delivery/restart decisions.
+    fn exit_diagnostic(&self) -> Option<String> {
+        None
+    }
 
     /// Operating system id of the vendor process, when it has one.
     fn process_id(&self) -> Option<u32> {

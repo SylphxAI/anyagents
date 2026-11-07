@@ -98,7 +98,7 @@ class CutTests(unittest.TestCase):
 
 
 class AdmissionTests(unittest.TestCase):
-    """Use real first-parent Git objects, including a squash-style release commit."""
+    """Reconcile real first-parent Git history; registry writes are simulated."""
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -108,14 +108,16 @@ class AdmissionTests(unittest.TestCase):
         release.git("config", "user.name", "Test")
         release.git("config", "user.email", "test@example.com")
         self.commit("0.1.1", "initial")
-        self.commit("0.1.2", "release: v0.1.2 (#90)")
-        self.sha = release.git("rev-parse", "HEAD")
-        self.run = proof(self.sha)
+        self.sha = self.commit("0.1.2", "release: v0.1.2 (#90)")
+        self.live_main = self.sha
+        self.runs = {self.sha: [proof(self.sha)]}
+        self.published = set()
+        self.reads = []
         self.env = {
             "GITHUB_REPOSITORY": release.REPOSITORY, "GITHUB_REF": "refs/heads/main",
             "GITHUB_SHA": self.sha, "GITHUB_EVENT_NAME": "workflow_run",
         }
-        self.event = {"repository": {"visibility": "public"}, "workflow_run": self.run}
+        self.event = {"repository": {"visibility": "public"}, "workflow_run": self.runs[self.sha][0]}
 
     def tearDown(self):
         os.chdir(self.old_cwd)
@@ -128,43 +130,208 @@ class AdmissionTests(unittest.TestCase):
             target.write_text(data)
         release.git("add", ".")
         release.git("commit", "--allow-empty", "-qm", subject)
+        return release.git("rev-parse", "HEAD")
+
+    def advance(self, version, subject):
+        self.live_main = self.commit(version, subject)
+        self.env["GITHUB_SHA"] = self.live_main
+        self.runs[self.live_main] = [{**proof(self.live_main), "id": 124}]
+        self.event["workflow_run"] = self.runs[self.live_main][0]
+        return self.live_main
 
     def api(self, path):
-        return {
-            "actions/runs/123": self.run,
-            f"actions/workflows/{release.CI['id']}": release.CI,
-            "git/ref/heads/main": {"object": {"sha": self.sha}},
-        }[path]
+        self.reads.append(path)
+        if path == f"actions/workflows/{release.CI['id']}":
+            return release.CI
+        if path == "git/ref/heads/main":
+            return {"object": {"sha": self.live_main}}
+        if path.startswith("compare/"):
+            base, head = path.removeprefix("compare/").split("...")
+            try:
+                merge_base = release.git("merge-base", base, head)
+            except subprocess.CalledProcessError:
+                merge_base = OTHER
+            return {"status": "identical" if base == head else "ahead" if merge_base == base else "diverged",
+                    "base_commit": {"sha": base}, "merge_base_commit": {"sha": merge_base}}
+        if path.startswith(f"actions/workflows/{release.CI['id']}/runs?"):
+            sha = path.split("head_sha=")[1].split("&")[0]
+            values = self.runs.get(sha, [])
+            return {"total_count": len(values), "workflow_runs": values}
+        self.fail(f"unexpected API request: {path}")
 
-    def admit(self, complete=False):
-        return release.admit(self.event, self.env, self.api,
-                             lambda version, sha: {"npm": complete, "github": complete})
+    def inspect(self, version, sha):
+        done = (version, sha) in self.published
+        return {"npm": done, "github": done}
+
+    def admit(self):
+        return release.admit(self.event, self.env, self.api, self.inspect)
 
     def test_new_cut_admits_and_complete_release_is_explicit_noop(self):
-        self.assertEqual(self.admit()["publish"], "true")
-        self.assertEqual(self.admit()["source"], self.sha)
-        self.assertEqual(self.admit(True)["reason"], "already published from this exact green source")
+        result = self.admit()
+        self.assertEqual(result["publish"], "true")
+        self.assertEqual(result["releases"], [{"version": "0.1.2", "source": self.sha, "ci_run_id": "123"}])
+        self.published.add(("0.1.2", self.sha))
+        self.reads.clear()
+        self.assertEqual(self.admit()["publish"], "false")
+        self.assertFalse(any("/runs?" in path for path in self.reads))
 
-    def test_manual_reconcile_requires_same_exact_proof(self):
+    def test_later_main_and_trigger_sha_never_replace_the_release_source(self):
+        later = self.advance("0.1.2", "docs: setup")
+        result = self.admit()
+        self.assertEqual(result["main"], later)
+        self.assertEqual([item["source"] for item in result["releases"]], [self.sha])
+        self.assertEqual(result["releases"][0]["ci_run_id"], "123")
+
+    def test_evicted_first_event_two_quick_bumps_and_idempotent_rerun(self):
+        # No first-event handler runs: its pending workflow was evicted. Only
+        # the second event survives, and state reconciliation catches both cuts.
+        second = self.advance("0.1.3", "release: v0.1.3 (#123)")
+        result = self.admit()
+        with tempfile.TemporaryDirectory() as output_dir:
+            output = Path(output_dir) / "outputs"
+            release.report(result, {"GITHUB_OUTPUT": str(output)})
+            values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+            matrix = json.loads(values["matrix"])["include"]
+        published = []
+        for item in matrix:
+            published.append((item["version"], item["source"]))
+            self.published.add((item["version"], item["source"]))
+        self.assertEqual(published, [("0.1.2", self.sha), ("0.1.3", second)])
+        self.assertEqual([item["ci_run_id"] for item in matrix], ["123", "124"])
+        self.assertEqual(release.receipt({"ADMISSION_RESULT": "success", "RELEASE_RESULT": "success",
+                                         "ADMISSION": values["admission"]}, self.inspect)["outcome"], "published")
+        again = self.admit()
+        self.assertEqual(again["releases"], [])
+        self.assertEqual(again["publish"], "false")
+        self.assertEqual(again["refused"], [])
+
+    def test_red_cut_refuses_even_with_a_green_later_main(self):
+        self.runs[self.sha][0]["conclusion"] = "failure"
+        self.advance("0.1.2", "fix: later main is green")
+        result = self.admit()
+        self.assertEqual(result["releases"], [])
+        self.assertEqual(result["refused"][0]["source"], self.sha)
+        self.assertIn("123:failure", result["refused"][0]["reason"])
+        with self.assertRaisesRegex(ValueError, "release sources refused.*exact-source"):
+            release.receipt({"ADMISSION_RESULT": "success", "RELEASE_RESULT": "skipped",
+                             "ADMISSION": json.dumps(result)}, self.inspect)
+
+    def test_red_cut_does_not_authorize_or_prevent_an_independent_green_cut(self):
+        self.runs[self.sha][0]["conclusion"] = "failure"
+        second = self.advance("0.1.3", "release: v0.1.3")
+        result = self.admit()
+        self.assertEqual([item["source"] for item in result["releases"]], [second])
+        self.assertEqual([item["source"] for item in result["refused"]], [self.sha])
+        self.published.add(("0.1.3", second))
+        with self.assertRaisesRegex(ValueError, "release sources refused.*123:failure"):
+            release.receipt({"ADMISSION_RESULT": "success", "RELEASE_RESULT": "success",
+                             "ADMISSION": json.dumps(result)}, self.inspect)
+
+    def test_manual_and_failed_trigger_only_reconcile_own_source_proofs(self):
         self.env["GITHUB_EVENT_NAME"] = "workflow_dispatch"
-        self.event["inputs"] = {"ci_run_id": "123"}
+        self.event["inputs"] = {"ci_run_id": "unrelated-input-is-not-authority"}
         self.assertEqual(self.admit()["publish"], "true")
-        self.run["event"] = "workflow_dispatch"
-        with self.assertRaisesRegex(ValueError, "event"):
-            self.admit()
-        self.event["inputs"]["ci_run_id"] = ""
-        with self.assertRaisesRegex(ValueError, "ci_run_id"):
+        self.env["GITHUB_EVENT_NAME"] = "workflow_run"
+        self.event["workflow_run"] = {**proof(OTHER), "conclusion": "failure"}
+        self.assertEqual(self.admit()["releases"][0]["source"], self.sha)
+        self.runs[self.sha][0]["event"] = "workflow_dispatch"
+        self.assertIn("event", self.admit()["refused"][0]["reason"])
+
+    def test_missing_pending_and_incomplete_source_proofs_refuse(self):
+        for runs in ([], [{**proof(self.sha), "status": "in_progress", "conclusion": None}]):
+            with self.subTest(runs=runs):
+                self.runs[self.sha] = runs
+                result = self.admit()
+                self.assertEqual(result["releases"], [])
+                self.assertIn("exact-source", result["refused"][0]["reason"])
+        original_api = self.api
+        def incomplete(path):
+            value = original_api(path)
+            return {**value, "total_count": 101} if "/runs?" in path else value
+        result = release.admit(self.event, self.env, incomplete, self.inspect)
+        self.assertIn("incomplete source CI inventory", result["refused"][0]["reason"])
+
+    def test_snapshot_can_lag_live_main_but_cannot_leave_its_ancestry(self):
+        later = self.advance("0.1.2", "docs: later main")
+        release.git("checkout", "--detach", self.sha)
+        self.assertEqual(self.admit()["releases"][0]["source"], self.sha)
+        self.assertIn(f"compare/{self.sha}...{later}", self.reads)
+        release.git("checkout", "--orphan", "unrelated")
+        self.commit("0.1.2", "initial unrelated")
+        with self.assertRaisesRegex(ValueError, "not an ancestor"):
             self.admit()
 
-    def test_superseded_event_sha_or_live_main_is_noop(self):
-        self.env["GITHUB_SHA"] = OTHER
-        self.assertIn("superseded", self.admit()["reason"])
-        self.env["GITHUB_SHA"] = self.sha
+    def test_first_parent_merge_is_the_version_introducing_source(self):
+        original = self.sha
+        release.git("checkout", "-b", "feature")
+        feature = self.commit("0.1.3", "release: v0.1.3")
+        release.git("checkout", "--detach", original)
+        release.git("merge", "--no-ff", "-m", "release: v0.1.3 (#91)", feature)
+        merged = release.git("rev-parse", "HEAD")
+        self.live_main = merged
+        self.runs[merged] = [{**proof(merged), "id": 125}]
+        result = self.admit()
+        self.assertEqual([item["source"] for item in result["releases"]], [original, merged])
+        self.assertNotIn(feature, [item["source"] for item in result["releases"]])
+
+    def test_existing_provenance_or_digest_mismatch_is_a_loud_refusal(self):
+        def mismatch(*args):
+            raise ValueError("GitHub identity digest mismatch")
+        result = release.admit(self.event, self.env, self.api, mismatch)
+        self.assertEqual(result["releases"], [])
+        self.assertIn("digest mismatch", result["refused"][0]["reason"])
+        with self.assertRaisesRegex(ValueError, "digest mismatch"):
+            release.receipt({"ADMISSION_RESULT": "success", "RELEASE_RESULT": "skipped",
+                             "ADMISSION": json.dumps(result)}, self.inspect)
+
+    def test_complete_legacy_cut_is_noop_but_cannot_authorize_new_publication(self):
+        release.git("commit", "--amend", "-qm", "chore: release AnyAgents 0.1.2")
+        legacy = release.git("rev-parse", "HEAD")
+        self.live_main = legacy
+        self.published.add(("0.1.2", legacy))
+        self.assertEqual(self.admit()["complete"], [{"version": "0.1.2", "source": legacy}])
+        self.published.clear()
+        self.assertIn("release-cut commit", self.admit()["refused"][0]["reason"])
+
+    def test_initial_launcher_added_after_root_is_not_an_unreleased_bump(self):
+        # Real history introduced the launcher after the repository's first
+        # commit. Neither that initial version nor a root is a version cut.
+        release.git("checkout", "--orphan", "launcher-later")
+        release.git("rm", "-rf", ".")
+        release.git("commit", "--allow-empty", "-qm", "repository root")
+        self.live_main = self.commit("0.1.1", "add launcher")
+        result = self.admit()
+        self.assertEqual(result["releases"], [])
+        self.assertEqual(result["refused"], [])
+
+    def test_ancestry_response_must_name_the_snapshot_as_base_and_merge_base(self):
         original_api = self.api
-        result = release.admit(self.event, self.env,
-                               lambda path: {"object": {"sha": OTHER}} if path == "git/ref/heads/main"
-                               else original_api(path), lambda *args: self.fail("must not probe publication"))
-        self.assertEqual(result["publish"], "false")
+        for key in ("base_commit", "merge_base_commit"):
+            def wrong(path):
+                value = original_api(path)
+                return {**value, key: {"sha": OTHER}} if path.startswith("compare/") else value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "not an ancestor"):
+                release.admit(self.event, self.env, wrong, self.inspect)
+
+    def test_reintroduced_version_cannot_borrow_its_original_publication(self):
+        original = self.sha
+        second = self.advance("0.1.3", "release: v0.1.3")
+        self.published.update((("0.1.2", original), ("0.1.3", second)))
+        repeated = self.advance("0.1.2", "release: v0.1.2")
+        result = self.admit()
+        self.assertEqual(result["releases"], [])
+        self.assertEqual(result["refused"], [{"version": "0.1.2", "source": repeated,
+                                             "reason": "version introduced more than once on main"}])
+
+    def test_shallow_history_refuses_instead_of_missing_an_older_cut(self):
+        with tempfile.TemporaryDirectory() as clone:
+            subprocess.run(["git", "clone", "-q", "--depth", "1", Path.cwd().as_uri(), clone], check=True)
+            os.chdir(clone)
+            try:
+                with self.assertRaisesRegex(ValueError, "complete main history"):
+                    self.admit()
+            finally:
+                os.chdir(self.temporary.name)
 
     def test_public_main_required_including_missing_visibility(self):
         for visibility in (None, "private", "internal"):
@@ -175,13 +342,6 @@ class AdmissionTests(unittest.TestCase):
         self.env["GITHUB_REF"] = "refs/heads/feature"
         with self.assertRaisesRegex(ValueError, "main ref"):
             self.admit()
-
-    def test_ordinary_followup_cannot_publish_superseded_cut(self):
-        self.commit("0.1.2", "docs: setup")
-        self.sha = release.git("rev-parse", "HEAD")
-        self.run["head_sha"] = self.sha
-        self.env["GITHUB_SHA"] = self.sha
-        self.assertEqual(self.admit()["reason"], "ordinary commit; no committed version cut")
 
 
 class PublicationTests(unittest.TestCase):
@@ -297,7 +457,7 @@ class PublicationTests(unittest.TestCase):
 class ReceiptTests(unittest.TestCase):
     def test_success_requires_readback_not_just_green_reusable_workflow(self):
         env = {"ADMISSION_RESULT": "success", "RELEASE_RESULT": "success",
-               "ADMISSION": json.dumps({"publish": "true", "version": "0.1.2", "source": SOURCE})}
+               "ADMISSION": json.dumps({"publish": "true", "releases": [{"version": "0.1.2", "source": SOURCE}]})}
         with self.assertRaisesRegex(ValueError, "without complete"):
             release.receipt(env, lambda *args: {"npm": True, "github": False})
         self.assertEqual(release.receipt(env, lambda *args: {"npm": True, "github": True})["outcome"], "published")

@@ -110,19 +110,25 @@ impl From<anyagents_core::AgentSchedule> for ScheduleView {
     }
 }
 
-fn default_harness() -> String {
-    "claude-code".to_string()
-}
-
 /// Body of `POST /v1/agents`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
     #[serde(alias = "agent", alias = "id", alias = "agent_id", alias = "target")]
     pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
+    pub archetype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default = "default_harness")]
-    pub harness: String,
+    /// Omitted HTTP harness retains the legacy `claude-code` default. An explicit
+    /// empty string or `inherit` lets sub-agent defaults select the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,7 +143,12 @@ pub struct CreateAgentRequest {
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "instruction",
+        alias = "system_prompt"
+    )]
     pub instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -233,8 +244,43 @@ pub struct InboxResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct RawCoordinateView {
+    pub segment: String,
+    pub offset: u64,
+    pub length: u64,
+    pub sha256: String,
+    pub seq: u64,
+}
+impl From<anyagents_core::raw_segment::RawCoordinate> for RawCoordinateView {
+    fn from(c: anyagents_core::raw_segment::RawCoordinate) -> Self {
+        Self {
+            segment: c.segment.to_string_lossy().into(),
+            offset: c.offset,
+            length: c.length,
+            sha256: c.sha256,
+            seq: c.seq,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ConversationTurnView {
     pub id: String,
+    /// Exact bytes for an explicit bounded raw-range read; `text` is a lossy preview.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawCoordinateView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<RawCoordinateView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
     /// `"in"` (received by the agent) or `"out"` (sent by the agent).
     pub direction: String,
     pub from: String,
@@ -242,7 +288,8 @@ pub struct ConversationTurnView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_to: Option<String>,
     pub text: String,
-    pub timestamp_ms: i64,
+    /// Null when the native historical event has no source timestamp.
+    pub timestamp_ms: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -468,5 +515,56 @@ mod create_agent_tests {
         }
         let legacy: LegacyRequest = serde_json::from_value(serialized).unwrap();
         assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
+    }
+
+    #[test]
+    fn archetype_aliases_deserialize_and_omit_when_absent() {
+        for key in ["archetype", "type", "template", "preset"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), json!("worker"));
+            obj.insert(key.into(), json!("writer"));
+            let req: CreateAgentRequest =
+                serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+            assert_eq!(req.archetype.as_deref(), Some("writer"));
+            assert!(req.harness.is_none());
+        }
+        let absent: CreateAgentRequest = serde_json::from_value(json!({
+            "name": "worker"
+        }))
+        .unwrap();
+        assert!(absent.archetype.is_none());
+        let serialized = serde_json::to_value(absent).unwrap();
+        assert!(serialized.get("archetype").is_none());
+    }
+}
+
+/// End-exclusive coordinates in decoded body text, not serialized JSON bytes.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionSpan {
+    /// `bytes` (UTF-8 boundaries required) or `chars` (Unicode scalar values).
+    pub unit: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TryFrom<RedactionSpan> for anyagents_core::redaction::Span {
+    type Error = anyagents_core::Error;
+    fn try_from(span: RedactionSpan) -> Result<Self, Self::Error> {
+        use anyagents_core::redaction::SpanUnit;
+        let unit = match span.unit.as_str() {
+            "bytes" => SpanUnit::Bytes,
+            "chars" => SpanUnit::Chars,
+            _ => {
+                return Err(anyagents_core::Error::Message(
+                    "span unit must be bytes or chars".into(),
+                ));
+            }
+        };
+        Ok(Self {
+            unit,
+            start: span.start,
+            end: span.end,
+        })
     }
 }

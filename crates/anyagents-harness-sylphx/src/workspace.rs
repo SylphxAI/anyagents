@@ -13,16 +13,7 @@ pub(super) fn delegated(env: &[(String, String)]) -> bool {
 }
 
 pub(super) fn command(program: &Path, env: &[(String, String)]) -> Result<Command, String> {
-    // The shared launcher historically treats malformed specs as unconfigured.
-    // A configured workspace principal must instead fail closed, never run the
-    // next tool as the server. Only the server-supplied launch environment counts.
-    if let Some((_, spec)) = env.iter().find(|(key, _)| key == SEAT_LAUNCH_ENV) {
-        let parts: Vec<_> = spec.split('\t').collect();
-        if parts.len() != 4 || parts.iter().any(|part| part.is_empty()) {
-            return Err("invalid trusted workspace launcher specification".into());
-        }
-    }
-    Ok(spawn_command(program, env))
+    spawn_command(program, env).map_err(|e| e.to_string())
 }
 
 /// Pipe inputs instead of putting file contents/patches in argv. Drain output

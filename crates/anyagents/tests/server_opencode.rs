@@ -58,7 +58,7 @@ struct Server {
 
 impl Server {
     fn start(dir: &Path) -> Self {
-        let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        let child = support::contract_server()
             // The scripted CLI, which speaks `serve` and `api` as the real one does.
             .env("ANYAGENTS_OPENCODE_BIN", scripted_opencode())
             .env("ANYAGENTS_FAKE_LOG", dir.join("fake.log"))
@@ -127,7 +127,7 @@ fn call(socket: &Path, request: &str) -> Value {
 #[test]
 fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
@@ -169,13 +169,30 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         assert!(Instant::now() < deadline, "messages not delivered");
         std::thread::sleep(Duration::from_millis(50));
     }
+    // The shipping wrapper persists OpenCode's late native ID and binds it to
+    // the host generation already pinned before dispatch (scripted runtime).
+    let marker = std::fs::read_to_string(config_dir.join("opencode-session-id")).unwrap();
+    let pin = anyagents_core::host_session::active(config_dir.parent().unwrap())
+        .unwrap()
+        .unwrap();
+    let registry: Value = serde_json::from_slice(
+        &std::fs::read(config_dir.parent().unwrap().join("sessions/registry.json")).unwrap(),
+    )
+    .unwrap();
+    let alias = serde_json::to_string(&("opencode", marker.trim())).unwrap();
+    assert_eq!(registry["aliases"][alias]["generation"], pin.generation);
+    assert!(!marker.trim().is_empty());
     // The agent replies with its own MCP `send`, not through anything the
     // session printed: the adapter scrapes no answer and writes no reply row.
     // To a second agent, so the reply is the switchboard's routing of the
     // agent's own tool call.
     let other = create(&data, "owner");
     assert!(other.status.success(), "{other:?}");
+    let mcp_stderr = data.join("mcp.stderr");
     let answered = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .env_remove("ANYAGENTS_AGENT_ROUTE")
+        .env_remove("ANYAGENTS_DATA")
+        .env_remove("ANYAGENTS_AGENT_ID")
         .args([
             "--data",
             data.to_str().unwrap(),
@@ -185,10 +202,15 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(std::fs::File::create(&mcp_stderr).unwrap()))
         .spawn()
         .and_then(mcp_send_once)
-        .expect("the agent's tool server runs");
+        .unwrap_or_else(|error| {
+            panic!(
+                "the agent's tool server failed: {error}: {}",
+                std::fs::read_to_string(&mcp_stderr).unwrap_or_default()
+            )
+        });
     assert!(answered.status.success(), "{answered:?}");
     // The reply is the agent's own `send`, routed by the switchboard: the
     // owner's mailbox holds it, and nothing was read from the session.
@@ -234,7 +256,7 @@ fn an_opencode_agent_answers_one_line_and_the_answer_is_on_its_mailbox() {
 #[test]
 fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port() {
     let _env = support::lock();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = support::physical_tempdir();
     let data = dir.path().join("data");
     std::fs::create_dir_all(&data).unwrap();
     support::operator_with_configured_seat(&data);
