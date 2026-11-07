@@ -271,6 +271,8 @@ pub struct ConversationTurnView {
     pub window: Option<RawCoordinateView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_name: Option<String>,
+    #[serde(default)]
+    pub tool_names: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     /// `"in"` (received by the agent) or `"out"` (sent by the agent).

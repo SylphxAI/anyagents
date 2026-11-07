@@ -10,6 +10,7 @@ mod error;
 mod host_cursor;
 pub mod host_index;
 pub mod host_migration;
+mod host_native_metadata;
 pub mod host_retrieval;
 pub mod host_session;
 pub mod host_skills;

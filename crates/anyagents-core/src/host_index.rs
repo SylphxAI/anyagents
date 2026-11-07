@@ -52,6 +52,9 @@ pub struct IndexMetadata {
     pub sender: String,
     pub destination: String,
     pub tool_name: Option<String>,
+    /// All tool memberships for native events containing multiple tool blocks.
+    #[serde(default)]
+    pub tool_names: Vec<String>,
     pub role: Option<String>,
 }
 
@@ -64,6 +67,12 @@ pub struct IndexHit {
     /// Exact bounded matching window, with its own SHA for readback.
     pub window: RawCoordinate,
     pub lexical_score: f64,
+}
+
+fn decode_tool_names(value: String) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(error))
+    })
 }
 
 pub struct HostIndex {
@@ -96,6 +105,8 @@ impl HostIndex {
                     "
                 DROP TRIGGER IF EXISTS host_windows_delete;
                 DROP TABLE IF EXISTS host_windows;
+                DROP TABLE IF EXISTS host_calls;
+                DROP TABLE IF EXISTS host_document_tools;
                 DROP TABLE IF EXISTS host_documents;
                 DROP TABLE IF EXISTS host_sources;
                 DROP TABLE IF EXISTS host_fts;",
@@ -108,6 +119,13 @@ impl HostIndex {
                 sender TEXT NOT NULL, destination TEXT NOT NULL, tool_name TEXT,
                 role TEXT, segment TEXT NOT NULL, offset INTEGER NOT NULL,
                 length INTEGER NOT NULL, sha256 TEXT NOT NULL, seq INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS host_document_tools (
+                document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
+                name TEXT NOT NULL, PRIMARY KEY(document_id,name));
+            CREATE TABLE IF NOT EXISTS host_calls (
+                agent_id TEXT NOT NULL, segment TEXT NOT NULL, call_id TEXT NOT NULL,
+                tool_name TEXT NOT NULL, document_id TEXT NOT NULL REFERENCES host_documents(id) ON DELETE CASCADE,
+                PRIMARY KEY(agent_id,segment,call_id));
             CREATE TABLE IF NOT EXISTS host_sources (
                 agent_id TEXT NOT NULL, segment TEXT NOT NULL, cursor TEXT NOT NULL,
                 PRIMARY KEY(agent_id,segment));
@@ -192,7 +210,7 @@ impl HostIndex {
             })
             .collect::<Result<Vec<_>, _>>()?;
         due.retain(|(_, _, c)| {
-            c.policy.starts_with("native-jsonl-v3:")
+            c.policy.starts_with("native-jsonl-v4:")
                 && c.full_verified_ms <= now_ms.saturating_sub(3_600_000)
         });
         due.sort_by(|a, b| {
@@ -242,6 +260,39 @@ impl HostIndex {
             params![owner, path.to_string_lossy()],
         )?;
         Ok(())
+    }
+    pub(crate) fn call_tool(
+        &self,
+        owner: &str,
+        path: &Path,
+        call_id: &str,
+    ) -> Result<Option<String>, IndexError> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT tool_name FROM host_calls WHERE agent_id=?1 AND segment=?2 AND call_id=?3",
+                params![owner, path.to_string_lossy(), call_id],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+    pub(crate) fn save_call(
+        &self,
+        owner: &str,
+        path: &Path,
+        call_id: &str,
+        name: &str,
+        document: &str,
+    ) -> Result<(), IndexError> {
+        self.conn.execute("INSERT INTO host_calls VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent_id,segment,call_id) DO UPDATE SET tool_name=excluded.tool_name,document_id=excluded.document_id",
+            params![owner,path.to_string_lossy(),call_id,name,document])?;
+        Ok(())
+    }
+    fn document_tools(&self, document: &str) -> Result<Vec<String>, rusqlite::Error> {
+        self.conn
+            .prepare("SELECT name FROM host_document_tools WHERE document_id=?1 ORDER BY name")?
+            .query_map([document], |r| r.get(0))?
+            .collect()
     }
     pub(crate) fn save_source(
         &self,
@@ -339,9 +390,14 @@ impl HostIndex {
             metadata.role
         ])
         .to_string();
-        if old
-            .as_ref()
-            .is_some_and(|(r, m)| r == &raw_identity && m == &meta_identity)
+        let mut names = metadata.tool_names.clone();
+        names.extend(metadata.tool_name.iter().cloned());
+        names.sort();
+        names.dedup();
+        if self.document_tools(id)? == names
+            && old
+                .as_ref()
+                .is_some_and(|(r, m)| r == &raw_identity && m == &meta_identity)
         {
             return Ok(false);
         }
@@ -366,6 +422,12 @@ impl HostIndex {
                 raw.seq
             ],
         )?;
+        for name in names {
+            tx.execute(
+                "INSERT INTO host_document_tools VALUES(?1,?2)",
+                params![id, name],
+            )?;
+        }
         let mut file = crate::raw_segment::open_readonly(&raw.segment)?;
         let mut relative = 0u64;
         let mut json_state = JsonProjection::default();
@@ -438,7 +500,9 @@ impl HostIndex {
         );
         let sql = format!(
             "SELECT id,agent_id,source,timestamp_ms,direction,sender,destination,tool_name,role,
-                segment,offset,length,sha256,seq FROM host_documents
+                segment,offset,length,sha256,seq,
+                (SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))
+                FROM host_documents d
                 WHERE agent_id IN ({placeholders}) AND id=? AND (? IS NULL OR source=?)"
         );
         values.push(values.last().unwrap().clone());
@@ -466,6 +530,7 @@ impl HostIndex {
                         sender: r.get(5)?,
                         destination: r.get(6)?,
                         tool_name: r.get(7)?,
+                        tool_names: decode_tool_names(r.get(14)?)?,
                         role: r.get(8)?,
                     },
                     window: raw.clone(),
@@ -547,13 +612,14 @@ impl HostIndex {
         // Tool filters apply identically to both sources; memory does not gain
         // a bypass merely because it is a filesystem document.
         if query.only_tools {
-            where_sql.push_str(" AND d.tool_name IS NOT NULL");
+            where_sql.push_str(" AND (d.tool_name IS NOT NULL OR EXISTS(SELECT 1 FROM host_document_tools t WHERE t.document_id=d.id))");
         }
         if !query.include_tools && !query.only_tools && query.tool_name.is_none() {
-            where_sql.push_str(" AND d.tool_name IS NULL");
+            where_sql.push_str(" AND d.tool_name IS NULL AND NOT EXISTS(SELECT 1 FROM host_document_tools t WHERE t.document_id=d.id)");
         }
         if let Some(tool) = &query.tool_name {
-            where_sql.push_str(" AND lower(d.tool_name)=lower(?)");
+            where_sql.push_str(" AND (lower(d.tool_name)=lower(?) OR EXISTS(SELECT 1 FROM host_document_tools t WHERE t.document_id=d.id AND lower(t.name)=lower(?)))");
+            values.push(tool.trim().to_owned().into());
             values.push(tool.trim().to_owned().into());
         }
         for (clause, value) in [
@@ -594,7 +660,8 @@ impl HostIndex {
             ""
         };
         let sql = format!("SELECT d.id,d.agent_id,d.source,d.timestamp_ms,d.direction,d.sender,d.destination,d.tool_name,d.role,
-            d.segment,d.offset,d.length,d.sha256,d.seq,w.offset,w.length,w.sha256,{score} AS score
+            d.segment,d.offset,d.length,d.sha256,d.seq,w.offset,w.length,w.sha256,{score} AS score,
+            (SELECT json_group_array(name) FROM (SELECT name FROM host_document_tools WHERE document_id=d.id ORDER BY name))
             FROM host_documents d JOIN host_windows w ON w.document_id=d.id {join}
             WHERE {where_sql} ORDER BY {order}");
         let mut statement = self.conn.prepare(&sql)?;
@@ -629,6 +696,7 @@ impl HostIndex {
                     sender: row.get(5)?,
                     destination: row.get(6)?,
                     tool_name: row.get(7)?,
+                    tool_names: decode_tool_names(row.get(18)?)?,
                     role: row.get(8)?,
                 },
                 window: RawCoordinate {
@@ -840,6 +908,7 @@ mod tests {
             sender: "user".into(),
             destination: owner.into(),
             tool_name: None,
+            tool_names: Vec::new(),
             role: Some("user".into()),
         }
     }

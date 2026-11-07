@@ -4949,6 +4949,7 @@ async fn conversation_route(
                     raw: Some(hit.raw.into()),
                     window: Some(hit.window.into()),
                     tool_name: hit.metadata.tool_name,
+                    tool_names: hit.metadata.tool_names,
                     role: hit.metadata.role,
                 }],
             }));
@@ -5110,6 +5111,7 @@ async fn conversation_route(
                 raw: None,
                 window: None,
                 tool_name: None,
+                tool_names: Vec::new(),
                 role: None,
                 id: t.id,
                 direction: t.direction,
@@ -5148,6 +5150,7 @@ async fn conversation_route(
                     raw: Some(hit.raw.into()),
                     window: Some(hit.window.into()),
                     tool_name: hit.metadata.tool_name,
+                    tool_names: hit.metadata.tool_names,
                     role: hit.metadata.role,
                 },
             ));
@@ -6958,6 +6961,20 @@ pub(crate) mod tests {
             assert_eq!(untimed.turns.len(), 1);
             assert!(untimed.turns[0].timestamp_ms.is_none());
             assert!(serde_json::to_value(&untimed).unwrap()["turns"][0]["timestamp_ms"].is_null());
+            // Source-shaped synthetic Claude blocks, exercised through the
+            // canonical selector rather than only direct index queries.
+            let native = dir.path().join("agents").join(child.id.as_str()).join("config/sylphx-transcript.jsonl");
+            std::fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(
+                "{\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"tool_use\",\"id\":\"canon-shell\",\"name\":\"shell\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"canon-files\",\"name\":\"files\",\"input\":{}}]}}\n"
+            .as_bytes()).unwrap();
+            let Json(multi)=conversation_route(principal(),State(state.clone()),AxumPath(child.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"transcripts","tool_name":"files","include_tools":false})).unwrap())).await.unwrap_or_else(|e|panic!("{}", e.message));
+            assert_eq!(multi.turns.len(), 1);
+            assert_eq!(multi.turns[0].tool_names, ["files", "shell"]);
+            assert_eq!(serde_json::to_value(&multi).unwrap()["turns"][0]["tool_names"], serde_json::json!(["files", "shell"]));
+            std::fs::OpenOptions::new().append(true).open(native).unwrap().write_all(b"{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"canon-shell\",\"content\":\"canonicaltoolresult\"}]}}\n").unwrap();
+            let Json(result)=conversation_route(principal(),State(state.clone()),AxumPath(child.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"transcripts","tool_name":"shell","query":"canonicaltoolresult"})).unwrap())).await.unwrap_or_else(|e|panic!("{}", e.message));
+            assert_eq!(result.turns.len(), 1);
+            assert_eq!(result.turns[0].tool_names, ["shell"]);
             let denied=conversation_route(principal(),State(state.clone()),AxumPath(peer.name.clone()),Query(serde_json::from_value(serde_json::json!({"scope":"memory"})).unwrap())).await.unwrap_err();assert_eq!(denied.status,StatusCode::FORBIDDEN);
             let query=serde_json::from_value(serde_json::json!({"scope":"all","only_tools":true,"tool_name":"browser","from_seq":1,"to_seq":1})).unwrap();
             let Json(response)=conversation_route(principal(),State(state),AxumPath("all".into()),Query(query)).await.unwrap_or_else(|e|panic!("{}",e.message));assert_eq!(response.turns.len(),2);assert!(response.turns.iter().all(|t|t.tool_name.as_deref()==Some("browser")));

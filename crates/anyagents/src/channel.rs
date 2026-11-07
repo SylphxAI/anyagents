@@ -419,6 +419,7 @@ pub fn conversation(
             raw: None,
             window: None,
             tool_name: None,
+            tool_names: Vec::new(),
             role: None,
             id: t.id,
             direction: t.direction,

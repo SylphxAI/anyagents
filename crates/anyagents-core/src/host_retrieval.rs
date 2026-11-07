@@ -4,6 +4,7 @@ use crate::{
     Agent, HistorySearchQuery, Store,
     host_cursor::{FileStamp, SourceCursor},
     host_index::{HostIndex, IndexError, IndexHit, IndexMetadata, MemoryScope},
+    host_native_metadata::{EventHeader, MetadataReader},
     learned_memory::sha256,
     raw_segment::{RawCoordinate, open_readonly, read_raw},
 };
@@ -232,6 +233,7 @@ impl Store {
                         sender: format!("agent:{}", agent.name),
                         destination: format!("agent:{}", agent.name),
                         tool_name: None,
+                        tool_names: Vec::new(),
                         role: Some("memory".into()),
                     };
                     refresh_document(&mut index, &id, &metadata, &path)?;
@@ -264,6 +266,7 @@ impl Store {
                         sender: format!("agent:{}", agent.name),
                         destination: format!("agent:{}", agent.name),
                         tool_name: None,
+                        tool_names: Vec::new(),
                         role: Some("history".into()),
                     };
                     refresh_document(&mut index, &id, &metadata, &path)?;
@@ -361,7 +364,7 @@ fn refresh_native_at(
     now_ms: i64,
 ) -> Result<RefreshStats, IndexError> {
     let stamp = FileStamp::read(&open_readonly(path)?)?;
-    let policy = format!("native-jsonl-v3:{}:{}", agent.id, agent.name);
+    let policy = format!("native-jsonl-v4:{}:{}", agent.id, agent.name);
     let old = index
         .source_cursor(agent.id.as_str(), path)?
         .filter(|old| old.policy == policy);
@@ -382,8 +385,37 @@ fn refresh_native_at(
             use std::io::{Read, Seek, SeekFrom};
             let mut file = open_readonly(path)?;
             file.seek(SeekFrom::Start(raw.offset))?;
-            let header: EventHeader = serde_json::from_reader(file.take(raw.length))?;
-            let metadata = event_metadata(agent, &header);
+            let header: EventHeader =
+                serde_json::from_reader(MetadataReader::new(file.take(raw.length)))?;
+            let mut metadata = event_metadata(agent, &header);
+            let records = header.tool_records();
+            let mut names = Vec::new();
+            if let Some(name) = &metadata.tool_name {
+                names.push(name.clone());
+            }
+            for (call_id, name) in &records {
+                let name = name.map(str::to_owned).or_else(|| {
+                    call_id
+                        .and_then(|id| {
+                            records.iter().find_map(|(key, name)| {
+                                (*key == Some(id)).then_some(*name).flatten()
+                            })
+                        })
+                        .map(str::to_owned)
+                });
+                let name = match (name, call_id) {
+                    (Some(name), _) => name,
+                    (None, Some(id)) => index
+                        .call_tool(agent.id.as_str(), path, id)?
+                        .unwrap_or_else(|| "unknown".into()),
+                    (None, None) => "unknown".into(),
+                };
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            metadata.tool_name = names.first().cloned();
+            metadata.tool_names = names;
             let id = format!(
                 "transcript:{}:{}:{}",
                 agent.id,
@@ -391,6 +423,11 @@ fn refresh_native_at(
                 raw.seq
             );
             index.index(&id, &metadata, raw)?;
+            for (call_id, name) in records {
+                if let (Some(call_id), Some(name)) = (call_id, name) {
+                    index.save_call(agent.id.as_str(), path, call_id, name, &id)?;
+                }
+            }
         }
         // A live append racing this snapshot is not corruption. Do not advance
         // the frontier; the next refresh revalidates and retries that suffix.
@@ -534,23 +571,6 @@ fn native_transcripts(root: &Path) -> io::Result<Vec<PathBuf>> {
     result.dedup();
     Ok(result)
 }
-#[derive(Default, serde::Deserialize)]
-struct EventHeader {
-    role: Option<String>,
-    message: Option<EventRole>,
-    tool_name: Option<String>,
-    tool: Option<String>,
-    name: Option<String>,
-    direction: Option<String>,
-    sender: Option<String>,
-    destination: Option<String>,
-    timestamp_ms: Option<i64>,
-    timestamp: Option<String>,
-}
-#[derive(Default, serde::Deserialize)]
-struct EventRole {
-    role: Option<String>,
-}
 fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
     let role = value
         .role
@@ -584,6 +604,7 @@ fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
             .destination
             .clone()
             .unwrap_or_else(|| format!("agent:{}", agent.name)),
+        tool_names: tool.iter().cloned().collect(),
         tool_name: tool,
         role: Some(role.into()),
     }
@@ -593,6 +614,185 @@ fn event_metadata(agent: &Agent, value: &EventHeader) -> IndexMetadata {
 mod tests {
     use super::*;
     use crate::NewAgent;
+    #[test]
+    fn native_tool_correlation_survives_reopen_and_is_scoped_atomic_and_rebuildable() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("state.db");
+        let store = Store::open(&db).unwrap();
+        let own = store
+            .create_agent(NewAgent::new("tool-owner", "sylphx"))
+            .unwrap();
+        let peer = store
+            .create_agent(NewAgent::new("tool-peer", "sylphx"))
+            .unwrap();
+        let path = |agent: &Agent| {
+            dir.path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("config/sylphx-transcript.jsonl")
+        };
+        let native = path(&own);
+        fs::create_dir_all(native.parent().unwrap()).unwrap();
+        // Source-shaped synthetic Responses/Claude formats; not captured runtime data.
+        fs::write(&native, concat!(
+            "{\"type\":\"function_call\",\"call_id\":\"same\",\"name\":\"browser\",\"arguments\":\"{}\"}\n",
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"ordinary\"},{\"type\":\"tool_use\",\"id\":\"claude1\",\"name\":\"shell\",\"input\":{}},{\"type\":\"tool_use\",\"id\":\"claude2\",\"name\":\"files\",\"input\":{}}]}}\n"
+        )).unwrap();
+        let foreign = path(&peer);
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(
+            &foreign,
+            "{\"type\":\"function_call\",\"call_id\":\"same\",\"name\":\"foreign\"}\n",
+        )
+        .unwrap();
+        let ids = [own.id.to_string(), peer.id.to_string()];
+        store
+            .search_host_files(
+                &ids,
+                MemoryScope::Transcripts,
+                &HistorySearchQuery::default(),
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&db).unwrap();
+        let huge = r#"escaped \"☃\\"#.repeat(20_000);
+        let output = format!(
+            "{{\"output\":{},\"type\":\"function_call_output\",\"call_id\":\"same\"}}\n",
+            serde_json::to_string(&huge).unwrap()
+        );
+        let claude = "{\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"mixed\"},{\"type\":\"tool_result\",\"tool_use_id\":\"claude1\",\"content\":\"result\"}]}}\n";
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&native)
+            .unwrap()
+            .write_all(format!("{output}{claude}").as_bytes())
+            .unwrap();
+        let other = native
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("transcripts/other.jsonl");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(
+            &other,
+            "{\"type\":\"function_call_output\",\"call_id\":\"same\",\"output\":\"unresolved\"}\n",
+        )
+        .unwrap();
+        let search = |name: Option<&str>, include_tools, only_tools| {
+            store
+                .search_host_files(
+                    &[own.id.to_string()],
+                    MemoryScope::Transcripts,
+                    &HistorySearchQuery {
+                        tool_name: name.map(str::to_owned),
+                        include_tools,
+                        only_tools,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        };
+        let browser = search(Some("BROWSER"), false, false);
+        assert_eq!(browser.len(), 2);
+        let result = browser.iter().find(|(h, _)| h.raw.seq == 3).unwrap();
+        assert_eq!(read_raw(&result.0.raw).unwrap(), output.as_bytes());
+        assert_eq!(result.0.metadata.timestamp_ms, None);
+        let shell = search(Some("shell"), true, false);
+        assert_eq!(shell.len(), 2);
+        let multi = shell.iter().find(|(h, _)| h.raw.seq == 2).unwrap();
+        assert_eq!(multi.0.metadata.tool_names, vec!["files", "shell"]);
+        assert_eq!(search(Some("files"), true, false).len(), 1);
+        assert_eq!(search(Some("foreign"), true, false).len(), 0);
+        assert_eq!(search(Some("unknown"), true, false).len(), 1);
+        assert_eq!(search(None, true, true).len(), 5);
+        assert!(search(None, false, false).is_empty());
+        let mut index = HostIndex::open(&dir.path().join(INDEX_FILE)).unwrap();
+        let cursor = index.source_cursor(own.id.as_str(), &native).unwrap();
+        let doc = browser[0].0.id.clone();
+        let failure = index
+            .refresh_source(|index| -> Result<(), IndexError> {
+                index.save_call(own.id.as_str(), &native, "injected", "wrong", &doc)?;
+                index.clear_source(own.id.as_str(), &native)?;
+                Err(io::Error::other("injected metadata rollback").into())
+            })
+            .unwrap_err();
+        assert!(failure.to_string().contains("injected metadata rollback"));
+        assert!(
+            index
+                .call_tool(own.id.as_str(), &native, "injected")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            index
+                .call_tool(own.id.as_str(), &native, "same")
+                .unwrap()
+                .as_deref(),
+            Some("browser")
+        );
+        assert_eq!(
+            serde_json::to_string(&cursor).unwrap(),
+            serde_json::to_string(&index.source_cursor(own.id.as_str(), &native).unwrap()).unwrap()
+        );
+        assert_eq!(
+            index
+                .call_tool(peer.id.as_str(), &foreign, "same")
+                .unwrap()
+                .as_deref(),
+            Some("foreign")
+        );
+        // A valid earlier append plus excessive later metadata must publish
+        // neither the new correlation nor an advanced source cursor.
+        let excessive = serde_json::json!({"content": (0..1025).map(|_| serde_json::json!({"type":"tool_use","id":"too-many","name":"wrong"})).collect::<Vec<_>>()});
+        fs::OpenOptions::new().append(true).open(&native).unwrap().write_all(format!("{{\"type\":\"function_call\",\"call_id\":\"partial\",\"name\":\"not-published\"}}\n{excessive}\n").as_bytes()).unwrap();
+        let failure = refresh_native(&mut index, &own, &native)
+            .err()
+            .expect("metadata cap must refuse refresh");
+        assert!(
+            failure
+                .to_string()
+                .contains("native event exceeds tool metadata limit")
+        );
+        assert!(
+            index
+                .call_tool(own.id.as_str(), &native, "partial")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_string(&cursor).unwrap(),
+            serde_json::to_string(&index.source_cursor(own.id.as_str(), &native).unwrap()).unwrap()
+        );
+        // Replacement must discard old call correlations, not attach stale names.
+        fs::write(&native, &output).unwrap();
+        refresh_native(&mut index, &own, &native).unwrap();
+        assert!(
+            index
+                .call_tool(own.id.as_str(), &native, "same")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(search(Some("unknown"), true, false).len(), 2);
+        index
+            .retain_agent_documents(own.id.as_str(), &HashSet::new())
+            .unwrap();
+        assert!(
+            index
+                .source_cursor(own.id.as_str(), &native)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            index
+                .call_tool(peer.id.as_str(), &foreign, "same")
+                .unwrap()
+                .as_deref(),
+            Some("foreign")
+        );
+    }
+
     #[test]
     fn native_times_preserve_explicit_values_and_leave_absent_or_invalid_unknown() {
         let dir = tempfile::tempdir().unwrap();
@@ -935,6 +1135,7 @@ mod tests {
             sender: "owner".into(),
             destination: "owner".into(),
             tool_name: None,
+            tool_names: Vec::new(),
             role: Some("memory".into()),
         };
         fs::write(&path, "committedneedle").unwrap();
@@ -1206,7 +1407,10 @@ mod tests {
         fs::create_dir_all(root.join("config")).unwrap();
         fs::write(
             root.join("config/sylphx-transcript.jsonl"),
-            b"{\"role\":\"user\",\"content\":\"secrettoken remainingword\"}\n",
+            concat!(
+                "{\"type\":\"function_call\",\"call_id\":\"redaction-call\",\"name\":\"browser\"}\n",
+                "{\"type\":\"function_call_output\",\"call_id\":\"redaction-call\",\"output\":\"secrettoken remainingword\"}\n"
+            ),
         )
         .unwrap();
         let ids = [agent.id.to_string()];
@@ -1229,6 +1433,14 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+        assert_eq!(
+            HostIndex::open(&dir.path().join(INDEX_FILE))
+                .unwrap()
+                .call_tool(agent.id.as_str(), &native, "redaction-call")
+                .unwrap()
+                .as_deref(),
+            Some("browser")
+        );
         // An unrelated unsupported binary copy produces a partial receipt but
         // must not hide the successfully scrubbed local transcript.
         fs::write(root.join("config/unrelated.sqlite"), b"unmodified binary").unwrap();
@@ -1237,7 +1449,7 @@ mod tests {
                 crate::redaction::Actor::Operator,
                 &agent.id,
                 &crate::redaction::Request {
-                    message_id: Some("transcript:0".into()),
+                    message_id: Some("transcript:1".into()),
                     seq: None,
                     span: Some(crate::redaction::Span {
                         unit: crate::redaction::SpanUnit::Bytes,
@@ -1253,6 +1465,13 @@ mod tests {
             HostIndex::open(&dir.path().join(INDEX_FILE))
                 .unwrap()
                 .source_cursor(agent.id.as_str(), &native)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            HostIndex::open(&dir.path().join(INDEX_FILE))
+                .unwrap()
+                .call_tool(agent.id.as_str(), &native, "redaction-call")
                 .unwrap()
                 .is_none()
         );
