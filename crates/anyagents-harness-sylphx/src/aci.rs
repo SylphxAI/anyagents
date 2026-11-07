@@ -77,7 +77,7 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
 pub(super) fn execute_bash_with_timeout(
     cmd_str: &str,
     work_dir: &Path,
-    env: &[(String, String)],
+    env: &workspace::Environment,
     timeout_ms: u64,
 ) -> String {
     let bounded_timeout_ms = timeout_ms.clamp(500, 600_000);
@@ -569,7 +569,7 @@ fn apply_single_edit_cascade(
 pub(super) fn apply_patch_universal(
     work_dir: &Path,
     patch_text: &str,
-    env: &[(String, String)],
+    env: &workspace::Environment,
 ) -> Result<String, String> {
     let trimmed = patch_text.trim();
     if trimmed.is_empty() {
@@ -648,7 +648,7 @@ fn resolve_rel_path(work_dir: &Path, raw: &str) -> PathBuf {
 fn apply_v4a_patch_local(
     work_dir: &Path,
     patch_text: &str,
-    env: &[(String, String)],
+    env: &workspace::Environment,
 ) -> Result<String, String> {
     let normalized = patch_text.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.lines().collect();
@@ -752,7 +752,7 @@ fn apply_v4a_patch_local(
 fn apply_unified_diff_context_fallback(
     work_dir: &Path,
     patch_text: &str,
-    env: &[(String, String)],
+    env: &workspace::Environment,
 ) -> Result<String, String> {
     let normalized = patch_text.replace("\r\n", "\n");
     let lines: Vec<&str> = normalized.lines().collect();
