@@ -7908,7 +7908,10 @@ mod tests {
         request.workdir = Some("inherit".into());
         let err = create_with_consumer(&store, dir.path(), request, &f.consumer).unwrap_err();
         assert!(matches!(err, Error::WorkdirPermission { .. }), "{err}");
-        assert!(err.to_string().contains("parent has no accessible workdir"), "{err}");
+        assert!(
+            err.to_string().contains("parent has no accessible workdir"),
+            "{err}"
+        );
         assert!(store.agent_by_name("missing-inherit").is_err());
         assert!(!f.log.exists());
     }
