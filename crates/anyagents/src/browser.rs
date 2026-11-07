@@ -5570,7 +5570,7 @@ mod tests {
         );
     }
     #[test]
-    #[ignore = "Chromium startup race; fix owner: lyra-anyagents-takeover-test-race after #91"]
+    #[ignore = "Chromium startup and OOPIF click/focus races; see docs/verification.md; fix owner: lyra-anyagents-takeover-test-race after #91"]
     fn takeover_focus_finds_cross_origin_input() {
         if !Path::new(&chromium_binary()).exists() {
             return;
@@ -5604,9 +5604,9 @@ mod tests {
             &serde_json::json!({"type":"click","x":100,"y":100}),
         )
         .unwrap();
-        assert_eq!(response["focus"]["editable"], true);
+        let _ = stop_profile(dir.path(), "frame-focus");
+        assert_eq!(response["focus"]["editable"], true, "{response}");
         assert_eq!(response["focus"]["rect"]["x"], 60.0);
         assert_eq!(response["focus"]["rect"]["y"], 80.0);
-        let _ = stop_profile(dir.path(), "frame-focus");
     }
 }

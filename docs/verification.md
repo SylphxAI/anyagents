@@ -140,6 +140,30 @@ browser tests exercise trusted input, byte-identical browser identity, restored
 metrics on every exit, and expiry before a queued toggle or Done. They require
 Chromium; the existing browser suites skip when it is unavailable.
 
+`takeover_focus_finds_cross_origin_input` is separately quarantined for two
+intermittent Chromium failures: a CDP startup timeout and a post-startup
+`focus.editable = false` assertion. On 2026-11-07, the latter also reproduced in
+the unmodified `52c4432b362ac548434ab30cead122c5e2e244ed` test binary, before
+the clipboard changes, using the same Chromium 156.0.8078.47. A bounded cohort
+restricted eight concurrent fixture processes to one CPU to expose the race;
+this is reproduction evidence, not a retry policy or a supported latency bound.
+Failure-only diagnostics on both revisions found a focused parent iframe but
+an unfocused child `BODY`, with the input present and both documents complete.
+The cause remains unresolved; capturing a screenshot before the click did not
+remove it. The focus detector and click dispatch were unchanged by the clipboard
+feature. Run this test explicitly when reviewing takeover changes, so its
+quarantine cannot hide a new regression:
+
+```sh
+cargo test -p anyagents --bin anyagents --locked \
+  browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
+```
+
+A green ordinary suite does not establish this ignored test passed. Its focused
+assertions still require the first click to find the child input at offset
+(60, 80); there is no interaction retry. Remove the quarantine only after both
+failure modes have deterministic fixes.
+
 The full UI acceptance test additionally requires Node.js 22 or newer (native
 WebSocket support). It launches its own headless Chromium viewer and remote test
 page, records trusted remote click coordinates within 2 CSS pixels, and saves
