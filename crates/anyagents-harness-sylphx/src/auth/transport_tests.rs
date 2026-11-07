@@ -4,7 +4,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{curl_post_json_fallback, run_json_post_command};
+use super::{curl_command, curl_post_json_fallback, run_json_post_command};
 
 fn assert_large_post(status: u16, response_body: &str) {
     let payload = serde_json::json!({
@@ -114,4 +114,54 @@ fn a_closed_request_pipe_without_an_http_response_remains_an_error() {
     client.args(["-c", "printf '\\n000'"]);
     let result = run_json_post_command(client, &"x".repeat(512 * 1024));
     assert!(result.unwrap_err().contains("writing HTTP request body"));
+}
+
+#[test]
+fn curl_spawn_argv_excludes_the_bearer_credential() {
+    let token = format!("synthetic-argv-sentinel-{}", std::process::id());
+    let (mut cmd, header_file) = curl_command(Some(&token)).unwrap();
+    let header_file = header_file.unwrap();
+    let header_path = header_file.path().to_path_buf();
+    assert!(
+        std::fs::read_to_string(&header_path)
+            .unwrap()
+            .contains(&token),
+        "the private file must carry the credential"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            header_file
+                .as_file()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    cmd.arg("--version");
+    // Record the complete argv of the very Command spawned below. Avoid
+    // printing either argv or the sentinel if this assertion ever fails.
+    let argv: Vec<_> = cmd
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        argv.iter().all(|arg| !arg.contains(&token)),
+        "curl argv must not contain the bearer credential"
+    );
+    assert!(cmd.output().unwrap().status.success());
+    drop(header_file);
+    assert!(!header_path.exists(), "the private header must be removed");
+}
+
+#[test]
+fn unauthenticated_curl_does_not_create_a_header_file() {
+    let (cmd, header_file) = curl_command(None).unwrap();
+    assert!(header_file.is_none());
+    assert_eq!(cmd.get_args().count(), 0);
 }
