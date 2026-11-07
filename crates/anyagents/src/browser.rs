@@ -1682,6 +1682,94 @@ fn takeover_focused_field(cdp: &mut CdpSession) -> serde_json::Value {
     focus
 }
 
+// Clipboard extraction is explicit and never exposes a password's value or selection.
+const TAKEOVER_SELECTION_JS: &str = r#"(() => {
+    let el = document.activeElement;
+    try { while (el?.tagName === 'IFRAME' && el.contentDocument) el = el.contentDocument.activeElement; } catch (_) {}
+    if (el?.tagName === 'IFRAME') return {frame_focused:true};
+    if (!document.hasFocus()) return {focused:false};
+    if (el?.type === 'password') return {focused:true,blocked:true};
+    if (el && typeof el.selectionStart === 'number') {
+        return {focused:true,text:el.value.slice(el.selectionStart,el.selectionEnd)};
+    }
+    return {focused:true,text:(el?.ownerDocument || document).getSelection()?.toString() || ''};
+})()"#;
+
+fn takeover_selection(cdp: &mut CdpSession) -> Result<serde_json::Value, Error> {
+    let selection = eval_js(cdp, TAKEOVER_SELECTION_JS)?;
+    if selection["frame_focused"].as_bool() == Some(true) {
+        for frame in discover_child_frames(cdp) {
+            if let Ok(child) = eval_js_in_frame(cdp, Some(&frame.frame_id), TAKEOVER_SELECTION_JS)
+                && child["focused"].as_bool() == Some(true)
+            {
+                return Ok(child);
+            }
+        }
+        return Err(Error::Message("focused selection is unavailable".into()));
+    }
+    Ok(selection)
+}
+
+fn dispatch_takeover_key(cdp: &mut CdpSession, payload: &serde_json::Value) -> Result<(), Error> {
+    let key = payload["key"].as_str().unwrap_or("Enter");
+    let modifiers = payload["modifiers"].as_u64().unwrap_or(0) & 15;
+    let shortcut = modifiers & (2 | 4) != 0;
+    let lower = key.to_ascii_lowercase();
+    if shortcut && matches!(lower.as_str(), "w" | "t" | "l") {
+        return Err(Error::Message("browser-tab shortcuts stay local".into()));
+    }
+    let commands: Vec<&str> = payload["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|v| matches!(*v, "selectAll" | "copy" | "cut" | "paste"))
+        .collect();
+    let inferred = if shortcut {
+        match lower.as_str() {
+            "a" => Some("selectAll"),
+            "c" => Some("copy"),
+            "x" => Some("cut"),
+            "v" => Some("paste"),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let commands = if commands.is_empty() {
+        inferred.into_iter().collect()
+    } else {
+        commands
+    };
+    if commands.iter().any(|c| matches!(*c, "copy" | "cut"))
+        && takeover_selection(cdp)?["blocked"].as_bool() == Some(true)
+    {
+        return Err(Error::Message(
+            "password fields cannot be copied or cut".into(),
+        ));
+    }
+    let spec = resolve_key_spec(key);
+    let mut down = serde_json::json!({
+        "type":"keyDown", "key":spec.key, "code":spec.code,
+        "windowsVirtualKeyCode":spec.vk, "nativeVirtualKeyCode":spec.vk,
+        "modifiers":modifiers, "commands":commands,
+    });
+    // A modified printable key is a chord, never a literal character insertion.
+    if spec.key.chars().count() == 1 && modifiers & (1 | 2 | 4) == 0 && commands.is_empty() {
+        down["text"] = serde_json::json!(spec.key);
+        down["unmodifiedText"] = serde_json::json!(spec.key);
+    }
+    cdp.call("Input.dispatchKeyEvent", down)?;
+    cdp.call(
+        "Input.dispatchKeyEvent",
+        serde_json::json!({
+            "type":"keyUp", "key":spec.key, "code":spec.code,
+            "windowsVirtualKeyCode":spec.vk, "nativeVirtualKeyCode":spec.vk, "modifiers":modifiers,
+        }),
+    )?;
+    Ok(())
+}
+
 fn generate_takeover_token() -> String {
     let mut bytes = [0u8; 16];
     if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -2083,76 +2171,48 @@ fn dispatch_takeover_input(
             Ok(serde_json::json!({ "ok": true, "type": "wheel" }))
         }
         "key" => {
-            let raw_key = payload
-                .get("key")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Enter");
-            let spec = resolve_key_spec(raw_key);
-            if spec.key.chars().count() == 1 && spec.vk != 13 && spec.vk != 9 && spec.vk != 8 {
-                let s = spec.key.clone();
-                let _ = cdp.call(
-                    "Input.dispatchKeyEvent",
-                    serde_json::json!({
-                        "type": "keyDown",
-                        "key": s,
-                        "code": spec.code,
-                        "text": s,
-                        "unmodifiedText": s,
-                        "windowsVirtualKeyCode": spec.vk,
-                        "nativeVirtualKeyCode": spec.vk,
-                    }),
-                );
-                let _ = cdp.call(
-                    "Input.dispatchKeyEvent",
-                    serde_json::json!({
-                        "type": "keyUp",
-                        "key": spec.key,
-                        "code": spec.code,
-                        "windowsVirtualKeyCode": spec.vk,
-                        "nativeVirtualKeyCode": spec.vk,
-                    }),
-                );
-            } else {
-                dispatch_cdp_key_down(&mut cdp, &spec, false, None)?;
-                dispatch_cdp_key_up(&mut cdp, &spec, None)?;
-            }
-            Ok(serde_json::json!({ "ok": true, "type": "key", "key": spec.key }))
+            dispatch_takeover_key(&mut cdp, payload)?;
+            Ok(
+                serde_json::json!({ "ok":true, "type":"key", "focus":takeover_focused_field(&mut cdp) }),
+            )
         }
-        "text" => {
-            let text_val = payload.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            let submit = payload
-                .get("submit")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            if text_val.chars().count() <= 128 && !text_val.contains('\n') {
-                for ch in text_val.chars() {
-                    let s = ch.to_string();
-                    let _ = cdp.call(
-                        "Input.dispatchKeyEvent",
-                        serde_json::json!({
-                            "type": "keyDown",
-                            "key": s,
-                            "text": s,
-                            "unmodifiedText": s,
-                        }),
-                    );
-                    let _ = cdp.call(
-                        "Input.dispatchKeyEvent",
-                        serde_json::json!({
-                            "type": "keyUp",
-                            "key": s,
-                        }),
-                    );
+        "clipboard" => {
+            let selection = takeover_selection(&mut cdp)?;
+            if selection["blocked"].as_bool() == Some(true) {
+                return Err(Error::Message(
+                    "password fields cannot be copied or cut".into(),
+                ));
+            }
+            let text = selection["text"].as_str().unwrap_or("");
+            match payload["action"].as_str().unwrap_or("copy") {
+                "copy" => Ok(serde_json::json!({ "ok":true, "text":text })),
+                "cut" => {
+                    // The local clipboard must accept the selection before deletion.
+                    // Refuse a changed selection rather than cutting unrelated new input.
+                    if payload["expected_text"].as_str() != Some(text) {
+                        return Err(Error::Message("selection changed before cut".into()));
+                    }
+                    if !text.is_empty() {
+                        dispatch_takeover_key(&mut cdp, &serde_json::json!({"key":"Backspace"}))?;
+                    }
+                    Ok(serde_json::json!({ "ok":true, "type":"cut" }))
                 }
-            } else if !text_val.is_empty() {
-                let _ = cdp.call("Input.insertText", serde_json::json!({ "text": text_val }));
+                _ => Err(Error::Message("unsupported clipboard action".into())),
             }
+        }
+        "text" | "paste" => {
+            let text = payload["text"].as_str().unwrap_or("");
+            if !text.is_empty() {
+                cdp.call("Input.insertText", serde_json::json!({ "text":text }))?;
+            }
+            let submit = payload["submit"].as_bool().unwrap_or(false);
             if submit {
-                let enter = resolve_key_spec("Enter");
-                let _ = dispatch_cdp_key_down(&mut cdp, &enter, false, None);
-                let _ = dispatch_cdp_key_up(&mut cdp, &enter, None);
+                dispatch_takeover_key(&mut cdp, &serde_json::json!({"key":"Enter"}))?;
             }
-            Ok(serde_json::json!({ "ok": true, "type": "text", "submitted": submit }))
+            // Never echo typed or pasted values, including password text.
+            Ok(
+                serde_json::json!({ "ok":true, "type":kind, "submitted":submit, "focus":takeover_focused_field(&mut cdp) }),
+            )
         }
         "navigate" => {
             if let Some(u) = payload
@@ -5206,7 +5266,7 @@ mod tests {
         let html = r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
         <title>Remote browser input test</title>
         <style>body{margin:0;background:#edf3fb;font:20px system-ui;color:#172a43}header{padding:28px;background:#fff;border-bottom:1px solid #ccd9e8}input{display:block;font:20px system-ui;width:280px;height:48px;margin-top:12px}#target{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#086bce;color:white;border:0;border-radius:16px;padding:24px;font:20px system-ui}p{margin:28px;max-width:460px;line-height:1.6}</style>
-        <header>Remote browser<input id="entry" placeholder="Type here"></header>
+        <header>Remote browser<input id="entry" placeholder="Type here"><input id="entry2" placeholder="Next field"><input id="password" type="password" placeholder="Password"></header>
         <p>Pinch to inspect the page. Tap the blue target to verify precise input. The remote browser keeps its original identity.</p>
         <button id="target">Click target</button>
         <script>window.clicks=[];window.keys=[];document.addEventListener('click',e=>window.clicks.push({x:e.clientX,y:e.clientY,target:e.target.id,trusted:e.isTrusted}));document.addEventListener('keydown',e=>window.keys.push(e.key));</script>"#.to_string();

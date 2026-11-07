@@ -41,6 +41,7 @@ if (typeof document !== 'undefined') {
     canvas.style.width = r.width + 'px'; canvas.style.height = r.height + 'px';
     canvas.style.transform = `translate(${view.x}px, ${view.y}px) scale(${view.scale})`;
     $('fit-btn').textContent = fitMode ? '1:1' : 'Fit';
+    placeKeyboard();
   }
   function reset() { fitMode = true; view = { x: 0, y: 0, scale: fitScale() }; paintView(); }
   function zoom(scale, x, y) {
@@ -63,15 +64,26 @@ if (typeof document !== 'undefined') {
     inputQueue = operation.catch(reconnect);
     return operation;
   }
+  function placeKeyboard() {
+    const r = remoteFocus?.rect;
+    const active = !!r && remoteFocus.editable && matchMedia('(pointer: coarse)').matches;
+    proxy.style.pointerEvents = active ? 'auto' : 'none';
+    if (!active) return;
+    proxy.style.left = (view.x + r.x * view.scale) + 'px';
+    proxy.style.top = (view.y + r.y * view.scale) + 'px';
+    proxy.style.width = (r.width * view.scale) + 'px';
+    proxy.style.height = (r.height * view.scale) + 'px';
+  }
   function openKeyboard() {
     keyboardActive = true;
     proxy.inputMode = remoteFocus?.input_mode || 'text';
     proxy.type = remoteFocus?.input_type === 'password' ? 'password' : 'text';
+    placeKeyboard();
     proxy.focus({ preventScroll: true });
   }
   function focusField(focus) {
     remoteFocus = focus;
-    if (!focus?.editable) { keyboardActive = false; proxy.blur(); return; }
+    if (!focus?.editable) { keyboardActive = false; proxy.style.pointerEvents = 'none'; proxy.blur(); return; }
     if (matchMedia('(pointer: coarse)').matches) openKeyboard();
     if (!matchMedia('(pointer: coarse)').matches) return;
     const s = size(), r = focus.rect;
@@ -148,7 +160,56 @@ if (typeof document !== 'undefined') {
     if (e.ctrlKey || e.metaKey) zoom(view.scale * Math.exp(-e.deltaY * .01), e.clientX, e.clientY);
     else sendInput({ type: 'wheel', ...point(e.clientX, e.clientY), delta_x: e.deltaX, delta_y: e.deltaY }).catch(reconnect);
   }, { passive: false });
-  canvas.addEventListener('keydown', e => { e.preventDefault(); sendInput({ type: 'key', key: e.key }).catch(reconnect); });
+  const remoteTarget = target => target === canvas || target === proxy || target === document.body;
+  const modifiers = e => (e.altKey ? 1 : 0) | (e.ctrlKey ? 2 : 0) | (e.metaKey ? 4 : 0) | (e.shiftKey ? 8 : 0);
+  function clipboardError() { $('clipboard-status').textContent = 'Allow clipboard access, or use your device’s Paste menu.'; }
+  async function clipboardOut(action = 'copy') {
+    if (remoteFocus?.input_type === 'password') return;
+    const selection = sendInput({ type: 'clipboard', action: 'copy' });
+    // Start the native write in the user gesture. WebKit requires this before
+    // the asynchronous remote selection arrives, so provide a promised Blob.
+    try {
+      if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+        await navigator.clipboard.write([new ClipboardItem({ 'text/plain': selection.then(result => new Blob([result.text || ''], { type: 'text/plain' })) })]);
+      } else {
+        const result = await selection;
+        await navigator.clipboard.writeText(result.text || '');
+      }
+      const result = await selection;
+      if (action === 'cut') await sendInput({ type: 'clipboard', action: 'cut', expected_text: result.text || '' });
+      $('clipboard-status').textContent = '';
+    } catch (_) { clipboardError(); }
+  }
+  function pasteText(text) {
+    $('clipboard-status').textContent = '';
+    return sendInput({ type: 'paste', text }).then(result => { if (result?.focus) focusField(result.focus); });
+  }
+  document.addEventListener('paste', e => {
+    if (!remoteTarget(e.target) || completed) return;
+    e.preventDefault();
+    pasteText(e.clipboardData?.getData('text/plain') || '').catch(reconnect);
+  });
+  for (const action of ['copy', 'cut']) document.addEventListener(action, e => {
+    if (!remoteTarget(e.target) || completed) return;
+    e.preventDefault(); clipboardOut(action);
+  });
+  function remoteKey(e) {
+    if (e.isComposing || completed) return;
+    const shortcut = e.ctrlKey || e.metaKey, key = e.key.toLowerCase();
+    // These belong to the viewer's browser, never the remote page.
+    if (shortcut && ['w', 't', 'l'].includes(key)) return;
+    // The paste event carries the real local clipboard. Forwarding keydown
+    // as well would insert twice or type a literal 'v'.
+    if (shortcut && key === 'v') return;
+    if (shortcut && ['c', 'x'].includes(key)) { e.preventDefault(); clipboardOut(key === 'x' ? 'cut' : 'copy'); return; }
+    if (e.target === proxy && !shortcut && e.key.length === 1) return;
+    if (['Control', 'Meta', 'Shift', 'Alt'].includes(e.key)) return;
+    e.preventDefault();
+    sendInput({ type: 'key', key: e.key, modifiers: modifiers(e), commands: shortcut && key === 'a' ? ['selectAll'] : [] })
+      .then(result => { if (result?.focus) focusField(result.focus); }).catch(reconnect);
+  }
+  canvas.addEventListener('keydown', remoteKey);
+  proxy.addEventListener('keydown', remoteKey);
   proxy.addEventListener('compositionstart', () => { composing = true; });
   function commit() {
     if (proxy.value) { sendInput({ type: 'text', text: proxy.value }).catch(reconnect); proxy.value = ''; }
@@ -158,12 +219,17 @@ if (typeof document !== 'undefined') {
   proxy.addEventListener('beforeinput', e => {
     if (e.inputType.startsWith('delete')) { e.preventDefault(); sendInput({ type: 'key', key: 'Backspace' }).catch(reconnect); }
   });
-  proxy.addEventListener('keydown', e => {
-    if (e.isComposing) return;
-    if (['Enter', 'Backspace', 'Tab', 'Escape', 'ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', 'Delete'].includes(e.key)) {
-      e.preventDefault(); sendInput({ type: 'key', key: e.key }).catch(reconnect);
-    }
-  });
+  // Do not steal the local keyboard focus when a shortcut pill is tapped.
+  for (const id of ['paste-btn', 'copy-btn', 'select-all-btn', 'tab-btn', 'esc-btn']) {
+    $(id).addEventListener('pointerdown', e => e.preventDefault());
+  }
+  $('paste-btn').onclick = async () => {
+    try { await pasteText(await navigator.clipboard.readText()); } catch (_) { clipboardError(); }
+  };
+  $('copy-btn').onclick = () => clipboardOut();
+  $('select-all-btn').onclick = () => sendInput({ type: 'key', key: 'a', modifiers: 2, commands: ['selectAll'] }).catch(reconnect);
+  $('tab-btn').onclick = () => sendInput({ type: 'key', key: 'Tab' }).then(result => focusField(result?.focus)).catch(reconnect);
+  $('esc-btn').onclick = () => sendInput({ type: 'key', key: 'Escape' }).catch(reconnect);
   $('hud-toggle').onclick = () => {
     const expanded = $('hud-panel').hidden;
     $('hud-panel').hidden = !expanded; $('hud-toggle').setAttribute('aria-expanded', String(expanded));

@@ -68,6 +68,79 @@ try {
       throw error;
     }
   }
+  async function key(key, code, vk, modifiers = 0) {
+    await viewer.call('Input.dispatchKeyEvent', { type:'keyDown', key, code, windowsVirtualKeyCode:vk, modifiers });
+    await viewer.call('Input.dispatchKeyEvent', { type:'keyUp', key, code, windowsVirtualKeyCode:vk, modifiers });
+  }
+  async function remoteField(id) {
+    const r = await remote.eval(`(() => {const r=document.querySelector('#${id}').getBoundingClientRect();return {x:r.x+r.width/2,y:r.y+r.height/2}})()`);
+    const local = await viewer.eval(`(() => {const c=document.querySelector('#screen'),r=c.getBoundingClientRect();return {x:r.x+${r.x}*r.width/Number(c.dataset.remoteWidth),y:r.y+${r.y}*r.height/Number(c.dataset.remoteHeight)}})()`);
+    if (await viewer.eval(`matchMedia('(pointer:coarse)').matches`)) await tap(local.x, local.y);
+    else {
+      await viewer.call('Input.dispatchMouseEvent', {type:'mousePressed',button:'left',buttons:1,clickCount:1,...local});
+      await viewer.call('Input.dispatchMouseEvent', {type:'mouseReleased',button:'left',buttons:0,clickCount:1,...local});
+    }
+    await until(() => remote.eval(`document.activeElement.id === '${id}'`), 'remote field '+id);
+  }
+  await viewer.call('Browser.grantPermissions', {origin:new URL(url).origin,permissions:['clipboardReadWrite','clipboardSanitizedWrite']});
+  for (const [width,height] of [[1440,900],[390,844]]) {
+    await viewer.call('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width<700});
+    await viewer.call('Emulation.setTouchEmulationEnabled', {enabled:width<700});
+    await viewer.call('Page.navigate', {url});
+    await until(() => viewer.eval(`!!document.querySelector('#screen') && document.querySelector('#connection').hidden`), 'clipboard viewer connected');
+    await remote.eval(`document.querySelector('#entry').value='';document.querySelector('#entry2').value=''`);
+    await remoteField('entry');
+    await viewer.eval(`navigator.clipboard.writeText('pasted once ✓')`);
+    await key('v','KeyV',86,2);
+    await until(() => remote.eval(`document.querySelector('#entry').value === 'pasted once ✓'`), 'native paste inserted once');
+    // Cmd+A must select, never type a literal a. Cmd+C returns that selection.
+    await key('a','KeyA',65,4);
+    await key('c','KeyC',67,4);
+    await until(() => viewer.eval(`navigator.clipboard.readText().then(v=>v==='pasted once ✓')`), 'copy remote selection');
+    await key('x','KeyX',88,4);
+    await until(() => remote.eval(`document.querySelector('#entry').value === ''`), 'Cmd+A then Cmd+X cut');
+    assert.equal(await viewer.eval(`navigator.clipboard.readText()`), 'pasted once ✓');
+    await key('Tab','Tab',9);
+    await until(() => remote.eval(`document.activeElement.id === 'entry2'`), 'Tab remote focus');
+    await key('Tab','Tab',9,8);
+    await until(() => remote.eval(`document.activeElement.id === 'entry'`), 'Shift+Tab remote focus');
+    await viewer.eval(`navigator.clipboard.writeText('pill paste')`);
+    await clickSelector('#paste-btn');
+    await until(() => remote.eval(`document.querySelector('#entry').value === 'pill paste'`), 'one-tap paste pill');
+    await clickSelector('#select-all-btn');
+    await clickSelector('#copy-btn');
+    await until(() => viewer.eval(`navigator.clipboard.readText().then(v=>v==='pill paste')`), 'one-tap copy pill');
+    if (width<700) {
+      const overlay = await viewer.eval(`(() => {const p=document.querySelector('#keyboard-proxy'),c=document.querySelector('#screen'),r=p.getBoundingClientRect(),s=c.getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height,screen:{x:s.x,y:s.y,width:s.width},remoteWidth:Number(c.dataset.remoteWidth),pointer:getComputedStyle(p).pointerEvents,active:document.activeElement.id};})()`);
+      const field = await remote.eval(`(() => {const r=document.querySelector('#entry').getBoundingClientRect();return {x:r.x,y:r.y,width:r.width,height:r.height}})()`);
+      const scale=overlay.screen.width/overlay.remoteWidth;
+      assert.ok(Math.abs(overlay.x-(overlay.screen.x+field.x*scale))<1,JSON.stringify(overlay));
+      assert.ok(Math.abs(overlay.y-(overlay.screen.y+field.y*scale))<1,JSON.stringify(overlay));
+      assert.ok(Math.abs(overlay.width-field.width*scale)<1 && Math.abs(overlay.height-field.height*scale)<1,JSON.stringify(overlay));
+      assert.equal(overlay.pointer,'auto'); assert.equal(overlay.active,'keyboard-proxy');
+      // Native paste into the aligned input uses the same single paste bridge.
+      await viewer.eval(`navigator.clipboard.writeText('mobile paste')`);
+      await key('v','KeyV',86,2);
+      await until(() => remote.eval(`document.querySelector('#entry').value === 'mobile paste'`), 'aligned phone native paste');
+    }
+    await screenshot(`${width}-clipboard`);
+    await remoteField('password');
+    const typed = await api('/input', {type:'paste',text:'private-fixture-password'});
+    assert.ok(!JSON.stringify(typed).includes('private-fixture-password'), 'paste response must not echo secrets');
+    const blocked=await api('/input', {type:'clipboard',action:'copy'});
+    assert.equal(blocked.ok,false); assert.ok(!JSON.stringify(blocked).includes('private-fixture-password'));
+    await viewer.eval(`navigator.clipboard.writeText('keep local clipboard')`);
+    await key('a','KeyA',65,4); await key('c','KeyC',67,4);
+    assert.equal(await viewer.eval(`navigator.clipboard.readText()`),'keep local clipboard');
+    const reserved=await viewer.eval(`['w','t','l'].map(key=>{const e=new KeyboardEvent('keydown',{key,ctrlKey:true,bubbles:true,cancelable:true});document.activeElement.dispatchEvent(e);return e.defaultPrevented})`);
+    assert.deepEqual(reserved,[false,false,false], 'browser-tab shortcuts stay local');
+    for (const key of ['w','t','l']) assert.equal((await api('/input',{type:'key',key,modifiers:2})).ok,false);
+    await remote.eval(`document.querySelector('#password').value='';document.querySelector('#entry').value=''`);
+  }
+  if (process.env.TAKEOVER_CLIPBOARD_ONLY === '1') {
+    await writeFile(path.join(output,'clipboard-result.json'),JSON.stringify({passed:true,viewports:2,nativePaste:true,copy:true,cut:true,tab:true,overlay:true,passwordGuard:true}));
+    console.log(JSON.stringify({passed:true,clipboard:true,screenshots:output}));
+  } else {
   for (const [width, height] of [[390, 844], [588, 1280], [1280, 800], [1440, 900]]) {
     await viewer.call('Emulation.setDeviceMetricsOverride', { width, height, deviceScaleFactor: 1, mobile: width < 700 });
     await viewer.call('Emulation.setTouchEmulationEnabled', { enabled: width < 700 });
@@ -130,6 +203,7 @@ try {
     const localInput = await viewer.eval(`(() => {const c=document.querySelector('#screen'),r=c.getBoundingClientRect();return {x:r.x+${input.x}*r.width/Number(c.dataset.remoteWidth),y:r.y+${input.y}*r.height/Number(c.dataset.remoteHeight)}})()`);
     await tap(localInput.x, localInput.y);
     await until(() => remote.eval(`document.activeElement.id === 'entry'`), 'remote input focused');
+    await clickSelector('#hud-toggle');
     await clickSelector('#keyboard-btn');
     assert.equal(await viewer.eval('document.activeElement.id'), 'keyboard-proxy');
     await viewer.call('Input.insertText', { text: 'hello世界' });
@@ -139,6 +213,7 @@ try {
     await viewer.call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 });
     await until(() => remote.eval(`document.querySelector('#entry').value === 'hello世' && window.keys.includes('Enter')`), 'remote keyboard text/delete/enter');
     await screenshot(`${width}-keyboard`);
+    await clickSelector('#hud-toggle');
     await remote.eval(`document.querySelector('#entry').value='';window.keys=[]`);
     await clickSelector('#hud-toggle'); await clickSelector('#viewport-btn');
     await until(async () => !(await api('/state')).phone_layout, 'phone layout disabled');
@@ -185,6 +260,7 @@ try {
   assert.deepEqual(await remote.eval('({width:innerWidth,height:innerHeight,dpr:devicePixelRatio,ua:navigator.userAgent,hints:JSON.stringify(navigator.userAgentData?.toJSON()),screen:[screen.width,screen.height]})'), original);
   await writeFile(path.join(output, 'remote-click-log.json'), JSON.stringify(logs, null, 2));
   console.log(JSON.stringify({passed:true, viewports:4, clicks:logs.length, screenshots:output}));
+  }
 } finally {
   viewer?.close(); remote?.close(); chrome.kill('SIGTERM');
   await new Promise(resolve => { if (chrome.exitCode !== null) resolve(); else chrome.once('exit', resolve); });
