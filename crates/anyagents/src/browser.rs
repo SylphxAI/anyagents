@@ -2133,12 +2133,19 @@ fn dispatch_takeover_input(
         let arm = std::env::var("ANYAGENTS_FOCUS_ARM").unwrap_or_default();
         let mut children = Vec::new();
         if arm == "main" || arm == "all" {
-            cdp.call("Emulation.setFocusEmulationEnabled", serde_json::json!({"enabled":true}))?;
+            cdp.call(
+                "Emulation.setFocusEmulationEnabled",
+                serde_json::json!({"enabled":true}),
+            )?;
         }
         if arm == "all" {
             for frame in discover_child_frames(&mut cdp) {
-                let mut child = CdpSession::connect(cdp.port, &format!("/devtools/page/{}",frame.frame_id))?;
-                child.call("Emulation.setFocusEmulationEnabled",serde_json::json!({"enabled":true}))?;
+                let mut child =
+                    CdpSession::connect(cdp.port, &format!("/devtools/page/{}", frame.frame_id))?;
+                child.call(
+                    "Emulation.setFocusEmulationEnabled",
+                    serde_json::json!({"enabled":true}),
+                )?;
                 children.push(child);
             }
         }
@@ -5626,12 +5633,18 @@ mod tests {
             BrowserRequest {
                 action: "open".into(),
                 url: Some(format!("http://127.0.0.1:{parent}")),
-                headless: Some(true),
+                headless: Some(std::env::var("ANYAGENTS_FOCUS_MODE").as_deref() != Ok("headed")),
                 wait_ms: Some(400),
                 ..Default::default()
             },
         )
         .unwrap();
+        let rt = load_runtime(dir.path(), "frame-focus").unwrap();
+        eprintln!("FOCUS MODE: {} headless={}", rt.display_mode, rt.headless);
+        if std::env::var("ANYAGENTS_FOCUS_MODE").as_deref() == Ok("headed") {
+            assert_eq!(rt.display_mode, "xvfb-headed");
+            assert!(!rt.headless);
+        }
         let response = dispatch_takeover_input(
             dir.path(),
             "frame-focus",
