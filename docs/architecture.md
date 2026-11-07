@@ -166,6 +166,32 @@ No harness here uses `queue`: none of them is a one-shot run that must wait.
 
 The per-harness programmatic modes, sign-in methods and usage fields are listed with their sources in [harnesses.md](harnesses.md).
 
+### OpenCode service isolation
+
+Each OpenCode agent persists its service port in
+`<agent>/config/opencode-service-port`. Allocation probes loopback ports
+20000–29999, reuses the saved port when free, and reserves it while the child
+starts. An occupied saved port or a bind race selects a replacement, persists it,
+and logs the old and new numbers. Stopping the harness releases its socket and
+in-process reservation; deleting the agent also removes the saved allocation
+with its config directory.
+
+The adapter uses `serve --hostname 127.0.0.1 --port <port>`, then points every
+`api --server <url>` call at that child's announced endpoint. It refuses to call
+`api` if the announcement is missing, so a failed startup cannot discover or
+start the machine's default managed service. Agent config, data and state roots
+are set before the first vendor command. Inherited server passwords are removed
+only from the service launch so OpenCode generates and announces its own private
+credential; subsequent API children receive that credential.
+
+OpenCode v2.1.4 source, read 2026-11-07 UTC at
+[`68bc26b`](https://github.com/anomalyco/opencode/tree/68bc26b7da1990ce10ffecfbc1e09eb13aa5d824),
+confirms the explicit port in `packages/cli/src/commands/handlers/serve.ts:9–14`
+and `packages/cli/src/server-process.ts:68–72`. The managed-service fallback is
+in `packages/cli/src/services/server-connection.ts:29–55`; service setters stop
+the managed service before writing (`services/service-config.ts:273–277`), so
+this adapter does not invoke a setter or edit shared service configuration.
+
 ### Antigravity and Muse
 
 - **Antigravity (`agy`).** The installed CLI documents a turn per stream-json input line and `--conversation <id>` for resume. The adapter reports followup/unproven. Its hook helpers are not wired to a confirmed customization root and have no vendor consumption acknowledgement. AGY 1.4.5's embedded lifecycle documentation specifies `hooks.json` in a customization root (for example `.agents/hooks.json`), with a named hook's flat `PreInvocation` command array and output `{"injectSteps":[{"userMessage":"..."}]}`. It does not specify the durable acceptance/replay contract needed to commit the mailbox cursor across hook abort or process restart. The existing `agy-hook` helper only offers `received` rows, while stream pipe writes already mark rows delivered; it cannot establish native mid-turn delivery. Do not advertise steer support or install a hook bound to a seat in a shared workspace until isolated hook discovery and consumption/recovery semantics are verified.
