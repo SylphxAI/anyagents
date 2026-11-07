@@ -192,8 +192,16 @@ committed action.
 trusted Chromium input at 1440×900, 834×1194 and 390×844. It covers global focus
 owners, native/fallback single paste, password paste, clipboard/undo/redo, IME,
 local HUD isolation, sign-in clicks, desktop/touch slider drag, mouse/two-finger
-scroll, same-URL reconnect and 20 input-to-painted-JPEG latency samples with a
-150 ms maximum. Emulated touch is not a physical iPhone Safari receipt.
+scroll, delayed two-finger pinch, same-URL reconnect and 20 input-to-painted-JPEG
+latency samples with a 150 ms maximum. Stationary touches remain undecided until
+lift or an 8 CSS px drag, not an elapsed-time timer. A second finger after either
+0 or 250 ms must scroll without clicking the initial button; a delayed pinch
+must zoom without clicking it. A 600 ms stationary single touch still clicks
+exactly once on lift. Once a one-finger drag owns a remote press, additional
+fingers are ignored until its original pointer releases, so their arrival cannot
+complete that press into a click. Deterministic shipped-handler tests also check
+the 600 ms delayed pair and the already-committed drag boundary. Emulated touch
+is not a physical iPhone Safari receipt.
 `npm test` checks bounded move/wheel queues and no replay on input failure. The
 resource-free Rust regression holds an incomplete frame HTTP request open while
 verifying a separate input request completes, distinguishing the old serial

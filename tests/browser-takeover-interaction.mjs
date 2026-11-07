@@ -145,25 +145,49 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
     const trajectory=await remote.eval('window.trajectory');
     assert.equal(trajectory[0].type,'mousedown');assert.equal(trajectory.at(-1).type,'mouseup');
     assert.ok(trajectory.some(p=>p.type==='mousemove'&&p.buttons===1));assert.ok(trajectory.every(p=>p.trusted));
-    await remote.eval(`document.querySelector('#scrollbox').scrollTop=0`);
     const scroll=await localPoint(540,380);
     if(mobile) {
       const button=await localPoint(540,350);
-      await remote.eval('window.scrollButtonClicks=0');
-      // Separate starts preserve the real first-finger undecided interval.
+      for(const delay of [0,250]) {
+        await remote.eval('window.scrollButtonClicks=0;document.querySelector("#scrollbox").scrollTop=0');
+        await touch('touchStart',[[button.x-12,button.y]]);
+        if(delay) await viewer.eval(`new Promise(resolve=>setTimeout(resolve,${delay}))`);
+        await touch('touchStart',[[button.x-12,button.y],[button.x+12,button.y]]);
+        await touch('touchMove',[[button.x-12,button.y-40],[button.x+12,button.y-40]]);
+        await touch('touchEnd',[]);
+        await until(()=>remote.eval(`document.querySelector('#scrollbox').scrollTop>0`),'two-finger scroll after '+delay+'ms');
+        assert.equal(await remote.eval('window.scrollButtonClicks'),0,'two-finger scroll starting on a button must not click after '+delay+'ms');
+      }
+      await remote.eval('window.scrollButtonClicks=0;document.querySelector("#scrollbox").scrollTop=0');
+      const beforePinch=await viewer.eval(`document.querySelector('#screen').getBoundingClientRect().width`);
       await touch('touchStart',[[button.x-12,button.y]]);
+      await viewer.eval('new Promise(resolve=>setTimeout(resolve,250))');
       await touch('touchStart',[[button.x-12,button.y],[button.x+12,button.y]]);
-      await touch('touchMove',[[button.x-12,button.y-40],[button.x+12,button.y-40]]);
+      await touch('touchMove',[[button.x-24,button.y],[button.x+24,button.y]]);
       await touch('touchEnd',[]);
-    } else await viewer.call('Input.dispatchMouseEvent',{type:'mouseWheel',...scroll,deltaX:0,deltaY:240});
-    await until(()=>remote.eval(`document.querySelector('#scrollbox').scrollTop>0`),'wheel/two-finger scroll');
-    if(mobile) assert.equal(await remote.eval('window.scrollButtonClicks'),0,'two-finger scroll starting on a button must not click');
+      await until(()=>viewer.eval(`document.querySelector('#screen').getBoundingClientRect().width>${beforePinch+1}`),'delayed two-finger pinch zooms');
+      assert.equal(await remote.eval('window.scrollButtonClicks'),0,'delayed pinch starting on a button must not click');
+    } else {
+      await remote.eval(`document.querySelector('#scrollbox').scrollTop=0`);
+      await viewer.call('Input.dispatchMouseEvent',{type:'mouseWheel',...scroll,deltaX:0,deltaY:240});
+      await until(()=>remote.eval(`document.querySelector('#scrollbox').scrollTop>0`),'wheel scroll');
+    }
     await viewer.eval(`document.querySelector('#reset-btn').click()`);
     const before=await remote.eval('window.signins');
     await remote.eval('window.signinEvents=[]');
     await clickRemote('signin',mobile);
     await until(()=>remote.eval(`window.signins===${before+1} && window.lastSigninTrusted`),'trusted sign-in click');
     assert.deepEqual(await remote.eval('window.signinEvents'),[{type:'mousedown',trusted:true},{type:'mouseup',trusted:true}],'single tap sends one trusted press and release');
+    if(mobile) {
+      const button=await localPoint(500,55),heldBefore=await remote.eval('window.signins');
+      await remote.eval('window.signinEvents=[]');
+      await touch('touchStart',[[button.x,button.y]]);
+      await viewer.eval('new Promise(resolve=>setTimeout(resolve,600))');
+      assert.deepEqual(await remote.eval('window.signinEvents'),[],'stationary hold cannot commit a press before lift');
+      await touch('touchEnd',[]);
+      await until(()=>remote.eval(`window.signins===${heldBefore+1}`),'stationary long-press clicks once on lift');
+      assert.deepEqual(await remote.eval('window.signinEvents'),[{type:'mousedown',trusted:true},{type:'mouseup',trusted:true}]);
+    }
     // Deliberately overlap actual screenshot/state requests with input.
     const reads=[api('/state'),fetch(url+'/frame.jpg').then(r=>r.arrayBuffer())];
     const began=performance.now();

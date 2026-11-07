@@ -23,14 +23,14 @@ async function mount() {
   const document = new Target('document'), body = element('body');
   document.activeElement = body; document.getElementById = element;
   element('takeover-config').textContent = JSON.stringify({ token: 'fixture' });
-  const inputs = [], held = [], timers = new Map(); let nextTimer = 0, hold = false;
+  const inputs = [], held = [], timers = new Map(); let nextTimer = 0, clock = 0, hold = false;
   const focus = { editable: true, rect: { x: 10, y: 10, width: 280, height: 48 } };
   const context = {
     document, window: new Target('window'), innerWidth: 390, innerHeight: 844,
     matchMedia: () => ({ matches: true }), AbortSignal, performance,
     requestAnimationFrame: fn => { const id = ++nextTimer; timers.set(id, fn); return id; },
     cancelAnimationFrame: id => timers.delete(id),
-    setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
+    setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms, due: clock + ms }); return id; },
     clearTimeout: id => timers.delete(id),
     addEventListener() {}, navigator: { clipboard: { readText: async () => 'native paste' } },
     createImageBitmap: async () => ({ width: 1280, height: 800, close() {} }),
@@ -48,7 +48,14 @@ async function mount() {
   await settle();
   const stage = element('stage');
   const pointer = (type, id, x = 100, y = 200) => stage.emit(type, { pointerId: id, pointerType: 'touch', clientX: x, clientY: y, button: 0, buttons: type === 'pointerup' ? 0 : 1 });
-  return { element, inputs, pointer, settle, document, timers, window: context.window, hold: () => { hold = true; }, release: () => { hold = false; held.splice(0).forEach(resolve => resolve()); } };
+  async function advance(ms) {
+    clock += ms;
+    for (const [id, timer] of [...timers]) if (timer.due <= clock) {
+      timers.delete(id); await timer.fn();
+    }
+    await settle();
+  }
+  return { element, inputs, pointer, settle, advance, document, timers, window: context.window, hold: () => { hold = true; }, release: () => { hold = false; held.splice(0).forEach(resolve => resolve()); } };
 }
 
 test('two-finger scroll beginning on a button sends no press or release', async () => {
@@ -119,24 +126,39 @@ test('late focus acknowledgement cannot undo a blur to the local document', asyn
   assert.equal(ui.document.activeElement.id, 'body');
 });
 
-test('a single held touch resolves once at the 180ms threshold', async () => {
+test('a stationary held touch stays undecided until release, then clicks once', async () => {
   const ui = await mount();
-  ui.pointer('pointerdown', 1);
-  assert.deepEqual(ui.inputs, []);
-  const timer = [...ui.timers.values()].find(timer => timer.ms === 180);
-  assert.ok(timer, 'touch decision timer is armed'); timer.fn();
-  await ui.settle();
-  assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed']);
-  ui.pointer('pointerup', 1); await ui.settle();
+  ui.pointer('pointerdown', 1, 100, 400);
+  await ui.advance(600);
+  assert.deepEqual(ui.inputs, [], 'elapsed time alone cannot commit a remote press');
+  ui.pointer('pointerup', 1, 100, 400); await ui.settle();
   assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed', 'mouseReleased']);
 });
 
-test('a second finger disarms the undecided single-touch timer', async () => {
+for (const delay of [0, 250, 600]) test(`a second finger after ${delay}ms cancels the stationary first touch`, async () => {
   const ui = await mount();
-  ui.pointer('pointerdown', 1); ui.pointer('pointerdown', 2, 140, 200);
-  assert.equal([...ui.timers.values()].some(timer => timer.ms === 180), false);
-  ui.pointer('pointerup', 1); ui.pointer('pointerup', 2);
-  await ui.settle(); assert.deepEqual(ui.inputs, []);
+  ui.pointer('pointerdown', 1, 100, 400); await ui.advance(delay);
+  ui.pointer('pointerdown', 2, 140, 400);
+  ui.pointer('pointermove', 1, 100, 360); ui.pointer('pointermove', 2, 140, 360);
+  ui.pointer('pointerup', 1, 100, 360); ui.pointer('pointerup', 2, 140, 360);
+  await ui.settle();
+  assert.deepEqual(ui.inputs.map(p => p.type), ['wheel'], 'only the pair wheel may reach the remote');
+  assert.ok(ui.inputs[0].delta_y > 0);
+});
+
+test('a second finger cannot release an already committed remote drag', async () => {
+  const ui = await mount();
+  ui.pointer('pointerdown', 1, 100, 400); await ui.advance(250);
+  ui.pointer('pointermove', 1, 116, 400); await ui.settle();
+  assert.equal(ui.inputs[0].event_type, 'mousePressed');
+  ui.pointer('pointerdown', 2, 140, 400);
+  ui.pointer('pointermove', 2, 140, 360); ui.pointer('pointerup', 2, 140, 360);
+  await ui.settle();
+  assert.equal(ui.inputs.some(p => p.event_type === 'mouseReleased'), false, 'the other finger cannot release/click');
+  ui.pointer('pointermove', 1, 160, 400); ui.pointer('pointerup', 1, 180, 400);
+  await ui.settle();
+  assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed', 'mouseMoved', 'mouseReleased']);
+  assert.ok(ui.inputs[0].x < ui.inputs[1].x && ui.inputs[1].x < ui.inputs[2].x);
 });
 
 for (const isTrusted of [true, false]) test(`two independent paste events each insert once (trusted=${isTrusted})`, async () => {
