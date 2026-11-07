@@ -862,6 +862,15 @@ impl Store {
     /// or live process must never prevent its lifecycle from being changed.
     /// Keep the returned file open through preparation and the store commit.
     pub fn lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+        self.agent_lifecycle_lock(agent_id, false)
+    }
+
+    /// Maintenance must skip a busy lifecycle rather than delay unrelated mail.
+    pub fn try_lock_agent_lifecycle(&self, agent_id: &AgentId) -> Result<File, Error> {
+        self.agent_lifecycle_lock(agent_id, true)
+    }
+
+    fn agent_lifecycle_lock(&self, agent_id: &AgentId, nonblocking: bool) -> Result<File, Error> {
         let dir = self.data_dir.join("locks");
         std::fs::create_dir_all(&dir)?;
         let file = OpenOptions::new()
@@ -870,12 +879,16 @@ impl Store {
             .read(true)
             .write(true)
             .open(dir.join(format!("{}.lifecycle", agent_id.as_str())))?;
+        let operation = libc::LOCK_EX | if nonblocking { libc::LOCK_NB } else { 0 };
         loop {
-            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            let rc = unsafe { libc::flock(file.as_raw_fd(), operation) };
             if rc == 0 {
                 return Ok(file);
             }
             let error = std::io::Error::last_os_error();
+            if error.kind() == ErrorKind::WouldBlock {
+                return Err(Error::AgentBusy);
+            }
             if error.kind() != ErrorKind::Interrupted {
                 return Err(Error::Io(error));
             }

@@ -650,6 +650,7 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
             .as_deref()
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &found.id));
+        std::fs::create_dir_all(&work_dir)?;
         if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             || std::env::var_os("ANYAGENTS_SUPPRESS_CONFIG_WRITE").is_some()
         {
@@ -669,9 +670,15 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
     if state == "running" {
         crate::create::poke_agent_wake_socket(data, &agent.id);
     } else if state == "archived" {
-        server::mark_explicitly_archived_locked(&store, data, &agent);
-        if found.parent_id.is_some() {
-            server::reap_subagent_ephemeral_dirs(data, &found.id);
+        let archived = server::mark_explicitly_archived_locked(&store, data, &agent);
+        // The offline path has no daemon maintenance worker. Keep the parent's
+        // lifecycle lock, taking descendant locks only downward as above.
+        for id in archived {
+            if id == agent.id {
+                server::reap_archived_agent_locked(&store, data, &id);
+            } else if let Ok(_child_lifecycle) = store.lock_agent_lifecycle(&id) {
+                server::reap_archived_agent_locked(&store, data, &id);
+            }
         }
     }
     let lag = store.lag(&agent.id, anyagents_core::now_ms())?;
