@@ -28,6 +28,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--binary', type=Path, required=True)
     p.add_argument('--source-sha', required=True)
+    p.add_argument('--vendor-test-binary', type=Path, required=True)
     p.add_argument('--launcher', type=Path, default=Path('/usr/bin/setpriv'))
     p.add_argument('--uid', type=int, required=True)
     p.add_argument('--gid', type=int, required=True)
@@ -53,7 +54,7 @@ def main():
         'started_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'server_uid': os.getuid(), 'server_gid': os.getgid(),
         'expected_uid': args.uid, 'expected_primary_gid': args.gid,
-        'entrypoint': 'anyagents agent-run -> sandbox::run -> checks -> native setpriv',
+        'entrypoint': 'CLI and actual vendor_launch -> shared harness admission -> native setpriv',
         'cases': [],
     }
     root = Path(tempfile.mkdtemp(prefix='host-memory-seat-', dir=args.base.resolve()))
@@ -195,6 +196,38 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
                 raise RuntimeError(f'{name} did not refuse before command')
             elif expected_check and f'boundary check failed: {expected_check}' not in result.stderr:
                 raise RuntimeError(f'{name} refused for a different boundary: {result.stderr}')
+        # The actual vendor path runs in a required, isolated test subprocess.
+        # Remove DAC override/read-search so root cannot fake traversal of the
+        # legitimate seat-owned 0700 vendor parent. Retain UID/GID transitions.
+        vendor_binary = args.vendor_test_binary.resolve(strict=True)
+        public_test = root / 'vendor-test-binary'
+        shutil.copyfile(vendor_binary, public_test)
+        public_test.chmod(0o555)
+        receipt['vendor_test_binary_sha256'] = digest(vendor_binary)
+        if digest(public_test) != receipt['vendor_test_binary_sha256']:
+            raise RuntimeError('vendor test artifact copy mismatch')
+        vendor_env = {k: v for k, v in env.items() if not k.startswith('ANYAGENTS_')}
+        vendor_env.update(ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST='1', ANYAGENTS_NATIVE_SEAT_BASE=str(root))
+        vendor = subprocess.run([
+            str(launcher), '--reuid', '0', '--regid', '0', '--groups', f'{args.gid},{args.socket_gid}',
+            '--bounding-set=-dac_override,-dac_read_search', '--no-new-privs', '--',
+            str(public_test), '--exact', 'vendor::tests::native_vendor_launch_enforces_shared_boundary_and_real_skill_mounts',
+            '--ignored', '--nocapture', '--test-threads=1',
+        ], env=vendor_env, text=True, capture_output=True, timeout=90)
+        receipt['cases'].append({'name': 'actual-vendor-launch-real-uid-and-mounts',
+                                 'exit': vendor.returncode, 'stdout': vendor.stdout, 'stderr': vendor.stderr})
+        if vendor.returncode != 0:
+            raise RuntimeError(f'actual vendor launch proof failed: {vendor.stdout} {vendor.stderr}')
+        for marker in ['REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK',
+                       'NATIVE_VENDOR_WRITABLE_PEER_memory_REFUSED_BEFORE_COMMAND',
+                       'NATIVE_VENDOR_WRITABLE_PEER_skills_REFUSED_BEFORE_COMMAND',
+                       'NATIVE_VENDOR_WRITABLE_PEER_config_REFUSED_BEFORE_COMMAND',
+                       'NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED',
+                       'NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER', 'NATIVE_VENDOR_FIXTURE_REMOVED',
+                       '1 passed; 0 failed']:
+            if marker not in vendor.stdout:
+                raise RuntimeError(f'actual vendor launch missing {marker}')
+        public_test.unlink()
         run_case('real-uid-positive-and-denial-controls', True)
         if (memory / 'MEMORY.md').read_text() != 'synthetic-memory-after\n':
             raise RuntimeError('host memory readback mismatch')

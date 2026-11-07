@@ -228,13 +228,14 @@ certify Google sign-in, a physical phone's keyboard, or deployed release bytes.
 
 The required public Linux CI lane builds the shipping `anyagents` binary and
 runs `scripts/verify-host-memory-seat.py` with native `/usr/bin/setpriv`. The
-entrypoint is `anyagents --data <synthetic-data> agent-run --config <own-config>
--- <probe>`: production `sandbox::run` executes its memory/skills and identity
-admission checks before launching the probe. No test launcher substitutes for
-those checks. The agent's actual UID 24031 and primary GID 24032 are asserted
+entrypoints are `anyagents --data <synthetic-data> agent-run --config
+<own-config> -- <probe>` and the real `vendor_launch` adapter path with a scripted
+vendor child. Both use the same shared harness admission primitive that also
+starts native workspace commands; a refused probe never returns a command to
+its caller. No test launcher substitutes for those checks. The agent's actual UID 24031 and primary GID 24032 are asserted
 independently; supplementary socket group 24033 is not a primary-GID proxy.
 
-The disposable, invocation-owned fixture proves learned-memory read/write and
+The CLI fixture proves learned-memory read/write and
 readback, discovery/read through all three skill projections, writable own skill
 overlay, and denied global/peer/host-private reads or writes as appropriate.
 Missing memory, missing overlay, writable peer memory/skills/config and writable
@@ -257,6 +258,21 @@ fixture uses a newly created leaf under `/var/tmp`: the runner's private home
 ancestor makes its ordinary `RUNNER_TEMP` inaccessible to the distinct UID.
 The receipt remains in `RUNNER_TEMP`, read only by the invoking CI process.
 No account, ACL, real agent directory or daemon is changed.
+
+A required isolated Rust test invokes `vendor_launch` through the real Claude
+adapter and native setpriv, not the CLI route. It removes the executor's DAC
+override/read-search capabilities while retaining UID/GID transitions, mounts
+skills under daemon umask `077`, and requires reads through the actual
+`.claude`, `.agents` and `.agy` projections. A seat-owned `0700` vendor parent
+must receive its projection through the narrow owner fallback without widening
+that parent. It also checks legacy SQLite ownership handoff with exact bytes,
+a second registered agent on the same UID/GID, writable foreign-seat
+memory/skills/config refusals before vendor execution, protected bytes/modes,
+and fixture removal. Same-seat exceptions require the host-resolved principal
+and exact registered root, not merely ownership of a directory. Local unprivileged
+tests separately exercise deterministic directory-to-symlink replacement during
+descriptor-bound permission sharing. Passing CLI controls alone does not certify
+this vendor proof or real vendor subscriptions.
 
 A non-root local invocation deliberately refuses before creating a fixture. It
 is not a skipped pass or actual alternate-UID evidence: acceptance requires the

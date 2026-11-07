@@ -10,10 +10,32 @@ use std::{
 
 #[cfg(unix)]
 pub fn mount(agent_root: &Path, global: &Path, config: &Path) -> io::Result<()> {
+    mount_with_fallback(agent_root, global, config, |_, _, _, _| {
+        Err(io::Error::from(io::ErrorKind::PermissionDenied))
+    })
+}
+
+/// Build the host view once; an inaccessible seat-owned vendor parent can be
+/// installed by its owner without widening that parent or changing authority.
+#[cfg(unix)]
+pub fn mount_with_fallback(
+    agent_root: &Path,
+    global: &Path,
+    config: &Path,
+    fallback: impl Fn(&Path, &Path, &Path, &Path) -> io::Result<()>,
+) -> io::Result<()> {
     let overlay = agent_root.join("skills");
     let view = agent_root.join("skills-view");
     fs::create_dir_all(&overlay)?;
     fs::create_dir_all(&view)?;
+    // The host publishes this read-only projection, not a seat-private overlay.
+    // Explicit mode is required even when the daemon starts with umask 077.
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(&view)?;
+    directory.set_permissions(fs::Permissions::from_mode(0o755))?;
     // Refuse a foreign view/overlay link rather than writing into another tree.
     if fs::symlink_metadata(&overlay)?.file_type().is_symlink()
         || fs::symlink_metadata(&view)?.file_type().is_symlink()
@@ -43,6 +65,7 @@ pub fn mount(agent_root: &Path, global: &Path, config: &Path) -> io::Result<()> 
         "skills",
         ".agents/skills",
         ".claude/skills",
+        ".agy/skills",
         ".codex/skills",
         "opencode/skills",
         ".config/opencode/skills",
@@ -66,24 +89,34 @@ pub fn mount(agent_root: &Path, global: &Path, config: &Path) -> io::Result<()> 
         {
             continue;
         }
-        fs::create_dir_all(parent)?;
-        match fs::symlink_metadata(&target) {
-            Ok(meta) if meta.file_type().is_dir() => {
-                sync_entries(&target, &entries, &[global, &overlay])?
-            }
-            Ok(meta) if meta.file_type().is_symlink() => {
-                let current = fs::read_link(&target)?;
-                if current == view {
-                    continue;
+        let install = || -> io::Result<()> {
+            fs::create_dir_all(parent)?;
+            match fs::symlink_metadata(&target) {
+                Ok(meta) if meta.file_type().is_dir() => {
+                    sync_entries(&target, &entries, &[global, &overlay])?
                 }
-                if current == global {
-                    replace_link(&target, &view)?;
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    let current = fs::read_link(&target)?;
+                    if current == view {
+                        return Ok(());
+                    }
+                    if current == global {
+                        replace_link(&target, &view)?;
+                    }
+                    // Foreign mounts remain untouched, not recursively cleared.
                 }
-                // Foreign mounts remain untouched, not recursively cleared.
+                Ok(_) => (),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => replace_link(&target, &view)?,
+                Err(e) => return Err(e),
             }
-            Ok(_) => (),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => replace_link(&target, &view)?,
-            Err(e) => return Err(e),
+            Ok(())
+        };
+        match install() {
+            Ok(()) => (),
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                fallback(&target, &view, global, &overlay)?
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(())

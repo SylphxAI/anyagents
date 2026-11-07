@@ -1121,12 +1121,105 @@ pub(crate) fn ensure_seat_skills(target_config: &Path, _host_home: &Path) {
     };
     let skills_root = data.join("skills");
     if let Some(root) = target_config.parent()
-        && let Err(error) = anyagents_core::host_skills::mount(root, &skills_root, target_config)
+        && let Err(error) = anyagents_core::host_skills::mount_with_fallback(
+            root,
+            &skills_root,
+            target_config,
+            |target, view, global, overlay| {
+                install_skill_projection_as_owner(target_config, target, view, global, overlay)
+            },
+        )
     {
         eprintln!(
             "skill overlay mount refused for {}: {error}",
             target_config.display()
         );
+    }
+}
+
+/// Only a refused mirror is delegated, and all effects run as the existing
+/// parent owner. No daemon chmod, broad home grant or foreign-link replacement.
+#[cfg(unix)]
+fn install_skill_projection_as_owner(
+    config: &Path,
+    target: &Path,
+    view: &Path,
+    global: &Path,
+    overlay: &Path,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+    let relative = target.strip_prefix(config).map_err(std::io::Error::other)?;
+    if relative
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return Err(std::io::Error::other("invalid skill projection path"));
+    }
+    let owner = target
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
+        .take_while(|p| p.starts_with(config))
+        .find_map(|p| std::fs::symlink_metadata(p).ok().filter(|m| m.is_dir()));
+    let owner = owner.ok_or_else(|| std::io::Error::other("skill projection owner missing"))?;
+    if owner.uid() == crate::sandbox::server_uid() {
+        return Err(std::io::Error::other(
+            "skill projection is not owned by another seat",
+        ));
+    }
+    let launcher = crate::sandbox::descriptor_launcher()
+        .ok_or_else(|| std::io::Error::other("skill projection launcher missing"))?;
+    let output = std::process::Command::new(launcher).args([
+        "--reuid", &owner.uid().to_string(), "--regid", &owner.gid().to_string(),
+        "--groups", &owner.gid().to_string(), "--no-new-privs", "--", "/bin/sh", "-c",
+        r#"set -eu
+config=$1; relative=$2; view=$3; global=$4; overlay=$5
+# Every existing component is inspected by its actual owner, not the daemon
+# which was denied traversal. Foreign parent links are preserved untouched.
+parent=$config
+old_ifs=$IFS; IFS=/; set -- $relative; IFS=$old_ifs
+while [ "$#" -gt 1 ]; do
+  parent=$parent/$1; shift
+  if [ -L "$parent" ]; then exit 0; fi
+  mkdir -p "$parent"
+done
+target=$parent/$1
+if [ -L "$target" ]; then
+  old=$(readlink "$target")
+  if [ "$old" = "$view" ]; then exit 0; fi
+  if [ "$old" != "$global" ]; then exit 0; fi
+  temp=$parent/.skills-owner-$$
+  trap 'rm -f "$temp"' EXIT HUP INT TERM
+  ln -s "$view" "$temp"
+  mv -fT "$temp" "$target"
+elif [ -d "$target" ]; then
+  for item in "$target"/*; do
+    [ -L "$item" ] || continue
+    old=$(readlink "$item"); source_parent=${old%/*}
+    if { [ "$source_parent" = "$global" ] || [ "$source_parent" = "$overlay" ]; } && [ ! -e "$view/${item##*/}" ]; then rm "$item"; fi
+  done
+  for item in "$view"/*; do
+    [ -L "$item" ] || continue
+    link=$target/${item##*/}; source=$(readlink "$item")
+    if [ -L "$link" ]; then
+      old=$(readlink "$link"); source_parent=${old%/*}
+      if [ "$source_parent" != "$global" ] && [ "$source_parent" != "$overlay" ]; then continue; fi
+      if [ "$old" = "$source" ]; then continue; fi
+      rm "$link"
+    elif [ -e "$link" ]; then continue; fi
+    ln -s "$source" "$link"
+  done
+elif [ ! -e "$target" ]; then ln -s "$view" "$target"; fi
+"#, "skill-projection-owner",
+    ]).args([config.as_os_str(), relative.as_os_str(), view.as_os_str(), global.as_os_str(), overlay.as_os_str()])
+        .stdin(std::process::Stdio::null()).output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "owner skill projection refused: {}",
+            output.status
+        )))
     }
 }
 

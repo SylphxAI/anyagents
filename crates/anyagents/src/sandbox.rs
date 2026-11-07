@@ -886,413 +886,32 @@ pub fn hydrate_operator_groups_if_needed() {
     }
 }
 
-fn migrate_file_to_seat_uid(path: &Path, uid: u32, gid: u32) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if is_isolated_test_env() || !launcher().is_file() {
-            return;
-        }
-        let Some(sock_gid) = sock_gid_for() else {
-            return;
-        };
-        let f_gid = std::fs::metadata(path).map(|m| m.gid()).unwrap_or(gid);
-        let t_uid = uid.to_string();
-        let t_gid = gid.to_string();
-        let groups = if f_gid != gid && f_gid >= 2100 {
-            format!("{gid},{f_gid},{sock_gid}")
-        } else {
-            format!("{gid},{sock_gid}")
-        };
-        let tmp = path.with_extension("seat_mig_tmp");
-        let status = std::process::Command::new(launcher())
-            .args([
-                "--reuid",
-                &t_uid,
-                "--regid",
-                &t_gid,
-                "--groups",
-                &groups,
-                "--no-new-privs",
-                "--",
-                "cp",
-                "-f",
-            ])
-            .arg(path)
-            .arg(&tmp)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        if status.is_ok_and(|s| s.success()) {
-            let _ = std::process::Command::new(launcher())
-                .args([
-                    "--reuid",
-                    &t_uid,
-                    "--regid",
-                    &t_gid,
-                    "--groups",
-                    &groups,
-                    "--no-new-privs",
-                    "--",
-                    "chmod",
-                    "0660",
-                ])
-                .arg(&tmp)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let _ = std::process::Command::new(launcher())
-                .args([
-                    "--reuid",
-                    &t_uid,
-                    "--regid",
-                    &t_gid,
-                    "--groups",
-                    &groups,
-                    "--no-new-privs",
-                    "--",
-                    "mv",
-                    "-f",
-                ])
-                .arg(&tmp)
-                .arg(path)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
+/// Registered root-to-principal resolution is the same authority used by vendor
+/// launch. Unregistered directories remain foreign in the shared inventory.
+pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
+    let mut peers = Vec::new();
+    for agent in store.list_agents()? {
+        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent) {
+            peers.push(anyagents_harness::SeatPeer {
+                root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
+                    .parent()
+                    .unwrap()
+                    .to_owned(),
+                uid,
+                gid,
+            });
         }
     }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, uid, gid);
-    }
+    serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))
+}
+
+pub(super) fn descriptor_launcher() -> Option<PathBuf> {
+    let path = launcher();
+    path.is_file().then_some(path)
 }
 
 fn give_tree(dir: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
-    if dir.ends_with(".config/op") || dir.ends_with(".ssh") || dir.ends_with(".gnupg") {
-        return Ok(());
-    }
-    let me = current_uid();
-    if let Ok(meta) = std::fs::metadata(dir) {
-        if meta.uid() == me {
-            let _ = chown_to_seat_group(dir, gid);
-            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o2770));
-        } else if meta.uid() != uid
-            && !is_isolated_test_env()
-            && let Some(sock_gid) = sock_gid_for()
-            && launcher().is_file()
-        {
-            let f_uid = meta.uid().to_string();
-            let f_gid = meta.gid().to_string();
-            let target_gid = gid.to_string();
-            let groups = if meta.gid() != gid {
-                format!("{},{gid},{sock_gid}", meta.gid())
-            } else {
-                format!("{},{sock_gid}", meta.gid())
-            };
-            let _ = std::process::Command::new(launcher())
-                .args([
-                    "--reuid",
-                    &f_uid,
-                    "--regid",
-                    &f_gid,
-                    "--groups",
-                    &groups,
-                    "--no-new-privs",
-                    "--",
-                    "chgrp",
-                    "-h",
-                    &target_gid,
-                ])
-                .arg(dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-            let _ = std::process::Command::new(launcher())
-                .args([
-                    "--reuid",
-                    &f_uid,
-                    "--regid",
-                    &f_gid,
-                    "--groups",
-                    &groups,
-                    "--no-new-privs",
-                    "--",
-                    "chmod",
-                    "02770",
-                ])
-                .arg(dir)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        if kind.is_symlink() {
-            continue;
-        };
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("");
-        if kind.is_dir() {
-            if (name == "op" && dir.ends_with(".config"))
-                || matches!(
-                    name,
-                    ".ssh"
-                        | ".gnupg"
-                        | "node_modules"
-                        | ".bun"
-                        | ".turbo"
-                        | ".next"
-                        | "target"
-                        | ".git"
-                        | "cache-home"
-                        | "tmp"
-                        | ".cargo"
-                        | ".rustup"
-                )
-            {
-                continue;
-            }
-            let _ = give_tree(&path, uid, gid);
-            continue;
-        }
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if meta.uid() != me {
-            if meta.uid() != uid {
-                if !is_isolated_test_env()
-                    && launcher().is_file()
-                    && let Some(sock_gid) = sock_gid_for()
-                {
-                    let f_uid = meta.uid().to_string();
-                    let f_gid = meta.gid().to_string();
-                    let target_gid = gid.to_string();
-                    let groups = if meta.gid() != gid {
-                        format!("{},{gid},{sock_gid}", meta.gid())
-                    } else {
-                        format!("{},{sock_gid}", meta.gid())
-                    };
-                    let _ = std::process::Command::new(launcher())
-                        .args([
-                            "--reuid",
-                            &f_uid,
-                            "--regid",
-                            &f_gid,
-                            "--groups",
-                            &groups,
-                            "--no-new-privs",
-                            "--",
-                            "chgrp",
-                            "-h",
-                            &target_gid,
-                        ])
-                        .arg(&path)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                    let _ = std::process::Command::new(launcher())
-                        .args([
-                            "--reuid",
-                            &f_uid,
-                            "--regid",
-                            &f_gid,
-                            "--groups",
-                            &groups,
-                            "--no-new-privs",
-                            "--",
-                            "chmod",
-                            "g+rw",
-                        ])
-                        .arg(&path)
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                }
-                if name.starts_with("opencode.db")
-                    || name == "serve-exit.jsonl"
-                    || name.contains(".sqlite")
-                {
-                    migrate_file_to_seat_uid(&path, uid, gid);
-                }
-            } else if (meta.permissions().mode() & 0o060) != 0o060
-                && !is_isolated_test_env()
-                && launcher().is_file()
-                && let Some(sock_gid) = sock_gid_for()
-            {
-                let t_uid = uid.to_string();
-                let t_gid = gid.to_string();
-                let groups = format!("{gid},{sock_gid}");
-                let _ = std::process::Command::new(launcher())
-                    .args([
-                        "--reuid",
-                        &t_uid,
-                        "--regid",
-                        &t_gid,
-                        "--groups",
-                        &groups,
-                        "--no-new-privs",
-                        "--",
-                        "chmod",
-                        "g+rw",
-                    ])
-                    .arg(&path)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status();
-            }
-            continue;
-        }
-        let _ = chown_to_seat_group(&path, gid);
-        if name == crate::operator::CAPABILITY_FILE {
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640));
-        } else {
-            let exec = meta.permissions().mode() & 0o100 != 0;
-            let mode = if exec { 0o770 } else { 0o660 };
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode));
-            if (name.starts_with("opencode.db")
-                || name == "serve-exit.jsonl"
-                || name.contains(".sqlite"))
-                && meta.uid() != uid
-            {
-                migrate_file_to_seat_uid(&path, uid, gid);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// One thing the boundary promises, as a shell program.
-struct Check {
-    what: &'static str,
-    program: String,
-}
-
-fn admission_script(checks: impl IntoIterator<Item = Check>) -> String {
-    let mut script = String::from(
-        "set -e\ncheck='probe startup'\n\
-         trap 'status=$?; if [ \"$status\" -ne 0 ]; then printf \"boundary check failed: %s\\n\" \"$check\" >&2; fi' 0\n",
-    );
-    for check in checks {
-        // Labels are static diagnostic text, never a path, capability or command output.
-        let label = check.what.replace('\'', "'\\''");
-        // A failing left operand of `&&` is exempt from errexit. Make the
-        // complete check a standalone command so its nonzero result must fail;
-        // do not put it in an if/|| context that disables inner errexit.
-        script.push_str(&format!("check='{label}'\n(\n{}\n)\n", check.program));
-    }
-    script
-}
-
-fn checks(
-    config: Option<&Path>,
-    boundary: &Boundary,
-    uid: u32,
-    gid: u32,
-) -> Result<Vec<Check>, Error> {
-    let data = PathBuf::from(&boundary.data_dir);
-    let quote = |path: &Path| -> Result<String, Error> {
-        let path = path.to_str().ok_or_else(|| {
-            Error::Message("a boundary path cannot be represented by the admission shell".into())
-        })?;
-        Ok(format!("'{}'", path.replace('\'', "'\\''")))
-    };
-    let deny = |what: &'static str, path: &Path| -> Result<Check, Error> {
-        let path = quote(path)?;
-        Ok(Check {
-            what,
-            program: format!("[ ! -r {path} ] && [ ! -w {path} ]"),
-        })
-    };
-    let mut list = vec![
-        Check {
-            what: "the agent runs as its own uid, not the server's",
-            program: format!(
-                "[ \"$(id -u)\" = \"{uid}\" ] && [ \"$(id -u)\" != \"{}\" ]",
-                current_uid()
-            ),
-        },
-        Check {
-            what: "the agent runs in its own group",
-            program: format!("[ \"$(id -g)\" = \"{gid}\" ]"),
-        },
-        Check {
-            what: "no privilege can be gained after the start",
-            program: "[ \"$(awk '/^NoNewPrivs:/ {{print $2}}' /proc/self/status)\" = 1 ]"
-                .to_string(),
-        },
-    ];
-    for name in [
-        "state.db",
-        "secrets",
-        "anyagents.sock",
-        "operator-token",
-        "identity-boundary.json",
-    ] {
-        list.push(deny("the server's own files are denied", &data.join(name))?);
-    }
-    // The seat can traverse known children without being able to list agents/.
-    // Enumerate under the server identity, and refuse an incomplete inventory:
-    // a glob evaluated after dropping privileges can silently hide every peer.
-    let mut peers = match std::fs::read_dir(data.join("agents")) {
-        Ok(entries) => entries
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<Result<Vec<_>, _>>()?,
-        // A config-less command can target a boundary without any agent layout.
-        // Only confirmed absence is optional; unreadable inventories still fail.
-        Err(err) if config.is_none() && err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(err) => return Err(err.into()),
-    };
-    peers.sort();
-    for peer in peers {
-        if Some(peer.as_path()) == config.and_then(Path::parent) {
-            continue;
-        }
-        for name in ["config", "memory", "skills"] {
-            list.push(deny(
-                "peer seats' private trees are denied",
-                &peer.join(name),
-            )?);
-        }
-        list.push(deny(
-            "peer capabilities are denied",
-            &peer.join("config/mcp-capability"),
-        )?);
-    }
-    if let Some(config) = config {
-        let mine = quote(config)?;
-        let root = config
-            .parent()
-            .ok_or_else(|| Error::Message("the agent config has no parent boundary".into()))?;
-        list.push(Check {
-            what: "the agent's own config is writable by it",
-            program: format!("[ -w {mine} ]"),
-        });
-        list.push(Check {
-            what: "host memory and skills are writable only in the agent's own tree",
-            program: format!(
-                "[ -w {} ] || exit 1; [ -w {} ] || exit 1; [ ! -w {} ]",
-                quote(&root.join("memory"))?,
-                quote(&root.join("skills"))?,
-                quote(&data.join("skills"))?,
-            ),
-        });
-        let capability = quote(&config.join("mcp-capability"))?;
-        list.push(Check {
-            what: "its capability is readable by its own seat only",
-            program: format!("m=$(stat -c %a {capability}); [ \"$m\" = 640 ] || [ \"$m\" = 600 ]"),
-        });
-    }
-    Ok(list)
+    crate::seat_tree::share(dir, uid, gid)
 }
 
 /// Start one admitted agent command, or say what admission is missing.
@@ -1327,45 +946,28 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
             config.display()
         )));
     }
-    let groups = format!("{gid},{sock_gid}");
-    let checks = checks(config, &boundary, uid, gid).map_err(|err| {
-        Error::Message(unadmitted(
-            &boundary,
-            &format!("cannot inventory peer boundaries: {err}"),
-        ))
-    })?;
-    let script = admission_script(checks);
-    // The probe asserts every property of the boundary and then exits; the
-    // agent's own command is not started unless it passes.
-    let probe_ref = [
-        "/bin/sh".to_string(),
-        "-c".to_string(),
-        script,
-        "agent-run".to_string(),
+    let mut environment = vec![
+        (
+            anyagents_harness::SEAT_LAUNCH_ENV.to_owned(),
+            format!("{}\t{uid}\t{gid}\t{gid},{sock_gid}", launcher().display()),
+        ),
+        ("ANYAGENTS_DATA".to_owned(), boundary.data_dir.clone()),
     ];
-    let mut probe = prefix(uid, gid, &groups);
-    probe.extend(probe_ref);
-    let output = std::process::Command::new(&probe[0])
-        .args(&probe[1..])
-        .env("DATA", &boundary.data_dir)
-        .env(
-            "MINE",
-            config
-                .map(|dir| dir.display().to_string())
-                .unwrap_or_default(),
-        )
-        .output()
-        .map_err(|err| Error::Message(unadmitted(&boundary, &err.to_string())))?;
-    if !output.status.success() {
-        let why = String::from_utf8_lossy(&output.stderr);
-        let first = why.lines().next().unwrap_or("a boundary check failed");
-        return Err(Error::Message(unadmitted(&boundary, first)));
+    if let Some(config) = config {
+        environment.push((
+            "ANYAGENTS_AGENT_CONFIG".to_owned(),
+            config.display().to_string(),
+        ));
     }
-    let mut argv = prefix(uid, gid, &groups);
-    argv.extend(command.iter().cloned());
-    let status = std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .env("ANYAGENTS_DATA", &boundary.data_dir)
+    if let Ok(store) = anyagents_core::Store::open(data.join("state.db")) {
+        environment.push((
+            anyagents_harness::SEAT_PEERS_ENV.to_owned(),
+            peer_principals(&store)?,
+        ));
+    }
+    let status = anyagents_harness::spawn_command(Path::new(&command[0]), &environment)
+        .map_err(|e| Error::Message(e.to_string()))?
+        .args(&command[1..])
         .status()
         .map_err(Error::Io)?;
     if status.success() {
@@ -1373,25 +975,6 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
     } else {
         Err(Error::Message(format!("the agent command exited {status}")))
     }
-}
-
-/// The privileged launcher's own arguments, then `--`.
-fn prefix(uid: u32, gid: u32, groups: &str) -> Vec<String> {
-    let launcher = launcher();
-    [
-        launcher.to_str().unwrap_or(SETPRIV),
-        "--reuid",
-        &uid.to_string(),
-        "--regid",
-        &gid.to_string(),
-        "--groups",
-        groups,
-        "--no-new-privs",
-        "--",
-    ]
-    .iter()
-    .map(|part| part.to_string())
-    .collect()
 }
 
 /// The one admission an operator must grant, with the exact command. A managed
@@ -1409,99 +992,6 @@ fn unadmitted(boundary: &Boundary, why: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn admission_failure_names_its_check_without_running_later_commands() {
-        for program in ["false", "true; exit 9", "false && true", "false\ntrue"] {
-            let script = admission_script([
-                Check {
-                    what: "the server's synthetic boundary",
-                    program: program.into(),
-                },
-                Check {
-                    what: "later check",
-                    program: "printf 'SHOULD_NOT_RUN\\n'".into(),
-                },
-            ]);
-            let output = std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                .output()
-                .unwrap();
-            assert!(!output.status.success());
-            assert!(output.stdout.is_empty());
-            assert_eq!(
-                String::from_utf8(output.stderr).unwrap(),
-                "boundary check failed: the server's synthetic boundary\n"
-            );
-        }
-        let script = admission_script([Check {
-            what: "successful boundary",
-            program: "true".into(),
-        }]);
-        let output = std::process::Command::new("/bin/sh")
-            .args(["-c", &script])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        assert!(output.stdout.is_empty());
-        assert!(output.stderr.is_empty());
-    }
-
-    #[test]
-    fn peer_checks_use_complete_host_inventory_and_quoted_exact_paths() {
-        let dir = crate::test_tempdir();
-        let contract = boundary::write(dir.path()).unwrap();
-        let config = dir.path().join("agents/own/config");
-        std::fs::create_dir_all(&config).unwrap();
-        let first = dir.path().join("agents/first-empty");
-        let peer = dir.path().join("agents/peer's private tree");
-        std::fs::create_dir(&first).unwrap();
-        std::fs::create_dir(&peer).unwrap();
-        let run = || {
-            let script = admission_script(
-                checks(Some(&config), &contract, 2100, 2100)
-                    .unwrap()
-                    .into_iter()
-                    .filter(|check| check.what == "peer seats' private trees are denied"),
-            );
-            std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                // Seat-side discovery cannot supply a peer through this path.
-                .env("DATA", dir.path().join("no-seat-inventory"))
-                .output()
-                .unwrap()
-        };
-        assert!(run().status.success(), "absent optional peer subtrees");
-        for name in ["memory", "skills", "config"] {
-            let path = peer.join(name);
-            std::fs::create_dir(&path).unwrap();
-            let result = run();
-            assert!(!result.status.success(), "readable/writable peer {name}");
-            assert_eq!(
-                String::from_utf8(result.stderr).unwrap(),
-                "boundary check failed: peer seats' private trees are denied\n"
-            );
-            std::fs::remove_dir(path).unwrap();
-            assert!(run().status.success(), "restored absent peer {name}");
-        }
-    }
-
-    #[test]
-    fn peer_inventory_errors_refuse_except_absent_configless_layout() {
-        let dir = crate::test_tempdir();
-        let contract = boundary::write(dir.path()).unwrap();
-        let config = dir.path().join("agents/own/config");
-        assert!(checks(None, &contract, 2100, 2100).is_ok());
-        assert!(matches!(
-            checks(Some(&config), &contract, 2100, 2100),
-            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound
-        ));
-        std::fs::write(dir.path().join("agents"), b"not a directory").unwrap();
-        assert!(matches!(
-            checks(None, &contract, 2100, 2100),
-            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotADirectory
-        ));
-    }
 
     #[test]
     fn an_unconfigured_seat_is_refused_before_anything_starts() {
@@ -1543,62 +1033,5 @@ mod tests {
             std::env::remove_var("ANYAGENTS_AGENT_GID");
             std::env::remove_var("ANYAGENTS_SOCKET_GID");
         }
-    }
-
-    #[test]
-    fn assembled_overlay_probe_fails_for_each_missing_required_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let contract = boundary::write(dir.path()).unwrap();
-        let root = dir.path().join("agents/one");
-        let config = root.join("config");
-        std::fs::create_dir_all(&config).unwrap();
-        // The absent shared library makes the final denial check succeed;
-        // an earlier false requirement must not be hidden by that success.
-        let shared = dir.path().join("skills");
-        let overlay_check = checks(Some(&config), &contract, 2100, 2100)
-            .unwrap()
-            .into_iter()
-            .find(|c| c.what.starts_with("host memory and skills"))
-            .unwrap();
-        let script = format!("set -e\n{}\n", overlay_check.program);
-        let run = || {
-            std::process::Command::new("/bin/sh")
-                .args(["-c", &script])
-                .env("MINE", &config)
-                .env("DATA", dir.path())
-                .status()
-                .unwrap()
-                .success()
-        };
-        assert!(!run(), "both required directories absent");
-        std::fs::create_dir(root.join("memory")).unwrap();
-        assert!(!run(), "skills absent");
-        std::fs::remove_dir(root.join("memory")).unwrap();
-        std::fs::create_dir(root.join("skills")).unwrap();
-        assert!(!run(), "memory absent despite later successful checks");
-        std::fs::create_dir(root.join("memory")).unwrap();
-        assert!(run(), "both required directories present");
-        std::fs::create_dir(&shared).unwrap();
-        assert!(!run(), "global library must not be writable");
-    }
-
-    #[test]
-    fn the_probe_asserts_the_process_and_what_it_is_denied() {
-        let dir = tempfile::tempdir().unwrap();
-        let contract = boundary::write(dir.path()).unwrap();
-        let config = dir.path().join("agents/one/config");
-        std::fs::create_dir_all(&config).unwrap();
-        let text: String = checks(Some(&config), &contract, 2100, 2100)
-            .unwrap()
-            .iter()
-            .map(|check| check.program.clone())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("id -u"), "{text}");
-        assert!(text.contains("NoNewPrivs"), "{text}");
-        for denied in ["state.db", "secrets", "anyagents.sock", "operator-token"] {
-            assert!(text.contains(denied), "{text}");
-        }
-        assert!(text.contains("mcp-capability"), "{text}");
     }
 }

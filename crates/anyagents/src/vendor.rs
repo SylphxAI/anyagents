@@ -508,6 +508,9 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             !matches!(
                 k.as_str(),
                 anyagents_harness::SEAT_LAUNCH_ENV
+                    | anyagents_harness::SEAT_PEERS_ENV
+                    | "ANYAGENTS_DATA"
+                    | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
@@ -554,6 +557,9 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
             !matches!(
                 k.as_str(),
                 anyagents_harness::SEAT_LAUNCH_ENV
+                    | anyagents_harness::SEAT_PEERS_ENV
+                    | "ANYAGENTS_DATA"
+                    | "ANYAGENTS_AGENT_CONFIG"
                     | "ANYAGENTS_AGENT_UID"
                     | "ANYAGENTS_OPERATOR_TOKEN_FILE"
                     | "ANYAGENTS_CAPABILITY_KEY"
@@ -696,6 +702,12 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     }
     if let Some((_, ref spec)) = seat_spec {
         env.push((anyagents_harness::SEAT_LAUNCH_ENV.to_string(), spec.clone()));
+        if let Some(store) = &store_opt {
+            env.push((
+                anyagents_harness::SEAT_PEERS_ENV.to_owned(),
+                crate::sandbox::peer_principals(store).map_err(|e| e.to_string())?,
+            ));
+        }
     }
     enforce_host_memory_env(&request.agent.harness, &mut env);
     if let Some(config) = adapter_config(&request.config_dir, &request.agent.harness) {
@@ -1441,6 +1453,309 @@ mod tests {
             .output()
             .unwrap();
         assert_eq!(output.stdout, b"1:kept");
+    }
+
+    /// Required by the Linux native-UID lane, never counted as a green skip.
+    /// The executor drops DAC override so a seat-owned 0700 vendor parent really
+    /// denies the daemon and exercises the owner projection fallback.
+    #[test]
+    #[cfg(target_os = "linux")]
+    #[ignore = "requires the explicit privileged synthetic native-UID CI lane"]
+    fn native_vendor_launch_enforces_shared_boundary_and_real_skill_mounts() {
+        use anyagents_core::{NewAgent, Store};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        assert_eq!(
+            std::env::var("ANYAGENTS_REQUIRE_NATIVE_SEAT_TEST").as_deref(),
+            Ok("1")
+        );
+        assert_eq!(
+            crate::sandbox::server_uid(),
+            0,
+            "privileged fixture executor required"
+        );
+        let _env = crate::server::tests::env_lock();
+        let base = std::env::var_os("ANYAGENTS_NATIVE_SEAT_BASE").unwrap();
+        let fixture = tempfile::Builder::new()
+            .prefix("vendor-seat-")
+            .tempdir_in(base)
+            .unwrap();
+        let fixture = std::fs::canonicalize(fixture.path()).unwrap();
+        let uid = 24031;
+        let gid = 24032;
+        let directory = |path: &Path, mode, owner, group| {
+            std::fs::create_dir_all(path).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c.as_ptr(), owner, group) }, 0);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let file = |path: &Path, content: &str, mode, group| {
+            std::fs::write(path, content).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            assert_eq!(unsafe { libc::chown(c.as_ptr(), 0, group) }, 0);
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        directory(&fixture, 0o711, 0, 0);
+        let data = fixture.join("data");
+        directory(&data, 0o711, 0, 0);
+        directory(&data.join("agents"), 0o711, 0, 0);
+        let store = Store::open(data.join("state.db")).unwrap();
+        std::fs::set_permissions(
+            data.join("state.db"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv");
+        }
+        let agent = store
+            .create_agent(NewAgent::new("native-own", "claude-code"))
+            .unwrap();
+        let colocated = store
+            .create_agent(NewAgent::new("native-same-seat", "claude-code"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(&data, &agent.id);
+        let root = config.parent().unwrap();
+        directory(root, 0o711, 0, 0);
+        for path in [
+            &config,
+            &root.join("memory"),
+            &root.join("skills"),
+            &root.join("work"),
+        ] {
+            directory(path, 0o2770, 0, gid);
+        }
+        file(
+            &config.join("mcp-capability"),
+            "synthetic-capability\n",
+            0o640,
+            gid,
+        );
+        file(
+            &root.join("memory/MEMORY.md"),
+            "synthetic-memory-before\n",
+            0o660,
+            gid,
+        );
+        directory(&root.join("skills/local"), 0o2770, 0, gid);
+        file(&root.join("skills/local/SKILL.md"), "# local\n", 0o660, gid);
+        let colocated_root = anyagents_core::agent_config_dir(&data, &colocated.id)
+            .parent()
+            .unwrap()
+            .to_owned();
+        directory(&colocated_root, 0o711, 0, 0);
+        for name in ["config", "memory", "skills"] {
+            directory(&colocated_root.join(name), 0o2770, 0, gid);
+            file(
+                &colocated_root.join(name).join("same-seat"),
+                "legitimate shared principal\n",
+                0o660,
+                gid,
+            );
+        }
+        let peer = data.join("agents/foreign-seat");
+        directory(&peer, 0o711, 0, 0);
+        let mut protected = Vec::new();
+        for name in ["config", "memory", "skills"] {
+            directory(&peer.join(name), 0o700, 0, 0);
+            file(
+                &peer.join(name).join("private"),
+                "foreign-seat-private\n",
+                0o600,
+                0,
+            );
+            protected.push(peer.join(name));
+            protected.push(peer.join(name).join("private"));
+        }
+        for name in ["sessions", "transcripts"] {
+            directory(&root.join(name), 0o700, 0, 0);
+            file(&root.join(name).join("private"), "host-only\n", 0o600, 0);
+            protected.push(root.join(name).join("private"));
+        }
+        for name in [
+            "secrets",
+            "operator-token",
+            "anyagents.sock",
+            "identity-boundary.json",
+        ] {
+            file(&data.join(name), "host-private\n", 0o600, 0);
+            protected.push(data.join(name));
+        }
+        directory(&data.join("skills"), 0o555, 0, 0);
+        directory(&data.join("skills/global"), 0o555, 0, 0);
+        file(
+            &data.join("skills/global/SKILL.md"),
+            "# global preserved\n",
+            0o444,
+            0,
+        );
+        protected.push(data.join("skills/global/SKILL.md"));
+        // Daemon cannot traverse this exact legitimate owner-private parent.
+        directory(&config.join(".agy"), 0o700, uid, gid);
+        assert_eq!(
+            std::fs::read_dir(config.join(".agy")).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "fixture must actually remove daemon DAC override"
+        );
+        let old_mask = unsafe { libc::umask(0o077) };
+        crate::create::ensure_seat_skills(&config, &fixture);
+        unsafe {
+            libc::umask(old_mask);
+        }
+        assert_eq!(
+            std::fs::metadata(root.join("skills-view")).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            std::fs::read_dir(config.join(".agy")).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "mount fallback must not widen the vendor parent"
+        );
+        // The real launch sharing boundary must grant the daemon-created 0700
+        // mirrors; the fixture does not pre-grant them after umask 077 mounting.
+        file(
+            &config.join("legacy.sqlite"),
+            "legacy sqlite handoff bytes\n",
+            0o600,
+            gid,
+        );
+        let report = config.join("native-vendor-report");
+        let probe = fixture.join("vendor-probe.sh");
+        file(
+            &probe,
+            r#"#!/bin/sh
+set -eu
+[ "$(id -u)" = 24031 ]; [ "$(id -g)" = 24032 ]
+[ -x "$ANYAGENTS_DATA/agents" ]; [ ! -r "$ANYAGENTS_DATA/agents" ]
+for mirror in .claude .agents .agy; do
+  grep -qx '# global preserved' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/global/SKILL.md"
+  grep -qx '# local' "$ANYAGENTS_AGENT_CONFIG/$mirror/skills/local/SKILL.md"
+done
+printf synthetic-memory-after > "$ANYAGENTS_AGENT_CONFIG/../memory/MEMORY.md"
+printf authored > "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
+rm "$ANYAGENTS_AGENT_CONFIG/../skills/authored"
+for path in "$ANYAGENTS_DATA/secrets" "$ANYAGENTS_DATA/operator-token" "$ANYAGENTS_DATA/agents/foreign-seat/memory/private" "$ANYAGENTS_AGENT_CONFIG/../sessions/private"; do
+  if cat "$path" >/dev/null 2>&1; then exit 41; fi
+  if (printf forbidden > "$path") 2>/dev/null; then exit 42; fi
+done
+if (printf forbidden > "$ANYAGENTS_AGENT_CONFIG/.agy/skills/global/SKILL.md") 2>/dev/null; then exit 43; fi
+printf 'ACTUAL_UID=%s PRIMARY_GID=%s REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK MEMORY_RW_OK PRIVATE_GLOBAL_DENIED\n' "$(id -u)" "$(id -g)" > "$ANYAGENTS_AGENT_CONFIG/native-vendor-report"
+# Keep the real adapter child alive until its owner drops the harness.
+cat >/dev/null
+"#,
+            0o555,
+            0,
+        );
+        let snapshot = || {
+            protected
+                .iter()
+                .map(|p| {
+                    let m = std::fs::symlink_metadata(p).unwrap();
+                    (
+                        p.clone(),
+                        m.uid(),
+                        m.gid(),
+                        m.mode(),
+                        if m.is_file() {
+                            std::fs::read(p).unwrap()
+                        } else {
+                            Vec::new()
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = snapshot();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+            std::env::set_var("ANYAGENTS_AGENT_UID", uid.to_string());
+            std::env::set_var("ANYAGENTS_AGENT_GID", gid.to_string());
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "24033");
+            std::env::set_var("ANYAGENTS_CLAUDE_BIN", &probe);
+            std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv");
+        }
+        let launch = || {
+            vendor_launch(LaunchRequest {
+                agent: agent.clone(),
+                data_dir: data.clone(),
+                config_dir: config.clone(),
+                work_dir: root.join("work"),
+                extra_env: vec![],
+            })
+        };
+        let harness = launch().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !report.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::metadata(config.join("legacy.sqlite"))
+                .unwrap()
+                .uid(),
+            uid
+        );
+        assert_eq!(
+            std::fs::read(config.join("legacy.sqlite")).unwrap(),
+            b"legacy sqlite handoff bytes\n"
+        );
+        assert_eq!(
+            std::fs::metadata(config.join(".agy")).unwrap().mode() & 0o777,
+            0o700,
+            "sharing must retain the existing owner-private vendor parent"
+        );
+        println!("NATIVE_VENDOR_LEGACY_SQLITE_OWNER_AND_BYTES_RETAINED");
+        let evidence = std::fs::read_to_string(&report).unwrap();
+        assert!(
+            evidence.contains("REAL_MOUNTS_UMASK077_OWNER_FALLBACK_OK SAME_SEAT_OK"),
+            "{evidence}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap(),
+            "synthetic-memory-after"
+        );
+        println!("{evidence}");
+        drop(harness);
+        std::fs::remove_file(&report).unwrap();
+        for name in ["memory", "skills", "config"] {
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o777))
+                .unwrap();
+            let error = match launch() {
+                Ok(_) => panic!("writable foreign {name} started vendor"),
+                Err(e) => e,
+            };
+            assert!(
+                error.contains(
+                    "agent not started: boundary check failed: peer seats' private trees are denied"
+                ),
+                "{name}: {error}"
+            );
+            assert!(!report.exists(), "vendor command ran before refusal");
+            std::fs::set_permissions(peer.join(name), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            println!("NATIVE_VENDOR_WRITABLE_PEER_{name}_REFUSED_BEFORE_COMMAND");
+        }
+        assert_eq!(snapshot(), before, "protected bytes or permissions changed");
+        println!("NATIVE_VENDOR_PROTECTED_BEFORE_EQUALS_AFTER");
+        // Cleanup needs DAC override only for this fixture's private seat parent;
+        // perform it under that parent's owner, never widen any outside path.
+        let output = std::process::Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                "24031",
+                "--regid",
+                "24032",
+                "--clear-groups",
+                "--no-new-privs",
+                "--",
+                "chmod",
+                "0770",
+            ])
+            .arg(config.join(".agy"))
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        std::fs::remove_dir_all(&fixture).unwrap();
+        assert!(!fixture.exists());
+        println!("NATIVE_VENDOR_FIXTURE_REMOVED");
     }
 
     #[test]

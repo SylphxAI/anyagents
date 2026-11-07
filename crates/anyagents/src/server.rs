@@ -3396,7 +3396,8 @@ impl CommandRunner for ProcessRunner {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
-        let mut command = anyagents_harness::spawn_command(Path::new(program), &env_pairs);
+        let mut command = anyagents_harness::spawn_command(Path::new(program), &env_pairs)
+            .map_err(|err| InstallError::Failed(err.to_string()))?;
         command
             .args(args)
             .current_dir(dir)

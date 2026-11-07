@@ -6321,9 +6321,9 @@ mod tests {
             &launcher,
             r#"#!/bin/bash
 set -eu
-[[ "$1" == --reuid && "$2" == fixture-uid ]]
-[[ "$3" == --regid && "$4" == fixture-gid ]]
-[[ "$5" == --groups && "$6" == fixture-groups ]]
+[[ "$1" == --reuid && "$2" == 24031 ]]
+[[ "$3" == --regid && "$4" == 24032 ]]
+[[ "$5" == --groups && "$6" == 24032,24033 ]]
 [[ "$7" == --no-new-privs && "$8" == -- ]]
 [[ -z ${ANYAGENTS_SEAT_LAUNCH+x} ]]
 shift 8
@@ -6332,6 +6332,9 @@ if [[ ${WORKSPACE_TEST_REFUSE:-0} == 1 ]]; then
     echo 'fixture launcher refused' >&2
     exit 73
 fi
+# This unit double proves routing only. The required native-UID fixture
+# executes the admission script with real setpriv instead.
+if [[ "$1" == /bin/sh && "${2:-}" == -c ]]; then exit 0; fi
 exec "$@"
 "#,
         )
@@ -6339,12 +6342,10 @@ exec "$@"
         std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
         (
             vec![
+                ("ANYAGENTS_DATA".into(), root.display().to_string()),
                 (
                     anyagents_harness::SEAT_LAUNCH_ENV.into(),
-                    format!(
-                        "{}\tfixture-uid\tfixture-gid\tfixture-groups",
-                        launcher.display()
-                    ),
+                    format!("{}\t24031\t24032\t24032,24033", launcher.display()),
                 ),
                 (
                     "WORKSPACE_TEST_LAUNCH_LOG".into(),
@@ -6569,7 +6570,7 @@ exec "$@"
             .find(|(k, _)| k == anyagents_harness::SEAT_LAUNCH_ENV)
             .unwrap()
             .1 = format!(
-            "{}\tfixture-uid\tfixture-gid\tfixture-groups",
+            "{}\t24031\t24032\t24032,24033",
             tmp.path().join("no-launcher").display()
         );
         for (name, args) in [
@@ -6590,11 +6591,7 @@ exec "$@"
                 assert_eq!(std::fs::read(path).unwrap(), *bytes);
             }
         }
-        for malformed in [
-            "",
-            "bad\tspec",
-            "\tfixture-uid\tfixture-gid\tfixture-groups",
-        ] {
+        for malformed in ["", "bad\tspec", "\t24031\t24032\t24032,24033"] {
             let mut bad = env.clone();
             bad.iter_mut()
                 .find(|(k, _)| k == anyagents_harness::SEAT_LAUNCH_ENV)

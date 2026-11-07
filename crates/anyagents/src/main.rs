@@ -30,6 +30,7 @@ mod operator;
 mod reply;
 mod sandbox;
 mod schedule;
+mod seat_tree;
 mod server;
 mod signin;
 mod sylphx;

@@ -262,7 +262,7 @@ impl ClaudeHarness {
     }
 
     fn launch(&mut self, session_id: Option<&str>) -> Result<(), HarnessError> {
-        let mut cmd = anyagents_harness::spawn_command(&self.program, &self.environment);
+        let mut cmd = anyagents_harness::spawn_command(&self.program, &self.environment)?;
         cmd.arg("-p")
             .arg("--input-format")
             .arg("stream-json")
@@ -279,9 +279,6 @@ impl ClaudeHarness {
             .stderr(Stdio::null());
         if let Some(dir) = &self.work_dir {
             cmd.current_dir(dir);
-        }
-        for (key, value) in &self.environment {
-            cmd.env(key, value);
         }
         let mut child = cmd
             .spawn()
