@@ -20,10 +20,11 @@ use crate::{
     DEFAULT_SYLPHX_SANDBOX_PARENT, PersistedCloudSession, SharedState, append_transcript_message,
     assemble_system_prompt, build_cloud_agent_tools, build_cloud_environment_spec,
     build_prior_transcript_continuity_block, clear_persisted_cloud_session,
-    cloud_session_resource_path, curl_get, curl_post_json, load_persisted_cloud_session,
-    load_transcript_input_items, normalize_cloud_env_slug, parse_sylphx_model_and_effort,
-    resolve_cloud_api_url, resolve_sylphx_cloud_access_key, run_cloud_session_turn,
-    run_native_gateway_turn, save_persisted_cloud_session,
+    cloud_session_resource_path, compute_instructions_fingerprint, curl_get, curl_post_json,
+    load_persisted_cloud_session, load_transcript_input_items, normalize_cloud_env_slug,
+    parse_sylphx_model_and_effort, resolve_agent_short_name, resolve_cloud_api_url,
+    resolve_sylphx_cloud_access_key, run_cloud_session_turn, run_native_gateway_turn,
+    save_persisted_cloud_session,
 };
 use anyagents_harness::TurnUsage;
 use std::io::{BufRead, Write};
@@ -164,11 +165,8 @@ pub fn teleport_session_to_cloud(
     let environment_spec = build_cloud_environment_spec(config_dir, Some(work_dir), env);
 
     let create_agent_url = format!("{base}/v1/{canonical_env}/agents");
-    let agent_short_name = config_dir
-        .parent()
-        .and_then(|p| p.file_name())
-        .and_then(|s| s.to_str())
-        .unwrap_or("sylphx-sdk-agent");
+    let agent_short_name = resolve_agent_short_name(config_dir, env);
+    let current_fp = compute_instructions_fingerprint(&agent_short_name, &system_prompt);
     let spec_body = json!({
         "meta": {
             "display_name": agent_short_name,
@@ -230,6 +228,10 @@ pub fn teleport_session_to_cloud(
             env_slug: canonical_env.clone(),
             last_seq: 0,
         },
+    );
+    let _ = std::fs::write(
+        config_dir.join(".sylphx-cloud-instructions-fingerprint"),
+        format!("{current_fp}\n"),
     );
     let _ = std::fs::write(
         config_dir.join("sylphx-session-id"),

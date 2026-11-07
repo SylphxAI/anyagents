@@ -20,6 +20,7 @@ pub struct CreateRequest {
     pub workdir: Option<PathBuf>,
     /// The working directory an owner agent gets when none is named.
     pub workdir_default: Option<PathBuf>,
+    pub description: Option<String>,
     pub instructions: Option<String>,
     pub parent_id: Option<AgentId>,
 }
@@ -51,7 +52,19 @@ pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agen
             (normalized_harness == "sylphx")
                 .then(|| crate::sylphx::DEFAULT_SYLPHX_MODEL.to_string())
         });
-    new.instructions = request.instructions;
+    new.description = request
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    new.instructions = request
+        .instructions
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| new.description.clone());
     new.parent_id = request.parent_id;
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
@@ -772,21 +785,19 @@ pub(crate) fn write_agent_instructions_with_continuity(
 
     doc.push_str(
         "\n## 2.1 Hierarchy, Event-Driven Topology & Scope Encapsulation\n\n\
-         - **Two-Layer Identity Architecture (`description` vs. `instructions`)**:\n\
-           - **Layer 1 (`description` — Public Routing Card)**: Every agent has a concise public `description` (mission, domain, and capabilities) shown in `agents({ \"action\": \"describe\", \"name\": \"all\" })` without leaking private instructions.\n\
-           - **Layer 2 (`instructions` — Private Execution Prompt)**: Your detailed operating SOPs and standing instructions remain strictly private in Section 2 above (visible only to you and your ancestor supervisors).\n\
-         - **Event-Driven Topology (100% Static System Prompt + User-Message `<topology>` Events)**:\n\
-           - To keep your LLM prompt prefix KV cache 100% stable, dynamic peer/sibling/sub-agent rosters are **never** injected into this System Prompt.\n\
-           - Instead, your initial relationship snapshot arrives on your first user message inside `<topology event=\"initial\" self=\"...\" scope=\"...\" parent=\"...\" siblings=\"...\" children=\"...\" groups=\"...\" />`, and any subsequent changes (when a sibling, peer, child, or group is added or removed) arrive as incremental inbox events `<topology event=\"delta\" changes=\"+sibling: ...; -sibling: ...\" />`.\n\
-           - Every incoming `<message ...>` also carries `sender_rel=\"parent|sibling|child|peer|external_user\"` and `sender_role=\"...\"`.\n\
-         - **Orthogonal Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`) & External Channels**:\n\
-           - **`\"isolated\"` *(External Partner / Personal Liaison Bots)*:** Confined strictly to direct `parent`, own `children`, and bound external channels (e.g. Telegram). Cannot message or read siblings or other roots.\n\
-           - **`\"private\"` *(Default for all sub-agents)*:** Only direct `parent`, own `children`, or members of a shared `group:<name>` can message it; reports upward via `to: [\"parent\"]`.\n\
-           - **`\"siblings\"` *(Explicit opt-in)*:** Can freely collaborate with and message direct `parent`, own `children`, and sibling domain sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`), without crossing into another root manager's tree.\n\
-           - **`\"public\"` *(Root Agents & Cross-Tree Shared Services)*:** Reachable across the workspace.\n\
-           - **Scope updates:** An explicit `scope` persists across restarts and reconciliation. Legacy `public: true` selects `public`; `public: false` only revokes public reachability, preserving nonpublic scopes (including `siblings`) or restoring the relationship-based default. Explicit `scope` wins when both are supplied.\n\
-           - **Downward-Only Supervision:** A parent/ancestor can inspect its descendants' `instructions` and `conversation` history, never the reverse (a child or sibling can never read its parent's or sibling's private instructions or private conversations).\n\
-           - **Group Chat Discipline:** When a human user posts in a shared Telegram group, only the single agent whose domain matches the user's message answers; all other agents stay silent (`NO_REPLY`).\n",
+         - **Two-Layer Identity (`description` vs. `instructions`)**:\n\
+           - **Layer 1 (`description`)**: Concise public routing card visible in `agents({ \"action\": \"describe\", \"name\": \"all\" })` and group rosters without leaking private instructions.\n\
+           - **Layer 2 (`instructions`)**: Detailed private operating instructions in Section 2 above (visible only to you and ancestor supervisors).\n\
+         - **Event-Driven Topology (Cache-Stable System Prompt + `<topology>` Events)**:\n\
+           - Dynamic peer/sibling/sub-agent rosters are never injected into this static System Prompt.\n\
+           - Relationship snapshots arrive inline via `<topology event=\"initial\" ... />` and `<topology event=\"delta\" ... />`, and each `<message ...>` carries `sender_rel` and `sender_role`.\n\
+         - **Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`)**:\n\
+           - **`\"isolated\"`**: Confined to direct `parent`, own `children`, and bound external channels.\n\
+           - **`\"private\"` *(Sub-agent default)*:** Reachable by direct `parent`, own `children`, or shared `group:<name>`; reports via `to: [\"parent\"]`.\n\
+           - **`\"siblings\"`**: Also collaborates with sibling sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`).\n\
+           - **`\"public\"`**: Reachable across the workspace.\n\
+           - **Downward-Only Supervision**: Ancestors can inspect descendants' `instructions` and `conversation`, never the reverse.\n\
+           - **Group Chat Discipline**: In shared Telegram groups, only the single matching domain agent answers; all others stay silent (`NO_REPLY`).\n",
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
@@ -796,42 +807,31 @@ pub(crate) fn write_agent_instructions_with_continuity(
 
     doc.push_str(
         "\n## 3. Runtime Awareness & the 6 Canonical MCP Tools (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`)\n\n\
-         - **Cache-Stable Architecture (Static System Prompt + Tail Events & On-Demand Tools)**:\n\
-           - This System Prompt is **strictly static** so your LLM prompt prefix KV cache is never invalidated when groups, channels, peers, or sub-agents change.\n\
-           - Live routing context arrives **inline per message** at the tail of your context inside the `<message ...>` XML envelope (`id`, `from`, `sender_name`, `to`, `participants`, `channel`, `chat`, `chat_title`, `chat_type`, `topic`, `event`, `in_reply_to`, `mentions`, `reply_to`, `answer_to`).\n\
-           - Always call your native **AnyAgents MCP tools** (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`) directly (or via `await tools.anyagents.<tool>({...})` inside `execute` in OpenCode Code Mode) — they are schema-typed, zero-overlap, and automatically authenticated as your seat.\n\
-         - **1. Unified Agent & Sub-Agent Manager (`agents` MCP Tool — Native Harness Sub-Agents Disabled by Default)**:\n\
-           - Built-in harness sub-agent tools (`Task`/`Agent`/`task`/`invoke_subagent`) are **disabled by default** so sub-agents are never trapped inside a single vendor CLI. Always use `agents` for all peer, role, and sub-agent operations:\n\
-             - **List Peers or Sub-Agents**: `agents({ \"action\": \"list\" })` (all agents), `agents({ \"action\": \"list\", \"parent\": \"self\" })` (your sub-agents + summary counts), `agents({ \"action\": \"list\", \"parent\": \"root\" })` (root agents), with optional `state`: `\"running\"` | `\"working\"` | `\"paused\"` | `\"archived\"` | `\"all\"`.\n\
-             - **Inspect Status & Recent Turns**: `agents({ \"action\": \"inspect\", \"name\": \"<name-or-id>\", \"limit\": 10 })` (live status, schedules, and recent conversation turns in one call).\n\
-             - **Spawn a Sub-Agent**: `agents({ \"action\": \"spawn\", \"name\": \"<optional-name>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<optional-branch>\", \"base\": \"<optional-base>\", \"workdir\": \"<optional-path-or-mode>\", \"description\": \"...\", \"prompt\": \"...\" })`. When `harness`/`model`/`profile` are omitted, AnyAgents automatically uses the configured sub-agent default (`sylphx` + `sylphx/openai/gpt-6.1-sol#xhigh` + `sylphx/default`, or pass `harness: \"inherit\"` to inherit your own harness/model/profile).\n\
-             - **Read or Update Public Description vs. Private Instructions (`describe`)**: `agents({ \"action\": \"describe\", \"name\": \"self\" })` (read your own `description` and `instructions`), `agents({ \"action\": \"describe\", \"name\": \"self\", \"description\": \"...\", \"instructions\": \"...\" })` (update your concise public `description` visible in the team/group roster, your detailed private `instructions`, or both), `agents({ \"action\": \"describe\", \"name\": \"all\" })` (read every peer's public `description` & role).\n\
-             - **Steer & Lifecycle Control**: `agents({ \"action\": \"steer\", \"name\": \"<name-or-id>\", \"prompt\": \"...\" })`, `agents({ \"action\": \"wake\" | \"pause\" | \"archive\" | \"delete\", \"name\": \"<name-or-id>\" })` (omit `name` on `\"archive\"` to archive yourself).\n\
-             - **Admin / Configuration**: `agents({ \"action\": \"create\" | \"rename\" | \"role\" | \"harness\" | \"models\", ... })`.\n\
-         - **Per-Agent Workspace (`workdir` / `repo`), Managed Git Worktrees & Shared Context Architecture**:\n\
-           - **Every Agent Owns Its Own Workspace**: Working directories and Git worktrees belong to each individual agent (`<data>/agents/<id>/work` or a chosen path), never a single system-wide directory. Multi-level sub-agent trees (Root -> L1 -> L2+) are supported at any depth.\n\
-           - **Choosing a Sub-Agent's Workspace (`repo` & `workdir` on `agents` `action = \"spawn\"`)**:\n\
-             - **Target a Specific Repository (`repo: \"<org>/<repo>\"` or git path/URL)**: Automatically provisions an isolated Git worktree for that agent at `<data>/agents/<id>/work` on branch `agent/<name>` (or custom `branch` from `base`).\n\
-             - **Isolated Branch of Your Current Repository (`repo: \"inherit\"` or `workdir: \"worktree\"`)**: Branches a new isolated Git worktree at `<data>/agents/<id>/work` from your current Git repo and `HEAD` — use this whenever spawning parallel coding sub-agents on the same repo so they never collide on `.git/index.lock` or uncommitted edits.\n\
-             - **Private Empty Sandbox (`workdir: \"private\"`)**: Gives the agent its own clean directory at `<data>/agents/<id>/work`.\n\
+         - **Cache-Stable Routing & Native Tools**:\n\
+           - Live routing context arrives per message in `<message ...>` (`id`, `from`, `sender_name`, `to`, `participants`, `channel`, `chat`, `topic`, `reply_to`, `answer_to`).\n\
+           - Call your **AnyAgents MCP tools** (`agents`, `send`, `conversation`, `groups`, `schedule`, `browser`) directly (or via `await tools.anyagents.<tool>({...})` in OpenCode Code Mode).\n\
+         - **1. Unified Agent & Sub-Agent Manager (`agents`)**:\n\
+           - Vendor sub-agent tools are disabled by default; always use `agents`:\n\
+             - **List / Inspect**: `agents({ \"action\": \"list\", \"parent\": \"self\" | \"root\", \"state\": \"running\" | \"all\" })`, `agents({ \"action\": \"inspect\", \"name\": \"<name-or-id>\", \"limit\": 10 })`.\n\
+             - **Spawn**: `agents({ \"action\": \"spawn\", \"name\": \"<opt>\", \"repo\": \"<org>/<repo>\" | \"inherit\", \"branch\": \"<opt>\", \"base\": \"<opt>\", \"workdir\": \"<opt>\", \"description\": \"...\", \"instructions\": \"...\", \"prompt\": \"...\" })`.\n\
+             - **Describe**: `agents({ \"action\": \"describe\", \"name\": \"self\" | \"all\", \"description\": \"...\", \"instructions\": \"...\" })`.\n\
+             - **Steer & Lifecycle**: `agents({ \"action\": \"steer\" | \"wake\" | \"pause\" | \"archive\" | \"delete\" | \"create\" | \"rename\" | \"role\" | \"harness\" | \"models\", ... })`.\n\
+           - **Workspaces & Managed Git Worktrees**:\n\
              - **Default When `repo` and `workdir` Are Omitted**: Every sub-agent defaults to its own isolated `<data>/agents/<id>/work`; roots do too unless the operator configures a root working directory. Pass `workdir: \"inherit\"` only when explicitly sharing your parent directory.\n\
-           - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global instructions (`<data>/AGENTS.md`) and global `skills` (`<data>/skills`) are mounted inside every agent's `config/` home directory, so switching `repo` or `workdir` never loses shared instructions or skills; meanwhile, any repo-specific `<workdir>/AGENTS.md` or `.agents/skills` in the target repo is layered on top automatically.\n\
-           - **Safe Automatic Worktree Lifecycle**: While a sub-agent is `idle` between turns, its Git worktree is preserved so its parent can inspect or `steer` it. When `archive` is called, AnyAgents checks if the managed worktree is clean (`git status --porcelain` empty) and has no unpushed commits: if clean/pushed, it runs `git worktree remove` and deletes the directory automatically; if uncommitted or unpushed work remains, it preserves the worktree on disk so zero code is ever lost.\n\
-         - **2. Outbound Messages, Rich Media & Message Interactions (`send` MCP Tool)**:\n\
-           - Plain text printed only to your local session/stdout is **never** delivered to other agents, your parent, groups, or channels. Whenever a message or task asks you to reply, answer, or report back, you **must** call `send` (`to`: e.g. `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to` / `from`; `reply_to`: the `anyagents:reply:msg_...` token from `<message>`; `text`, plus optional `media`, `location`, `poll`, `checklist`, `article`). Agents with `scope: \"siblings\"` can message their `parent`, `children`, and reachable `siblings`; agents with `scope: \"private\"` or `scope: \"isolated\"` report upward to `parent` (or shared `group:<name>`).\n\
-           - **Reactions, Poll Votes & Edits**: Pass `action`: `\"react\"` (with `emoji`, e.g. `\"👍\"`, `\"🔥\"`), `\"vote\"` (with `options`, e.g. `[\"1\"]`), `\"check\"` / `\"uncheck\"`, `\"edit\"`, `\"delete\"`, `\"pin\"`, `\"unpin\"`, or `\"stop_poll\"` along with `target` (or `reply_to`: `anyagents:reply:msg_...`) on `send`.\n\
-         - **3. Memory, History & Zero-Embedding Lexical + Structured Search (`conversation` & `search` MCP Tools)**:\n\
-           - Incoming messages are pushed automatically to your session — never poll an inbox. Every historical and live turn across all agents is stored lossless in the append-only store (`Raw-RAG`).\n\
-           - Pass `query` or `queries` (`conversation({ \"query\": \"...\", \"queries\": [\"synonym1\", \"synonym2\"], \"exclude\": [\"noise\"], \"agent\": \"all\", \"include_tools\": true, \"only_tools\": false, \"tool_name\": \"browser\", \"direction\": \"in\" | \"out\", \"since_ms\": 0, \"until_ms\": ..., \"range\": \"seq:10-25\", \"sort\": \"relevance\" | \"newest\" | \"oldest\", \"radius\": 2, \"limit\": 20 })`) to run zero-latency lexical + structured search (SQLite FTS5 BM25 with hybrid ASCII identifiers + CJK bigrams, exact phrase boost, tool history toggles, range coordinates, and contiguous episode context expansion) across all agents' history. Omit `query` (`conversation({ \"agent\": \"sage\", \"limit\": 50 })`) to read recent chronological two-way (`in` + `out`) turns.\n\
-         - **4. Internal Multi-Agent Groups (`groups` MCP Tool)**:\n\
-           - `groups({ \"action\": \"list\" })` (returns `members` + full `roster` with each member's `description`), `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
-         - **5. Self-Wakes & Event Watches (`schedule` MCP Tool — Native Harness Timers/Monitors Disabled by Default)**:\n\
-           - Schedule your own one-off (`at`) or recurring (`every`) wakes (`schedule({ \"every\": \"15m\", \"prompt\": \"...\" })`, `schedule({ \"at\": \"1m\", \"prompt\": \"...\" })`) or external/local event watches (`schedule({ \"watch\": \"github:pr:<owner>/<repo>#<num>\" | \"github:check:<owner>/<repo>@<ref>\" | \"spiron:promise:<id>\" | \"agent:idle:<name>\" | \"pid:<pid>\" | \"file:<path>\", \"prompt\": \"...\" })`), list them (`schedule({ \"action\": \"list\" })`), or cancel them (`schedule({ \"action\": \"cancel\", \"id\": \"<sch_...>\" | \"all\" })`). Wakes fire only when you are idle and not quota-blocked, and a missed wake never double-fires.\n\
-         - **6. Native SOTA Anti-Detect Browser & Persistent Browser Profiles (`browser` MCP Tool)**:\n\
-           - Runs real headed Chromium on a virtual X11 display (`xvfb-headed`) with deterministic per-profile anti-detect fingerprinting (WebGL vendor/renderer, Client Hints `Sec-CH-UA`, `navigator.webdriver = false`, WebRTC UDP leak protection, Canvas seed), hardware-trusted CDP input (`event.isTrusted === true`), and persistent `--user-data-dir` login profiles.\n\
-           - **Zero-Knowledge Credential & 2FA OTP Fill**: Never read a plaintext password into your LLM context to type it into a browser. Pass a 1Password or credential reference directly in `text` or `secret_ref` (`browser({ \"action\": \"fill\", \"selector\": \"@e2\", \"secret_ref\": \"op://Vault/Item/password\" })` or `\"op-otp://Vault/Item\"` for live 6-digit 2FA TOTP, or `\"secret://<ref>\"`); the daemon resolves and types it via hardware CDP in memory without exposing the secret to LLM logs.\n\
-           - **Human / User Takeover for CAPTCHAs & Interactive Verification (`action: \"takeover\"`)**: When `open` or `snapshot` reports `captcha_detected: true` (Cloudflare Turnstile, reCAPTCHA, hCaptcha, Arkose, slider CAPTCHA, or interactive 2FA/QR approval), call `browser({ \"action\": \"takeover\", \"reason\": \"Solve CAPTCHA\" })` and send the returned `takeover_url` (and `screenshot_path` via `send` media) to the user. The user interacts directly with your persistent browser profile via a live remote HTML5 Canvas view; when they click **Done — Hand Back to Agent** (or solve the challenge), control returns to you (`[Browser Takeover Completed]` wake message, or `browser({ \"action\": \"wait_for_user\", \"wait_ms\": 120000 })`, or `browser({ \"action\": \"release_takeover\" })`) with the solved clearance cookies saved in your profile.\n\
-           - Actions: `browser({ \"action\": \"open\", \"url\": \"https://...\", \"profile\": \"<optional-profile>\" })` (launches on demand and returns visible text + `@e1`, `@e2` interactive element refs), `browser({ \"action\": \"snapshot\" })`, `browser({ \"action\": \"click\", \"selector\": \"@e1\" })`, `browser({ \"action\": \"fill\", \"selector\": \"@e2\", \"text\": \"...\", \"submit\": true })`, `browser({ \"action\": \"press\", \"key\": \"Enter\" })`, `browser({ \"action\": \"eval\", \"script\": \"...\" })`, `browser({ \"action\": \"screenshot\" })` (returns PNG path ready to inspect or send via `send` media), `browser({ \"action\": \"takeover\", \"reason\": \"...\" })`, `browser({ \"action\": \"takeover_status\" })`, `browser({ \"action\": \"wait_for_user\" })`, `browser({ \"action\": \"release_takeover\" })`, `browser({ \"action\": \"cookies\" })`, `browser({ \"action\": \"tabs\" })`, `browser({ \"action\": \"profiles\" })`, and `browser({ \"action\": \"close\" })` (scales the browser process to zero while keeping the profile logged in on disk).\n",
+             - `repo: \"<org>/<repo>\"` or `repo: \"inherit\"` provisions an isolated Git worktree automatically; on `archive`, clean/pushed worktrees are reaped while dirty/unpushed worktrees are preserved.\n\
+             - **Universal Shared `AGENTS.md` & `Skills` + Repo-Local Layering**: Global `<data>/AGENTS.md` and `<data>/skills` are mounted in every agent's `config/` home, with `<workdir>/AGENTS.md` and `.agents/skills` layered on top.\n\
+         - **2. Outbound Messages & Interactions (`send`)**:\n\
+           - Stdout is never delivered to peers/parents/channels; always call `send` (`to`: `[\"parent\"]`, `[\"children\"]`, `[\"siblings\"]`, `[\"agent:<name>\"]`, or `answer_to`; `reply_to`: `anyagents:reply:msg_...`; `text`, `media`, `poll`, `checklist`, `article`, or `action`: `\"react\"` | `\"vote\"` | `\"edit\"` | `\"delete\"` | `\"pin\"`).\n\
+         - **3. Lossless History & Lexical Search (`conversation` & `search`)**:\n\
+           - Never poll an inbox. Query history via `conversation({ \"query\": \"...\", \"queries\": [...], \"agent\": \"all\" | \"self\", \"include_tools\": true, \"range\": \"seq:10-25\", \"limit\": 20 })` or omit `query` for chronological turns.\n\
+         - **4. Internal Multi-Agent Groups (`groups`)**:\n\
+           - `groups({ \"action\": \"list\" })`, `groups({ \"action\": \"join\" | \"leave\", \"group\": \"<name>\" })`.\n\
+         - **5. Self-Wakes & Event Watches (`schedule`)**:\n\
+           - `schedule({ \"every\": \"15m\" | \"at\": \"1m\", \"prompt\": \"...\" })`, `schedule({ \"watch\": \"github:pr:<owner>/<repo>#<num>\" | \"github:check:<owner>/<repo>@<ref>\" | \"agent:idle:<name>\" | \"pid:<pid>\" | \"file:<path>\", \"prompt\": \"...\" })`, `schedule({ \"action\": \"list\" | \"cancel\" })`.\n\
+         - **6. Anti-Detect Browser & Persistent Profiles (`browser`)**:\n\
+           - Headed Chromium with persistent `--user-data-dir` profiles (`open`, `snapshot`, `click`, `fill`, `press`, `eval`, `screenshot`, `cookies`, `tabs`, `profiles`, `close`).\n\
+           - **Zero-Knowledge Secret/OTP Fill**: Pass `secret_ref: \"op://Vault/Item/password\"` or `\"op-otp://Vault/Item\"` on `fill` without reading secrets into LLM context.\n\
+           - **Human Takeover**: On `captcha_detected: true`, call `browser({ \"action\": \"takeover\", \"reason\": \"Solve CAPTCHA\" })`, send `takeover_url` to the user, and resume via `wait_for_user` / `release_takeover`.\n",
     );
 
     if let Some(shared) = read_shared_agents_md(config) {
@@ -841,25 +841,47 @@ pub(crate) fn write_agent_instructions_with_continuity(
     }
 
     if let Some(cont) = continuity.map(str::trim).filter(|s| !s.is_empty()) {
-        doc.push('\n');
-        doc.push_str(cont);
-        doc.push('\n');
+        // Keep the full rendered prompt under Antigravity's 24,000-byte per-file rule cap.
+        const MAX_DOC_BYTES: usize = 23_200;
+        let remaining = MAX_DOC_BYTES.saturating_sub(doc.len() + 2);
+        if remaining >= 256 {
+            doc.push('\n');
+            if cont.len() <= remaining {
+                doc.push_str(cont);
+            } else {
+                let mut cut = remaining;
+                while cut > 0 && !cont.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                if let Some(nl) = cont[..cut].rfind('\n')
+                    && nl > 0
+                {
+                    cut = nl;
+                }
+                doc.push_str(&cont[..cut]);
+            }
+            doc.push('\n');
+        }
+    }
+
+    let sys_prompt_path = config.join("SYSTEM_PROMPT.md");
+    let prompt_changed = std::fs::read(&sys_prompt_path).ok().as_deref() != Some(doc.as_bytes());
+    if prompt_changed && config.join("sylphx-cloud-session.json").is_file() {
+        let _ = write_seat_shared_file(
+            &config.join(".sylphx-cloud-instructions-fingerprint"),
+            b"stale\n",
+            0o664,
+        );
     }
 
     let paths = [
-        config.join("SYSTEM_PROMPT.md"),
+        sys_prompt_path,
         config.join("AGENTS.md"),
         config.join("opencode").join("AGENTS.md"),
         config.join(".config").join("opencode").join("AGENTS.md"),
         config.join("CLAUDE.md"),
         config.join(".claude").join("CLAUDE.md"),
         config.join(".gemini").join("config").join("GEMINI.md"),
-        config.join(".gemini").join("config").join("AGENTS.md"),
-        config
-            .join(".gemini")
-            .join("config")
-            .join("rules")
-            .join("AGENTS.md"),
         config.join("muse").join("AGENTS.md"),
         config.join(".config").join("muse").join("AGENTS.md"),
         config.join(".omp").join("agent").join("APPEND_SYSTEM.md"),
@@ -872,6 +894,42 @@ pub(crate) fn write_agent_instructions_with_continuity(
             continue;
         }
         let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
+    }
+    // Antigravity (`agy`) deduplicates global rules by resolved file path (`EvalSymlinks`),
+    // not by content. Point `.gemini/config/AGENTS.md` and `.gemini/config/rules/AGENTS.md`
+    // at `.gemini/config/GEMINI.md` via relative symlinks so `agy` loads the rule once
+    // instead of 3 times while callers reading any of the three paths still get `doc`.
+    let gemini_cfg = config.join(".gemini").join("config");
+    let gemini_agents = gemini_cfg.join("AGENTS.md");
+    let gemini_rules_dir = gemini_cfg.join("rules");
+    let _ = std::fs::create_dir_all(&gemini_rules_dir);
+    let gemini_rules_agents = gemini_rules_dir.join("AGENTS.md");
+    #[cfg(unix)]
+    {
+        for (link_path, rel_target) in [
+            (&gemini_agents, "GEMINI.md"),
+            (&gemini_rules_agents, "../GEMINI.md"),
+        ] {
+            let already_linked = std::fs::symlink_metadata(link_path)
+                .ok()
+                .is_some_and(|m| m.file_type().is_symlink())
+                && std::fs::read_link(link_path).ok().as_deref()
+                    == Some(std::path::Path::new(rel_target));
+            if !already_linked {
+                let _ = std::fs::remove_file(link_path);
+                if std::os::unix::fs::symlink(rel_target, link_path).is_err() {
+                    let _ = write_seat_shared_file(link_path, doc.as_bytes(), 0o664);
+                }
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        for path in [&gemini_agents, &gemini_rules_agents] {
+            if std::fs::read(path).ok().as_deref() != Some(doc.as_bytes()) {
+                let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
+            }
+        }
     }
 }
 
@@ -7592,6 +7650,7 @@ mod tests {
                     workdir,
                     // A root override must never become a child default.
                     workdir_default: Some(parent_workdir.clone()),
+                    description: None,
                     instructions: None,
                     parent_id: Some(parent.id.clone()),
                 },
@@ -7707,6 +7766,7 @@ mod tests {
                 base: None,
                 workdir: None,
                 workdir_default: Some(data.to_path_buf()),
+                description: None,
                 instructions: Some("Should never start".to_string()),
                 parent_id: None,
             },
@@ -7742,6 +7802,7 @@ mod tests {
                 base: None,
                 workdir: None,
                 workdir_default: Some(data.to_path_buf()),
+                description: None,
                 instructions: Some("Parent".to_string()),
                 parent_id: None,
             },
@@ -7762,6 +7823,7 @@ mod tests {
                 base: None,
                 workdir: None,
                 workdir_default: Some(data.to_path_buf()),
+                description: None,
                 instructions: Some("Child".to_string()),
                 parent_id: Some(parent.id.clone()),
             },
@@ -7942,6 +8004,7 @@ mod tests {
                 base: None,
                 workdir: Some(root_wd.clone()),
                 workdir_default: Some(root_wd.clone()),
+                description: None,
                 instructions: Some("Root owner role description.".to_string()),
                 parent_id: None,
             },
@@ -7963,6 +8026,7 @@ mod tests {
                 base: Some("main".to_string()),
                 workdir: None,
                 workdir_default: Some(root_wd.clone()),
+                description: None,
                 instructions: Some("L1 worker role description.".to_string()),
                 parent_id: Some(root.id.clone()),
             },
@@ -7988,6 +8052,7 @@ mod tests {
                 base: None,
                 workdir: None,
                 workdir_default: Some(root_wd.clone()),
+                description: None,
                 instructions: Some("L2 nested worker role description.".to_string()),
                 parent_id: Some(l1.id.clone()),
             },
@@ -8328,5 +8393,94 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("uuid-rita")
         );
+    }
+
+    #[test]
+    fn create_and_gemini_rules_deduplicate_and_stay_under_agy_24kb_limit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+
+        let shared_constitution = format!(
+            "# SylphxAI/owner\n\n{}",
+            "Rule line for shared company instructions.\n".repeat(160)
+        );
+        std::fs::write(data.join("AGENTS.md"), &shared_constitution).unwrap();
+
+        let agent = create(
+            &store,
+            data,
+            CreateRequest {
+                name: "hermes".to_string(),
+                role: Some("Growth Mind".to_string()),
+                harness: "agy".to_string(),
+                model: Some("claude-opus-4-6-thinking#max".to_string()),
+                profile: None,
+                repo: None,
+                branch: None,
+                base: None,
+                workdir: None,
+                workdir_default: Some(data.to_path_buf()),
+                description: Some("Public Layer 1 charter for Hermes.".to_string()),
+                instructions: Some("Private Layer 2 execution SOP for Hermes.".to_string()),
+                parent_id: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            agent.public_description().as_deref(),
+            Some("Public Layer 1 charter for Hermes.")
+        );
+        assert_eq!(
+            agent.instructions.as_deref(),
+            Some("Private Layer 2 execution SOP for Hermes.")
+        );
+
+        let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+        std::fs::write(cfg.join("sylphx-cloud-session.json"), "{}").unwrap();
+
+        let huge_continuity = format!(
+            "## 4. Cross-Harness Session Continuity (`claude-code` -> `agy`)\n\n{}",
+            "- `[OUT (already sent/completed)]` `msg_1`: Completed verification step.\n"
+                .repeat(150)
+        );
+        write_agent_instructions_with_continuity(&cfg, &agent, None, Some(&huge_continuity));
+
+        let sys_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(sys_prompt.contains("- **Agent Name**: `hermes`"));
+        assert!(sys_prompt.contains("- **Role Label**: `Growth Mind`"));
+        assert!(sys_prompt.contains("Public Layer 1 charter for Hermes."));
+        assert!(sys_prompt.contains("Private Layer 2 execution SOP for Hermes."));
+        assert!(sys_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(sys_prompt.contains("## 4. Cross-Harness Session Continuity"));
+        assert!(
+            sys_prompt.len() < 24_000,
+            "prompt must stay under agy's 24,000-byte per-file cap, got {} bytes",
+            sys_prompt.len()
+        );
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".sylphx-cloud-instructions-fingerprint")).unwrap(),
+            "stale\n"
+        );
+
+        let gemini_md = cfg.join(".gemini/config/GEMINI.md");
+        let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
+        let gemini_rules_agents = cfg.join(".gemini/config/rules/AGENTS.md");
+        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
+        assert_eq!(std::fs::read_to_string(&gemini_agents).unwrap(), sys_prompt);
+        assert_eq!(
+            std::fs::read_to_string(&gemini_rules_agents).unwrap(),
+            sys_prompt
+        );
+        #[cfg(unix)]
+        {
+            let canon_base = std::fs::canonicalize(&gemini_md).unwrap();
+            assert_eq!(std::fs::canonicalize(&gemini_agents).unwrap(), canon_base);
+            assert_eq!(
+                std::fs::canonicalize(&gemini_rules_agents).unwrap(),
+                canon_base
+            );
+        }
     }
 }
