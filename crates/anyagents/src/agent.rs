@@ -754,7 +754,8 @@ fn create(data: &Path, body: serde_json::Value) -> Result<AgentView, String> {
         ),
         None => None,
     };
-    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed);
+    crate::create::apply_archetype_defaults(data, parent_agent.as_ref(), &mut parsed)
+        .map_err(|err| err.to_string())?;
     let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
     let (harness, model, profile) = crate::create::resolve_subagent_defaults(
         data,

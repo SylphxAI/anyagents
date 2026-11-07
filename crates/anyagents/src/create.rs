@@ -7191,54 +7191,79 @@ pub(crate) struct ArchetypeTemplate {
 
 /// Parse optional YAML frontmatter (`description`, `scope`, `workdir`, `harness`, `model`,
 /// `role`, `profile`) and markdown body from an archetype `.md` file.
-pub(crate) fn parse_archetype_markdown(raw: &str) -> ArchetypeTemplate {
+///
+/// Templates are configuration, rather than best-effort prose.  In particular, once a
+/// document starts with a frontmatter delimiter, an incomplete or malformed delimiter must
+/// not turn the rest of the file into an instruction body by accident.
+pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, Error> {
     let mut tpl = ArchetypeTemplate::default();
     let normalized = raw.replace("\r\n", "\n");
     let trimmed_start = normalized.trim_start_matches('\u{feff}');
     let body = if let Some(rest) = trimmed_start.strip_prefix("---\n") {
-        if let Some(end_idx) = rest.find("\n---") {
-            let frontmatter = &rest[..end_idx];
-            let after_closing = &rest[end_idx + 4..];
-            let body_part = after_closing.strip_prefix('\n').unwrap_or(after_closing);
-            for line in frontmatter.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let Some((k, v)) = line.split_once(':') else {
-                    continue;
-                };
-                let key = k.trim().to_ascii_lowercase();
-                let mut val = v.trim();
-                if (val.starts_with('"') && val.ends_with('"') && val.len() >= 2)
-                    || (val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2)
-                {
-                    val = &val[1..val.len() - 1];
-                }
-                let val_trimmed = val.trim();
-                if val_trimmed.is_empty() {
-                    continue;
-                }
-                match key.as_str() {
-                    "description" | "summary" => tpl.description = Some(val_trimmed.to_string()),
-                    "scope" => tpl.scope = Some(val_trimmed.to_string()),
-                    "workdir" | "workspace" => tpl.workdir = Some(val_trimmed.to_string()),
-                    "harness" => tpl.harness = Some(val_trimmed.to_string()),
-                    "model" => tpl.model = Some(val_trimmed.to_string()),
-                    "role" => tpl.role = Some(val_trimmed.to_string()),
-                    "profile" => tpl.profile = Some(val_trimmed.to_string()),
-                    _ => {}
-                }
+        let mut offset = 0;
+        let mut closing = None;
+        for line in rest.split_inclusive('\n') {
+            if line.trim_end_matches('\n') == "---" {
+                closing = Some((offset, offset + line.len()));
+                break;
             }
-            body_part
-        } else {
-            trimmed_start
+            offset += line.len();
         }
+        let (start, end) = closing.ok_or_else(|| {
+            Error::Message("archetype template has unclosed YAML frontmatter".to_string())
+        })?;
+        let frontmatter = &rest[..start];
+        let invalid_yaml = |err: serde_yaml_ng::Error| {
+            // YAML errors can quote the input. Do not reflect private template
+            // contents into a validation response.
+            Error::Message(format!(
+                "archetype template has malformed YAML frontmatter{}",
+                err.location()
+                    .map(|loc| format!(" at line {}", loc.line()))
+                    .unwrap_or_default()
+            ))
+        };
+        let fields: std::collections::BTreeMap<String, String> = if frontmatter
+            .lines()
+            .all(|line| line.trim().is_empty() || line.trim().starts_with('#'))
+        {
+            std::collections::BTreeMap::new()
+        } else {
+            // Value's mapping parser also rejects duplicate keys; a direct
+            // BTreeMap deserializer would silently overwrite them.
+            let mapping: serde_yaml_ng::Value =
+                serde_yaml_ng::from_str(frontmatter).map_err(invalid_yaml)?;
+            serde_yaml_ng::from_value(mapping).map_err(invalid_yaml)?
+        };
+        if fields.is_empty() && rest[end..].trim().is_empty() {
+            return Err(Error::Message(
+                "archetype template frontmatter requires fields or a markdown body".to_string(),
+            ));
+        }
+        for (key, value) in fields {
+            let value = value.trim();
+            if key.trim().is_empty() || value.is_empty() {
+                return Err(Error::Message(
+                    "archetype template has an empty YAML key or value".to_string(),
+                ));
+            }
+            match key.to_ascii_lowercase().as_str() {
+                "description" | "summary" => tpl.description = Some(value.to_string()),
+                "scope" => tpl.scope = Some(value.to_string()),
+                "workdir" | "workspace" => tpl.workdir = Some(value.to_string()),
+                "harness" => tpl.harness = Some(value.to_string()),
+                "model" => tpl.model = Some(value.to_string()),
+                "role" => tpl.role = Some(value.to_string()),
+                "profile" => tpl.profile = Some(value.to_string()),
+                _ => {}
+            }
+        }
+        &rest[end..]
     } else {
         trimmed_start
     };
     tpl.body = body.trim().to_string();
-    tpl
+    Ok(tpl)
 }
 
 /// Resolve an archetype template by name across:
@@ -7251,37 +7276,32 @@ pub(crate) fn resolve_archetype_template(
     explicit_workdir: Option<&Path>,
     parent_workdir: Option<&Path>,
     data_dir: &Path,
-) -> Option<ArchetypeTemplate> {
-    let slug = archetype.trim().trim_end_matches(".md");
-    if slug.is_empty()
-        || slug.contains("..")
-        || slug.contains('/')
-        || slug.contains('\\')
-        || !slug
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-    {
-        return None;
+) -> Result<Option<ArchetypeTemplate>, Error> {
+    let slug = archetype.trim();
+    if !valid_template_stem(slug) {
+        return Err(Error::Message(format!(
+            "invalid archetype template name {archetype:?}; expected a single filename stem"
+        )));
     }
 
-    let mut search_roots: Vec<PathBuf> = Vec::new();
+    let mut search_roots: Vec<(PathBuf, PathBuf)> = Vec::new();
     if let Some(wd) = explicit_workdir {
         let s = wd.to_string_lossy();
         if !matches!(s.trim(), "" | "worktree" | "branch" | "private" | "inherit") {
-            search_roots.push(wd.join(".agents").join("agents"));
+            search_roots.push((wd.to_path_buf(), PathBuf::from(".agents/agents")));
         }
     }
     if let Some(pwd) = parent_workdir {
-        search_roots.push(pwd.join(".agents").join("agents"));
+        search_roots.push((pwd.to_path_buf(), PathBuf::from(".agents/agents")));
     }
-    search_roots.push(data_dir.join("agents-templates"));
-    search_roots.push(data_dir.join("archetypes"));
-    search_roots.push(data_dir.join(".agents").join("agents"));
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from("agents-templates")));
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from("archetypes")));
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-        search_roots.push(home.join(".agents").join("agents"));
+        search_roots.push((home, PathBuf::from(".agents/agents")));
     }
     if let Some(owd) = crate::server::owner_workdir() {
-        search_roots.push(owd.join(".agents").join("agents"));
+        search_roots.push((owd, PathBuf::from(".agents/agents")));
     }
 
     let candidates = [
@@ -7290,15 +7310,154 @@ pub(crate) fn resolve_archetype_template(
         format!("{}/AGENT.md", slug),
     ];
 
-    for root in search_roots {
+    for (base, root) in search_roots {
         for rel in &candidates {
-            let candidate = root.join(rel);
-            if let Ok(raw) = std::fs::read_to_string(&candidate) {
-                return Some(parse_archetype_markdown(&raw));
+            if let Some(raw) = read_archetype_file(&base, &root.join(rel))? {
+                return parse_archetype_markdown(&raw).map(Some);
             }
         }
     }
-    None
+    Ok(None)
+}
+
+/// Read a template without ever following a symlink in the candidate path.  The
+/// check is intentionally performed for every lookup, including implicit role
+/// lookup, so a hostile `.agents/agents` cannot be bypassed by falling through to
+/// another search root.
+fn read_archetype_file(base: &Path, relative: &Path) -> Result<Option<String>, Error> {
+    let inspect = |component: &Path| -> Result<bool, Error> {
+        let metadata = match std::fs::symlink_metadata(component) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => {
+                return Err(Error::Message(format!(
+                    "cannot inspect archetype template path {}: {err}",
+                    component.display()
+                )));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(Error::Message(format!(
+                "archetype template path contains a symlink: {}",
+                component.display()
+            )));
+        }
+        Ok(true)
+    };
+    if !inspect(base)? {
+        return Ok(None);
+    }
+    // Ancestors above the authorized base can contain OS aliases (e.g. macOS
+    // /var -> /private/var). Resolve those once, then refuse every symlink from
+    // the base through the template file itself.
+    let canonical_base = std::fs::canonicalize(base).map_err(|err| {
+        Error::Message(format!(
+            "cannot resolve archetype base {}: {err}",
+            base.display()
+        ))
+    })?;
+    let mut component = canonical_base.clone();
+    for part in relative.components() {
+        component.push(part);
+        if !inspect(&component)? {
+            return Ok(None);
+        }
+    }
+    let path = canonical_base.join(relative);
+    let path = path.as_path();
+
+    let template_dir = path.parent().ok_or_else(|| {
+        Error::Message(format!(
+            "archetype template has no containing directory: {}",
+            path.display()
+        ))
+    })?;
+    let canonical_dir = std::fs::canonicalize(template_dir).map_err(|err| {
+        Error::Message(format!(
+            "cannot resolve archetype template directory {}: {err}",
+            template_dir.display()
+        ))
+    })?;
+    let canonical_file = std::fs::canonicalize(path).map_err(|err| {
+        Error::Message(format!(
+            "cannot resolve archetype template {}: {err}",
+            path.display()
+        ))
+    })?;
+    if canonical_file.parent() != Some(canonical_dir.as_path()) {
+        return Err(Error::Message(format!(
+            "archetype template escapes its authorized directory: {}",
+            path.display()
+        )));
+    }
+
+    let file = open_archetype_nofollow(path).map_err(|err| {
+        Error::Message(format!(
+            "cannot open archetype template {} without following symlinks: {err}",
+            path.display()
+        ))
+    })?;
+    if !file.metadata()?.is_file() {
+        return Err(Error::Message(format!(
+            "archetype template is not a regular file: {}",
+            path.display()
+        )));
+    }
+    let mut raw = String::new();
+    use std::io::Read;
+    std::io::BufReader::new(file)
+        .read_to_string(&mut raw)
+        .map_err(|err| {
+            Error::Message(format!(
+                "cannot read archetype template {}: {err}",
+                path.display()
+            ))
+        })?;
+    Ok(Some(raw))
+}
+
+// Pin each parent directory by descriptor. O_NOFOLLOW on the final file alone
+// would still allow an intermediate directory to be swapped for a symlink after
+// symlink_metadata has checked it.
+#[cfg(unix)]
+fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Component;
+
+    let mut directory = std::fs::File::open(if path.is_absolute() { "/" } else { "." })?;
+    let mut parts = path
+        .components()
+        .filter(|part| !matches!(part, Component::RootDir))
+        .peekable();
+    while let Some(part) = parts.next() {
+        let name = std::ffi::CString::new(part.as_os_str().as_bytes())?;
+        let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+        if parts.peek().is_some() {
+            flags |= libc::O_DIRECTORY;
+        }
+        // SAFETY: name is a NUL-terminated path component and the borrowed
+        // directory descriptor is live. A successful descriptor is owned once.
+        let fd = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a new descriptor and ownership is transferred.
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if parts.peek().is_none() {
+            return Ok(file);
+        }
+        directory = file;
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "empty template path",
+    ))
+}
+
+#[cfg(not(unix))]
+fn open_archetype_nofollow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::open(path)
 }
 
 /// Apply archetype template defaults (`.agents/agents/<archetype>.md`) to a `CreateAgentRequest`
@@ -7309,7 +7468,7 @@ pub(crate) fn apply_archetype_defaults(
     data_dir: &Path,
     parent: Option<&Agent>,
     body: &mut crate::api::CreateAgentRequest,
-) {
+) -> Result<(), Error> {
     let explicit_wd = body
         .workdir
         .as_deref()
@@ -7323,7 +7482,14 @@ pub(crate) fn apply_archetype_defaults(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)
+        match resolve_archetype_template(arch, explicit_wd.as_deref(), parent_wd, data_dir)? {
+            Some(template) => Some(template),
+            None => {
+                return Err(Error::Message(format!(
+                    "unknown archetype template {arch:?}"
+                )));
+            }
+        }
     } else if let Some(role) = body
         .role
         .as_deref()
@@ -7331,14 +7497,24 @@ pub(crate) fn apply_archetype_defaults(
         .filter(|s| !s.is_empty())
     {
         let slugified = role.to_ascii_lowercase().replace(' ', "-");
-        resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir).or_else(
-            || resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir),
-        )
+        let direct = if valid_template_stem(role) {
+            resolve_archetype_template(role, explicit_wd.as_deref(), parent_wd, data_dir)?
+        } else {
+            None
+        };
+        if direct.is_some() {
+            direct
+        } else if valid_template_stem(&slugified) {
+            resolve_archetype_template(&slugified, explicit_wd.as_deref(), parent_wd, data_dir)?
+        } else {
+            // A display label is not required to be a template stem.
+            None
+        }
     } else {
         None
     };
     let Some(tpl) = tpl else {
-        return;
+        return Ok(());
     };
 
     if body
@@ -7417,6 +7593,15 @@ pub(crate) fn apply_archetype_defaults(
             None => Some(tpl.body),
         };
     }
+    Ok(())
+}
+
+fn valid_template_stem(value: &str) -> bool {
+    let value = value.trim();
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
 }
 
 /// Resolve `(harness, model, profile)` for a newly created agent or sub-agent.
@@ -8570,6 +8755,88 @@ mod tests {
                 .pointer("/claudeAiOauth/accountUuid")
                 .and_then(serde_json::Value::as_str),
             Some("uuid-rita")
+        );
+    }
+}
+
+#[cfg(test)]
+mod archetype_tests {
+    use super::*;
+
+    #[test]
+    fn archetype_frontmatter_requires_valid_yaml_and_complete_delimiters() {
+        for raw in [
+            "---\ndescription: broken",
+            "---\ndescription: broken\n---not-a-delimiter\nbody",
+            "---\ndescription missing colon\n---\nbody",
+            "---\ndescription: \"unclosed\n---\nbody",
+            "---\ndescription: [unclosed\n---\nbody",
+            "---\ndescription: {unclosed\n---\nbody",
+            "---\n: missing key\n---\nbody",
+            "---\ndescription:\n---\nbody",
+            "---\ndescription: ''\n---\nbody",
+            "---\ndescription: first\ndescription: second\n---\nbody",
+            "---\n---",
+            "---\n# comment only\n---\n",
+        ] {
+            let error = parse_archetype_markdown(raw).unwrap_err().to_string();
+            assert!(error.contains("archetype template"), "{error}");
+        }
+
+        for raw in [
+            "---\ndescription: 'Reviewer: #1'\n---\nReview this change.",
+            "---\r\ndescription: 'Reviewer: #1'\r\n---\r\nReview this change.",
+        ] {
+            let template = parse_archetype_markdown(raw).unwrap();
+            assert_eq!(template.description.as_deref(), Some("Reviewer: #1"));
+            assert_eq!(template.body, "Review this change.");
+        }
+        let fields_only = parse_archetype_markdown("---\nrole: reviewer\n---").unwrap();
+        assert_eq!(fields_only.role.as_deref(), Some("reviewer"));
+        assert!(fields_only.body.is_empty());
+        assert_eq!(
+            parse_archetype_markdown("---\n---\nBody.").unwrap().body,
+            "Body."
+        );
+        assert_eq!(
+            parse_archetype_markdown("Plain markdown.").unwrap().body,
+            "Plain markdown."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archetype_nofollow_opens_refuse_symlinks_but_allow_os_aliases_above_base() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let real = root.join("real");
+        let templates = real.join("work/.agents/agents");
+        std::fs::create_dir_all(&templates).unwrap();
+        std::fs::write(templates.join("writer.md"), "Trusted template.").unwrap();
+        let alias = root.join("alias");
+        symlink(&real, &alias).unwrap();
+        let template =
+            resolve_archetype_template("writer", Some(&alias.join("work")), None, dir.path())
+                .unwrap()
+                .unwrap();
+        assert_eq!(template.body, "Trusted template.");
+
+        // These use the descriptor-only open directly, so the race-resistant
+        // layer is independently covered rather than masked by metadata checks.
+        symlink(templates.join("writer.md"), templates.join("escape.md")).unwrap();
+        assert_eq!(
+            open_archetype_nofollow(&templates.join("escape.md"))
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::ELOOP)
+        );
+        symlink(&templates, real.join("redirected")).unwrap();
+        let error = open_archetype_nofollow(&real.join("redirected/writer.md")).unwrap_err();
+        assert!(
+            matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)),
+            "{error}"
         );
     }
 }

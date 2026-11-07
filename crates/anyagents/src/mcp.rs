@@ -2365,11 +2365,9 @@ pub(crate) fn filter_and_summarize_agent_list(
     query: Option<&str>,
     limit: Option<usize>,
 ) -> serde_json::Value {
-    if let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) {
-        agents.retain(|a| agent_matches_query(a, q));
-    }
-
-    let total_matched = agents.len();
+    // The caller has already applied visibility, parent and state scope. Query
+    // and pagination change the slice, not this population's health counts.
+    let total = agents.len();
     let running = agents.iter().filter(|a| a.state == "running").count();
     let working = agents
         .iter()
@@ -2385,9 +2383,14 @@ pub(crate) fn filter_and_summarize_agent_list(
     let paused = agents.iter().filter(|a| a.state == "paused").count();
     let archived = agents.iter().filter(|a| a.state == "archived").count();
 
+    if let Some(q) = query.map(str::trim).filter(|s| !s.is_empty()) {
+        agents.retain(|a| agent_matches_query(a, q));
+    }
+    let matched = agents.len();
+    let matched_archived = agents.iter().filter(|a| a.state == "archived").count();
     let max_archived = limit.unwrap_or(25);
-    if archived > max_archived {
-        let mut skip_archived = archived - max_archived;
+    if matched_archived > max_archived {
+        let mut skip_archived = matched_archived - max_archived;
         agents.retain(|a| {
             if a.state == "archived" && skip_archived > 0 {
                 skip_archived -= 1;
@@ -2411,7 +2414,8 @@ pub(crate) fn filter_and_summarize_agent_list(
     }
 
     serde_json::json!({
-        "total": total_matched,
+        "total": total,
+        "matched": matched,
         "returned": agents.len(),
         "running": running,
         "working": working,
@@ -2618,6 +2622,7 @@ mod spawn_args_tests {
         let mut default_capped = agents.clone();
         let summary = filter_and_summarize_agent_list(&mut default_capped, None, None);
         assert_eq!(summary["total"], 123);
+        assert_eq!(summary["matched"], 123);
         assert_eq!(summary["returned"], 100);
         assert_eq!(summary["running"], 3);
         assert_eq!(summary["working"], 1);
@@ -2632,8 +2637,70 @@ mod spawn_args_tests {
         let mut queried = agents.clone();
         let q_summary =
             filter_and_summarize_agent_list(&mut queried, Some("archetype active"), Some(10));
-        assert_eq!(q_summary["total"], 1);
+        assert_eq!(q_summary["total"], 123);
+        assert_eq!(q_summary["matched"], 1);
+        assert_eq!(q_summary["idle"], 121);
+        assert_eq!(q_summary["running"], 3);
         assert_eq!(q_summary["returned"], 1);
         assert_eq!(queried[0].name, "active-writer");
+
+        let mut limited = agents.clone();
+        let limited_summary =
+            filter_and_summarize_agent_list(&mut limited, Some("idle-sub"), Some(2));
+        assert_eq!(limited_summary["total"], 123);
+        assert_eq!(limited_summary["matched"], 120);
+        assert_eq!(limited_summary["returned"], 2);
+        assert_eq!(limited_summary["running"], 3);
+        assert_eq!(limited_summary["idle"], 121);
+        assert_eq!(limited.len(), 2);
+        assert!(
+            limited
+                .iter()
+                .all(|agent| agent.name.starts_with("idle-sub-"))
+        );
+
+        let mut unmatched = agents.clone();
+        let no_matches =
+            filter_and_summarize_agent_list(&mut unmatched, Some("no-such-agent"), Some(1));
+        assert_eq!(no_matches["total"], 123);
+        assert_eq!(no_matches["matched"], 0);
+        assert_eq!(no_matches["returned"], 0);
+        assert_eq!(no_matches["running"], 3);
+        assert!(unmatched.is_empty());
+    }
+
+    #[test]
+    fn list_query_preserves_archived_and_paused_population_counts() {
+        let mut agents = vec![dummy_agent_view(
+            "paused",
+            "paused-worker",
+            "paused",
+            "idle",
+            None,
+        )];
+        for i in 0..30 {
+            agents.push(dummy_agent_view(
+                &format!("archive-{i}"),
+                &format!("archived-worker-{i}"),
+                "archived",
+                "idle",
+                None,
+            ));
+        }
+        // There are 30 archived agents in scope but only 11 match this query.
+        // The archived cap must be applied to matches, not the full population.
+        let summary =
+            filter_and_summarize_agent_list(&mut agents, Some("archived-worker-1"), Some(2));
+        assert_eq!(summary["total"], 31);
+        assert_eq!(summary["archived"], 30);
+        assert_eq!(summary["paused"], 1);
+        assert_eq!(summary["matched"], 11);
+        assert_eq!(summary["returned"], 2);
+        assert_eq!(agents.len(), 2);
+        assert!(
+            agents
+                .iter()
+                .all(|agent| agent.name.starts_with("archived-worker-1"))
+        );
     }
 }

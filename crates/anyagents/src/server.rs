@@ -3725,7 +3725,8 @@ async fn create_agent_route(
             }
             (None, None) => None,
         };
-        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body);
+        create::apply_archetype_defaults(state.store.data_dir(), parent_agent.as_ref(), &mut body)
+            .map_err(ApiError::from_store)?;
         let parent_id = parent_agent.as_ref().map(|p| p.id.clone());
         let (harness, model, profile) = create::resolve_subagent_defaults(
             state.store.data_dir(),
@@ -7884,6 +7885,211 @@ exec /usr/bin/git "$@"
                 auditor.description.as_deref(),
                 Some("Global template auditor")
             );
+        });
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    fn archetype_validation_state(data: &Path) -> AppState {
+        let store = Arc::new(Store::open(data.join("state.db")).unwrap());
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
+        AppState {
+            store,
+            health: HealthBoard::default(),
+            sign_in: Arc::new(Mutex::new(ProcessRunner)),
+            identity: Arc::new(ServingIdentity::capture()),
+            auth: auth::Mode::Trusted {
+                data_dir: data.into(),
+            },
+        }
+    }
+
+    async fn assert_archetype_create_refused(
+        state: &AppState,
+        body: serde_json::Value,
+        expected_error: &str,
+    ) {
+        let result = create_agent_route(
+            Principal::Operator,
+            State(state.clone()),
+            Json(serde_json::from_value(body).unwrap()),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("invalid archetype unexpectedly created an agent"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST, "{}", error.message);
+        assert!(error.message.contains(expected_error), "{}", error.message);
+        assert!(!error.message.contains("OUTSIDE_TEMPLATE_SENTINEL"));
+        assert!(state.store.list_agents().unwrap().is_empty());
+        let Json(listed) = list_agents(Principal::Operator, State(state.clone()))
+            .await
+            .unwrap_or_else(|error| panic!("{}", error.message));
+        assert!(listed.agents.is_empty());
+        assert!(
+            !serde_json::to_string(&listed)
+                .unwrap()
+                .contains("OUTSIDE_TEMPLATE_SENTINEL")
+        );
+        let description = get_description_route(
+            Principal::Operator,
+            State(state.clone()),
+            AxumPath("rejected-template-agent".into()),
+        )
+        .await;
+        match description {
+            Ok(_) => panic!("rejected template must not have a description"),
+            Err(error) => assert_eq!(error.status, StatusCode::NOT_FOUND),
+        }
+        // Validation runs before creation, including config/SYSTEM_PROMPT.md writes.
+        let agents_dir = state.store.data_dir().join("agents");
+        assert!(
+            !agents_dir.exists() || std::fs::read_dir(agents_dir).unwrap().next().is_none(),
+            "a rejected template must not leave a SYSTEM_PROMPT.md or agent directory"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archetype_templates_reject_file_and_directory_symlinks_without_leaking() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for variant in [
+                "file",
+                "agents-dir",
+                "dot-agents-dir",
+                "nested-dir",
+                "data-dir",
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let state = archetype_validation_state(dir.path());
+                let work = dir.path().join("work");
+                let outside = dir.path().join("outside");
+                std::fs::create_dir_all(&outside).unwrap();
+                let secret = outside.join("escape.md");
+                std::fs::write(&secret, "OUTSIDE_TEMPLATE_SENTINEL").unwrap();
+                std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+                std::fs::write(outside.join("agent.md"), "OUTSIDE_TEMPLATE_SENTINEL").unwrap();
+                match variant {
+                    "file" => {
+                        std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
+                        symlink(&secret, work.join(".agents/agents/escape.md")).unwrap();
+                    }
+                    "agents-dir" => {
+                        std::fs::create_dir_all(work.join(".agents")).unwrap();
+                        symlink(&outside, work.join(".agents/agents")).unwrap();
+                    }
+                    "dot-agents-dir" => {
+                        std::fs::create_dir_all(&work).unwrap();
+                        std::fs::create_dir_all(outside.join("agents")).unwrap();
+                        std::fs::write(
+                            outside.join("agents/escape.md"),
+                            "OUTSIDE_TEMPLATE_SENTINEL",
+                        )
+                        .unwrap();
+                        symlink(&outside, work.join(".agents")).unwrap();
+                    }
+                    "nested-dir" => {
+                        std::fs::create_dir_all(work.join(".agents/agents")).unwrap();
+                        symlink(&outside, work.join(".agents/agents/escape")).unwrap();
+                    }
+                    "data-dir" => {
+                        std::fs::create_dir_all(&work).unwrap();
+                        symlink(&outside, dir.path().join("agents-templates")).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                // A lower-priority valid template must never mask a hostile path.
+                std::fs::create_dir_all(dir.path().join("archetypes")).unwrap();
+                std::fs::write(dir.path().join("archetypes/escape.md"), "Safe fallback.").unwrap();
+                for selector in ["archetype", "role"] {
+                    let mut body = serde_json::json!({
+                        "name": "rejected-template-agent",
+                        "workdir": work,
+                        "harness": "codex",
+                    });
+                    body[selector] = serde_json::json!("escape");
+                    assert_archetype_create_refused(&state, body, "symlink").await;
+                }
+            }
+        });
+        unsafe {
+            std::env::remove_var("ANYAGENTS_FAKE_MODE");
+        }
+    }
+
+    #[test]
+    fn archetype_templates_reject_unknown_explicit_names_and_malformed_frontmatter() {
+        let _env = env_lock();
+        unsafe {
+            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = archetype_validation_state(dir.path());
+        let work = dir.path().join("work");
+        let templates = work.join(".agents/agents");
+        std::fs::create_dir_all(&templates).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for selector in ["archetype", "template", "type", "preset"] {
+                let mut body =
+                    serde_json::json!({"name": "rejected-template-agent", "workdir": work});
+                body[selector] = serde_json::json!("nonexistent-role");
+                assert_archetype_create_refused(
+                    &state,
+                    body,
+                    "unknown archetype template \"nonexistent-role\"",
+                )
+                .await;
+            }
+            for name in [
+                ".",
+                "..",
+                "../escape",
+                "escape.md",
+                "escape/agent",
+                "escape\\agent",
+            ] {
+                assert_archetype_create_refused(
+                    &state,
+                    serde_json::json!({
+                        "name": "rejected-template-agent", "archetype": name, "workdir": work,
+                    }),
+                    "invalid archetype template name",
+                )
+                .await;
+            }
+            for (raw, expected) in [
+                ("---\ndescription: unclosed", "unclosed YAML frontmatter"),
+                (
+                    "---\ndescription broken\n---\nBody.",
+                    "malformed YAML frontmatter",
+                ),
+                (
+                    "---\ndescription: [broken\n---\nBody.",
+                    "malformed YAML frontmatter",
+                ),
+                (
+                    "---\ndescription: broken\n---not-a-delimiter\nBody.",
+                    "unclosed YAML frontmatter",
+                ),
+            ] {
+                std::fs::write(templates.join("broken.md"), raw).unwrap();
+                for selector in ["archetype", "role"] {
+                    let mut body =
+                        serde_json::json!({"name": "rejected-template-agent", "workdir": work});
+                    body[selector] = serde_json::json!("broken");
+                    assert_archetype_create_refused(&state, body, expected).await;
+                }
+            }
         });
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
