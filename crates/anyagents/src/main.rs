@@ -31,7 +31,7 @@ mod sandbox;
 mod schedule;
 mod server;
 mod signin;
-mod sylphx;
+mod spiron;
 mod telegram;
 mod ui;
 mod vendor;

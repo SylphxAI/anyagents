@@ -15,12 +15,11 @@ use anyagents_harness_codex::CodexHarness;
 use anyagents_harness_muse::MuseHarness;
 use anyagents_harness_omp::OmpHarness;
 use anyagents_harness_opencode::OpenCodeHarness;
-use anyagents_harness_stream::{Launch, StreamHarness};
+use anyagents_harness_stream::{Launch, LineProtocol, StreamHarness, StreamSpec};
 use anyagents_supervisor::LaunchRequest;
 
 use crate::dsh::DshHarness;
 use crate::grok::GrokHarness;
-use crate::sylphx::SylphxHarness;
 
 pub enum VendorHarness {
     Claude(Box<ClaudeHarness>, PathBuf),
@@ -31,7 +30,9 @@ pub enum VendorHarness {
     Omp(Box<OmpHarness>, PathBuf),
     Dsh(Box<DshHarness>, PathBuf),
     Grok(Box<GrokHarness>, PathBuf),
-    Sylphx(Box<SylphxHarness>, PathBuf),
+    /// The external Spiron CLI.  The `PathBuf` is the canonical session file;
+    /// legacy `sylphx-session-id` is read once when this adapter starts.
+    Spiron(Box<StreamHarness>, PathBuf),
     Contract(Box<ContractHarness>),
 }
 
@@ -51,7 +52,7 @@ impl VendorHarness {
             Self::Omp(harness, path) => (harness.session_id(), Some(path)),
             Self::Dsh(harness, path) => (harness.session_id(), Some(path)),
             Self::Grok(harness, path) => (harness.session_id(), Some(path)),
-            Self::Sylphx(harness, path) => (harness.session_id(), Some(path)),
+            Self::Spiron(harness, path) => (harness.session_id(), Some(path)),
             Self::OpenCode(_) | Self::Contract(_) => (None, None),
         };
         if let (Some(id), Some(path)) = (session, path) {
@@ -73,7 +74,9 @@ impl VendorHarness {
 fn adapter_config(config_dir: &Path, harness: &str) -> Option<PathBuf> {
     let text = std::fs::read_to_string(config_dir.join("adapter.json")).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-    if value.get("mode").and_then(|v| v.as_str()) == Some("sylphx-native") {
+    // Ignore the retired in-process mode marker. Explicit contract doubles
+    // remain available to the credential-free server acceptance suite.
+    if value.get("mode").and_then(|item| item.as_str()) == Some("sylphx-native") {
         return None;
     }
     let named = value.get("harness").and_then(|item| item.as_str())?;
@@ -812,29 +815,23 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         );
         vh.sync_session();
         Ok(vh)
-    } else if request.agent.harness == "sylphx" {
-        let session = session_from_file(&request.config_dir, "sylphx-session-id");
-        let exe = crate::data::current_exe_clean().unwrap_or_else(|_| PathBuf::from("anyagents"));
-        let mcp_args = vec![
-            "--data".to_string(),
-            request.data_dir.display().to_string(),
-            "mcp".to_string(),
-            "--config".to_string(),
-            request.config_dir.display().to_string(),
-        ];
-        let harness = SylphxHarness::start(
+    } else if is_spiron_harness(&request.agent.harness) {
+        let session = session_from_file(&request.config_dir, "spiron-session-id")
+            .or_else(|| session_from_file(&request.config_dir, "sylphx-session-id"));
+        let program = std::env::var("ANYAGENTS_SPIRON_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| crate::install::program(&root, "spiron"));
+        let harness = start_spiron(
+            &program,
             &request.config_dir,
             &request.work_dir,
-            request.agent.model.as_deref(),
+            &request.agent,
             session.as_deref(),
-            &pairs(&env),
-            &exe,
-            &mcp_args,
-        )
-        .map_err(|err| err.to_string())?;
-        let vh = VendorHarness::Sylphx(
+            &env,
+        )?;
+        let vh = VendorHarness::Spiron(
             Box::new(harness),
-            request.config_dir.join("sylphx-session-id"),
+            request.config_dir.join("spiron-session-id"),
         );
         vh.sync_session();
         Ok(vh)
@@ -1112,6 +1109,93 @@ fn start_claude(
         .map_err(|err| err.to_string())
 }
 
+/// Legacy AnyAgents records named `sylphx` are deliberately only a selector
+/// alias.  They launch the external `spiron` process and never enter a local
+/// model/tool loop.
+fn is_spiron_harness(harness: &str) -> bool {
+    harness == "spiron"
+        || harness == "sylphx"
+        || harness == "sylphx-agent"
+        || harness == "sylphx_agent"
+        || harness.starts_with("sylphx/")
+}
+
+fn start_spiron(
+    program: &Path,
+    config_dir: &Path,
+    work_dir: &Path,
+    agent: &anyagents_core::Agent,
+    session: Option<&str>,
+    env: &[(String, String)],
+) -> Result<StreamHarness, String> {
+    let mcp_config = config_dir.join("spiron-mcp.json");
+    let skills = config_dir.join(".agents/skills");
+    let mut args = vec![
+        "--headless".to_string(),
+        "--json".to_string(),
+        "--mcp-config".to_string(),
+        mcp_config.display().to_string(),
+        "--workdir".to_string(),
+        work_dir.display().to_string(),
+        "--skills-dir".to_string(),
+        skills.display().to_string(),
+        "--state-dir".to_string(),
+        config_dir.display().to_string(),
+        "--instructions-file".to_string(),
+        config_dir.join("SYSTEM_PROMPT.md").display().to_string(),
+        "--agent-id".to_string(),
+        agent.id.to_string(),
+        "--agent-name".to_string(),
+        agent.name.clone(),
+    ];
+    if let Some(model) = agent
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    let base_args = args.clone();
+    if let Some(session) = session {
+        args.extend(["--session".to_string(), session.to_string()]);
+    }
+    let spec = StreamSpec {
+        name: "anyagents-spiron".to_string(),
+        args: base_args,
+        resume_flag: "--session",
+        start_line: "user",
+        cancel: "cancel",
+        protocol: LineProtocol::AcknowledgedResult,
+    };
+    let mut environment = env.to_vec();
+    environment.push(("HOME".to_string(), config_dir.display().to_string()));
+    // Profiles are materialized into the seat config by create.rs. Do not pass
+    // their coordinator selector as a Spiron TOML filename.
+    environment.extend([
+        (
+            "SPIRON_MCP_CONFIG".to_string(),
+            mcp_config.display().to_string(),
+        ),
+        (
+            "SPIRON_WORKSPACE".to_string(),
+            work_dir.display().to_string(),
+        ),
+        ("SPIRON_SKILLS".to_string(), skills.display().to_string()),
+    ]);
+    StreamHarness::launch(Launch {
+        spec,
+        program: program.to_path_buf(),
+        args,
+        environment,
+        work_dir: Some(work_dir.to_path_buf()),
+        session_id: session.map(str::to_string),
+        mode: anyagents_harness::DeliveryMode::Steer,
+        steer: anyagents_harness::SteerSupport::Yes,
+    })
+    .map_err(|err| err.to_string())
+}
+
 fn start_codex(
     program: &str,
     session: Option<&str>,
@@ -1139,7 +1223,11 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.deliver(message),
             Self::Dsh(harness, _) => harness.deliver(message),
             Self::Grok(harness, _) => harness.deliver(message),
-            Self::Sylphx(harness, _) => harness.deliver(message),
+            Self::Spiron(harness, _) => harness.deliver(message, &serde_json::json!({
+                "type": "user",
+                "request_id": message.id,
+                "text": anyagents_harness::compose_message(&message.id, &message.context, &message.text),
+            })),
             Self::Contract(harness) => harness.deliver(message),
         };
         self.sync_session();
@@ -1156,7 +1244,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.background(),
             Self::Dsh(harness, _) => harness.background(),
             Self::Grok(harness, _) => harness.background(),
-            Self::Sylphx(harness, _) => harness.background(),
+            Self::Spiron(harness, _) => harness.background(),
             Self::Contract(harness) => harness.background(),
         }
     }
@@ -1171,7 +1259,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.resume(session),
             Self::Dsh(harness, _) => harness.resume(session),
             Self::Grok(harness, _) => harness.resume(session),
-            Self::Sylphx(harness, _) => harness.resume(session),
+            Self::Spiron(harness, _) => harness.resume(session),
             Self::Contract(harness) => harness.resume(session),
         };
         self.sync_session();
@@ -1188,7 +1276,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.cancel(),
             Self::Dsh(harness, _) => harness.cancel(),
             Self::Grok(harness, _) => harness.cancel(),
-            Self::Sylphx(harness, _) => harness.cancel(),
+            Self::Spiron(harness, _) => harness.cancel(&serde_json::json!({"type": "cancel"})),
             Self::Contract(harness) => harness.cancel(),
         }
     }
@@ -1204,7 +1292,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.health(),
             Self::Dsh(harness, _) => harness.health(),
             Self::Grok(harness, _) => harness.health(),
-            Self::Sylphx(harness, _) => harness.health(),
+            Self::Spiron(harness, _) => harness.health(),
             Self::Contract(harness) => harness.health(),
         }
     }
@@ -1219,7 +1307,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.input_ready(),
             Self::Dsh(harness, _) => harness.input_ready(),
             Self::Grok(harness, _) => harness.input_ready(),
-            Self::Sylphx(harness, _) => harness.input_ready(),
+            Self::Spiron(harness, _) => harness.input_ready(),
             Self::Contract(harness) => harness.input_ready(),
         }
     }
@@ -1235,9 +1323,13 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.last_usage(),
             Self::Dsh(harness, _) => harness.last_usage(),
             Self::Grok(harness, _) => harness.last_usage(),
-            Self::Sylphx(harness, _) => harness.last_usage(),
+            Self::Spiron(harness, _) => harness.served_usage(),
             Self::Contract(harness) => harness.last_usage(),
         }
+    }
+
+    fn served_usage(&self) -> TurnUsage {
+        self.last_usage()
     }
 
     fn turns_served(&self) -> u32 {
@@ -1250,7 +1342,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.turns_served(),
             Self::Dsh(harness, _) => harness.turns_served(),
             Self::Grok(harness, _) => harness.turns_served(),
-            Self::Sylphx(harness, _) => harness.turns_served(),
+            Self::Spiron(harness, _) => harness.turns_served(),
             Self::Contract(harness) => harness.turns_served(),
         }
     }
@@ -1265,7 +1357,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Dsh(harness, _) => harness.quiet_for(id, quiet, patience),
             Self::Grok(harness, _) => harness.quiet_for(id, quiet, patience),
-            Self::Sylphx(harness, _) => harness.quiet_for(id, quiet, patience),
+            Self::Spiron(_, _) => false,
             Self::Contract(harness) => harness.quiet_for(id, quiet, patience),
         }
     }
@@ -1280,7 +1372,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.ends_on_quiet(),
             Self::Dsh(harness, _) => harness.ends_on_quiet(),
             Self::Grok(harness, _) => harness.ends_on_quiet(),
-            Self::Sylphx(harness, _) => harness.ends_on_quiet(),
+            Self::Spiron(_, _) => None,
             Self::Contract(harness) => harness.ends_on_quiet(),
         }
     }
@@ -1295,7 +1387,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.clear_quota(),
             Self::Dsh(harness, _) => harness.clear_quota(),
             Self::Grok(harness, _) => harness.clear_quota(),
-            Self::Sylphx(harness, _) => harness.clear_quota(),
+            Self::Spiron(harness, _) => harness.clear_quota(),
             Self::Contract(harness) => harness.clear_quota(),
         }
     }
@@ -1310,7 +1402,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.process_id(),
             Self::Dsh(harness, _) => harness.process_id(),
             Self::Grok(harness, _) => harness.process_id(),
-            Self::Sylphx(harness, _) => harness.process_id(),
+            Self::Spiron(harness, _) => harness.process_id(),
             Self::Contract(harness) => harness.process_id(),
         }
     }
@@ -1325,7 +1417,7 @@ impl Harness for VendorHarness {
             Self::Omp(harness, _) => harness.watch_activity(notify),
             Self::Dsh(harness, _) => harness.watch_activity(notify),
             Self::Grok(harness, _) => harness.watch_activity(notify),
-            Self::Sylphx(harness, _) => harness.watch_activity(notify),
+            Self::Spiron(harness, _) => harness.watch_activity(notify),
             Self::Contract(harness) => harness.watch_activity(notify),
         }
     }
@@ -1385,3 +1477,7 @@ mod tests {
         assert_eq!(json2, json);
     }
 }
+
+#[cfg(test)]
+#[path = "vendor/spiron_tests.rs"]
+mod spiron_tests;

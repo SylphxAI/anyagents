@@ -12,7 +12,7 @@ mod rpc;
 
 pub use rpc::{NotificationEffect, RequestHandler, RpcChild, RpcFail, RpcLaunch};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -51,6 +51,9 @@ pub enum LineProtocol {
     /// `result` closes the turn with usage and an optional `cost_micros`; a
     /// `text` line is answer text.
     ResultWithCost,
+    /// A persistent controller acknowledges each correlated input before the
+    /// mailbox releases custody. `result` is the only terminal frame.
+    AcknowledgedResult,
 }
 
 /// One harness's catalog entry, as the launch needs it.
@@ -134,7 +137,9 @@ impl StreamSpec {
         let quota_reset_at_ms = quota_of(value);
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
-                LineProtocol::Result | LineProtocol::ResultWithCost => {
+                LineProtocol::Result
+                | LineProtocol::ResultWithCost
+                | LineProtocol::AcknowledgedResult => {
                     kind == Some("result") && (!is_error || self.name == "anyagents-agy")
                 }
                 LineProtocol::Done => {
@@ -171,9 +176,12 @@ impl StreamSpec {
         TurnUsage {
             input_tokens: number(usage, "input_tokens").max(number(usage, "input")),
             output_tokens: number(usage, "output_tokens").max(number(usage, "output")),
-            cache_read_tokens: number(usage, "cache_read_tokens").max(number(usage, "cacheRead")),
+            cache_read_tokens: number(usage, "cache_read_tokens")
+                .max(number(usage, "cacheRead"))
+                .max(number(usage, "cache_read_input_tokens")),
             cache_write_tokens: number(usage, "cache_write_tokens")
-                .max(number(usage, "cacheWrite")),
+                .max(number(usage, "cacheWrite"))
+                .max(number(usage, "cache_creation_input_tokens")),
             reported_cost_micros: match self.protocol {
                 LineProtocol::ResultWithCost => value.get("cost_micros").and_then(Value::as_i64),
                 _ => None,
@@ -184,10 +192,17 @@ impl StreamSpec {
     /// Only a vendor that streams an answer without a closing result line has
     /// answer text: a `text` line, or the text on the closing line itself.
     fn text_of(&self, value: &Value, finishes: bool) -> Option<String> {
+        let kind = value.get("type").and_then(Value::as_str);
+        if self.protocol == LineProtocol::AcknowledgedResult {
+            return (kind == Some("text_delta"))
+                .then(|| value.get("text").or_else(|| value.get("delta")))
+                .flatten()
+                .and_then(Value::as_str)
+                .map(str::to_string);
+        }
         if self.protocol != LineProtocol::ResultWithCost {
             return None;
         }
-        let kind = value.get("type").and_then(Value::as_str);
         if !(finishes || kind == Some("text")) {
             return None;
         }
@@ -260,6 +275,9 @@ struct State {
     planner_config: Option<Value>,
     http_port: Option<u16>,
     seen: HashSet<String>,
+    acknowledged: HashSet<String>,
+    input_turns: HashMap<String, String>,
+    rejected: HashMap<String, String>,
     written: Vec<String>,
     open: Vec<String>,
     followups: Vec<String>,
@@ -508,8 +526,10 @@ impl StreamHarness {
             self.wake.notify_all();
             return Err(HarnessError::Dead);
         }
-        state.open.clear();
-        state.followups.clear();
+        if self.spec.protocol != LineProtocol::AcknowledgedResult {
+            state.open.clear();
+            state.followups.clear();
+        }
         state.turn_user_inputs = 0;
         state.last_turn_step_type = None;
         state.idle_since = None;
@@ -581,7 +601,15 @@ impl StreamHarness {
                 {
                     return Ok(DeliverOutcome::Quota { reset_at_ms });
                 }
+                if let Some(reason) = state.rejected.get(&message.id) {
+                    return Err(HarnessError::Failed(reason.clone()));
+                }
                 if state.seen.contains(&message.id) {
+                    if self.spec.protocol == LineProtocol::AcknowledgedResult
+                        && !state.acknowledged.contains(&message.id)
+                    {
+                        return Ok(DeliverOutcome::Deferred);
+                    }
                     return Ok(DeliverOutcome::Accepted {
                         turn_finished: state.finished.contains(&message.id),
                     });
@@ -784,9 +812,15 @@ impl StreamHarness {
                 let pending = self.pending.take().expect("completed write");
                 state.seen.insert(pending.id.clone());
                 state.written.push(pending.id);
-                Ok(DeliverOutcome::Accepted {
-                    turn_finished: state.finished.contains(&message.id),
-                })
+                if self.spec.protocol == LineProtocol::AcknowledgedResult
+                    && !state.acknowledged.contains(&message.id)
+                {
+                    Ok(DeliverOutcome::Deferred)
+                } else {
+                    Ok(DeliverOutcome::Accepted {
+                        turn_finished: state.finished.contains(&message.id),
+                    })
+                }
             }
             Err(_) => {
                 state.alive = false;
@@ -879,6 +913,9 @@ impl StreamHarness {
             // Pipe acceptance belongs to this process, never its replacement.
             state.input_blocked = false;
             state.seen.clear();
+            state.acknowledged.clear();
+            state.input_turns.clear();
+            state.rejected.clear();
             state.written.clear();
             state.finished.clear();
             state.finished_quiet.clear();
@@ -1012,6 +1049,9 @@ impl State {
             generation: 0,
             input_blocked: false,
             seen: HashSet::new(),
+            acknowledged: HashSet::new(),
+            input_turns: HashMap::new(),
+            rejected: HashMap::new(),
             written: Vec::new(),
             open: Vec::new(),
             followups: Vec::new(),
@@ -1120,6 +1160,44 @@ fn read_stdout(
             }
             state.idle_since = None;
             note_markers(&mut state, &value);
+            if spec.protocol == LineProtocol::AcknowledgedResult
+                && let Some(id) = value.get("request_id").and_then(Value::as_str)
+                && state
+                    .open
+                    .iter()
+                    .chain(&state.followups)
+                    .any(|open| open == id)
+            {
+                match kind {
+                    Some("accepted") => {
+                        state.acknowledged.insert(id.to_string());
+                        state.input_turns.insert(id.to_string(), id.to_string());
+                    }
+                    Some("steer_ack")
+                        if value.get("accepted").and_then(Value::as_bool) == Some(true)
+                            && value.get("turn_id").and_then(Value::as_str).is_some() =>
+                    {
+                        state.acknowledged.insert(id.to_string());
+                        state.input_turns.insert(
+                            id.to_string(),
+                            value["turn_id"].as_str().unwrap().to_string(),
+                        );
+                    }
+                    Some("rejected") => {
+                        state.rejected.insert(
+                            id.to_string(),
+                            format!(
+                                "controller rejected input: {}",
+                                value
+                                    .get("code")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("unknown")
+                            ),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             if let Some(step_type) = value
                 .pointer("/step_update/step_type")
                 .and_then(Value::as_str)
@@ -1149,11 +1227,21 @@ fn read_stdout(
                     other => *other = Some((id, vec![text])),
                 }
             }
-            if effect.finishes_turn {
+            let correlated = spec.protocol != LineProtocol::AcknowledgedResult
+                || value
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| state.input_turns.values().any(|owner| owner == id));
+            if effect.finishes_turn && correlated {
                 state.sign_in_fault = None;
                 let usage = effect.usage.unwrap_or_default();
-                finish_open(&mut state, usage);
-            } else if effect.quota_reset_at_ms.is_none()
+                if spec.protocol == LineProtocol::AcknowledgedResult {
+                    finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);
+                } else {
+                    finish_open(&mut state, usage);
+                }
+            } else if correlated
+                && effect.quota_reset_at_ms.is_none()
                 && matches!(kind, Some("done") | Some("result"))
                 && let Some(err_str) = value
                     .pointer("/result/error")
@@ -1252,6 +1340,34 @@ fn finish_open(state: &mut State, usage: TurnUsage) {
     if !state.followups.is_empty() {
         state.turns_started += 1;
         state.open.append(&mut state.followups);
+    }
+}
+
+fn finish_correlated(state: &mut State, turn: &str, usage: TurnUsage) {
+    let ids: Vec<String> = state
+        .open
+        .iter()
+        .chain(&state.followups)
+        .filter(|id| {
+            state
+                .input_turns
+                .get(*id)
+                .is_some_and(|owner| owner == turn)
+        })
+        .cloned()
+        .collect();
+    for id in ids {
+        state.open.retain(|open| open != &id);
+        state.followups.retain(|open| open != &id);
+        state.finished.insert(id.clone());
+        state.usages.push((
+            id.clone(),
+            if id == turn {
+                usage.clone()
+            } else {
+                TurnUsage::default()
+            },
+        ));
     }
 }
 
