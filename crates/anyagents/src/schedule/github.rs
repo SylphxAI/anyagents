@@ -1459,6 +1459,46 @@ mod tests {
     }
 
     #[test]
+    fn recovery_spread_admits_no_request_in_the_old_secondary_only_jitter_window() {
+        let mut probes = Probes::default();
+        let mut calls = 0;
+        probes.probe("a", "o", "r", "sha", false, 0, |_, _, _| {
+            calls += 1;
+            Ok(response(
+                403,
+                json!({"message":"secondary rate limit"}),
+                &[
+                    ("retry-after", "60"),
+                    ("x-ratelimit-remaining", "1499"),
+                    ("x-ratelimit-reset", "3600"),
+                ],
+            ))
+        });
+        // Before the repair this was assigned from the shorter secondary hold.
+        // Check that entire old window, not an internal gate that is correctly
+        // beyond the hourly reset after the fix.
+        for now in 120_000..360_000 {
+            let result = probes.probe("a", "o", "r", "sha", false, now, |_, _, _| {
+                calls += 1;
+                Ok(response(
+                    200,
+                    pending(),
+                    &[
+                        ("x-ratelimit-remaining", "1498"),
+                        ("x-ratelimit-reset", "3600"),
+                    ],
+                ))
+            });
+            assert_eq!(result.1, "probe_error:rate_limited");
+        }
+        assert_eq!(
+            calls, 1,
+            "recovery jitter admitted a request below reserve before the one-hour reset"
+        );
+        assert!((3_660_000..3_900_000).contains(&probes.targets["a"].resume_at));
+    }
+
+    #[test]
     fn paused_targets_resume_across_the_window_without_a_reset_herd() {
         const N: usize = 96;
         const RESET: i64 = 600_000;
@@ -2080,5 +2120,237 @@ mod tests {
             304
         );
         assert_eq!(encode("feature/path #?"), "feature%2Fpath%20%23%3F");
+    }
+
+    #[test]
+    fn reviewer_secondary_limit_must_not_shorten_primary_reserve_hold() {
+        let mut probes = Probes::default();
+        let result = probes.probe("a", "o", "r", "sha", false, 0, |_, _, _| {
+            Ok(response(
+                403,
+                json!({"message":"You have exceeded a secondary rate limit."}),
+                &[
+                    ("retry-after", "60"),
+                    ("x-ratelimit-remaining", "1499"),
+                    ("x-ratelimit-reset", "3600"),
+                ],
+            ))
+        });
+        assert_eq!(result.1, "probe_error:rate_limited");
+        assert_eq!(
+            probes.limited_until, 3_600_000,
+            "secondary Retry-After must not overwrite a longer primary reserve hold"
+        );
+    }
+
+    #[test]
+    fn reviewer_below_reserve_secondary_limit_must_admit_no_pre_reset_request() {
+        let mut probes = Probes::default();
+        let mut calls = 0;
+        probes.probe("a", "o", "r", "sha", false, 0, |_, _, _| {
+            calls += 1;
+            Ok(response(
+                403,
+                json!({"message":"secondary rate limit"}),
+                &[
+                    ("retry-after", "60"),
+                    ("x-ratelimit-remaining", "1499"),
+                    ("x-ratelimit-reset", "3600"),
+                ],
+            ))
+        });
+        let result = probes.probe("b", "o", "r", "sha", false, 60_000, |_, _, _| {
+            calls += 1;
+            Ok(response(
+                200,
+                pending(),
+                &[
+                    ("x-ratelimit-remaining", "1498"),
+                    ("x-ratelimit-reset", "3600"),
+                ],
+            ))
+        });
+        assert_eq!(calls, 1, "request admitted below reserve before UTC reset");
+        assert_eq!(result.1, "probe_error:rate_limited");
+    }
+
+    #[test]
+    fn reviewer_validator_changes_do_not_hide_terminal_payloads() {
+        for (old_etag, new_etag, old_modified, new_modified) in [
+            ("same", "same", "old", "new"),
+            ("old", "new", "same", "same"),
+        ] {
+            let mut probes = Probes::default();
+            probes.probe("v", "o", "r", "sha", false, 0, |_, _, _| {
+                Ok(response(
+                    200,
+                    pending(),
+                    &[("etag", old_etag), ("last-modified", old_modified)],
+                ))
+            });
+            let terminal =
+                probes.probe("v", "o", "r", "sha", false, 60_000, |_, etag, modified| {
+                    assert_eq!(etag, Some(old_etag));
+                    assert_eq!(modified, Some(old_modified));
+                    Ok(response(
+                        200,
+                        completed(),
+                        &[("etag", new_etag), ("last-modified", new_modified)],
+                    ))
+                });
+            assert_eq!(terminal.1, "checks_completed");
+            assert!(terminal.0);
+        }
+        let mut probes = Probes::default();
+        probes.probe("no-etag", "o", "r", "sha", false, 0, |_, _, _| {
+            Ok(response(200, pending(), &[("last-modified", "old")]))
+        });
+        assert!(
+            probes
+                .probe(
+                    "no-etag",
+                    "o",
+                    "r",
+                    "sha",
+                    false,
+                    60_000,
+                    |_, etag, modified| {
+                        assert_eq!(etag, None);
+                        assert_eq!(modified, Some("old"));
+                        Ok(response(200, completed(), &[("last-modified", "new")]))
+                    }
+                )
+                .0
+        );
+    }
+
+    #[test]
+    fn reviewer_unsafe_token_files_fail_closed() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let dir = tempfile::tempdir().unwrap();
+        let safe = dir.path().join("safe");
+        std::fs::write(&safe, "fixture-only").unwrap();
+        std::fs::set_permissions(&safe, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("o.token");
+        symlink(&safe, &link).unwrap();
+        assert!(matches!(token_for_owner(dir.path(), "o"), Err(Error::Auth)));
+        std::fs::remove_file(&link).unwrap();
+        std::fs::create_dir(&link).unwrap();
+        assert!(matches!(token_for_owner(dir.path(), "o"), Err(Error::Auth)));
+        std::fs::remove_dir(&link).unwrap();
+        std::fs::write(&link, "fixture-only").unwrap();
+        std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(token_for_owner(dir.path(), "o"), Err(Error::Auth)));
+        std::fs::set_permissions(&link, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(token_for_owner(dir.path(), "o").is_ok());
+        let duplicate = dir.path().join("O.token");
+        std::fs::write(&duplicate, "fixture-only").unwrap();
+        std::fs::set_permissions(&duplicate, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(token_for_owner(dir.path(), "o"), Err(Error::Auth)));
+    }
+
+    #[test]
+    fn reviewer_auth_retries_are_unbounded_but_one_per_owner_per_minute() {
+        let mut probes = Probes::default();
+        let mut requests = 0;
+        for minute in 0..180 {
+            let now = minute * 60_000;
+            assert_eq!(
+                probes
+                    .probe("bad", "o", "r", "sha", false, now, |_, _, _| {
+                        requests += 1;
+                        Ok(response(401, Value::Null, &[]))
+                    })
+                    .1,
+                "probe_error:auth"
+            );
+            assert_eq!(
+                probes
+                    .probe(
+                        "second",
+                        "O",
+                        "r2",
+                        "sha",
+                        false,
+                        now + 59_999,
+                        |_, _, _| { panic!("owner pause bypassed") }
+                    )
+                    .1,
+                "probe_error:auth"
+            );
+        }
+        assert_eq!(requests, 180);
+    }
+
+    #[test]
+    fn reviewer_http_conditional_validators_are_sent_with_etag_precedence() {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            for (expected_etag, expected_modified, status) in
+                [(Some("v1"), None, 304), (None, Some("date1"), 304)]
+            {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut reader = BufReader::new(&mut stream);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let mut headers = HashMap::new();
+                loop {
+                    line.clear();
+                    assert!(reader.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    let (key, value) = line.trim().split_once(':').unwrap();
+                    headers.insert(key.to_ascii_lowercase(), value.trim().to_string());
+                }
+                assert_eq!(
+                    headers.get("if-none-match").map(String::as_str),
+                    expected_etag
+                );
+                assert_eq!(
+                    headers.get("if-modified-since").map(String::as_str),
+                    expected_modified
+                );
+                write!(stream, "HTTP/1.1 {status} Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            }
+        });
+        assert_eq!(
+            http_request(&base, "repos/o/r/pulls/1", Some("v1"), Some("date1"), None)
+                .unwrap()
+                .status,
+            304
+        );
+        assert_eq!(
+            http_request(&base, "repos/o/r/pulls/1", None, Some("date1"), None)
+                .unwrap()
+                .status,
+            304
+        );
+        server.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reviewer_fifo_token_must_be_refused_without_blocking_all_owners() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.token");
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(matches!(token_from_file(&path), Err(Error::Auth)))
+                .unwrap();
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(true),
+            "unsafe FIFO must be refused instead of blocking before descriptor validation"
+        );
     }
 }
