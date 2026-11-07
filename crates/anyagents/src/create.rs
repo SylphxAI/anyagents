@@ -9772,7 +9772,7 @@ git -c safe.directory="$5" -C "$5" status --porcelain
                 "shared AGENTS.md must be loaded by the harness for {}",
                 ag.name
             );
-            if let Some(parent_id) = ag.parent_id.as_deref() {
+            if let Some(parent_id) = ag.parent_id.as_ref() {
                 let parent = store.agent(parent_id).unwrap();
                 assert!(prompt.contains(&format!("Direct parent: `agent:{}`", parent.name)));
             }
