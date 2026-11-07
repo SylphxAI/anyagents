@@ -19,6 +19,8 @@
 //! agent. Nothing here reads a credential: the service's address and password
 //! come from the private service this adapter starts for this agent.
 
+mod port;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -50,6 +52,7 @@ pub struct OpenCodeHarness {
     work_dir: Option<PathBuf>,
     environment: Vec<(String, String)>,
     child: Option<Child>,
+    port: Option<port::PortLease>,
     shared: Arc<Mutex<State>>,
     steer: Option<SteerQueue>,
 }
@@ -93,7 +96,7 @@ impl OpenCodeHarness {
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
-        Self::start_with(program, session_id, environment, work_dir)
+        Self::start_with(program, session_id, environment, work_dir, None)
     }
 
     fn start_with(
@@ -101,19 +104,36 @@ impl OpenCodeHarness {
         session_id: Option<&str>,
         environment: &[(&str, &str)],
         work_dir: Option<&Path>,
+        config_dir: Option<&Path>,
     ) -> Result<Self, HarnessError> {
         let mut harness = Self {
             program: program.into(),
-            config_dir: None,
+            config_dir: config_dir.map(Path::to_path_buf),
             work_dir: work_dir.map(Path::to_path_buf),
             environment: environment
                 .iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect(),
             child: None,
+            port: None,
             shared: Arc::new(Mutex::new(State::default())),
             steer: None,
         };
+        if let Some(dir) = config_dir {
+            // Override inherited host roots, including OpenCode's explicit
+            // config override, before any vendor command can discover a service.
+            for (key, value) in [
+                ("XDG_CONFIG_HOME", dir.to_path_buf()),
+                ("OPENCODE_CONFIG_DIR", dir.join("opencode")),
+                ("XDG_DATA_HOME", dir.join("data-home")),
+                ("XDG_STATE_HOME", dir.join("state-home")),
+            ] {
+                harness.environment.retain(|(name, _)| name != key);
+                harness
+                    .environment
+                    .push((key.into(), value.display().to_string()));
+            }
+        }
         harness.lock().session = session_id.map(str::to_string);
         harness.begin()?;
         Ok(harness)
@@ -127,10 +147,7 @@ impl OpenCodeHarness {
         work_dir: Option<&Path>,
         config_dir: &Path,
     ) -> Result<Self, HarnessError> {
-        let mut harness = Self::start_with(program, session_id, environment, work_dir)?;
-        harness.config_dir = Some(config_dir.to_path_buf());
-        harness.remember_session();
-        Ok(harness)
+        Self::start_with(program, session_id, environment, work_dir, Some(config_dir))
     }
 
     /// Also watch `queue` for lines a channel pushed between model steps.
@@ -176,24 +193,74 @@ impl OpenCodeHarness {
 
     /// Start the service, wait until it answers, and resume the session.
     fn begin(&mut self) -> Result<(), HarnessError> {
-        // The service prints its address and password on stdout, so it is read
-        // here and every later call is pointed at exactly this one.
+        // Keep a stable private port across restarts; never use the managed
+        // service default or allow `api` to discover a different service.
+        for attempt in 0..3 {
+            let previous = self.port.take().map(|lease| lease.port);
+            self.port = Some(port::PortLease::acquire(
+                self.config_dir.as_deref(),
+                previous,
+            )?);
+            let port = self.port.as_ref().expect("allocated port").port;
+            let (announced, collision) = self.launch_service(port)?;
+            if announced {
+                return self.resume_session();
+            }
+            self.stop_child();
+            // The holder may already have released the port. Preserve the
+            // child's bind result rather than inferring it from a later probe.
+            let reported_collision = collision
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or(false);
+            // An unrelated process can win the bind after socket handoff.
+            // Only retry a witnessed collision, never a generic startup error.
+            if attempt == 2
+                || (!reported_collision
+                    && !matches!(std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)),
+                        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse))
+            {
+                return Err(HarnessError::Failed(
+                    "the OpenCode service did not announce its private endpoint; the session is untouched".into(),
+                ));
+            }
+        }
+        unreachable!("bounded startup attempts")
+    }
+
+    fn launch_service(
+        &mut self,
+        port: u16,
+    ) -> Result<(bool, std::sync::mpsc::Receiver<bool>), HarnessError> {
         let mut command = anyagents_harness::spawn_command(&self.program, &self.environment);
         command
-            .args(["serve", "--port", "0"])
+            .args([
+                "serve",
+                "--hostname",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+            ])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         if let Some(dir) = &self.work_dir {
             command.current_dir(dir);
         }
         for (key, value) in &self.environment {
             command.env(key, value);
         }
+        // Inherited credentials suppress the password announcement. Generate a
+        // fresh child credential instead; only API children receive it below.
+        command
+            .env_remove("OPENCODE_PASSWORD")
+            .env_remove("OPENCODE_SERVER_PASSWORD");
+        self.port.as_mut().expect("allocated port").handoff();
         let mut child = command
             .spawn()
             .map_err(|err| HarnessError::Failed(err.to_string()))?;
-        if let Some(stdout) = child.stdout.take() {
+        let collision = port::watch_collision(child.stderr.take().expect("piped stderr"));
+        self.child = Some(child);
+        if let Some(stdout) = self.child.as_mut().and_then(|child| child.stdout.take()) {
             use std::io::{BufRead, BufReader, Read};
             use std::sync::mpsc;
             // A service that never announces itself must not wedge the
@@ -221,12 +288,17 @@ impl OpenCodeHarness {
             let deadline = Instant::now() + START_TIMEOUT;
             while Instant::now() < deadline {
                 let left = deadline.saturating_duration_since(Instant::now());
-                let Ok(line) = heard.recv_timeout(left.min(Duration::from_millis(500))) else {
-                    continue;
+                let line = match heard.recv_timeout(left.min(Duration::from_millis(500))) {
+                    Ok(line) => line,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 };
                 let line = line.trim();
                 if let Some(rest) = line.strip_prefix("server listening on ") {
-                    self.lock().service = Some(rest.trim_end_matches('/').to_string());
+                    let endpoint = rest.trim_end_matches('/');
+                    if endpoint == format!("http://127.0.0.1:{port}") {
+                        self.lock().service = Some(endpoint.to_string());
+                    }
                 }
                 if let Some(password) = line.strip_prefix("server password ") {
                     self.lock().password = Some(password.trim().to_string());
@@ -236,8 +308,12 @@ impl OpenCodeHarness {
                 }
             }
         }
-        self.child = Some(child);
-        self.lock().alive = true;
+        let announced = self.lock().service.is_some() && self.lock().password.is_some();
+        self.lock().alive = announced;
+        Ok((announced, collision))
+    }
+
+    fn resume_session(&mut self) -> Result<(), HarnessError> {
         let ready = Instant::now() + READY_TIMEOUT;
         let mut up = false;
         while Instant::now() < ready {
@@ -343,9 +419,12 @@ impl OpenCodeHarness {
         // `opencode api --server <url> <METHOD> <path>`, as the CLI reads it:
         // the subcommand comes first, then its flags.
         command.arg("api");
-        if let Some(service) = self.lock().service.clone() {
-            command.args(["--server", &service]);
-        }
+        let service = self.lock().service.clone().ok_or_else(|| {
+            HarnessError::Failed(
+                "OpenCode private endpoint is unavailable; refusing service discovery".into(),
+            )
+        })?;
+        command.args(["--server", &service]);
         command.args([method, path]);
         if let Some(body) = &body {
             command.args(["-d", &body.to_string()]);
@@ -704,8 +783,8 @@ impl Harness for OpenCodeHarness {
     }
 }
 
-impl Drop for OpenCodeHarness {
-    fn drop(&mut self) {
+impl OpenCodeHarness {
+    fn stop_child(&mut self) {
         self.lock().alive = false;
         if let Some(mut child) = self.child.take() {
             // The exact child, never a pattern or a group: a shared desk refuses
@@ -726,6 +805,14 @@ impl Drop for OpenCodeHarness {
             }
             let _ = child.wait();
         }
+        self.lock().service = None;
+        self.lock().password = None;
+    }
+}
+
+impl Drop for OpenCodeHarness {
+    fn drop(&mut self) {
+        self.stop_child();
     }
 }
 

@@ -43,9 +43,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         include_str!("../migrations/021_lexical_fts_perf_and_seq.sql"),
     ),
     (21, include_str!("../migrations/022_agent_description.sql")),
+    (22, include_str!("../migrations/023_scope_audit.sql")),
     (
-        22,
-        include_str!("../migrations/023_conversation_redactions.sql"),
+        23,
+        include_str!("../migrations/024_conversation_redactions.sql"),
     ),
 ];
 
@@ -97,4 +98,31 @@ pub fn current_version(conn: &Connection) -> Result<i64, Error> {
         |row| row.get(0),
     )?;
     Ok(version)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redaction_migration_upgrades_scope_audit_without_replacing_it() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at_ms INTEGER NOT NULL);",
+        )
+        .unwrap();
+        for (version, sql) in MIGRATIONS.iter().filter(|(version, _)| *version <= 22) {
+            conn.execute_batch(sql).unwrap();
+            conn.execute("INSERT INTO schema_migrations VALUES (?1, 0)", [version])
+                .unwrap();
+        }
+        migrate(&mut conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 23);
+        conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
+            .unwrap();
+        conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
+            .unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 23);
+    }
 }
