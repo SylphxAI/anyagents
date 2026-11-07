@@ -777,3 +777,138 @@ fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
         }
     }
 }
+
+#[test]
+fn contended_migration_publishes_wait_without_pin_or_dispatch_then_retries() {
+    use anyagents_core::{NewAgent, Store, host_session};
+    use std::{fs, os::unix::fs::PermissionsExt};
+    // Complete salt residue classes and every distinct exponential shift,
+    // including saturation: the existing retry path never sleeps over 60 s.
+    let delays: Vec<_> = (0..=18)
+        .chain([u32::MAX])
+        .flat_map(|attempt| {
+            (0..40).map(move |salt| anyagents_supervisor::restart_delay_ms(attempt, salt))
+        })
+        .collect();
+    assert!(delays.iter().all(|delay| (1..=60_000).contains(delay)));
+    assert_eq!(delays.iter().max(), Some(&60_000));
+    assert_eq!(anyagents_supervisor::restart_delay_ms(1, 0), 200);
+    assert_eq!(anyagents_supervisor::restart_delay_ms(1, 39), 297);
+    let _env = support::lock();
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path();
+    support::operator_with_configured_seat(data);
+    let store = Store::open(data.join("state.db")).unwrap();
+    let agent = store
+        .create_agent(NewAgent::new("launch-waits", "claude-code"))
+        .unwrap();
+    store.set_agent_state(&agent.id, "running").unwrap();
+    let config = data.join("agents").join(agent.id.as_str()).join("config");
+    let root = config.parent().unwrap();
+    let vendor_memory = config.join("projects/known/memory");
+    fs::create_dir_all(&vendor_memory).unwrap();
+    fs::write(
+        vendor_memory.join("MEMORY.md"),
+        b"vendor-only authoritative facts",
+    )
+    .unwrap();
+    fs::write(config.join("adapter.json"), br#"{"harness":"claude-code"}"#).unwrap();
+    let adapter = data.join("adapter");
+    fs::write(
+        &adapter,
+        r#"#!/bin/sh
+printf dispatched > "$ANYAGENTS_AGENT_CONFIG/dispatch"
+exec /bin/cat
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&adapter, fs::Permissions::from_mode(0o755)).unwrap();
+    let migration = data.join("host-memory-migration");
+    fs::create_dir_all(&migration).unwrap();
+    let held = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(migration.join("migration.lock"))
+        .unwrap();
+    held.lock().unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+        .env("PATH", support::machine_path(data))
+        .env("ANYAGENTS_HARNESS_BIN", &adapter)
+        .env("ANYAGENTS_FAKE_MODE", "1")
+        .arg("--data")
+        .arg(data)
+        .arg("serve")
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(
+            fs::File::create(data.join("server.stderr")).unwrap(),
+        ))
+        .spawn()
+        .unwrap();
+    let server = Serve {
+        child,
+        socket: data.join("anyagents.sock"),
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::os::unix::net::UnixStream::connect(&server.socket).is_ok() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            fs::read_to_string(data.join("server.stderr")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    loop {
+        let (_, body) = support::call(&server.socket, "GET", "/v1/agents", "");
+        let row = body["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == agent.id.as_str())
+            .unwrap();
+        if row["block_reason"] == "memory_migration_wait" {
+            assert!(
+                row["last_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("waiting_on=migration.lock"),
+                "{row}"
+            );
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "missing explicit migration wait: {body}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!config.join("dispatch").exists());
+    assert!(host_session::active(root).unwrap().is_none());
+    assert!(!root.join("memory/MEMORY.md").exists());
+    drop(held); // flock's existing descriptor-close path releases the holder.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !config.join("dispatch").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "retry did not dispatch: {}",
+            fs::read_to_string(data.join("server.stderr")).unwrap()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let session = host_session::active(root).unwrap().unwrap();
+    assert!(
+        session
+            .memory
+            .section
+            .contains("vendor-only authoritative facts")
+    );
+    assert_eq!(
+        fs::read(root.join("memory/MEMORY.md")).unwrap(),
+        b"vendor-only authoritative facts"
+    );
+    assert!(!vendor_memory.join("MEMORY.md").exists());
+}

@@ -384,8 +384,16 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     // The supervisor owns the agent process lock. Allocate the host generation
     // before any vendor can consume its instructions, never from a late marker.
-    crate::host_memory::before_launch(&request.data_dir, &request.agent.id)
-        .map_err(|e| format!("host migration failed: {e}"))?;
+    crate::host_memory::before_launch(&request.data_dir, &request.agent.id).map_err(|error| {
+        match error {
+            anyagents_core::Error::Io(ref cause)
+                if cause.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                "memory_migration_wait: waiting_on=migration.lock; retryable=true".to_owned()
+            }
+            _ => format!("host migration failed: {error}"),
+        }
+    })?;
     prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
     let res = vendor_launch_inner(request);

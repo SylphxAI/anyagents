@@ -3458,6 +3458,9 @@ pub(crate) fn compute_block_reason(
     }
     if let Some(err) = last_error.map(str::trim).filter(|s| !s.is_empty()) {
         let lower = err.to_ascii_lowercase();
+        if lower.starts_with("memory_migration_wait:") {
+            return Some("memory_migration_wait".to_string());
+        }
         if lower.contains("quota")
             || lower.contains("resource_exhausted")
             || lower.contains("rate_limit")

@@ -33,7 +33,11 @@ fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Resu
         .open(directory.join("migration.lock"))?;
     if !try_migration_lock(&lock)? {
         record_lock_deferral(data, "before_launch", Some(agent))?;
-        return Ok(());
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "host memory migration deferred (retryable): waiting_on=migration.lock",
+        )
+        .into());
     }
     let mut migration = HostMigration::open(data)?;
     let stopped = HashSet::from([agent.to_string()]);
@@ -440,7 +444,10 @@ mod tests {
         worker.join().unwrap();
         let (launch, startup) =
             completed_while_held.expect("maintenance waited for the held global lock");
-        launch.unwrap();
+        assert!(
+            matches!(launch, Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{launch:?}"
+        );
         startup.unwrap();
         assert!(unchanged_while_held);
         for name in ["startup".to_owned(), agent.id.to_string()] {
