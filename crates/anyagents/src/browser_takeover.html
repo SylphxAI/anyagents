@@ -17,7 +17,7 @@
     button { padding: 0 12px; cursor: pointer; }
     button:hover { background: #344965; }
     button:focus-visible, input:focus-visible { outline: 2px solid #80ceff; outline-offset: 1px; }
-    #hud-bar button { border: 0; border-radius: 24px; background: transparent; }
+    #hud-bar button { flex: 0 0 auto; padding: 0 4px; font-size: 14px; border: 0; border-radius: 24px; background: transparent; }
     #hud-bar #done-btn { background: #047b61; font-weight: 650; }
     #hud-panel { width: 360px; max-width: calc(100vw - 26px); padding: 10px; display: grid; gap: 8px; max-height: 65dvh; overflow-y: auto; }
     #hud-panel[hidden] { display: none; }
@@ -27,7 +27,8 @@
     #page-url { font-size: 12px; color: #a7b9cf; overflow-wrap: anywhere; max-height: 40px; overflow: auto; }
     details { font-size: 13px; color: #bfd0e4; }
     summary { cursor: pointer; padding: 8px 0; }
-    #keyboard-proxy { position: fixed; left: 0; top: 0; width: 1px; height: 1px; min-width: 0; min-height: 0; opacity: .01; border: 0; padding: 0; pointer-events: none; }
+    #keyboard-proxy { position: fixed; left: 0; top: 0; width: 1px; height: 1px; min-width: 0; min-height: 0; opacity: .02; color: transparent; background: transparent; border: 0; padding: 0; pointer-events: none; z-index: 2; font-size: 16px; }
+    #clipboard-status { position: fixed; left: 12px; right: 12px; bottom: 70px; text-align: center; font-size: 14px; color: #ffe2a2; pointer-events: none; }
     #done-overlay { position: fixed; inset: 0; background: #0b1019f5; display: grid; place-content: center; text-align: center; padding: 24px; }
     #done-overlay[hidden] { display: none; }
     #hint { font-size: 12px; color: #a7b9cf; }
@@ -38,11 +39,16 @@
   <div id="connection" role="status">Connecting…</div>
   <section id="hud" aria-label="Browser controls">
     <div id="hud-bar">
-      <button id="hud-toggle" aria-expanded="false" aria-controls="hud-panel">☰ Controls</button>
-      <button id="keyboard-btn" aria-label="Open keyboard">⌨</button>
+      <button id="hud-toggle" aria-label="More controls" aria-expanded="false" aria-controls="hud-panel">☰</button>
+      <button id="paste-btn">Paste</button>
+      <button id="copy-btn">Copy</button>
+      <button id="select-all-btn" aria-label="Select all" title="Select all (⌘A / Ctrl+A)">Select all</button>
+      <button id="tab-btn">Tab</button>
+      <button id="esc-btn">Esc</button>
       <button id="done-btn">Done</button>
     </div>
     <div id="hud-panel" hidden>
+      <button id="keyboard-btn" aria-label="Open keyboard">Open keyboard ⌨</button>
       <input id="type-input" placeholder="Type or paste text…" aria-label="Text to send" autocomplete="off" autocapitalize="off" spellcheck="false">
       <div class="row"><button id="send-text-btn">Send</button><button id="enter-btn">Enter ↵</button><button id="bksp-btn" aria-label="Backspace">⌫</button></div>
       <div class="row"><button id="reset-btn">Reset zoom</button><button id="fit-btn">1:1</button></div>
@@ -51,6 +57,7 @@
       <details><summary>Session details · {{PROFILE}}</summary><p>{{REASON}}</p><p>Phone layout is optional. It resizes the remote page without changing its browser identity.</p><div id="captcha-badge"></div><div id="page-url"></div><button id="reload-btn" aria-label="Reload remote page">Reload ↻</button></details>
     </div>
   </section>
+  <div id="clipboard-status" role="status" aria-live="polite"></div>
   <input id="keyboard-proxy" aria-label="Remote keyboard" autocomplete="off" autocapitalize="off" spellcheck="false">
   <div id="done-overlay" hidden><h2>Control handed back</h2><p>Your session is saved in <b>{{PROFILE}}</b>.<br>You can close this tab.</p></div>
   <script id="takeover-config" type="application/json">{{CONFIG}}</script>

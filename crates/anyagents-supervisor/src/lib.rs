@@ -1035,8 +1035,8 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Ok(RunOutcome::Idle) => {
-                // The mailbox has drained, so whatever the vendor reported for
-                // this burst is read once and recorded.
+                // No message was accepted on this pass (the mailbox may still
+                // contain deferred mail). Record whatever the vendor reported.
                 self.record_usage();
                 if self.try_apply_pending_switch() {
                     return false;
@@ -1238,6 +1238,11 @@ impl<H: Harness + 'static> Session<H> {
                 self.pending_recovery = false;
                 return false;
             };
+            // Idle also covers deferred or passive mail. Recovery must not
+            // overtake any queued message, and a failed read is not emptiness.
+            if !matches!(delivery.store().next_undelivered(&self.id), Ok(None)) {
+                return false;
+            }
             let open = match delivery.store().open_turn(&self.id) {
                 Ok(Some(open)) => open,
                 Ok(None) | Err(_) => {

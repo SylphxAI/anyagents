@@ -7678,6 +7678,17 @@ mod tests {
             }
         });
         std::fs::write(&rollout_path, format!("{rollout_line}\n")).unwrap();
+        let rotated_at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        std::fs::write(
+            child_cfg.join(".anyagents-profile-rotated-ms"),
+            "1700000000000\n",
+        )
+        .unwrap();
+        let rollout = std::fs::File::options()
+            .write(true)
+            .open(&rollout_path)
+            .unwrap();
+        rollout.set_modified(rotated_at).unwrap();
 
         let mut views = vec![crate::api::AgentView {
             id: child.id.to_string(),
@@ -7713,6 +7724,16 @@ mod tests {
             schedules: Vec::new(),
         }];
 
+        // A rollout at the rotation boundary is stale, even if it contains an
+        // error. Do not let wall-clock or filesystem precision decide freshness.
+        crate::agent::reconcile_and_enrich_views(data, &mut views);
+        assert_eq!(views[0].turn_state, "working");
+        assert!(views[0].last_error.is_none());
+        assert!(store.next_undelivered(&parent.id).unwrap().is_none());
+
+        rollout
+            .set_modified(rotated_at + std::time::Duration::from_secs(1))
+            .unwrap();
         crate::agent::reconcile_and_enrich_views(data, &mut views);
         assert_eq!(views[0].turn_state, "errored");
         assert_eq!(

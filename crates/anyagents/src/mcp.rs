@@ -394,7 +394,7 @@ struct SendArgs {
 struct ConversationArgs {
     /// Optional lexical + structured search query (`Raw-RAG`: SQLite FTS5 BM25 with hybrid
     /// ASCII identifier + CJK bigram tokenization, exact phrase boost, and substring fallback).
-    /// When set, searches across all historical and live turns without loading the
+    /// When set, searches authorized historical and live turns without loading the
     /// full history. Omit `query` to read recent chronological turns or filter by tool/range.
     #[serde(default, alias = "q", alias = "search")]
     query: Option<String>,
@@ -407,7 +407,8 @@ struct ConversationArgs {
     exclude: Vec<String>,
     /// Agent name (`sage`, `volt`, `xenon`, `"all"`) or `agt_...` ID whose complete
     /// two-way (`in` + `out`) conversation to read or search. Defaults to `"all"` when
-    /// searching, or this agent when reading recent chronological turns.
+    /// searching, or this agent when reading recent chronological turns. Non-admin
+    /// callers can read only self and descendants; `all` means that authorized set.
     #[serde(default)]
     agent: Option<String>,
     /// Optional peer filter (e.g. `alice`, `telegram:user:42`, `telegram:chat:-1001234567890`,
@@ -932,7 +933,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Unified two-way (`in` + `out`) conversation reader and Zero-Embedding Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search across all agents' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns."
+        description = "Unified two-way (`in` + `out`) conversation reader and Zero-Embedding Lexical + Structured History Search (`query`, `queries`, `exclude`, `include_tools`, `only_tools`, `tool_name`, `direction`, `sender`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Live incoming messages are pushed automatically to your session, so you never need to poll an inbox. Pass `query` / `queries` (or structured filters like `only_tools: true`, `tool_name`, `range`) to search the caller's and descendants' historical memory (`agent` defaults to `\"all\"`), or omit them to read recent chronological two-way turns. Non-admin agents read only self and descendants; `all` never grants peer, sibling or parent history access."
     )]
     async fn conversation(
         &self,
@@ -1066,7 +1067,7 @@ impl AgentMcp {
     }
 
     #[tool(
-        description = "Zero-Embedding Lossless Lexical + Structured History Search across all agents' conversations and tool history (`query`, `queries`, `exclude`, `agent`, `with`, `direction`, `sender`, `include_tools`, `only_tools`, `tool_name`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Combines SQLite FTS5 BM25 (ASCII identifiers + CJK bigrams), exact phrase boost, and contiguous episode context expansion."
+        description = "Zero-Embedding Lossless Lexical + Structured History Search across authorized conversations and tool history (`query`, `queries`, `exclude`, `agent`, `with`, `direction`, `sender`, `include_tools`, `only_tools`, `tool_name`, `since_ms`, `until_ms`, `from_seq`, `to_seq`, `range`, `sort`, `radius`, `limit`). Combines SQLite FTS5 BM25 (ASCII identifiers + CJK bigrams), exact phrase boost, and contiguous episode context expansion."
     )]
     async fn search(
         &self,
