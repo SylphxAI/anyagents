@@ -51,7 +51,7 @@ impl Store {
         for agent in &agents {
             let root = self.data_dir().join("agents").join(agent.id.as_str());
             if !safe_components(self.data_dir(), &root)? {
-                index.retain_agent_documents(agent.id.as_str(), &HashSet::new())?;
+                index.retain_agent_scope(agent.id.as_str(), scope, &HashSet::new())?;
                 continue;
             }
             let mut ids = HashSet::new();
@@ -74,35 +74,39 @@ impl Store {
                 .into_iter()
                 .flatten()
                 .collect::<Vec<_>>();
-            for path in regular_files(&root.join("memory"), true)? {
-                if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                    continue;
+            if scope != MemoryScope::Transcripts {
+                for path in regular_files(&root.join("memory"), true)? {
+                    if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
+                        continue;
+                    }
+                    let id = format!(
+                        "memory:{}:{}",
+                        agent.id,
+                        sha256(path.as_os_str().as_encoded_bytes())
+                    );
+                    let metadata = IndexMetadata {
+                        agent_id: agent.id.to_string(),
+                        source: MemoryScope::Memory,
+                        timestamp_ms: modified_ms(&path)?,
+                        direction: "in".into(),
+                        sender: format!("agent:{}", agent.name),
+                        destination: format!("agent:{}", agent.name),
+                        tool_name: None,
+                        role: Some("memory".into()),
+                    };
+                    refresh_document(&mut index, &id, &metadata, &path)?;
+                    ids.insert(id);
                 }
-                let id = format!(
-                    "memory:{}:{}",
-                    agent.id,
-                    sha256(path.as_os_str().as_encoded_bytes())
-                );
-                let metadata = IndexMetadata {
-                    agent_id: agent.id.to_string(),
-                    source: MemoryScope::Memory,
-                    timestamp_ms: modified_ms(&path)?,
-                    direction: "in".into(),
-                    sender: format!("agent:{}", agent.name),
-                    destination: format!("agent:{}", agent.name),
-                    tool_name: None,
-                    role: Some("memory".into()),
-                };
-                refresh_document(&mut index, &id, &metadata, &path)?;
-                ids.insert(id);
             }
-            for path in native_transcripts(&root)? {
-                if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
-                    continue;
+            if scope != MemoryScope::Memory {
+                for path in native_transcripts(&root)? {
+                    if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
+                        continue;
+                    }
+                    ids.extend(refresh_native(&mut index, agent, &path)?.documents);
                 }
-                ids.extend(refresh_native(&mut index, agent, &path)?.documents);
             }
-            index.retain_agent_documents(agent.id.as_str(), &ids)?;
+            index.retain_agent_scope(agent.id.as_str(), scope, &ids)?;
         }
         let visible: Vec<_> = agents.iter().map(|a| a.id.to_string()).collect();
         let mut request = query.clone();
@@ -132,6 +136,15 @@ fn refresh_document(
     metadata: &IndexMetadata,
     path: &Path,
 ) -> Result<(), IndexError> {
+    refresh_document_before_publish(index, id, metadata, path, || Ok(()))
+}
+fn refresh_document_before_publish(
+    index: &mut HostIndex,
+    id: &str,
+    metadata: &IndexMetadata,
+    path: &Path,
+    before_publish: impl FnOnce() -> io::Result<()>,
+) -> Result<(), IndexError> {
     let stamp = FileStamp::read(&open_readonly(path)?)?;
     let policy = serde_json::to_string(metadata)?;
     if index
@@ -143,6 +156,7 @@ fn refresh_document(
     let raw = document_coordinate(path)?;
     index.refresh_source(|index| {
         index.index(id, metadata, &raw)?;
+        before_publish()?;
         if FileStamp::read(&open_readonly(path)?)? == stamp {
             index.save_source(
                 &metadata.agent_id,
@@ -155,6 +169,12 @@ fn refresh_document(
                     prefix_sha256: raw.sha256.clone(),
                 },
             )?;
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "memory source changed during refresh; retry",
+            )
+            .into());
         }
         Ok(())
     })
@@ -379,6 +399,137 @@ fn event_metadata(agent: &Agent, value: &EventHeader, fallback_time: i64) -> Ind
 mod tests {
     use super::*;
     use crate::NewAgent;
+    #[test]
+    fn memory_changed_during_publication_rolls_back_documents_and_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("MEMORY.md");
+        let mut index = HostIndex::open(&dir.path().join("index.db")).unwrap();
+        let metadata = IndexMetadata {
+            agent_id: "owner".into(),
+            source: MemoryScope::Memory,
+            timestamp_ms: 0,
+            direction: "in".into(),
+            sender: "owner".into(),
+            destination: "owner".into(),
+            tool_name: None,
+            role: Some("memory".into()),
+        };
+        fs::write(&path, "committedneedle").unwrap();
+        refresh_document(&mut index, "memory:owner:one", &metadata, &path).unwrap();
+        let before = serde_json::to_string(&index.source_cursor("owner", &path).unwrap()).unwrap();
+        fs::write(&path, "uncommittedneedle").unwrap();
+        let error = refresh_document_before_publish(
+            &mut index,
+            "memory:owner:one",
+            &metadata,
+            &path,
+            || fs::write(&path, "racingneedle"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, IndexError::Io(ref e) if e.kind() == io::ErrorKind::WouldBlock));
+        assert_eq!(
+            serde_json::to_string(&index.source_cursor("owner", &path).unwrap()).unwrap(),
+            before
+        );
+        let query = |term: &str| HistorySearchQuery {
+            query: Some(term.into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            index
+                .search(
+                    &["owner".into()],
+                    MemoryScope::Memory,
+                    &query("committedneedle")
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            index
+                .search(
+                    &["owner".into()],
+                    MemoryScope::Memory,
+                    &query("uncommittedneedle")
+                )
+                .unwrap()
+                .is_empty()
+        );
+        refresh_document(&mut index, "memory:owner:one", &metadata, &path).unwrap();
+        assert_eq!(
+            index
+                .search(
+                    &["owner".into()],
+                    MemoryScope::Memory,
+                    &query("racingneedle")
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn scoped_refresh_ignores_unrelated_failures_and_preserves_other_class() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("scoped-owner", "sylphx"))
+            .unwrap();
+        let root = dir.path().join("agents").join(agent.id.as_str());
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::create_dir_all(root.join("config")).unwrap();
+        let memory = root.join("memory/MEMORY.md");
+        let native = root.join("config/sylphx-transcript.jsonl");
+        fs::write(&memory, "sharedneedle").unwrap();
+        fs::write(&native, "{\"content\":\"sharedneedle\"}\n").unwrap();
+        let ids = [agent.id.to_string()];
+        let q = HistorySearchQuery {
+            query: Some("sharedneedle".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            store
+                .search_host_files(&ids, MemoryScope::All, &q)
+                .unwrap()
+                .len(),
+            2
+        );
+        let cursor = |path: &Path| {
+            serde_json::to_string(
+                &HostIndex::open(&dir.path().join(INDEX_FILE))
+                    .unwrap()
+                    .source_cursor(agent.id.as_str(), path)
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        let native_before = cursor(&native);
+        fs::write(&native, "invalid complete JSON record\n").unwrap();
+        assert_eq!(
+            store
+                .search_host_files(&ids, MemoryScope::Memory, &q)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(cursor(&native), native_before);
+        assert!(store.search_host_files(&ids, MemoryScope::All, &q).is_err());
+        fs::write(&native, "{\"content\":\"sharedneedle\"}\n").unwrap();
+        let memory_before = cursor(&memory);
+        fs::hard_link(&memory, root.join("hardlink")).unwrap();
+        assert_eq!(
+            store
+                .search_host_files(&ids, MemoryScope::Transcripts, &q)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(cursor(&memory), memory_before);
+        assert!(store.search_host_files(&ids, MemoryScope::All, &q).is_err());
+    }
+
     #[test]
     fn persistent_cursor_reuses_unchanged_and_authenticates_append_edit_replace_and_tail() {
         use std::io::Write;

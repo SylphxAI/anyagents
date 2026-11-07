@@ -104,10 +104,22 @@ impl HostIndex {
         owner: &str,
         keep: &std::collections::HashSet<String>,
     ) -> Result<(), IndexError> {
+        self.retain_agent_scope(owner, MemoryScope::All, keep)
+    }
+
+    /// A scoped refresh must not prune the other source class or its cursors.
+    pub(crate) fn retain_agent_scope(
+        &mut self,
+        owner: &str,
+        scope: MemoryScope,
+        keep: &std::collections::HashSet<String>,
+    ) -> Result<(), IndexError> {
         let ids = self
             .conn
-            .prepare("SELECT id FROM host_documents WHERE agent_id=?1")?
-            .query_map([owner], |r| r.get::<_, String>(0))?
+            .prepare(
+                "SELECT id FROM host_documents WHERE agent_id=?1 AND (?2 IS NULL OR source=?2)",
+            )?
+            .query_map(params![owner, scope.source()], |r| r.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         let tx = self.conn.transaction()?;
         for id in ids {
