@@ -2716,7 +2716,7 @@ async fn set_subagent_defaults_route(
 struct DescriptionRequest {
     #[serde(default)]
     description: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "instruction", alias = "system_prompt")]
     instructions: Option<String>,
     #[serde(default)]
     role: Option<String>,
@@ -3733,7 +3733,6 @@ async fn create_agent_route(
             body.model,
             body.profile,
         );
-        let explicit_description = body.description.clone();
         let mut agent = create::create(
             &state.store,
             state.store.data_dir(),
@@ -3748,39 +3747,39 @@ async fn create_agent_route(
                 base: body.base,
                 workdir: body.workdir.map(PathBuf::from),
                 workdir_default: owner_workdir(),
-                instructions: body.instructions.or(body.description),
+                description: body.description,
+                instructions: body.instructions,
                 parent_id,
             },
         )
         .map_err(ApiError::from_store)?;
-        if let Some(ref desc) = explicit_description {
-            let trimmed = desc.trim();
-            if !trimmed.is_empty() {
-                agent = state
-                    .store
-                    .set_agent_description(&agent.id, Some(trimmed))
-                    .map_err(ApiError::from_store)?;
-            }
-        }
         let actor = match &principal {
             Principal::Operator => "operator".to_string(),
             Principal::Agent { name, .. } => format!("agent:{name}"),
         };
+        let mut scope_changed = false;
         if let Some(ref scope_val) = body.scope {
             agent = state
                 .store
                 .set_agent_scope_as(&agent.id, scope_val, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         } else if body.public == Some(true) {
             agent = state
                 .store
                 .set_agent_public_as(&agent.id, true, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
         } else if body.public == Some(false) {
             agent = state
                 .store
                 .set_agent_public_as(&agent.id, false, &actor)
                 .map_err(ApiError::from_store)?;
+            scope_changed = true;
+        }
+        if scope_changed {
+            let cfg = anyagents_core::agent_config_dir(state.store.data_dir(), &agent.id);
+            create::sync_agent_description_files(&state.store, &agent, &cfg);
         }
         if !requested_group_names.is_empty() {
             let mut targets = vec![agent.id.clone()];
