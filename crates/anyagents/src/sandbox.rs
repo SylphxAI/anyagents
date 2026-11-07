@@ -1185,16 +1185,33 @@ fn admission_script(checks: impl IntoIterator<Item = Check>) -> String {
     for check in checks {
         // Labels are static diagnostic text, never a path, capability or command output.
         let label = check.what.replace('\'', "'\\''");
-        script.push_str(&format!("check='{label}'\n{}\n", check.program));
+        // A failing left operand of `&&` is exempt from errexit. Make the
+        // complete check a standalone command so its nonzero result must fail;
+        // do not put it in an if/|| context that disables inner errexit.
+        script.push_str(&format!("check='{label}'\n(\n{}\n)\n", check.program));
     }
     script
 }
 
-fn checks(config: Option<&Path>, boundary: &Boundary, uid: u32, gid: u32) -> Vec<Check> {
+fn checks(
+    config: Option<&Path>,
+    boundary: &Boundary,
+    uid: u32,
+    gid: u32,
+) -> Result<Vec<Check>, Error> {
     let data = PathBuf::from(&boundary.data_dir);
-    let deny = |what: &'static str, path: String| Check {
-        what,
-        program: format!("[ ! -r {path} ] && [ ! -w {path} ]"),
+    let quote = |path: &Path| -> Result<String, Error> {
+        let path = path.to_str().ok_or_else(|| {
+            Error::Message("a boundary path cannot be represented by the admission shell".into())
+        })?;
+        Ok(format!("'{}'", path.replace('\'', "'\\''")))
+    };
+    let deny = |what: &'static str, path: &Path| -> Result<Check, Error> {
+        let path = quote(path)?;
+        Ok(Check {
+            what,
+            program: format!("[ ! -r {path} ] && [ ! -w {path} ]"),
+        })
     };
     let mut list = vec![
         Check {
@@ -1221,40 +1238,61 @@ fn checks(config: Option<&Path>, boundary: &Boundary, uid: u32, gid: u32) -> Vec
         "operator-token",
         "identity-boundary.json",
     ] {
-        list.push(deny(
-            "the server's own files are denied",
-            data.join(name).display().to_string(),
-        ));
+        list.push(deny("the server's own files are denied", &data.join(name))?);
     }
-    list.push(Check {
-        what: "a peer seat's config is denied",
-        program: "p=; for d in \"$DATA\"/agents/*/config; do [ \"$d\" = \"$MINE\" ] && continue; \
-                  [ -e \"$d\" ] || continue; p=$d; break; done; \
-                  [ -z \"$p\" ] || { [ ! -r \"$p\" ] && [ ! -r \"$p/mcp-capability\" ]; }"
-            .to_string(),
-    });
+    // The seat can traverse known children without being able to list agents/.
+    // Enumerate under the server identity, and refuse an incomplete inventory:
+    // a glob evaluated after dropping privileges can silently hide every peer.
+    let mut peers = match std::fs::read_dir(data.join("agents")) {
+        Ok(entries) => entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()?,
+        // A config-less command can target a boundary without any agent layout.
+        // Only confirmed absence is optional; unreadable inventories still fail.
+        Err(err) if config.is_none() && err.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(err) => return Err(err.into()),
+    };
+    peers.sort();
+    for peer in peers {
+        if Some(peer.as_path()) == config.and_then(Path::parent) {
+            continue;
+        }
+        for name in ["config", "memory", "skills"] {
+            list.push(deny(
+                "peer seats' private trees are denied",
+                &peer.join(name),
+            )?);
+        }
+        list.push(deny(
+            "peer capabilities are denied",
+            &peer.join("config/mcp-capability"),
+        )?);
+    }
     if let Some(config) = config {
-        let mine = config.display().to_string();
+        let mine = quote(config)?;
+        let root = config
+            .parent()
+            .ok_or_else(|| Error::Message("the agent config has no parent boundary".into()))?;
         list.push(Check {
             what: "the agent's own config is writable by it",
             program: format!("[ -w {mine} ]"),
         });
         list.push(Check {
             what: "host memory and skills are writable only in the agent's own tree",
-            program: "root=${MINE%/config}; [ -w \"$root/memory\" ] || exit 1; [ -w \"$root/skills\" ] || exit 1; \
-                      for d in \"$DATA\"/agents/*; do [ \"$d\" = \"$root\" ] && continue; \
-                      for n in memory skills; do [ ! -w \"$d/$n\" ] || exit 1; done; done; \
-                      [ ! -w \"$DATA/skills\" ]"
-                .to_string(),
-        });
-        list.push(Check {
-            what: "its capability is readable by its own seat only",
             program: format!(
-                "m=$(stat -c %a {mine}/mcp-capability); [ \"$m\" = 640 ] || [ \"$m\" = 600 ]"
+                "[ -w {} ] || exit 1; [ -w {} ] || exit 1; [ ! -w {} ]",
+                quote(&root.join("memory"))?,
+                quote(&root.join("skills"))?,
+                quote(&data.join("skills"))?,
             ),
         });
+        let capability = quote(&config.join("mcp-capability"))?;
+        list.push(Check {
+            what: "its capability is readable by its own seat only",
+            program: format!("m=$(stat -c %a {capability}); [ \"$m\" = 640 ] || [ \"$m\" = 600 ]"),
+        });
     }
-    list
+    Ok(list)
 }
 
 /// Start one admitted agent command, or say what admission is missing.
@@ -1290,7 +1328,13 @@ pub fn run(data: &Path, config: Option<&Path>, command: &[String]) -> Result<(),
         )));
     }
     let groups = format!("{gid},{sock_gid}");
-    let script = admission_script(checks(config, &boundary, uid, gid));
+    let checks = checks(config, &boundary, uid, gid).map_err(|err| {
+        Error::Message(unadmitted(
+            &boundary,
+            &format!("cannot inventory peer boundaries: {err}"),
+        ))
+    })?;
+    let script = admission_script(checks);
     // The probe asserts every property of the boundary and then exits; the
     // agent's own command is not started unless it passes.
     let probe_ref = [
@@ -1368,7 +1412,7 @@ mod tests {
 
     #[test]
     fn admission_failure_names_its_check_without_running_later_commands() {
-        for program in ["false", "true; exit 9"] {
+        for program in ["false", "true; exit 9", "false && true", "false\ntrue"] {
             let script = admission_script([
                 Check {
                     what: "the server's synthetic boundary",
@@ -1401,6 +1445,62 @@ mod tests {
         assert!(output.status.success());
         assert!(output.stdout.is_empty());
         assert!(output.stderr.is_empty());
+    }
+
+    #[test]
+    fn peer_checks_use_complete_host_inventory_and_quoted_exact_paths() {
+        let dir = crate::test_tempdir();
+        let contract = boundary::write(dir.path()).unwrap();
+        let config = dir.path().join("agents/own/config");
+        std::fs::create_dir_all(&config).unwrap();
+        let first = dir.path().join("agents/first-empty");
+        let peer = dir.path().join("agents/peer's private tree");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&peer).unwrap();
+        let run = || {
+            let script = admission_script(
+                checks(Some(&config), &contract, 2100, 2100)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|check| check.what == "peer seats' private trees are denied"),
+            );
+            std::process::Command::new("/bin/sh")
+                .args(["-c", &script])
+                // Seat-side discovery cannot supply a peer through this path.
+                .env("DATA", dir.path().join("no-seat-inventory"))
+                .output()
+                .unwrap()
+        };
+        assert!(run().status.success(), "absent optional peer subtrees");
+        for name in ["memory", "skills", "config"] {
+            let path = peer.join(name);
+            std::fs::create_dir(&path).unwrap();
+            let result = run();
+            assert!(!result.status.success(), "readable/writable peer {name}");
+            assert_eq!(
+                String::from_utf8(result.stderr).unwrap(),
+                "boundary check failed: peer seats' private trees are denied\n"
+            );
+            std::fs::remove_dir(path).unwrap();
+            assert!(run().status.success(), "restored absent peer {name}");
+        }
+    }
+
+    #[test]
+    fn peer_inventory_errors_refuse_except_absent_configless_layout() {
+        let dir = crate::test_tempdir();
+        let contract = boundary::write(dir.path()).unwrap();
+        let config = dir.path().join("agents/own/config");
+        assert!(checks(None, &contract, 2100, 2100).is_ok());
+        assert!(matches!(
+            checks(Some(&config), &contract, 2100, 2100),
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound
+        ));
+        std::fs::write(dir.path().join("agents"), b"not a directory").unwrap();
+        assert!(matches!(
+            checks(None, &contract, 2100, 2100),
+            Err(Error::Io(err)) if err.kind() == std::io::ErrorKind::NotADirectory
+        ));
     }
 
     #[test]
@@ -1456,6 +1556,7 @@ mod tests {
         // an earlier false requirement must not be hidden by that success.
         let shared = dir.path().join("skills");
         let overlay_check = checks(Some(&config), &contract, 2100, 2100)
+            .unwrap()
             .into_iter()
             .find(|c| c.what.starts_with("host memory and skills"))
             .unwrap();
@@ -1486,7 +1587,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let contract = boundary::write(dir.path()).unwrap();
         let config = dir.path().join("agents/one/config");
+        std::fs::create_dir_all(&config).unwrap();
         let text: String = checks(Some(&config), &contract, 2100, 2100)
+            .unwrap()
             .iter()
             .map(|check| check.program.clone())
             .collect::<Vec<_>>()

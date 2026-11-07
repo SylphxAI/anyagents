@@ -119,6 +119,9 @@ root=$1; expected_uid=$2; expected_gid=$3
 [ "$(id -u)" = "$expected_uid" ]
 [ "$(id -g)" = "$expected_gid" ]
 printf 'ACTUAL_UID=%s PRIMARY_GID=%s\\n' "$(id -u)" "$(id -g)"
+[ -x "$root/agents" ]
+[ ! -r "$root/agents" ]
+echo PEER_PARENT_TRAVERSE_ONLY
 printf 'synthetic-memory-after\\n' > "$root/agents/synthetic-own/memory/MEMORY.md"
 grep -qx synthetic-memory-after "$root/agents/synthetic-own/memory/MEMORY.md"
 printf 'synthetic-created\n' > "$root/agents/synthetic-own/memory/created"
@@ -176,7 +179,7 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
                                  'stderr': preflight.stderr})
         if preflight.returncode != 0 or 'REAL_UID_FIXTURE_TRAVERSAL_OK' not in preflight.stdout:
             raise RuntimeError(f'real UID fixture traversal failed: {preflight.stderr}')
-        def run_case(name, success):
+        def run_case(name, success, expected_check=None):
             result = subprocess.run(command, env=env, text=True, capture_output=True, timeout=30)
             receipt['cases'].append({'name': name, 'exit': result.returncode,
                                      'stdout': result.stdout, 'stderr': result.stderr})
@@ -184,11 +187,14 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
                 raise RuntimeError(f'{name} unexpected exit {result.returncode}: {result.stderr}')
             if success:
                 for marker in [f'ACTUAL_UID={args.uid} PRIMARY_GID={args.gid}', 'MEMORY_RW_OK',
-                               'SKILL_VIEWS_READ_AND_OWN_OVERLAY_WRITE_OK', 'PRIVATE_AND_GLOBAL_DENIED']:
+                               'PEER_PARENT_TRAVERSE_ONLY', 'SKILL_VIEWS_READ_AND_OWN_OVERLAY_WRITE_OK',
+                               'PRIVATE_AND_GLOBAL_DENIED']:
                     if marker not in result.stdout:
                         raise RuntimeError(f'missing {marker}')
             elif 'MEMORY_RW_OK' in result.stdout or 'agent not started' not in result.stderr:
                 raise RuntimeError(f'{name} did not refuse before command')
+            elif expected_check and f'boundary check failed: {expected_check}' not in result.stderr:
+                raise RuntimeError(f'{name} refused for a different boundary: {result.stderr}')
         run_case('real-uid-positive-and-denial-controls', True)
         if (memory / 'MEMORY.md').read_text() != 'synthetic-memory-after\n':
             raise RuntimeError('host memory readback mismatch')
@@ -198,10 +204,12 @@ echo REAL_UID_FIXTURE_TRAVERSAL_OK
         overlay.rename(mine / 'skills-held')
         run_case('missing-own-overlay-refuses-before-command', False)
         (mine / 'skills-held').rename(overlay)
-        peer_memory = data / 'agents/synthetic-peer/memory'
-        peer_memory.chmod(0o777)
-        run_case('writable-peer-memory-refuses-before-command', False)
-        peer_memory.chmod(0o700)
+        for name in ['memory', 'skills', 'config']:
+            peer_tree = data / f'agents/synthetic-peer/{name}'
+            peer_tree.chmod(0o777)
+            run_case(f'writable-peer-{name}-refuses-before-command', False,
+                     "peer seats' private trees are denied")
+            peer_tree.chmod(0o700)
         (data / 'skills').chmod(0o777)
         run_case('writable-global-refuses-before-command', False)
         (data / 'skills').chmod(0o555)

@@ -237,9 +237,16 @@ independently; supplementary socket group 24033 is not a primary-GID proxy.
 The disposable, invocation-owned fixture proves learned-memory read/write and
 readback, discovery/read through all three skill projections, writable own skill
 overlay, and denied global/peer/host-private reads or writes as appropriate.
-Missing memory, missing overlay, writable peer memory and writable global skills
-each refuse admission before the probe starts. Protected bytes are hashed before
-and after. The receipt records source/binary/script/launcher hashes, each case's
+Missing memory, missing overlay, writable peer memory/skills/config and writable
+global skills each refuse admission before the probe starts. The agent parent
+remains traverse-only (`0711`) and the probe asserts it cannot be listed by the
+seat. Production admission enumerates the complete peer inventory as the server
+before dropping UID, then checks exact shell-quoted paths; seat-side glob
+expansion is not accepted as evidence that no accessible peer exists. Inventory
+errors refuse admission, except confirmed absence for a config-less boundary
+that has no agent layout. Each admission check runs as a standalone subshell,
+so a false left operand of `&&` cannot be hidden by a later passing check under
+shell `errexit`. Protected bytes are hashed before and after. The receipt records source/binary/script/launcher hashes, each case's
 exit and output, and confirmed fixture removal; CI prints it even after failure.
 A native-setpriv preflight checks every fixture ancestor's traversal permission
 with the actual UID/GID before admission. Production admission failures report
