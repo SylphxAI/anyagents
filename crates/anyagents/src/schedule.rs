@@ -1616,13 +1616,13 @@ mod tests {
                 } else if request.contains("/check-runs") {
                     match stage {
                         0 => {
-                            r#"{"check_runs":[{"name":"ci","status":"in_progress","conclusion":null}]}"#
+                            r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"in_progress","conclusion":null}]}"#
                         }
                         2 => {
-                            r#"{"check_runs":[{"name":"review","status":"completed","conclusion":"failure"}]}"#
+                            r#"{"total_count":1,"check_runs":[{"id":2,"name":"review","status":"completed","conclusion":"failure"}]}"#
                         }
                         _ => {
-                            r#"{"check_runs":[{"name":"ci","status":"completed","conclusion":"success"}]}"#
+                            r#"{"total_count":1,"check_runs":[{"id":1,"name":"ci","status":"completed","conclusion":"success"}]}"#
                         }
                     }
                 } else if request.contains("/status?") {
