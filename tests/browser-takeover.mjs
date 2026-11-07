@@ -105,6 +105,9 @@ try {
     await until(() => remote.eval(`document.querySelector('#entry').value === 'pasted once ✓'`), 'native paste inserted once');
     // Cmd+A must select, never type a literal a. Cmd+C returns that selection.
     await key('a','KeyA',65,4);
+    // The preceding paste already populated the clipboard with this text.
+    // A distinct sentinel makes the next read prove Copy actually completed.
+    await viewer.eval(`navigator.clipboard.writeText('shortcut copy pending')`);
     await key('c','KeyC',67,4);
     await until(() => viewer.eval(`navigator.clipboard.readText().then(v=>v==='pasted once ✓')`), 'copy remote selection');
     await key('x','KeyX',88,4);
@@ -137,6 +140,9 @@ try {
     await clickSelector('#paste-btn');
     await until(() => remote.eval(`document.querySelector('#entry').value === 'pill paste'`), 'one-tap paste pill');
     await clickSelector('#select-all-btn');
+    // Do not let the paste's existing clipboard value satisfy the Copy wait.
+    // Otherwise a late Copy can overwrite the next native-paste fixture.
+    await viewer.eval(`navigator.clipboard.writeText('pill copy pending')`);
     await clickSelector('#copy-btn');
     await until(() => viewer.eval(`navigator.clipboard.readText().then(v=>v==='pill paste')`), 'one-tap copy pill');
     if (width<700) {

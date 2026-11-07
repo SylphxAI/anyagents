@@ -66,7 +66,9 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
       assert.equal(await remote.eval('window.remoteInputs'),1,'native + fallback cannot insert twice');
       // Refocus owner after a remote ack auto-focuses the keyboard proxy.
       await viewer.eval(`document.querySelector(${JSON.stringify(owner)}).focus()`);
-      await key('a','KeyA',65,4); await key('c','KeyC',67,4);
+      await key('a','KeyA',65,4);
+      await viewer.eval(`navigator.clipboard.writeText('global copy pending')`);
+      await key('c','KeyC',67,4);
       await until(()=>viewer.eval(`navigator.clipboard.readText().then(t=>t==='shortcut fixture ✓')`),'global Cmd+A/C '+owner);
       await key('x','KeyX',88,4);
       await until(()=>remote.eval(`document.querySelector('#entry').value===''`),'global Cmd+X '+owner);

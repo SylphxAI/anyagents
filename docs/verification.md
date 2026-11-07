@@ -292,6 +292,18 @@ assertions still require the first click to find the child input at offset
 (60, 80); there is no interaction retry. Remove the quarantine only after both
 failure modes have deterministic fixes.
 
+Copy assertions first replace the local clipboard with a distinct sentinel.
+The preceding paste may already have left the expected Copy text there, so an
+unchanged-value read is not proof that asynchronous Copy completed. In takeover
+run `42406668267` at head `4ba8682d`, the phone native-paste assertion timed out
+with the previous `pill paste` value. A Chromium 156.0.8078.47 control on
+2026-11-07 held a real `ClipboardItem` selection promise: the old equality
+predicate passed before Copy finished, then the late Copy overwrote the next
+`mobile paste` value. A distinct sentinel held the predicate false until Copy
+completed and preserved the subsequent value. The fixture now requires that
+transition in all three affected copy checks; native paste still must produce
+its original exact expected text without retries or a longer deadline.
+
 The full UI acceptance test additionally requires Node.js 22 or newer (native
 WebSocket support). It launches its own headless Chromium viewer and remote test
 page, records trusted remote click coordinates within 2 CSS pixels, and saves
