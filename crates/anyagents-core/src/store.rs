@@ -5874,6 +5874,30 @@ mod tests {
     }
 
     #[test]
+    fn unrelated_agent_updates_preserve_explicit_scope() {
+        let (_dir, store) = setup();
+        let alpha = agent(&store, "alpha");
+        store.set_agent_scope(&alpha.id, "siblings").unwrap();
+        store
+            .set_agent_description(&alpha.id, Some("Charter"))
+            .unwrap();
+        store
+            .set_agent_instructions(&alpha.id, Some("Instructions"))
+            .unwrap();
+        store.set_agent_role(&alpha.id, Some("Mind")).unwrap();
+        store.set_agent_model(&alpha.id, "model").unwrap();
+        store.set_agent_harness(&alpha.id, "codex").unwrap();
+        store.rename_agent(&alpha.id, "renamed").unwrap();
+        assert_eq!(store.agent(&alpha.id).unwrap().scope(), "siblings");
+
+        let stale = store.agent(&alpha.id).unwrap().launch_env;
+        store.set_agent_scope(&alpha.id, "isolated").unwrap();
+        // A stale transfer/harness snapshot cannot put the old policy back.
+        store.set_agent_launch_env(&alpha.id, &stale).unwrap();
+        assert_eq!(store.agent(&alpha.id).unwrap().scope(), "isolated");
+    }
+
+    #[test]
     fn opens_in_wal_and_migrates_once() {
         let (dir, store) = setup();
         let mode: String = store
