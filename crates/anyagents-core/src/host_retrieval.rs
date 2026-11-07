@@ -158,6 +158,30 @@ impl Store {
                     }
                     ids.extend(refresh_native(&mut index, agent, &path)?.documents);
                 }
+                // Reconciled owner pages are lossless historical documents,
+                // not necessarily JSONL. Their entire text remains searchable.
+                for path in regular_files(&root.join("history/owners"), true)? {
+                    if unresolved.iter().any(|blocked| path.starts_with(blocked)) {
+                        continue;
+                    }
+                    let id = format!(
+                        "history:{}:{}",
+                        agent.id,
+                        sha256(path.as_os_str().as_encoded_bytes())
+                    );
+                    let metadata = IndexMetadata {
+                        agent_id: agent.id.to_string(),
+                        source: MemoryScope::Transcripts,
+                        timestamp_ms: modified_ms(&path)?,
+                        direction: "in".into(),
+                        sender: format!("agent:{}", agent.name),
+                        destination: format!("agent:{}", agent.name),
+                        tool_name: None,
+                        role: Some("history".into()),
+                    };
+                    refresh_document(&mut index, &id, &metadata, &path)?;
+                    ids.insert(id);
+                }
             }
             index.retain_agent_scope(agent.id.as_str(), scope, &ids)?;
         }
@@ -475,6 +499,67 @@ fn event_metadata(agent: &Agent, value: &EventHeader, fallback_time: i64) -> Ind
 mod tests {
     use super::*;
     use crate::NewAgent;
+    #[test]
+    fn reconciled_non_jsonl_history_is_full_text_scoped_and_read_back_losslessly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let own = store
+            .create_agent(NewAgent::new("page-owner", "sylphx"))
+            .unwrap();
+        let hidden = store
+            .create_agent(NewAgent::new("page-hidden", "sylphx"))
+            .unwrap();
+        let mut own_path = PathBuf::new();
+        for agent in [&own, &hidden] {
+            let root = dir
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("history/owners/pagehash");
+            fs::create_dir_all(&root).unwrap();
+            let path = root.join("history.md");
+            fs::write(
+                &path,
+                format!(
+                    "# historical page\n{} pagetailneedle",
+                    "padding ".repeat(2000)
+                ),
+            )
+            .unwrap();
+            if agent.id == own.id {
+                own_path = path;
+            }
+        }
+        let ids = [own.id.to_string()];
+        let q = HistorySearchQuery {
+            query: Some("pagetailneedle".into()),
+            ..Default::default()
+        };
+        assert!(
+            store
+                .search_host_files(&ids, MemoryScope::Memory, &q)
+                .unwrap()
+                .is_empty()
+        );
+        let hits = store
+            .search_host_files(&ids, MemoryScope::Transcripts, &q)
+            .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0.metadata.agent_id, own.id.as_str());
+        assert_eq!(hits[0].0.metadata.role.as_deref(), Some("history"));
+        assert_eq!(
+            read_raw(&hits[0].0.raw).unwrap(),
+            fs::read(&own_path).unwrap()
+        );
+        assert!(String::from_utf8_lossy(&hits[0].1).contains("pagetailneedle"));
+        assert!(
+            store
+                .search_host_files(&[], MemoryScope::All, &q)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn boundary_fast_path_reads_bounded_prefix_and_periodic_verifier_recovers_older_edits() {
         use std::io::{Seek, SeekFrom, Write};

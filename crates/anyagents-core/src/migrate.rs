@@ -48,6 +48,10 @@ pub const MIGRATIONS: &[(i64, &str)] = &[
         23,
         include_str!("../migrations/024_conversation_redactions.sql"),
     ),
+    (
+        24,
+        include_str!("../migrations/025_full_mailbox_history.sql"),
+    ),
 ];
 
 /// Apply pending migrations. Each migration commits on its own, in order.
@@ -117,12 +121,12 @@ mod tests {
                 .unwrap();
         }
         migrate(&mut conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 23);
+        assert_eq!(current_version(&conn).unwrap(), 24);
         conn.prepare("SELECT before_scope, after_scope, source FROM admin_audit")
             .unwrap();
         conn.prepare("SELECT id, target_id, receipt FROM conversation_redactions")
             .unwrap();
         migrate(&mut conn).unwrap();
-        assert_eq!(current_version(&conn).unwrap(), 23);
+        assert_eq!(current_version(&conn).unwrap(), 24);
     }
 }

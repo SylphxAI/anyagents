@@ -393,3 +393,17 @@ SHA check. Full verification uses the same lifecycle locks and pending-redaction
 path exclusions as query refresh; it never edits the source. This maintenance is
 host-driven, not an LLM schedule. Native transcript writers remain active in PR1;
 the host raw append port is not activated by this index.
+
+The retained mailbox index no longer clips newly recorded inbound, outbound or
+tool text at 2,400 characters; full cleaned bodies also define deduplication hashes.
+The first authorized lexical/structured search upgrades pre-existing mailbox
+chunks from their authoritative inbound/outbound bodies in one transaction,
+reading 32 rows per batch. The policy marker and FTS/text changes commit together;
+subsequent searches skip upgraded rows. This backfill may add first-search latency
+and retains the legacy mailbox index representation; it is not the filesystem
+index's suffix-only scanner. Hidden owners are neither read nor upgraded.
+Redacted mailbox bodies remain authoritative on retry/restart. Historical
+standalone tool summaries clipped by an older writer have no raw mailbox body to
+recover; they are preserved as-is rather than claiming a reconstructed suffix.
+Reconciled pages under `agents/<id>/history/owners` are indexed as whole historical
+documents in `transcripts` scope even when they are Markdown rather than JSONL.
