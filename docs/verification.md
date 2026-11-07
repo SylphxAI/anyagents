@@ -33,6 +33,18 @@ cargo test --workspace --locked
 npm test
 ```
 
+## OpenCode port-collision fixtures
+
+The scripted child owns a competing socket before publishing its handoff barrier
+by atomic rename, then deliberately attempts the conflicting bind. The transient
+case releases that holder before acknowledging its bind failure and cannot exit
+until the test acknowledges the release. Both cases require the witnessed bind
+failure, startup retry and a different persisted port. The stored-port fixture
+retains its socket throughout setup; restart checks accept a legal replacement
+rather than assuming a released number stays available on a shared runner.
+These cases run in the ordinary OpenCode `protocol` suite without product hooks
+or an installed vendor CLI. The real-CLI case remains optional and ignored.
+
 ## Archived sub-agent cleanup
 
 ```sh
@@ -84,6 +96,29 @@ requires a configured runtime boundary and a separate execution check on that
 runtime. This script does not certify Docker, Kubernetes, cross-user isolation,
 or live authentication. See [ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md).
 
+## Telegram batch checkpoints and replay
+
+```sh
+cargo test -p anyagents --test telegram --locked
+```
+
+Telegram ingestion commits mailbox rows before saving the batch's channel
+checkpoint (`offset` and `chats`). A reader can therefore see the entire inbox
+while the persisted offset still names the previous batch. The DM/topic
+acceptance test waits for both the mailbox rows and the completed checkpoint
+before asserting channel state; it does not assume those separate commits are
+atomic. A disposable two-second pause immediately before the checkpoint write
+reproduced CI run 42335689725's `offset = 0` versus `12` failure in the original
+test. No pause or test retry belongs in the shipped ingestion path.
+
+`a_restart_before_the_offset_checkpoint_replays_without_duplicate_mail` uses a
+fixture-only SQLite trigger to reject the offset write while allowing inbox
+commits. It kills the server with two messages stored and offset zero, removes
+the trigger, and starts a fresh server with the same Telegram updates. The
+checkpoint must advance to 12 without changing the two mailbox IDs or provider
+origins. This verifies replay after an interrupted checkpoint without relying
+on a sleep to hit the crash window.
+
 ## Browser takeover on phones
 
 Takeover starts with the original desktop page, fitted to a full-viewport canvas.
@@ -106,6 +141,30 @@ the viewport regression advances the reaper's explicit clock without writing
 expired deadlines or stale heartbeats that race its background loop. Neither
 regression needs timing sleeps or retries.
 
+Desktop takeover accepts native modifier chords, including select-all, copy,
+cut, paste and undo. Paste inserts local clipboard text into the remote focus;
+copy and cut export the remote selection only after checking that the focus is
+not a password field. The viewer keeps new-tab, close-tab and address-bar
+shortcuts local. The floating pill also exposes Paste, Copy, Select all, Tab and Esc;
+clipboard permission refusal displays a prompt instead of silently losing input.
+On touch devices the native keyboard input overlays the remote field and tracks
+its position through zoom and pan, so the device's Paste menu works in place.
+No typed or pasted text is returned in input acknowledgements.
+
+`takeover_clipboard_ui_acceptance` runs the Chromium viewer clipboard and
+keyboard regressions in the ordinary native suite when Chromium is available.
+The 1440×900 and 390×844 cases cover native and synthetic paste (one insertion),
+copy/cut, undo, Tab/Shift+Tab, aligned touch input, permission refusal and password
+export denial. Viewer teardown retries only recursive deletion of its disposable
+profile (five retries, 100 ms linear backoff), because Chromium helpers can finish
+profile writes after the browser parent exits. An exhausted cleanup retry still
+fails the fixture; interaction assertions are never retried. This addresses the
+Linux `ENOTEMPTY` cleanup failure in CI run 42334433646 after all clipboard
+assertions passed.
+
+Actual iPhone Safari keyboard and long-press menus require a
+post-deployment device check; Chromium emulation does not certify those OS menus.
+
 Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
 and reported DPR. A screenshot captured by a fresh CDP session can be 1920×1080
 while the document reports DPR 2; dividing image coordinates by DPR alone is
@@ -122,6 +181,30 @@ The geometry suite covers DPR 1/2/3, zoom anchors and pan limits. The native
 browser tests exercise trusted input, byte-identical browser identity, restored
 metrics on every exit, and expiry before a queued toggle or Done. They require
 Chromium; the existing browser suites skip when it is unavailable.
+
+`takeover_focus_finds_cross_origin_input` is separately quarantined for two
+intermittent Chromium failures: a CDP startup timeout and a post-startup
+`focus.editable = false` assertion. On 2026-11-07, the latter also reproduced in
+the unmodified `52c4432b362ac548434ab30cead122c5e2e244ed` test binary, before
+the clipboard changes, using the same Chromium 156.0.8078.47. A bounded cohort
+restricted eight concurrent fixture processes to one CPU to expose the race;
+this is reproduction evidence, not a retry policy or a supported latency bound.
+Failure-only diagnostics on both revisions found a focused parent iframe but
+an unfocused child `BODY`, with the input present and both documents complete.
+The cause remains unresolved; capturing a screenshot before the click did not
+remove it. The focus detector and click dispatch were unchanged by the clipboard
+feature. Run this test explicitly when reviewing takeover changes, so its
+quarantine cannot hide a new regression:
+
+```sh
+cargo test -p anyagents --bin anyagents --locked \
+  browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
+```
+
+A green ordinary suite does not establish this ignored test passed. Its focused
+assertions still require the first click to find the child input at offset
+(60, 80); there is no interaction retry. Remove the quarantine only after both
+failure modes have deterministic fixes.
 
 The full UI acceptance test additionally requires Node.js 22 or newer (native
 WebSocket support). It launches its own headless Chromium viewer and remote test

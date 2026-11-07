@@ -4,7 +4,38 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use super::{curl_command, curl_post_json_fallback, run_json_post_command};
+use super::{
+    PROVIDER_KEY_ENVIRONMENT, curl_command, curl_post_json_fallback,
+    external_provider_key_environment, remove_provider_key_environment, run_json_post_command,
+};
+
+#[test]
+fn provider_key_environment_lookup_preserves_alias_names_and_order() {
+    assert_eq!(
+        PROVIDER_KEY_ENVIRONMENT.sylphx,
+        ["SYLPHX_API_KEY", "SYLPHX_AI_KEY", "SYLPHX_GATEWAY_KEY"]
+    );
+    let external: &[(&str, &[&str])] = &[
+        (
+            "kimi-code-plan",
+            &["KIMI_CODE_PLAN_API_KEY", "KIMI_API_KEY"],
+        ),
+        (
+            "qwen-token-plan",
+            &["QWEN_TOKEN_PLAN_API_KEY", "DASHSCOPE_API_KEY"],
+        ),
+        ("glm-code-plan", &["GLM_CODE_PLAN_API_KEY", "ZAI_API_KEY"]),
+        (
+            "minimax-code-plan",
+            &["MINIMAX_CODE_PLAN_API_KEY", "MINIMAX_API_KEY"],
+        ),
+        ("openrouter", &["OPENROUTER_API_KEY"]),
+    ];
+    for (provider, expected) in external {
+        assert_eq!(external_provider_key_environment(provider), *expected);
+    }
+    assert!(external_provider_key_environment("unsupported-provider").is_empty());
+}
 
 fn assert_large_post(status: u16, response_body: &str) {
     let payload = serde_json::json!({
@@ -164,4 +195,82 @@ fn unauthenticated_curl_does_not_create_a_header_file() {
     let (cmd, header_file) = curl_command(None).unwrap();
     assert!(header_file.is_none());
     assert_eq!(cmd.get_args().count(), 0);
+}
+
+#[test]
+fn curl_children_drop_provider_keys_but_preserve_operational_environment() {
+    let provider_keys = [
+        "SYLPHX_API_KEY",
+        "SYLPHX_AI_KEY",
+        "SYLPHX_GATEWAY_KEY",
+        "KIMI_CODE_PLAN_API_KEY",
+        "KIMI_API_KEY",
+        "QWEN_TOKEN_PLAN_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "GLM_CODE_PLAN_API_KEY",
+        "ZAI_API_KEY",
+        "MINIMAX_CODE_PLAN_API_KEY",
+        "MINIMAX_API_KEY",
+        "OPENROUTER_API_KEY",
+    ];
+    for bearer_token in [None, Some("synthetic-environment-test-token")] {
+        let (cmd, _header_file) = curl_command(bearer_token).unwrap();
+        for key in provider_keys {
+            assert!(
+                cmd.get_envs()
+                    .any(|(name, value)| name == key && value.is_none()),
+                "curl must explicitly remove {key}"
+            );
+        }
+    }
+
+    let operational = [
+        ("HTTP_PROXY", "http://proxy.invalid:8080"),
+        ("HTTPS_PROXY", "http://proxy.invalid:8081"),
+        ("ALL_PROXY", "socks5://proxy.invalid:1080"),
+        ("NO_PROXY", "localhost,127.0.0.1"),
+        ("http_proxy", "http://proxy.invalid:8082"),
+        ("https_proxy", "http://proxy.invalid:8083"),
+        ("all_proxy", "socks5://proxy.invalid:1081"),
+        ("no_proxy", "localhost"),
+        ("CURL_CA_BUNDLE", "/synthetic/ca.pem"),
+        ("SSL_CERT_FILE", "/synthetic/cert.pem"),
+        ("SSL_CERT_DIR", "/synthetic/certs"),
+        ("PATH", "/usr/bin:/bin"),
+        ("TMPDIR", "/synthetic/tmp"),
+        ("UNRELATED_SETTING", "preserve-this-value"),
+    ];
+    // Only this synthetic fixture clears its environment. Never mutate the
+    // test process's environment or read live credentials into the fixture.
+    let mut child = Command::new("/usr/bin/env");
+    child.env_clear().envs(operational);
+    for key in provider_keys {
+        child.env(key, "synthetic-provider-key");
+    }
+    let before = child.output().unwrap();
+    assert!(before.status.success());
+    let before = String::from_utf8(before.stdout).unwrap();
+    for key in provider_keys {
+        assert!(
+            before
+                .lines()
+                .any(|line| line == format!("{key}=synthetic-provider-key"))
+        );
+    }
+
+    remove_provider_key_environment(&mut child);
+    let after = child.output().unwrap();
+    assert!(after.status.success());
+    let after = String::from_utf8(after.stdout).unwrap();
+    for key in provider_keys {
+        assert!(
+            !after
+                .lines()
+                .any(|line| line.starts_with(&format!("{key}="))),
+            "child must not receive {key}"
+        );
+    }
+    for (name, value) in operational {
+        assert!(after.lines().any(|line| line == format!("{name}={value}")));
+    }
 }

@@ -11,6 +11,7 @@ mod id;
 pub mod masking;
 mod migrate;
 pub mod quote;
+pub mod redaction;
 mod secret;
 mod store;
 
@@ -20,11 +21,11 @@ pub use id::{AgentId, ChannelId, MessageId, UsageId};
 pub use quote::{Quote, QuoteRef};
 pub use secret::{CredentialStore, FileCredentialStore, Secret};
 pub use store::{
-    Ack, Agent, AgentLock, AgentSchedule, BillingMode, Channel, ConversationTurn,
-    HistorySearchQuery, HistorySort, Incoming, Lag, MAX_RECOVERY_ATTEMPTS, Message, NewAgent,
-    NewChannel, NewSchedule, NewUsage, OpenTurn, Origin, OutboundEffect, ReceiveOutcome, Store,
-    UsageRecord, UsageTotal, Wake, agent_config_dir, agent_work_dir, clean_rag_text, now_ms,
-    rag_content_hash, read_children_roster, read_root_roster, sum_usage,
+    Ack, Agent, AgentLock, AgentSchedule, BillingMode, Channel, ConversationTurn, Group,
+    GroupAction, GroupActor, HistorySearchQuery, HistorySort, Incoming, Lag, MAX_RECOVERY_ATTEMPTS,
+    Message, NewAgent, NewChannel, NewSchedule, NewUsage, OpenTurn, Origin, OutboundEffect,
+    ReceiveOutcome, Store, UsageRecord, UsageTotal, Wake, agent_config_dir, agent_work_dir,
+    clean_rag_text, now_ms, rag_content_hash, read_children_roster, read_root_roster, sum_usage,
     tokenize_hybrid_search_tokens, utc_day,
 };
 

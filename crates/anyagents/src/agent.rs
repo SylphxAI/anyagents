@@ -1481,6 +1481,9 @@ pub fn join_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), Er
         .map_err(Error::Message)?;
         return Ok(());
     }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message("agent group mutations require the authenticated server; offline database fallback is disabled".into()));
+    }
     open(data)?.join_group(group, agent_id)
 }
 
@@ -1502,6 +1505,9 @@ pub fn leave_group(data: &Path, group: &str, agent_id: &AgentId) -> Result<(), E
         )
         .map_err(Error::Message)?;
         return Ok(());
+    }
+    if client::agent_identity().is_some() {
+        return Err(Error::Message("agent group mutations require the authenticated server; offline database fallback is disabled".into()));
     }
     open(data)?.leave_group(group, agent_id)
 }

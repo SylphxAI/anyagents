@@ -172,6 +172,9 @@ pub struct GroupMemberView {
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct GroupView {
     pub name: String,
+    /// Immutable creator ID; absent means operator-owned (including legacy groups).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_agent_id: Option<String>,
     #[serde(default)]
     pub public: bool,
     pub members: Vec<String>,
@@ -465,5 +468,36 @@ mod create_agent_tests {
         }
         let legacy: LegacyRequest = serde_json::from_value(serialized).unwrap();
         assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
+    }
+}
+
+/// End-exclusive coordinates in decoded body text, not serialized JSON bytes.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RedactionSpan {
+    /// `bytes` (UTF-8 boundaries required) or `chars` (Unicode scalar values).
+    pub unit: String,
+    pub start: usize,
+    pub end: usize,
+}
+
+impl TryFrom<RedactionSpan> for anyagents_core::redaction::Span {
+    type Error = anyagents_core::Error;
+    fn try_from(span: RedactionSpan) -> Result<Self, Self::Error> {
+        use anyagents_core::redaction::SpanUnit;
+        let unit = match span.unit.as_str() {
+            "bytes" => SpanUnit::Bytes,
+            "chars" => SpanUnit::Chars,
+            _ => {
+                return Err(anyagents_core::Error::Message(
+                    "span unit must be bytes or chars".into(),
+                ));
+            }
+        };
+        Ok(Self {
+            unit,
+            start: span.start,
+            end: span.end,
+        })
     }
 }

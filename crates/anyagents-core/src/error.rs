@@ -23,8 +23,12 @@ pub enum Error {
         at: i64,
         attempted: i64,
     },
+    #[error("{0}")]
+    PermissionDenied(String),
     #[error("agent is already running")]
     AgentBusy,
+    #[error("group `{group}`: {reason}")]
+    GroupForbidden { group: String, reason: &'static str },
     #[error("not implemented yet: {0}")]
     NotImplemented(String),
     #[error("{0}")]
