@@ -427,3 +427,8 @@ preview, the complete `raw` coordinate and the requested `window` coordinate/SHA
 The byte array is authoritative for invalid UTF-8, zero bytes and ranges splitting
 a Unicode character. It uses the same six-tool MCP surface; no seventh tool or
 native writer handoff is introduced.
+
+## Host-owned memory and retained history
+
+[Host memory](host-memory.md) documents pinned learned facts, ACL-scoped lexical
+retrieval, resumable migration, retained native writers and measured limits.
