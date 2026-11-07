@@ -2028,7 +2028,8 @@ pub(crate) fn reconcile_agent_runtime_config(
             ensure_seat_op_config(config, spec);
         }
         crate::sandbox::share_config_with_seat_uid(config, uid, gid);
-        crate::worktree_access::verify(work_dir, uid, gid, spec_opt.as_deref())?;
+        // Workdir admission belongs to create, not config-only reconciliation:
+        // an archived agent may already have had its managed workdir reaped.
         if agent.harness == "muse"
             && std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
             && !crate::sandbox::is_isolated_test_env()
@@ -7831,6 +7832,19 @@ mod tests {
             std::fs::read_to_string(target.join("src/child")).unwrap(),
             "child"
         );
+        // B's ACL grant and new Git objects must not revoke sibling A.
+        let out = Command::new("/usr/bin/setpriv")
+            .env("HOME", "/nonexistent")
+            .env("XDG_CONFIG_HOME", "/nonexistent")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .args(["--reuid", &a_uid.to_string(), "--regid", &a_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
+                "set -eu; cd \"$1\"; printf sibling > src/sibling; git -c safe.directory=\"$1\" add src/sibling; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Sibling commit'; git -c safe.directory=\"$1\" status --porcelain", "sibling-seat"])
+            .arg(&f.source).output().unwrap();
+        assert!(
+            out.status.success(),
+            "A still creates/commits/status after B: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         // Existing explicit workdirs are checked as B without rewriting them.
         let mut explicit = worktree_request("explicit-b", None);
         explicit.workdir = Some(target.clone());
@@ -7872,7 +7886,7 @@ mod tests {
             0o600
         );
         eprintln!(
-            "A→B worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}; create, commit, status passed"
+            "A→B worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}; create, commit, status and sibling A preservation passed"
         );
     }
 

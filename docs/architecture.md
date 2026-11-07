@@ -215,8 +215,12 @@ Explicit `workdir` paths, including `/scratch/wt/...` and `/scratch/tmp/...`, ar
 honoured or refused, never replaced by the default directory. Before an agent
 becomes running, its execution seat must be able to write and traverse its
 working tree, the per-worktree Git directory and the common objects/refs
-storage, and create lock files. New worktrees are shared with that seat's group;
-failed permission changes are typed refusals. Existing explicit directories are
+storage, and create lock files. New worktrees are shared with that seat's group.
+Git metadata uses additive named POSIX ACLs and matching default ACLs on Linux,
+so granting another child access does not replace existing owners or group grants.
+New objects inherit access for both seats. An ACL write or readback failure refuses
+the spawn with a typed permission error; non-Linux hosts accept only already-permitted
+metadata access. Existing explicit directories are
 validated without rewriting their permissions. Sharing does not follow symlinks
 or alter hard-linked files that require permission changes.
 
