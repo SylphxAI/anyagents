@@ -5156,7 +5156,9 @@ mod tests {
     fn block_aligned_stride_windowing_preserves_prefix_cache() {
         let tmp = tempfile::tempdir().unwrap();
         let transcript = tmp.path().join("sylphx-transcript.jsonl");
-        for i in 0..165 {
+        // Exercise a real stride cut even when the configured window changes.
+        let initial_items = memory::WINDOW_MAX_ITEMS + 5;
+        for i in 0..initial_items {
             append_transcript_message(
                 &transcript,
                 &json!({ "role": "user", "content": format!("msg_{i}") }),
@@ -5165,12 +5167,22 @@ mod tests {
         let w1 = load_transcript_input_items(&transcript);
         append_transcript_message(
             &transcript,
-            &json!({ "role": "user", "content": "msg_165" }),
+            &json!({ "role": "user", "content": format!("msg_{initial_items}") }),
         );
         let w2 = load_transcript_input_items(&transcript);
-        // Item 0 must stay identical across consecutive turns between block strides!
+        // A cut occurred, it is stride-aligned, and appending one message does
+        // not change the pinned prefix between consecutive stride boundaries.
+        assert!(w1.len() <= memory::WINDOW_MAX_ITEMS);
+        let first_index = w1[0]["content"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("msg_")
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert!(first_index > 0);
+        assert_eq!(first_index % memory::WINDOW_STRIDE_ITEMS, 0);
         assert_eq!(w1[0], w2[0]);
-        assert_eq!(w1[0]["content"], "msg_80");
     }
 
     #[test]
