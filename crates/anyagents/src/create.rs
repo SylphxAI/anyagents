@@ -380,28 +380,9 @@ fn provision_managed_worktree(
         consumer.remote(repo_raw, target_wt, &branch, base)?;
     }
 
-    let _ = std::process::Command::new("git")
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .arg("-C")
-        .arg(target_wt)
-        .args(["config", "--local", "user.name", "Kyle Tse"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ])
-        .arg("-C")
-        .arg(target_wt)
-        .args(["config", "--local", "user.email", "hi@kylet.se"])
-        .status();
+    // Identity belongs to this checkout, not A's common config. Replacing the
+    // common file as the server would drop its owner and existing named ACLs.
+    crate::worktree_access::set_worktree_identity(target_wt)?;
 
     record_managed_worktree_marker(config, target_wt, repo_raw, Some(&branch));
     Ok(())
@@ -903,7 +884,7 @@ pub(crate) fn extract_file_tilde_refs(text: &str) -> Vec<String> {
     out
 }
 
-pub(crate) fn ensure_seat_environment(target_config: &Path) {
+pub(crate) fn ensure_seat_environment(target_config: &Path, workdir: &Path) -> Result<(), Error> {
     for subdir in ["tmp", "data-home", "cache-home", "state-home"] {
         let dir = target_config.join(subdir);
         let _ = std::fs::create_dir_all(&dir);
@@ -913,10 +894,7 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777));
         }
     }
-    let gitconfig = target_config.join(".gitconfig");
-    if !gitconfig.exists() {
-        let _ = std::fs::write(&gitconfig, "[safe]\n\tdirectory = *\n");
-    }
+    crate::worktree_access::configure_seat_git(target_config, workdir)?;
     #[cfg(unix)]
     if let Some(host_home) = crate::sandbox::host_home_dir() {
         let host_local = host_home.join(".local");
@@ -976,6 +954,7 @@ pub(crate) fn ensure_seat_environment(target_config: &Path) {
         }
         ensure_seat_skills(target_config, &host_home);
     }
+    Ok(())
 }
 
 pub(crate) fn data_dir_from_config(config: &Path) -> Option<PathBuf> {
@@ -1991,7 +1970,7 @@ pub(crate) fn reconcile_agent_runtime_config(
                 .find(|(k, _)| k == "ANYAGENTS_PARENT_NAME")
                 .map(|(_, v)| v.clone())
         });
-    ensure_seat_environment(config);
+    ensure_seat_environment(config, work_dir)?;
     seed_harness_credentials(store, data, agent, config);
     if !config.join("mcp-capability").is_file()
         && crate::operator::ensure(store, &agent.id).is_err()
@@ -7854,6 +7833,14 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(&data);
         let (a_uid, a_gid) = ids[0];
         let (b_uid, b_gid) = ids[1];
+        // Match the consumer's already-initialized shared repository. Sparse
+        // checkout must write only its private config, not initialize A's.
+        crate::worktree::tests::git(&f.source, &["config", "extensions.worktreeConfig", "true"]);
+        crate::worktree::tests::git(&f.source, &["config", "user.name", "Original local owner"]);
+        crate::worktree::tests::git(
+            &f.source,
+            &["config", "user.email", "original@example.invalid"],
+        );
         std::fs::set_permissions(
             f.source.join(".git/config"),
             std::fs::Permissions::from_mode(0o600),
@@ -7867,6 +7854,12 @@ mod tests {
                 .unwrap()
                 .success()
         );
+        // A's config must survive byte-for-byte. The new seat gets its own
+        // identity, never a common rewrite.
+        let common_config = f.source.join(".git/config");
+        let config_before = std::fs::read(&common_config).unwrap();
+        let config_inode =
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&common_config).unwrap());
         let authority = data.join("consumer-authority");
         std::fs::rename(data.join("consumer"), &authority).unwrap();
         std::fs::write(data.join("consumer"), format!("#!/bin/sh\nexec /usr/bin/setpriv --reuid {a_uid} --regid {a_gid} --clear-groups -- env HOME=/nonexistent XDG_CONFIG_HOME=/nonexistent GIT_CONFIG_GLOBAL=/dev/null {:?} \"$@\"\n", authority)).unwrap();
@@ -7886,7 +7879,7 @@ mod tests {
         // The consumer executes as A and must be able to create the checkout.
         std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
         let mut request = worktree_request("child-b", Some("inherit".into()));
-        request.parent_id = Some(parent.id);
+        request.parent_id = Some(parent.id.clone());
         request.workdir = Some(target.clone());
         let agent = create_with_seat(
             &store,
@@ -7897,6 +7890,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agent.workdir.as_deref(), target.to_str());
+        use std::os::unix::fs::MetadataExt;
+        let config_after = std::fs::metadata(&common_config).unwrap();
+        assert_eq!(config_after.uid(), a_uid);
+        assert_eq!(config_after.ino(), config_inode);
+        assert_eq!(config_after.mode() & 0o707, 0o600);
+        assert_eq!(std::fs::read(&common_config).unwrap(), config_before);
+        let readable = Command::new("/usr/bin/setpriv")
+            .args([
+                "--reuid",
+                &a_uid.to_string(),
+                "--regid",
+                &a_gid.to_string(),
+                "--clear-groups",
+                "--",
+                "cat",
+            ])
+            .arg(&common_config)
+            .output()
+            .unwrap();
+        assert!(readable.status.success(), "A must still read its config");
+        assert_eq!(readable.stdout, config_before);
         let common = crate::worktree::tests::git(
             &target,
             &["rev-parse", "--path-format=absolute", "--git-common-dir"],
@@ -7906,13 +7920,20 @@ mod tests {
             .map(|n| objects.join(format!("{n:02x}")))
             .find(|p| !p.exists())
             .unwrap();
+        let b_config = agent_config_dir(&data, &agent.id);
+        crate::sandbox::share_config_with_seat_uid(&b_config, b_uid, b_gid);
+        let push_remote = dir.path().join("seat-push.git");
         let out = Command::new("/usr/bin/setpriv")
-            .env("HOME", "/nonexistent")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_AUTHOR_NAME").env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME").env_remove("GIT_COMMITTER_EMAIL")
+            .env("HOME", &b_config)
             .env("XDG_CONFIG_HOME", "/nonexistent")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", b_config.join(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["--reuid", &b_uid.to_string(), "--regid", &b_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                "set -eu; mkdir \"$2\"; cd \"$1\"; printf child > src/child; git -c safe.directory=\"$1\" add src/child; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Child commit'; git -c safe.directory=\"$1\" status --porcelain", "child-seat"])
-            .arg(&target).arg(&new_object_dir).output().unwrap();
+                r#"set -eu; mkdir "$2"; cd "$1"; printf child > src/child; git add src/child; git commit -m 'Child commit'; git status --porcelain; git init --bare "$3"; git push "$3" HEAD:refs/heads/seat-proof"#, "child-seat"])
+            .arg(&target).arg(&new_object_dir).arg(&push_remote).output().unwrap();
         assert!(
             out.status.success(),
             "B create/commit/status: {}",
@@ -7921,6 +7942,10 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(target.join("src/child")).unwrap(),
             "child"
+        );
+        assert_eq!(
+            crate::worktree::tests::git(&target, &["log", "-1", "--format=%an <%ae>%n%cn <%ce>"]),
+            "Kyle Tse <hi@kylet.se>\nKyle Tse <hi@kylet.se>"
         );
         let common = objects.parent().unwrap();
         let private = PathBuf::from(crate::worktree::tests::git(
@@ -7983,7 +8008,6 @@ if rm "$2/logs/HEAD"; then exit 28; fi
         );
         assert!(!target.join("hook-executed").exists());
         // B's ACL grant and new Git objects must not revoke sibling A.
-        use std::os::unix::fs::MetadataExt;
         assert_eq!(std::fs::metadata(&new_object_dir).unwrap().uid(), b_uid);
         let out = Command::new("/usr/bin/setpriv")
             .env("GIT_CONFIG_COUNT", "1")
@@ -8076,6 +8100,107 @@ if rm "$2/logs/HEAD"; then exit 28; fi
             r#"set -eu; if cat "$1/HEAD"; then exit 23; fi"#,
             &[&c_private],
         );
+        // Vesta's same-size clean-filter payload: merely disabling hooks and
+        // fsmonitor does not stop `status` executing a configured clean driver.
+        let original_dotgit = std::fs::read(target.join(".git")).unwrap();
+        let forged = dir.path().join("child-controlled.git");
+        let seed = dir.path().join("filter-seed");
+        let filter = dir.path().join("clean-filter");
+        let filter_marker = dir.path().join("filter-executed");
+        run_as(
+            b_uid,
+            b_gid,
+            r#"
+set -eu
+umask 022
+git init -b main --separate-git-dir="$2" "$1"
+mkdir "$1/src"
+printf 'included\n' > "$1/src/keep"
+printf 'src/keep filter=x\n' > "$1/.gitattributes"
+git -C "$1" add .
+git -C "$1" -c user.name='Fixture' -c user.email=fixture@example.invalid commit -m 'Synthetic filter baseline'
+printf '#!/bin/sh\nid -u >> "%s"\ncat\n' "$4" > "$3"
+chmod +x "$3"
+git --git-dir="$2" config filter.x.clean "$3"
+git --git-dir="$2" config filter.x.required true
+git --git-dir="$2" config core.worktree "$5"
+printf 'gitdir: %s\n' "$2" > "$5/.git"
+printf 'src/keep filter=x\n' > "$5/.gitattributes"
+printf 'changed!\n' > "$5/src/keep"
+printf 'changed!\n' > "$1/src/keep"
+# Positive exploit control: this seat owns the planted gitdir and must run it.
+git -c safe.directory="$5" -C "$5" status --porcelain
+"#,
+            &[&seed, &forged, &filter, &filter_marker, &target],
+        );
+        let executions = std::fs::read_to_string(&filter_marker).unwrap();
+        assert!(!executions.is_empty());
+        assert!(executions.lines().all(|line| line == b_uid.to_string()));
+        std::fs::remove_file(&filter_marker).unwrap();
+        let recorded =
+            crate::worktree_access::RecordedWorktree::load(&data, &agent.id, &target).unwrap();
+        let pinned = recorded
+            .command()
+            .unwrap()
+            .args(["status", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(
+            pinned.status.success(),
+            "trusted cleanup status: {}",
+            String::from_utf8_lossy(&pinned.stderr)
+        );
+        assert!(!crate::server::is_git_worktree_safe_to_reap(
+            &data, &agent.id, &target
+        ));
+        assert!(
+            !filter_marker.exists(),
+            "server cleanup followed B's .git pointer"
+        );
+        // The A and C seat homes trust only their own recorded roots, not B's.
+        let a_config = agent_config_dir(&data, &parent.id);
+        std::fs::create_dir_all(&a_config).unwrap();
+        ensure_seat_environment(&a_config, &f.source).unwrap();
+        crate::sandbox::share_config_with_seat_uid(&a_config, a_uid, a_gid);
+        for (uid, gid, config) in [
+            (a_uid, a_gid, &a_config),
+            (c_uid, c_gid, &agent_config_dir(&data, &c.id)),
+        ] {
+            crate::sandbox::share_config_with_seat_uid(config, uid, gid);
+            let out = Command::new("/usr/bin/setpriv")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env("HOME", config)
+                .env("XDG_CONFIG_HOME", "/nonexistent")
+                .env("GIT_CONFIG_GLOBAL", config.join(".gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "--reuid",
+                    &uid.to_string(),
+                    "--regid",
+                    &gid.to_string(),
+                    "--clear-groups",
+                    "--",
+                    "git",
+                    "-C",
+                ])
+                .arg(&seed)
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap();
+            assert!(!out.status.success());
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains("dubious ownership"),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                !filter_marker.exists(),
+                "foreign seat executed B's clean filter"
+            );
+        }
+        std::fs::write(target.join(".git"), original_dotgit).unwrap();
+        std::fs::write(target.join("src/keep"), "included\n").unwrap();
+        std::fs::remove_file(target.join(".gitattributes")).unwrap();
         // Concurrent agents commonly share one OS seat. B2 admission and B1
         // archive must not revoke either live workspace's effective bindings.
         let b2_target = dir.path().join("checkout-b2");
@@ -8159,7 +8284,7 @@ if rm "$2/logs/HEAD"; then exit 28; fi
             &[&objects],
         );
         eprintln!(
-            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation and parent hook pin passed"
+            "A→B→C worktree acceptance EXECUTED: parent uid={a_uid}, child uid={b_uid}, third uid={c_uid}; writes, protected config/hooks/info/config.worktree/shared logs/HEAD, sticky rename denial, sibling metadata denial, same-seat B1/B2 survival, archive/reap/rollback revocation, parent hook pin, private commit identity, exact seat trust/status/commit/push, and planted-filter cleanup/foreign-seat denial passed"
         );
     }
 

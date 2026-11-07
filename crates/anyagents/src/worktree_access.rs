@@ -31,12 +31,54 @@ fn git_dirs(path: &Path) -> Result<Vec<PathBuf>, Error> {
         if !out.status.success() {
             return Err(refusal(path, String::from_utf8_lossy(&out.stderr)));
         }
-        let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let dir =
+            std::fs::canonicalize(PathBuf::from(String::from_utf8_lossy(&out.stdout).trim()))?;
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
     }
     Ok(dirs)
+}
+
+/// The consumer enables worktreeConfig for sparse checkout. Refuse rather than
+/// let --worktree silently fall back to rewriting the common configuration.
+pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
+    let dirs = git_dirs(path)?;
+    let (Some(private), Some(common)) = (dirs.first(), dirs.last()) else {
+        return Err(refusal(path, "consumer did not produce Git metadata"));
+    };
+    if private == common {
+        return Err(refusal(path, "identity requires a linked worktree"));
+    }
+    validate_config_files(private, common)?;
+    let extension = std::process::Command::new("git")
+        .args(["config", "--no-includes", "--file"])
+        .arg(common.join("config"))
+        .args(["--bool", "--get", "extensions.worktreeConfig"])
+        .output()?;
+    if !extension.status.success() || extension.stdout != b"true\n" {
+        return Err(refusal(
+            path,
+            "consumer must enable extensions.worktreeConfig",
+        ));
+    }
+    // No agent has been admitted yet. This parent-controlled private file will
+    // receive the read-only ACL/sticky protection before the seat can run.
+    let config = private.join("config.worktree");
+    if config.symlink_metadata().is_ok_and(|m| !m.is_file()) {
+        return Err(refusal(&config, "worktree config is not a regular file"));
+    }
+    for (key, value) in [("user.name", "Kyle Tse"), ("user.email", "hi@kylet.se")] {
+        let out = std::process::Command::new("git")
+            .args(["config", "--no-includes", "--file"])
+            .arg(&config)
+            .args([key, value])
+            .output()?;
+        if !out.status.success() {
+            return Err(refusal(&config, "cannot set worktree commit identity"));
+        }
+    }
+    Ok(())
 }
 
 /// Includes can redirect otherwise protected configuration to child-writable
@@ -106,6 +148,163 @@ fn validate_config_files(private: &Path, common: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+/// Replace the legacy wildcard with a reset plus exact admitted roots. Preserve
+/// other caller settings; bind the final replacement to the opened config dir,
+/// never a seat-replaceable .gitconfig symlink or hard-link target.
+pub(crate) fn configure_seat_git(config: &Path, workdir: &Path) -> Result<(), Error> {
+    use std::io::{Read, Write};
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    let data = crate::create::data_dir_from_config(config)
+        .ok_or_else(|| refusal(config, "missing agent data root"))?;
+    let directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(config)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".gitconfig".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    let mut bytes = Vec::new();
+    if fd >= 0 {
+        let mut old = unsafe { std::fs::File::from_raw_fd(fd) };
+        let meta = old.metadata()?;
+        if !meta.is_file() || meta.nlink() != 1 || meta.len() > 1024 * 1024 {
+            return Err(refusal(config, "unsafe or oversized .gitconfig"));
+        }
+        old.read_to_end(&mut bytes)?;
+    } else if std::io::Error::last_os_error().kind() != std::io::ErrorKind::NotFound {
+        return Err(refusal(config, std::io::Error::last_os_error()));
+    }
+    // Harness fixtures can deliberately omit system tools from PATH. Preserve
+    // their configured precedence, then include the OS Git used for parsing.
+    let mut paths: Vec<_> = std::env::var_os("PATH")
+        .map(|value| std::env::split_paths(&value).collect())
+        .unwrap_or_default();
+    paths.extend([PathBuf::from("/usr/bin"), PathBuf::from("/bin")]);
+    let path_env = std::env::join_paths(paths).map_err(|e| refusal(config, e))?;
+    let staging = data.join("worktree-grants");
+    std::fs::create_dir_all(&staging)?;
+    let temporary = staging.join(format!(
+        "gitconfig-{}.tmp",
+        anyagents_core::AgentId::generate()
+    ));
+    let result = (|| -> Result<(), Error> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        let edit = |args: &[&str]| -> Result<std::process::Output, Error> {
+            Ok(std::process::Command::new("git")
+                .env("PATH", &path_env)
+                .args(["config", "--no-includes", "--file"])
+                .arg(&temporary)
+                .args(args)
+                .output()?)
+        };
+        let unset = edit(&["--unset-all", "safe.directory"])?;
+        if !unset.status.success() && unset.status.code() != Some(5) {
+            return Err(refusal(config, "cannot narrow safe.directory"));
+        }
+        let mut roots = vec![std::path::absolute(workdir)?];
+        if let Some(id) = config
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str())
+        {
+            let journal = data.join("worktree-grants").join(format!("{id}.json"));
+            if let Ok(raw) = std::fs::read(journal) {
+                let grant: Grant = serde_json::from_slice(&raw).map_err(|e| refusal(config, e))?;
+                if grant.active && grant.checkout == roots[0] {
+                    roots.push(grant.common);
+                }
+            }
+        }
+        if roots
+            .iter()
+            .any(|root| root.as_os_str().as_encoded_bytes().contains(&b'*'))
+        {
+            return Err(refusal(
+                workdir,
+                "exact safe.directory paths cannot contain wildcard characters",
+            ));
+        }
+        // Generate the suffix with Git's own parser/quoting, then append it
+        // after all preserved include sections. Editing an existing [safe]
+        // section in place could let a later include re-enable its wildcard.
+        let suffix = temporary.with_extension("safe");
+        let suffix_result = (|| -> Result<Vec<u8>, Error> {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&suffix)?;
+            for root in
+                std::iter::once(String::new()).chain(roots.iter().map(|p| p.display().to_string()))
+            {
+                let out = std::process::Command::new("git")
+                    .env("PATH", &path_env)
+                    .args(["config", "--no-includes", "--file"])
+                    .arg(&suffix)
+                    .args(["--add", "safe.directory", &root])
+                    .output()?;
+                if !out.status.success() {
+                    return Err(refusal(config, "cannot record exact safe.directory"));
+                }
+            }
+            Ok(std::fs::read(&suffix)?)
+        })();
+        let _ = std::fs::remove_file(&suffix);
+        let mut bytes = std::fs::read(&temporary)?;
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&suffix_result?);
+        let name = std::ffi::CString::new(format!(
+            ".gitconfig-{}",
+            anyagents_core::AgentId::generate()
+        ))
+        .map_err(|e| refusal(config, e))?;
+        let fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o640,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        if unsafe { libc::fchown(file.as_raw_fd(), u32::MAX, directory.metadata()?.gid()) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        if unsafe {
+            libc::renameat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                directory.as_raw_fd(),
+                c".gitconfig".as_ptr(),
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        directory.sync_all()?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
 /// The journal lives under the server-owned data directory, outside the seat's
 /// config/worktree. Persist it before granting anything so partial admission can
 /// always revoke, even if the checkout or its .git pointer later disappears.
@@ -121,6 +320,163 @@ struct Grant {
 
 pub(crate) fn grant_path(data: &Path, id: &anyagents_core::AgentId) -> PathBuf {
     data.join("worktree-grants").join(format!("{id}.json"))
+}
+
+// st_mode's group bits are the POSIX ACL mask, not the owning-group entry.
+// A preserved named-owner rw grant can make that mask writable while every
+// foreign principal remains read-only. Inspect effective entries instead.
+fn writable_by_untrusted(path: &Path, owners: &[u32]) -> std::io::Result<bool> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    let meta = file.metadata()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        let mut bytes = vec![0u8; 65536];
+        let len = unsafe {
+            libc::fgetxattr(
+                file.as_raw_fd(),
+                c"system.posix_acl_access".as_ptr(),
+                bytes.as_mut_ptr().cast(),
+                bytes.len(),
+            )
+        };
+        if len >= 0 {
+            bytes.truncate(len as usize);
+            if bytes.len() < 4
+                || bytes[..4] != 2u32.to_le_bytes()
+                || !(bytes.len() - 4).is_multiple_of(8)
+            {
+                return Err(std::io::Error::other("invalid metadata ACL"));
+            }
+            let entries: Vec<_> = bytes[4..]
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|b| {
+                    (
+                        u16::from_le_bytes([b[0], b[1]]),
+                        u16::from_le_bytes([b[2], b[3]]),
+                        u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+                    )
+                })
+                .collect();
+            let mask = entries.iter().find(|e| e.0 == 16).map_or(7, |e| e.1);
+            return Ok(entries.iter().any(|(tag, perm, uid)| match tag {
+                2 => perm & mask & 2 != 0 && !owners.contains(uid),
+                4 | 8 => perm & mask & 2 != 0,
+                32 => perm & 2 != 0,
+                _ => false,
+            }));
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ENODATA) {
+            return Err(err);
+        }
+    }
+    Ok(meta.mode() & 0o022 != 0)
+}
+
+/// The checkout's .git file is seat-writable. Maintenance may only use this
+/// server-owned record, including after revocation; it must never rediscover a
+/// gitdir through the checkout or the seat-owned marker.
+pub(crate) struct RecordedWorktree(Grant);
+
+impl RecordedWorktree {
+    pub(crate) fn load(data: &Path, id: &anyagents_core::AgentId, checkout: &Path) -> Option<Self> {
+        let bytes = std::fs::read(grant_path(data, id)).ok()?;
+        let grant: Grant = serde_json::from_slice(&bytes).ok()?;
+        (grant.checkout == checkout).then_some(Self(grant))
+    }
+
+    pub(crate) fn validate(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let g = &self.0;
+        if g.private.parent() != Some(g.common.join("worktrees").as_path()) {
+            return Err(std::io::Error::other("unrecorded private gitdir layout"));
+        }
+        let owner = std::fs::symlink_metadata(&g.private)?.uid();
+        if owner == g.uid && owner != crate::sandbox::server_uid() {
+            return Err(std::io::Error::other("seat-owned private gitdir"));
+        }
+        for path in [&g.common, &g.common.join("worktrees"), &g.private] {
+            let meta = std::fs::symlink_metadata(path)?;
+            if !meta.is_dir()
+                || meta.uid() != owner
+                || std::fs::canonicalize(path)? != *path
+                || path != &g.private
+                    && writable_by_untrusted(path, &[owner, crate::sandbox::server_uid()])?
+            {
+                return Err(std::io::Error::other("untrusted Git metadata directory"));
+            }
+        }
+        for path in [
+            g.common.join("config"),
+            g.common.join("config.worktree"),
+            g.private.join("config.worktree"),
+            g.private.join("commondir"),
+        ] {
+            let meta = match std::fs::symlink_metadata(&path) {
+                Err(e)
+                    if path == g.common.join("config.worktree")
+                        && e.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                other => other?,
+            };
+            if !meta.is_file()
+                || meta.nlink() != 1
+                || writable_by_untrusted(&path, &[owner, crate::sandbox::server_uid()])?
+                || ![owner, crate::sandbox::server_uid()].contains(&meta.uid())
+            {
+                return Err(std::io::Error::other(
+                    "untrusted Git configuration or common-dir pointer",
+                ));
+            }
+        }
+        if std::fs::read_to_string(g.private.join("commondir"))?.trim() != "../.." {
+            return Err(std::io::Error::other("unrecorded common-dir pointer"));
+        }
+        validate_config_files(&g.private, &g.common).map_err(std::io::Error::other)
+    }
+
+    pub(crate) fn command(&self) -> std::io::Result<std::process::Command> {
+        self.validate()?;
+        let mut cmd = std::process::Command::new("git");
+        cmd.env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ATTR_NOSYSTEM", "1")
+            .args([
+                "--no-optional-locks",
+                "-c",
+                "safe.directory=",
+                "-c",
+                "core.fsmonitor=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.attributesFile=/dev/null",
+            ])
+            .arg("--git-dir")
+            .arg(&self.0.private)
+            .arg("--work-tree")
+            .arg(&self.0.checkout);
+        Ok(cmd)
+    }
+
+    pub(crate) fn private(&self) -> &Path {
+        &self.0.private
+    }
 }
 
 pub(crate) fn revoke_recorded(data: &Path, id: &anyagents_core::AgentId) -> Result<(), Error> {
@@ -1008,6 +1364,197 @@ fi
 mod tests {
     use super::*;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn private_identity_preserves_common_config_and_requires_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("SylphxAI/demo", &target, "child", None)
+            .unwrap();
+        let common_config = f.source.join(".git/config");
+        let before = std::fs::read(&common_config).unwrap();
+        let inode = std::fs::metadata(&common_config).unwrap().ino();
+        set_worktree_identity(&target).unwrap();
+        assert_eq!(std::fs::read(&common_config).unwrap(), before);
+        assert_eq!(std::fs::metadata(&common_config).unwrap().ino(), inode);
+        for (key, expected) in [("user.name", "Kyle Tse"), ("user.email", "hi@kylet.se")] {
+            assert_eq!(
+                crate::worktree::tests::git(&target, &["config", "--worktree", "--get", key]),
+                expected
+            );
+        }
+        crate::worktree::tests::git(
+            &target,
+            &["config", "--local", "extensions.worktreeConfig", "false"],
+        );
+        let before = std::fs::read(&common_config).unwrap();
+        let err = set_worktree_identity(&target).unwrap_err();
+        assert!(
+            err.to_string().contains("extensions.worktreeConfig"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(common_config).unwrap(), before);
+    }
+
+    #[test]
+    fn recorded_status_ignores_planted_gitdir_and_rejects_untrusted_config() {
+        use crate::worktree::tests::git;
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("SylphxAI/demo", &target, "child", None)
+            .unwrap();
+        set_worktree_identity(&target).unwrap();
+        let id = anyagents_core::AgentId::generate();
+        share(
+            &target,
+            crate::sandbox::server_uid(),
+            crate::sandbox::server_gid(),
+            &grant_path(dir.path(), &id),
+        )
+        .unwrap();
+        let recorded = RecordedWorktree::load(dir.path(), &id, &target).unwrap();
+        let status = || {
+            recorded
+                .command()
+                .unwrap()
+                .args(["status", "--porcelain"])
+                .output()
+                .unwrap()
+        };
+        let baseline = status();
+        assert!(
+            baseline.status.success(),
+            "{}",
+            String::from_utf8_lossy(&baseline.stderr)
+        );
+        assert!(baseline.stdout.is_empty());
+        let planted = dir.path().join("planted");
+        std::fs::create_dir(&planted).unwrap();
+        git(&planted, &["init", "-b", "main"]);
+        std::fs::write(planted.join("payload"), "included\n").unwrap();
+        std::fs::write(planted.join(".gitattributes"), "payload filter=x\n").unwrap();
+        git(&planted, &["add", "."]);
+        git(
+            &planted,
+            &[
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "-m",
+                "Synthetic baseline",
+            ],
+        );
+        let marker = dir.path().join("filter-ran");
+        git(
+            &planted,
+            &[
+                "config",
+                "filter.x.clean",
+                &format!("printf hit >> '{}'; cat", marker.display()),
+            ],
+        );
+        git(
+            &planted,
+            &["config", "core.worktree", target.to_str().unwrap()],
+        );
+        std::fs::write(
+            target.join(".git"),
+            format!("gitdir: {}\n", planted.join(".git").display()),
+        )
+        .unwrap();
+        std::fs::write(target.join("payload"), "changed!\n").unwrap();
+        std::fs::write(target.join(".gitattributes"), "payload filter=x\n").unwrap();
+        git(&target, &["status", "--porcelain"]);
+        assert!(marker.exists(), "payload positive control did not execute");
+        std::fs::remove_file(&marker).unwrap();
+        let safe = status();
+        assert!(
+            safe.status.success(),
+            "{}",
+            String::from_utf8_lossy(&safe.stderr)
+        );
+        assert!(!safe.stdout.is_empty());
+        assert!(!marker.exists(), "recorded status followed planted gitdir");
+        let config = recorded.private().join("config.worktree");
+        let previous = std::fs::read(&config).unwrap();
+        std::fs::write(&config, b"[include]\npath = /nonexistent/foreign\n").unwrap();
+        let err = recorded.command().expect_err("include must refuse");
+        assert!(err.to_string().contains("include/includeIf"), "{err}");
+        std::fs::write(&config, previous).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(recorded.command().is_err(), "writable config must refuse");
+        assert!(!marker.exists());
+    }
+
+    #[test]
+    fn seat_trust_is_exact_resets_late_includes_and_preserves_other_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = anyagents_core::AgentId::generate();
+        let config = anyagents_core::agent_config_dir(dir.path(), &id);
+        std::fs::create_dir_all(&config).unwrap();
+        let included = dir.path().join("included.gitconfig");
+        std::fs::write(&included, "[safe]\n directory = *\n").unwrap();
+        std::fs::write(config.join(".gitconfig"), format!("[safe]\n directory = *\n[alias]\n check = \"確認 status --short\"\n[include]\n path = {}\n", included.display())).unwrap();
+        let workdir = dir.path().join("checkout with \"quote\"");
+        let common = dir.path().join("common");
+        write_grant(
+            &grant_path(dir.path(), &id),
+            &Grant {
+                common: common.clone(),
+                private: common.join("worktrees/child"),
+                checkout: workdir.clone(),
+                uid: crate::sandbox::server_uid(),
+                gid: crate::sandbox::server_gid(),
+                active: true,
+            },
+        )
+        .unwrap();
+        for root in [&workdir, &dir.path().join("changed-root")] {
+            configure_seat_git(&config, root).unwrap();
+            let read = |key| {
+                let out = std::process::Command::new("git")
+                    .args(["config", "--includes", "--file"])
+                    .arg(config.join(".gitconfig"))
+                    .args(["--get-all", key])
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                String::from_utf8(out.stdout).unwrap()
+            };
+            let expected = if root == &workdir {
+                format!("*\n\n{}\n{}\n", root.display(), common.display())
+            } else {
+                format!("*\n\n{}\n", root.display())
+            };
+            assert_eq!(read("safe.directory"), expected);
+            assert_eq!(read("alias.check"), "確認 status --short\n");
+        }
+        let before = std::fs::read(config.join(".gitconfig")).unwrap();
+        let err = configure_seat_git(&config, &dir.path().join("literal-*")).unwrap_err();
+        assert!(err.to_string().contains("wildcard characters"), "{err}");
+        assert_eq!(std::fs::read(config.join(".gitconfig")).unwrap(), before);
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "keep").unwrap();
+        std::fs::remove_file(config.join(".gitconfig")).unwrap();
+        std::os::unix::fs::symlink(&outside, config.join(".gitconfig")).unwrap();
+        assert!(configure_seat_git(&config, &workdir).is_err());
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+        std::fs::remove_file(config.join(".gitconfig")).unwrap();
+        std::fs::hard_link(&outside, config.join(".gitconfig")).unwrap();
+        let err = configure_seat_git(&config, &workdir).unwrap_err();
+        assert!(err.to_string().contains("unsafe or oversized"), "{err}");
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "keep");
+    }
 
     #[test]
     fn sharing_covers_worktree_gitdir_and_common_objects_and_refs() {

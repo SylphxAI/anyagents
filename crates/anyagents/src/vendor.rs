@@ -549,7 +549,8 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         }
     }
     if let Some((ref seat_user, ref seat_launch)) = seat_spec {
-        crate::create::ensure_seat_environment(&request.config_dir);
+        crate::create::ensure_seat_environment(&request.config_dir, &request.work_dir)
+            .map_err(|e| e.to_string())?;
         let cache_home = request.config_dir.join("cache-home");
         let _ = std::fs::create_dir_all(&cache_home);
         let tmp_dir = request.config_dir.join("tmp");

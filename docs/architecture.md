@@ -234,6 +234,22 @@ commands pin `core.hooksPath=/dev/null` and disable fsmonitor. The parent commit
 and its parent-owned hooks-path pin in the three-UID proof belong to the test fixture.
 Shared common and worktree configs refuse `include`/`includeIf` rather than
 following a potentially child-controlled configuration graph.
+Commit identity is set to `Kyle Tse <hi@kylet.se>` in the protected private
+`config.worktree`, never by replacing the parent's common config. The consumer
+must enable `extensions.worktreeConfig`; otherwise admission refuses. Seat Git
+configuration resets legacy wildcard trust and lists only the seat's exact
+checkout and recorded common gitdir, preserving other settings. Cleanup loads
+its gitdir/worktree pair from the server journal, verifies the protected metadata
+ownership and effective ACLs, and passes both paths explicitly: a child-edited
+`.git` pointer is never consulted. It excludes global/system config and attribute
+files and keeps default dubious-ownership checks; unrecorded legacy or arbitrary
+repositories are preserved rather than inspected through their `.git` pointer.
+Deletion additionally requires an empty pinned status and zero commits in HEAD
+or any local branch outside the recorded remote-tracking refs. A seat-owned
+initial-head marker cannot waive that test. Dirty or unpushed checkouts and their
+private registration remain; clean, pushed pairs are removed without invoking
+`git worktree remove` or its nested Git subprocesses. Remote-tracking refs remain
+within the documented shared-ref integrity boundary, not a live publication proof.
 A server-owned grant journal is file- and directory-synced before sharing. Its
 serialized transitions preserve bindings needed by another active agent on the
 same OS seat; retiring one agent revokes its private metadata without removing

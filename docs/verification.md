@@ -150,6 +150,17 @@ A provisions B, B commits, A still writes B-created Git content and commits usin
 an explicit protected hooks path. B cannot write common config/hooks/info,
 write or unlink/replace its `config.worktree`, or alter `commondir`; C can use
 its own checkout but cannot read B's HEAD/index, nor can B read C's metadata.
+B's ordinary status, commit and local bare-remote push use its generated seat
+config, with no `-c user.*` or author/committer environment overrides; the commit
+records the exact Kyle author and committer. A's common config retains its owner,
+inode, content and owner read access. A same-size clean-filter positive control
+executes as B, then a forged `.git` pointer cannot execute that filter during
+journal-pinned server cleanup or A/C seat commands in the foreign checkout.
+A non-privileged counterpart requires pinned status to execute successfully,
+checks the marker stays absent and rejects included or writable metadata config.
+A cleanup regression snapshots every checkout and private-registration file and
+requires byte-for-byte retention for an unpushed HEAD and for another unpushed
+local branch beside a published detached HEAD; publishing both permits removal.
 Archive immediately revokes B's common-store access while preserving its external
 checkout bytes; reap is idempotent and C remains admitted. A separate post-sharing
 admission failure verifies rollback revocation. ACL readbacks cover every changed
