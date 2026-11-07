@@ -946,6 +946,7 @@ impl CdpSession {
             &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
             Duration::from_secs(5),
         )?;
+        stream.set_nodelay(true)?;
         stream.set_read_timeout(Some(Duration::from_secs(20)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
@@ -2215,7 +2216,7 @@ fn render_takeover_html(profile: &str, token: &str, reason: Option<&str>) -> Str
         .replace("{{SCRIPT}}", include_str!("browser_takeover.js"))
 }
 
-struct TakeoverInputSession {
+struct TakeoverPageSession {
     target_id: String,
     cdp: CdpSession,
 }
@@ -2233,29 +2234,40 @@ fn dispatch_takeover_input_session(
     data: &Path,
     profile: &str,
     payload: &serde_json::Value,
-    session: &mut Option<TakeoverInputSession>,
+    session: &mut Option<TakeoverPageSession>,
 ) -> Result<serde_json::Value, Error> {
     let mut rt = load_runtime(data, profile)
         .ok_or_else(|| Error::Message(format!("browser profile `{profile}` is not running")))?;
     touch_runtime(data, &mut rt);
-    if session.as_ref().is_none_or(|s| {
-        s.cdp.port != rt.cdp_port || rt.active_target_id.as_deref() != Some(&s.target_id)
-    }) {
-        let target = select_page_target(data, &mut rt, None)?;
-        let ws_url = target
-            .ws_url
-            .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
-        *session = Some(TakeoverInputSession {
-            target_id: target.id,
-            cdp: CdpSession::connect(rt.cdp_port, &ws_url)?,
-        });
-    }
-    let result = dispatch_takeover_cdp_input(&mut session.as_mut().unwrap().cdp, payload);
+    let cdp = takeover_page_session(data, &mut rt, session)?;
+    let result = dispatch_takeover_cdp_input(cdp, payload);
     // Reconnect for the next action, never replay a possibly committed input.
     if result.is_err() {
         *session = None;
     }
     result
+}
+
+// Frame capture and input each keep their own page connection. A slow capture
+// must not hold the input lock, and a target/port change replaces either cache.
+fn takeover_page_session<'a>(
+    data: &Path,
+    rt: &mut BrowserRuntimeState,
+    session: &'a mut Option<TakeoverPageSession>,
+) -> Result<&'a mut CdpSession, Error> {
+    if session.as_ref().is_none_or(|s| {
+        s.cdp.port != rt.cdp_port || rt.active_target_id.as_deref() != Some(&s.target_id)
+    }) {
+        let target = select_page_target(data, rt, None)?;
+        let ws_url = target
+            .ws_url
+            .ok_or_else(|| Error::Message("browser page has no WebSocket debugger URL".into()))?;
+        *session = Some(TakeoverPageSession {
+            target_id: target.id,
+            cdp: CdpSession::connect(rt.cdp_port, &ws_url)?,
+        });
+    }
+    Ok(&mut session.as_mut().unwrap().cdp)
 }
 
 fn dispatch_takeover_cdp_input(
@@ -2485,7 +2497,8 @@ fn jpeg_size(bytes: &[u8]) -> Option<TakeoverFrameSize> {
 #[derive(Default)]
 struct TakeoverServerShared {
     last_frame: Mutex<Option<TakeoverFrameSize>>,
-    input: Mutex<Option<TakeoverInputSession>>,
+    input: Mutex<Option<TakeoverPageSession>>,
+    frame: Mutex<Option<TakeoverPageSession>>,
     // Serialize read-modify-publish of viewport/heartbeat/completion only.
     control: Mutex<()>,
 }
@@ -2628,7 +2641,8 @@ fn handle_takeover_http_client(
                 );
                 return false;
             };
-            let Ok(target) = select_page_target(data, &mut rt, None) else {
+            let mut session = shared.frame.lock().unwrap();
+            let Ok(cdp) = takeover_page_session(data, &mut rt, &mut session) else {
                 let _ = write_http_response(
                     &mut stream,
                     "503 Service Unavailable",
@@ -2637,18 +2651,13 @@ fn handle_takeover_http_client(
                 );
                 return false;
             };
-            let Some(ws_url) = target.ws_url else {
-                return false;
-            };
-            let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url) else {
-                return false;
-            };
-            let metrics = eval_js(&mut cdp, TAKEOVER_METRICS_JS).unwrap_or(serde_json::Value::Null);
+            let metrics = eval_js(cdp, TAKEOVER_METRICS_JS).unwrap_or(serde_json::Value::Null);
             if let Ok(shot) = cdp.call(
                 "Page.captureScreenshot",
                 serde_json::json!({
                     "format": "jpeg",
                     "quality": 75,
+                    "optimizeForSpeed": true,
                     "captureBeyondViewport": false,
                 }),
             ) && let Some(b64) = shot.get("data").and_then(|v| v.as_str())
@@ -2668,6 +2677,7 @@ fn handle_takeover_http_client(
                     ),
                 );
             } else {
+                *session = None;
                 let _ = write_http_response(
                     &mut stream,
                     "500 Internal Server Error",

@@ -354,7 +354,8 @@ if (typeof document !== 'undefined') {
       }
       image.close();
     } catch (_) { reconnect(); }
-    setTimeout(pollFrame, 32);
+    // One capture in flight; do not add a whole display frame after decoding.
+    setTimeout(pollFrame, 8);
   }
   async function pollState() {
     if (completed) return;

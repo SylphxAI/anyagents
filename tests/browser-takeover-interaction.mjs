@@ -154,7 +154,7 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
       }
       // Retain every sample before enforcing the contract.
       await writeFile(path.join(output,'input-to-paint-latency.json'),JSON.stringify({unit:'ms',boundary:'trusted viewer press to changed decoded JPEG pixel on viewer rAF',samples:latency,max:Math.max(...latency)},null,2));
-      assert.ok(latency.every(ms=>ms<=150),'input-to-frame <=150ms; samples: '+JSON.stringify(latency));
+
     }
   }
   await viewer.call('Network.enable');
@@ -163,5 +163,6 @@ export async function interactionAcceptance({ viewer, remote, url, output, until
   await viewer.call('Network.setBlockedURLs',{urls:[]});
   await until(()=>viewer.eval(`document.querySelector('#connection').hidden`),'automatic same-URL reconnect');
   await remote.eval(`document.querySelector('#interaction-fixture').remove();document.querySelector('#entry').value='';document.querySelector('#password').value=''`);
-  await writeFile(path.join(output,'interaction-result.json'),JSON.stringify({passed:true,viewports:3,cases:results,latency,reconnect:true},null,2));
+  await writeFile(path.join(output,'interaction-result.json'),JSON.stringify({passed:latency.every(ms=>ms<=150),viewports:3,cases:results,latency,reconnect:true},null,2));
+  assert.ok(latency.length===20 && latency.every(ms=>ms<=150),'input-to-frame <=150ms; samples: '+JSON.stringify(latency));
 }
