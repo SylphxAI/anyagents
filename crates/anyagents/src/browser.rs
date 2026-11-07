@@ -2124,9 +2124,13 @@ fn dispatch_takeover_input(
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or("click");
-    // CDP's input injector focuses the renderer widget, not its owning window.
-    // Activate the page before input so OOPIF focus is not undone by window focus.
-    cdp.call("Page.bringToFront", serde_json::json!({}))?;
+    if kind == "click" || (kind == "mouse" && payload["event_type"] == "mousePressed") {
+        cdp.call("Page.bringToFront", serde_json::json!({}))?;
+        eval_js(&mut cdp, "window.focus(); document.hasFocus()")?;
+        for frame in discover_child_frames(&mut cdp) {
+            eval_js_in_frame(&mut cdp, Some(&frame.frame_id), "document.hasFocus()")?;
+        }
+    }
     match kind {
         "click" => {
             let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
