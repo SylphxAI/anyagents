@@ -65,3 +65,49 @@ capabilities are **not** an OS security sandbox. Container/Pod/user isolation
 requires a configured runtime boundary and a separate execution check on that
 runtime. This script does not certify Docker, Kubernetes, cross-user isolation,
 or live authentication. See [ADR 0002](adr/0002-runtime-drivers-and-capability-identity.md).
+
+## Browser takeover on phones
+
+Takeover starts with the original desktop page, fitted to a full-viewport canvas.
+The floating control pill expands to reveal typing, Enter, Backspace, reset/1:1,
+and an opt-in phone layout. Touch pinches zoom locally; dragging pans when
+zoomed and scrolls the remote page at fit. Mouse dragging continues to operate
+the remote page. Phone layout resizes only the browser window, leaving its
+User-Agent, Client Hints, screen and DPR unchanged. The original window bounds
+and state are restored on Done, agent release, expiry, navigation away, or a
+lost viewer heartbeat (10 seconds).
+
+Frame metadata supplies the remote CSS viewport alongside the actual JPEG size
+and reported DPR. A screenshot captured by a fresh CDP session can be 1920×1080
+while the document reports DPR 2; dividing image coordinates by DPR alone is
+incorrect. Input uses the measured CSS extent and the current zoom/pan transform.
+
+Run the focused checks without an existing browser profile or external account:
+
+```sh
+npm test
+cargo test -p anyagents --bin anyagents browser::tests:: --locked
+```
+
+The geometry suite covers DPR 1/2/3, zoom anchors and pan limits. The native
+browser tests exercise trusted input, byte-identical browser identity, restored
+metrics on every exit, and expiry before a queued toggle or Done. They require
+Chromium; the existing browser suites skip when it is unavailable.
+
+The full UI acceptance test additionally requires Node.js 22 or newer (native
+WebSocket support). It launches its own headless Chromium viewer and remote test
+page, records trusted remote click coordinates within 2 CSS pixels, and saves
+collapsed, expanded, zoomed, phone-layout and keyboard captures at 390×844,
+588×1280, 1280×800 and 1440×900. It also checks pagehide restoration and visible
+reconnection/recovery:
+
+```sh
+TAKEOVER_EVIDENCE_DIR="$(mktemp -d)" \
+  cargo test -p anyagents --bin anyagents \
+  browser::tests::mobile_takeover_ui_acceptance --locked -- --ignored --nocapture
+```
+
+Set `TAKEOVER_GOOGLE_ACCEPTANCE=1` for the additional network-dependent,
+unauthenticated `accounts.google.com` phone-layout captures. No credentials are
+entered. This is separate from the deterministic local fixture and does not
+certify Google sign-in, a physical phone's keyboard, or deployed release bytes.

@@ -682,7 +682,7 @@ pub fn stop_profile(data: &Path, profile: &str) -> Result<serde_json::Value, Err
         stop_process_group(rt.pid);
     }
     clear_held_keys(data, profile);
-    cleanup_takeover_session(data, profile);
+    let _ = cleanup_takeover_session(data, profile);
     let _ = std::fs::remove_file(&rt_path);
     cleanup_singleton_locks(&dir.join("user-data"));
     Ok(serde_json::json!({
@@ -1379,6 +1379,18 @@ pub struct CaptchaDetection {
     pub summary: Option<String>,
 }
 
+/// Original page metrics are kept with the target, not whichever tab is active at release.
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+pub struct TakeoverViewport {
+    cdp_port: u16,
+    window_id: i64,
+    window_width: u32,
+    window_height: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+    window_state: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct BrowserTakeoverState {
     pub profile: String,
@@ -1407,6 +1419,10 @@ pub struct BrowserTakeoverState {
     pub initial_captcha_detected: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_captcha_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub original_viewport: Option<TakeoverViewport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewport_heartbeat_ms: Option<i64>,
 }
 
 fn takeover_path(data: &Path, profile: &str) -> PathBuf {
@@ -1438,6 +1454,9 @@ fn reap_expired_takeover(data: &Path, profile: &str, now: i64) {
         && !st.completed
         && (now >= st.expires_at_ms || !cdp_port_alive(st.port))
     {
+        if restore_takeover_viewport(&mut st).is_err() {
+            return;
+        }
         if let Some(tpid) = st.tunnel_pid.take() {
             stop_process_group(tpid);
         }
@@ -1449,13 +1468,200 @@ fn reap_expired_takeover(data: &Path, profile: &str, now: i64) {
     }
 }
 
-fn cleanup_takeover_session(data: &Path, profile: &str) {
-    if let Some(st) = load_takeover_state(data, profile)
-        && let Some(tpid) = st.tunnel_pid
-    {
-        stop_process_group(tpid);
+fn cleanup_takeover_session(data: &Path, profile: &str) -> Result<(), Error> {
+    if let Some(mut st) = load_takeover_state(data, profile) {
+        restore_takeover_viewport(&mut st)?;
+        if let Some(tpid) = st.tunnel_pid {
+            stop_process_group(tpid);
+        }
     }
     let _ = std::fs::remove_file(takeover_path(data, profile));
+    Ok(())
+}
+
+const TAKEOVER_METRICS_JS: &str = "({width:innerWidth,height:innerHeight,device_scale_factor:devicePixelRatio,screen_width:screen.width,screen_height:screen.height})";
+
+fn restore_takeover_viewport(st: &mut BrowserTakeoverState) -> Result<(), Error> {
+    if let Some(original) = st.original_viewport.as_ref() {
+        // Bounds are window-global and outlive CDP sessions. Use any surviving
+        // page, so closing the initial tab does not strand the resized window.
+        if cdp_port_alive(original.cdp_port) {
+            let pages = list_page_targets(original.cdp_port)?;
+            if let Some(ws) = pages.iter().find_map(|p| p.ws_url.as_deref()) {
+                let mut cdp = CdpSession::connect(original.cdp_port, ws)?;
+                let mut exists = false;
+                for page in &pages {
+                    let window = cdp.call(
+                        "Browser.getWindowForTarget",
+                        serde_json::json!({"targetId": page.id}),
+                    )?;
+                    if window["windowId"].as_i64() == Some(original.window_id) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if exists {
+                    cdp.call("Browser.setWindowBounds", serde_json::json!({
+                        "windowId": original.window_id,
+                        "bounds": { "width": original.window_width, "height": original.window_height },
+                    }))?;
+                    if original.window_state != "normal" {
+                        cdp.call("Browser.setWindowBounds", serde_json::json!({
+                            "windowId": original.window_id, "bounds": { "windowState": original.window_state },
+                        }))?;
+                    }
+                    // CDP acknowledges the window operation before the renderer
+                    // receives its resize. Hand back only after CSS metrics settle.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let metrics = eval_js(&mut cdp, TAKEOVER_METRICS_JS)?;
+                        if metrics["width"].as_u64() == Some(original.viewport_width as u64)
+                            && metrics["height"].as_u64() == Some(original.viewport_height as u64)
+                        {
+                            break;
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Err(Error::Message(
+                                "browser viewport restoration did not settle".into(),
+                            ));
+                        }
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                }
+            }
+        }
+        st.original_viewport = None;
+        st.viewport_heartbeat_ms = None;
+    }
+    Ok(())
+}
+
+/// Phone layout is a short lease, renewed by /state. A vanished client must not
+/// leave the agent with an emulated viewport, even before the takeover expires.
+fn reap_disconnected_takeover_viewport(data: &Path, profile: &str, now: i64) {
+    if let Some(mut st) = load_takeover_state(data, profile)
+        && st.original_viewport.is_some()
+        && st
+            .viewport_heartbeat_ms
+            .is_none_or(|last| now - last > 10_000)
+        && restore_takeover_viewport(&mut st).is_ok()
+    {
+        save_takeover_state(data, &st);
+    }
+}
+
+fn set_takeover_viewport(
+    data: &Path,
+    profile: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value, Error> {
+    let mut st = load_takeover_state(data, profile)
+        .ok_or_else(|| Error::Message("takeover session is not active".into()))?;
+    if st.completed || st.holder != "human" || now_ms() >= st.expires_at_ms {
+        return Err(Error::Message("takeover session has ended".into()));
+    }
+    let enabled = payload
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if !enabled {
+        restore_takeover_viewport(&mut st)?;
+    } else {
+        let mut rt = load_runtime(data, profile)
+            .ok_or_else(|| Error::Message("browser is not running".into()))?;
+        let target = select_page_target(data, &mut rt, None)?;
+        let ws_url = target
+            .ws_url
+            .ok_or_else(|| Error::Message("no page target".into()))?;
+        let mut cdp = CdpSession::connect(rt.cdp_port, &ws_url)?;
+        let window = cdp.call(
+            "Browser.getWindowForTarget",
+            serde_json::json!({"targetId": target.id}),
+        )?;
+        let window_id = window["windowId"]
+            .as_i64()
+            .ok_or_else(|| Error::Message("browser target has no window".into()))?;
+        let bounds = &window["bounds"];
+        if st
+            .original_viewport
+            .as_ref()
+            .is_some_and(|v| v.window_id != window_id)
+        {
+            restore_takeover_viewport(&mut st)?;
+        }
+        if st.original_viewport.is_none() {
+            let metrics = eval_js(&mut cdp, TAKEOVER_METRICS_JS)?;
+            st.original_viewport = Some(TakeoverViewport {
+                cdp_port: rt.cdp_port,
+                window_id,
+                window_width: bounds["width"].as_u64().unwrap_or(1280) as u32,
+                window_height: bounds["height"].as_u64().unwrap_or(800) as u32,
+                viewport_width: metrics["width"].as_u64().unwrap_or(1280) as u32,
+                viewport_height: metrics["height"].as_u64().unwrap_or(800) as u32,
+                window_state: bounds["windowState"]
+                    .as_str()
+                    .unwrap_or("normal")
+                    .to_string(),
+            });
+            st.viewport_heartbeat_ms = Some(now_ms());
+            save_takeover_state(data, &st);
+        }
+        // Resize only the window: no Emulation/UA/Client Hints/DPR changes.
+        // Metrics overrides disappear with their short-lived CDP session; window
+        // bounds are shared by the screenshot, input and focused-page sessions.
+        cdp.call(
+            "Browser.setWindowBounds",
+            serde_json::json!({
+                "windowId": window_id, "bounds": { "windowState": "normal" },
+            }),
+        )?;
+        cdp.call(
+            "Browser.setWindowBounds",
+            serde_json::json!({
+                "windowId": window_id,
+                "bounds": { "width": payload["width"].as_u64().unwrap_or(390).clamp(390, 430),
+                            "height": payload["height"].as_u64().unwrap_or(844).clamp(600, 1400) },
+            }),
+        )?;
+        st.viewport_heartbeat_ms = Some(now_ms());
+    }
+    save_takeover_state(data, &st);
+    Ok(serde_json::json!({ "ok": true, "phone_layout": st.original_viewport.is_some() }))
+}
+
+const TAKEOVER_FOCUS_JS: &str = r#"(() => {
+    let el = document.activeElement, x = 0, y = 0;
+    // Traverse same-origin frames here; cross-origin focus is inspected via CDP below.
+    try {
+        while (el && el.tagName === 'IFRAME' && el.contentDocument) {
+            const r = el.getBoundingClientRect(); x += r.x; y += r.y;
+            el = el.contentDocument.activeElement;
+        }
+    } catch (_) {}
+    const editable = !!el && !el.disabled && !el.readOnly && (el.isContentEditable || el.tagName === 'TEXTAREA' ||
+        (el.tagName === 'INPUT' && !['button','submit','reset','checkbox','radio','range','color','file','hidden','image'].includes(el.type)));
+    if (!editable) return {editable:false,frame_focused:el?.tagName === 'IFRAME'};
+    const r = el.getBoundingClientRect();
+    return {editable:true,focused:document.hasFocus(),input_type:el.type || 'text',input_mode:el.inputMode || (el.type === 'email' ? 'email' : el.type === 'number' || el.type === 'tel' ? 'decimal' : 'text'),rect:{x:r.x+x,y:r.y+y,width:r.width,height:r.height}};
+})()"#;
+
+fn takeover_focused_field(cdp: &mut CdpSession) -> serde_json::Value {
+    let focus = eval_js(cdp, TAKEOVER_FOCUS_JS).unwrap_or(serde_json::Value::Null);
+    if focus["frame_focused"].as_bool() == Some(true) {
+        for frame in discover_child_frames(cdp) {
+            if let Ok(mut child) = eval_js_in_frame(cdp, Some(&frame.frame_id), TAKEOVER_FOCUS_JS)
+                && child["editable"].as_bool() == Some(true)
+                && child["focused"].as_bool() == Some(true)
+            {
+                let x = child["rect"]["x"].as_f64().unwrap_or(0.0) + frame.offset_x;
+                let y = child["rect"]["y"].as_f64().unwrap_or(0.0) + frame.offset_y;
+                child["rect"]["x"] = serde_json::json!(x);
+                child["rect"]["y"] = serde_json::json!(y);
+                return child;
+            }
+        }
+    }
+    focus
 }
 
 fn generate_takeover_token() -> String {
@@ -1755,322 +1961,23 @@ fn extract_trycloudflare_url(line: &str) -> Option<String> {
 }
 
 fn render_takeover_html(profile: &str, token: &str, reason: Option<&str>) -> String {
-    let reason_banner = reason
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("Solve the CAPTCHA / verification challenge below, then click Done.");
-    let reason_escaped = reason_banner
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;");
-    let profile_escaped = profile
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
-    format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
-  <title>AnyAgents Browser Takeover ({profile_escaped})</title>
-  <style>
-    * {{ box-sizing: border-box; }}
-    body {{
-      margin: 0;
-      background: #0b0f17;
-      color: #f3f4f6;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-      display: flex;
-      flex-direction: column;
-      min-height: 100vh;
-    }}
-    .topbar {{
-      background: #111827;
-      border-bottom: 1px solid #1f2937;
-      padding: 10px 14px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-      align-items: center;
-      justify-content: space-between;
-    }}
-    .badge {{
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      font-size: 13px;
-      font-weight: 600;
-      padding: 5px 10px;
-      border-radius: 999px;
-      background: #1e293b;
-      color: #38bdf8;
-    }}
-    .badge.warn {{ background: #422006; color: #fbbf24; }}
-    .badge.ok {{ background: #064e3b; color: #34d399; }}
-    .reason {{
-      font-size: 13px;
-      color: #d1d5db;
-      flex: 1 1 240px;
-    }}
-    .controls {{
-      display: flex;
-      flex-wrap: wrap;
-      gap: 6px;
-      align-items: center;
-    }}
-    input.text-box {{
-      background: #0f172a;
-      color: #f9fafb;
-      border: 1px solid #334155;
-      border-radius: 6px;
-      padding: 6px 10px;
-      font-size: 13px;
-      min-width: 170px;
-    }}
-    button {{
-      border: 1px solid #334155;
-      background: #1e293b;
-      color: #f9fafb;
-      border-radius: 6px;
-      padding: 6px 11px;
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-    }}
-    button:hover {{ background: #334155; }}
-    button.done-btn {{
-      background: #059669;
-      border-color: #10b981;
-      color: #ffffff;
-      font-weight: 600;
-      padding: 7px 14px;
-    }}
-    button.done-btn:hover {{ background: #047857; }}
-    .urlbar {{
-      background: #0f172a;
-      border-bottom: 1px solid #1e293b;
-      padding: 6px 14px;
-      font-size: 12px;
-      color: #94a3b8;
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      white-space: nowrap;
-    }}
-    .stage {{
-      flex: 1;
-      display: flex;
-      align-items: flex-start;
-      justify-content: center;
-      padding: 8px;
-      overflow: auto;
-    }}
-    canvas {{
-      background: #000;
-      max-width: 100%;
-      height: auto;
-      border: 1px solid #1f2937;
-      border-radius: 6px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.5);
-      touch-action: none;
-      cursor: pointer;
-    }}
-    .done-overlay {{
-      display: none;
-      position: fixed;
-      inset: 0;
-      background: rgba(11, 15, 23, 0.92);
-      align-items: center;
-      justify-content: center;
-      flex-direction: column;
-      gap: 12px;
-      z-index: 50;
-      text-align: center;
-      padding: 24px;
-    }}
-  </style>
-</head>
-<body>
-  <div class="topbar">
-    <span class="badge" id="status-badge">🟢 Live Profile: {profile_escaped}</span>
-    <span class="badge warn" id="captcha-badge" style="display:none;">⚠️ Challenge Active</span>
-    <div class="reason">{reason_escaped}</div>
-    <div class="controls">
-      <input id="type-input" class="text-box" type="text" placeholder="Type/paste text or 2FA..." />
-      <button type="button" id="send-text-btn">Type</button>
-      <button type="button" id="enter-btn">Enter ↵</button>
-      <button type="button" id="bksp-btn">⌫</button>
-      <button type="button" id="reload-btn">↻</button>
-      <button type="button" class="done-btn" id="done-btn">✅ Done — Hand Back to Agent</button>
-    </div>
-  </div>
-  <div class="urlbar">
-    <span>URL:</span>
-    <span id="page-url">connecting...</span>
-  </div>
-  <div class="stage">
-    <canvas id="screen" width="1280" height="800" tabindex="0"></canvas>
-  </div>
-  <div class="done-overlay" id="done-overlay">
-    <h2>✅ Control Handed Back to Agent</h2>
-    <p>Your session cookies and verification state are saved in profile <b>{profile_escaped}</b>. You can close this tab now.</p>
-  </div>
-  <script>
-    const TOKEN = {token_json};
-    const BASE = "/takeover/" + encodeURIComponent(TOKEN);
-    const canvas = document.getElementById("screen");
-    const ctx = canvas.getContext("2d");
-    const urlEl = document.getElementById("page-url");
-    const captchaBadge = document.getElementById("captcha-badge");
-    const doneOverlay = document.getElementById("done-overlay");
-    let completed = false;
-    let isPointerDown = false;
-
-    async function sendInput(payload) {{
-      if (completed) return;
-      try {{
-        await fetch(BASE + "/input", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify(payload),
-        }});
-      }} catch (_) {{}}
-    }}
-
-    function canvasCoords(clientX, clientY) {{
-      const rect = canvas.getBoundingClientRect();
-      const x = Math.round(((clientX - rect.left) / Math.max(rect.width, 1)) * canvas.width);
-      const y = Math.round(((clientY - rect.top) / Math.max(rect.height, 1)) * canvas.height);
-      return {{ x: Math.max(0, Math.min(canvas.width, x)), y: Math.max(0, Math.min(canvas.height, y)) }};
-    }}
-
-    canvas.addEventListener("pointerdown", (e) => {{
-      e.preventDefault();
-      canvas.focus();
-      isPointerDown = true;
-      const pt = canvasCoords(e.clientX, e.clientY);
-      sendInput({{ type: "mouse", event_type: "mousePressed", x: pt.x, y: pt.y, button: "left", buttons: 1 }});
-    }});
-
-    canvas.addEventListener("pointermove", (e) => {{
-      if (!isPointerDown) return;
-      e.preventDefault();
-      const pt = canvasCoords(e.clientX, e.clientY);
-      sendInput({{ type: "mouse", event_type: "mouseMoved", x: pt.x, y: pt.y, button: "left", buttons: 1 }});
-    }});
-
-    window.addEventListener("pointerup", (e) => {{
-      if (!isPointerDown) return;
-      isPointerDown = false;
-      const pt = canvasCoords(e.clientX, e.clientY);
-      sendInput({{ type: "mouse", event_type: "mouseReleased", x: pt.x, y: pt.y, button: "left", buttons: 0 }});
-    }});
-
-    canvas.addEventListener("wheel", (e) => {{
-      e.preventDefault();
-      const pt = canvasCoords(e.clientX, e.clientY);
-      sendInput({{ type: "wheel", x: pt.x, y: pt.y, delta_x: e.deltaX, delta_y: e.deltaY }});
-    }}, {{ passive: false }});
-
-    canvas.addEventListener("keydown", (e) => {{
-      if (e.target !== canvas) return;
-      e.preventDefault();
-      sendInput({{ type: "key", key: e.key }});
-    }});
-
-    document.getElementById("send-text-btn").addEventListener("click", () => {{
-      const inp = document.getElementById("type-input");
-      if (inp.value) {{
-        sendInput({{ type: "text", text: inp.value, submit: false }});
-        inp.value = "";
-      }}
-    }});
-    document.getElementById("type-input").addEventListener("keydown", (e) => {{
-      if (e.key === "Enter") {{
-        e.preventDefault();
-        const inp = e.target;
-        if (inp.value) {{
-          sendInput({{ type: "text", text: inp.value, submit: true }});
-          inp.value = "";
-        }} else {{
-          sendInput({{ type: "key", key: "Enter" }});
-        }}
-      }}
-    }});
-    document.getElementById("enter-btn").addEventListener("click", () => sendInput({{ type: "key", key: "Enter" }}));
-    document.getElementById("bksp-btn").addEventListener("click", () => sendInput({{ type: "key", key: "Backspace" }}));
-    document.getElementById("reload-btn").addEventListener("click", () => sendInput({{ type: "reload" }}));
-
-    document.getElementById("done-btn").addEventListener("click", async () => {{
-      try {{
-        await fetch(BASE + "/complete", {{
-          method: "POST",
-          headers: {{ "Content-Type": "application/json" }},
-          body: JSON.stringify({{ note: "completed by user in takeover UI" }}),
-        }});
-      }} catch (_) {{}}
-      completed = true;
-      doneOverlay.style.display = "flex";
-    }});
-
-    async function pollFrame() {{
-      if (completed) return;
-      try {{
-        const img = new Image();
-        const loaded = new Promise((resolve, reject) => {{
-          img.onload = resolve;
-          img.onerror = reject;
-        }});
-        img.src = BASE + "/frame.jpg?t=" + Date.now();
-        await loaded;
-        if (img.naturalWidth > 0 && img.naturalHeight > 0) {{
-          if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {{
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-          }}
-          ctx.drawImage(img, 0, 0);
-        }}
-      }} catch (_) {{}}
-      setTimeout(pollFrame, 160);
-    }}
-
-    async function pollState() {{
-      if (completed) return;
-      try {{
-        const res = await fetch(BASE + "/state");
-        if (res.ok) {{
-          const st = await res.json();
-          if (st.url) urlEl.textContent = st.url + (st.title ? " — " + st.title : "");
-          if (st.captcha_detected) {{
-            captchaBadge.style.display = "inline-flex";
-            captchaBadge.className = "badge warn";
-            captchaBadge.textContent = "⚠️ " + (st.captcha_kind || "Challenge Active");
-          }} else {{
-            captchaBadge.style.display = "inline-flex";
-            captchaBadge.className = "badge ok";
-            captchaBadge.textContent = "✅ No Challenge Detected";
-          }}
-          if (st.completed) {{
-            completed = true;
-            doneOverlay.style.display = "flex";
-            return;
-          }}
-        }}
-      }} catch (_) {{}}
-      setTimeout(pollState, 800);
-    }}
-
-    pollFrame();
-    pollState();
-  </script>
-</body>
-</html>"#,
-        token_json = serde_json::to_string(token).unwrap_or_else(|_| "\"\"".into()),
-    )
+    let escape = |s: &str| {
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let config = serde_json::json!({ "token": token })
+        .to_string()
+        .replace('<', "\\u003c");
+    include_str!("browser_takeover.html")
+        .replace("{{PROFILE}}", &escape(profile))
+        .replace(
+            "{{REASON}}",
+            &escape(reason.unwrap_or("Finish verification, then tap Done.")),
+        )
+        .replace("{{CONFIG}}", &config)
+        .replace("{{SCRIPT}}", include_str!("browser_takeover.js"))
 }
 
 fn dispatch_takeover_input(
@@ -2096,7 +2003,8 @@ fn dispatch_takeover_input(
             let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
             let y = payload.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
             dispatch_trusted_click(&mut cdp, x, y)?;
-            Ok(serde_json::json!({ "ok": true, "type": "click", "x": x, "y": y }))
+            let focus = takeover_focused_field(&mut cdp);
+            Ok(serde_json::json!({ "ok": true, "type": "click", "x": x, "y": y, "focus": focus }))
         }
         "mouse" => {
             let event_type = payload
@@ -2124,7 +2032,14 @@ fn dispatch_takeover_input(
                     "clickCount": 1,
                 }),
             )?;
-            Ok(serde_json::json!({ "ok": true, "type": "mouse", "event_type": event_type }))
+            let focus = if event_type == "mouseReleased" {
+                Some(takeover_focused_field(&mut cdp))
+            } else {
+                None
+            };
+            Ok(
+                serde_json::json!({ "ok": true, "type": "mouse", "event_type": event_type, "focus": focus }),
+            )
         }
         "wheel" => {
             let x = payload.get("x").and_then(|v| v.as_f64()).unwrap_or(400.0);
@@ -2247,8 +2162,18 @@ fn write_http_response(
     content_type: &str,
     body: &[u8],
 ) -> std::io::Result<()> {
+    write_http_response_with_headers(stream, status, content_type, body, "")
+}
+
+fn write_http_response_with_headers(
+    stream: &mut TcpStream,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    extra_headers: &str,
+) -> std::io::Result<()> {
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\n{extra_headers}Content-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store, no-cache, must-revalidate\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(header.as_bytes())?;
@@ -2256,11 +2181,43 @@ fn write_http_response(
     stream.flush()
 }
 
+#[derive(Clone, Copy)]
+struct TakeoverFrameSize {
+    width: u16,
+    height: u16,
+}
+
+fn jpeg_size(bytes: &[u8]) -> Option<TakeoverFrameSize> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut offset = 2;
+    while offset + 4 <= bytes.len() {
+        if bytes[offset] != 0xff {
+            return None;
+        }
+        let marker = bytes[offset + 1];
+        let len = u16::from_be_bytes([bytes[offset + 2], bytes[offset + 3]]) as usize;
+        if len < 2 || offset + 2 + len > bytes.len() {
+            return None;
+        }
+        if matches!(marker, 0xc0..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf) && len >= 7 {
+            return Some(TakeoverFrameSize {
+                height: u16::from_be_bytes([bytes[offset + 5], bytes[offset + 6]]),
+                width: u16::from_be_bytes([bytes[offset + 7], bytes[offset + 8]]),
+            });
+        }
+        offset += 2 + len;
+    }
+    None
+}
+
 fn handle_takeover_http_client(
     mut stream: TcpStream,
     data: &Path,
     profile: &str,
     expected_token: &str,
+    last_frame: &mut Option<TakeoverFrameSize>,
 ) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
@@ -2317,8 +2274,8 @@ fn handle_takeover_http_client(
 
     let prefix = format!("/takeover/{expected_token}");
     let subpath = match path_only.strip_prefix(&prefix) {
-        Some(s) => s,
-        None => {
+        Some(s) if s.is_empty() || s.starts_with('/') => s,
+        _ => {
             let matched = path_only
                 .strip_prefix("/takeover/")
                 .map(|rest| rest.split('/').next().unwrap_or(""))
@@ -2373,16 +2330,30 @@ fn handle_takeover_http_client(
             let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url) else {
                 return false;
             };
+            let metrics = eval_js(&mut cdp, TAKEOVER_METRICS_JS).unwrap_or(serde_json::Value::Null);
             if let Ok(shot) = cdp.call(
                 "Page.captureScreenshot",
                 serde_json::json!({
                     "format": "jpeg",
                     "quality": 75,
+                    "captureBeyondViewport": false,
                 }),
             ) && let Some(b64) = shot.get("data").and_then(|v| v.as_str())
                 && let Ok(jpeg_bytes) = decode_base64(b64)
             {
-                let _ = write_http_response(&mut stream, "200 OK", "image/jpeg", &jpeg_bytes);
+                *last_frame = jpeg_size(&jpeg_bytes);
+                let dpr = metrics["device_scale_factor"].as_f64().unwrap_or(1.0);
+                let width = metrics["width"].as_u64().unwrap_or(1280);
+                let height = metrics["height"].as_u64().unwrap_or(800);
+                let _ = write_http_response_with_headers(
+                    &mut stream,
+                    "200 OK",
+                    "image/jpeg",
+                    &jpeg_bytes,
+                    &format!(
+                        "X-Remote-Dpr: {dpr}\r\nX-Remote-Width: {width}\r\nX-Remote-Height: {height}\r\n"
+                    ),
+                );
             } else {
                 let _ = write_http_response(
                     &mut stream,
@@ -2397,6 +2368,7 @@ fn handle_takeover_http_client(
             let mut url = String::new();
             let mut title = String::new();
             let mut cap = CaptchaDetection::default();
+            let mut metrics = serde_json::Value::Null;
             if let Some(mut rt) = load_runtime(data, profile)
                 && let Ok(target) = select_page_target(data, &mut rt, None)
             {
@@ -2406,6 +2378,8 @@ fn handle_takeover_http_client(
                     && let Ok(mut cdp) = CdpSession::connect(rt.cdp_port, &ws_url)
                 {
                     cap = detect_captcha(&mut cdp);
+                    metrics =
+                        eval_js(&mut cdp, TAKEOVER_METRICS_JS).unwrap_or(serde_json::Value::Null);
                     if let Ok(u) = eval_js(&mut cdp, "location.href")
                         && let Some(s) = u.as_str()
                     {
@@ -2418,7 +2392,14 @@ fn handle_takeover_http_client(
                     }
                 }
             }
-            let st = load_takeover_state(data, profile);
+            let mut st = load_takeover_state(data, profile);
+            if let Some(st) = st.as_mut()
+                && st.original_viewport.is_some()
+            {
+                st.viewport_heartbeat_ms = Some(now_ms());
+                save_takeover_state(data, st);
+            }
+            let dpr = metrics["device_scale_factor"].as_f64().unwrap_or(1.0);
             let body = serde_json::json!({
                 "profile": profile,
                 "url": url,
@@ -2429,9 +2410,32 @@ fn handle_takeover_http_client(
                 "holder": st.as_ref().map(|s| s.holder.as_str()).unwrap_or("agent"),
                 "completed": st.as_ref().is_none_or(|s| s.completed),
                 "expires_at_ms": st.as_ref().map(|s| s.expires_at_ms),
+                "phone_layout": st.as_ref().is_some_and(|s| s.original_viewport.is_some()),
+                "viewport": metrics,
+                "device_scale_factor": dpr,
+                "natural_width": last_frame.map(|f| f.width),
+                "natural_height": last_frame.map(|f| f.height),
             });
             let bytes = serde_json::to_vec(&body).unwrap_or_default();
             let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
+            false
+        }
+        ("POST", "/viewport") => {
+            let payload = serde_json::from_slice(body_bytes).unwrap_or(serde_json::Value::Null);
+            let result = set_takeover_viewport(data, profile, &payload);
+            let (status, body) = match result {
+                Ok(value) => ("200 OK", value),
+                Err(err) => (
+                    "400 Bad Request",
+                    serde_json::json!({ "ok": false, "error": err.to_string() }),
+                ),
+            };
+            let _ = write_http_response(
+                &mut stream,
+                status,
+                "application/json",
+                &serde_json::to_vec(&body).unwrap_or_default(),
+            );
             false
         }
         ("POST", "/input") => {
@@ -2468,7 +2472,7 @@ fn handle_takeover_http_client(
             let done = complete_takeover_session(data, profile, note.as_deref());
             let bytes = serde_json::to_vec(&done).unwrap_or_default();
             let _ = write_http_response(&mut stream, "200 OK", "application/json", &bytes);
-            true
+            done["completed"].as_bool().unwrap_or(false)
         }
         _ => {
             let _ = write_http_response(
@@ -2499,6 +2503,9 @@ fn complete_takeover_session(data: &Path, profile: &str, note: Option<&str>) -> 
     }
     if let Some(mut st) = load_takeover_state(data, profile) {
         let was_completed = st.completed;
+        if let Err(err) = restore_takeover_viewport(&mut st) {
+            return serde_json::json!({ "ok": false, "error": err.to_string(), "completed": false });
+        }
         if let Some(tpid) = st.tunnel_pid.take() {
             stop_process_group(tpid);
         }
@@ -2564,7 +2571,7 @@ fn start_or_reuse_takeover_session(
         return Ok(existing);
     }
 
-    cleanup_takeover_session(data, profile);
+    cleanup_takeover_session(data, profile)?;
 
     let listener = TcpListener::bind("0.0.0.0:0").or_else(|_| TcpListener::bind("127.0.0.1:0"))?;
     let port = listener.local_addr()?.port();
@@ -2600,6 +2607,8 @@ fn start_or_reuse_takeover_session(
         tunnel_pid,
         initial_captcha_detected: initial_captcha.detected,
         initial_captcha_kind: initial_captcha.kind.clone(),
+        original_viewport: None,
+        viewport_heartbeat_ms: None,
     };
     save_takeover_state(data, &state);
 
@@ -2609,21 +2618,33 @@ fn start_or_reuse_takeover_session(
     std::thread::Builder::new()
         .name(format!("anyagents-takeover-{prof}"))
         .spawn(move || {
+            let mut last_frame = None;
             loop {
                 let now = now_ms();
+                reap_disconnected_takeover_viewport(&data_dir, &prof, now);
                 let Some(cur) = load_takeover_state(&data_dir, &prof) else {
                     break;
                 };
                 if cur.token != tok || cur.completed || now >= cur.expires_at_ms {
                     if cur.token == tok && !cur.completed && now >= cur.expires_at_ms {
                         reap_expired_takeover(&data_dir, &prof, now);
+                        if load_takeover_state(&data_dir, &prof).is_some_and(|s| !s.completed) {
+                            std::thread::sleep(Duration::from_millis(100));
+                            continue;
+                        }
                     }
                     break;
                 }
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let _ = stream.set_nonblocking(false);
-                        let finished = handle_takeover_http_client(stream, &data_dir, &prof, &tok);
+                        let finished = handle_takeover_http_client(
+                            stream,
+                            &data_dir,
+                            &prof,
+                            &tok,
+                            &mut last_frame,
+                        );
                         if finished {
                             std::thread::sleep(Duration::from_millis(150));
                             break;
@@ -4440,7 +4461,7 @@ pub fn execute(
                 .or(req.text.as_deref())
                 .unwrap_or("released by agent");
             let _ = complete_takeover_session(data, &profile, Some(note));
-            cleanup_takeover_session(data, &profile);
+            cleanup_takeover_session(data, &profile)?;
             let snap = capture_snapshot(data, &profile, &mut cdp)?;
             Ok(serde_json::json!({
                 "profile": profile,
@@ -5055,7 +5076,7 @@ mod tests {
             raw_http_call(takeover_port, "GET", &format!("/takeover/{token}"), None);
         assert_eq!(html_code, 200);
         assert!(
-            String::from_utf8_lossy(&html_bytes).contains("Done — Hand Back to Agent"),
+            String::from_utf8_lossy(&html_bytes).contains("id=\"done-btn\""),
             "expected takeover UI HTML"
         );
 
@@ -5156,5 +5177,246 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+    #[test]
+    #[ignore = "requires Chromium and Node >=22; run explicitly for takeover UI changes"]
+    fn mobile_takeover_ui_acceptance() {
+        assert!(
+            Path::new(&chromium_binary()).exists(),
+            "Chromium is required"
+        );
+        let html = r#"<!doctype html><meta name="viewport" content="width=device-width,initial-scale=1">
+        <title>Remote browser input test</title>
+        <style>body{margin:0;background:#edf3fb;font:20px system-ui;color:#172a43}header{padding:28px;background:#fff;border-bottom:1px solid #ccd9e8}input{display:block;font:20px system-ui;width:280px;height:48px;margin-top:12px}#target{position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);background:#086bce;color:white;border:0;border-radius:16px;padding:24px;font:20px system-ui}p{margin:28px;max-width:460px;line-height:1.6}</style>
+        <header>Remote browser<input id="entry" placeholder="Type here"></header>
+        <p>Pinch to inspect the page. Tap the blue target to verify precise input. The remote browser keeps its original identity.</p>
+        <button id="target">Click target</button>
+        <script>window.clicks=[];window.keys=[];document.addEventListener('click',e=>window.clicks.push({x:e.clientX,y:e.clientY,target:e.target.id,trusted:e.isTrusted}));document.addEventListener('keydown',e=>window.keys.push(e.key));</script>"#.to_string();
+        let port = spawn_html_server("127.0.0.1", html);
+        let dir = tempfile::tempdir().unwrap();
+        execute(
+            dir.path(),
+            "mobile-ui",
+            BrowserRequest {
+                action: "open".into(),
+                headless: Some(true),
+                url: Some(format!("http://127.0.0.1:{port}/")),
+                wait_ms: Some(200),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut rt = load_runtime(dir.path(), "mobile-ui").unwrap();
+        let ws = select_page_target(dir.path(), &mut rt, None)
+            .unwrap()
+            .ws_url
+            .unwrap();
+        let st = start_or_reuse_takeover_session(
+            dir.path(),
+            "mobile-ui",
+            None,
+            Some("Verify the remote browser controls."),
+            Some(300_000),
+            Some(false),
+            &CaptchaDetection::default(),
+        )
+        .unwrap();
+        let output = std::env::var("TAKEOVER_EVIDENCE_DIR")
+            .unwrap_or_else(|_| dir.path().join("captures").display().to_string());
+        let result = Command::new("node")
+            .arg(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/browser-takeover.mjs"
+            ))
+            .args([&st.local_url, &ws, &output])
+            .env("ANYAGENTS_CHROMIUM", chromium_binary())
+            .status();
+        let _ = execute(
+            dir.path(),
+            "mobile-ui",
+            BrowserRequest {
+                action: "close".into(),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result.unwrap().success(),
+            "mobile takeover acceptance failed; captures: {output}"
+        );
+    }
+    #[test]
+    fn takeover_viewport_preserves_identity_and_restores_every_exit() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        execute(
+            dir.path(),
+            "viewport",
+            BrowserRequest {
+                action: "open".into(),
+                headless: Some(true),
+                url: Some("about:blank".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut rt = load_runtime(dir.path(), "viewport").unwrap();
+        let ws = select_page_target(dir.path(), &mut rt, None)
+            .unwrap()
+            .ws_url
+            .unwrap();
+        let mut cdp = CdpSession::connect(rt.cdp_port, &ws).unwrap();
+        let identity_js = "({ua:navigator.userAgent,hints:JSON.stringify(navigator.userAgentData?.toJSON()),screen:[screen.width,screen.height]})";
+        let identity = eval_js(&mut cdp, identity_js).unwrap();
+        let baseline = eval_js(&mut cdp, TAKEOVER_METRICS_JS).unwrap();
+        let begin = || {
+            start_or_reuse_takeover_session(
+                dir.path(),
+                "viewport",
+                None,
+                None,
+                Some(60_000),
+                Some(false),
+                &CaptchaDetection::default(),
+            )
+            .unwrap()
+        };
+        let enable = || {
+            set_takeover_viewport(
+                dir.path(),
+                "viewport",
+                &serde_json::json!({"enabled":true,"width":390,"height":844}),
+            )
+            .unwrap()
+        };
+        let assert_restored = |cdp: &mut CdpSession| {
+            assert_eq!(eval_js(cdp, TAKEOVER_METRICS_JS).unwrap(), baseline);
+            assert_eq!(eval_js(cdp, identity_js).unwrap(), identity);
+        };
+        assert!(
+            begin().original_viewport.is_none(),
+            "phone mode must default off"
+        );
+        enable();
+        let metrics = eval_js(&mut cdp, TAKEOVER_METRICS_JS).unwrap();
+        assert_eq!(metrics["width"], 390);
+        assert!(metrics["height"].as_u64().unwrap() >= 600);
+        assert_eq!(
+            metrics["device_scale_factor"],
+            baseline["device_scale_factor"]
+        );
+        assert_eq!(
+            eval_js(&mut cdp, identity_js).unwrap(),
+            identity,
+            "UA and Client Hints must remain byte-identical"
+        );
+        set_takeover_viewport(
+            dir.path(),
+            "viewport",
+            &serde_json::json!({"enabled":false}),
+        )
+        .unwrap();
+        assert_restored(&mut cdp);
+        enable();
+        complete_takeover_session(dir.path(), "viewport", None);
+        assert_restored(&mut cdp);
+        assert!(
+            load_takeover_state(dir.path(), "viewport")
+                .unwrap()
+                .completed
+        );
+
+        begin();
+        enable();
+        execute(
+            dir.path(),
+            "viewport",
+            BrowserRequest {
+                action: "release_takeover".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_restored(&mut cdp);
+
+        begin();
+        enable();
+        let mut st = load_takeover_state(dir.path(), "viewport").unwrap();
+        st.expires_at_ms = now_ms() - 1;
+        save_takeover_state(dir.path(), &st);
+        reap_expired_takeover(dir.path(), "viewport", now_ms());
+        assert_restored(&mut cdp);
+        assert!(
+            set_takeover_viewport(dir.path(), "viewport", &serde_json::json!({"enabled":true}))
+                .is_err(),
+            "late toggle after reap must be refused"
+        );
+        complete_takeover_session(dir.path(), "viewport", None);
+        assert_restored(&mut cdp);
+
+        begin();
+        enable();
+        let mut st = load_takeover_state(dir.path(), "viewport").unwrap();
+        st.viewport_heartbeat_ms = Some(now_ms() - 10_001);
+        save_takeover_state(dir.path(), &st);
+        reap_disconnected_takeover_viewport(dir.path(), "viewport", now_ms());
+        assert_restored(&mut cdp);
+        assert!(
+            !load_takeover_state(dir.path(), "viewport")
+                .unwrap()
+                .completed,
+            "disconnect restores metrics, not control"
+        );
+        enable();
+        cleanup_takeover_session(dir.path(), "viewport").unwrap();
+        assert_restored(&mut cdp);
+        let _ = execute(
+            dir.path(),
+            "viewport",
+            BrowserRequest {
+                action: "close".into(),
+                ..Default::default()
+            },
+        );
+    }
+    #[test]
+    fn takeover_focus_finds_cross_origin_input() {
+        if !Path::new(&chromium_binary()).exists() {
+            return;
+        }
+        let child = spawn_html_server(
+            "127.0.0.2",
+            "<style>body{margin:0}input{width:240px;height:44px}</style><input id='entry'>".into(),
+        );
+        let parent = spawn_html_server(
+            "127.0.0.1",
+            format!(
+                "<style>body{{margin:0}}iframe{{position:absolute;left:60px;top:80px;border:0;width:400px;height:200px}}</style><iframe src='http://127.0.0.2:{child}'></iframe>"
+            ),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        execute(
+            dir.path(),
+            "frame-focus",
+            BrowserRequest {
+                action: "open".into(),
+                url: Some(format!("http://127.0.0.1:{parent}")),
+                headless: Some(true),
+                wait_ms: Some(400),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let response = dispatch_takeover_input(
+            dir.path(),
+            "frame-focus",
+            &serde_json::json!({"type":"click","x":100,"y":100}),
+        )
+        .unwrap();
+        assert_eq!(response["focus"]["editable"], true);
+        assert_eq!(response["focus"]["rect"]["x"], 60.0);
+        assert_eq!(response["focus"]["rect"]["y"], 80.0);
+        let _ = stop_profile(dir.path(), "frame-focus");
     }
 }
