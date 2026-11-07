@@ -39,6 +39,64 @@ fn before_launch_from(data: &Path, agent: &AgentId, owners_pages: &Path) -> Resu
     Ok(())
 }
 
+/// Deploy/startup migration inventories every registered identity, including
+/// archived identities that will never launch. Process locks, not SQL state,
+/// establish quiescence; live or busy identities are explicitly deferred.
+pub(crate) fn on_start(store: &Store) -> Result<(), Error> {
+    on_start_from(store, Path::new("/scratch/tmp/owners"))
+}
+fn on_start_from(store: &Store, owners_pages: &Path) -> Result<(), Error> {
+    let directory = store.data_dir().join("host-memory-migration");
+    fs::create_dir_all(&directory)?;
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(directory.join("migration.lock"))?;
+    lock.lock()?;
+    let registry = store.list_agents()?;
+    let mut stopped = HashSet::new();
+    let mut deferred = Vec::new();
+    let mut guards = Vec::new();
+    let mut owners = Vec::new();
+    for agent in &registry {
+        let mut aliases = store.agent_aliases(&agent.id)?;
+        aliases.push(agent.name.clone());
+        owners.push(AgentOwnership {
+            id: agent.id.clone(),
+            aliases,
+        });
+        if let Ok(lifecycle) = store.try_lock_agent_lifecycle(&agent.id)
+            && let Ok(process) = store.try_lock_agent(&agent.id)
+        {
+            stopped.insert(agent.id.to_string());
+            guards.push((lifecycle, process));
+        } else {
+            deferred.push(agent.id.to_string());
+        }
+    }
+    let mut migration = HostMigration::open(store.data_dir())?;
+    migration.discover(&owners, owners_pages)?;
+    migration.stage(&stopped)?;
+    let mut statuses = std::collections::BTreeMap::<String, usize>::new();
+    for entry in &migration.manifest.entries {
+        *statuses.entry(format!("{:?}", entry.status)).or_default() += 1;
+    }
+    let mut stopped: Vec<_> = stopped.into_iter().collect();
+    stopped.sort();
+    deferred.sort();
+    let receipt = serde_json::json!({"version": 1, "timestamp_ms": anyagents_core::now_ms(),
+        "population_count": registry.len(), "stopped_agents": stopped,
+        "deferred_active_or_busy_agents": deferred, "entry_counts": statuses,
+        "manifest_sha256": anyagents_core::learned_memory::sha256(&fs::read(directory.join("manifest-v1.json"))?)});
+    anyagents_core::learned_memory::atomic_write(
+        &directory.join("population-v1.json"),
+        &serde_json::to_vec_pretty(&receipt).map_err(std::io::Error::other)?,
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,6 +105,58 @@ mod tests {
         host_migration::{MigrationKind, MigrationStatus},
         learned_memory::sha256,
     };
+    #[test]
+    fn deploy_population_migrates_archived_and_defers_active_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let archived = store
+            .create_agent(NewAgent::new("never-launches", "claude-code"))
+            .unwrap();
+        store.set_agent_state(&archived.id, "archived").unwrap();
+        let active = store
+            .create_agent(NewAgent::new("active-writer", "claude-code"))
+            .unwrap();
+        for agent in [&archived, &active] {
+            let old = dir
+                .path()
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("config/projects/known/memory");
+            fs::create_dir_all(&old).unwrap();
+            fs::write(old.join("MEMORY.md"), format!("exact {}", agent.name)).unwrap();
+        }
+        let _live = store.try_lock_agent(&active.id).unwrap();
+        on_start_from(&store, &dir.path().join("owners")).unwrap();
+        let root = |id: &AgentId| dir.path().join("agents").join(id.as_str());
+        assert_eq!(
+            fs::read(root(&archived.id).join("memory/MEMORY.md")).unwrap(),
+            b"exact never-launches"
+        );
+        assert!(
+            !root(&archived.id)
+                .join("config/projects/known/memory/MEMORY.md")
+                .exists()
+        );
+        assert_eq!(
+            fs::read(root(&active.id).join("config/projects/known/memory/MEMORY.md")).unwrap(),
+            b"exact active-writer"
+        );
+        assert!(!root(&active.id).join("memory/MEMORY.md").exists());
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(dir.path().join("host-memory-migration/population-v1.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["population_count"], 2);
+        assert_eq!(
+            receipt["stopped_agents"],
+            serde_json::json!([archived.id.to_string()])
+        );
+        assert_eq!(
+            receipt["deferred_active_or_busy_agents"],
+            serde_json::json!([active.id.to_string()])
+        );
+    }
+
     #[test]
     fn daemon_launch_migrates_facts_stages_state_and_never_hands_off_native_raw() {
         let dir = tempfile::tempdir().unwrap();

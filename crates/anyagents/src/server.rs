@@ -111,6 +111,7 @@ fn acquire_server_lock(data: &Path) -> Result<std::fs::File, Error> {
 async fn serve(data: &Path, sign_in: Arc<Mutex<dyn CommandRunner + Send>>) -> Result<(), Error> {
     let _server_lock = acquire_server_lock(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
+    crate::host_memory::on_start(&store)?;
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
     let agents = store.list_agents()?;
@@ -1419,6 +1420,7 @@ pub fn run_admin(data: &Path) -> Result<(), Error> {
     let _admin_lock = acquire_admin_lock(data)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
+    crate::host_memory::on_start(&store)?;
     let res = runtime.block_on(async move {
         let auth = deployment_mode(data);
         let path = data.join("admin.sock");

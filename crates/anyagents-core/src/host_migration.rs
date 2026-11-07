@@ -354,11 +354,10 @@ impl HostMigration {
                 self.save()?;
                 continue;
             }
-            if entry.kind != MigrationKind::NativeState
-                && !entry
-                    .agent_id
-                    .as_ref()
-                    .is_some_and(|id| stopped_agents.contains(id))
+            if !entry
+                .agent_id
+                .as_ref()
+                .is_some_and(|id| stopped_agents.contains(id))
             {
                 self.manifest.entries[idx].source_fingerprint = Some(current);
                 self.manifest.entries[idx].status = MigrationStatus::RetainedActiveWriter;

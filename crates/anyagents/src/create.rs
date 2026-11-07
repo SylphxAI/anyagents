@@ -841,7 +841,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
     // Only the host lifecycle allocates a generation. Describe/restart/render
     // consume its persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
-        doc.push_str(&format!("\n## Host Learned Memory and Skills\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. The section below is the immutable snapshot for this session.\n", root.display(), root.display()));
+        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. Only the separately delimited `<learned_memory>` section is the bounded immutable snapshot for this session.\n", root.display(), root.display()));
         match anyagents_core::host_session::active(root) {
             Ok(Some(session)) if session.harness == agent.harness => {
                 doc.push('\n');
@@ -7528,6 +7528,46 @@ mod tests {
             std::fs::read(skill).unwrap()
         );
         assert!(!dir.path().join("skills").exists());
+    }
+
+    #[test]
+    fn rendered_whole_memory_block_respects_caps_separate_from_fixed_file_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let mut agent = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "caps-rendered",
+                "claude-code",
+            ))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &agent.id);
+        let root = config.parent().unwrap();
+        std::fs::create_dir_all(root.join("memory")).unwrap();
+        std::fs::write(root.join("memory/MEMORY.md"), "繁體長記憶".repeat(3000)).unwrap();
+        for harness in ["claude-code", "sylphx"] {
+            agent.harness = harness.into();
+            let pin = anyagents_core::host_session::new_session(root, harness).unwrap();
+            write_agent_instructions(&config, &agent, None);
+            for name in ["AGENTS.md", "CLAUDE.md", "SYSTEM_PROMPT.md"] {
+                let doc = std::fs::read_to_string(config.join(name)).unwrap();
+                // Find full delimiters at line boundaries, not their mention in
+                // the independent fixed operating instructions.
+                let start = doc.find("\n<learned_memory>\n").unwrap() + 1;
+                let end = doc[start..].find("</learned_memory>\n").unwrap()
+                    + start
+                    + "</learned_memory>\n".len();
+                let block = &doc[start..end];
+                assert_eq!(block, pin.memory.section);
+                assert!(block.len() <= 4096, "{name}: {} bytes", block.len());
+                assert!(block.lines().count() <= 150);
+                assert!(block.contains("Memory truncated"));
+                assert!(!block.contains("fixed; not learned memory"));
+                assert!(
+                    doc[..start]
+                        .contains("Host File Operating Instructions (fixed; not learned memory)")
+                );
+            }
+        }
     }
 
     #[test]
