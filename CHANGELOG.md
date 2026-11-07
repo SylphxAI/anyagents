@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## Unreleased
 
+- Keep role labels methodology-neutral: roots and labelled children can self-archive
+  and release idle processes under the same rules. Preserve legacy effective scopes
+  on upgrade, default all new children to private, and retain browser profiles until
+  deletion. Discovery and generated lifecycle instructions no longer depend on roles.
+
 ## 0.1.3
 
 ### Added

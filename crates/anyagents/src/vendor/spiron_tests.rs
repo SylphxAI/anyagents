@@ -93,6 +93,9 @@ for line in sys.stdin:
             emit('text_delta', id, text='awake')
             emit('result', id, status='completed', usage={'input_tokens':5,'output_tokens':1})
             active=None
+        elif id=='failure':
+            emit('result', id, status='failed', is_error=True, error='synthetic provider refusal', usage={'input_tokens':13,'output_tokens':2})
+            active=None
 "#).unwrap();
     std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o755)).unwrap();
     let _env = Environment::set(&[
@@ -212,6 +215,25 @@ for line in sys.stdin:
                 })
             )
         });
+        eventually(|| {
+            matches!(
+                vendor.deliver(&message("failure")),
+                Ok(DeliverOutcome::Accepted {
+                    turn_finished: true
+                })
+            )
+        });
+        assert_eq!(
+            vendor.health().turn_state,
+            anyagents_harness::TurnState::Idle
+        );
+        assert_eq!(
+            vendor.health().sign_in_fault.as_deref(),
+            Some("synthetic provider refusal"),
+            "failed terminal result retains its diagnostic"
+        );
+        assert_eq!(vendor.turns_served(), 2);
+        assert_eq!(vendor.served_usage().input_tokens, 18);
         let launches: Vec<serde_json::Value> =
             std::fs::read_to_string(config.join("launches.jsonl"))
                 .unwrap()
@@ -272,7 +294,7 @@ for line in sys.stdin:
             .collect();
         assert_eq!(
             inputs.len(),
-            4,
+            5,
             "each mailbox request crosses stdin only once"
         );
         assert_eq!(inputs[0]["request_id"], "first");
@@ -280,6 +302,7 @@ for line in sys.stdin:
         assert!(inputs[1]["text"].as_str().unwrap().contains("body-steer"));
         assert_eq!(inputs[2]["type"], "cancel");
         assert_eq!(inputs[3]["request_id"], "wake");
+        assert_eq!(inputs[4]["request_id"], "failure");
         assert_eq!(store.agent(&agent.id).unwrap(), agent);
         assert_eq!(store.inbox(&agent.id, None).unwrap(), inbox);
         assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 0);

@@ -137,9 +137,8 @@ impl StreamSpec {
         let quota_reset_at_ms = quota_of(value);
         let finishes = quota_reset_at_ms.is_none()
             && match self.protocol {
-                LineProtocol::Result
-                | LineProtocol::ResultWithCost
-                | LineProtocol::AcknowledgedResult => {
+                LineProtocol::AcknowledgedResult => kind == Some("result"),
+                LineProtocol::Result | LineProtocol::ResultWithCost => {
                     kind == Some("result") && (!is_error || self.name == "anyagents-agy")
                 }
                 LineProtocol::Done => {
@@ -1234,6 +1233,24 @@ fn read_stdout(
                     .is_some_and(|id| state.input_turns.values().any(|owner| owner == id));
             if effect.finishes_turn && correlated {
                 state.sign_in_fault = None;
+                if spec.protocol == LineProtocol::AcknowledgedResult {
+                    let error = value
+                        .get("error")
+                        .and_then(|error| {
+                            error
+                                .as_str()
+                                .or_else(|| error.get("message").and_then(Value::as_str))
+                        })
+                        .map(str::trim)
+                        .filter(|error| !error.is_empty());
+                    if value.get("is_error").and_then(Value::as_bool) == Some(true)
+                        || value.get("status").and_then(Value::as_str) == Some("failed")
+                        || error.is_some()
+                    {
+                        state.sign_in_fault =
+                            Some(error.unwrap_or("harness turn failed").to_string());
+                    }
+                }
                 let usage = effect.usage.unwrap_or_default();
                 if spec.protocol == LineProtocol::AcknowledgedResult {
                     finish_correlated(&mut state, value["request_id"].as_str().unwrap(), usage);

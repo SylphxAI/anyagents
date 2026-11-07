@@ -471,7 +471,7 @@ struct AgentsArgs {
     /// - `"steer"` / `"send"` (send/steer a follow-up `prompt` into an agent or sub-agent, waking it if archived)
     /// - `"wake"` / `"resume"` (wake an archived or paused agent, with optional `prompt`)
     /// - `"pause"` (pause an agent)
-    /// - `"archive"` (archive an agent or yourself to scale to zero; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
+    /// - `"archive"` (any agent, including roots and labelled children, may self-archive; preserves browser profiles; auto-reaps clean/pushed managed Git worktrees while preserving dirty ones)
     /// - `"delete"` / `"kill"` (permanently delete a sub-agent or agent)
     /// - `"rename"` (admin-only: rename an agent in place while keeping its `agt_...` ID and old name as an alias)
     /// - `"role"` (set or clear an agent's short role label)
@@ -511,7 +511,7 @@ struct AgentsArgs {
     /// New agent name when `action = "rename"`.
     #[serde(default, alias = "to")]
     new_name: Option<String>,
-    /// Short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...)
+    /// Optional display-only role label (for example, `"Researcher"`); never selects lifecycle or scope.
     /// when `action` is `"spawn"`, `"create"`, `"describe"`, or `"role"`.
     #[serde(default)]
     role: Option<String>,
@@ -588,7 +588,7 @@ struct SpawnArgs {
         alias = "target"
     )]
     name: Option<String>,
-    /// Optional short role label for the spawned agent.
+    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
     #[serde(default)]
     role: Option<String>,
     /// Harness catalog ID (`opencode`, `codex`, `claude-code`, `agy`, `muse`, `omp`, `dsh`, `grok`).
@@ -645,7 +645,7 @@ struct DescribeArgs {
     /// Detailed private standing instructions (`instructions`, Layer 2 — injected only into the agent's own private system prompt).
     #[serde(default)]
     instructions: Option<String>,
-    /// Optional short role label (`"Spiron"`, `"Design"`, `"Revenue"`, `"Growth"`, `"Lead"`, `"Standards"`, ...).
+    /// Optional display-only role label; no effect on lifecycle, scope or prompts.
     #[serde(default)]
     role: Option<String>,
     /// Optional internal communication & visibility scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`).

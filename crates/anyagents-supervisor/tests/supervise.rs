@@ -666,6 +666,16 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
     store
         .set_agent_running(&agent.id, &work.display().to_string())
         .unwrap();
+    // Keep a real child active so the completed parent remains resident for
+    // the crash/restart proof. A fully idle root now releases its process too.
+    let mut child_new = NewAgent::new("child", "claude-code");
+    child_new.parent_id = Some(agent.id.clone());
+    let child = store.create_agent(child_new).unwrap();
+    let child_work = dir.path().join("work-child");
+    std::fs::create_dir_all(&child_work).unwrap();
+    store
+        .set_agent_running(&child.id, &child_work.display().to_string())
+        .unwrap();
     let clock = ManualClock::new(1_699_000_000_000);
     let supervisor = Supervisor::start(
         Arc::clone(&store),
@@ -697,6 +707,12 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
         wait_until(|| other.open_turn(&agent.id).unwrap().is_none()),
         "completed turn must clear open_turn"
     );
+    assert!(wait_until(|| {
+        other.agent(&child.id).unwrap().state == "running"
+            && supervisor
+                .live(&child.id)
+                .is_some_and(|live| live.process_alive && live.pid.is_some())
+    }));
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
     let killed = std::process::Command::new("kill")
         .args(["-KILL", &pid.to_string()])
@@ -726,6 +742,20 @@ fn a_finished_turn_does_not_receive_a_recovery_note_on_restart() {
 
 #[test]
 fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail() {
+    assert_finished_agent_scales_to_zero(false, None);
+}
+
+#[test]
+fn a_role_bearing_subagent_scales_to_zero_and_wakes_on_follow_up_mail() {
+    assert_finished_agent_scales_to_zero(false, Some("Researcher"));
+}
+
+#[test]
+fn a_role_bearing_root_scales_to_zero_and_wakes_on_follow_up_mail() {
+    assert_finished_agent_scales_to_zero(true, Some("Researcher"));
+}
+
+fn assert_finished_agent_scales_to_zero(is_root: bool, role: Option<&str>) {
     let dir = short_dir();
     let log = dir.path().join("vendor.log");
     let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
@@ -734,7 +764,8 @@ fn a_finished_subagent_automatically_scales_to_zero_and_wakes_on_follow_up_mail(
         .unwrap();
     let mut sub_new = NewAgent::new("alpha-worker", "claude-code");
     sub_new.model = Some("sonnet".to_string());
-    sub_new.parent_id = Some(root.id.clone());
+    sub_new.parent_id = (!is_root).then(|| root.id.clone());
+    sub_new.role = role.map(str::to_string);
     let sub = store.create_agent(sub_new).unwrap();
     let work = dir.path().join("work-sub");
     std::fs::create_dir_all(&work).unwrap();

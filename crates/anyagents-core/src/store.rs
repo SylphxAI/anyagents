@@ -106,13 +106,17 @@ impl Agent {
     /// Internal communication and discovery scope (`"isolated"` | `"private"` | `"siblings"` | `"public"`):
     /// - `"isolated"`: strictly confined to direct `parent`, own `children`, and bound external channels;
     ///   cannot message or read siblings or other roots.
-    /// - `"private"` (default for task sub-agents without a standing `role`): only direct `parent`,
+    /// - `"private"` (default for all sub-agents): only direct `parent`,
     ///   own `children`, or shared `group:<name>` can message it; can message `public` agents.
-    /// - `"siblings"` (default for standing domain sub-agents with a `role` that are not `*-assistant`):
+    /// - `"siblings"` (explicit opt-in):
     ///   reachable by `parent`, `children`, and sibling sub-agents under the same `parent` with
     ///   `"siblings"` or `"public"` scope.
     /// - `"public"` (default for Root Agents, or sub-agents with `public: true`): reachable across the workspace.
     pub fn scope(&self) -> &'static str {
+        self.scope_or_default(self.default_scope())
+    }
+
+    fn scope_or_default(&self, default: &'static str) -> &'static str {
         if let Some((_, v)) = self.launch_env.iter().find(|(k, _)| k == "ANYAGENTS_SCOPE") {
             match v.trim().to_ascii_lowercase().as_str() {
                 "isolated" | "none" => return "isolated",
@@ -135,16 +139,12 @@ impl Agent {
                 _ => {}
             }
         }
-        self.default_scope()
+        default
     }
 
     fn default_scope(&self) -> &'static str {
         if self.parent_id.is_none() {
             "public"
-        } else if self.name.ends_with("-assistant") {
-            "isolated"
-        } else if self.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
-            "siblings"
         } else {
             "private"
         }
@@ -606,6 +606,45 @@ impl std::ops::Deref for ReadConn<'_> {
 /// A capability is 32 random bytes, written in hex.
 const CAPABILITY_BYTES: usize = 32;
 
+/// Freeze the old effective policy before removing implicit role/name defaults.
+/// New rows always have an explicit scope. This bounded, transactional upgrade
+/// touches only legacy environment metadata, never identities or work state.
+fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let ids: Vec<String> = {
+        let mut stmt = tx.prepare(
+            "SELECT id FROM agents WHERE NOT EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(launch_env) THEN launch_env ELSE '[]' END) entry
+                WHERE entry.key % 2 = 0 AND entry.value = 'ANYAGENTS_SCOPE'
+                  AND lower(trim(json_extract(launch_env, '$[' || (entry.key + 1) || ']'))) IN (
+                    'isolated','none','private','false','0','siblings','sibling','team',
+                    'public','org','all','true','1'))",
+        )?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<Result<_, _>>()?
+    };
+    for id in ids {
+        let agent = agent_by_id(&tx, &AgentId::parse(&id)?)?;
+        // Compatibility only: role and name never select policy for new agents.
+        let legacy_default = if agent.parent_id.is_none() {
+            "public"
+        } else if agent.name.ends_with("-assistant") {
+            "isolated"
+        } else if agent.role.as_deref().is_some_and(|r| !r.trim().is_empty()) {
+            "siblings"
+        } else {
+            "private"
+        };
+        let scope = agent.scope_or_default(legacy_default);
+        tx.execute(
+            "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+            params![encode_env(&scope_env(&agent, scope)), id],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 impl Store {
     /// Open or create the database, turn on WAL, and apply pending migrations.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, Error> {
@@ -626,6 +665,7 @@ impl Store {
         }
         let mut conn = conn;
         migrate::migrate(&mut conn)?;
+        preserve_legacy_scopes(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
@@ -968,7 +1008,7 @@ impl Store {
                     .filter(|s| !s.is_empty())
                     .map(|line| line.chars().take(300).collect())
             });
-        let agent = Agent {
+        let mut agent = Agent {
             is_admin: false,
             id: AgentId::generate(),
             name: new.name,
@@ -983,6 +1023,7 @@ impl Store {
             launch_env: Vec::new(),
             parent_id: new.parent_id,
         };
+        agent.launch_env = scope_env(&agent, agent.default_scope());
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let taken: i64 = tx.query_row(
@@ -995,8 +1036,8 @@ impl Store {
         }
         tx.execute(
             "INSERT INTO agents (
-                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10)",
+                id, name, harness, model, workdir, instructions, state, created_at_ms, parent_id, role, description, launch_env
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'created', ?7, ?8, ?9, ?10, ?11)",
             params![
                 agent.id.as_str(),
                 agent.name,
@@ -1008,6 +1049,7 @@ impl Store {
                 agent.parent_id.as_ref().map(|id| id.as_str()),
                 agent.role,
                 agent.description,
+                encode_env(&agent.launch_env),
             ],
         )?;
         tx.execute(
@@ -2170,16 +2212,16 @@ impl Store {
         Ok(changed)
     }
 
-    /// Atomically transition a running sub-agent (`parent_id IS NOT NULL`) to
+    /// Atomically transition any running agent to
     /// `idle` (process released / scaled to zero) when it has delivered every
     /// message in its mailbox, completed its latest turn
     /// (`completed_seq >= opened_seq >= max_seq > 0`), and has no active
     /// (`running`) child sub-agents of its own.
     ///
-    /// Returns `Ok(true)` when the sub-agent transitioned to `idle` (and
+    /// Returns `Ok(true)` when the agent transitioned to `idle` (and
     /// notifies the supervisor to stop its worker slot), or `Ok(false)` if new
     /// mail arrived, a turn is still open, or a child sub-agent is still running.
-    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+    pub fn complete_idle_agent(&self, id: &AgentId) -> Result<bool, Error> {
         let err_file =
             crate::agent_config_dir(self.data_dir(), id).join(".anyagents-last-error.json");
         if let Ok(raw) = std::fs::read_to_string(&err_file)
@@ -2196,7 +2238,7 @@ impl Store {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let parent_id_opt: Option<AgentId> = tx
                 .query_row(
-                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL AND (role IS NULL OR TRIM(role) = '')",
+                    "SELECT parent_id FROM agents WHERE id = ?1 AND parent_id IS NOT NULL",
                     [id.as_str()],
                     |r| {
                         let pid: String = r.get(0)?;
@@ -2212,7 +2254,6 @@ impl Store {
                      JOIN turn_recovery tr ON tr.agent_id = a.id
                      WHERE a.id = ?1
                        AND a.parent_id IS NOT NULL
-                       AND (a.role IS NULL OR TRIM(a.role) = '')
                        AND a.state = 'running'
                        AND NOT EXISTS (
                            SELECT 1 FROM outbound_messages om
@@ -2235,8 +2276,6 @@ impl Store {
                 "UPDATE agents
                  SET state = 'idle'
                  WHERE id = ?1
-                   AND parent_id IS NOT NULL
-                   AND (role IS NULL OR TRIM(role) = '')
                    AND state = 'running'
                    AND NOT EXISTS (
                        SELECT 1 FROM agents child
@@ -2293,6 +2332,11 @@ impl Store {
             }
         }
         Ok(transitioned)
+    }
+
+    /// Compatibility alias; idle release now applies to roots and children alike.
+    pub fn complete_idle_subagent(&self, id: &AgentId) -> Result<bool, Error> {
+        self.complete_idle_agent(id)
     }
 
     /// Permanently delete an agent and its associated records from the store.
@@ -2407,6 +2451,7 @@ impl Store {
         let id = format!("tool_{}", MessageId::generate());
         let ts_ms = now_ms();
         let clean_tool = tool_name.trim().to_ascii_lowercase();
+        let summary = crate::masking::mask_known_secrets(summary);
         let text = if summary.trim().starts_with("[tool") {
             summary.trim().to_string()
         } else {
@@ -4114,7 +4159,7 @@ pub fn read_root_roster(data_dir: &Path) -> Vec<(String, Option<String>, Option<
 }
 
 /// Reads the active direct child sub-agents `(name, role, public_description)` for `parent_id`
-/// that have a standing `role` label from `{data}/state.db` read-only.
+/// from `{data}/state.db` read-only, regardless of role label.
 pub fn read_children_roster(
     data_dir: &Path,
     parent_id: &str,
@@ -4131,7 +4176,7 @@ pub fn read_children_roster(
     let _ = conn.busy_timeout(Duration::from_millis(500));
     let query = "SELECT name, role, description, instructions
          FROM agents
-         WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != ''
+         WHERE parent_id = ?1 AND state != 'archived'
          ORDER BY name ASC";
     let mut roster = Vec::new();
     if let Ok(mut stmt) = conn.prepare(query)
@@ -5827,7 +5872,7 @@ fn compute_and_diff_topology_event(
     } else if rec.allows_sibling_messages()
         && let Some(ref pid) = rec.parent_id
         && let Ok(mut stmt) = conn.prepare(
-            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+            "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND id != ?2 ORDER BY name ASC",
         )
         && let Ok(rows) = stmt.query_map(params![pid.as_str(), rec.id.as_str()], |r| {
             r.get::<_, String>(0)
@@ -5845,14 +5890,17 @@ fn compute_and_diff_topology_event(
 
     let mut children = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' AND role IS NOT NULL AND TRIM(role) != '' ORDER BY name ASC",
+        "SELECT id FROM agents WHERE parent_id = ?1 AND state != 'archived' ORDER BY name ASC",
     ) && let Ok(rows) = stmt.query_map([rec.id.as_str()], |r| r.get::<_, String>(0))
     {
         for id_str in rows.flatten() {
             if let Ok(aid) = AgentId::parse(&id_str)
                 && let Ok(child) = agent_by_id(conn, &aid)
             {
-                children.push(format_agent_topology_tag(&child.name, child.role.as_deref()));
+                children.push(format_agent_topology_tag(
+                    &child.name,
+                    child.role.as_deref(),
+                ));
             }
         }
     }
@@ -6338,7 +6386,12 @@ mod tests {
         let (_dir, store) = setup();
         let alpha = agent(&store, "alpha");
         store.set_agent_launch_env(&alpha.id, &env).unwrap();
-        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, env);
+        let mut expected = env.clone();
+        expected.extend([
+            ("ANYAGENTS_SCOPE".to_string(), "public".to_string()),
+            ("ANYAGENTS_PUBLIC".to_string(), "1".to_string()),
+        ]);
+        assert_eq!(store.agent(&alpha.id).unwrap().launch_env, expected);
 
         // A value with a quote, a backslash and a newline keeps its characters.
         let awkward = vec![("K".to_string(), "a\"b\\c\nd".to_string())];
@@ -6411,9 +6464,9 @@ mod tests {
         let (_dir, store) = setup();
         let parent = agent(&store, "parent");
         for (name, role, default) in [
-            ("mind", Some("Mind"), "siblings"),
+            ("labelled", Some("Researcher"), "private"),
             ("task", None, "private"),
-            ("liaison-assistant", Some("Liaison"), "isolated"),
+            ("liaison-assistant", Some("Liaison"), "private"),
         ] {
             let mut new = NewAgent::new(name, "codex");
             new.parent_id = Some(parent.id.clone());
@@ -7363,6 +7416,206 @@ mod tests {
     }
 
     #[test]
+    fn idle_release_preserves_pending_work_and_role_independent_identity() {
+        let (_dir, store) = setup();
+        let parent = agent(&store, "parent");
+        for (name, parent_id, role) in [
+            ("root", None, Some("Researcher")),
+            ("labelled", Some(parent.id.clone()), Some("Researcher")),
+            ("plain", Some(parent.id.clone()), None),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = parent_id;
+            new.role = role.map(str::to_string);
+            new.instructions = Some("Keep serving future requests.".into());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
+            store.receive(&agent.id, Incoming::new("task")).unwrap();
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+            store.note_delivered(&agent.id, 1).unwrap();
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+            store.note_turn_completed(&agent.id).unwrap();
+            assert!(store.complete_idle_agent(&agent.id).unwrap());
+            let idle = store.agent(&agent.id).unwrap();
+            assert_eq!(idle.role, agent.role);
+            assert_eq!(idle.instructions, agent.instructions);
+            assert_eq!(store.delivered_cursor(&agent.id).unwrap(), 1);
+            store
+                .receive(&agent.id, Incoming::new("follow-up"))
+                .unwrap();
+            assert_eq!(store.agent(&agent.id).unwrap().state, "running");
+            assert!(!store.complete_idle_agent(&agent.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn relationship_discovery_includes_children_and_siblings_without_roles() {
+        let (dir, store) = setup();
+        let parent = agent(&store, "parent");
+        let mut new = NewAgent::new("first", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let first = store.create_agent(new).unwrap();
+        let mut new = NewAgent::new("second", "codex");
+        new.parent_id = Some(parent.id.clone());
+        let second = store.create_agent(new).unwrap();
+        store.set_agent_scope(&first.id, "siblings").unwrap();
+        store.set_agent_scope(&second.id, "siblings").unwrap();
+        let roster = read_children_roster(dir.path(), parent.id.as_str());
+        assert_eq!(
+            roster.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        let ReceiveOutcome::New(parent_mail) =
+            store.receive(&parent.id, Incoming::new("check")).unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        let topology = parent_mail.context.topology.as_deref().unwrap();
+        assert!(topology.contains("agent:first"));
+        assert!(topology.contains("agent:second"));
+        let ReceiveOutcome::New(child_mail) =
+            store.receive(&first.id, Incoming::new("check")).unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        assert!(
+            child_mail
+                .context
+                .topology
+                .as_deref()
+                .unwrap()
+                .contains("agent:second")
+        );
+        // A private sibling remains hidden even though it has a label.
+        store
+            .set_agent_role(&second.id, Some("Researcher"))
+            .unwrap();
+        store.set_agent_scope(&second.id, "private").unwrap();
+        let ReceiveOutcome::New(changed) = store
+            .receive(&first.id, Incoming::new("check again"))
+            .unwrap()
+        else {
+            panic!("new mail expected")
+        };
+        assert!(
+            changed
+                .context
+                .topology
+                .as_deref()
+                .unwrap()
+                .contains("-sibling: agent:second")
+        );
+    }
+
+    #[test]
+    fn upgrade_materializes_legacy_effective_scopes_without_changing_work() {
+        let (dir, store) = setup();
+        let root = agent(&store, "root");
+        let mut expected = Vec::new();
+        let mut schedules = Vec::new();
+        for (name, role, env, scope) in [
+            ("labelled", Some("Researcher"), vec![], "siblings"),
+            ("plain", None, vec![], "private"),
+            ("liaison-assistant", Some("Liaison"), vec![], "isolated"),
+            (
+                "explicit",
+                Some("Researcher"),
+                vec![("ANYAGENTS_SCOPE".into(), "private".into())],
+                "private",
+            ),
+            (
+                "legacy-public",
+                Some("Researcher"),
+                vec![("ANYAGENTS_PUBLIC".into(), "1".into())],
+                "public",
+            ),
+            (
+                "invalid-scope",
+                Some("Researcher"),
+                vec![("ANYAGENTS_SCOPE".into(), "unknown".into())],
+                "siblings",
+            ),
+        ] {
+            let mut new = NewAgent::new(name, "codex");
+            new.parent_id = Some(root.id.clone());
+            new.role = role.map(str::to_string);
+            new.instructions = Some("User-authored instructions".into());
+            let agent = store.create_agent(new).unwrap();
+            store.set_agent_running(&agent.id, "/work").unwrap();
+            store
+                .receive(&agent.id, Incoming::new("completed"))
+                .unwrap();
+            store.note_delivered(&agent.id, 1).unwrap();
+            store.note_turn_completed(&agent.id).unwrap();
+            store.receive(&agent.id, Incoming::new("pending")).unwrap();
+            schedules.push(
+                store
+                    .create_schedule(NewSchedule {
+                        agent_id: agent.id.clone(),
+                        kind: "at".into(),
+                        spec: "1h".into(),
+                        prompt: "Future work".into(),
+                        interval_ms: None,
+                        next_fire_at_ms: Some(now_ms() + 3_600_000),
+                        watch_baseline: None,
+                    })
+                    .unwrap(),
+            );
+            let mut env = env;
+            env.push(("CUSTOM".into(), "preserve".into()));
+            // Write the exact pre-upgrade flat-array representation.
+            store
+                .conn()
+                .execute(
+                    "UPDATE agents SET launch_env = ?1 WHERE id = ?2",
+                    params![encode_env(&env), agent.id.as_str()],
+                )
+                .unwrap();
+            expected.push((store.agent(&agent.id).unwrap(), scope));
+        }
+        for _ in 0..2 {
+            let reopened = Store::open(dir.path().join("state.db")).unwrap();
+            for schedule in &schedules {
+                assert_eq!(
+                    reopened.get_schedule(&schedule.id).unwrap().as_ref(),
+                    Some(schedule)
+                );
+            }
+            for (before, scope) in &expected {
+                let after = reopened.agent(&before.id).unwrap();
+                assert_eq!(after.scope(), *scope);
+                assert!(
+                    after
+                        .launch_env
+                        .contains(&("ANYAGENTS_SCOPE".into(), scope.to_string()))
+                );
+                assert!(
+                    after
+                        .launch_env
+                        .contains(&("CUSTOM".into(), "preserve".into()))
+                );
+                let mut normalized = after.clone();
+                normalized.launch_env = before.launch_env.clone();
+                assert_eq!(&normalized, before);
+                assert_eq!(reopened.delivered_cursor(&before.id).unwrap(), 1);
+                assert_eq!(
+                    reopened.next_undelivered(&before.id).unwrap().unwrap().text,
+                    "pending"
+                );
+            }
+        }
+        let new = store
+            .create_agent(NewAgent {
+                name: "new-child".into(),
+                parent_id: Some(root.id),
+                role: Some("Researcher".into()),
+                ..NewAgent::new("unused", "codex")
+            })
+            .unwrap();
+        assert_eq!(new.scope(), "private");
+    }
+
+    #[test]
     fn subagent_scales_to_idle_when_done_wakes_on_message_and_stays_archived_when_retired() {
         let (_dir, store) = setup();
         let root = agent(&store, "root");
@@ -7731,8 +7984,8 @@ mod tests {
             })
             .unwrap();
         assert_eq!(argus.scope(), "public");
-        assert_eq!(helios.scope(), "siblings");
-        assert_eq!(plutus.scope(), "siblings");
+        store.set_agent_scope(&helios.id, "siblings").unwrap();
+        store.set_agent_scope(&plutus.id, "siblings").unwrap();
 
         // 1. First message to helios from argus -> emits `<topology event="initial" ... />`
         let mut m1 = Incoming::new("Start sprint");
@@ -7779,6 +8032,7 @@ mod tests {
                 parent_id: Some(argus.id.clone()),
             })
             .unwrap();
+        store.set_agent_scope(&sage.id, "siblings").unwrap();
         let mut m3 = Incoming::new("Design sync");
         m3.sender = Some("agent:argus".to_string());
         let ReceiveOutcome::New(msg3) = store.receive(&helios.id, m3).unwrap() else {
@@ -7812,7 +8066,7 @@ mod tests {
             "topo4={topo4}"
         );
 
-        // 5. External liaison `stanley-assistant` defaults to `scope = "isolated"` and sees no siblings
+        // 5. Explicitly isolated agents see no siblings regardless of name or role
         let stanley = store
             .create_agent(NewAgent {
                 name: "stanley-assistant".to_string(),
@@ -7825,7 +8079,7 @@ mod tests {
                 parent_id: Some(argus.id.clone()),
             })
             .unwrap();
-        assert_eq!(stanley.scope(), "isolated");
+        store.set_agent_scope(&stanley.id, "isolated").unwrap();
         let mut m5 = Incoming::new("Hello Stanley");
         m5.sender = Some("agent:argus".to_string());
         let ReceiveOutcome::New(msg5) = store.receive(&stanley.id, m5).unwrap() else {
