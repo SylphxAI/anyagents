@@ -69,6 +69,8 @@ if (typeof document !== 'undefined') {
   let touchTimer = 0, focusSequence = 0;
   // Proxy focus is an acknowledgement of remote ownership, not a new choice.
   document.addEventListener('focusin', e => { if (e.target !== proxy) focusSequence++; });
+  // Blurring into a non-focusable local surface has no matching focusin.
+  document.addEventListener('focusout', e => { if (e.relatedTarget !== proxy) focusSequence++; });
   const size = () => ({ width: stage.clientWidth, height: stage.clientHeight });
   const extent = () => remoteExtent(canvas.width, canvas.height, metrics);
   const fitScale = () => Math.min(size().width / extent().width, size().height / extent().height);

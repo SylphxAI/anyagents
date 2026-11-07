@@ -13,7 +13,7 @@ async function mount() {
     addEventListener(type, fn) { const list = this.listeners.get(type) || []; list.push(fn); this.listeners.set(type, list); }
     emit(type, props = {}) { const e = { type, target: this, preventDefault() {}, ...props }; for (const fn of this.listeners.get(type) || []) fn(e); }
     focus() { if (document.activeElement === this) return; document.activeElement = this; document.emit('focusin', { target: this }); }
-    blur() { document.activeElement = body; document.emit('focusin', { target: body }); }
+    blur() { document.activeElement = body; document.emit('focusout', { target: this, relatedTarget: null }); }
     closest() { return this.id === 'type-input' ? this : null; }
     getContext() { return { drawImage() {} }; }
     setPointerCapture() {}
@@ -109,4 +109,32 @@ test('an explicit paste is not swallowed as a previous shortcut duplicate', asyn
   ui.document.emit('paste', { target, clipboardData: { getData: () => 'explicit paste' }, isTrusted: false });
   await ui.settle();
   assert.deepEqual(ui.inputs.filter(p => p.type === 'paste').map(p => p.text), ['native paste', 'explicit paste']);
+});
+
+test('late focus acknowledgement cannot undo a blur to the local document', async () => {
+  const ui = await mount(); ui.hold();
+  const target = ui.element('keyboard-proxy'); target.focus();
+  ui.document.emit('paste', { target, clipboardData: { getData: () => 'remote text' } });
+  target.blur(); ui.release(); await ui.settle();
+  assert.equal(ui.document.activeElement.id, 'body');
+});
+
+test('a single held touch resolves once at the 180ms threshold', async () => {
+  const ui = await mount();
+  ui.pointer('pointerdown', 1);
+  assert.deepEqual(ui.inputs, []);
+  const timer = [...ui.timers.values()].find(timer => timer.ms === 180);
+  assert.ok(timer, 'touch decision timer is armed'); timer.fn();
+  await ui.settle();
+  assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed']);
+  ui.pointer('pointerup', 1); await ui.settle();
+  assert.deepEqual(ui.inputs.map(p => p.event_type), ['mousePressed', 'mouseReleased']);
+});
+
+test('a second finger disarms the undecided single-touch timer', async () => {
+  const ui = await mount();
+  ui.pointer('pointerdown', 1); ui.pointer('pointerdown', 2, 140, 200);
+  assert.equal([...ui.timers.values()].some(timer => timer.ms === 180), false);
+  ui.pointer('pointerup', 1); ui.pointer('pointerup', 2);
+  await ui.settle(); assert.deepEqual(ui.inputs, []);
 });
