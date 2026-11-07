@@ -534,12 +534,39 @@ One embedded SQLite database in WAL mode under the data directory holds every re
 
 ## Methodology-neutral roles and lifecycle
 
-`role` is an optional display label. It does not select a prompt, communication
-policy, discovery membership or process lifetime. Private `instructions` define
-an agent's responsibilities, reporting conventions and decision to archive.
-AnyAgents ships no company hierarchy, standing-agent policy or role templates.
-Role labels are not interpreted as template names; callers that manage templates
-supply their contents through `instructions`.
+`role` is an optional display label, not a lifecycle or residency policy.
+Private `instructions` define an agent's responsibilities, reporting conventions
+and decision to archive. AnyAgents ships no company hierarchy, standing-agent
+policy or built-in role templates.
+
+Callers may supply local Markdown templates through `archetype` (aliases:
+`template`, `type`, `preset`). A name is a single ASCII filename stem containing
+only letters, digits, `-` or `_`, without a `.md` suffix. Lookup searches the
+explicit and parent workspaces' `.agents/agents`, the data directory's
+`agents-templates`, `archetypes` and `.agents/agents`, then the home and owner
+workspaces' `.agents/agents`. Both `<name>.md` and `<name>/agent.md` (or `AGENT.md`)
+are supported. An explicit nonempty selector must resolve; an unknown name is a
+validation error. Without a selector, a matching `role` or its lowercase,
+space-to-hyphen form may supply template defaults; an unmatched label stays a
+label. Templates prepend their Markdown body to caller instructions and supply
+missing fields from YAML frontmatter (`description`/`summary`, `scope`,
+`workdir`/`workspace`, `harness`, `model`, `role`, `profile`). Unknown keys,
+invalid scopes, malformed or unclosed frontmatter and
+symlinks in any template path are validation errors, including implicit lookup;
+lookup never silently falls through after a refusal. Scope validation happens
+before agent persistence. Without a template, omitted HTTP harness retains
+`claude-code`; an explicit empty harness or `inherit` selects child defaults.
+
+MCP agent lists first apply visibility, parent and state scope. `summary.total`
+and health/state counts describe that full population, before `query` or
+pagination. `summary.matched` counts query matches before truncation and
+`summary.returned` counts the returned slice. Every matched list is ordered by
+working/errored status, running, idle, paused, then other states, with name and
+ID tie-breakers, before slicing. List `limit` defaults to 100 and is clamped to
+1–100. `cursor` (alias `offset`) is a zero-based position; `next_cursor` is the
+next position or null at the end. Both unified and legacy sub-agent tools return
+it. Continue with the same query, parent and state. Pages reflect current state,
+not a snapshot; concurrent population/state changes can shift positions.
 
 Every agent, including a root or role-bearing child, may archive itself.
 Archive is reversible: an intentional direct message wakes the identity again;

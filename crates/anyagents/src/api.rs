@@ -110,19 +110,25 @@ impl From<anyagents_core::AgentSchedule> for ScheduleView {
     }
 }
 
-fn default_harness() -> String {
-    "claude-code".to_string()
-}
-
 /// Body of `POST /v1/agents`.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct CreateAgentRequest {
     #[serde(alias = "agent", alias = "id", alias = "agent_id", alias = "target")]
     pub name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "type",
+        alias = "template",
+        alias = "preset"
+    )]
+    pub archetype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
-    #[serde(default = "default_harness")]
-    pub harness: String,
+    /// Omitted HTTP harness retains the legacy `claude-code` default. An explicit
+    /// empty string or `inherit` lets sub-agent defaults select the harness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -473,6 +479,26 @@ mod create_agent_tests {
         }
         let legacy: LegacyRequest = serde_json::from_value(serialized).unwrap();
         assert_eq!(legacy.instructions.as_deref(), Some("Legacy instructions"));
+    }
+
+    #[test]
+    fn archetype_aliases_deserialize_and_omit_when_absent() {
+        for key in ["archetype", "type", "template", "preset"] {
+            let mut obj = serde_json::Map::new();
+            obj.insert("name".into(), json!("worker"));
+            obj.insert(key.into(), json!("writer"));
+            let req: CreateAgentRequest =
+                serde_json::from_value(serde_json::Value::Object(obj)).unwrap();
+            assert_eq!(req.archetype.as_deref(), Some("writer"));
+            assert!(req.harness.is_none());
+        }
+        let absent: CreateAgentRequest = serde_json::from_value(json!({
+            "name": "worker"
+        }))
+        .unwrap();
+        assert!(absent.archetype.is_none());
+        let serialized = serde_json::to_value(absent).unwrap();
+        assert!(serialized.get("archetype").is_none());
     }
 }
 
