@@ -682,3 +682,98 @@ fn conversation_reads_are_downward_only_for_every_scope_and_cli_fails_closed() {
         assert!(offline.stdout.is_empty(), "{offline:?}");
     }
 }
+
+/// Exercise both executable entrypoints, not just a maintenance helper: neither
+/// corrupt recovery state nor a held global lock may prevent socket service.
+#[test]
+fn migration_failure_and_busy_global_lock_do_not_block_host_sockets() {
+    use anyagents_core::{NewAgent, Store};
+    use std::fs;
+    let _env = support::lock();
+    for command in ["serve", "serve-admin"] {
+        for busy in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let data = dir.path();
+            support::operator_with_configured_seat(data);
+            let store = Store::open(data.join("state.db")).unwrap();
+            let agent = store
+                .create_agent(NewAgent::new("maintenance-only", "sylphx"))
+                .unwrap();
+            store.set_agent_state(&agent.id, "archived").unwrap();
+            let memory = data
+                .join("agents")
+                .join(agent.id.as_str())
+                .join("config/projects/known/memory");
+            fs::create_dir_all(&memory).unwrap();
+            fs::write(memory.join("MEMORY.md"), b"must survive failed maintenance").unwrap();
+            let migration = data.join("host-memory-migration");
+            fs::create_dir_all(&migration).unwrap();
+            let manifest = migration.join("manifest-v1.json");
+            let original = if busy {
+                b"{\"version\":1,\"entries\":[]}".as_slice()
+            } else {
+                b"corrupt manifest must not be replaced".as_slice()
+            };
+            fs::write(&manifest, original).unwrap();
+            let held = fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(migration.join("migration.lock"))
+                .unwrap();
+            if busy {
+                held.lock().unwrap();
+            }
+            let child = Command::new(env!("CARGO_BIN_EXE_anyagents"))
+                .env("PATH", support::machine_path(data))
+                .env("ANYAGENTS_CLAUDE_BIN", "/bin/true")
+                .arg("--data")
+                .arg(data)
+                .arg(command)
+                .stdout(Stdio::null())
+                .stderr(Stdio::from(
+                    fs::File::create(data.join("server.stderr")).unwrap(),
+                ))
+                .spawn()
+                .unwrap();
+            let socket = data.join(if command == "serve" {
+                "anyagents.sock"
+            } else {
+                "admin.sock"
+            });
+            let server = Serve { child, socket };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while std::os::unix::net::UnixStream::connect(&server.socket).is_err() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{command}, busy={busy}: {}",
+                    fs::read_to_string(data.join("server.stderr")).unwrap_or_default()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let receipt_path = migration.join(if busy {
+                "deferred-startup-v1.json"
+            } else {
+                "startup-error-v1.json"
+            });
+            let receipt: Value = serde_json::from_slice(&fs::read(receipt_path).unwrap()).unwrap();
+            assert_eq!(
+                receipt["status"],
+                if busy {
+                    "deferred_busy_lock"
+                } else {
+                    "deferred_error"
+                }
+            );
+            assert_eq!(receipt["retryable"], true);
+            assert_eq!(fs::read(&manifest).unwrap(), original);
+            assert_eq!(
+                fs::read(memory.join("MEMORY.md")).unwrap(),
+                b"must survive failed maintenance"
+            );
+            drop(server);
+            drop(held);
+        }
+    }
+}

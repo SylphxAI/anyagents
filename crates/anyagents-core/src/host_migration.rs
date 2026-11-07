@@ -144,6 +144,17 @@ impl HostMigration {
     /// owners-page directory. Unknown and multiply claimed pages are inventoried
     /// but never moved. Nested symlinks are inventoried, not followed.
     pub fn discover(&mut self, agents: &[AgentOwnership], owners_pages: &Path) -> io::Result<()> {
+        self.discover_selected(agents, owners_pages, None)
+    }
+    /// Inspect only selected owners' config and page directories. The complete
+    /// registry is still required to reconcile shared aliases without guessing.
+    /// Callers can isolate discovery failures per owner before staging any move.
+    pub fn discover_selected(
+        &mut self,
+        agents: &[AgentOwnership],
+        owners_pages: &Path,
+        selected: Option<&HashSet<String>>,
+    ) -> io::Result<()> {
         for path in ["/home/kyle/.claude/projects", "/home/kyle/.codex/memories"] {
             self.add(
                 None,
@@ -162,6 +173,9 @@ impl HostMigration {
             }
         }
         for agent in agents {
+            if selected.is_some_and(|ids| !ids.contains(agent.id.as_str())) {
+                continue;
+            }
             let root = self.data_dir.join("agents").join(agent.id.to_string());
             let config = root.join("config");
             for projects in [config.join("projects"), config.join(".claude/projects")] {
@@ -253,6 +267,23 @@ impl HostMigration {
                 let set: HashSet<_> = owners.iter().map(|id| id.to_string()).collect();
                 (set.len() == 1).then_some(owners[0])
             });
+            // Resolve ownership before touching a page's directory contents.
+            // In scoped maintenance an unrelated unreadable page cannot block
+            // the selected owner. Unknown pages remain in place, uninspected.
+            if let Some(ids) = selected
+                && !unique.is_some_and(|id| ids.contains(id.as_str()))
+            {
+                if unique.is_none() {
+                    self.add(
+                        None,
+                        page,
+                        None,
+                        MigrationKind::History,
+                        Some("unknown or ambiguous reconciled agent ownership; contents not inspected"),
+                    );
+                }
+                continue;
+            }
             let files = if fs::symlink_metadata(&page)?.file_type().is_dir() {
                 tree_files(&page)?
             } else {
@@ -284,8 +315,8 @@ impl HostMigration {
     pub fn stage(&mut self, stopped_agents: &HashSet<String>) -> io::Result<()> {
         self.stage_selected(stopped_agents, None)
     }
-    /// A daemon pre-launch boundary stages only this agent; discovery still uses
-    /// the complete registry so aliases shared by other agents stay ambiguous.
+    /// A daemon pre-launch boundary stages only this agent; scoped discovery
+    /// uses the complete registry so aliases shared by other agents stay ambiguous.
     pub fn stage_selected(
         &mut self,
         stopped_agents: &HashSet<String>,
