@@ -7816,13 +7816,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agent.workdir.as_deref(), target.to_str());
+        let common = crate::worktree::tests::git(
+            &target,
+            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        );
+        let objects = PathBuf::from(common).join("objects");
+        let new_object_dir = (0..256)
+            .map(|n| objects.join(format!("{n:02x}")))
+            .find(|p| !p.exists())
+            .unwrap();
         let out = Command::new("/usr/bin/setpriv")
             .env("HOME", "/nonexistent")
             .env("XDG_CONFIG_HOME", "/nonexistent")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["--reuid", &b_uid.to_string(), "--regid", &b_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                "set -eu; cd \"$1\"; printf child > src/child; git -c safe.directory=\"$1\" add src/child; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Child commit'; git -c safe.directory=\"$1\" status --porcelain", "child-seat"])
-            .arg(&target).output().unwrap();
+                "set -eu; mkdir \"$2\"; cd \"$1\"; printf child > src/child; git -c safe.directory=\"$1\" add src/child; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Child commit'; git -c safe.directory=\"$1\" status --porcelain", "child-seat"])
+            .arg(&target).arg(&new_object_dir).output().unwrap();
         assert!(
             out.status.success(),
             "B create/commit/status: {}",
@@ -7833,13 +7842,15 @@ mod tests {
             "child"
         );
         // B's ACL grant and new Git objects must not revoke sibling A.
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&new_object_dir).unwrap().uid(), b_uid);
         let out = Command::new("/usr/bin/setpriv")
             .env("HOME", "/nonexistent")
             .env("XDG_CONFIG_HOME", "/nonexistent")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .args(["--reuid", &a_uid.to_string(), "--regid", &a_gid.to_string(), "--clear-groups", "--", "/bin/sh", "-c",
-                "set -eu; cd \"$1\"; printf sibling > src/sibling; git -c safe.directory=\"$1\" add src/sibling; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Sibling commit'; git -c safe.directory=\"$1\" status --porcelain", "sibling-seat"])
-            .arg(&f.source).output().unwrap();
+                "set -eu; : > \"$2/sibling-write\"; rm \"$2/sibling-write\"; cd \"$1\"; printf sibling > src/sibling; git -c safe.directory=\"$1\" add src/sibling; git -c safe.directory=\"$1\" -c user.name='Kyle Tse' -c user.email=hi@kylet.se commit -m 'Sibling commit'; git -c safe.directory=\"$1\" status --porcelain", "sibling-seat"])
+            .arg(&f.source).arg(&new_object_dir).output().unwrap();
         assert!(
             out.status.success(),
             "A still creates/commits/status after B: {}",
