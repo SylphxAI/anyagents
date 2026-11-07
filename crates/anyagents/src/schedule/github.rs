@@ -216,6 +216,10 @@ fn read_target(
     if target.head.as_deref() != Some(&head) {
         target.pages.retain(|path, _| path.contains("/pulls/"));
         target.head = Some(head.clone());
+        // A new revision is a transition even when its aggregate check state
+        // matches the old head. Restart adaptive polling without altering the
+        // schedule's persisted transition baseline.
+        target.successful = None;
     }
     let mut checks = read_checks(
         target,
@@ -577,6 +581,52 @@ mod tests {
             (true, "checks_completed".to_string())
         );
         assert_eq!(probes.targets["target"].interval, MIN_INTERVAL);
+    }
+
+    #[test]
+    fn head_replacement_revalidates_checks_and_resets_the_interval() {
+        let mut probes = Probes::default();
+        for (now, head, interval) in [
+            (0, "old", 60_000),
+            (60_000, "old", 120_000),
+            (180_000, "old", 240_000),
+            (420_000, "old", 300_000),
+            (720_000, "new", 60_000),
+            (780_000, "new", 120_000),
+        ] {
+            let changed = now == 0 || now == 720_000;
+            let mut calls = 0;
+            assert_eq!(
+                probes.probe("pr", "o", "r", "42", true, now, |path, etag| {
+                    calls += 1;
+                    if path.contains("/pulls/") {
+                        return Ok(response(200, pull("open", false, head), &[("etag", head)]));
+                    }
+                    assert!(path.contains(&format!("/commits/{head}/")));
+                    assert_eq!(etag, if changed { None } else { Some(head) });
+                    Ok(if changed {
+                        response(
+                            200,
+                            if path.contains("/status?") {
+                                json!({"statuses":[]})
+                            } else {
+                                pending()
+                            },
+                            &[("etag", head)],
+                        )
+                    } else {
+                        response(304, Value::Null, &[])
+                    })
+                }),
+                (false, "checks_in_progress".to_string())
+            );
+            assert_eq!(calls, 3);
+            assert_eq!(probes.targets["pr"].interval, interval);
+            assert_eq!(probes.targets["pr"].next_at, now + interval);
+            assert!(probes.targets["pr"].pages.keys().all(|path| {
+                path.contains("/pulls/") || path.contains(&format!("/commits/{head}/"))
+            }));
+        }
     }
 
     #[test]
