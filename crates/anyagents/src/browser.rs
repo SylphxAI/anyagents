@@ -1439,9 +1439,9 @@ fn save_takeover_state(data: &Path, state: &BrowserTakeoverState) {
     let dir = profile_dir(data, &state.profile);
     let seq = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp = dir.join(format!(".takeover.{}.{seq}.json", std::process::id()));
-    let publish = || -> Result<(), Error> {
+    let publish = || -> std::io::Result<()> {
         std::fs::create_dir_all(&dir)?;
-        let bytes = serde_json::to_vec_pretty(state)?;
+        let bytes = serde_json::to_vec_pretty(state).map_err(std::io::Error::other)?;
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
