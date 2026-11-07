@@ -2307,14 +2307,45 @@ fn cancel_takeover_mouse(
     cdp: &mut CdpSession,
     payload: &serde_json::Value,
 ) -> Result<serde_json::Value, Error> {
+    // Snapshot both the frame tree and out-of-process iframe targets. Unlike
+    // geometry discovery, cancellation cannot treat a failed census as empty.
+    fn collect(node: &serde_json::Value, frames: &mut Vec<String>) -> Result<(), Error> {
+        let id = node
+            .pointer("/frame/id")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| Error::Message("missing cancellation frame".into()))?;
+        if !frames.iter().any(|frame| frame == id) {
+            frames.push(id.to_string());
+        }
+        if let Some(children) = node.get("childFrames") {
+            let children = children
+                .as_array()
+                .ok_or_else(|| Error::Message("invalid cancellation frame tree".into()))?;
+            for child in children {
+                collect(child, frames)?;
+            }
+        }
+        Ok(())
+    }
     let tree = cdp.call("Page.getFrameTree", serde_json::json!({}))?;
-    let main = tree
-        .pointer("/frameTree/frame/id")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| Error::Message("missing cancellation frame".into()))?;
-    let frames: Vec<_> = std::iter::once(main.to_string())
-        .chain(discover_child_frames(cdp).into_iter().map(|f| f.frame_id))
-        .collect();
+    let mut frames = Vec::new();
+    collect(&tree["frameTree"], &mut frames)?;
+    let targets = cdp.call("Target.getTargets", serde_json::json!({}))?;
+    let targets = targets["targetInfos"]
+        .as_array()
+        .ok_or_else(|| Error::Message("missing cancellation target census".into()))?;
+    for target in targets {
+        if target["type"] == "iframe" {
+            let id = target["targetId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or_else(|| Error::Message("missing cancellation iframe target".into()))?;
+            if !frames.iter().any(|frame| frame == id) {
+                frames.push(id.to_string());
+            }
+        }
+    }
     release_cancelled_takeover_mouse(cdp, payload, &frames)
 }
 
@@ -4961,6 +4992,101 @@ mod tests {
             .stderr(Stdio::from(std::fs::File::create(log).unwrap()))
             .spawn()
             .unwrap()
+    }
+
+    #[test]
+    fn cancelled_mouse_release_requires_complete_frame_census() {
+        for mode in [
+            "ready",
+            "targets-failed",
+            "targets-malformed",
+            "tree-failed",
+            "tree-malformed",
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            stream.set_nodelay(true).unwrap();
+            let endpoint = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_nodelay(true).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut server = CdpSession {
+                    port: 0,
+                    stream,
+                    read_buf: Vec::new(),
+                    next_id: 1,
+                };
+                let mut calls = Vec::new();
+                while let Ok(text) = server.read_text_message() {
+                    let call: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    let method = call["method"].as_str().unwrap();
+                    let mut response = serde_json::json!({"id": call["id"], "result": {}});
+                    if (method == "Page.getFrameTree" && mode == "tree-failed")
+                        || (method == "Target.getTargets" && mode == "targets-failed")
+                    {
+                        response = serde_json::json!({"id": call["id"], "error": {"message": "discovery refused"}});
+                    } else if method == "Page.getFrameTree" {
+                        response["result"] = if mode == "tree-malformed" {
+                            serde_json::json!({"frameTree":{"frame":{"id":"main"},"childFrames":[{}]}})
+                        } else {
+                            serde_json::json!({"frameTree":{"frame":{"id":"main"},"childFrames":[{"frame":{"id":"child"}}]}})
+                        };
+                    } else if method == "Target.getTargets" {
+                        response["result"] = if mode == "ready" {
+                            serde_json::json!({"targetInfos":[{"type":"iframe","targetId":"oop"},{"type":"iframe","targetId":"child"}]})
+                        } else {
+                            serde_json::json!({"targetInfos":[{"type":"iframe"}]})
+                        };
+                    } else if method == "Page.createIsolatedWorld" {
+                        response["result"] = serde_json::json!({"executionContextId":1});
+                    } else if method == "Runtime.evaluate" {
+                        response["result"] = serde_json::json!({"result":{"value":true}});
+                    }
+                    calls.push(call);
+                    server
+                        .send_text_frame(response.to_string().as_bytes())
+                        .unwrap();
+                }
+                calls
+            });
+            let mut cdp = CdpSession {
+                port: 0,
+                stream,
+                read_buf: Vec::new(),
+                next_id: 1,
+            };
+            let result = cancel_takeover_mouse(&mut cdp, &serde_json::json!({"x":100,"y":400}));
+            drop(cdp);
+            let calls = endpoint.join().unwrap();
+            if mode == "ready" {
+                result.unwrap();
+                let release = calls
+                    .iter()
+                    .position(|c| c["method"] == "Input.dispatchMouseEvent")
+                    .unwrap();
+                let installed: Vec<_> = calls[..release]
+                    .iter()
+                    .filter(|c| c["method"] == "Page.createIsolatedWorld")
+                    .map(|c| c["params"]["frameId"].as_str().unwrap())
+                    .collect();
+                assert_eq!(
+                    installed,
+                    ["main", "child", "oop"],
+                    "deduplicate frames and cover out-of-process targets"
+                );
+                assert_eq!(release, 8, "all three installs acknowledged before release");
+            } else {
+                assert!(result.is_err(), "{mode}: incomplete frame census must fail");
+                assert!(
+                    !calls
+                        .iter()
+                        .any(|c| c["method"] == "Input.dispatchMouseEvent"),
+                    "{mode}: no bare release"
+                );
+            }
+        }
     }
 
     #[test]

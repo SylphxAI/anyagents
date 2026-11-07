@@ -405,9 +405,10 @@ if (typeof document !== 'undefined') {
         lastFrame = Date.now(); $('connection').hidden = true;
       }
       image.close();
-    } catch (_) { reconnect(); }
-    // One capture in flight; do not add a whole display frame after decoding.
-    setTimeout(pollFrame, 8);
+    } catch (_) { reconnect(); setTimeout(pollFrame, 100); return; }
+    // Capture already waits for the remote compositor. Start the next request
+    // immediately: a cooldown adds to the stale-frame wait after every input.
+    setTimeout(pollFrame, 0);
   }
   async function pollState() {
     if (completed) return;

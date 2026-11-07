@@ -5,7 +5,7 @@ import vm from 'node:vm';
 
 // Execute the shipped handlers, with deterministic frame, clock and HTTP edges.
 // Real trusted input and remote DOM effects are also covered by the Chromium suite.
-async function mount() {
+async function mount({ frameOk = true } = {}) {
   class Target {
     listeners = new Map(); style = {}; dataset = {}; value = ''; hidden = false;
     clientWidth = 390; clientHeight = 844; width = 1280; height = 800;
@@ -35,6 +35,7 @@ async function mount() {
     addEventListener() {}, navigator: { clipboard: { readText: async () => 'native paste' } },
     createImageBitmap: async () => ({ width: 1280, height: 800, close() {} }),
     fetch: async (url, options) => {
+      if (url.includes('/frame.jpg') && !frameOk) throw new Error('capture unavailable');
       if (url.includes('/input')) {
         inputs.push(JSON.parse(options.body));
         if (hold) await new Promise(resolve => held.push(resolve));
@@ -174,8 +175,9 @@ for (const isTrusted of [true, false]) test(`two independent paste events each i
 for (const nativeFirst of [true, false]) test(`one shortcut turn pairs native paste and fallback (native first=${nativeFirst})`, async () => {
   const ui = await mount();
   const target = ui.element('keyboard-proxy'); target.focus();
+  const priorTimers = new Set(ui.timers.keys());
   ui.window.emit('keydown', { target, key: 'v', ctrlKey: true });
-  const fallback = [...ui.timers.values()].find(timer => timer.ms === 0);
+  const fallback = [...ui.timers].find(([id, timer]) => !priorTimers.has(id) && timer.ms === 0)[1];
   const native = () => ui.document.emit('paste', { target, isTrusted: true, clipboardData: { getData: () => 'native paste' } });
   if (nativeFirst) { native(); await fallback.fn(); } else { await fallback.fn(); native(); }
   await ui.settle();
@@ -188,10 +190,22 @@ for (const nativeFirst of [true, false]) test(`one shortcut turn pairs native pa
 test('keyup ends a shortcut turn when only its clipboard fallback ran', async () => {
   const ui = await mount();
   const target = ui.element('keyboard-proxy'); target.focus();
+  const priorTimers = new Set(ui.timers.keys());
   ui.window.emit('keydown', { target, key: 'v', metaKey: true });
-  await [...ui.timers.values()].find(timer => timer.ms === 0).fn();
+  await [...ui.timers].find(([id, timer]) => !priorTimers.has(id) && timer.ms === 0)[1].fn();
   ui.window.emit('keyup', { target, key: 'v', metaKey: true });
   ui.document.emit('paste', { target, isTrusted: true, clipboardData: { getData: () => 'menu paste' } });
   await ui.settle();
   assert.deepEqual(ui.inputs.filter(p => p.type === 'paste').map(p => p.text), ['native paste', 'menu paste']);
+});
+
+// Frame acquisition already waits for the remote compositor. A successful
+// capture must not add another cooldown; failures still need a bounded backoff.
+test('frame capture schedules immediately on success and backs off on failure', async () => {
+  const ready = await mount();
+  assert.ok([...ready.timers.values()].some(timer => timer.ms === 0));
+  assert.equal([...ready.timers.values()].some(timer => timer.ms === 100), false);
+  const failed = await mount({ frameOk: false });
+  assert.ok([...failed.timers.values()].some(timer => timer.ms === 100));
+  assert.equal([...failed.timers.values()].some(timer => timer.ms === 0), false);
 });

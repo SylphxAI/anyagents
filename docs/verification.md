@@ -206,8 +206,11 @@ trusted Chromium input at 1440×900, 834×1194 and 390×844. It covers global fo
 owners, native/fallback single paste, password paste, clipboard/undo/redo, IME,
 local HUD isolation, sign-in clicks, desktop/touch slider drag, mouse/two-finger
 scroll, delayed two-finger pinch, same-URL reconnect and 20 input-to-painted-JPEG
-latency samples with a 150 ms maximum. Touches resolve as a tap on lift, a drag
-at 8 CSS px, or a sustained press after 150 ms, leaving 50 ms for remote delivery. A five-second stationary touch
+latency samples with a 150 ms maximum. Frame polling has no successful-capture
+cooldown: capture already waits for the remote compositor, so another delay can
+put input behind two stale capture intervals. Capture failures back off for
+100 ms. Touches resolve as a tap on lift, a drag at 8 CSS px, or a sustained press
+after 150 ms, leaving 50 ms for remote delivery. A five-second stationary touch
 must press within 200 ms, remain held remotely for at least 4800 ms and release
 only at lift. Immediate two-finger gestures send no mouse events; pairs after
 250 or 600 ms cancel a committed press before scrolling or pinching, without
@@ -218,8 +221,9 @@ withholds the release. Each listener removes itself on its first click or after
 250 ms, and explicit cleanup also runs after dispatch. The fixture checks the
 next tap after 500 ms, including cancellation over a disabled/no-click target,
 and verifies the page main world has no cancellation global. Resource-free CDP
-protocol tests verify every frame's installation acknowledgement precedes the
-release, and failed/slow installation produces no release. Deterministic shipped
+protocol tests verify a complete frame-tree/OOPIF census and every frame's
+installation acknowledgement precede release; failed or malformed discovery and
+failed/slow installation produce no release. Deterministic shipped
 handlers also check the held-button lifetime and committed-drag cancellation.
 Emulated touch is not a physical iPhone Safari receipt.
 `npm test` checks bounded move/wheel queues and no replay on input failure. The
