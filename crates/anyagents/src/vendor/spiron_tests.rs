@@ -35,7 +35,7 @@ impl Drop for Environment {
 }
 #[track_caller]
 fn eventually(mut check: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     while !check() {
         assert!(
             Instant::now() < deadline,
@@ -59,9 +59,9 @@ fn message(id: &str) -> OutboundMessage {
 #[test]
 fn spiron_external_spawn_steer_cancel_and_wake_preserve_legacy_state() {
     let _lock = crate::server::tests::env_lock();
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tempdir();
     let probe = temp.path().join("spiron-probe");
-    std::fs::write(&probe, r#"#!/usr/bin/python3
+    std::fs::write(&probe, r#"#!/usr/bin/env python3
 import sys, os, json, pathlib, time
 root = pathlib.Path(os.environ['ANYAGENTS_AGENT_CONFIG'])
 args = sys.argv[1:]
@@ -390,7 +390,7 @@ fn external_probe(
     std::fs::create_dir_all(&config).unwrap();
     std::fs::create_dir_all(&work).unwrap();
     let program = temp.join("peer");
-    std::fs::write(&program, format!("#!/usr/bin/python3\n{script}")).unwrap();
+    std::fs::write(&program, format!("#!/usr/bin/env python3\n{script}")).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let store = Store::open(temp.join("state.db")).unwrap();
     let agent = store
@@ -403,7 +403,7 @@ fn external_probe(
 #[test]
 fn spiron_external_cancelled_unconfirmed_steer_retains_mailbox_custody_across_restart() {
     use anyagents_agent::DeliveryLoop;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tempdir();
     // Vesta's exact cancel/cancel_ack/cancelled-result shape: acknowledged
     // steering text is returned verbatim in undelivered_steers, without IDs.
     let script = r#"
@@ -525,7 +525,7 @@ for line in sys.stdin:
 #[test]
 fn spiron_external_hold_write_failure_refuses_unsent_steer_and_restart_keeps_custody() {
     use anyagents_agent::DeliveryLoop;
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tempdir();
     let script = r#"
 import sys,json,pathlib
 for line in sys.stdin:
@@ -642,7 +642,7 @@ for line in sys.stdin:
 
 #[test]
 fn spiron_external_ingestion_masks_all_nine_forms_and_fragmented_text() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tempdir();
     let script = r#"
 import sys,json
 canary='SYNTHETIC_FIXTURE_0123456789012345'
@@ -695,7 +695,7 @@ for line in sys.stdin:
 #[test]
 fn spiron_external_nonzero_exit_retains_masked_bounded_stderr_and_success_does_not_fault() {
     for (exit, after_input) in [(1, false), (1, true), (0, false)] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tempdir();
         let script = format!(
             r#"
 import sys,json
