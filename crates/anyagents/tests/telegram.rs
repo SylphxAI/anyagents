@@ -150,20 +150,23 @@ fn answer(
             }
         }
     };
-    let method = head
+    let path = head
         .lines()
         .next()
         .and_then(|line| line.split_whitespace().nth(1))
-        .unwrap_or("/")
-        .rsplit('/')
+        .unwrap_or("/");
+    let bot_id: i64 = path
+        .trim_start_matches("/bot")
+        .split(':')
         .next()
-        .unwrap_or("")
-        .to_string();
+        .and_then(|id| id.parse().ok())
+        .unwrap_or(777);
+    let method = path.rsplit('/').next().unwrap_or("").to_string();
     let request: Value = serde_json::from_slice(&body).unwrap_or(json!({}));
     let response = match method.as_str() {
         "getMe" => json!({
             "ok": true,
-            "result": {"id": 777, "is_bot": true, "first_name": "Ada", "username": "ada_bot"},
+            "result": {"id": bot_id, "is_bot": true, "first_name": "Ada", "username": format!("bot_{bot_id}")},
         }),
         "getUpdates" => {
             // A short poll is the server releasing a held long poll: it hands
@@ -302,6 +305,7 @@ fn create(dir: &Path, name: &str) -> String {
 }
 
 fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
+    let fake = FakeTelegram::start(Vec::new());
     let token_file = dir.join("bot-token");
     std::fs::write(&token_file, token).unwrap();
     let added = Command::new(env!("CARGO_BIN_EXE_anyagents"))
@@ -310,6 +314,7 @@ fn add_channel(dir: &Path, agent: &str, token: &str) -> String {
             dir.join(support::TOKEN_FILE),
         )
         .env("ANYAGENTS_TESTS", "own-seat")
+        .env("ANYAGENTS_TELEGRAM_API", &fake.address)
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .arg("--data")
         .arg(dir)
@@ -480,7 +485,7 @@ fn a_dm_and_a_topic_reach_the_mailbox_and_answers_go_back_there() {
     // The bot confirms itself once and remembers what it has stored.
     let channel = store.list_channels().unwrap().remove(0);
     let state: Value = serde_json::from_str(&channel.state).unwrap();
-    assert_eq!(state["bot"], "777:ada_bot");
+    assert_eq!(state["bot"], "777:bot_777");
     assert_eq!(state["offset"], 12);
     let chats = state["chats"].as_array().unwrap();
     assert!(chats.iter().any(|link| link["chat_id"] == 100));

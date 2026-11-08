@@ -291,6 +291,7 @@ fn create(dir: &Path, name: &str) -> String {
 
 /// Add one Telegram bot for `agent`, with the bot id as its token's first field.
 fn add_channel(dir: &Path, agent: &str, bot: i64) {
+    let fake = FakeTelegram::start();
     let token = dir.join(format!("bot-token-{bot}"));
     std::fs::write(&token, format!("{bot}:test-token")).unwrap();
     let added = Command::new(env!("CARGO_BIN_EXE_anyagents"))
@@ -301,6 +302,7 @@ fn add_channel(dir: &Path, agent: &str, bot: i64) {
         .arg(&token)
         .env("ANYAGENTS_LAUNCHER", support::fake_launcher(dir))
         .env("ANYAGENTS_TESTS", "own-seat")
+        .env("ANYAGENTS_TELEGRAM_API", &fake.address)
         .env(
             "ANYAGENTS_OPERATOR_TOKEN_FILE",
             dir.join(support::TOKEN_FILE),
