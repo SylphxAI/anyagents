@@ -162,7 +162,7 @@ pub struct SylphxHarness {
     config_dir: PathBuf,
     work_dir: PathBuf,
     model: Option<String>,
-    env: Vec<(String, String)>,
+    env: workspace::Environment,
     mcp_command: PathBuf,
     mcp_args: Vec<String>,
     fake_mode: bool,
@@ -230,7 +230,7 @@ impl SylphxHarness {
             config_dir: config_dir.to_path_buf(),
             work_dir: work_dir.to_path_buf(),
             model: model.map(str::to_string),
-            env: env_owned,
+            env: env_owned.into(),
             mcp_command: clean_exe_path(mcp_command),
             mcp_args: mcp_args.to_vec(),
             fake_mode,
@@ -238,6 +238,15 @@ impl SylphxHarness {
             cancel_flag: Arc::new(AtomicBool::new(false)),
             state,
         })
+    }
+
+    /// Supply the embedding host's authoritative peer inventory. Workspace
+    /// commands refresh it immediately before admission, including mid-turn.
+    pub fn set_seat_peers_resolver(
+        &mut self,
+        resolver: impl Fn() -> Result<String, String> + Send + Sync + 'static,
+    ) {
+        self.env.set_peer_resolver(Arc::new(resolver));
     }
 
     pub fn session_id(&self) -> Option<String> {
@@ -1058,7 +1067,7 @@ pub(crate) fn run_cloud_session_turn(
     config_dir: &Path,
     work_dir: &Path,
     model: Option<&str>,
-    env: &[(String, String)],
+    env: &workspace::Environment,
     mcp_command: &Path,
     mcp_args: &[String],
     env_slug: &str,
@@ -2522,7 +2531,7 @@ pub(crate) fn run_native_gateway_turn(
     config_dir: &Path,
     work_dir: &Path,
     model: Option<&str>,
-    env: &[(String, String)],
+    env: &workspace::Environment,
     mcp_command: &Path,
     mcp_args: &[String],
     initial_user_message: &str,
@@ -3087,7 +3096,7 @@ pub fn run_stdio_adapter(
         })
         .unwrap_or_default();
 
-    let env: Vec<(String, String)> = std::env::vars().collect();
+    let env: workspace::Environment = std::env::vars().collect::<Vec<_>>().into();
     let session_id = std::fs::read_to_string(config_dir.join("sylphx-session-id"))
         .ok()
         .map(|s| s.trim().to_string())
@@ -4277,7 +4286,7 @@ fn execute_sylphx_tool(
     args: &Value,
     config_dir: &Path,
     work_dir: &Path,
-    env: &[(String, String)],
+    env: &workspace::Environment,
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> String {
@@ -4319,7 +4328,7 @@ fn execute_sylphx_tool_raw(
     args: &Value,
     config_dir: &Path,
     work_dir: &Path,
-    env: &[(String, String)],
+    env: &workspace::Environment,
     mcp_command: &Path,
     mcp_args: &[String],
 ) -> String {
@@ -5284,7 +5293,7 @@ mod tests {
             }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -5794,7 +5803,7 @@ mod tests {
             &cfg,
             &work,
             Some("preflight-http/model"),
-            &env,
+            &env.clone().into(),
             Path::new("unused-mcp"),
             &[],
             "continue pending task #123",
@@ -5824,7 +5833,7 @@ mod tests {
             &cfg,
             &work,
             Some("preflight-http/model"),
-            &env,
+            &env.clone().into(),
             Path::new("unused-mcp"),
             &[],
             &irreducible,
@@ -5925,7 +5934,15 @@ mod tests {
             &json!({"type":"context_window_open", "handoff":"continue", "retained_items":[inbound]}),
         );
         let read = |args: &Value| {
-            execute_sylphx_tool("read_file", args, cfg, cfg, &[], Path::new("unused"), &[])
+            execute_sylphx_tool(
+                "read_file",
+                args,
+                cfg,
+                cfg,
+                &workspace::Environment::default(),
+                Path::new("unused"),
+                &[],
+            )
         };
         let mut args = json!({"path":"sylphx-transcript.jsonl", "start_line":1, "end_line":1});
         #[cfg(unix)]
@@ -6204,7 +6221,7 @@ mod tests {
             &json!({ "path": "sample.rs" }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6229,7 +6246,7 @@ mod tests {
             }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6245,7 +6262,7 @@ mod tests {
             &json!({ "patch": v4a_patch }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6270,7 +6287,7 @@ mod tests {
             &json!({ "patch": broken_unified }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6288,7 +6305,7 @@ mod tests {
             &json!({ "command": "sleep 10", "timeout_ms": 500 }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6373,7 +6390,7 @@ mod tests {
             &json!({ "action": "inspect" }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6391,7 +6408,7 @@ mod tests {
             }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6424,7 +6441,7 @@ mod tests {
             }),
             &cfg,
             &work,
-            &[],
+            &workspace::Environment::default(),
             Path::new("anyagents"),
             &[],
         );
@@ -6710,7 +6727,7 @@ mod tests {
             &json!({ "action": "placement", "placement": "local" }),
             &cfg,
             &work,
-            &env,
+            &env.clone().into(),
             Path::new("anyagents"),
             &[],
         );
@@ -6859,7 +6876,15 @@ exec "$@"
         let preserved = workspace_continuity_fixture(&cfg);
         let env = Vec::new();
         let tool = |name, args: Value| {
-            execute_sylphx_tool(name, &args, &cfg, &work, &env, Path::new("unused-mcp"), &[])
+            execute_sylphx_tool(
+                name,
+                &args,
+                &cfg,
+                &work,
+                &env.clone().into(),
+                Path::new("unused-mcp"),
+                &[],
+            )
         };
         let uid = Command::new("id").arg("-u").output().unwrap();
         let out = tool(
@@ -6881,6 +6906,144 @@ exec "$@"
 
     #[test]
     #[cfg(unix)]
+    fn already_started_harness_refreshes_same_seat_peers_for_each_workspace_command() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().canonicalize().unwrap();
+        let config = data.join("agents/own/config");
+        let work = data.join("work");
+        for path in [
+            &config,
+            &work,
+            &data.join("agents/own/memory"),
+            &data.join("agents/own/skills"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::fs::write(config.join("mcp-capability"), "synthetic").unwrap();
+        let uid = std::fs::metadata(&config)
+            .unwrap()
+            .uid()
+            .wrapping_add(1)
+            .max(1);
+        let gid = uid.wrapping_add(1).max(1);
+        let launcher = data.join("fixture-launcher");
+        // Only process identity/procfs and GNU/BSD stat differences are mocked.
+        // The complete production admission script still performs real peer
+        // access tests on the actual directories; this does not prove setpriv.
+        std::fs::write(
+            &launcher,
+            format!(
+                r#"#!/bin/sh
+set -eu
+shift 8
+if [ "$1" = /bin/sh ] && [ "$2" = -c ]; then
+    prefix='id() {{ case "$1" in -u) echo {uid};; -g) echo {gid};; esac; }}
+awk() {{ echo 1; }}
+stat() {{ echo 640; }}
+'
+    exec /bin/sh -c "$prefix$3"
+fi
+exec "$@"
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let values = vec![
+            ("ANYAGENTS_DATA".into(), data.display().to_string()),
+            (
+                "ANYAGENTS_AGENT_CONFIG".into(),
+                config.display().to_string(),
+            ),
+            (
+                anyagents_harness::SEAT_LAUNCH_ENV.into(),
+                format!("{}\t{uid}\t{gid}\t{gid}", launcher.display()),
+            ),
+            (anyagents_harness::SEAT_PEERS_ENV.into(), "[]".into()),
+        ];
+        let pairs: Vec<_> = values
+            .iter()
+            .map(|(k, v): &(String, String)| (k.as_str(), v.as_str()))
+            .collect();
+        let mut harness =
+            SylphxHarness::start(&config, &work, None, None, &pairs, Path::new("unused"), &[])
+                .unwrap();
+        let peers = Arc::new(Mutex::new(Vec::<anyagents_harness::SeatPeer>::new()));
+        let live = peers.clone();
+        harness.set_seat_peers_resolver(move || {
+            serde_json::to_string(&*live.lock().unwrap()).map_err(|e| e.to_string())
+        });
+        // The running turn retains its environment clone before child creation.
+        let turn_env = harness.env.clone();
+        let run = |environment: &workspace::Environment| {
+            execute_sylphx_tool(
+                "bash",
+                &json!({"command":"printf admitted"}),
+                &config,
+                &work,
+                environment,
+                Path::new("unused"),
+                &[],
+            )
+        };
+        assert!(run(&turn_env).contains("admitted"));
+        let child = data.join("agents/late-child");
+        for name in ["config", "memory", "skills"] {
+            let path = child.join(name);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        }
+        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        assert_eq!(std::fs::metadata(&child).unwrap().mode() & 0o7777, 0o2770);
+        let stale = workspace::Environment::from(values);
+        assert!(run(&stale).contains("peer seats' private trees are denied"));
+        peers.lock().unwrap().push(anyagents_harness::SeatPeer {
+            root: child.clone(),
+            uid,
+            gid,
+        });
+        assert!(
+            run(&turn_env).contains("admitted"),
+            "refresh must reach an already-running turn"
+        );
+        for wrong_principal in [(uid + 1, gid), (uid, gid + 1)] {
+            let mut list = peers.lock().unwrap();
+            list[0].uid = wrong_principal.0;
+            list[0].gid = wrong_principal.1;
+            drop(list);
+            assert!(run(&turn_env).contains("peer seats' private trees are denied"));
+        }
+        peers.lock().unwrap()[0] = anyagents_harness::SeatPeer {
+            root: child,
+            uid,
+            gid,
+        };
+        assert!(run(&turn_env).contains("admitted"));
+        // Directory group/mode alone cannot admit an unregistered peer.
+        let foreign = data.join("agents/unregistered/memory");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::set_permissions(&foreign, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        assert!(run(&turn_env).contains("peer seats' private trees are denied"));
+        harness.set_seat_peers_resolver(|| Err("synthetic authority unavailable".into()));
+        let refused = execute_sylphx_tool(
+            "write_file",
+            &json!({"path":"must-not-exist", "content":"forbidden"}),
+            &config,
+            &work,
+            &harness.env,
+            Path::new("unused"),
+            &[],
+        );
+        assert!(
+            refused.contains("synthetic authority unavailable"),
+            "{refused}"
+        );
+        assert!(!work.join("must-not-exist").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn selected_local_workspace_tools_dispatch_through_trusted_launcher() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = tmp.path().join("cfg");
@@ -6890,7 +7053,15 @@ exec "$@"
         let preserved = workspace_continuity_fixture(&cfg);
         let (env, log) = workspace_test_launcher(tmp.path());
         let tool = |name, args: Value| {
-            execute_sylphx_tool(name, &args, &cfg, &work, &env, Path::new("unused-mcp"), &[])
+            execute_sylphx_tool(
+                name,
+                &args,
+                &cfg,
+                &work,
+                &env.clone().into(),
+                Path::new("unused-mcp"),
+                &[],
+            )
         };
         let cases = [
             (
@@ -6987,7 +7158,15 @@ exec "$@"
         let (mut env, log) = workspace_test_launcher(tmp.path());
         env.push(("WORKSPACE_TEST_REFUSE".into(), "1".into()));
         let tool = |name, args: Value, env: &[(String, String)]| {
-            execute_sylphx_tool(name, &args, &cfg, &work, env, Path::new("unused-mcp"), &[])
+            execute_sylphx_tool(
+                name,
+                &args,
+                &cfg,
+                &work,
+                &env.to_vec().into(),
+                Path::new("unused-mcp"),
+                &[],
+            )
         };
         for (name, args) in [
             ("bash", json!({"command":"printf forbidden > retained"})),

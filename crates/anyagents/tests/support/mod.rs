@@ -37,18 +37,18 @@ pub fn operator_at(data: &Path) -> String {
 /// The deployment's own start line: `<agent>=<uid>` for the agents a test
 /// deployment names, before every serve.
 pub fn agents_line() -> String {
+    agents_line_for_uid(our_uid())
+}
+
+/// Synthetic identities stay distinct from root, each other and the actual
+/// server UID. These numbers describe fixture seats, not real host accounts.
+pub fn agents_line_for_uid(server_uid: u32) -> String {
     [
-        ("alpha", "2101"),
-        ("beta", "2102"),
-        ("ada", "2103"),
-        ("bea", "2104"),
-        ("cy", "2105"),
-        ("kind", "2106"),
-        ("gamma", "2107"),
-        ("delta", "2108"),
+        "alpha", "beta", "ada", "bea", "cy", "kind", "gamma", "delta",
     ]
-    .iter()
-    .map(|(name, seat)| format!("{name}={seat}"))
+    .into_iter()
+    .zip((2101..=2109).filter(|uid| *uid != server_uid))
+    .map(|(name, uid)| format!("{name}={uid}"))
     .collect::<Vec<_>>()
     .join(",")
 }
@@ -82,23 +82,7 @@ pub fn operator(data: &Path) -> PathBuf {
         // starts its agents with: the test double that only runs the command.
         std::env::remove_var("ANYAGENTS_FAKE_MODE");
         std::env::set_var("ANYAGENTS_LAUNCHER", fake_launcher(data));
-        std::env::set_var(
-            "ANYAGENTS_AGENTS",
-            [
-                ("alpha", "2101"),
-                ("beta", "2102"),
-                ("ada", "2103"),
-                ("bea", "2104"),
-                ("cy", "2105"),
-                ("kind", "2106"),
-                ("gamma", "2107"),
-                ("delta", "2108"),
-            ]
-            .iter()
-            .map(|(name, seat)| format!("{name}={seat}"))
-            .collect::<Vec<_>>()
-            .join(","),
-        );
+        std::env::set_var("ANYAGENTS_AGENTS", agents_line());
     }
     path
 }

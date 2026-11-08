@@ -6,14 +6,59 @@ use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
-use anyagents_harness::{SEAT_LAUNCH_ENV, spawn_command};
+use anyagents_harness::{SEAT_LAUNCH_ENV, SEAT_PEERS_ENV, spawn_command};
+use std::sync::Arc;
 
-pub(super) fn delegated(env: &[(String, String)]) -> bool {
+type PeerResolver = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+
+/// Launch values plus a host-owned authority reader, never tool-selected data.
+#[derive(Clone, Default)]
+pub(crate) struct Environment {
+    values: Vec<(String, String)>,
+    peers: Option<PeerResolver>,
+}
+
+impl Environment {
+    pub(crate) fn set_peer_resolver(&mut self, resolver: PeerResolver) {
+        self.peers = Some(resolver);
+    }
+}
+
+impl From<Vec<(String, String)>> for Environment {
+    fn from(values: Vec<(String, String)>) -> Self {
+        Self {
+            values,
+            peers: None,
+        }
+    }
+}
+
+impl std::ops::Deref for Environment {
+    type Target = [(String, String)];
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+pub(super) fn delegated(env: &Environment) -> bool {
     env.iter().any(|(key, _)| key == SEAT_LAUNCH_ENV)
 }
 
-pub(super) fn command(program: &Path, env: &[(String, String)]) -> Result<Command, String> {
-    spawn_command(program, env).map_err(|e| e.to_string())
+pub(super) fn command(program: &Path, env: &Environment) -> Result<Command, String> {
+    let Some(resolve) = env.peers.as_ref().filter(|_| delegated(env)) else {
+        return spawn_command(program, env).map_err(|e| e.to_string());
+    };
+    // Resolve on every command, not on start or turn entry: agents can be
+    // created by a tool while this harness/turn is already running. A failed
+    // refresh refuses instead of reusing a stale allowlist.
+    let peers = resolve()?;
+    let mut values: Vec<_> = env
+        .iter()
+        .filter(|(k, _)| k != SEAT_PEERS_ENV)
+        .cloned()
+        .collect();
+    values.push((SEAT_PEERS_ENV.to_owned(), peers));
+    spawn_command(program, &values).map_err(|e| e.to_string())
 }
 
 /// Pipe inputs instead of putting file contents/patches in argv. Drain output
@@ -46,7 +91,7 @@ pub(super) fn output(mut cmd: Command, input: &[u8]) -> Result<Output, String> {
 
 fn file_command(
     path: &Path,
-    env: &[(String, String)],
+    env: &Environment,
     script: &str,
     input: &[u8],
 ) -> Result<Vec<u8>, String> {
@@ -63,21 +108,21 @@ fn file_command(
     Ok(out.stdout)
 }
 
-pub(super) fn read_bytes(path: &Path, env: &[(String, String)]) -> Result<Vec<u8>, String> {
+pub(super) fn read_bytes(path: &Path, env: &Environment) -> Result<Vec<u8>, String> {
     if !delegated(env) {
         return std::fs::read(path).map_err(|e| e.to_string());
     }
     file_command(path, env, "/bin/cat -- \"$1\"", b"")
 }
 
-pub(super) fn read_to_string(path: &Path, env: &[(String, String)]) -> Result<String, String> {
+pub(super) fn read_to_string(path: &Path, env: &Environment) -> Result<String, String> {
     String::from_utf8(read_bytes(path, env)?).map_err(|e| e.to_string())
 }
 
 pub(super) fn write(
     path: &Path,
     content: impl AsRef<[u8]>,
-    env: &[(String, String)],
+    env: &Environment,
 ) -> Result<(), String> {
     if !delegated(env) {
         return std::fs::write(path, content).map_err(|e| e.to_string());
@@ -85,14 +130,14 @@ pub(super) fn write(
     file_command(path, env, "/bin/cat > \"$1\"", content.as_ref()).map(|_| ())
 }
 
-pub(super) fn create_dir_all(path: &Path, env: &[(String, String)]) -> Result<(), String> {
+pub(super) fn create_dir_all(path: &Path, env: &Environment) -> Result<(), String> {
     if !delegated(env) {
         return std::fs::create_dir_all(path).map_err(|e| e.to_string());
     }
     file_command(path, env, "/bin/mkdir -p -- \"$1\"", b"").map(|_| ())
 }
 
-pub(super) fn remove_if_exists(path: &Path, env: &[(String, String)]) -> Result<(), String> {
+pub(super) fn remove_if_exists(path: &Path, env: &Environment) -> Result<(), String> {
     if !delegated(env) {
         return match std::fs::remove_file(path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

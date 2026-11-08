@@ -691,7 +691,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
         doc.push_str("- **Role**: Root Agent\n");
     }
 
-    doc.push_str("- **Lifecycle**: Your role is a label, not a lifecycle policy. Follow your own instructions for when to archive. Any agent may call `agents({ \"action\": \"archive\" })` to archive itself. After a completed turn, an idle agent releases its process when its mailbox is drained and no child or background work is active; its identity and session are preserved.\n");
+    doc.push_str("- **Lifecycle**: Role labels do not set lifecycle policy; follow your instructions. Any agent may call `agents` with `action: \"archive\"`. Idle processes release after mailbox/child/background work drains; identity and session persist.\n");
 
     if let Some(custom) = agent
         .instructions
@@ -707,121 +707,21 @@ pub(crate) fn write_agent_instructions_with_continuity(
     }
 
     doc.push_str(
-        "\n## 2.1 Hierarchy, Event-Driven Topology & Scope Encapsulation\n\n\
-         - **Two-Layer Identity (`description` vs. `instructions`)**:\n\
-           - **Layer 1 (`description`)**: Concise public routing card visible in `agents({ \"action\": \"describe\", \"name\": \"all\" })` and group rosters without leaking private instructions.\n\
-           - **Layer 2 (`instructions`)**: Detailed private operating instructions in Section 2 above (visible only to you and ancestor supervisors).\n\
-         - **Event-Driven Topology (Cache-Stable System Prompt + `<topology>` Events)**:\n\
-           - Dynamic peer/sibling/sub-agent rosters are never injected into this static System Prompt.\n\
-           - Relationship snapshots arrive inline via `<topology event=\"initial\" ... />` and `<topology event=\"delta\" ... />`, and each `<message ...>` carries `sender_rel` and `sender_role`.\n\
-         - **Internal Scope (`scope`: `\"isolated\"` | `\"private\"` | `\"siblings\"` | `\"public\"`)**:\n\
-           - **`\"isolated\"`**: Confined to direct `parent`, own `children`, and bound external channels.\n\
-           - **`\"private\"` *(Sub-agent default)*:** Reachable by direct `parent`, own `children`, or shared `group:<name>`; reports via `to: [\"parent\"]`.\n\
-           - **`\"siblings\"`**: Also collaborates with sibling sub-agents under the same `parent` (`to: [\"siblings\"]` or `to: [\"agent:<sibling>\"]`).\n\
-           - **`\"public\"`**: Reachable across the workspace.\n\
-           - **Downward-Only Supervision**: Ancestors can inspect descendants' `instructions` and `conversation`, never the reverse.\n\
-           - **Group Chat Discipline**: In shared Telegram groups, only the single matching domain agent answers; all others stay silent (`NO_REPLY`).\n",
+        "\n## 3. Hierarchy, Topology & Communication Rules\n\
+         \n\
+         - `description` is a public routing card; `instructions` are private to you and ancestors. Supervision is downward-only.\n\
+         - Live rosters arrive via `<topology event=\"initial|delta\" ... />`; inline `<message ...>` routing carries `sender_rel`, `sender_role`, `reply_to`, `answer_to`.\n\
+         - `scope`: \"isolated\" = parent/children/bound channels; \"private\" (sub-agent default) adds shared groups; \"siblings\" adds siblings; \"public\" = workspace-wide. In group chats only the matching domain agent replies; otherwise `NO_REPLY`.\n\
+         - Stdout never reaches peers/parents/channels. Always call `send` to reply/report (`to`, `reply_to: \"anyagents:reply:msg_...\"`, `text`, etc.); use the envelope's `answer_to`.\n\
+         - Never poll an inbox: messages, sub-agent completions and watches wake you reactively.\n\
+         - Vendor sub-agent/timer tools are disabled by default. Use `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`, `device.*`, `media.*`) as your unified programmatic execution surface: `anyagents.agents` for lifecycle (isolated `<data>/agents/<id>/work` by default, or `repo` worktrees; `archive` reaps clean/pushed worktrees, preserves dirty/unpushed ones), `anyagents.memory` for durable memory, `anyagents.conversation` for history/search, `anyagents.groups` for groups, `anyagents.schedule` for wakes/event watches.\n\
+         - `browser` provides persistent Chromium; fill secrets with `secret_ref: \"op://...\"` / `\"op-otp://...\"` without reading them. On `captcha_detected: true`, use `action: \"takeover\"` and send the takeover URL to the user.\n",
     );
     if let Some(parent) = parent_name {
         doc.push_str(&format!(
-            "         - **Your Direct Parent Agent**: `agent:{parent}` (send upward via `to: [\"parent\"]` or `to: [\"agent:{parent}\"]`)\n"
+            "- Direct parent: `agent:{parent}`; report via `send` to `parent`.\n"
         ));
     }
-
-    doc.push_str(
-        "\n## 3. Runtime Awareness & Code Mode (`code`)\n\n\
-         - **Cache-Stable Routing & Pure Code Mode (`code`)**:\n\
-           - Live routing context arrives per message in `<message ...>` (`id`, `from`, `sender_name`, `to`, `participants`, `channel`, `chat`, `topic`, `reply_to`, `answer_to`).\n\
-           - The AnyAgents MCP server exposes **`code`** (`mcp__anyagents__code` / `anyagents_code`) as your universal programmatic tool-calling surface across all harnesses. Execute an async TypeScript/JavaScript snippet (`code({ \"code\": \"...\", \"timeout_ms\": 30000 })`) inside an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) to compose `anyagents.*`, `workspace.*`, and `web.*` calls in parallel and return only compact results:\n\
-```ts\n\
-declare const anyagents: {\n\
-  memory: {\n\
-    (req?: string | { action?: \"list\"|\"read\"|\"write\"|\"upsert\"|\"delete\"|\"search\"; topic?: string; description?: string; content?: string; query?: string; delete?: boolean; agent?: string; limit?: number }): Promise<any>;\n\
-    read(topicOrOpts: string | { topic: string; agent?: string }): Promise<{ topic: string; description: string; content: string; turns: any[] }>;\n\
-    write(opts: { topic: string; description?: string; content: string; agent?: string }): Promise<{ topic: string; filename: string; sha256: string }>;\n\
-    delete(topicOrOpts: string | { topic: string; agent?: string }): Promise<{ topic: string; deleted: boolean; index: string }>;\n\
-    list(opts?: string | { agent?: string; limit?: number }): Promise<{ index: string; topics: any[]; count: number }>;\n\
-    search(queryOrOpts: string | { query: string; agent?: string; limit?: number }): Promise<{ matches: any[]; count: number }>;\n\
-  };\n\
-  conversation(req?: { query?: string; queries?: string[]; exclude?: string[]; agent?: string; with?: string; scope?: \"all\"|\"memory\"|\"transcripts\"; direction?: \"in\"|\"out\"; since_ms?: number; until_ms?: number; include_tools?: boolean; range?: string; limit?: number; raw_id?: string; raw_sha256?: string; raw_offset?: number; raw_length?: number }): Promise<any>;\n\
-  send(req: { to?: string[]; text?: string; reply_to?: string; action?: \"react\"|\"vote\"|\"check\"|\"uncheck\"|\"edit\"|\"delete\"|\"pin\"|\"unpin\"|\"stop_poll\"; target?: string; emoji?: string; media?: any; poll?: any; checklist?: any; article?: any }): Promise<any>;\n\
-  agents(req?: { action?: \"list\"|\"inspect\"|\"spawn\"|\"create\"|\"describe\"|\"steer\"|\"wake\"|\"pause\"|\"archive\"|\"delete\"|\"rename\"|\"role\"|\"harness\"|\"models\"|\"reset_session\"; name?: string; parent?: string; state?: string; query?: string; repo?: string; branch?: string; base?: string; workdir?: string; description?: string; instructions?: string; prompt?: string; limit?: number }): Promise<any>;\n\
-  schedule(req?: { action?: \"set\"|\"list\"|\"cancel\"; at?: string; every?: string; watch?: string; prompt?: string; id?: string }): Promise<any>;\n\
-  groups(req?: { action?: \"list\"|\"members\"|\"join\"|\"leave\"; group?: string; agents?: string[]; public?: boolean }): Promise<any>;\n\
-  browser(req: { action: string; url?: string; selector?: string; value?: string; secret_ref?: string; key?: string; profile?: string }): Promise<any>;\n\
-  web: typeof web;\n\
-  files(req: any): Promise<any>;\n\
-};\n\
-declare const workspace: {\n\
-  read(opts: string | { path: string; start_line?: number; end_line?: number; byte_offset?: number; max_bytes?: number }): Promise<{ path: string; content: string; numbered: string; total_lines: number; sha256: string }>;\n\
-  write(opts: string | { path: string; content: string; overwrite?: boolean; append?: boolean }, content?: string): Promise<{ path: string; bytes_written: number; sha256: string }>;\n\
-  edit(opts: { path: string; target: string; replacement: string; replace_all?: boolean }): Promise<{ path: string; replacements_made: number; lines_added: number; lines_removed: number; sha256: string }>;\n\
-  multi_edit(opts: { path: string; edits: Array<{ target: string; replacement: string; replace_all?: boolean }> }): Promise<{ path: string; replacements_made: number; sha256: string }>;\n\
-  patch(patchOrOpts: string | { patch: string }): Promise<{ files_changed: any[]; count: number }>;\n\
-  glob(opts?: string | { pattern?: string; path?: string; max_results?: number }): Promise<{ files: string[]; count: number }>;\n\
-  grep(opts: string | { query: string; path?: string; glob?: string; max_results?: number; context_lines?: number }): Promise<{ matches: Array<{ path: string; line: number; text: string }> }>;\n\
-  list(opts?: string | { path?: string; max_results?: number; include_hidden?: boolean }): Promise<{ entries: Array<{ name: string; path: string; kind: \"file\"|\"dir\"|\"symlink\"; bytes: number }>; count: number }>;\n\
-  exec(cmdOrOpts: string | { cmd: string; cwd?: string; timeout_ms?: number }): Promise<{ exit_code: number; stdout: string; stderr: string; duration_ms: number }>;\n\
-};\n\
-declare const web: {\n\
-  search(queryOrOpts: string | { query: string; engine?: \"auto\"|\"parallel\"|\"exa\"|\"tavily\"|\"firecrawl\"|\"perplexity\"|\"brave\"|\"anysearch\"; allowed_domains?: string[]; blocked_domains?: string[]; country?: string; max_results?: number; mode?: string; external_web_access?: boolean }): Promise<{ engine: string; results: Array<{ title: string; url: string; snippet: string }>; answer?: string }>;\n\
-  fetch(urlOrOpts: string | { url: string; engine?: \"auto\"|\"firecrawl\"|\"exa\"|\"parallel\"|\"tavily\"|\"anysearch\"|\"direct\"; allowed_domains?: string[]; blocked_domains?: string[]; max_chars?: number; external_web_access?: boolean }): Promise<{ engine: string; url: string; title?: string; content: string; truncated: boolean }>;\n\
-};\n\
-declare const computer: {\n\
-  snapshot(opts?: { app?: string; window_id?: string; skeleton?: boolean; root_ref?: string; interactive_only?: boolean }): Promise<{ snapshot_id: string; elements: Array<{ ref_id: string; role: string; name: string; bounds: { x: number; y: number; width: number; height: number } }> }>;\n\
-  list_windows(): Promise<{ windows: Array<{ window_id: string; title: string; bounds: any }> }>;\n\
-  focus_window(widOrOpts: string | { window_id: string }): Promise<any>;\n\
-  clipboard_get(): Promise<{ text: string }>;\n\
-  clipboard_set(textOrOpts: string | { text: string }): Promise<{ bytes: number; stdin_piped: boolean }>;\n\
-  screenshot(opts?: { provider?: string; session_id?: string; display?: string }): Promise<{ width: number; height: number; image_base64: string }>;\n\
-  click(refOrOpts: string | { ref?: string; x?: number; y?: number; button?: \"left\"|\"right\"|\"middle\"; count?: 1|2|3; modifiers?: string[] }): Promise<any>;\n\
-  move(opts: { ref?: string; x?: number; y?: number }): Promise<any>;\n\
-  drag(opts: { from_x: number; from_y: number; to_x: number; to_y: number; button?: string }): Promise<any>;\n\
-  scroll(opts: { x?: number; y?: number; direction: \"up\"|\"down\"|\"left\"|\"right\"; amount?: number }): Promise<any>;\n\
-  type(textOrOpts: string | { ref?: string; text: string; delay_ms?: number }): Promise<any>;\n\
-  key(keyOrOpts: string | { key: string; modifiers?: string[] }): Promise<any>;\n\
-  zoom(opts: { x: number; y: number; width: number; height: number }): Promise<{ image_base64: string }>;\n\
-  action(actionJson: any): Promise<any>;\n\
-};\n\
-declare const device: {\n\
-  screenshot(opts?: { serial?: string }): Promise<{ width: number; height: number; image_base64: string }>;\n\
-  tap(opts: { x: number; y: number; serial?: string }): Promise<any>;\n\
-  swipe(opts: { from_x: number; from_y: number; to_x: number; to_y: number; duration_ms?: number; serial?: string }): Promise<any>;\n\
-  type(textOrOpts: string | { text: string; serial?: string }): Promise<any>;\n\
-  press(btnOrOpts: string | { button: \"home\"|\"back\"|\"app_switch\"|\"power\"|\"volume_up\"|\"volume_down\"; serial?: string }): Promise<any>;\n\
-  install_app(apkOrOpts: string | { apk_path: string; serial?: string }): Promise<any>;\n\
-  launch_app(pkgOrOpts: string | { package: string; activity?: string; serial?: string }): Promise<any>;\n\
-  terminate_app(pkgOrOpts: string | { package: string; serial?: string }): Promise<any>;\n\
-  open_url(urlOrOpts: string | { url: string; serial?: string }): Promise<any>;\n\
-  rotate(orientOrOpts: string | { orientation: \"portrait\"|\"landscape\"; serial?: string }): Promise<any>;\n\
-};\n\
-declare const media: {\n\
-  image_generate(promptOrOpts: string | { prompt: string; model?: string; size?: string; n?: number; output_path?: string }): Promise<any>;\n\
-  speech(inputOrOpts: string | { input: string; model?: string; voice?: string; response_format?: string; output_path?: string }): Promise<{ bytes: number; sha256: string; output_path?: string; audio_base64: string }>;\n\
-  transcribe(pathOrOpts: string | { file_path: string; model?: string; language?: string; prompt?: string }): Promise<{ text: string }>;\n\
-};\n\
-declare const tools: { anyagents: typeof anyagents; workspace: typeof workspace; web: typeof web; computer: typeof computer; device: typeof device; media: typeof media };\n\
-const [roster, mem, hits] = await Promise.all([\n\
-  anyagents.agents({ action: \"list\", parent: \"self\" }),\n\
-  anyagents.memory.list(),\n\
-  workspace.grep({ query: \"CANONICAL_MCP_TOOLS\", path: \"crates\" }),\n\
-]);\n\
-return { running: roster.agents.map((a: any) => a.name), topics: mem.count, hits: hits.matches };\n\
-```\n\
-         - **Domain Capabilities Inside `code`**:\n\
-           - **1. Learned Memory (`anyagents.memory`) vs. Episodic History (`anyagents.conversation`)**:\n\
-             - Curate durable semantic memory (`MEMORY.md` + `<topic>.md`) via `anyagents.memory.list()`, `anyagents.memory.read(\"<slug>\")`, `anyagents.memory.write({ topic, description, content })`, `anyagents.memory.delete(\"<slug>\")`, and `anyagents.memory.search(\"<query>\")`.\n\
-             - Search raw episodic turns & transcripts via `anyagents.conversation({ query, agent: \"all\" | \"self\", include_tools: true, range: \"seq:10-25\", limit: 20 })`.\n\
-           - **2. Workspace Files, Patches & Exec (`workspace.*`)**:\n\
-             - Deterministic paths resolved against your `workdir`: `workspace.read`, `workspace.write`, `workspace.edit` (4-stage indentation-tolerant cascade), `workspace.multi_edit`, `workspace.patch` (OpenAI V4A `*** Begin Patch` or unified diff `--- a/...`), `workspace.list`, `workspace.glob`, `workspace.grep`, and `workspace.exec({ cmd, cwd, timeout_ms })`.\n\
-           - **3. Multi-Provider Web Search & Fetch (`web.search`, `web.fetch`)**:\n\
-             - Policy-aware search (`parallel -> exa -> tavily -> firecrawl -> perplexity -> brave -> anysearch`) and extraction (`firecrawl -> exa -> parallel -> tavily -> anysearch -> direct`) with domain filtering and automatic failover.\n\
-           - **4. Agents, Worktrees, Messaging, Groups, Schedules & Browser (`anyagents.*`)**:\n\
-             - **Sub-Agents & Worktrees**: `anyagents.agents({ action: \"spawn\" | \"list\" | \"inspect\" | \"describe\" | \"steer\" | \"wake\" | \"archive\" | \"delete\", ... })`. Sub-agents default to isolated `<data>/agents/<id>/work`; pass `repo: \"<org>/<repo>\" | \"inherit\"` for a managed Git worktree or `workdir: \"inherit\"` to share.\n\
-             - **Outbound Messaging**: Stdout is never delivered; always call `anyagents.send({ to: [\"parent\"] | [\"agent:<name>\"] | [\"<answer_to>\"], reply_to: \"anyagents:reply:msg_...\", text: \"...\" })`.\n\
-             - **Schedules & Event Watches**: `anyagents.schedule({ at: \"1m\" | every: \"15m\" | watch: \"github:pr:<owner>/<repo>#<num>\" | \"agent:idle:<name>\" | \"pid:<pid>\", prompt: \"...\" })`.\n\
-             - **Browser**: `anyagents.browser({ action: \"open\" | \"snapshot\" | \"click\" | \"fill\" | \"takeover\", secret_ref: \"op://...\" })`.\n",
-    );
 
     // Only the host lifecycle allocates a generation. Describe/restart/render
     // consume its persisted pin without opening live learned-memory files.
@@ -851,38 +751,45 @@ return { running: roster.agents.map((a: any) => a.name), topics: mem.count, hits
         }
     }
 
+    // Sylphx assembles the shared layer independently. Native harnesses load
+    // their global AGENTS.md / CLAUDE.md / GEMINI.md instead, so those files
+    // must retain the shared layer even though SYSTEM_PROMPT.md stays compact.
+    let mut native_doc = doc.clone();
     if let Some(shared) = read_shared_agents_md(config) {
-        doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
-        doc.push_str(&shared);
-        doc.push('\n');
+        native_doc.push_str("\n## 4. Shared Instructions (AGENTS.md)\n\n");
+        native_doc.push_str(&shared);
+        native_doc.push('\n');
     }
-
     if let Some(cont) = continuity.map(str::trim).filter(|s| !s.is_empty()) {
-        // Keep the full rendered prompt under Antigravity's 24,000-byte per-file rule cap.
+        // Reserve each file's own shared-layer budget before adding continuity.
+        // Never truncate company instructions to make room for history.
         const MAX_DOC_BYTES: usize = 23_200;
-        let remaining = MAX_DOC_BYTES.saturating_sub(doc.len() + 2);
-        if remaining >= 256 {
-            doc.push('\n');
-            if cont.len() <= remaining {
-                doc.push_str(cont);
-            } else {
-                let mut cut = remaining;
-                while cut > 0 && !cont.is_char_boundary(cut) {
-                    cut -= 1;
+        for rendered in [&mut doc, &mut native_doc] {
+            let remaining = MAX_DOC_BYTES.saturating_sub(rendered.len() + 2);
+            if remaining >= 256 {
+                rendered.push('\n');
+                if cont.len() <= remaining {
+                    rendered.push_str(cont);
+                } else {
+                    let mut cut = remaining;
+                    while cut > 0 && !cont.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    if let Some(nl) = cont[..cut].rfind('\n')
+                        && nl > 0
+                    {
+                        cut = nl;
+                    }
+                    rendered.push_str(&cont[..cut]);
                 }
-                if let Some(nl) = cont[..cut].rfind('\n')
-                    && nl > 0
-                {
-                    cut = nl;
-                }
-                doc.push_str(&cont[..cut]);
+                rendered.push('\n');
             }
-            doc.push('\n');
         }
     }
 
     let sys_prompt_path = config.join("SYSTEM_PROMPT.md");
-    let prompt_changed = std::fs::read(&sys_prompt_path).ok().as_deref() != Some(doc.as_bytes());
+    let prompt_changed = std::fs::read(&sys_prompt_path).ok().as_deref() != Some(doc.as_bytes())
+        || std::fs::read(config.join("AGENTS.md")).ok().as_deref() != Some(native_doc.as_bytes());
     if prompt_changed && config.join("sylphx-cloud-session.json").is_file() {
         let _ = write_seat_shared_file(
             &config.join(".sylphx-cloud-instructions-fingerprint"),
@@ -892,58 +799,32 @@ return { running: roster.agents.map((a: any) => a.name), topics: mem.count, hits
     }
 
     let paths = [
-        sys_prompt_path,
-        config.join("AGENTS.md"),
-        config.join("opencode").join("AGENTS.md"),
-        config.join(".config").join("opencode").join("AGENTS.md"),
-        config.join("CLAUDE.md"),
-        config.join(".claude").join("CLAUDE.md"),
-        config.join(".gemini").join("config").join("GEMINI.md"),
-        config.join("muse").join("AGENTS.md"),
-        config.join(".config").join("muse").join("AGENTS.md"),
-        config.join(".omp").join("agent").join("APPEND_SYSTEM.md"),
-        config.join(".omp").join("agent").join("AGENTS.md"),
-        config.join(".dsh").join("AGENTS.md"),
-        config.join(".grok").join("AGENTS.md"),
+        (sys_prompt_path, &doc),
+        (config.join("AGENTS.md"), &native_doc),
+        (config.join("opencode/AGENTS.md"), &native_doc),
+        (config.join(".config/opencode/AGENTS.md"), &native_doc),
+        (config.join("CLAUDE.md"), &native_doc),
+        (config.join(".claude/CLAUDE.md"), &native_doc),
+        (config.join(".gemini/config/GEMINI.md"), &native_doc),
+        (config.join("muse/AGENTS.md"), &native_doc),
+        (config.join(".config/muse/AGENTS.md"), &native_doc),
+        (config.join(".omp/agent/APPEND_SYSTEM.md"), &native_doc),
+        (config.join(".omp/agent/AGENTS.md"), &native_doc),
+        (config.join(".dsh/AGENTS.md"), &native_doc),
+        (config.join(".grok/AGENTS.md"), &native_doc),
     ];
-    for path in &paths {
-        if std::fs::read(path).ok().as_deref() == Some(doc.as_bytes()) {
+    for (path, contents) in &paths {
+        if std::fs::read(path).ok().as_deref() == Some(contents.as_bytes()) {
             continue;
         }
-        let _ = write_seat_shared_file(path, doc.as_bytes(), 0o664);
+        let _ = write_seat_shared_file(path, contents.as_bytes(), 0o664);
     }
-    // Antigravity (`agy`) loads `.gemini/config/GEMINI.md` under the fixed rule key
-    // `"user_global"`, and additionally loads every `.md` file in `.gemini/config/rules/`
-    // under its canonical path key (`EvalSymlinks`). Because `"user_global"` differs from
-    // the canonical file path key, any file or symlink at `.gemini/config/rules/AGENTS.md`
-    // causes `agy` to inject the entire `SYSTEM_PROMPT.md` twice into `<user_rules>`.
-    // Remove `.gemini/config/rules/AGENTS.md` so `agy` loads `.gemini/config/GEMINI.md`
-    // (`<RULE[user_global]>`) once, and keep `.gemini/config/AGENTS.md -> GEMINI.md`
-    // as a symlink for callers inspecting `.gemini/config/AGENTS.md`.
+    // agy identifies GEMINI.md as "user_global", but rules by file path: even
+    // symlinks inject the prompt twice. Keep only the canonical global rule and
+    // remove both legacy aliases on every refresh of existing configurations.
     let gemini_cfg = config.join(".gemini").join("config");
-    let gemini_agents = gemini_cfg.join("AGENTS.md");
-    let gemini_rules_agents = gemini_cfg.join("rules").join("AGENTS.md");
-    let _ = std::fs::remove_file(&gemini_rules_agents);
-    #[cfg(unix)]
-    {
-        let already_linked = std::fs::symlink_metadata(&gemini_agents)
-            .ok()
-            .is_some_and(|m| m.file_type().is_symlink())
-            && std::fs::read_link(&gemini_agents).ok().as_deref()
-                == Some(std::path::Path::new("GEMINI.md"));
-        if !already_linked {
-            let _ = std::fs::remove_file(&gemini_agents);
-            if std::os::unix::fs::symlink("GEMINI.md", &gemini_agents).is_err() {
-                let _ = write_seat_shared_file(&gemini_agents, doc.as_bytes(), 0o664);
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        if std::fs::read(&gemini_agents).ok().as_deref() != Some(doc.as_bytes()) {
-            let _ = write_seat_shared_file(&gemini_agents, doc.as_bytes(), 0o664);
-        }
-    }
+    let _ = std::fs::remove_file(gemini_cfg.join("AGENTS.md"));
+    let _ = std::fs::remove_file(gemini_cfg.join("rules").join("AGENTS.md"));
 }
 
 /// Fast, non-intrusive instruction sync used by `describe()`: updates the
@@ -1115,11 +996,10 @@ pub(crate) fn data_dir_from_config(config: &Path) -> Option<PathBuf> {
 
 pub(crate) fn read_shared_agents_md(config: &Path) -> Option<String> {
     let data_dir = data_dir_from_config(config)?;
-    let path = data_dir.join("AGENTS.md");
-    std::fs::read_to_string(path)
+    std::fs::read_to_string(data_dir.join("AGENTS.md"))
         .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|text| text.trim().to_string())
+        .filter(|text| !text.is_empty())
 }
 
 #[cfg(unix)]
@@ -10088,25 +9968,46 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             2
         );
 
-        // 6. Verify L0, L1, and L2 all receive the shared AGENTS.md in their config/AGENTS.md
-        // AND their own role description in `## 2. Role, Responsibilities & Standing Description`
+        // 6. Sylphx identity stays compact at every depth, while native
+        // harness entrypoints retain the shared company instructions.
         for (ag, expected_desc) in [
             (&root, "Root owner role description."),
             (&l1, "L1 worker role description."),
             (&l2, "L2 nested worker role description."),
         ] {
             let cfg = anyagents_core::agent_config_dir(data, &ag.id);
-            let prompt = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+            let prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+            let native_prompt = std::fs::read_to_string(cfg.join("AGENTS.md")).unwrap();
+            assert!(native_prompt.starts_with(&prompt));
+            assert_eq!(
+                native_prompt
+                    .matches("# SylphxAI Shared Constitution")
+                    .count(),
+                1
+            );
+            assert!(prompt.len() < 3_500, "{}: {} bytes", ag.name, prompt.len());
             assert!(
                 prompt.contains(expected_desc),
                 "missing role description for {}",
                 ag.name
             );
             assert!(
-                prompt.contains("## 4. Shared Instructions (AGENTS.md)")
-                    && prompt.contains("# SylphxAI Shared Constitution"),
-                "missing shared AGENTS.md for {}",
+                !prompt.contains("## 4. Shared Instructions (AGENTS.md)")
+                    && !prompt.contains("# SylphxAI Shared Constitution"),
+                "shared AGENTS.md must be loaded by the harness for {}",
                 ag.name
+            );
+            if let Some(parent_id) = ag.parent_id.as_ref() {
+                let parent = store.agent(parent_id).unwrap();
+                assert!(prompt.contains(&format!("Direct parent: `agent:{}`", parent.name)));
+            }
+            let assembled = anyagents_harness_sylphx::assemble_system_prompt(
+                &cfg,
+                Path::new(ag.workdir.as_deref().unwrap()),
+            );
+            assert_eq!(
+                assembled.matches("# SylphxAI Shared Constitution").count(),
+                1
             );
             let toml = std::fs::read_to_string(cfg.join("config.toml")).unwrap();
             assert!(toml.contains("project_doc_max_bytes = 131072"));
@@ -10418,7 +10319,88 @@ git -c safe.directory="$5" -C "$5" status --porcelain
     }
 
     #[test]
-    fn create_and_gemini_rules_deduplicate_and_stay_under_agy_24kb_limit() {
+    fn shared_agents_md_reaches_native_aliases_and_sylphx_assembly_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let store = Store::open(data.join("state.db")).unwrap();
+        let shared_path = data.join("AGENTS.md");
+        let work = data.join("workspace");
+        std::fs::create_dir_all(work.join(".git")).unwrap();
+        std::fs::write(
+            work.join("AGENTS.md"),
+            "# Repository rules\nLOCAL_ONLY_RULE\n",
+        )
+        .unwrap();
+        let shared = "# SylphxAI/owner\nCOMPANY_ONLY_RULE 繁體\n";
+
+        for harness in ["agy", "claude-code", "codex", "sylphx"] {
+            std::fs::write(&shared_path, shared).unwrap();
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(harness, harness))
+                .unwrap();
+            let config = agent_config_dir(data, &agent.id);
+            std::fs::create_dir_all(&config).unwrap();
+            write_agent_instructions_with_continuity(&config, &agent, None, None);
+
+            let compact = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+            assert!(!compact.contains("COMPANY_ONLY_RULE"), "{harness}");
+            assert!(!compact.contains("## 4. Shared Instructions (AGENTS.md)"));
+            for path in [
+                "AGENTS.md",
+                "CLAUDE.md",
+                ".claude/CLAUDE.md",
+                ".gemini/config/GEMINI.md",
+            ] {
+                let native = std::fs::read_to_string(config.join(path)).unwrap();
+                assert!(native.starts_with(&compact), "{harness}: {path}");
+                assert!(native.contains(shared.trim()), "{harness}: {path}");
+                assert_eq!(
+                    native.matches("COMPANY_ONLY_RULE").count(),
+                    1,
+                    "{harness}: {path}"
+                );
+                assert_eq!(
+                    native
+                        .matches("## 4. Shared Instructions (AGENTS.md)")
+                        .count(),
+                    1,
+                    "{harness}: {path}"
+                );
+            }
+            assert!(!config.join(".gemini/config/AGENTS.md").exists());
+            assert!(!config.join(".gemini/config/rules/AGENTS.md").exists());
+
+            // Sylphx's native-gateway and cloud paths share this real assembler.
+            // It must read current shared rules, not also load the native alias.
+            let assembled = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
+            assert_eq!(
+                assembled.matches("COMPANY_ONLY_RULE").count(),
+                1,
+                "{harness}"
+            );
+            assert_eq!(assembled.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
+            assert_eq!(assembled.matches("# AnyAgents Identity").count(), 1);
+            std::fs::write(&shared_path, "# SylphxAI/owner\nUPDATED_COMPANY_RULE\n").unwrap();
+            let updated = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
+            assert_eq!(updated.matches("UPDATED_COMPANY_RULE").count(), 1);
+            assert!(!updated.contains("COMPANY_ONLY_RULE"));
+
+            // If the global mount is unavailable, recover the shared layer
+            // from config/AGENTS.md without copying the identity layer twice.
+            std::fs::remove_file(&shared_path).unwrap();
+            let fallback = anyagents_harness_sylphx::assemble_system_prompt(&config, &work);
+            assert_eq!(
+                fallback.matches("COMPANY_ONLY_RULE").count(),
+                1,
+                "{harness}"
+            );
+            assert_eq!(fallback.matches("LOCAL_ONLY_RULE").count(), 1, "{harness}");
+            assert_eq!(fallback.matches("# AnyAgents Identity").count(), 1);
+        }
+    }
+
+    #[test]
+    fn create_compact_prompt_removes_legacy_gemini_rules_and_bounds_continuity() {
         let dir = tempfile::TempDir::new().unwrap();
         let data = dir.path();
         let store = Store::open(data.join("state.db")).unwrap();
@@ -10460,17 +10442,56 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         );
 
         let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+        let base_prompt = std::fs::read_to_string(cfg.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(base_prompt.len() < 3_500, "{} bytes", base_prompt.len());
+        assert!(!base_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(!base_prompt.contains(&shared_constitution));
+        assert!(!base_prompt.contains("Cross-Harness Session Continuity"));
+        assert!(!base_prompt.contains("\n<learned_memory>\n"));
+        assert!(
+            base_prompt.contains("Host File Operating Instructions (fixed; not learned memory)")
+        );
+        assert!(base_prompt.contains("## 3. Hierarchy, Topology & Communication Rules"));
+        assert!(!base_prompt.contains("Runtime Awareness & the 6 Canonical MCP Tools"));
+        assert!(!base_prompt.contains("## 2.1"));
+
+        let gemini_md = cfg.join(".gemini/config/GEMINI.md");
+        let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
+        let gemini_rules_agents = cfg.join(".gemini/config/rules/AGENTS.md");
+        let base_native_prompt = std::fs::read_to_string(&gemini_md).unwrap();
+        assert!(base_native_prompt.starts_with(&base_prompt));
+        assert!(base_native_prompt.contains(shared_constitution.trim()));
+        assert_eq!(base_native_prompt.matches("# SylphxAI/owner").count(), 1);
+        assert!(!gemini_agents.exists());
+        assert!(!gemini_rules_agents.exists());
+
+        // Refresh cleans up old copies without disturbing unrelated rules.
+        std::fs::create_dir_all(gemini_rules_agents.parent().unwrap()).unwrap();
+        std::fs::write(&gemini_agents, &base_prompt).unwrap();
+        std::fs::write(&gemini_rules_agents, &base_prompt).unwrap();
+        let other_rule = cfg.join(".gemini/config/rules/custom.md");
+        std::fs::write(&other_rule, "Keep this caller-owned rule.\n").unwrap();
+        write_agent_instructions_with_continuity(&cfg, &agent, None, None);
+        assert!(!gemini_agents.exists());
+        assert!(!gemini_rules_agents.exists());
+        assert_eq!(
+            std::fs::read_to_string(&gemini_md).unwrap(),
+            base_native_prompt
+        );
         std::fs::write(cfg.join("sylphx-cloud-session.json"), "{}").unwrap();
 
-        let gemini_rules_dir = cfg.join(".gemini/config/rules");
-        std::fs::create_dir_all(&gemini_rules_dir).unwrap();
-        let gemini_rules_agents = gemini_rules_dir.join("AGENTS.md");
-        std::fs::write(&gemini_rules_agents, "stale duplicate rule").unwrap();
+        // The previous symlink deduplication did not work: agy identifies the
+        // global rule as user_global and scanned rules by file path.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("GEMINI.md", &gemini_agents).unwrap();
+            std::os::unix::fs::symlink("../GEMINI.md", &gemini_rules_agents).unwrap();
+        }
 
         let huge_continuity = format!(
             "## 4. Cross-Harness Session Continuity (`claude-code` -> `agy`)\n\n{}",
-            "- `[OUT (already sent/completed)]` `msg_1`: Completed verification step.\n"
-                .repeat(150)
+            "- `[OUT (already sent/completed)]` `msg_1`: Completed verification 繁體.\n"
+                .repeat(1500)
         );
         write_agent_instructions_with_continuity(&cfg, &agent, None, Some(&huge_continuity));
 
@@ -10478,8 +10499,11 @@ git -c safe.directory="$5" -C "$5" status --porcelain
         assert!(sys_prompt.contains("- **Agent Name**: `hermes`"));
         assert!(sys_prompt.contains("- **Role Label**: `Growth Mind`"));
         assert!(sys_prompt.contains("Public Layer 1 charter for Hermes."));
-        assert!(sys_prompt.contains("<role_instructions>\nPrivate Layer 2 execution SOP for Hermes.\n</role_instructions>"));
-        assert!(sys_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(sys_prompt.contains("Private Layer 2 execution SOP for Hermes."));
+        assert!(!sys_prompt.contains("## 4. Shared Instructions (AGENTS.md)"));
+        assert!(!sys_prompt.contains(&shared_constitution));
+        assert!(sys_prompt.starts_with(&base_prompt));
+        assert!(sys_prompt.len() < base_prompt.len() + huge_continuity.len());
         assert!(sys_prompt.contains("## 4. Cross-Harness Session Continuity"));
         assert!(
             sys_prompt.len() < 24_000,
@@ -10491,19 +10515,39 @@ git -c safe.directory="$5" -C "$5" status --porcelain
             "stale\n"
         );
 
-        let gemini_md = cfg.join(".gemini/config/GEMINI.md");
-        let gemini_agents = cfg.join(".gemini/config/AGENTS.md");
-        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), sys_prompt);
-        assert_eq!(std::fs::read_to_string(&gemini_agents).unwrap(), sys_prompt);
+        let native_prompt = std::fs::read_to_string(&gemini_md).unwrap();
+        assert!(native_prompt.starts_with(&base_native_prompt));
+        assert!(native_prompt.contains(shared_constitution.trim()));
+        assert_eq!(native_prompt.matches("# SylphxAI/owner").count(), 1);
+        assert!(native_prompt.contains("## 4. Cross-Harness Session Continuity"));
         assert!(
-            !gemini_rules_agents.exists(),
-            "rules/AGENTS.md must be removed so agy does not load GEMINI.md twice"
+            native_prompt.len() < 24_000,
+            "{} bytes",
+            native_prompt.len()
+        );
+        let assembled = anyagents_harness_sylphx::assemble_system_prompt(
+            &cfg,
+            Path::new(agent.workdir.as_deref().unwrap()),
+        );
+        assert_eq!(assembled.matches("# SylphxAI/owner").count(), 1);
+        assert!(!gemini_agents.exists());
+        assert!(!gemini_rules_agents.exists());
+        // exists() alone also accepts dangling symlinks; neither alias may remain.
+        assert!(std::fs::symlink_metadata(&gemini_agents).is_err());
+        assert!(std::fs::symlink_metadata(&gemini_rules_agents).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&other_rule).unwrap(),
+            "Keep this caller-owned rule.\n"
         );
         #[cfg(unix)]
         {
-            let canon_base = std::fs::canonicalize(&gemini_md).unwrap();
-            assert_eq!(std::fs::canonicalize(&gemini_agents).unwrap(), canon_base);
+            std::os::unix::fs::symlink("missing.md", &gemini_agents).unwrap();
+            std::os::unix::fs::symlink("missing.md", &gemini_rules_agents).unwrap();
         }
+        write_agent_instructions_with_continuity(&cfg, &agent, None, Some(&huge_continuity));
+        assert!(std::fs::symlink_metadata(&gemini_agents).is_err());
+        assert!(std::fs::symlink_metadata(&gemini_rules_agents).is_err());
+        assert_eq!(std::fs::read_to_string(&gemini_md).unwrap(), native_prompt);
     }
 }
 
