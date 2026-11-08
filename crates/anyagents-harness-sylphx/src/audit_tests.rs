@@ -449,37 +449,48 @@ fn cloud_interrupt_requires_http_ack_and_settled_readback() {
 }
 
 #[test]
-fn cloud_tool_outbox_retains_failed_submission_and_reconciles_without_execution() {
+fn legacy_cloud_tool_receipts_require_reconciliation_without_submission_or_execution() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tmp.path();
     save_persisted_cloud_session(cfg, &binding()).unwrap();
     let path = cfg.join("sylphx-cloud-tool-receipt.json");
-    let receipt = json!({"session_path":cloud_session_resource_path(&binding().env_slug,&binding().session_id),"call_id":"call-a","event_sequence":3,"state":"completed","output":"effect already completed","error":false});
-    std::fs::write(&path, receipt.to_string()).unwrap();
-    let (base, server) = serve(vec![(503, json!({}))]);
-    assert!(flush_cloud_tool_receipt(cfg, &base, "fixture-key").is_err());
-    server.join().unwrap();
-    assert_eq!(read_json(&path).unwrap().unwrap(), receipt);
-    assert_eq!(
-        load_persisted_cloud_session(cfg).unwrap().unwrap().last_seq,
-        2
-    );
-    let (base, server) = serve(vec![(200, json!({}))]);
-    flush_cloud_tool_receipt(cfg, &base, "fixture-key").unwrap();
-    let reqs = server.join().unwrap();
-    assert!(reqs[0].contains("effect already completed"));
-    assert!(!path.exists());
-    assert_eq!(
-        load_persisted_cloud_session(cfg).unwrap().unwrap().last_seq,
-        3
-    );
-    std::fs::write(&path, json!({"state":"executing"}).to_string()).unwrap();
-    assert!(
-        flush_cloud_tool_receipt(cfg, "http://127.0.0.1:1", "fixture-key")
-            .unwrap_err()
-            .contains("unresolved")
-    );
-    assert!(path.exists());
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let env = vec![
+        (
+            "SYLPHX_API_URL".into(),
+            format!("http://{}", listener.local_addr().unwrap()),
+        ),
+        ("SYLPHX_API_KEY".into(), "fixture-key".into()),
+    ]
+    .into();
+    for state in ["executing", "completed"] {
+        let receipt = json!({"session_path":cloud_session_resource_path(&binding().env_slug,&binding().session_id),"call_id":"call-a","event_sequence":3,"state":state,"output":"effect already completed","error":false});
+        std::fs::write(&path, receipt.to_string()).unwrap();
+        let error = run_cloud_session_turn(
+            &Arc::new(Mutex::new(SharedState::default())),
+            &Arc::new(AtomicBool::new(false)),
+            cfg,
+            cfg,
+            Some("example/model"),
+            &env,
+            Path::new("unused-mcp"),
+            &[],
+            &binding().env_slug,
+            "continue in the cloud",
+        )
+        .unwrap_err();
+        assert!(error.contains("operator reconciliation"), "{error}");
+        assert_eq!(read_json(&path).unwrap().unwrap(), receipt);
+        assert_eq!(
+            load_persisted_cloud_session(cfg).unwrap().unwrap().last_seq,
+            2
+        );
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }
 
 #[test]
@@ -872,7 +883,7 @@ fn teleport_requires_durable_instruction_revision_and_retains_created_binding_on
 }
 
 #[test]
-fn transcript_validation_recovers_crash_spliced_lines_and_local_switch_clears_receipt() {
+fn transcript_validation_recovers_crash_spliced_lines_and_mcp_omits_server_only_env() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = tmp.path();
     let tr = cfg.join("sylphx-transcript.jsonl");
@@ -886,54 +897,10 @@ fn transcript_validation_recovers_crash_spliced_lines_and_local_switch_clears_re
     assert!(repaired.contains("anyagents-message:recovery_msg_1"));
     assert!(!repaired.contains("truncated"));
 
-    let rcpt = cfg.join("sylphx-cloud-tool-receipt.json");
-    std::fs::write(
-        &rcpt,
-        json!({
-            "session_path": "orgs/a/projects/b/envs/c/agent_sessions/s1",
-            "call_id": "call-local",
-            "event_sequence": 2,
-            "state": "completed",
-            "output": "{\n  \"status\": \"ok\",\n  \"placement\": \"local\",\n  \"note\": \"Switched workspace execution to host-local Sylphx harness\"\n}",
-            "error": false
-        })
-        .to_string(),
-    )
-    .unwrap();
-    flush_cloud_tool_receipt(cfg, "http://127.0.0.1:1", "fixture-key").unwrap();
-    assert!(!rcpt.exists());
-
     assert!(auth::is_transient_gateway_failure(
         503,
         r#"{"error":{"type":"service_unavailable","code":"service_unavailable","message":"Durable spend authorization is unavailable."},"retryable":false}"#,
     ));
-
-    // When `:submitToolResult` returns HTTP 400 because the remote turn already settled
-    // (`state: "idle"`), `flush_cloud_tool_receipt` reconciles `last_seq` and clears the receipt.
-    save_persisted_cloud_session(cfg, &binding()).unwrap();
-    let settled_rcpt = json!({
-        "session_path": cloud_session_resource_path(&binding().env_slug, &binding().session_id),
-        "call_id": "call-settled",
-        "event_sequence": 9,
-        "state": "completed",
-        "output": "ok",
-        "error": false
-    });
-    std::fs::write(&rcpt, settled_rcpt.to_string()).unwrap();
-    let (base, server) = serve(vec![
-        (
-            400,
-            json!({"error":{"message":"The turn ended before the client result was accepted."}}),
-        ),
-        (200, json!({"state":"idle","last_event_sequence":9})),
-    ]);
-    flush_cloud_tool_receipt(cfg, &base, "fixture-key").unwrap();
-    server.join().unwrap();
-    assert!(!rcpt.exists());
-    assert_eq!(
-        load_persisted_cloud_session(cfg).unwrap().unwrap().last_seq,
-        9
-    );
 
     // `call_anyagents_mcp_tool` strips `SERVER_ONLY_ENV` (`ANYAGENTS_SEAT_PEERS` > 128 KiB
     // Linux `MAX_ARG_STRLEN`) so spawning the MCP child never fails with `E2BIG`.
