@@ -3451,11 +3451,37 @@ fn write_profile_key_file(dir: &Path, filename: &str, key: &str) -> Result<(), E
     write_required_file(&key_path, format!("{key}\n").as_bytes(), 0o600)
 }
 
+/// How a credential write relates to the processes already running on it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CredentialChange {
+    /// New credentials: running processes move to them at their next boundary.
+    Replaced,
+    /// The same account renewed its token. The harness renews tokens by itself,
+    /// so this only refreshes files for future launches.
+    Renewed,
+}
+
 pub(crate) fn propagate_profile_files_to_bound_agents(
     data: &Path,
     provider: &str,
     profile: &str,
     rel_paths: &[&str],
+) -> Result<(), Error> {
+    propagate_credentials(
+        data,
+        provider,
+        profile,
+        rel_paths,
+        CredentialChange::Replaced,
+    )
+}
+
+fn propagate_credentials(
+    data: &Path,
+    provider: &str,
+    profile: &str,
+    rel_paths: &[&str],
+    change: CredentialChange,
 ) -> Result<(), Error> {
     let prof_dir = data.join("profiles").join(provider).join(profile);
     let target_tag = format!("{provider}/{profile}");
@@ -3536,28 +3562,29 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        let now_prop = anyagents_core::now_ms();
-        let _ = write_profile_marker(
-            &cfg,
-            ".anyagents-quota-cleared-ms",
-            &format!("{now_prop}\n"),
-        );
-        let has_open = store_opt
-            .as_ref()
-            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
-        if !has_open {
+        if change == CredentialChange::Replaced {
+            let now_prop = anyagents_core::now_ms();
+            let _ = write_profile_marker(
+                &cfg,
+                ".anyagents-quota-cleared-ms",
+                &format!("{now_prop}\n"),
+            );
+            // A profile change holds no mail and never preempts a live turn:
+            // the supervisor moves the process at its next idle or faulted point.
             write_profile_marker(
                 &cfg,
                 ".anyagents-profile-rotated-ms",
                 &format!("{now_prop}\n"),
             )?;
+            let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         }
-        let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
                 crate::sandbox::share_config_with_seat_uid(&cfg, uid, gid);
             }
-            poke_agent_wake_socket(data, &agent_rec.id);
+            if change == CredentialChange::Replaced {
+                poke_agent_wake_socket(data, &agent_rec.id);
+            }
         }
     }
     Ok(())
@@ -5962,7 +5989,12 @@ pub(crate) fn sync_fresher_bound_agent_credentials(data: &Path) {
                 }
             }
             if updated_any {
-                propagate_profile_files_to_bound_agents(data, &provider, &prof_name, rels)
+                let change = if provider == "google-antigravity" {
+                    CredentialChange::Renewed
+                } else {
+                    CredentialChange::Replaced
+                };
+                propagate_credentials(data, &provider, &prof_name, rels, change)
                     .unwrap_or_else(|err| eprintln!("runtime persistence failed: {err}"));
             } else if provider == "anthropic" {
                 sync_anthropic_agent_credentials_from_profile(
@@ -7170,11 +7202,12 @@ pub(crate) fn probe_one_profile_usage(
                                 eprintln!("credential refresh persistence failed: {err}")
                             })
                             .ok()?;
-                        propagate_profile_files_to_bound_agents(
+                        propagate_credentials(
                             data,
                             provider,
                             profile,
                             &[tok_rel],
+                            CredentialChange::Renewed,
                         )
                         .map_err(|err| eprintln!("runtime persistence failed: {err}"))
                         .ok()?;
@@ -13139,6 +13172,43 @@ mod runtime_config_tests {
             .unwrap();
         assert_eq!(seeded_profile_name(&cfg).as_deref(), Some("openai/target"));
         assert!(prof.join("auth.json").is_file());
+    }
+
+    #[test]
+    fn a_renewed_token_refreshes_files_without_rotating_the_running_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("sample", "agy"))
+            .unwrap();
+        let cfg = agent_config_dir(dir.path(), &agent.id);
+        let rel = ".gemini/antigravity-cli/antigravity-oauth-token";
+        std::fs::create_dir_all(cfg.join(".gemini/antigravity-cli")).unwrap();
+        write_profile_marker(&cfg, ".anyagents-profile", "google-antigravity/target\n").unwrap();
+        std::fs::write(cfg.join(".anyagents-last-error.json"), b"{}").unwrap();
+        let prof = dir.path().join("profiles/google-antigravity/target");
+        std::fs::create_dir_all(prof.join(".gemini/antigravity-cli")).unwrap();
+        std::fs::write(prof.join(rel), b"renewed-token").unwrap();
+
+        propagate_credentials(
+            dir.path(),
+            "google-antigravity",
+            "target",
+            &[rel],
+            CredentialChange::Renewed,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read(cfg.join(rel)).unwrap(), b"renewed-token");
+        assert!(!cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(cfg.join(".anyagents-last-error.json").exists());
+
+        propagate_profile_files_to_bound_agents(dir.path(), "google-antigravity", "target", &[rel])
+            .unwrap();
+        assert!(cfg.join(".anyagents-profile-rotated-ms").exists());
+        assert!(!cfg.join(".anyagents-last-error.json").exists());
     }
 
     #[test]

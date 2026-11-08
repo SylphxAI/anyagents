@@ -994,7 +994,7 @@ impl Clock for ObservedClock {
 }
 
 #[test]
-fn profile_rotation_preserves_an_in_turn_child_past_the_drain_deadline() {
+fn profile_rotation_keeps_mail_flowing_and_preserves_an_in_turn_child() {
     use anyagents_harness::TurnState;
     use std::os::unix::fs::PermissionsExt;
 
@@ -1074,24 +1074,15 @@ done
         format!("{}\n", clock.now_ms() + 1),
     )
     .unwrap();
-    store.poke(Wake::Agent {
-        agent_id: agent.id.clone(),
-    });
-    loop {
-        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
-        if deadline == Some(now + 1_000) {
-            break;
-        }
-    }
+    let log_path = dir.path().join("vendor.log");
     store
-        .receive(&agent.id, Incoming::new("queued-for-new-profile"))
+        .receive(&agent.id, Incoming::new("steered-during-rotation"))
         .unwrap();
-    loop {
-        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
-        if deadline == Some(now + 1_000) {
-            break;
-        }
-    }
+    // The mail reaches the live child at once, with the clock still at the start.
+    assert!(wait_until(
+        || store.delivered_cursor(&agent.id).unwrap() > before_cursor
+    ));
+    assert_eq!(clock.now_ms(), 1_700_000_000_000);
     for elapsed in [15_001, 30_001] {
         let now = 1_700_000_000_000 + elapsed;
         clock.set_ms(now);
@@ -1116,53 +1107,50 @@ done
                 .unwrap()
                 .success()
         );
-        assert_eq!(store.delivered_cursor(&agent.id).unwrap(), before_cursor);
-        assert!(!log_contains(
-            &dir.path().join("vendor.log"),
-            "queued-for-new-profile"
-        ));
     }
+    // The same child works through the steered mail before it is replaced.
     std::fs::write(dir.path().join("finish-turn"), "done\n").unwrap();
-    assert!(wait_until(|| supervisor.live(&agent.id).is_some_and(
-        |live| live.process_alive
-            && live.turn_state == TurnState::InTurn
-            && live.pid.is_some()
-            && live.pid != Some(first_pid)
-    ) && log_contains(
-        &dir.path().join("vendor.log"),
-        "queued-for-new-profile"
+    assert!(wait_until(|| log_contains(
+        &log_path,
+        "steered-during-rotation"
     )));
-    assert!(store.delivered_cursor(&agent.id).unwrap() > before_cursor);
-    let log = std::fs::read_to_string(dir.path().join("vendor.log")).unwrap();
-    assert_eq!(
-        log.lines()
-            .filter(|line| line.contains("initial-long-turn"))
-            .count(),
-        1
-    );
-    assert_eq!(
-        log.lines()
-            .filter(|line| line.contains("queued-for-new-profile"))
-            .count(),
-        1
-    );
+    let log = std::fs::read_to_string(&log_path).unwrap();
     assert!(
         log.lines()
-            .find(|line| line.contains("queued-for-new-profile"))
+            .find(|line| line.contains("steered-during-rotation"))
             .unwrap()
-            .starts_with(&format!(
-                "{}:",
-                supervisor.live(&agent.id).unwrap().pid.unwrap()
-            ))
+            .starts_with(&format!("{first_pid}:"))
     );
-    // Finishing the queued turn is a separate controlled transition. The
-    // product may now legitimately release this idle child; it must first
-    // persist completion without replaying either accepted message.
-    std::fs::write(dir.path().join("finish-turn"), "finish-queued-turn\n").unwrap();
+    // When that work ends the child is idle and the rotation takes effect.
+    std::fs::write(dir.path().join("finish-turn"), "finish-steered-turn\n").unwrap();
     assert!(wait_until(|| store.open_turn(&agent.id).unwrap().is_none()
-        && store.agent(&agent.id).unwrap().state == "idle"));
-    let completed_log = std::fs::read_to_string(dir.path().join("vendor.log")).unwrap();
-    assert_eq!(completed_log, log);
+        && supervisor
+            .live(&agent.id)
+            .is_none_or(|live| live.pid != Some(first_pid))));
+    store
+        .receive(&agent.id, Incoming::new("after-the-boundary"))
+        .unwrap();
+    assert!(wait_until(|| log_contains(&log_path, "after-the-boundary")));
+    let log = std::fs::read_to_string(&log_path).unwrap();
+    assert!(
+        !log.lines()
+            .find(|line| line.contains("after-the-boundary"))
+            .unwrap()
+            .starts_with(&format!("{first_pid}:"))
+    );
+    for message in [
+        "initial-long-turn",
+        "steered-during-rotation",
+        "after-the-boundary",
+    ] {
+        assert_eq!(
+            log.lines().filter(|line| line.contains(message)).count(),
+            1,
+            "{message} must be delivered exactly once"
+        );
+    }
+    std::fs::write(dir.path().join("finish-turn"), "finish-last-turn\n").unwrap();
+    assert!(wait_until(|| store.open_turn(&agent.id).unwrap().is_none()));
     drop(supervisor);
 }
 
@@ -1215,15 +1203,11 @@ fn profile_rotation_cannot_replace_an_in_turn_harness_via_quota_recovery() {
         format!("{}\n", clock.now_ms() + 1),
     )
     .unwrap();
+    let reads = old.lock().unwrap().health_reads;
     store.poke(Wake::Agent {
         agent_id: agent.id.clone(),
     });
-    loop {
-        let (now, deadline) = rx.recv_timeout(WAIT_CEILING).unwrap();
-        if deadline == Some(now + 1_000) {
-            break;
-        }
-    }
+    assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
     clock.set_ms(clock.now_ms() + 30_001);
     loop {
         let (now, _) = rx.recv_timeout(WAIT_CEILING).unwrap();
@@ -1308,6 +1292,102 @@ impl anyagents_harness::Harness for SwitchHarness {
         probe.health_reads += 1;
         probe.health.clone()
     }
+}
+
+#[test]
+fn a_replacement_that_fails_to_launch_leaves_the_old_process_serving_mail() {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let dir = short_dir();
+    let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+    let mut spec = NewAgent::new("switch-target", "sylphx");
+    spec.model = Some("old-model".into());
+    let agent = store.create_agent(spec).unwrap();
+    let work = dir.path().join("work");
+    store
+        .set_agent_running(&agent.id, &work.display().to_string())
+        .unwrap();
+    let probes = Arc::new(Mutex::new(Vec::<Arc<Mutex<SwitchProbe>>>::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let launch_works = Arc::new(AtomicBool::new(true));
+    let launched_models = Arc::new(Mutex::new(Vec::new()));
+    let clock = ManualClock::new(1_700_000_000_000);
+    let supervisor = Supervisor::start(
+        Arc::clone(&store),
+        Arc::new(clock.clone()),
+        {
+            let probes = Arc::clone(&probes);
+            let attempts = Arc::clone(&attempts);
+            let launch_works = Arc::clone(&launch_works);
+            let launched_models = Arc::clone(&launched_models);
+            Arc::new(move |request: LaunchRequest| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                if !launch_works.load(Ordering::SeqCst) {
+                    return Err("launch refused".to_string());
+                }
+                launched_models.lock().unwrap().push(request.agent.model);
+                let probe = Arc::new(Mutex::new(SwitchProbe::default()));
+                probes.lock().unwrap().push(Arc::clone(&probe));
+                Ok(SwitchHarness { probe })
+            })
+        },
+        Vec::new(),
+    )
+    .unwrap();
+    assert!(wait_until(|| supervisor.live(&agent.id).is_some()));
+    let old = Arc::clone(&probes.lock().unwrap()[0]);
+    {
+        let mut probe = old.lock().unwrap();
+        probe.accept = true;
+        probe.health.turn_state = anyagents_harness::TurnState::InTurn;
+    }
+    launch_works.store(false, Ordering::SeqCst);
+    let poke_agent = || {
+        store.poke(Wake::Agent {
+            agent_id: agent.id.clone(),
+        })
+    };
+    let settle = || {
+        let reads = old.lock().unwrap().health_reads;
+        poke_agent();
+        assert!(wait_until(|| old.lock().unwrap().health_reads > reads + 1));
+    };
+    let start = clock.now_ms();
+    store.set_agent_model(&agent.id, "new-model").unwrap();
+    settle();
+    // The drain ends and the replacement fails to launch.
+    clock.set_ms(start + 15_001);
+    poke_agent();
+    assert!(wait_until(|| attempts.load(Ordering::SeqCst) == 2));
+    assert_eq!(
+        supervisor.live(&agent.id).unwrap().live_model.as_deref(),
+        Some("old-model"),
+        "status must name the model that is actually running"
+    );
+    store
+        .receive(&agent.id, Incoming::new("still reaches the old process"))
+        .unwrap();
+    store.poke(Wake::Mail {
+        agent_id: agent.id.clone(),
+    });
+    assert!(wait_until(|| old.lock().unwrap().given.len() == 1));
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        2,
+        "the retry waits out its backoff"
+    );
+    // After the backoff a fresh drain runs, and this launch succeeds.
+    launch_works.store(true, Ordering::SeqCst);
+    clock.set_ms(start + 20_002);
+    settle();
+    clock.set_ms(start + 35_003);
+    poke_agent();
+    assert!(wait_until(|| probes.lock().unwrap().len() == 2));
+    assert_eq!(
+        launched_models.lock().unwrap().last().unwrap().as_deref(),
+        Some("new-model")
+    );
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
