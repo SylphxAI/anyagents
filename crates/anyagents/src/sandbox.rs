@@ -231,14 +231,21 @@ pub fn seat_for_agent_with_hint(
         return admitted_principal(raw.to_str()?, agent_name);
     }
     let path = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")?;
-    let raw = principals::read_principal_registry(Path::new(&path).parent()?).ok()??;
-    admitted_principal(&raw, agent_name)
+    principals::read_admitted_principal(Path::new(&path).parent()?, agent_name)
+        .ok()
+        .flatten()
 }
 
 /// Operator-owned map keyed by immutable agent ID, never inferred from names or files.
 fn admitted_principal(raw: &str, agent_id: &str) -> Option<(String, u32, u32, u32)> {
     let values: serde_json::Value = serde_json::from_str(raw).ok()?;
     let entry = values.get(agent_id)?;
+    admitted_principal_entry(entry)
+}
+
+pub(super) fn admitted_principal_entry(
+    entry: &serde_json::Value,
+) -> Option<(String, u32, u32, u32)> {
     let number = |key| entry.get(key)?.as_u64().and_then(|n| u32::try_from(n).ok());
     let uid = number("uid")?;
     if uid == 0 || uid == current_uid() {
@@ -618,6 +625,28 @@ pub fn hydrate_operator_groups_if_needed() {
     }
 }
 
+fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let check_dir = |p: &Path| -> bool {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            m.is_dir() && !m.file_type().is_symlink() && m.gid() == gid && (m.mode() & 0o007) == 0
+        })
+    };
+    if !check_dir(config)
+        || !check_dir(&config.with_file_name("memory"))
+        || !check_dir(&config.with_file_name("skills"))
+    {
+        return false;
+    }
+    let cap = config.join("mcp-capability");
+    if let Ok(m) = std::fs::symlink_metadata(&cap)
+        && (m.gid() != gid || (m.mode() & 0o007) != 0)
+    {
+        return false;
+    }
+    true
+}
+
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
@@ -625,19 +654,19 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
     for agent in store.list_agents()? {
         if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent) {
             let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+            let root = config.parent().unwrap().to_owned();
+            if !root.exists() {
+                continue;
+            }
             // The immutable-ID grant, not historical ownership, authorizes this
             // projection. Reconcile created peers before another seat probes them.
-            if config.is_dir() && existing_config_seat(&config).is_none() {
+            if config.is_dir()
+                && existing_config_seat(&config).is_none()
+                && !is_peer_boundary_shared(&config, gid)
+            {
                 share_config_with_seat_uid(&config, uid, gid);
             }
-            peers.push(anyagents_harness::SeatPeer {
-                root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
-                    .parent()
-                    .unwrap()
-                    .to_owned(),
-                uid,
-                gid,
-            });
+            peers.push(anyagents_harness::SeatPeer { root, uid, gid });
         }
     }
     serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))

@@ -1,14 +1,24 @@
 //! Durable, immutable-ID principal grants, with a bounded legacy import.
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyagents_core::{Agent, AgentId, Error, Store};
 use serde_json::{Map, Value};
 
 const REGISTRY: &str = "execution-principals.json";
+
+type PrincipalTuple = (String, u32, u32, u32);
+type CachedRegistry = (u32, String, HashMap<String, PrincipalTuple>);
+
+fn registry_cache() -> &'static Mutex<Option<CachedRegistry>> {
+    static CACHE: OnceLock<Mutex<Option<CachedRegistry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
 
 /// Select the deployment's registry before runtime threads start. Child API
 /// clients need not read the operator file; only a launch resolves its grants.
@@ -23,7 +33,23 @@ pub(crate) fn load_principal_registry(data: &Path) -> Result<(), Error> {
     Ok(())
 }
 
+pub(super) fn read_admitted_principal(
+    data: &Path,
+    agent_id: &str,
+) -> Result<Option<PrincipalTuple>, Error> {
+    let Some((_, parsed)) = read_principal_registry_parsed(data)? else {
+        return Ok(None);
+    };
+    Ok(parsed.get(agent_id).cloned())
+}
+
 pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Error> {
+    Ok(read_principal_registry_parsed(data)?.map(|(raw, _)| raw))
+}
+
+fn read_principal_registry_parsed(
+    data: &Path,
+) -> Result<Option<(String, HashMap<String, PrincipalTuple>)>, Error> {
     let path = data.join(REGISTRY);
     let file = match OpenOptions::new()
         .read(true)
@@ -54,19 +80,37 @@ pub(super) fn read_principal_registry(data: &Path) -> Result<Option<String>, Err
             "execution principal registry exceeds 1 MiB".into(),
         ));
     }
+    let me = super::current_uid();
+    if let Ok(guard) = registry_cache().lock()
+        && let Some((cached_uid, cached_raw, cached_map)) = guard.as_ref()
+        && *cached_uid == me
+        && cached_raw == &raw
+    {
+        return Ok(Some((raw, cached_map.clone())));
+    }
     let value: Value = serde_json::from_str(&raw)
         .map_err(|_| Error::Message("invalid execution principal registry JSON".into()))?;
     let entries = value
         .as_object()
         .ok_or_else(|| Error::Message("execution principal registry must be an object".into()))?;
-    for id in entries.keys() {
-        if AgentId::parse(id).is_err() || super::admitted_principal(&raw, id).is_none() {
+    let mut parsed = HashMap::with_capacity(entries.len());
+    for (id, entry) in entries {
+        let Some(principal) = super::admitted_principal_entry(entry) else {
+            return Err(Error::Message(
+                "execution principal registry contains an invalid identity or grant".into(),
+            ));
+        };
+        if AgentId::parse(id).is_err() {
             return Err(Error::Message(
                 "execution principal registry contains an invalid identity or grant".into(),
             ));
         }
+        parsed.insert(id.clone(), principal);
     }
-    Ok(Some(raw))
+    if let Ok(mut guard) = registry_cache().lock() {
+        *guard = Some((me, raw.clone(), parsed.clone()));
+    }
+    Ok(Some((raw, parsed)))
 }
 
 fn trusted_file(file: &File) -> Result<(), Error> {

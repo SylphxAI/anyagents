@@ -184,13 +184,21 @@ fn create_with_seat(
         } else {
             request.workdir.clone()
         };
+        if agent.harness == "sylphx" {
+            seed_harness_credentials(store, &data, &agent, &config)?;
+        }
         let is_cloud_agent_mode = wd_is_cloud_keyword
             || pairs
                 .iter()
                 .any(|(k, v)| k == "SYLPHX_AGENT_ENV" && !v.trim().is_empty())
             || std::env::var("SYLPHX_AGENT_ENV")
                 .ok()
-                .is_some_and(|v| !v.trim().is_empty());
+                .is_some_and(|v| !v.trim().is_empty())
+            || (agent.harness == "sylphx"
+                && anyagents_harness_sylphx::resolve_cloud_agent_environment(&config, &pairs)
+                    .ok()
+                    .flatten()
+                    .is_some());
         if wd_is_cloud_keyword && !pairs.iter().any(|(k, _)| k == "SYLPHX_AGENT_ENV") {
             pairs.push(("SYLPHX_AGENT_ENV".to_string(), "default".to_string()));
         }
