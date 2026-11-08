@@ -25,7 +25,7 @@ fn main() {
         .into_iter()
         .chain(git(&["symbolic-ref", "-q", "HEAD"]))
     {
-        if let Some(path) = git(&["rev-parse", "--git-path", &name]) {
+        if let Some(path) = git(&["rev-parse", "--path-format=absolute", "--git-path", &name]) {
             let path = PathBuf::from(path);
             println!("cargo:rerun-if-changed={}", path.display());
         }

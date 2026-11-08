@@ -392,6 +392,22 @@ pub fn persist_last_error(config_dir: &Path, error: Option<&str>, quota_reset_at
 }
 
 pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
+    vendor_launch_authorized(request, None)
+}
+
+/// Reuse the daemon's admitted in-memory authority; reopening SQLite alone does
+/// not confer capability verification or minting authority.
+pub fn vendor_launch_with_store(
+    request: LaunchRequest,
+    store: &anyagents_core::Store,
+) -> Result<VendorHarness, String> {
+    vendor_launch_authorized(request, Some(store))
+}
+
+fn vendor_launch_authorized(
+    request: LaunchRequest,
+    store: Option<&anyagents_core::Store>,
+) -> Result<VendorHarness, String> {
     // The supervisor owns the agent process lock. Allocate the host generation
     // before any vendor can consume its instructions, never from a late marker.
     crate::host_memory::before_launch(&request.data_dir, &request.agent.id).map_err(|error| {
@@ -406,7 +422,7 @@ pub fn vendor_launch(request: LaunchRequest) -> Result<VendorHarness, String> {
     })?;
     prepare_host_session(&request)?;
     let config_dir = request.config_dir.clone();
-    let res = vendor_launch_inner(request);
+    let res = vendor_launch_inner(request, store);
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         match &res {
             Ok(vh) => {
@@ -538,7 +554,10 @@ fn read_opencode_exit_error(config_dir: &Path) -> Option<String> {
     None
 }
 
-fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> {
+fn vendor_launch_inner(
+    request: LaunchRequest,
+    authority: Option<&anyagents_core::Store>,
+) -> Result<VendorHarness, String> {
     crate::worktree_access::ensure_launchable(&request.data_dir, &request.agent.id)
         .map_err(|error| error.to_string())?;
     // Strip any untrusted launch or authority variables from caller/stored env.
@@ -623,9 +642,14 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
         "MUSE_CONFIG_HOME".to_string(),
         request.config_dir.display().to_string(),
     ));
-    let store_opt = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
+    let reopened;
+    let store_opt = if let Some(store) = authority {
+        Some(store)
+    } else {
+        reopened = anyagents_core::Store::open(request.data_dir.join("state.db")).ok();
+        reopened.as_ref()
+    };
     let seat_hint = store_opt
-        .as_ref()
         .and_then(|s| crate::create::resolve_root_seat_hint(s, &request.agent))
         .or_else(|| {
             env.iter()
@@ -633,7 +657,6 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
                 .map(|(_, v)| v.clone())
         });
     let resolved_seat = store_opt
-        .as_ref()
         .and_then(|s| crate::create::resolved_agent_seat_info(s, &request.agent))
         .or_else(|| crate::sandbox::existing_config_seat(&request.config_dir));
     let seat_spec = resolved_seat
@@ -663,7 +686,7 @@ fn vendor_launch_inner(request: LaunchRequest) -> Result<VendorHarness, String> 
     }
     if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none() {
         let _ = crate::install::record(&root, &request.agent.harness);
-        if let Some(ref store) = store_opt {
+        if let Some(store) = store_opt {
             crate::create::reconcile_agent_runtime_config(
                 store,
                 &request.data_dir,
@@ -1654,6 +1677,9 @@ rmdir -- "$1"
         directory(&data, 0o711, 0, 0);
         directory(&data.join("agents"), 0o711, 0, 0);
         let store = Store::open(data.join("state.db")).unwrap();
+        store
+            .hold_capability_key("test-capability-key-0123456789abcdef")
+            .unwrap();
         std::fs::set_permissions(
             data.join("state.db"),
             std::fs::Permissions::from_mode(0o600),
@@ -1681,7 +1707,7 @@ rmdir -- "$1"
         }
         file(
             &config.join("mcp-capability"),
-            "synthetic-capability\n",
+            &format!("{}\n", store.issue_capability(&agent.id).unwrap()),
             0o640,
             gid,
         );
@@ -1843,13 +1869,16 @@ cat >/dev/null
             std::env::set_var("ANYAGENTS_LAUNCHER", "/usr/bin/setpriv");
         }
         let launch = || {
-            vendor_launch(LaunchRequest {
-                agent: agent.clone(),
-                data_dir: data.clone(),
-                config_dir: config.clone(),
-                work_dir: root.join("work"),
-                extra_env: vec![],
-            })
+            vendor_launch_with_store(
+                LaunchRequest {
+                    agent: agent.clone(),
+                    data_dir: data.clone(),
+                    config_dir: config.clone(),
+                    work_dir: root.join("work"),
+                    extra_env: vec![],
+                },
+                &store,
+            )
         };
         assert_eq!(
             crate::install::program(&data, "claude-code"),
@@ -2097,13 +2126,16 @@ done
             crate::create::ensure_seat_skills(&config, &fixture);
             let mut codex = agent.clone();
             codex.harness = "codex".into();
-            let harness = vendor_launch(LaunchRequest {
-                agent: codex,
-                data_dir: data.clone(),
-                config_dir: config.clone(),
-                work_dir: root.join("work"),
-                extra_env: vec![],
-            })
+            let harness = vendor_launch_with_store(
+                LaunchRequest {
+                    agent: codex,
+                    data_dir: data.clone(),
+                    config_dir: config.clone(),
+                    work_dir: root.join("work"),
+                    extra_env: vec![],
+                },
+                &store,
+            )
             .unwrap();
             assert_eq!(
                 std::fs::read_to_string(config.join("codex-session-id"))

@@ -2116,7 +2116,7 @@ pub(crate) fn reconcile_agent_runtime_config(
             let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
             let req = format!(
                 "POST /v1/operator/agents/{}/capability HTTP/1.1\r\nHost: localhost\r\n{}: {op_tok}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}",
-                agent.name,
+                agent.id,
                 crate::operator::HEADER
             );
             stream.write_all(req.as_bytes())?;
@@ -2132,11 +2132,7 @@ pub(crate) fn reconcile_agent_runtime_config(
         }
     }
     let capability = std::fs::read_to_string(config.join("mcp-capability"))?;
-    if store.authenticate_capability(capability.trim())? != agent.id {
-        return Err(Error::Message(
-            "mailbox capability belongs to another agent".into(),
-        ));
-    }
+    crate::operator::verify_capability(store, &agent.id, capability.trim())?;
     if crate::sandbox::seats_configured() && resolved_agent_seat_info(store, agent).is_none() {
         return Err(Error::Message(format!(
             "no admitted execution principal for {}",

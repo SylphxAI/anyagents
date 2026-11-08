@@ -196,10 +196,11 @@ async fn serve(
     if auth.is_confined() {
         crate::sandbox::share_socket_with_seats(&path);
     }
+    let launch_store = Arc::clone(&store);
     let supervisor = Supervisor::<VendorHarness>::start(
         Arc::clone(&store),
         Arc::new(SystemClock::new()),
-        Arc::new(vendor::vendor_launch),
+        Arc::new(move |request| vendor::vendor_launch_with_store(request, &launch_store)),
         vendor::child_env(),
     )
     .map_err(Error::Message)?;
@@ -1654,10 +1655,8 @@ pub fn not_confined_note(data: &Path) {
 
 /// Mint an agent's capability after its instance was made (a create, a new
 /// sign-in), so its harness starts with one and the last one is retired.
-fn capability_mark(data_dir: &Path) -> impl Fn() -> Result<(), Error> + Send + Sync + 'static {
-    let data_dir = data_dir.to_path_buf();
+fn capability_mark(store: Arc<Store>) -> impl Fn() -> Result<(), Error> + Send + Sync + 'static {
     move || {
-        let store = Store::open(data_dir.join("state.db"))?;
         let agents = store.list_agents()?;
         for agent in &agents {
             crate::operator::mint(&store, &agent.id)?;
@@ -3324,7 +3323,7 @@ async fn sign_in_route(
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(16);
     let runner = Arc::clone(&state.sign_in);
     let root = state.store.data_dir().to_path_buf();
-    let mark = capability_mark(state.store.data_dir());
+    let mark = capability_mark(Arc::clone(&state.store));
     let spawned = tokio::task::spawn_blocking(move || {
         let mut sink = ChannelSink { tx };
         let mut guard = runner.lock().unwrap_or_else(|err| err.into_inner());

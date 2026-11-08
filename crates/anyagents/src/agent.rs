@@ -1717,7 +1717,7 @@ pub fn flush(data: &Path, name: &str) -> Result<(), anyagents_core::Error> {
             work_dir,
             extra_env: Vec::new(),
         };
-        let mut harness = match crate::vendor::vendor_launch(request) {
+        let mut harness = match crate::vendor::vendor_launch_with_store(request, &store) {
             Ok(harness) => harness,
             Err(reason) => {
                 println!("{}\tskipped\t{reason}", agent.name);

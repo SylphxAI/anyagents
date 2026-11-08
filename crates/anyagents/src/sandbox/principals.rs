@@ -139,7 +139,7 @@ fn update(data: &Path, agents: &[Agent], import_legacy: bool) -> Result<(), Erro
         import_legacy && old.is_none(),
         lookup_account,
     );
-    if !changed && !(import_legacy && old.is_none()) {
+    if !changed && (old.is_some() || grants.is_empty()) {
         return Ok(());
     }
     let temp = data.join(format!(
@@ -236,6 +236,25 @@ fn extend(
 mod tests {
     use super::*;
     use anyagents_core::NewAgent;
+
+    #[test]
+    fn empty_initial_census_does_not_select_managed_execution() {
+        let _env = crate::server::tests::env_lock();
+        let previous = std::env::var_os("ANYAGENTS_SOCKET_GID");
+        unsafe {
+            std::env::set_var("ANYAGENTS_SOCKET_GID", "42003");
+        }
+        let dir = crate::test_tempdir();
+        update(dir.path(), &[], true).unwrap();
+        assert!(!dir.path().join(REGISTRY).exists());
+        assert!(read_principal_registry(dir.path()).unwrap().is_none());
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_SOCKET_GID", value),
+                None => std::env::remove_var("ANYAGENTS_SOCKET_GID"),
+            }
+        }
+    }
 
     #[test]
     fn legacy_import_is_once_and_children_inherit_immutable_parent_grants() {

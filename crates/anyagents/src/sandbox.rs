@@ -148,10 +148,7 @@ pub fn seats_configured() -> bool {
     // single-UID execution or fall back to another principal source.
     if std::env::var_os("ANYAGENTS_PRINCIPALS").is_some()
         || std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY").is_some_and(|path| {
-            match std::fs::symlink_metadata(path) {
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-                _ => true,
-            }
+            !matches!(std::fs::symlink_metadata(path), Err(err) if err.kind() == std::io::ErrorKind::NotFound)
         })
     {
         return true;
