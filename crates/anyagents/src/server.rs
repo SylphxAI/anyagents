@@ -8000,7 +8000,7 @@ pub(crate) mod tests {
             assert!(store.inbox(&external.id, None).unwrap().is_empty());
             let active = store.list_schedules(Some(&external.id), true).unwrap();
             assert_eq!(active[0].id, watch.id);
-            assert_eq!(active[0].last_observed, None);
+            assert_eq!(active[0].last_observed, watch.last_observed);
             // All five admissions are proven before releasing the external response.
             local.abort();
             network.abort();
