@@ -31,7 +31,11 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
             .unwrap_or(fn_name.as_str());
         match norm {
             // Lifecycle and compaction transitions must run sequentially.
-            "archive" | "context_window_open" | "context_edit" | "apply_patch" | "sandbox"
+            "archive"
+            | "context_window_open"
+            | "context_edit"
+            | "apply_patch"
+            | "sandbox"
             | "code" => {
                 return false;
             }
@@ -45,16 +49,12 @@ pub(super) fn can_parallelize_tool_batch(calls: &[(String, String, Value)]) -> b
                 }
             }
             "files" => {
-                let is_mut = args
-                    .get("action")
-                    .and_then(Value::as_str)
-                    .is_some_and(|a| {
-                        matches!(
-                            a.trim().to_ascii_lowercase().as_str(),
-                            "write" | "create" | "edit" | "multi_edit" | "replace"
-                        )
-                    })
-                    || args.get("content").is_some()
+                let is_mut = args.get("action").and_then(Value::as_str).is_some_and(|a| {
+                    matches!(
+                        a.trim().to_ascii_lowercase().as_str(),
+                        "write" | "create" | "edit" | "multi_edit" | "replace"
+                    )
+                }) || args.get("content").is_some()
                     || args.get("target").is_some()
                     || args.get("edits").is_some();
                 if is_mut {

@@ -138,12 +138,7 @@ impl SearchEngine {
                     Self::Firecrawl,
                     Self::AnySearch,
                 ],
-                Some("answer") => vec![
-                    Self::Perplexity,
-                    Self::Tavily,
-                    Self::Parallel,
-                    Self::Exa,
-                ],
+                Some("answer") => vec![Self::Perplexity, Self::Tavily, Self::Parallel, Self::Exa],
                 _ => vec![
                     Self::Parallel,
                     Self::Exa,
@@ -396,16 +391,14 @@ pub fn engine_supports_search_policy(engine: SearchEngine, req: &WebRequest) -> 
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-    {
-        if country.len() != 2
+        && (country.len() != 2
             || !country.bytes().all(|b| b.is_ascii_alphabetic())
             || !matches!(
                 engine,
                 SearchEngine::Exa | SearchEngine::Perplexity | SearchEngine::Brave
-            )
-        {
-            return false;
-        }
+            ))
+    {
+        return false;
     }
     engine != SearchEngine::Auto
 }
@@ -426,7 +419,12 @@ pub fn execute_web_request(data_dir: Option<&Path>, req: WebRequest) -> Result<J
         .filter(|s| !s.is_empty())
         .map(str::to_ascii_lowercase)
         .unwrap_or_else(|| {
-            if req.url.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+            if req
+                .url
+                .as_deref()
+                .map(str::trim)
+                .is_some_and(|s| !s.is_empty())
+            {
                 "fetch".to_string()
             } else {
                 "search".to_string()
@@ -491,12 +489,16 @@ fn url_allowed_by_domain_policy(
         return false;
     }
     if !blocked_domains.is_empty()
-        && blocked_domains.iter().any(|d| host_matches_domain(&host, d))
+        && blocked_domains
+            .iter()
+            .any(|d| host_matches_domain(&host, d))
     {
         return false;
     }
     if !allowed_domains.is_empty()
-        && !allowed_domains.iter().any(|d| host_matches_domain(&host, d))
+        && !allowed_domains
+            .iter()
+            .any(|d| host_matches_domain(&host, d))
     {
         return false;
     }
@@ -507,16 +509,11 @@ fn parse_http_url_parts(raw: &str) -> Option<(String, String, u16)> {
     let trimmed = raw.trim();
     let (scheme, rest) = if let Some(r) = trimmed.strip_prefix("https://") {
         ("https".to_string(), r)
-    } else if let Some(r) = trimmed.strip_prefix("http://") {
-        ("http".to_string(), r)
     } else {
-        return None;
+        let r = trimmed.strip_prefix("http://")?;
+        ("http".to_string(), r)
     };
-    let authority = rest
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or("")
-        .trim();
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
     if authority.is_empty() || authority.contains('@') {
         return None;
     }
@@ -555,8 +552,9 @@ pub fn validate_fetch_url_ssrf(url_str: &str) -> Result<(), String> {
 }
 
 fn validate_fetch_url_inner(url_str: &str, resolve_dns: bool) -> Result<(), String> {
-    let (_, host, port) = parse_http_url_parts(url_str)
-        .ok_or_else(|| "URL must be a valid `http://` or `https://` URL without credentials".to_string())?;
+    let (_, host, port) = parse_http_url_parts(url_str).ok_or_else(|| {
+        "URL must be a valid `http://` or `https://` URL without credentials".to_string()
+    })?;
     let lower_host = host.trim_matches('.').to_ascii_lowercase();
     if lower_host.is_empty()
         || lower_host == "localhost"
@@ -565,7 +563,9 @@ fn validate_fetch_url_inner(url_str: &str, resolve_dns: bool) -> Result<(), Stri
         || lower_host.ends_with(".internal")
         || lower_host == "metadata.google.internal"
     {
-        return Err(format!("SSRF guard rejected local/internal host `{lower_host}`"));
+        return Err(format!(
+            "SSRF guard rejected local/internal host `{lower_host}`"
+        ));
     }
     if let Ok(ip) = lower_host.parse::<IpAddr>() {
         if is_non_global_ip(ip) {
@@ -664,18 +664,14 @@ fn execute_web_search(
             Ok(mut hits) => {
                 let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(0);
                 hits.retain(|h| {
-                    h.get("url")
-                        .and_then(JsonValue::as_str)
-                        .is_some_and(|u| {
-                            url_allowed_by_domain_policy(
-                                u,
-                                &req.allowed_domains,
-                                &req.blocked_domains,
-                            )
-                        })
+                    h.get("url").and_then(JsonValue::as_str).is_some_and(|u| {
+                        url_allowed_by_domain_policy(u, &req.allowed_domains, &req.blocked_domains)
+                    })
                 });
-                let max_res = req.max_results.unwrap_or(DEFAULT_SEARCH_MAX_RESULTS).clamp(1, 20)
-                    as usize;
+                let max_res = req
+                    .max_results
+                    .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
+                    .clamp(1, 20) as usize;
                 if hits.len() > max_res {
                     hits.truncate(max_res);
                 }
@@ -715,7 +711,10 @@ fn execute_web_search(
 }
 
 fn build_search_payload(engine: SearchEngine, query: &str, req: &WebRequest) -> JsonValue {
-    let max_results = req.max_results.unwrap_or(DEFAULT_SEARCH_MAX_RESULTS).clamp(1, 20);
+    let max_results = req
+        .max_results
+        .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
+        .clamp(1, 20);
     let per_result_cap = req
         .max_chars
         .unwrap_or_else(|| DEFAULT_SEARCH_BUDGET_CHARS / (max_results.max(1) as usize));
@@ -945,7 +944,10 @@ fn execute_single_search_engine(
     }
 
     let parsed = if engine == SearchEngine::Brave {
-        let count = req.max_results.unwrap_or(DEFAULT_SEARCH_MAX_RESULTS).clamp(1, 20);
+        let count = req
+            .max_results
+            .unwrap_or(DEFAULT_SEARCH_MAX_RESULTS)
+            .clamp(1, 20);
         let url = format!(
             "{endpoint}?q={}&count={count}&extra_snippets=true",
             urlencoding_query(query)
@@ -967,7 +969,10 @@ fn execute_single_search_engine(
     parse_search_hits(engine, &parsed)
 }
 
-fn parse_search_hits(engine: SearchEngine, data: &JsonValue) -> Result<Vec<JsonValue>, EngineError> {
+fn parse_search_hits(
+    engine: SearchEngine,
+    data: &JsonValue,
+) -> Result<Vec<JsonValue>, EngineError> {
     if data.get("success") == Some(&JsonValue::Bool(false))
         || data.get("error").is_some_and(|v| !v.is_null() && v != "")
         || data.pointer("/result/isError") == Some(&JsonValue::Bool(true))
@@ -1011,16 +1016,16 @@ fn parse_search_hits(engine: SearchEngine, data: &JsonValue) -> Result<Vec<JsonV
         SearchEngine::Exa => {
             if let Some(arr) = data.get("results").and_then(JsonValue::as_array) {
                 for item in arr {
-                    let highlights = item
-                        .get("highlights")
-                        .and_then(JsonValue::as_array)
-                        .map(|items| {
-                            items
-                                .iter()
-                                .filter_map(JsonValue::as_str)
-                                .collect::<Vec<_>>()
-                                .join("\n\n")
-                        });
+                    let highlights =
+                        item.get("highlights")
+                            .and_then(JsonValue::as_array)
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .filter_map(JsonValue::as_str)
+                                    .collect::<Vec<_>>()
+                                    .join("\n\n")
+                            });
                     let snippet = item
                         .get("text")
                         .and_then(JsonValue::as_str)
@@ -1148,7 +1153,8 @@ fn parse_anysearch_markdown_hits(text: &str) -> Vec<JsonValue> {
                  url: &mut Option<String>,
                  snippet: &mut Option<String>| {
         if let Some(u) = url.take() {
-            if let Some(h) = make_hit(Some(&u), title.take().as_deref(), snippet.take().as_deref()) {
+            if let Some(h) = make_hit(Some(&u), title.take().as_deref(), snippet.take().as_deref())
+            {
                 hits.push(h);
             }
         } else {
@@ -1628,7 +1634,11 @@ fn resolve_redirect_url(base_url: &str, location: &str) -> Result<String, String
     }
     let path_part = &rest[authority_end..];
     let dir_end = path_part.rfind('/').map(|i| i + 1).unwrap_or(0);
-    let base_dir = if dir_end == 0 { "/" } else { &path_part[..dir_end] };
+    let base_dir = if dir_end == 0 {
+        "/"
+    } else {
+        &path_part[..dir_end]
+    };
     Ok(format!("{scheme}://{authority}{base_dir}{loc}"))
 }
 
@@ -1697,11 +1707,12 @@ fn execute_direct_http_fetch(
                     message: format!("HTTP {status} redirect missing Location header"),
                     retriable: false,
                 })?;
-            current_url = resolve_redirect_url(&current_url, location).map_err(|e| EngineError {
-                status: Some(status),
-                message: e,
-                retriable: false,
-            })?;
+            current_url =
+                resolve_redirect_url(&current_url, location).map_err(|e| EngineError {
+                    status: Some(status),
+                    message: e,
+                    retriable: false,
+                })?;
             continue;
         }
 
@@ -1737,7 +1748,12 @@ fn execute_direct_http_fetch(
 
 pub fn html_to_clean_markdown(raw: &str) -> (Option<String>, String) {
     let trimmed = raw.trim();
-    if !trimmed.contains('<') || (!trimmed.to_ascii_lowercase().contains("<html") && !trimmed.to_ascii_lowercase().contains("<body") && !trimmed.to_ascii_lowercase().contains("<p") && !trimmed.to_ascii_lowercase().contains("<div")) {
+    if !trimmed.contains('<')
+        || (!trimmed.to_ascii_lowercase().contains("<html")
+            && !trimmed.to_ascii_lowercase().contains("<body")
+            && !trimmed.to_ascii_lowercase().contains("<p")
+            && !trimmed.to_ascii_lowercase().contains("<div"))
+    {
         return (None, trimmed.to_string());
     }
 
@@ -1957,11 +1973,26 @@ mod tests {
             external_web_access: Some(false),
             ..Default::default()
         };
-        assert!(engine_supports_search_policy(SearchEngine::Exa, &cache_only_req));
-        assert!(!engine_supports_search_policy(SearchEngine::Parallel, &cache_only_req));
-        assert!(engine_supports_fetch_policy(FetchEngine::Exa, &cache_only_req));
-        assert!(engine_supports_fetch_policy(FetchEngine::Firecrawl, &cache_only_req));
-        assert!(!engine_supports_fetch_policy(FetchEngine::Direct, &cache_only_req));
+        assert!(engine_supports_search_policy(
+            SearchEngine::Exa,
+            &cache_only_req
+        ));
+        assert!(!engine_supports_search_policy(
+            SearchEngine::Parallel,
+            &cache_only_req
+        ));
+        assert!(engine_supports_fetch_policy(
+            FetchEngine::Exa,
+            &cache_only_req
+        ));
+        assert!(engine_supports_fetch_policy(
+            FetchEngine::Firecrawl,
+            &cache_only_req
+        ));
+        assert!(!engine_supports_fetch_policy(
+            FetchEngine::Direct,
+            &cache_only_req
+        ));
 
         let mixed_domains_req = WebRequest {
             query: Some("tokio".into()),
@@ -1969,10 +2000,22 @@ mod tests {
             blocked_domains: vec!["docs.rs".into()],
             ..Default::default()
         };
-        assert!(engine_supports_search_policy(SearchEngine::Exa, &mixed_domains_req));
-        assert!(engine_supports_search_policy(SearchEngine::Tavily, &mixed_domains_req));
-        assert!(!engine_supports_search_policy(SearchEngine::Parallel, &mixed_domains_req));
-        assert!(!engine_supports_search_policy(SearchEngine::Perplexity, &mixed_domains_req));
+        assert!(engine_supports_search_policy(
+            SearchEngine::Exa,
+            &mixed_domains_req
+        ));
+        assert!(engine_supports_search_policy(
+            SearchEngine::Tavily,
+            &mixed_domains_req
+        ));
+        assert!(!engine_supports_search_policy(
+            SearchEngine::Parallel,
+            &mixed_domains_req
+        ));
+        assert!(!engine_supports_search_policy(
+            SearchEngine::Perplexity,
+            &mixed_domains_req
+        ));
     }
 
     #[test]

@@ -33,11 +33,8 @@ fn base64_encode(data: &[u8]) -> String {
 }
 
 fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
-    let filtered: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace())
-        .collect();
-    if filtered.len() % 4 != 0 {
+    let filtered: Vec<u8> = input.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    if !filtered.len().is_multiple_of(4) {
         return Err("invalid base64 length".to_string());
     }
     let mut out = Vec::with_capacity((filtered.len() / 4) * 3);
@@ -54,8 +51,16 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, String> {
     for chunk in filtered.chunks(4) {
         let v0 = decode_val(chunk[0])?;
         let v1 = decode_val(chunk[1])?;
-        let v2 = if chunk[2] == b'=' { 0 } else { decode_val(chunk[2])? };
-        let v3 = if chunk[3] == b'=' { 0 } else { decode_val(chunk[3])? };
+        let v2 = if chunk[2] == b'=' {
+            0
+        } else {
+            decode_val(chunk[2])?
+        };
+        let v3 = if chunk[3] == b'=' {
+            0
+        } else {
+            decode_val(chunk[3])?
+        };
         let triple = (v0 << 18) | (v1 << 12) | (v2 << 6) | v3;
         out.push(((triple >> 16) & 0xff) as u8);
         if chunk[2] != b'=' {
@@ -518,20 +523,15 @@ pub fn resolve_snapshot_ref(
 }
 
 /// Mouse button identifier across Anthropic/OpenAI computer-use schemas.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MouseButton {
+    #[default]
     Left,
     Right,
     Middle,
     Back,
     Forward,
-}
-
-impl Default for MouseButton {
-    fn default() -> Self {
-        Self::Left
-    }
 }
 
 impl MouseButton {
@@ -660,10 +660,9 @@ impl ComputerAction {
     /// Normalize Anthropic `computer_20250124` / `computer_20251124` tool input JSON
     /// into a `ComputerAction`.
     pub fn from_anthropic(input: &Value) -> Result<Self, String> {
-        let action = input
-            .get("action")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "missing `action` string in Anthropic computer tool input".to_string())?;
+        let action = input.get("action").and_then(Value::as_str).ok_or_else(|| {
+            "missing `action` string in Anthropic computer tool input".to_string()
+        })?;
 
         let parse_coord = |field: &str| -> Result<Point, String> {
             let arr = input
@@ -1333,7 +1332,13 @@ async fn list_local_windows(envs: &[(&str, &str)]) -> Result<Vec<Value>, String>
     }
 
     // 2. Fallback to `xdotool search --onlyvisible --name ""`
-    if let Ok(out) = run_cmd("xdotool", &["search", "--onlyvisible", "--name", ""], envs, 5_000).await
+    if let Ok(out) = run_cmd(
+        "xdotool",
+        &["search", "--onlyvisible", "--name", ""],
+        envs,
+        5_000,
+    )
+    .await
         && out.status.success()
     {
         let ids: Vec<String> = String::from_utf8_lossy(&out.stdout)
@@ -1350,11 +1355,16 @@ async fn list_local_windows(envs: &[(&str, &str)]) -> Result<Vec<Value>, String>
                 .ok()
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .unwrap_or_default();
-            let geom = run_cmd("xdotool", &["getwindowgeometry", "--shell", &wid], envs, 2_000)
-                .await
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_default();
+            let geom = run_cmd(
+                "xdotool",
+                &["getwindowgeometry", "--shell", &wid],
+                envs,
+                2_000,
+            )
+            .await
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
             let mut x = 0i32;
             let mut y = 0i32;
             let mut width = 800u32;
@@ -1402,12 +1412,16 @@ async fn collect_local_a11y_nodes(
             .to_string();
         if let Some(wf) = window_filter.filter(|s| !s.trim().is_empty())
             && !wid.eq_ignore_ascii_case(wf.trim())
-            && !title.to_ascii_lowercase().contains(&wf.trim().to_ascii_lowercase())
+            && !title
+                .to_ascii_lowercase()
+                .contains(&wf.trim().to_ascii_lowercase())
         {
             continue;
         }
         if let Some(af) = app_filter.filter(|s| !s.trim().is_empty())
-            && !title.to_ascii_lowercase().contains(&af.trim().to_ascii_lowercase())
+            && !title
+                .to_ascii_lowercase()
+                .contains(&af.trim().to_ascii_lowercase())
         {
             continue;
         }
@@ -1702,8 +1716,7 @@ async fn execute_computer_request_inner(
                 ("xsel", &["--clipboard", "--input"][..]),
                 ("wl-copy", &[][..]),
             ] {
-                if let Ok(out) =
-                    run_cmd_with_stdin(prog, args, &envs, text.as_bytes(), 5_000).await
+                if let Ok(out) = run_cmd_with_stdin(prog, args, &envs, text.as_bytes(), 5_000).await
                     && out.status.success()
                 {
                     return Ok(json!({
@@ -1715,8 +1728,7 @@ async fn execute_computer_request_inner(
                 }
             }
             return Err(
-                "clipboard_set failed: none of `xclip`, `xsel`, or `wl-copy` succeeded"
-                    .to_string(),
+                "clipboard_set failed: none of `xclip`, `xsel`, or `wl-copy` succeeded".to_string(),
             );
         }
         _ => {}
@@ -1737,8 +1749,10 @@ async fn execute_computer_request_inner(
             Ok(entry) => {
                 let center = entry.bounds.center();
                 if let Some(obj) = payload.as_object_mut() {
-                    obj.entry("x".to_string()).or_insert_with(|| json!(center.x));
-                    obj.entry("y".to_string()).or_insert_with(|| json!(center.y));
+                    obj.entry("x".to_string())
+                        .or_insert_with(|| json!(center.x));
+                    obj.entry("y".to_string())
+                        .or_insert_with(|| json!(center.y));
                 }
                 resolved_ref_entry = Some(entry);
             }
@@ -1783,11 +1797,10 @@ async fn execute_computer_request_inner(
             "action": action,
             "display": display,
         });
-        let (status, bytes) = tokio::task::spawn_blocking(move || {
-            post_json_bytes(&endpoint, &api_key, &payload, 30)
-        })
-        .await
-        .map_err(|e| format!("cloud computer sandbox task failed: {e}"))??;
+        let (status, bytes) =
+            tokio::task::spawn_blocking(move || post_json_bytes(&endpoint, &api_key, &payload, 30))
+                .await
+                .map_err(|e| format!("cloud computer sandbox task failed: {e}"))??;
         let body: Value = serde_json::from_slice(&bytes)
             .map_err(|e| format!("invalid JSON from cloud computer sandbox ({status}): {e}"))?;
         if !(200..300).contains(&status) {
@@ -1835,13 +1848,7 @@ async fn execute_computer_request_inner(
             }))
         }
         ComputerAction::CursorPosition => {
-            let out = run_cmd(
-                "xdotool",
-                &["getmouselocation", "--shell"],
-                &envs,
-                5_000,
-            )
-            .await?;
+            let out = run_cmd("xdotool", &["getmouselocation", "--shell"], &envs, 5_000).await?;
             if !out.status.success() {
                 return Err(format!(
                     "xdotool getmouselocation failed: {}",
@@ -1895,22 +1902,12 @@ async fn execute_computer_request_inner(
             let ys = coordinate.y.to_string();
             let repeat = count.max(1).to_string();
             let btn = button.xdotool_code();
-            let mut args: Vec<String> = vec![
-                "mousemove".into(),
-                "--sync".into(),
-                xs,
-                ys,
-            ];
+            let mut args: Vec<String> = vec!["mousemove".into(), "--sync".into(), xs, ys];
             for m in &modifiers {
                 args.push("keydown".into());
                 args.push(m.clone());
             }
-            args.extend([
-                "click".into(),
-                "--repeat".into(),
-                repeat,
-                btn.into(),
-            ]);
+            args.extend(["click".into(), "--repeat".into(), repeat, btn.into()]);
             for m in modifiers.iter().rev() {
                 args.push("keyup".into());
                 args.push(m.clone());
@@ -1936,7 +1933,12 @@ async fn execute_computer_request_inner(
         ComputerAction::MouseDown { coordinate, button } => {
             let mut args: Vec<String> = Vec::new();
             if let Some(c) = coordinate {
-                args.extend(["mousemove".into(), "--sync".into(), c.x.to_string(), c.y.to_string()]);
+                args.extend([
+                    "mousemove".into(),
+                    "--sync".into(),
+                    c.x.to_string(),
+                    c.y.to_string(),
+                ]);
             }
             args.extend(["mousedown".into(), button.xdotool_code().into()]);
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -1956,7 +1958,12 @@ async fn execute_computer_request_inner(
         ComputerAction::MouseUp { coordinate, button } => {
             let mut args: Vec<String> = Vec::new();
             if let Some(c) = coordinate {
-                args.extend(["mousemove".into(), "--sync".into(), c.x.to_string(), c.y.to_string()]);
+                args.extend([
+                    "mousemove".into(),
+                    "--sync".into(),
+                    c.x.to_string(),
+                    c.y.to_string(),
+                ]);
             }
             args.extend(["mouseup".into(), button.xdotool_code().into()]);
             let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -2164,8 +2171,8 @@ pub fn escape_adb_input_text(text: &str) -> String {
     for ch in text.chars() {
         match ch {
             ' ' => out.push_str("%s"),
-            '&' | '|' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '\\' | '"' | '\'' | '*'
-            | '?' | '[' | ']' | '#' | '~' | '=' | '%' => {
+            '&' | '|' | ';' | '<' | '>' | '(' | ')' | '$' | '`' | '\\' | '"' | '\'' | '*' | '?'
+            | '[' | ']' | '#' | '~' | '=' | '%' => {
                 out.push('\\');
                 out.push(ch);
             }
@@ -2505,10 +2512,7 @@ pub fn resolve_sylphx_gateway_base_url() -> String {
         })
         .unwrap_or_else(|| "https://ai.sylphx.com".to_string());
     let trimmed = raw.trim().trim_end_matches('/');
-    trimmed
-        .strip_suffix("/v1")
-        .unwrap_or(trimmed)
-        .to_string()
+    trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
 }
 
 pub fn resolve_sylphx_api_key(data_dir: Option<&Path>, config_dir: &Path) -> Option<String> {
@@ -2766,7 +2770,8 @@ pub async fn execute_media_request(
                 curl_args.push(format!("prompt={prompt}"));
             }
             let arg_refs: Vec<&str> = curl_args.iter().map(String::as_str).collect();
-            let out = run_cmd_with_stdin("curl", &arg_refs, &[], curl_config.as_bytes(), 120_000).await?;
+            let out =
+                run_cmd_with_stdin("curl", &arg_refs, &[], curl_config.as_bytes(), 120_000).await?;
             if !out.status.success() {
                 return Err(format!(
                     "media.transcribe failed: {}",
@@ -2929,7 +2934,11 @@ mod tests {
         let (tree, ref_map) = build_snapshot_tree("s8f3k2p9", raw, false, true);
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].ref_id, "@s8f3k2p9:e1");
-        assert_eq!(tree[0].children.len(), 1, "anonymous group wrapper must be skipped");
+        assert_eq!(
+            tree[0].children.len(),
+            1,
+            "anonymous group wrapper must be skipped"
+        );
         assert_eq!(tree[0].children[0].ref_id, "@s8f3k2p9:e2");
         assert_eq!(tree[0].children[0].name, "Submit Order");
 
@@ -2959,14 +2968,8 @@ mod tests {
         fake_png.extend_from_slice(&1920u32.to_be_bytes());
         fake_png.extend_from_slice(&1080u32.to_be_bytes());
         assert_eq!(parse_png_dimensions(&fake_png), Some((1920, 1080)));
-        assert_eq!(
-            android_keyevent_for_button("home").unwrap(),
-            "KEYCODE_HOME"
-        );
-        assert_eq!(
-            escape_adb_input_text("hello world&1"),
-            "hello%sworld\\&1"
-        );
+        assert_eq!(android_keyevent_for_button("home").unwrap(), "KEYCODE_HOME");
+        assert_eq!(escape_adb_input_text("hello world&1"), "hello%sworld\\&1");
     }
 
     #[test]

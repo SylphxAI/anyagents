@@ -272,7 +272,9 @@ pub fn sanitize_topic_slug(raw: &str) -> io::Result<String> {
         if ch.is_ascii_alphanumeric() {
             slug.push(ch.to_ascii_lowercase());
             prev_dash = false;
-        } else if (ch == '-' || ch == '_' || ch == ' ' || ch == '.') && !slug.is_empty() && !prev_dash
+        } else if (ch == '-' || ch == '_' || ch == ' ' || ch == '.')
+            && !slug.is_empty()
+            && !prev_dash
         {
             slug.push('-');
             prev_dash = true;
@@ -378,7 +380,11 @@ pub fn parse_topic_frontmatter_full<'a>(
         let body = after_open[end_idx + 4..].trim_start_matches(['-', '\r', '\n']);
         if description.is_empty() {
             for line in body.lines() {
-                let clean = line.trim().trim_start_matches('#').trim_start_matches('-').trim();
+                let clean = line
+                    .trim()
+                    .trim_start_matches('#')
+                    .trim_start_matches('-')
+                    .trim();
                 if !clean.is_empty() {
                     description = clean.to_string();
                     break;
@@ -388,7 +394,11 @@ pub fn parse_topic_frontmatter_full<'a>(
         body
     } else {
         for line in trimmed.lines() {
-            let clean = line.trim().trim_start_matches('#').trim_start_matches('-').trim();
+            let clean = line
+                .trim()
+                .trim_start_matches('#')
+                .trim_start_matches('-')
+                .trim();
             if !clean.is_empty() {
                 description = clean.to_string();
                 break;
@@ -564,7 +574,7 @@ pub fn rebuild_memory_index(
                 for line in archival_text.lines() {
                     let l = format!("{line}\n");
                     if body.len() + l.len() <= max_body_bytes
-                        && body.lines().count() + 1 <= max_body_lines
+                        && body.lines().count() < max_body_lines
                     {
                         body.push_str(&l);
                     }
@@ -749,7 +759,10 @@ Follow these 4 strict rules:
 Output ONLY valid JSON with no markdown code fences or commentary."
         .to_string();
 
-    let role_str = role.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("none");
+    let role_str = role
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("none");
     let mut user_prompt = format!("Agent: {agent_name} (role: {role_str})\n\n");
 
     user_prompt.push_str("## Existing Topic Catalog\n");
@@ -813,10 +826,7 @@ Output ONLY valid JSON with no markdown code fences or commentary."
 fn strip_code_fences_or_extract_json(raw: &str) -> &str {
     let trimmed = raw.trim();
     if let Some(rest) = trimmed.strip_prefix("```") {
-        let after_lang = rest
-            .find('\n')
-            .map(|idx| &rest[idx + 1..])
-            .unwrap_or(rest);
+        let after_lang = rest.find('\n').map(|idx| &rest[idx + 1..]).unwrap_or(rest);
         if let Some(end) = after_lang.rfind("```") {
             return after_lang[..end].trim();
         }
@@ -831,7 +841,9 @@ fn strip_code_fences_or_extract_json(raw: &str) -> &str {
 
 /// Parses an OpenAI-compatible chat completion response or direct JSON plan and
 /// enforces slug sanitization and defragmentation safety invariants.
-pub fn parse_sleep_consolidation_plan(raw_response: &str) -> Result<SleepConsolidationPlan, String> {
+pub fn parse_sleep_consolidation_plan(
+    raw_response: &str,
+) -> Result<SleepConsolidationPlan, String> {
     let outer: serde_json::Value =
         serde_json::from_str(raw_response.trim()).map_err(|e| format!("invalid JSON: {e}"))?;
 
@@ -894,10 +906,8 @@ pub fn parse_sleep_consolidation_plan(raw_response: &str) -> Result<SleepConsoli
                     upserts.push((slug, description, content.to_string()));
                 }
             }
-            "delete" | "remove" => {
-                if !deletes.contains(&slug) {
-                    deletes.push(slug);
-                }
+            "delete" | "remove" if !deletes.contains(&slug) => {
+                deletes.push(slug);
             }
             _ => {}
         }
@@ -1344,13 +1354,8 @@ mod tests {
             assert!(!bounded.contains(MARKER), "truncated at i={i}: {bounded}");
             assert!(bounded.contains(&topic), "missing {topic} at i={i}");
         }
-        let (removed, after) = delete_memory_topic(
-            root.path(),
-            "sage",
-            Some("Designer"),
-            "alpha-topic-000",
-        )
-        .unwrap();
+        let (removed, after) =
+            delete_memory_topic(root.path(), "sage", Some("Designer"), "alpha-topic-000").unwrap();
         assert!(removed);
         assert!(!after.contains("alpha-topic-000"));
     }
@@ -1403,7 +1408,10 @@ mod tests {
         assert!(on_disk_second.contains("created_at_ms: 1700000001000"));
         assert!(on_disk_second.contains("updated_at_ms: 1700000009000"));
         assert!(on_disk_second.contains("Second body content"));
-        assert_eq!(on_disk_second.matches("name: architecture-notes").count(), 1);
+        assert_eq!(
+            on_disk_second.matches("name: architecture-notes").count(),
+            1
+        );
 
         let listed = list_memory_topics(root.path()).unwrap();
         assert_eq!(listed.len(), 1);

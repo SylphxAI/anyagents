@@ -1547,8 +1547,14 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
     let res = &code_res["result"];
     assert_eq!(res["memTopic"], "arch-decisions", "{code_res:?}");
     assert_eq!(res["memHasContent"], true, "{code_res:?}");
-    assert!(res["memCountBeforeDelete"].as_u64().unwrap_or(0) >= 1, "{code_res:?}");
-    assert!(res["memSearchCount"].as_u64().unwrap_or(0) >= 1, "{code_res:?}");
+    assert!(
+        res["memCountBeforeDelete"].as_u64().unwrap_or(0) >= 1,
+        "{code_res:?}"
+    );
+    assert!(
+        res["memSearchCount"].as_u64().unwrap_or(0) >= 1,
+        "{code_res:?}"
+    );
     assert_eq!(res["memDeleted"], true, "{code_res:?}");
     assert_eq!(res["editReplacements"], 1, "{code_res:?}");
     assert_eq!(res["patchCount"], 2, "{code_res:?}");
@@ -1556,10 +1562,7 @@ async fn code_mode_supports_memory_sdk_workspace_patch_list_exec_and_computer_sn
     assert_eq!(res["execStdout"], "exec-ok", "{code_res:?}");
     assert_eq!(res["snapshotIdPrefix"], true, "{code_res:?}");
     assert!(
-        res["firstRef"]
-            .as_str()
-            .unwrap_or("")
-            .contains(":e1"),
+        res["firstRef"].as_str().unwrap_or("").contains(":e1"),
         "{code_res:?}"
     );
     assert_eq!(res["staleCaught"], true, "{code_res:?}");

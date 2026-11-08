@@ -834,14 +834,16 @@ pub fn hydrate_operator_groups_if_needed() {
     }
 }
 
+type SeatCacheKey = (String, Option<String>);
+type SeatCacheMap = std::collections::HashMap<SeatCacheKey, Option<(u32, u32)>>;
+
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
     let agents = store.list_agents()?;
     let by_id: std::collections::HashMap<&str, &anyagents_core::Agent> =
         agents.iter().map(|a| (a.id.as_str(), a)).collect();
-    let mut seat_cache: std::collections::HashMap<(String, Option<String>), Option<(u32, u32)>> =
-        std::collections::HashMap::new();
+    let mut seat_cache: SeatCacheMap = std::collections::HashMap::new();
     let large_inventory = agents.len() > 32;
     let mut peers = Vec::with_capacity(agents.len().min(512));
     for agent in &agents {
@@ -876,20 +878,18 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
                 .map(|(_, v)| v.clone())
         });
         let key = (agent.name.clone(), hint.clone());
-        let resolved = *seat_cache
-            .entry(key)
-            .or_insert_with(|| {
-                if let Some((_, spec)) = seat_launch_spec_with_hint(&agent.name, hint.as_deref()) {
-                    let mut parts = spec.split('\t');
-                    if let (_, Some(u), Some(g)) = (parts.next(), parts.next(), parts.next())
-                        && let (Ok(uid), Ok(gid)) = (u.parse::<u32>(), g.parse::<u32>())
-                    {
-                        return Some((uid, gid));
-                    }
+        let resolved = *seat_cache.entry(key).or_insert_with(|| {
+            if let Some((_, spec)) = seat_launch_spec_with_hint(&agent.name, hint.as_deref()) {
+                let mut parts = spec.split('\t');
+                if let (_, Some(u), Some(g)) = (parts.next(), parts.next(), parts.next())
+                    && let (Ok(uid), Ok(gid)) = (u.parse::<u32>(), g.parse::<u32>())
+                {
+                    return Some((uid, gid));
                 }
-                seat_for_agent_with_hint(&agent.name, hint.as_deref())
-                    .map(|(_, uid, gid, _)| (uid, gid))
-            });
+            }
+            seat_for_agent_with_hint(&agent.name, hint.as_deref())
+                .map(|(_, uid, gid, _)| (uid, gid))
+        });
         if let Some((uid, gid)) = resolved {
             peers.push(anyagents_harness::SeatPeer { root, uid, gid });
         }

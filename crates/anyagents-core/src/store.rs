@@ -2737,7 +2737,9 @@ impl Store {
     fn backfill_full_mailbox_history(&self, visible: Option<&[String]>) -> Result<(), Error> {
         let mut conn = self.conn();
         let total_chunks: i64 = conn
-            .query_row("SELECT COALESCE(MAX(rowid), 0) FROM rag_chunks", [], |r| r.get(0))
+            .query_row("SELECT COALESCE(MAX(rowid), 0) FROM rag_chunks", [], |r| {
+                r.get(0)
+            })
             .unwrap_or(0);
         if total_chunks > 5000 && std::env::var_os("ANYAGENTS_TESTS").is_none() {
             return Ok(());
@@ -3439,11 +3441,13 @@ impl Store {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| i64::try_from(d.as_millis()).unwrap_or(0))
             .unwrap_or(0);
-        let any_newer_topic = updated_topics.iter().any(|t| t.updated_at_ms > mem_mtime_ms);
-        let is_truncated = crate::learned_memory::bounded_section(&current_mem)
-            .contains("[Memory truncated;");
-        let is_legacy_index = current_mem.contains("\n## Topics (")
-            && !current_mem.contains("\n## Active Topics");
+        let any_newer_topic = updated_topics
+            .iter()
+            .any(|t| t.updated_at_ms > mem_mtime_ms);
+        let is_truncated =
+            crate::learned_memory::bounded_section(&current_mem).contains("[Memory truncated;");
+        let is_legacy_index =
+            current_mem.contains("\n## Topics (") && !current_mem.contains("\n## Active Topics");
         let missing_index_with_topics = !mem_exists && !updated_topics.is_empty();
         let mut modified = false;
         if missing_index_with_topics
@@ -3587,8 +3591,10 @@ impl Store {
         };
 
         // Phase 2b: Quiescence & cooldown gate (2m turn quiescence + 10m consolidation cooldown).
-        let force =
-            std::env::var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE").ok().as_deref() == Some("1");
+        let force = std::env::var("ANYAGENTS_SLEEP_CONSOLIDATION_FORCE")
+            .ok()
+            .as_deref()
+            == Some("1");
         let custom_url_set = std::env::var("ANYAGENTS_SLEEP_MODEL_URL")
             .ok()
             .is_some_and(|s| !s.trim().is_empty());
@@ -8912,7 +8918,11 @@ mod tests {
         );
 
         let topics = crate::learned_memory::list_memory_topics(&root).unwrap();
-        assert_eq!(topics.len(), 1, "must update topic in place without duplicating");
+        assert_eq!(
+            topics.len(),
+            1,
+            "must update topic in place without duplicating"
+        );
         assert_eq!(topics[0].slug, "service-endpoint");
         assert_eq!(
             topics[0].description,

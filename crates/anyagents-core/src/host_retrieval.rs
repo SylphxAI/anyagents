@@ -192,7 +192,11 @@ impl Store {
     pub fn sync_agent_memory_index(&self, agent: &Agent) -> Result<(), IndexError> {
         if let Ok(mut cache) = host_refresh_cache().lock() {
             for scope_key in [0u8, 1u8, 2u8] {
-                cache.remove(&(self.data_dir().to_path_buf(), agent.id.to_string(), scope_key));
+                cache.remove(&(
+                    self.data_dir().to_path_buf(),
+                    agent.id.to_string(),
+                    scope_key,
+                ));
             }
         }
         let root = self.data_dir().join("agents").join(agent.id.as_str());
@@ -330,7 +334,11 @@ impl Store {
                 {
                     continue;
                 }
-                let cache_key = (self.data_dir().to_path_buf(), agent.id.to_string(), scope_key);
+                let cache_key = (
+                    self.data_dir().to_path_buf(),
+                    agent.id.to_string(),
+                    scope_key,
+                );
                 if let Ok(cache) = host_refresh_cache().lock()
                     && let Some(&last_ms) = cache.get(&cache_key)
                     && now_ms.saturating_sub(last_ms) < 60_000
@@ -433,11 +441,12 @@ impl Store {
     }
 }
 
-fn host_refresh_cache()
--> &'static std::sync::Mutex<std::collections::HashMap<(PathBuf, String, u8), i64>> {
-    static LAST_HOST_REFRESH_MS: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<(PathBuf, String, u8), i64>>,
-    > = std::sync::OnceLock::new();
+type HostRefreshKey = (PathBuf, String, u8);
+type HostRefreshMap = std::collections::HashMap<HostRefreshKey, i64>;
+
+fn host_refresh_cache() -> &'static std::sync::Mutex<HostRefreshMap> {
+    static LAST_HOST_REFRESH_MS: std::sync::OnceLock<std::sync::Mutex<HostRefreshMap>> =
+        std::sync::OnceLock::new();
     LAST_HOST_REFRESH_MS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -545,9 +554,7 @@ fn refresh_native_at(
             let header: EventHeader =
                 match serde_json::from_reader(MetadataReader::new(file.take(raw.length))) {
                     Ok(h) => h,
-                    Err(_) if !is_test_mode() => {
-                        EventHeader::default()
-                    }
+                    Err(_) if !is_test_mode() => EventHeader::default(),
                     Err(e) => return Err(e.into()),
                 };
             let mut metadata = event_metadata(agent, &header);
@@ -717,10 +724,7 @@ fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     let meta = match fs::symlink_metadata(root) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
-        Err(e)
-            if e.kind() == io::ErrorKind::PermissionDenied
-                && !is_test_mode() =>
-        {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !is_test_mode() => {
             return Ok(vec![]);
         }
         Err(e) => return Err(e),
@@ -730,10 +734,7 @@ fn regular_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     }
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
-        Err(e)
-            if e.kind() == io::ErrorKind::PermissionDenied
-                && !is_test_mode() =>
-        {
+        Err(e) if e.kind() == io::ErrorKind::PermissionDenied && !is_test_mode() => {
             return Ok(vec![]);
         }
         Err(e) => return Err(e),
@@ -1944,7 +1945,11 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(hits.len(), 1, "MEMORY.md must not duplicate topic search hit");
+        assert_eq!(
+            hits.len(),
+            1,
+            "MEMORY.md must not duplicate topic search hit"
+        );
         assert!(
             hits[0]
                 .0
@@ -1962,6 +1967,9 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(dot_hits.is_empty(), "dotfiles in memory/ must never be indexed");
+        assert!(
+            dot_hits.is_empty(),
+            "dotfiles in memory/ must never be indexed"
+        );
     }
 }

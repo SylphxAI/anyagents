@@ -1744,8 +1744,12 @@ fn render_memory_recall(
                         .enumerate()
                         .filter(|(_, line)| {
                             let ll = line.to_lowercase();
-                            queries_lower.iter().any(|ql| !ql.is_empty() && ll.contains(ql.as_str()))
-                                || q_tokens.iter().any(|qt| !qt.is_empty() && ll.contains(qt.as_str()))
+                            queries_lower
+                                .iter()
+                                .any(|ql| !ql.is_empty() && ll.contains(ql.as_str()))
+                                || q_tokens
+                                    .iter()
+                                    .any(|qt| !qt.is_empty() && ll.contains(qt.as_str()))
                         })
                         .take(12)
                         .map(|(ln, line)| format!("L{}: {}", ln + 1, line))

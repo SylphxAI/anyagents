@@ -4298,9 +4298,7 @@ fn execute_sylphx_tool(
     let limits = match normalized {
         "agents" | "subagents" | "send" | "conversation" | "search" | "groups" | "schedule"
         | "browser" | "describe" | "archive" | "wake" | "spawn" | "interact" | "memory" | "web"
-        | "computer" | "device" | "media" | "files" => {
-            Some((24_000, 11_000, 11_000))
-        }
+        | "computer" | "device" | "media" | "files" => Some((24_000, 11_000, 11_000)),
         "code" => Some((48_000, 22_000, 22_000)),
         "bash" | "shell" | "code_mode" | "grep" | "glob" | "context" => {
             Some((30_000, 14_000, 14_000))

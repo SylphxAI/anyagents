@@ -959,12 +959,7 @@ struct FileEditSpec {
     )]
     target: String,
     /// Replacement string to substitute in place of `target`.
-    #[serde(
-        default,
-        alias = "new_str",
-        alias = "new_string",
-        alias = "replace"
-    )]
+    #[serde(default, alias = "new_str", alias = "new_string", alias = "replace")]
     replacement: String,
     /// Optional per-edit override for whether multiple occurrences of `target` should all be replaced (`true` by default).
     #[serde(default)]
@@ -1015,19 +1010,10 @@ struct FilesArgs {
     #[serde(default)]
     append: Option<bool>,
     /// Target string to replace when `action = "edit"`.
-    #[serde(
-        default,
-        alias = "old_str",
-        alias = "old_string"
-    )]
+    #[serde(default, alias = "old_str", alias = "old_string")]
     target: Option<String>,
     /// Replacement string when `action = "edit"`.
-    #[serde(
-        default,
-        alias = "new_str",
-        alias = "new_string",
-        alias = "replace"
-    )]
+    #[serde(default, alias = "new_str", alias = "new_string", alias = "replace")]
     replacement: Option<String>,
     /// Array of `{ target, replacement }` edits applied atomically when `action = "edit"` or `"multi_edit"`.
     #[serde(default)]
@@ -2608,7 +2594,11 @@ impl AgentMcp {
                 .is_some_and(|d| d.join("admin.sock").exists());
         if !local_has_keys && server_available {
             let body = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
-            if let Ok(val) = self.client.get::<serde_json::Value>("/v1/web", Some(body)).await {
+            if let Ok(val) = self
+                .client
+                .get::<serde_json::Value>("/v1/web", Some(body))
+                .await
+            {
                 return Ok(rmcp::handler::server::wrapper::Json(val));
             }
         }
@@ -3056,8 +3046,7 @@ impl Drop for CodeChildGuard {
     }
 }
 
-static CACHED_JS_RUNTIME: std::sync::OnceLock<Option<(PathBuf, bool)>> =
-    std::sync::OnceLock::new();
+static CACHED_JS_RUNTIME: std::sync::OnceLock<Option<(PathBuf, bool)>> = std::sync::OnceLock::new();
 
 fn find_js_runtime() -> Option<(PathBuf, bool)> {
     CACHED_JS_RUNTIME
@@ -3166,9 +3155,7 @@ impl AgentMcp {
                 let mut topics_val = Vec::new();
                 let mut turns_val = Vec::new();
 
-                if is_self_target
-                    && let Some(ref root) = local_agent_root
-                {
+                if is_self_target && let Some(ref root) = local_agent_root {
                     if let Ok(topics) = anyagents_core::learned_memory::list_memory_topics(root) {
                         if let Some(lim) = args.limit {
                             topics_val = topics
@@ -3188,8 +3175,8 @@ impl AgentMcp {
                     }
                 }
 
-                if index_text.is_empty() || !is_self_target {
-                    if let Ok(resp) = self
+                if (index_text.is_empty() || !is_self_target)
+                    && let Ok(resp) = self
                         .conversation(Parameters(ConversationArgs {
                             scope: Some("memory".into()),
                             topic: Some("MEMORY".into()),
@@ -3197,19 +3184,18 @@ impl AgentMcp {
                             ..ConversationArgs::default()
                         }))
                         .await
+                {
+                    if let Some(first) = resp.0.turns.first()
+                        && index_text.is_empty()
                     {
-                        if let Some(first) = resp.0.turns.first() {
-                            if index_text.is_empty() {
-                                index_text = first.text.clone();
-                            }
-                        }
-                        turns_val = resp
-                            .0
-                            .turns
-                            .into_iter()
-                            .filter_map(|t| serde_json::to_value(t).ok())
-                            .collect();
+                        index_text = first.text.clone();
                     }
+                    turns_val = resp
+                        .0
+                        .turns
+                        .into_iter()
+                        .filter_map(|t| serde_json::to_value(t).ok())
+                        .collect();
                 }
                 if index_text.is_empty() {
                     index_text = format!(
@@ -3228,7 +3214,8 @@ impl AgentMcp {
                 }))
             }
             "read" | "get" => {
-                let topic = raw_topic.ok_or_else(|| "`memory` read requires `topic`".to_string())?;
+                let topic =
+                    raw_topic.ok_or_else(|| "`memory` read requires `topic`".to_string())?;
                 let slug = anyagents_core::learned_memory::sanitize_topic_slug(&topic)
                     .map_err(|e| e.to_string())?;
                 let filename = format!("{slug}.md");
@@ -3250,7 +3237,9 @@ impl AgentMcp {
                             .map(|t| t.text.clone())
                             .unwrap_or_default();
                         let (_, description) =
-                            anyagents_core::learned_memory::parse_topic_frontmatter(&slug, &content);
+                            anyagents_core::learned_memory::parse_topic_frontmatter(
+                                &slug, &content,
+                            );
                         Ok(serde_json::json!({
                             "action": "read",
                             "agent": resp.0.agent,
@@ -3262,9 +3251,7 @@ impl AgentMcp {
                         }))
                     }
                     Err(err) => {
-                        if is_self_target
-                            && let Some(ref root) = local_agent_root
-                        {
+                        if is_self_target && let Some(ref root) = local_agent_root {
                             let path = root.join("memory").join(&filename);
                             if let Ok(content) = std::fs::read_to_string(&path) {
                                 let (_, description) =
@@ -3295,7 +3282,8 @@ impl AgentMcp {
                 }
             }
             "write" | "upsert" | "set" => {
-                let topic = raw_topic.ok_or_else(|| "`memory` write requires `topic`".to_string())?;
+                let topic =
+                    raw_topic.ok_or_else(|| "`memory` write requires `topic`".to_string())?;
                 let slug = anyagents_core::learned_memory::sanitize_topic_slug(&topic)
                     .map_err(|e| e.to_string())?;
                 let content = args.content.unwrap_or_default();
@@ -3336,9 +3324,7 @@ impl AgentMcp {
                         }))
                     }
                     Err(err) => {
-                        if is_self_target
-                            && let Some(ref root) = local_agent_root
-                        {
+                        if is_self_target && let Some(ref root) = local_agent_root {
                             let (path, entry, index_md) =
                                 anyagents_core::learned_memory::upsert_memory_topic(
                                     root,
@@ -3377,7 +3363,8 @@ impl AgentMcp {
                 }
             }
             "delete" | "remove" | "rm" => {
-                let topic = raw_topic.ok_or_else(|| "`memory` delete requires `topic`".to_string())?;
+                let topic =
+                    raw_topic.ok_or_else(|| "`memory` delete requires `topic`".to_string())?;
                 let slug = anyagents_core::learned_memory::sanitize_topic_slug(&topic)
                     .map_err(|e| e.to_string())?;
 
@@ -3413,9 +3400,7 @@ impl AgentMcp {
                         }))
                     }
                     Err(err) => {
-                        if is_self_target
-                            && let Some(ref root) = local_agent_root
-                        {
+                        if is_self_target && let Some(ref root) = local_agent_root {
                             let (removed, index) =
                                 anyagents_core::learned_memory::delete_memory_topic(
                                     root,
@@ -3472,7 +3457,8 @@ impl AgentMcp {
                     Err(err) => {
                         if is_self_target
                             && let Some(ref root) = local_agent_root
-                            && let Ok(topics) = anyagents_core::learned_memory::list_memory_topics(root)
+                            && let Ok(topics) =
+                                anyagents_core::learned_memory::list_memory_topics(root)
                         {
                             let tokens: Vec<String> = q
                                 .to_ascii_lowercase()
@@ -3485,11 +3471,8 @@ impl AgentMcp {
                             for entry in topics {
                                 let path = root.join("memory").join(&entry.filename);
                                 let text = std::fs::read_to_string(&path).unwrap_or_default();
-                                let hay = format!(
-                                    "{} {} {}",
-                                    entry.slug, entry.description, text
-                                )
-                                .to_ascii_lowercase();
+                                let hay = format!("{} {} {}", entry.slug, entry.description, text)
+                                    .to_ascii_lowercase();
                                 if tokens.iter().all(|tok| hay.contains(tok)) {
                                     hits.push(serde_json::json!({
                                         "id": format!("memory:{}:{}", self.agent.id, entry.slug),
@@ -3525,8 +3508,8 @@ impl AgentMcp {
             }
             "status" => {
                 if let Some(ref root) = local_agent_root {
-                    let topics =
-                        anyagents_core::learned_memory::list_memory_topics(root).unwrap_or_default();
+                    let topics = anyagents_core::learned_memory::list_memory_topics(root)
+                        .unwrap_or_default();
                     let sleep_state = anyagents_core::learned_memory::read_sleep_state(root);
                     let index_text =
                         std::fs::read_to_string(root.join("memory/MEMORY.md")).unwrap_or_default();
@@ -3573,8 +3556,8 @@ impl AgentMcp {
                         None,
                     )
                     .map_err(|e| e.to_string())?;
-                    let topics =
-                        anyagents_core::learned_memory::list_memory_topics(root).unwrap_or_default();
+                    let topics = anyagents_core::learned_memory::list_memory_topics(root)
+                        .unwrap_or_default();
                     return Ok(serde_json::json!({
                         "action": "consolidate",
                         "agent": self.agent.name,
@@ -3595,7 +3578,10 @@ impl AgentMcp {
         tool: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, String> {
-        let norm = tool.trim().strip_prefix("mcp__anyagents__").unwrap_or(tool.trim());
+        let norm = tool
+            .trim()
+            .strip_prefix("mcp__anyagents__")
+            .unwrap_or(tool.trim());
         match norm {
             "memory" => {
                 let parsed: MemoryArgs = serde_json::from_value(args)
@@ -3646,24 +3632,18 @@ impl AgentMcp {
                 }
                 Ok(self.web(Parameters(parsed)).await?.0)
             }
-            "computer" => {
-                Ok(self
-                    .computer(Parameters(DynamicObjectArgs::from_value(args)?))
-                    .await?
-                    .0)
-            }
-            "device" => {
-                Ok(self
-                    .device(Parameters(DynamicObjectArgs::from_value(args)?))
-                    .await?
-                    .0)
-            }
-            "media" => {
-                Ok(self
-                    .media(Parameters(DynamicObjectArgs::from_value(args)?))
-                    .await?
-                    .0)
-            }
+            "computer" => Ok(self
+                .computer(Parameters(DynamicObjectArgs::from_value(args)?))
+                .await?
+                .0),
+            "device" => Ok(self
+                .device(Parameters(DynamicObjectArgs::from_value(args)?))
+                .await?
+                .0),
+            "media" => Ok(self
+                .media(Parameters(DynamicObjectArgs::from_value(args)?))
+                .await?
+                .0),
             "files" => {
                 let parsed: FilesArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `files` arguments: {e}"))?;
@@ -3746,9 +3726,12 @@ impl AgentMcp {
             cmd.process_group(0);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to spawn code sandbox ({}): {e}", runtime_bin.display()))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            format!(
+                "failed to spawn code sandbox ({}): {e}",
+                runtime_bin.display()
+            )
+        })?;
         let mut child_stdin = child
             .stdin
             .take()
@@ -3922,10 +3905,8 @@ impl AgentMcp {
         let serialized = serde_json::to_string(&raw_result).unwrap_or_default();
         if serialized.len() > MAX_CODE_RESULT_BYTES {
             let head_end = floor_char_boundary_str(&serialized, 36 * 1024);
-            let tail_start = ceil_char_boundary_str(
-                &serialized,
-                serialized.len().saturating_sub(8 * 1024),
-            );
+            let tail_start =
+                ceil_char_boundary_str(&serialized, serialized.len().saturating_sub(8 * 1024));
             let preview = format!(
                 "{}\n...[result truncated: {} bytes exceeded {} byte cap; filter or map fields inside `code` before returning]...\n{}",
                 &serialized[..head_end],
@@ -4009,7 +3990,11 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     }
 }
 
-fn resolve_workspace_path(base: &Path, raw: Option<&str>, required: bool) -> Result<PathBuf, String> {
+fn resolve_workspace_path(
+    base: &Path,
+    raw: Option<&str>,
+    required: bool,
+) -> Result<PathBuf, String> {
     let Some(raw_str) = raw else {
         if required {
             return Err("`path` is required for this `files` action".to_string());
@@ -4121,7 +4106,11 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                     "sha256": sha256,
                 }));
             }
-            let requested_end = args.end_line.unwrap_or(total_lines).min(total_lines).max(start_line);
+            let requested_end = args
+                .end_line
+                .unwrap_or(total_lines)
+                .min(total_lines)
+                .max(start_line);
             let selected_lines = &all_lines[start_line - 1..requested_end];
             let joined = selected_lines.join("\n");
 
@@ -4224,8 +4213,12 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
             }
             let existing = std::fs::read_to_string(&resolved)
                 .map_err(|e| format!("cannot read {} for edit: {e}", resolved.display()))?;
-            let (updated, replacements_made, lines_added, lines_removed) =
-                apply_atomic_edits(&existing, &specs, args.replace_all.unwrap_or(true), &resolved)?;
+            let (updated, replacements_made, lines_added, lines_removed) = apply_atomic_edits(
+                &existing,
+                &specs,
+                args.replace_all.unwrap_or(true),
+                &resolved,
+            )?;
             std::fs::write(&resolved, updated.as_bytes())
                 .map_err(|e| format!("cannot write edited file {}: {e}", resolved.display()))?;
             let sha256 = sha256_hex(updated.as_bytes());
@@ -4348,9 +4341,7 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
                 .include_hidden
                 .unwrap_or_else(|| clean_pat.starts_with('.') || clean_pat.contains("/."));
             let include_ignored = args.include_ignored.unwrap_or(false)
-                || DEFAULT_IGNORED_DIRS
-                    .iter()
-                    .any(|d| clean_pat.contains(d));
+                || DEFAULT_IGNORED_DIRS.iter().any(|d| clean_pat.contains(d));
 
             let mut candidate_files = Vec::new();
             let gitignore_patterns = if include_ignored {
@@ -4523,7 +4514,9 @@ fn execute_files_tool(base_dir: &Path, args: FilesArgs) -> Result<serde_json::Va
         "exec" | "bash" | "sh" | "command" => {
             if std::env::var("ANYAGENTS_DISABLE_WORKSPACE_EXEC")
                 .ok()
-                .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .is_some_and(|v| {
+                    matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+                })
             {
                 return Err(
                     "workspace.exec is disabled for this agent (ANYAGENTS_DISABLE_WORKSPACE_EXEC=1); delegate command execution to a subagent".to_string(),
@@ -4766,7 +4759,8 @@ fn apply_single_edit_cascade(
     // Stage 3: Line-end whitespace-trimmed (`trim_end()`) match
     let mut trim_end_hits = Vec::new();
     for i in 0..=(doc_lines.len() - target_lines.len()) {
-        if (0..target_lines.len()).all(|j| doc_lines[i + j].trim_end() == target_lines[j].trim_end())
+        if (0..target_lines.len())
+            .all(|j| doc_lines[i + j].trim_end() == target_lines[j].trim_end())
         {
             trim_end_hits.push(i);
         }
@@ -4919,8 +4913,9 @@ fn apply_workspace_patch(base_dir: &Path, patch_text: &str) -> Result<serde_json
                 if let Some(p) = target.parent()
                     && !p.as_os_str().is_empty()
                 {
-                    std::fs::create_dir_all(p)
-                        .map_err(|e| format!("failed creating parent directory {}: {e}", p.display()))?;
+                    std::fs::create_dir_all(p).map_err(|e| {
+                        format!("failed creating parent directory {}: {e}", p.display())
+                    })?;
                 }
                 let mut content = body_lines.join("\n");
                 if !content.is_empty() && !content.ends_with('\n') {
@@ -5612,8 +5607,7 @@ impl GrepMatcher {
                 let chars: Vec<char> = line.chars().collect();
                 let mut steps = 0usize;
                 for start in 0..=chars.len() {
-                    if eval_regex_node(node, &chars, start, *case_insensitive, &mut steps)
-                        .is_some()
+                    if eval_regex_node(node, &chars, start, *case_insensitive, &mut steps).is_some()
                     {
                         return true;
                     }
@@ -5802,11 +5796,7 @@ fn parse_bounded_rep(chars: &[char], mut idx: usize) -> Option<(usize, Option<us
     Some((min, max, idx + 1))
 }
 
-fn parse_regex_class(
-    chars: &[char],
-    pos: &mut usize,
-    case_insensitive: bool,
-) -> Option<RegexAtom> {
+fn parse_regex_class(chars: &[char], pos: &mut usize, case_insensitive: bool) -> Option<RegexAtom> {
     if *pos >= chars.len() {
         return None;
     }
@@ -6693,7 +6683,12 @@ mod spawn_args_tests {
         assert_eq!(read_res["end_line"], 6);
         assert_eq!(read_res["total_lines"], 9);
         assert_eq!(read_res["content"], "pub fn beta() -> i32 {\n    20\n}");
-        assert!(read_res["numbered"].as_str().unwrap().contains("4: pub fn beta()"));
+        assert!(
+            read_res["numbered"]
+                .as_str()
+                .unwrap()
+                .contains("4: pub fn beta()")
+        );
 
         // 4. Atomic multi_edit: if second edit fails, first edit must NOT be written to disk.
         let failed_edit = mcp
@@ -6938,7 +6933,10 @@ mod spawn_args_tests {
                     timeout_ms: Some(5_000),
                 }))
                 .await;
-            assert!(res.is_err(), "expected `{forbidden_snippet}` to fail in sandbox");
+            assert!(
+                res.is_err(),
+                "expected `{forbidden_snippet}` to fail in sandbox"
+            );
         }
 
         // 4. Oversized return payloads (>48 KB) are safely truncated with `truncated: true`.

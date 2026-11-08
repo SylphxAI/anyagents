@@ -214,7 +214,9 @@ fn checks_with_principals(
         let sock = quote(&data.join("anyagents.sock"))?;
         list.push(Check {
             what: "the server's own files are denied",
-            program: format!("[ -S {sock} ] || ([ ! -r {sock} ] && [ ! -w {sock} ] && [ ! -x {sock} ])"),
+            program: format!(
+                "[ -S {sock} ] || ([ ! -r {sock} ] && [ ! -w {sock} ] && [ ! -x {sock} ])"
+            ),
         });
     }
     // The seat can traverse known children without being able to list agents/.
@@ -250,7 +252,10 @@ fn checks_with_principals(
         if Some(peer.as_path()) == config.and_then(Path::parent) || same_seat {
             continue;
         }
-        if total_peers > 32 && !known_foreign_roots.is_empty() && !known_foreign_roots.contains(peer.as_path()) {
+        if total_peers > 32
+            && !known_foreign_roots.is_empty()
+            && !known_foreign_roots.contains(peer.as_path())
+        {
             continue;
         }
         if total_peers > 32 && foreign_roots.len() >= 16 {

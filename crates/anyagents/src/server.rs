@@ -226,7 +226,7 @@ async fn serve(
             loop {
                 interval.tick().await;
                 tick_count = tick_count.wrapping_add(1);
-                let run_verify = tick_count % 15 == 0;
+                let run_verify = tick_count.is_multiple_of(15);
                 let root = reaper_root.clone();
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
@@ -4918,7 +4918,12 @@ async fn conversation_route(
     Query(query): Query<ConversationQuery>,
 ) -> Result<Json<ConversationResponse>, ApiError> {
     spawn_store(move || {
-        if let Some(topic) = query.topic.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        if let Some(topic) = query
+            .topic
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             let is_write = query.content.is_some() || query.delete == Some(true);
             if !is_write {
                 let (resolved_name, visible_agent_ids) =
@@ -4941,7 +4946,11 @@ async fn conversation_route(
                 } else {
                     state
                         .store
-                        .agent_by_name(resolved_name.strip_prefix("agent:").unwrap_or(&resolved_name))
+                        .agent_by_name(
+                            resolved_name
+                                .strip_prefix("agent:")
+                                .unwrap_or(&resolved_name),
+                        )
                         .map_err(ApiError::from_store)?
                 };
                 if let Some(visible) = visible_agent_ids.as_ref()
@@ -4953,7 +4962,11 @@ async fn conversation_route(
                         "cannot read private memory of another agent",
                     ));
                 }
-                let agent_root = state.store.data_dir().join("agents").join(target.id.as_str());
+                let agent_root = state
+                    .store
+                    .data_dir()
+                    .join("agents")
+                    .join(target.id.as_str());
                 let is_index_read = topic.eq_ignore_ascii_case("memory")
                     || topic.eq_ignore_ascii_case("memory.md")
                     || topic.eq_ignore_ascii_case("index");
@@ -4983,12 +4996,13 @@ async fn conversation_route(
                         file.read_to_end(&mut bytes)
                             .map_err(|e| ApiError::new(StatusCode::BAD_REQUEST, e.to_string()))?;
                         let text_preview = String::from_utf8_lossy(&bytes);
-                        let fm_updated_ms = anyagents_core::learned_memory::parse_topic_frontmatter_full(
-                            &slug,
-                            &text_preview,
-                        )
-                        .3
-                        .filter(|&ts| ts > 0);
+                        let fm_updated_ms =
+                            anyagents_core::learned_memory::parse_topic_frontmatter_full(
+                                &slug,
+                                &text_preview,
+                            )
+                            .3
+                            .filter(|&ts| ts > 0);
                         fm_updated_ms.or_else(|| {
                             file.metadata()
                                 .ok()
@@ -5086,7 +5100,11 @@ async fn conversation_route(
                 .store
                 .lock_agent_lifecycle(&target.id)
                 .map_err(ApiError::from_store)?;
-            let agent_root = state.store.data_dir().join("agents").join(target.id.as_str());
+            let agent_root = state
+                .store
+                .data_dir()
+                .join("agents")
+                .join(target.id.as_str());
             let now_ms = anyagents_core::now_ms();
             let turn = if query.delete == Some(true) {
                 let (removed, index) = anyagents_core::learned_memory::delete_memory_topic(
@@ -5466,16 +5484,15 @@ async fn conversation_route(
             .map(|(rank, t)| (1.0 / (30.0 + rank as f64), t))
             .collect();
         for (rank, (hit, bytes)) in file_hits.into_iter().enumerate() {
-            let reply_to =
-                (hit.metadata.source == anyagents_core::host_index::MemoryScope::Memory)
-                    .then(|| {
-                        hit.raw
-                            .segment
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .map(str::to_string)
-                    })
-                    .flatten();
+            let reply_to = (hit.metadata.source == anyagents_core::host_index::MemoryScope::Memory)
+                .then(|| {
+                    hit.raw
+                        .segment
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                })
+                .flatten();
             ranked.push((
                 1.0 / (30.0 + rank as f64),
                 ConversationTurnView {
@@ -9357,7 +9374,9 @@ exec '{}' "$@"
                     scope: anyagents_core::host_index::MemoryScope::Memory,
                     topic: Some("test-invariants".into()),
                     description: Some("Vulcan system invariants and verified receipts".into()),
-                    content: Some("# Test Invariants\n\nVerified invariant alpha-beta-gamma.\n".into()),
+                    content: Some(
+                        "# Test Invariants\n\nVerified invariant alpha-beta-gamma.\n".into(),
+                    ),
                     ..Default::default()
                 }),
             )
@@ -9391,7 +9410,12 @@ exec '{}' "$@"
                 }),
             )
             .await
-            .unwrap_or_else(|e| panic!("immediate raw_id readback failed: {}: {}", e.status, e.message));
+            .unwrap_or_else(|e| {
+                panic!(
+                    "immediate raw_id readback failed: {}: {}",
+                    e.status, e.message
+                )
+            });
             assert_eq!(raw_read.turns.len(), 1);
             assert!(
                 raw_read.turns[0].raw_bytes.is_some(),
@@ -9415,9 +9439,16 @@ exec '{}' "$@"
             .await
             .unwrap_or_else(|e| panic!("direct topic read failed: {}: {}", e.status, e.message));
             assert_eq!(topic_read.turns.len(), 1);
-            assert!(topic_read.turns[0].text.contains("Verified invariant alpha-beta-gamma."));
+            assert!(
+                topic_read.turns[0]
+                    .text
+                    .contains("Verified invariant alpha-beta-gamma.")
+            );
             assert!(topic_read.turns[0].raw_bytes.is_none());
-            assert_eq!(topic_read.turns[0].reply_to.as_deref(), Some("test-invariants.md"));
+            assert_eq!(
+                topic_read.turns[0].reply_to.as_deref(),
+                Some("test-invariants.md")
+            );
 
             // 5. Lexical search in scope="memory" returns the topic file with reply_to filename
             // and does not return duplicate MEMORY.md index hits.
@@ -9437,7 +9468,10 @@ exec '{}' "$@"
             .await
             .unwrap_or_else(|e| panic!("memory search failed: {}: {}", e.status, e.message));
             assert_eq!(searched.turns.len(), 1);
-            assert_eq!(searched.turns[0].reply_to.as_deref(), Some("test-invariants.md"));
+            assert_eq!(
+                searched.turns[0].reply_to.as_deref(),
+                Some("test-invariants.md")
+            );
         });
     }
 }

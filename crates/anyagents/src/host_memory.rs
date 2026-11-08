@@ -47,9 +47,7 @@ pub(crate) fn before_launch(data: &Path, agent: &AgentId) -> Result<(), Error> {
     match before_launch_from(data, agent, &owner_pages(data, explicit_test_mode())) {
         Ok(()) => Ok(()),
         Err(err) if !explicit_test_mode() => {
-            eprintln!(
-                "warning: host memory before_launch deferred for {agent}: {err}"
-            );
+            eprintln!("warning: host memory before_launch deferred for {agent}: {err}");
             Ok(())
         }
         Err(err) => Err(err),
