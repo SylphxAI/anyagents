@@ -67,19 +67,19 @@ fn production_archive_reap_does_not_recreate_seat_directories() {
     assert!(!cfg.join(".anyagents-reaped").exists());
 }
 
-struct Admin(std::process::Child);
+struct Server(std::process::Child);
 
-impl Drop for Admin {
+impl Drop for Server {
     fn drop(&mut self) {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-fn admin(data: &Path, home: &Path, stderr: &Path) -> Admin {
-    Admin(
+fn server(data: &Path, home: &Path, stderr: &Path) -> Server {
+    Server(
         command(data, home)
-            .arg("serve-admin")
+            .arg("serve")
             .stdout(std::process::Stdio::null())
             .stderr(std::fs::File::create(stderr).unwrap())
             .spawn()
@@ -87,7 +87,7 @@ fn admin(data: &Path, home: &Path, stderr: &Path) -> Admin {
     )
 }
 
-fn wait_for_reap(admin: &mut Admin, cfg: &Path, stderr: &Path, stage: &str) {
+fn wait_for_reap(server: &mut Server, cfg: &Path, stderr: &Path, stage: &str) {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -101,8 +101,8 @@ fn wait_for_reap(admin: &mut Admin, cfg: &Path, stderr: &Path, stage: &str) {
             return;
         }
         assert!(
-            admin.0.try_wait().unwrap().is_none(),
-            "{stage} admin exited: {}",
+            server.0.try_wait().unwrap().is_none(),
+            "{stage} server exited: {}",
             std::fs::read_to_string(stderr).unwrap()
         );
         assert!(
@@ -134,15 +134,8 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     let cfg = anyagents_core::agent_config_dir(&data, &child.id);
     std::fs::create_dir_all(cfg.join(".claude")).unwrap();
     std::fs::create_dir_all(cfg.join(".gemini")).unwrap();
-    // Both workers tick at startup. Reconciliation takes parent then child,
-    // while maintenance takes only the child. Exclude the unrelated reconciler
-    // so a valid busy-child skip (next maintenance pass: 60s) cannot race this
-    // fixture's 5s first-pass assertion, on either initial start or restart.
-    let _reconcile_parent = store
-        .lock_agent_lifecycle(child.parent_id.as_ref().unwrap())
-        .unwrap();
-    let stderr = root.path().join("admin.stderr");
-    let mut first = admin(&data, &home, &stderr);
+    let stderr = root.path().join("server.stderr");
+    let mut first = server(&data, &home, &stderr);
     wait_for_reap(&mut first, &cfg, &stderr, "initial");
     assert!(!cfg.join(".claude").exists());
     assert!(!cfg.join(".gemini").exists());
@@ -161,7 +154,7 @@ fn production_maintenance_reaps_legacy_archive_once_across_restart() {
     let second = store.create_agent(new).unwrap();
     store.set_agent_state(&second.id, "archived").unwrap();
     let second_cfg = anyagents_core::agent_config_dir(&data, &second.id);
-    let mut restarted = admin(&data, &home, &stderr);
+    let mut restarted = server(&data, &home, &stderr);
     wait_for_reap(&mut restarted, &second_cfg, &stderr, "restarted");
     assert!(
         cfg.join("shell-snapshots").exists(),
@@ -193,15 +186,13 @@ fn production_maintenance_skips_busy_archive_then_reaps_it_on_restart() {
     for child in [&busy, &canary] {
         store.set_agent_state(&child.id, "archived").unwrap();
     }
-    // Keep reconciliation from competing for either child, then force only
-    // the busy child's maintenance lock to fail on the initial startup pass.
-    let _parent = store.lock_agent_lifecycle(&parent.id).unwrap();
+    // Force only the busy child's maintenance lock to fail at startup.
     let busy_lock = store.lock_agent_lifecycle(&busy.id).unwrap();
     let cfg = anyagents_core::agent_config_dir(&data, &busy.id);
     std::fs::create_dir_all(cfg.join(".claude")).unwrap();
     let canary_cfg = anyagents_core::agent_config_dir(&data, &canary.id);
-    let stderr = root.path().join("admin.stderr");
-    let mut first = admin(&data, &home, &stderr);
+    let stderr = root.path().join("server.stderr");
+    let mut first = server(&data, &home, &stderr);
     wait_for_reap(&mut first, &canary_cfg, &stderr, "canary");
     // Completion of the independent canary proves maintenance actually ran;
     // the busy archive may validly remain pending until the next 60s pass.
@@ -209,7 +200,7 @@ fn production_maintenance_skips_busy_archive_then_reaps_it_on_restart() {
     assert!(cfg.join(".claude").exists());
     drop(first);
     drop(busy_lock);
-    let mut restarted = admin(&data, &home, &stderr);
+    let mut restarted = server(&data, &home, &stderr);
     wait_for_reap(&mut restarted, &cfg, &stderr, "unblocked restart");
     assert!(!cfg.join(".claude").exists());
 }

@@ -2224,11 +2224,7 @@ mod tests {
         let Some(data) = std::env::var_os("ANYAGENTS_RECOVERY_WORKER_DATA") else {
             return;
         };
-        if std::env::var("ANYAGENTS_RECOVERY_WORKER_MODE").unwrap() == "admin" {
-            crate::server::run_admin(Path::new(&data)).unwrap();
-        } else {
-            crate::server::run(Path::new(&data)).unwrap();
-        }
+        crate::server::run(Path::new(&data)).unwrap();
     }
 
     #[cfg(target_os = "linux")]
@@ -2403,110 +2399,102 @@ mod tests {
                 },
             )
             .unwrap();
-            for mode in ["primary", "admin"] {
-                let log = dir.path().join(format!("{mode}.log"));
-                let command_env = std::env::vars_os()
-                    .filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"ANYAGENTS_"));
-                let mut server = Server(
-                    std::process::Command::new(std::env::current_exe().unwrap())
-                        .env_clear()
-                        .envs(command_env)
-                        .env("ANYAGENTS_RECOVERY_WORKER_DATA", dir.path())
-                        .env("ANYAGENTS_RECOVERY_WORKER_MODE", mode)
-                        .env("TOKIO_WORKER_THREADS", "2")
-                        .args([
-                            "--exact",
-                            "worktree_access::tests::recovery_server_worker",
-                            "--nocapture",
-                        ])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::fs::File::create(&log).unwrap())
-                        .spawn()
-                        .unwrap(),
-                );
-                let socket = if mode == "admin" {
-                    dir.path().join("admin.sock")
-                } else {
-                    crate::server::socket_path(dir.path())
-                };
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-                let mut stream = loop {
-                    if let Ok(stream) = UnixStream::connect(&socket) {
-                        break stream;
-                    }
-                    assert!(
-                        server.0.try_wait().unwrap().is_none()
-                            && std::time::Instant::now() < deadline,
-                        "{kind}, exact={exact}, {mode}: {}",
-                        std::fs::read_to_string(&log).unwrap()
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                };
-                stream
-                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
-                    .unwrap();
-                stream.write_all(format!("GET /v1/whoami HTTP/1.1\r\nHost: local\r\n{}: {}\r\nConnection: close\r\n\r\n", crate::auth::AGENT_ID_HEADER, good).as_bytes()).unwrap();
-                let mut response = String::new();
-                stream.read_to_string(&mut response).unwrap();
+            let log = dir.path().join("server.log");
+            let command_env = std::env::vars_os()
+                .filter(|(key, _)| !key.as_encoded_bytes().starts_with(b"ANYAGENTS_"));
+            let mut server = Server(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .env_clear()
+                    .envs(command_env)
+                    .env("ANYAGENTS_RECOVERY_WORKER_DATA", dir.path())
+                    .env("TOKIO_WORKER_THREADS", "2")
+                    .args([
+                        "--exact",
+                        "worktree_access::tests::recovery_server_worker",
+                        "--nocapture",
+                    ])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::fs::File::create(&log).unwrap())
+                    .spawn()
+                    .unwrap(),
+            );
+            let socket = crate::server::socket_path(dir.path());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut stream = loop {
+                if let Ok(stream) = UnixStream::connect(&socket) {
+                    break stream;
+                }
                 assert!(
-                    response.starts_with("HTTP/1.1 200") && response.contains(good.as_str()),
-                    "{response}"
+                    server.0.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline,
+                    "{kind}, exact={exact}: {}",
+                    std::fs::read_to_string(&log).unwrap()
                 );
-                let recovered: Grant =
-                    serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
-                assert!(recovered.quarantined && recovered.inspection && !recovered.active);
-                assert!(
-                    bad_record
-                        .validate()
-                        .unwrap_err()
-                        .to_string()
-                        .contains("quarantined")
-                );
-                assert!(
-                    restore_recorded(dir.path(), &bad)
-                        .unwrap_err()
-                        .to_string()
-                        .contains("quarantined")
-                );
-                let launch = crate::vendor::vendor_launch(anyagents_supervisor::LaunchRequest {
-                    agent: bad_agent.clone(),
-                    data_dir: dir.path().to_path_buf(),
-                    config_dir: anyagents_core::agent_config_dir(dir.path(), &bad),
-                    work_dir: checkout.clone(),
-                    extra_env: Vec::new(),
-                });
-                let error = match launch {
-                    Err(error) => error,
-                    Ok(_) => panic!("quarantined worktree launched"),
-                };
-                assert!(error.contains("quarantined"), "{error}");
-                ensure_launchable(dir.path(), &good).unwrap();
-                assert!(
-                    !has_group(&after, gid),
-                    "a hostile entry stopped later revocation"
-                );
-                assert_eq!(acl(&survivor_dirs[0]), survivor_acl);
-                assert_eq!(acl(&common.join("objects")), objects_acl);
-                RecordedWorktree::load(dir.path(), &good, &survivor)
-                    .unwrap()
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
+            stream.write_all(format!("GET /v1/whoami HTTP/1.1\r\nHost: local\r\n{}: {}\r\nConnection: close\r\n\r\n", crate::auth::AGENT_ID_HEADER, good).as_bytes()).unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            assert!(
+                response.starts_with("HTTP/1.1 200") && response.contains(good.as_str()),
+                "{response}"
+            );
+            let recovered: Grant =
+                serde_json::from_slice(&std::fs::read(&journal).unwrap()).unwrap();
+            assert!(recovered.quarantined && recovered.inspection && !recovered.active);
+            assert!(
+                bad_record
                     .validate()
-                    .unwrap();
-                assert!(!has_group(&other.join("HEAD"), gid + 2));
-                let other_grant: Grant =
-                    serde_json::from_slice(&std::fs::read(&other_journal).unwrap()).unwrap();
-                assert!(!other_grant.inspection && !other_grant.quarantined);
-                assert_eq!(std::fs::read(&outside).unwrap(), outside_bytes);
-                assert_eq!(
-                    acl(&outside),
-                    outside_acl,
-                    "outside link target ACL changed"
-                );
-                assert!(
-                    std::fs::read_to_string(&log)
-                        .unwrap()
-                        .contains("quarantined worktree journal")
-                );
-            }
+                    .unwrap_err()
+                    .to_string()
+                    .contains("quarantined")
+            );
+            assert!(
+                restore_recorded(dir.path(), &bad)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("quarantined")
+            );
+            let launch = crate::vendor::vendor_launch(anyagents_supervisor::LaunchRequest {
+                agent: bad_agent.clone(),
+                data_dir: dir.path().to_path_buf(),
+                config_dir: anyagents_core::agent_config_dir(dir.path(), &bad),
+                work_dir: checkout.clone(),
+                extra_env: Vec::new(),
+            });
+            let error = match launch {
+                Err(error) => error,
+                Ok(_) => panic!("quarantined worktree launched"),
+            };
+            assert!(error.contains("quarantined"), "{error}");
+            ensure_launchable(dir.path(), &good).unwrap();
+            assert!(
+                !has_group(&after, gid),
+                "a hostile entry stopped later revocation"
+            );
+            assert_eq!(acl(&survivor_dirs[0]), survivor_acl);
+            assert_eq!(acl(&common.join("objects")), objects_acl);
+            RecordedWorktree::load(dir.path(), &good, &survivor)
+                .unwrap()
+                .validate()
+                .unwrap();
+            assert!(!has_group(&other.join("HEAD"), gid + 2));
+            let other_grant: Grant =
+                serde_json::from_slice(&std::fs::read(&other_journal).unwrap()).unwrap();
+            assert!(!other_grant.inspection && !other_grant.quarantined);
+            assert_eq!(std::fs::read(&outside).unwrap(), outside_bytes);
+            assert_eq!(
+                acl(&outside),
+                outside_acl,
+                "outside link target ACL changed"
+            );
+            assert!(
+                std::fs::read_to_string(&log)
+                    .unwrap()
+                    .contains("quarantined worktree journal")
+            );
             // Even after releasing a transient lock, quarantine is not cleared
             // by reaping: no build output or recovery evidence may be removed.
             drop(held_lock);
@@ -2526,7 +2514,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn locked_head_inspection_recovery_starts_both_servers_and_preserves_build_outputs() {
+    fn locked_head_inspection_recovery_starts_server_and_preserves_build_outputs() {
         recovery_quarantines_hostile_entry("flock");
     }
 
