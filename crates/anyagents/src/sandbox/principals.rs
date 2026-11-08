@@ -13,7 +13,8 @@ use serde_json::{Map, Value};
 const REGISTRY: &str = "execution-principals.json";
 
 type PrincipalTuple = (String, u32, u32, u32);
-type CachedRegistry = (u32, String, HashMap<String, PrincipalTuple>);
+type FileStamp = (u64, u64, u64, i64, i64);
+type CachedRegistry = (u32, FileStamp, String, HashMap<String, PrincipalTuple>);
 
 fn registry_cache() -> &'static Mutex<Option<CachedRegistry>> {
     static CACHE: OnceLock<Mutex<Option<CachedRegistry>>> = OnceLock::new();
@@ -37,7 +38,39 @@ pub(super) fn read_admitted_principal(
     data: &Path,
     agent_id: &str,
 ) -> Result<Option<PrincipalTuple>, Error> {
-    let Some((_, parsed)) = read_principal_registry_parsed(data)? else {
+    let path = data.join(REGISTRY);
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(&path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(Error::Message(
+                    "execution principal registry path cannot be resolved".into(),
+                )),
+            };
+        }
+        Err(err) => {
+            return Err(Error::Message(format!(
+                "cannot read {}: {err}",
+                path.display()
+            )));
+        }
+    };
+    let stamp = trusted_file(&file)?;
+    let me = super::current_uid();
+    if !super::is_isolated_test_env()
+        && let Ok(guard) = registry_cache().lock()
+        && let Some((cached_uid, cached_stamp, _, cached_map)) = guard.as_ref()
+        && *cached_uid == me
+        && *cached_stamp == stamp
+    {
+        return Ok(cached_map.get(agent_id).cloned());
+    }
+    let Some((_, parsed)) = read_principal_registry_from_file(file, stamp)? else {
         return Ok(None);
     };
     Ok(parsed.get(agent_id).cloned())
@@ -72,7 +105,14 @@ fn read_principal_registry_parsed(
             )));
         }
     };
-    trusted_file(&file)?;
+    let stamp = trusted_file(&file)?;
+    read_principal_registry_from_file(file, stamp)
+}
+
+fn read_principal_registry_from_file(
+    file: File,
+    stamp: FileStamp,
+) -> Result<Option<(String, HashMap<String, PrincipalTuple>)>, Error> {
     let mut raw = String::new();
     file.take(1_048_577).read_to_string(&mut raw)?;
     if raw.len() > 1_048_576 {
@@ -82,7 +122,7 @@ fn read_principal_registry_parsed(
     }
     let me = super::current_uid();
     if let Ok(guard) = registry_cache().lock()
-        && let Some((cached_uid, cached_raw, cached_map)) = guard.as_ref()
+        && let Some((cached_uid, _, cached_raw, cached_map)) = guard.as_ref()
         && *cached_uid == me
         && cached_raw == &raw
     {
@@ -108,12 +148,12 @@ fn read_principal_registry_parsed(
         parsed.insert(id.clone(), principal);
     }
     if let Ok(mut guard) = registry_cache().lock() {
-        *guard = Some((me, raw.clone(), parsed.clone()));
+        *guard = Some((me, stamp, raw.clone(), parsed.clone()));
     }
     Ok(Some((raw, parsed)))
 }
 
-fn trusted_file(file: &File) -> Result<(), Error> {
+fn trusted_file(file: &File) -> Result<FileStamp, Error> {
     let meta = file.metadata()?;
     if !meta.is_file()
         || meta.uid() != super::current_uid()
@@ -122,7 +162,13 @@ fn trusted_file(file: &File) -> Result<(), Error> {
     {
         return Err(Error::Message("execution principal registry must be a server-owned regular file without shared write access or links".into()));
     }
-    Ok(())
+    Ok((
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+    ))
 }
 
 /// Only the first daemon startup can import exact legacy OS account names.

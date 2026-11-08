@@ -1651,7 +1651,11 @@ pub(crate) fn seed_harness_credentials(
     if let (Some(bound), Some(primary_profile_root)) =
         (current_bound.clone(), profile_roots.first().cloned())
     {
+        let harvest_peers = all_agents.len() <= 32 || std::env::var_os("ANYAGENTS_TESTS").is_some();
         for other in &all_agents {
+            if !harvest_peers && other.id != agent.id {
+                continue;
+            }
             let other_cfg = agent_config_dir(data, &other.id);
             if bound_profile_name(&other_cfg).as_deref() == Some(bound.as_str()) {
                 for rel in [

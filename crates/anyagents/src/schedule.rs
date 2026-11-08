@@ -582,14 +582,19 @@ pub fn agent_wake_block_reason(
     }
     let cfg = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
     let (session_quota, session_error) = if agent.harness == "claude-code" {
-        let (_, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
+        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
         (
             anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
             persisted_err,
         )
-    } else {
+    } else if agent.harness == "agy" {
         anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+    } else {
+        match crate::vendor::read_persisted_last_error(&cfg) {
+            Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
+            Some((err, None)) => (None, err),
+            _ => (None, None),
+        }
     };
     let live = health.get(&agent.id);
     let effective_quota = live

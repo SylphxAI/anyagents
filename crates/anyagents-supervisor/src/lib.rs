@@ -809,7 +809,7 @@ impl<H: Harness + 'static> Session<H> {
         let _ = fs::create_dir_all(&self.paths.config_dir);
         let _ = fs::create_dir_all(&self.paths.managed_work);
         let _ = fs::create_dir_all(&self.paths.work_dir);
-        let rotated_ms =
+        let pre_rotated_ms =
             fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
@@ -823,6 +823,12 @@ impl<H: Harness + 'static> Session<H> {
         });
         match &res {
             Ok(_) => {
+                let post_rotated_ms =
+                    fs::read_to_string(self.paths.config_dir.join(".anyagents-profile-rotated-ms"))
+                        .ok()
+                        .and_then(|s| s.trim().parse::<i64>().ok())
+                        .unwrap_or(0);
+                let rotated_ms = pre_rotated_ms.max(post_rotated_ms);
                 let rotated_advanced = rotated_ms > self.process_profile_rotated_ms;
                 self.pending_switch_started_at = None;
                 self.process_started_at = Some(self.inner.clock.now_ms());
@@ -1012,9 +1018,13 @@ impl<H: Harness + 'static> Session<H> {
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
                 .is_some_and(|ms| ms >= started_at);
-        let config_switched = self.inner.store.agent(&self.id).is_ok_and(|fresh| {
-            fresh.harness != self.agent.harness || fresh.model != self.agent.model
-        });
+        let config_switched = self
+            .delivery
+            .as_ref()
+            .and_then(|delivery| delivery.store().agent(&self.id).ok())
+            .is_some_and(|fresh| {
+                fresh.harness != self.agent.harness || fresh.model != self.agent.model
+            });
         if rotated_after_start || cleared_after_start || config_switched || now >= reset_at {
             self.quota_started_at = None;
             if let Some(delivery) = self.delivery.as_mut() {
@@ -1127,8 +1137,13 @@ impl<H: Harness + 'static> Session<H> {
                 false
             }
             Err(err) if err.agent_busy() => true,
-            Err(_) => {
-                self.wake_unless_more();
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                self.publish();
+                self.inner.clock.wait(
+                    Some(self.inner.clock.now_ms() + IDLE_REVIEW_MS),
+                    &self.woken,
+                );
                 false
             }
         }
@@ -1141,19 +1156,20 @@ impl<H: Harness + 'static> Session<H> {
     /// expires. A profile rotation never preempts a live `InTurn` child; it
     /// remains pending until that turn finishes (or the child exits).
     fn try_apply_pending_switch(&mut self) -> bool {
-        let replaceable = {
+        let (replaceable, fresh) = {
             let Some(delivery) = self.delivery.as_ref() else {
                 self.pending_switch_started_at = None;
                 return false;
             };
             let health = delivery.harness().health();
-            health.turn_state == TurnState::Idle
+            let replaceable = health.turn_state == TurnState::Idle
                 || !health.process_alive
                 || health.sign_in_fault.is_some()
-                || self.last_error.is_some()
-        };
-        let Ok(fresh) = self.inner.store.agent(&self.id) else {
-            return false;
+                || self.last_error.is_some();
+            let Ok(fresh) = delivery.store().agent(&self.id) else {
+                return false;
+            };
+            (replaceable, fresh)
         };
         let config_changed = fresh.harness != self.agent.harness
             || fresh.model != self.agent.model
@@ -1228,7 +1244,7 @@ impl<H: Harness + 'static> Session<H> {
     /// Its config directory and session are preserved so sending any future message
     /// to the agent automatically wakes and resumes it.
     fn try_release_idle_agent(&mut self) -> bool {
-        if self.last_error.is_some() {
+        if self.last_error.is_some() || self.pending_recovery {
             return false;
         }
         let scaled = {
@@ -1237,6 +1253,11 @@ impl<H: Harness + 'static> Session<H> {
             };
             let health = delivery.harness().health();
             if health.turn_state != TurnState::Idle || health.sign_in_fault.is_some() {
+                return false;
+            }
+            if !matches!(delivery.store().next_undelivered(&self.id), Ok(None))
+                || delivery.store().has_open_turn(&self.id).unwrap_or(true)
+            {
                 return false;
             }
             if harness_has_inflight_processes(delivery.harness().process_id()) {
@@ -1381,6 +1402,37 @@ impl<H: Harness + 'static> Session<H> {
     }
 }
 
+fn direct_non_zombie_children_of(pid: u32) -> Option<Vec<u32>> {
+    let task_dir = fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut children = Vec::new();
+    let mut read_any = false;
+    for entry in task_dir.flatten() {
+        if let Ok(raw) = fs::read_to_string(entry.path().join("children")) {
+            read_any = true;
+            for tok in raw.split_whitespace() {
+                if let Ok(cpid) = tok.parse::<u32>()
+                    && cpid > 0
+                    && !children.contains(&cpid)
+                {
+                    let is_alive = fs::read_to_string(format!("/proc/{cpid}/status"))
+                        .ok()
+                        .is_some_and(|st| {
+                            !st.lines().any(|l| {
+                                l.strip_prefix("State:").is_some_and(|r| {
+                                    matches!(r.trim().chars().next(), Some('Z' | 'X'))
+                                })
+                            })
+                        });
+                    if is_alive {
+                        children.push(cpid);
+                    }
+                }
+            }
+        }
+    }
+    read_any.then_some(children)
+}
+
 /// Return `true` when `root_pid` has any non-zombie descendant process in `/proc`
 /// other than an idle persistent sidecar (`anyagents ... mcp`, `codex-code-mode-host`,
 /// or `language_server_linux`) that itself has no child processes.
@@ -1390,6 +1442,31 @@ fn harness_has_inflight_processes(root_pid: Option<u32>) -> bool {
     };
     #[cfg(unix)]
     {
+        if let Some(direct_children) = direct_non_zombie_children_of(root_pid) {
+            for cpid in direct_children {
+                let cmdline = fs::read(format!("/proc/{cpid}/cmdline"))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|b| if b == 0 { b' ' } else { b })
+                    .collect::<Vec<u8>>();
+                let cmd = String::from_utf8_lossy(&cmdline);
+                let cmd_trimmed = cmd.trim();
+                let is_persistent_sidecar = cmd_trimmed.contains(" mcp ")
+                    || cmd_trimmed.ends_with(" mcp")
+                    || cmd_trimmed.contains("codex-code-mode-host")
+                    || cmd_trimmed.contains("language_server_linux");
+                if is_persistent_sidecar {
+                    if direct_non_zombie_children_of(cpid)
+                        .is_some_and(|grandkids| !grandkids.is_empty())
+                    {
+                        return true;
+                    }
+                } else {
+                    return true;
+                }
+            }
+            return false;
+        }
         let Ok(entries) = fs::read_dir("/proc") else {
             return false;
         };

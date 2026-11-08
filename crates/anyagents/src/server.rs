@@ -134,8 +134,13 @@ async fn serve(
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
     let agents = store.list_agents()?;
+    let skip_archived_mint =
+        agents.len() > 32 && !crate::sandbox::is_isolated_test_env();
     let mut mint_failures = Vec::new();
     for agent in &agents {
+        if skip_archived_mint && agent.state == "archived" {
+            continue;
+        }
         if let Err(err) = crate::operator::ensure(&store, &agent.id) {
             mint_failures.push(format!("{}: {err}", agent.name));
         }
@@ -772,6 +777,19 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
     {
         use std::io::{Read as _, Write as _};
         use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+        let log_path = cfg.join(".gemini/antigravity-cli/cli.log");
+        if let Ok(cur) = std::fs::read_to_string(&log_path)
+            && let Some(pid_line) = cur
+                .lines()
+                .find(|l| l.starts_with("Starting language server process with pid "))
+            && let Some(pid_str) = pid_line.strip_prefix("Starting language server process with pid ")
+            && let Ok(existing_pid) = pid_str.trim().parse::<u32>()
+            && existing_pid > 0
+            && cur.contains("Language server listening on random port at ")
+            && std::path::Path::new(&format!("/proc/{existing_pid}/status")).is_file()
+        {
+            return false;
+        }
         let Some((_, seat_uid, seat_gid, seat_spec)) =
             create::resolved_agent_seat_info(store, agent)
                 .or_else(|| crate::sandbox::existing_config_seat(cfg))
@@ -864,7 +882,6 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
         let Some(port) = found_port else {
             return false;
         };
-        let log_path = cfg.join(".gemini/antigravity-cli/cli.log");
         let expected = format!(
             "Starting language server process with pid {pid}\nLanguage server listening on random port at {port} for HTTP\n"
         );
@@ -872,7 +889,7 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
             .ok()
             .is_some_and(|cur| cur.contains(&expected))
         {
-            return true;
+            return false;
         }
         let _ = std::fs::remove_file(&log_path);
         if std::fs::write(&log_path, &expected).is_ok() {
@@ -1406,14 +1423,21 @@ fn reconcile_agent_snapshot(
                     create::poke_agent_wake_socket_mail(data, &agent.id);
                 }
             }
-            let is_down_without_quota = match health.get(&agent.id) {
+            let (is_down_without_quota, explicitly_backed_off) = match health.get(&agent.id) {
                 Some(live) => {
-                    !live.process_alive
+                    let down = !live.process_alive
                         && live.quota_reset_at_ms.is_none()
                         && (live.restart_at_ms.is_none()
-                            || live.restart_at_ms.is_some_and(|r| r >= 15_000))
+                            || live.restart_at_ms.is_some_and(|r| r >= 15_000));
+                    (down, down && live.restart_at_ms.is_some())
                 }
-                None => true,
+                None => {
+                    let lock_held = matches!(
+                        store.try_lock_agent(&agent.id),
+                        Err(anyagents_core::Error::AgentBusy)
+                    );
+                    (!lock_held, false)
+                }
             };
             if is_down_without_quota
                 && oldest_age_ms.is_some_and(|age| age >= 15_000)
@@ -1429,11 +1453,13 @@ fn reconcile_agent_snapshot(
                     guard
                         .last_backoff_reset_ms
                         .insert(agent.id.to_string(), now_ms);
-                    let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-                    let _ = std::fs::write(
-                        cfg.join(".anyagents-profile-rotated-ms"),
-                        now_ms.to_string(),
-                    );
+                    if explicitly_backed_off {
+                        let cfg = anyagents_core::agent_config_dir(data, &agent.id);
+                        let _ = std::fs::write(
+                            cfg.join(".anyagents-profile-rotated-ms"),
+                            now_ms.to_string(),
+                        );
+                    }
                     create::poke_agent_wake_socket(data, &agent.id);
                     create::poke_agent_wake_socket_mail(data, &agent.id);
                 }
@@ -2213,8 +2239,8 @@ fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
         let Ok(mut stream) = UnixStream::connect(&sock) else {
             return;
         };
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(3000)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(3000)));
+        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(10_000)));
+        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(10_000)));
         let auth_hdr = match crate::operator::operator_token(data) {
             Some(tok) => format!("{}: {tok}\r\n", crate::operator::HEADER),
             None => String::new(),
@@ -3663,7 +3689,7 @@ fn archived_agent_view_fast(store: &Store, agent: &Agent) -> AgentView {
         oldest_undelivered_age_ms: None,
         install: install_state(store, agent),
         description: agent.public_description(),
-        instructions: agent.instructions.clone(),
+        instructions: None,
         seat_user: None,
         seat_uid: None,
         seat_gid: None,
@@ -3685,14 +3711,19 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     let (session_quota, mut session_error) = if agent.state == "archived" {
         (None, None)
     } else if agent.harness == "claude-code" {
-        let (_, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
+        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
         (
             anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
             persisted_err,
         )
-    } else {
+    } else if agent.harness == "agy" {
         anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+    } else {
+        match crate::vendor::read_persisted_last_error(&cfg) {
+            Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
+            Some((err, None)) => (None, err),
+            _ => (None, None),
+        }
     };
     if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
         session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);

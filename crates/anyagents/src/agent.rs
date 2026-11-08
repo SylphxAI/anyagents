@@ -992,6 +992,7 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         return;
     };
     let now = anyagents_core::now_ms();
+    let small_batch = views.len() <= 32;
     for view in views.iter_mut() {
         if view.state == "archived" {
             if view.harness == "sylphx" {
@@ -1011,21 +1012,23 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
         let Ok(id) = AgentId::parse(&view.id) else {
             continue;
         };
-        if let Ok(agent_rec) = store.agent(&id) {
+        let agent_rec = store.agent(&id).ok();
+        if let Some(ref agent_rec) = agent_rec {
             if view.role.is_none() {
                 view.role = agent_rec.role.clone();
             }
-            if view.aliases.is_empty() {
+            if view.aliases.is_empty() && small_batch {
                 view.aliases = store.agent_aliases(&id).unwrap_or_default();
             }
-            if let Some((u, uid, gid, _)) =
-                crate::create::resolved_agent_seat_info(&store, &agent_rec)
+            if (view.seat_user.is_none() || view.seat_uid.is_none() || view.seat_gid.is_none())
+                && let Some((u, uid, gid, _)) =
+                    crate::create::resolved_agent_seat_info(&store, agent_rec)
             {
                 view.seat_user = Some(u);
                 view.seat_uid = Some(uid);
                 view.seat_gid = Some(gid);
             }
-            if view.schedules.is_empty() {
+            if view.schedules.is_empty() && small_batch {
                 match crate::schedule::list_agent_schedules(&store, &id, false) {
                     Ok(schedules) => view.schedules = schedules,
                     Err(error) => {
@@ -1086,8 +1089,15 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             view.quota_reset_at_ms = None;
             view.last_error = None;
         }
-        let (persisted_q, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
+        let (persisted_q, persisted_err) = if view.harness == "agy" {
+            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+        } else {
+            match crate::vendor::read_persisted_last_error(&cfg) {
+                Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
+                Some((err, None)) => (None, err),
+                _ => (None, None),
+            }
+        };
         if view.quota_reset_at_ms.is_none() && view.harness == "claude-code" {
             view.quota_reset_at_ms =
                 anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now).or(persisted_q);
@@ -1095,7 +1105,7 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             view.quota_reset_at_ms = persisted_q;
         }
         if view.quota_reset_at_ms.is_none()
-            && let Ok(agent_rec) = store.agent(&id)
+            && let Some(ref agent_rec) = agent_rec
         {
             let prov =
                 crate::create::upstream_provider_of(&agent_rec.harness, agent_rec.model.as_deref());
@@ -1125,10 +1135,10 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             view.last_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
         }
         if let Some(reset_ms) = view.quota_reset_at_ms.filter(|&ms| ms > now)
-            && let Ok(agent_rec) = store.agent(&id)
+            && let Some(ref agent_rec) = agent_rec
         {
-            crate::create::record_profile_quota_reset(data, &agent_rec, reset_ms);
-            if crate::create::try_rotate_exhausted_profile(&store, data, &agent_rec, true).is_some()
+            crate::create::record_profile_quota_reset(data, agent_rec, reset_ms);
+            if crate::create::try_rotate_exhausted_profile(&store, data, agent_rec, true).is_some()
             {
                 view.quota_reset_at_ms = None;
                 view.last_error = None;

@@ -1787,9 +1787,22 @@ pub fn detect_agy_session_quota_and_error(
     }
     logs.sort_by_key(|b| std::cmp::Reverse(b.0));
     for (mtime_ms, path) in logs.into_iter().take(3) {
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Ok(mut file) = std::fs::File::open(&path) else {
             continue;
         };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let tail_offset = len.saturating_sub(65_536);
+        if tail_offset > 0 {
+            use std::io::Seek as _;
+            let _ = file.seek(std::io::SeekFrom::Start(tail_offset));
+        }
+        let mut text = String::new();
+        {
+            use std::io::Read as _;
+            if file.read_to_string(&mut text).is_err() {
+                continue;
+            }
+        }
         for line in text.lines().rev() {
             if let Some((_, after)) = line.split_once("run ended with error and no response: ") {
                 let err_str = after.trim().to_string();

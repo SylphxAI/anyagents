@@ -650,9 +650,25 @@ fn is_peer_boundary_shared(config: &Path, gid: u32) -> bool {
 /// Registered root-to-principal resolution is the same authority used by vendor
 /// launch. Unregistered directories remain foreign in the shared inventory.
 pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, Error> {
+    use std::sync::{Mutex, OnceLock};
+    type CachedPeers = (std::time::Instant, PathBuf, usize, String);
+    static PEERS_CACHE: OnceLock<Mutex<Option<CachedPeers>>> = OnceLock::new();
+
+    let agents = store.list_agents()?;
+    let cacheable = !is_isolated_test_env() && std::env::var_os("ANYAGENTS_PRINCIPALS").is_none();
+    if cacheable
+        && let Ok(guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock()
+        && let Some((at, ref dir, count, ref json)) = *guard
+        && dir == store.data_dir()
+        && count == agents.len()
+        && at.elapsed() < std::time::Duration::from_secs(15)
+    {
+        return Ok(json.clone());
+    }
+
     let mut peers = Vec::new();
-    for agent in store.list_agents()? {
-        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent) {
+    for agent in agents.iter() {
+        if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, agent) {
             let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
             let root = config.parent().unwrap().to_owned();
             if !root.exists() {
@@ -669,7 +685,18 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
             peers.push(anyagents_harness::SeatPeer { root, uid, gid });
         }
     }
-    serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))
+    let json = serde_json::to_string(&peers).map_err(|e| Error::Message(e.to_string()))?;
+    if cacheable
+        && let Ok(mut guard) = PEERS_CACHE.get_or_init(|| Mutex::new(None)).lock()
+    {
+        *guard = Some((
+            std::time::Instant::now(),
+            store.data_dir().to_path_buf(),
+            agents.len(),
+            json.clone(),
+        ));
+    }
+    Ok(json)
 }
 
 pub(super) fn descriptor_launcher() -> Option<PathBuf> {

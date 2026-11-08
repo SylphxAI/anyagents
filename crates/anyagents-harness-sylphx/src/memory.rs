@@ -902,6 +902,7 @@ pub(super) fn append_transcript_message(
     }
     let mut file =
         opened.map_err(|e| format!("opening transcript {}: {e}", transcript_path.display()))?;
+    let orig_len = file.metadata().map(|m| m.len()).unwrap_or(0);
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -915,9 +916,17 @@ pub(super) fn append_transcript_message(
                 .map_err(|e| format!("transcript sharing permissions: {e}"))?;
         }
     }
-    writeln!(file, "{line}")
+    let payload = format!("{line}\n");
+    if let Err(e) = file
+        .write_all(payload.as_bytes())
         .and_then(|()| file.sync_data())
-        .map_err(|e| format!("appending transcript {}: {e}", transcript_path.display()))?;
+    {
+        let _ = file.set_len(orig_len);
+        return Err(format!(
+            "appending transcript {}: {e}",
+            transcript_path.display()
+        ));
+    }
     Ok(msg)
 }
 
