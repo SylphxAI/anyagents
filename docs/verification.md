@@ -222,11 +222,15 @@ connections would lose them on disconnect. A real Chromium regression replaces
 the root document after admission but before native press and requires zero
 target clicks plus terminal pointerup/capture release. Failed discovery or
 installation therefore prevents an uncommitted press, not its terminal release.
-The persistent guard observes trusted mouse pointerdown/pointerup (including
-controls preventing compatibility mouse events). Viewer mouse events use no
-keyboard modifiers; cancellation reserves all four modifier bits on its native
-release. The guard suppresses only that cancelled sequence's click/default
-activation, never terminal pointerup/mouseup. Cancellation performs no discovery,
+Viewer mouse events use no keyboard modifiers; cancellation reserves all four
+modifier bits on its native release. The persistent guard recognizes that marker
+on the resulting click without requiring an observed pointerdown or pointerup.
+An intentional four-modifier press remains usable when its observed native
+pointerup and click share the same timestamp; a stale modified release cannot
+authorize a later click. A real Chromium regression installs an earlier page
+capture listener that stops pointerdown propagation and requires zero additional
+clicks and exactly one terminal release. The guard never consumes terminal
+pointerup/mouseup, including on controls preventing compatibility mouse events. Cancellation performs no discovery,
 installation, deadline check or cleanup round-trip. The next ordinary click and
 an intentionally four-modifier click remain usable; page-world globals are not
 introduced. Protocol tests reject incomplete/failed prepress admission, allow
@@ -235,8 +239,13 @@ discovery/script operations would fail slowly. Deterministic shipped-handler
 regressions cover committed pointer cancellation, hidden/zero-size surfaces and
 finite last coordinates, plus obsolete clipboard reads after local focus, blur
 or a newer paste turn. Accepted HTTP workers recheck the live token, holder,
-completion and expiry after reading; completion drains admitted dispatch, and
-an unfinished old-token request cannot dispatch after completion or replacement.
+completion and expiry after reading. Shared HTTP dispatch and exclusive ownership
+transitions use the same profile file lock across processes. Before handback, one
+shared terminal path drains the retained native press on its original page target;
+HTTP/direct completion, agent reclaim, CAPTCHA auto-completion and expiry all use
+it. Their five Chromium regressions each require one release, zero clicks and no
+second release after repeated completion/cleanup. An unfinished old-token request
+cannot dispatch after completion or replacement.
 Emulated touch is not a physical iPhone Safari receipt.
 `npm test` checks bounded move/wheel queues and no replay on input failure. The
 resource-free Rust regression holds an incomplete frame HTTP request open while

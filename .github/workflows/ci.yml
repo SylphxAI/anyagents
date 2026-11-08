@@ -118,6 +118,10 @@ jobs:
             browser::tests::takeover_clipboard_ui_acceptance -- --ignored --exact --nocapture
           cargo test -p anyagents --bin anyagents --locked \
             browser::tests::takeover_focus_finds_cross_origin_input -- --ignored --exact --nocapture
+          cargo test -p anyagents --bin anyagents --locked \
+            releases_held_press -- --ignored --nocapture
+          cargo test -p anyagents --bin anyagents --locked \
+            browser::tests::takeover_cancel_survives_earlier_stopped_pointerdown -- --ignored --exact --nocapture
       - name: Takeover acceptance evidence
         if: always() && github.event_name == 'workflow_dispatch' && inputs.takeover && github.event.repository.visibility == 'public'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2

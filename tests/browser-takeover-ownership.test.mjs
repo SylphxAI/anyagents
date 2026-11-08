@@ -260,14 +260,16 @@ test('new native paste supersedes previous unfinished fallback turn',async()=>{
   assert.deepEqual(ui.inputs.filter(p=>p.type==='paste').map(p=>p.text),['new paste']);
 });
 
-test('prearmed cancellation guard preserves terminal pointerup and subsequent ordinary/modified clicks', async () => {
+test('prearmed cancellation guard derives cancellation from the native release marker', async () => {
   const listeners = new Map(), window = {
     addEventListener(type, listener) { const list = listeners.get(type) || []; list.push(listener); listeners.set(type, list); },
   };
   const source = await readFile(new URL('../crates/anyagents/src/browser_takeover_cancel.js', import.meta.url), 'utf8');
   assert.equal(vm.runInNewContext(source, { window }), true);
+  let stamp = 0;
   const emit = (type, modifiers = false, trusted = true) => {
-    const e = { type, isTrusted: trusted, pointerType: 'mouse', altKey: modifiers, ctrlKey: modifiers,
+    if (type === 'pointerdown' || type === 'pointerup') stamp++;
+    const e = { timeStamp: stamp, type, isTrusted: trusted, pointerType: 'mouse', altKey: modifiers, ctrlKey: modifiers,
       metaKey: modifiers, shiftKey: modifiers, prevented: false, stopped: false,
       preventDefault() { this.prevented = true; }, stopImmediatePropagation() { this.stopped = true; } };
     for (const fn of listeners.get(type) || []) fn(e);
@@ -282,6 +284,11 @@ test('prearmed cancellation guard preserves terminal pointerup and subsequent or
     emit('pointerdown', modified); emit('pointerup', modified);
     assert.equal(emit('click', modified).prevented, false);
   }
+  emit('pointerup', true); // An earlier listener hid the unmodified pointerdown.
+  assert.equal(emit('click', true).prevented, true, 'missing pointerdown cannot bypass cancellation');
+  emit('pointerdown', true); emit('pointerup', true); // Disabled control: no click.
+  stamp++; // Both down/up of a later cancelled press are hidden.
+  assert.equal(emit('click', true).prevented, true, 'an old modified release cannot authorize a later click');
   emit('pointerdown'); emit('pointerup', true);
   assert.equal(emit('click', true, false).prevented, false, 'page-script events are not consumed');
   emit('pointerdown'); emit('pointerup');
