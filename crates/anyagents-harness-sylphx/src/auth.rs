@@ -196,7 +196,10 @@ pub fn run_device_flow_login(
                     let org_id = item
                         .pointer("/org/id")
                         .and_then(Value::as_str)
-                        .unwrap_or("sylphx")
+                        .filter(|s| !s.trim().is_empty())
+                        .ok_or_else(|| {
+                            InstallError::Failed("device key missing organization identity".into())
+                        })?
                         .to_string();
                     let org_slug = item
                         .pointer("/org/slug")
@@ -217,10 +220,13 @@ pub fn run_device_flow_login(
                     });
                 }
             }
-            let primary = orgs
-                .iter()
-                .find(|o| o.slug == "sylphx" || o.id == "sylphx")
-                .or_else(|| orgs.first())
+            let selected = std::env::var("SYLPHX_ORG_ID").ok().or_else(|| {
+                v.get("active_org")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
+            let primary = select_org(&orgs, selected.as_deref())
+                .map_err(InstallError::Failed)?
                 .cloned();
             let (api_key, key_name, org_id, org_slug) = if let Some(p) = primary {
                 (
@@ -321,6 +327,9 @@ pub fn save_sylphx_credentials(
 ) -> Result<(), std::io::Error> {
     let sylphx_dir = base_dir.join(".config/sylphx");
     std::fs::create_dir_all(&sylphx_dir)?;
+    for rel in [".config/opencode/sylphx.key", ".config/sylphx/key"] {
+        crate::contracts::read_optional(&base_dir.join(rel)).map_err(std::io::Error::other)?;
+    }
     let creds_path = sylphx_dir.join("credentials.json");
     let body = serde_json::to_string_pretty(creds).map_err(std::io::Error::other)?;
     write_secret_file(&creds_path, &format!("{body}\n"))?;
@@ -337,8 +346,8 @@ pub fn save_sylphx_credentials(
         };
         for rel in [".config/opencode/sylphx.key", ".config/sylphx/key"] {
             let p = base_dir.join(rel);
-            let existing_is_project_key = std::fs::read_to_string(&p)
-                .ok()
+            let existing_is_project_key = crate::contracts::read_optional(&p)
+                .map_err(std::io::Error::other)?
                 .map(|s| s.trim().starts_with("sk-sx-"))
                 .unwrap_or(false);
             if existing_is_project_key && key_trimmed.starts_with("sylphx_sk_") {
@@ -354,13 +363,8 @@ pub fn save_sylphx_credentials(
 }
 
 fn write_secret_file(path: &Path, content: &str) -> Result<(), std::io::Error> {
-    std::fs::write(path, content)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(())
+    // NamedTempFile creates a private 0600 file before writing secret bytes.
+    crate::contracts::write_atomic(path, content.as_bytes()).map_err(std::io::Error::other)
 }
 
 /// Writes `<config_dir>/sylphx-agent.json`, `<config_dir>/adapter.json`
@@ -391,9 +395,8 @@ pub fn write_sylphx_config(
     let mut command_vec = vec![mcp_command.display().to_string()];
     command_vec.extend(mcp_args.iter().cloned());
 
-    let existing_agent_json = std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let existing_agent_json = crate::contracts::read_json(&config_dir.join("sylphx-agent.json"))
+        .map_err(anyagents_core::Error::Message)?;
     let worktree_marker =
         std::fs::read_to_string(config_dir.join(".anyagents-managed-worktree.json"))
             .ok()
@@ -421,6 +424,13 @@ pub fn write_sylphx_config(
     });
 
     if let Some(obj) = doc.as_object_mut() {
+        if let Some(existing) = existing_agent_json.as_ref().and_then(Value::as_object) {
+            for (key, value) in existing {
+                if !obj.contains_key(key) {
+                    obj.insert(key.clone(), value.clone());
+                }
+            }
+        }
         for key in ["repo", "branch", "base"] {
             if let Some(val) = worktree_marker
                 .as_ref()
@@ -466,7 +476,15 @@ pub fn write_sylphx_config(
     }
     let text = serde_json::to_string_pretty(&doc)
         .map_err(|e| anyagents_core::Error::Message(e.to_string()))?;
-    std::fs::write(config_dir.join("sylphx-agent.json"), format!("{text}\n"))?;
+    for name in ["sylphx-agent.json", "adapter.json"] {
+        crate::contracts::read_optional(&config_dir.join(name))
+            .map_err(anyagents_core::Error::Message)?;
+    }
+    crate::contracts::write_atomic(
+        &config_dir.join("sylphx-agent.json"),
+        format!("{text}\n").as_bytes(),
+    )
+    .map_err(anyagents_core::Error::Message)?;
 
     let adapter_doc = json!({
         "harness": "sylphx",
@@ -476,9 +494,13 @@ pub fn write_sylphx_config(
         "mcp_command": mcp_command.display().to_string(),
         "mcp_args": mcp_args,
     });
-    if let Ok(adapter_text) = serde_json::to_string_pretty(&adapter_doc) {
-        let _ = std::fs::write(config_dir.join("adapter.json"), format!("{adapter_text}\n"));
-    }
+    let adapter_text = serde_json::to_string_pretty(&adapter_doc)
+        .map_err(|e| anyagents_core::Error::Message(e.to_string()))?;
+    crate::contracts::write_atomic(
+        &config_dir.join("adapter.json"),
+        format!("{adapter_text}\n").as_bytes(),
+    )
+    .map_err(anyagents_core::Error::Message)?;
 
     Ok(())
 }
@@ -789,23 +811,18 @@ pub fn resolve_upstream_endpoint(
     env: &[(String, String)],
     raw_model: Option<&str>,
 ) -> Result<ResolvedUpstreamEndpoint, String> {
-    let effective_model = raw_model
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            std::fs::read_to_string(config_dir.join("sylphx-agent.json"))
-                .ok()
-                .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-                .and_then(|v| {
-                    v.get("model")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
-                        .map(str::to_string)
-                })
-        });
-    let (stripped, reasoning_effort) = parse_sylphx_model_and_effort(effective_model.as_deref());
+    let selected = crate::contracts::read_json(&config_dir.join("sylphx-agent.json"))?;
+    let configured_model = selected
+        .as_ref()
+        .map(|v| {
+            v.get("model")
+                .map(|_| crate::contracts::required_text(v, "model"))
+                .transpose()
+        })
+        .transpose()?
+        .flatten();
+    let effective_model = raw_model.or(configured_model);
+    let (stripped, reasoning_effort) = parse_sylphx_model_and_effort(effective_model);
     if let Some((provider, submodel)) = stripped.split_once('/') {
         match provider {
             "kimi-code-plan" => {
@@ -1070,6 +1087,30 @@ fn parse_retry_after_ms(body: &str) -> Option<u64> {
         .and_then(Value::as_u64)
         .or_else(|| val.get("retry_after_seconds").and_then(Value::as_u64))?;
     Some(secs.min(30).saturating_mul(1_000))
+}
+
+/// Cloud mutations must not be replayed after a transport-ambiguous response.
+pub(crate) fn post_cloud_json(
+    url: &str,
+    bearer: Option<&str>,
+    body: &Value,
+) -> Result<(u16, String), String> {
+    let payload = serde_json::to_string(body).map_err(|e| e.to_string())?;
+    let mut request = shared_http_agent()
+        .post(url)
+        .header("content-type", "application/json");
+    if let Some(key) = bearer {
+        request = request.header("authorization", &format!("Bearer {key}"));
+    }
+    let response = request
+        .send(payload.as_bytes())
+        .map_err(|e| format!("cloud mutation outcome unresolved; do not replay: {e}"))?;
+    let status = response.status().as_u16();
+    let text = response
+        .into_body()
+        .read_to_string()
+        .map_err(|e| format!("cloud mutation response unresolved; do not replay: {e}"))?;
+    Ok((status, text))
 }
 
 fn curl_post_json_once(
@@ -1388,4 +1429,128 @@ pub(super) fn base64_decode(input: &str) -> Vec<u8> {
         }
     }
     out
+}
+
+fn select_org<'a>(
+    orgs: &'a [SylphxOrgCredential],
+    selected: Option<&str>,
+) -> Result<Option<&'a SylphxOrgCredential>, String> {
+    if let Some(id) = selected {
+        return orgs
+            .iter()
+            .find(|org| org.id == id)
+            .map(Some)
+            .ok_or_else(|| "selected organization was not returned by authentication".into());
+    }
+    match orgs {
+        [] => Ok(None),
+        [org] => Ok(Some(org)),
+        _ => {
+            Err("multiple organizations: set SYLPHX_ORG_ID or select an active organization".into())
+        }
+    }
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn organization_selection_uses_authority_not_publisher_name_or_order() {
+        let org = |id: &str, slug: &str| SylphxOrgCredential {
+            id: id.into(),
+            slug: slug.into(),
+            key_name: "device".into(),
+            store: "file".into(),
+            api_key: Some("fixture-key".into()),
+        };
+        let orgs = vec![org("tenant-a", "sylphx"), org("tenant-b", "example")];
+        assert!(
+            select_org(&orgs, None)
+                .unwrap_err()
+                .contains("multiple organizations")
+        );
+        assert_eq!(
+            select_org(&orgs, Some("tenant-b")).unwrap().unwrap().id,
+            "tenant-b"
+        );
+        assert!(select_org(&orgs, Some("foreign")).is_err());
+        assert_eq!(
+            select_org(&orgs[..1], None).unwrap().unwrap().id,
+            "tenant-a"
+        );
+        assert!(select_org(&[], None).unwrap().is_none());
+    }
+    #[test]
+    fn credentials_are_private_and_existing_project_keys_are_preserved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        let creds = SylphxCredentials {
+            api_key: "sylphx_sk_fixture".into(),
+            key_name: None,
+            org_id: Some("tenant-a".into()),
+            org_slug: None,
+            api_url: None,
+            base_url: None,
+            store: None,
+            orgs: vec![],
+            active_org: Some("tenant-a".into()),
+        };
+        std::fs::create_dir_all(cfg.join(".config/opencode")).unwrap();
+        std::fs::write(
+            cfg.join(".config/opencode/sylphx.key"),
+            "sk-sx-project-fixture",
+        )
+        .unwrap();
+        save_sylphx_credentials(cfg, &creds).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cfg.join(".config/opencode/sylphx.key")).unwrap(),
+            "sk-sx-project-fixture"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(cfg.join(".config/sylphx/credentials.json"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        std::fs::remove_file(cfg.join(".config/opencode/sylphx.key")).unwrap();
+        std::fs::create_dir(cfg.join(".config/opencode/sylphx.key")).unwrap();
+        let before = std::fs::read(cfg.join(".config/sylphx/credentials.json")).unwrap();
+        assert!(save_sylphx_credentials(cfg, &creds).is_err());
+        assert_eq!(
+            std::fs::read(cfg.join(".config/sylphx/credentials.json")).unwrap(),
+            before
+        );
+    }
+    #[test]
+    fn generated_configuration_preserves_caller_settings_and_refuses_adapter_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path();
+        std::fs::write(
+            cfg.join("sylphx-agent.json"),
+            r#"{"execution_mode":"local_only","context_sources":["notes.md"]}"#,
+        )
+        .unwrap();
+        write_sylphx_config(cfg, None, Path::new("anyagents"), &[]).unwrap();
+        let value = crate::contracts::read_json(&cfg.join("sylphx-agent.json"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(value["context_sources"], json!(["notes.md"]));
+        assert_eq!(value["execution_mode"], "local_only");
+        std::fs::remove_file(cfg.join("adapter.json")).unwrap();
+        std::fs::create_dir(cfg.join("adapter.json")).unwrap();
+        let before = std::fs::read(cfg.join("sylphx-agent.json")).unwrap();
+        assert!(
+            write_sylphx_config(cfg, Some("example/changed"), Path::new("anyagents"), &[]).is_err()
+        );
+        assert_eq!(
+            std::fs::read(cfg.join("sylphx-agent.json")).unwrap(),
+            before
+        );
+    }
 }
