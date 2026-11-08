@@ -304,6 +304,17 @@ fn deleting_an_opencode_agent_removes_its_allocation_and_releases_only_its_port(
         })
         .collect();
     assert_ne!(ports[0], ports[1]);
+    // A bound service can still be processing the initial creation turn.
+    // Deletion requires that turn to finish, not merely a listening port.
+    let alpha = store.agent_by_name("alpha").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while store.has_open_turn(&alpha.id).unwrap() {
+        assert!(
+            Instant::now() < deadline,
+            "alpha's initial turn is still open"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     let deleted = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .arg("--data")
         .arg(&data)

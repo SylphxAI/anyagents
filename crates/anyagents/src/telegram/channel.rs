@@ -3964,11 +3964,19 @@ fn call_api(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    // The integration harness includes this module, so its transport fixtures
+    // must share this lock with these tests rather than defining another one.
+    pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ENV.lock().unwrap_or_else(|err| err.into_inner())
+    }
 
     #[test]
     fn updates_payload_keeps_only_the_result_array() {
+        let _env = env_lock();
         let payload = updates_payload(r#"{"ok":true,"result":[{"update_id":1}]}"#).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&payload).unwrap();
         assert_eq!(parsed[0]["update_id"], 1);
@@ -3977,6 +3985,7 @@ mod tests {
 
     #[test]
     fn a_channel_without_a_secret_is_not_polled() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         store
@@ -3997,6 +4006,7 @@ mod tests {
 
     #[test]
     fn outbound_uses_the_named_agents_bot_and_keeps_the_token_out() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let ada = store
@@ -4040,6 +4050,7 @@ mod tests {
 
     #[test]
     fn a_bot_belongs_to_one_agent() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let ada = store
@@ -4067,6 +4078,7 @@ mod tests {
 
     #[test]
     fn no_telegram_channel_is_refused() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let ada = store
@@ -4079,6 +4091,7 @@ mod tests {
 
     #[test]
     fn a_chat_an_agent_answers_in_is_remembered_once() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let ada = store
@@ -4111,6 +4124,7 @@ mod tests {
 
     #[test]
     fn webhook_update_verifies_secret_and_routes_into_mailbox() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path().join("state.db")).unwrap();
         let ada = store
@@ -4178,6 +4192,7 @@ mod tests {
 
     #[test]
     fn token_of_trims_trailing_newline() {
+        let _env = env_lock();
         let dir = tempfile::tempdir().unwrap();
         let secrets = FileCredentialStore::new(dir.path());
         secrets
@@ -4220,6 +4235,7 @@ mod tests {
 
     #[test]
     fn corrupt_memory_refuses_webhook_and_merge_without_overwrite() {
+        let _env = env_lock();
         let (dir, store, agent, mut channel) = custody_fixture();
         let corrupt = r#"{"offset": 9, "chats": broken}"#;
         // Simulate legacy/damaged bytes; the current public setter refuses them.
@@ -4254,6 +4270,7 @@ mod tests {
 
     #[test]
     fn message_text_cannot_forge_membership_but_provider_ids_remove_exact_bot() {
+        let _env = env_lock();
         let (_dir, store, agent, channel) = custody_fixture();
         let mut memory = Memory::try_from_state(&channel.state).unwrap();
         let update = serde_json::json!([{"update_id":10,"message":{"message_id":1,"date":1,
@@ -4287,6 +4304,7 @@ mod tests {
 
     #[test]
     fn incomplete_media_never_publishes_or_replaces_valid_file() {
+        let _env = env_lock();
         struct Broken;
         impl std::io::Read for Broken {
             fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
@@ -4316,6 +4334,7 @@ mod tests {
 
     #[test]
     fn bot_suggestions_do_not_strip_prefixes_or_collide_after_truncation() {
+        let _env = env_lock();
         let names = [
             "helper",
             "team-helper",
@@ -4339,6 +4358,7 @@ mod tests {
 
     #[test]
     fn managed_bot_binding_requires_exact_persisted_immutable_target() {
+        let _env = env_lock();
         let (_dir, store, agent, _) = custody_fixture();
         let mut memory = Memory::default();
         assert!(
@@ -4372,6 +4392,7 @@ mod tests {
 
     #[test]
     fn manager_fallback_order_uses_relationship_then_channel_order() {
+        let _env = env_lock();
         let (_dir, store, agent, channel) = custody_fixture();
         let other = store
             .create_agent(anyagents_core::NewAgent::new("coordinator", "codex"))
@@ -4397,6 +4418,7 @@ mod tests {
 
     #[test]
     fn inbound_peer_failure_preserves_update_offset_until_retry() {
+        let _env = env_lock();
         let (dir, store, agent, channel) = custody_fixture();
         let peer = store
             .create_agent(anyagents_core::NewAgent::new("peer", "codex"))
@@ -4458,6 +4480,7 @@ mod tests {
 
     #[test]
     fn outbound_receipt_survives_failed_local_projection_and_replays_once() {
+        let _env = env_lock();
         let (dir, store, agent, channel) = custody_fixture();
         let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
         conn.execute(
@@ -4485,6 +4508,7 @@ mod tests {
 
     #[test]
     fn corrupt_relay_journal_is_preserved_not_treated_as_complete() {
+        let _env = env_lock();
         let (dir, store, _, _) = custody_fixture();
         let journal = dir.path().join("telegram-relay-pending");
         std::fs::create_dir_all(&journal).unwrap();
@@ -4553,6 +4577,7 @@ mod tests {
 
     #[test]
     fn provider_identity_failure_cannot_replace_existing_binding() {
+        let _env = env_lock();
         let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
         for (status, body) in [
             (401, r#"{"ok":false,"error_code":401}"#),
@@ -4577,6 +4602,7 @@ mod tests {
 
     #[test]
     fn validated_identity_replaces_binding_without_erasing_prior_credential() {
+        let _env = env_lock();
         let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
         let (dir, store, agent, _) = custody_fixture();
         let (base, task) = provider_response(
@@ -4606,6 +4632,7 @@ mod tests {
 
     #[test]
     fn binding_detach_or_identity_write_failure_is_not_reported_bound() {
+        let _env = env_lock();
         let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
         for trigger in [
             "CREATE TRIGGER reject_change BEFORE DELETE ON channel_agents BEGIN SELECT RAISE(ABORT, 'detach failure'); END;",
@@ -4632,6 +4659,7 @@ mod tests {
 
     #[test]
     fn managed_bot_custody_failure_preserves_offset_and_retries_same_unassigned_channel() {
+        let _env = env_lock();
         let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
         let (dir, store, agent, channel) = custody_fixture();
         let conn = rusqlite::Connection::open(dir.path().join("state.db")).unwrap();
@@ -4686,6 +4714,7 @@ mod tests {
     }
     #[test]
     fn immutable_sender_id_cannot_resolve_to_an_id_shaped_display_name() {
+        let _env = env_lock();
         let (_dir, store, agent, channel) = custody_fixture();
         let impostor = store
             .create_agent(anyagents_core::NewAgent::new(agent.id.to_string(), "codex"))
@@ -4715,6 +4744,7 @@ mod tests {
     }
     #[test]
     fn outbound_peer_failure_keeps_pinned_recipients_and_replays_without_remote_send() {
+        let _env = env_lock();
         let (dir, store, agent, _) = custody_fixture();
         let peer = store
             .create_agent(anyagents_core::NewAgent::new("peer", "codex"))
@@ -4764,6 +4794,7 @@ mod tests {
     }
     #[test]
     fn later_chunk_failure_keeps_accepted_chunk_local_custody() {
+        let _env = env_lock();
         let _fake = EnvRestore::set("ANYAGENTS_FAKE_MODE", "1");
         let (dir, store, agent, _) = custody_fixture();
         let peer = store
