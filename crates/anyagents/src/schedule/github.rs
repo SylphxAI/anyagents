@@ -140,8 +140,33 @@ pub(super) fn probe(
         pr,
         now,
         |path, etag, modified| request(&base, path, etag, modified, agent_id, owner),
-        anyagents_core::now_ms,
+        completed_now,
     ))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static COMPLETION_CLOCK: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn with_completion_clock<T>(now: i64, call: impl FnOnce() -> T) -> T {
+    struct Reset(Option<i64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            COMPLETION_CLOCK.set(self.0);
+        }
+    }
+    let _reset = Reset(COMPLETION_CLOCK.replace(Some(now)));
+    call()
+}
+
+fn completed_now() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = COMPLETION_CLOCK.get() {
+        return now;
+    }
+    anyagents_core::now_ms()
 }
 
 fn target_key(base: &str, owner: &str, repo: &str, reference: &str, pr: bool) -> String {

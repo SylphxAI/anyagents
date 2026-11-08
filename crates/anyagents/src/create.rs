@@ -32,6 +32,19 @@ pub fn format_agent_display(name: &str, role: Option<&str>) -> String {
     }
 }
 
+/// New config roots are private before credentials or a seat grant exist.
+/// DirBuilder leaves an existing root's admitted group/mode unchanged.
+fn create_private_config_dir(config: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(config)
+}
+
 pub fn create(store: &Store, data: &Path, request: CreateRequest) -> Result<Agent, Error> {
     create_with_consumer(
         store,
@@ -92,6 +105,7 @@ fn create_with_seat(
     let agent = store.create_agent(new)?;
     let data = std::path::absolute(data)?;
     let finish = (|| -> Result<Agent, Error> {
+        crate::sandbox::bind_principal(store, &agent)?;
         // Nothing is installed until an agent needs it: this is that moment. A
         // failure is the reason the agent's first turn cannot start, reported here
         // and never retried in a loop.
@@ -113,7 +127,7 @@ fn create_with_seat(
         let managed = agent_work_dir(&data, &agent.id);
         std::fs::create_dir_all(&managed)?;
         let config = agent_config_dir(&data, &agent.id);
-        std::fs::create_dir_all(&config)?;
+        create_private_config_dir(&config)?;
         let _ = std::fs::create_dir_all(config.join("tmp"));
         if let Some(prof) = request
             .profile
@@ -850,7 +864,7 @@ pub(crate) fn sync_agent_description_files(
             .ok()
             .map(|m| m.permissions().mode() & 0o7777)
     };
-    std::fs::create_dir_all(config)?;
+    create_private_config_dir(config)?;
     #[cfg(unix)]
     if let Some(base_mode) = pre_existing_mode {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2063,7 +2077,7 @@ pub(crate) fn reconcile_agent_runtime_config(
             .ok()
             .map(|m| m.permissions().mode() & 0o7777)
     };
-    std::fs::create_dir_all(config)?;
+    create_private_config_dir(config)?;
     #[cfg(unix)]
     if let Some(base_mode) = pre_existing_mode {
         use std::os::unix::fs::PermissionsExt as _;
@@ -2661,7 +2675,7 @@ pub(crate) fn configure_agent_runtime(
     }
     let updated = store.agent(&existing.id)?;
 
-    std::fs::create_dir_all(&config)?;
+    create_private_config_dir(&config)?;
     let normalized_profile = format!("{provider}/{profile_name}");
     if profile.is_some() && profile_dir.is_dir() {
         fn copy_files(source: &Path, target: &Path) -> Result<(), Error> {
@@ -8037,6 +8051,28 @@ mod tests {
         std::fs::create_dir_all(&cfg).unwrap();
         write_profile_marker(&cfg, ".anyagents-profile", "openai/busy\n").unwrap();
         agent
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_config_roots_are_private_and_existing_seat_grants_are_preserved() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_tempdir();
+        let config = dir.path().join("created/config");
+        create_private_config_dir(&config).unwrap();
+        assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o777, 0o700);
+        std::fs::write(config.join("credential"), "retained credential").unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o2770)).unwrap();
+        create_private_config_dir(&config).unwrap();
+        assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+        assert_eq!(
+            std::fs::read_to_string(config.join("credential")).unwrap(),
+            "retained credential"
+        );
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "preserved").unwrap();
+        assert!(create_private_config_dir(&blocked).is_err());
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "preserved");
     }
 
     #[test]

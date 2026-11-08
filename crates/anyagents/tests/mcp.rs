@@ -134,7 +134,7 @@ fn start_server(data: &std::path::Path) -> Serve {
 }
 
 fn start_server_mode(data: &std::path::Path, mode: &str) -> Serve {
-    let mut child = bin()
+    let mut child = support::contract_server()
         .arg("--data")
         .arg(data)
         .arg(mode)
@@ -436,7 +436,12 @@ async fn mcp_tools_use_the_server_socket() {
         ok_json(call(&beta, "conversation", serde_json::json!({})).await);
     assert_eq!(got.turns.len(), 2);
     assert_eq!(got.turns[0].text, "hello");
-    assert_eq!(got.turns[0].from, "agent:alpha");
+    let alpha_id = anyagents_core::Store::open(dir.path().join("state.db"))
+        .unwrap()
+        .agent_by_name("alpha")
+        .unwrap()
+        .id;
+    assert_eq!(got.turns[0].from, format!("agent:{alpha_id}"));
 
     // A room reaches every other agent, and not the sender.
     // A named group reaches its own members.
@@ -588,10 +593,15 @@ async fn mcp_tools_use_the_server_socket() {
         .join(&spawned.id)
         .join("config")
         .join("fixture-claude-started");
-    support::wait_for(
-        || marker.is_file(),
-        "canonical Claude fixture was not launched",
-    );
+    let deadline = Instant::now() + support::WAIT;
+    while !marker.is_file() {
+        if Instant::now() >= deadline {
+            let views: serde_json::Value =
+                ok_json(call(&alpha, "agents", serde_json::json!({"state":"all"})).await);
+            panic!("canonical Claude fixture was not launched: {views}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
     assert_eq!(
         std::fs::read_to_string(&marker).unwrap().trim(),
         dir.path().join("bin/fixture-claude").to_str().unwrap()

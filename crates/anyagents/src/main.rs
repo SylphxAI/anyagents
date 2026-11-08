@@ -811,6 +811,7 @@ fn resolve_data_dir(raw: PathBuf, _is_serve: bool) -> PathBuf {
 
 fn run(cli: Cli) -> Result<(), anyagents_core::Error> {
     let data = resolve_data_dir(cli.data, matches!(cli.command, Command::Serve));
+    sandbox::load_principal_registry(&data)?;
     match cli.command {
         Command::Serve => server::run(&data),
         Command::ServeAdmin => server::run_admin(&data),

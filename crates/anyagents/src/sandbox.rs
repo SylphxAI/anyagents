@@ -144,6 +144,18 @@ pub fn seat_named() -> bool {
 /// explicit `ANYAGENTS_*` environment variables). Host account names alone
 /// do not select an execution mode or admit a principal.
 pub fn seats_configured() -> bool {
+    // Presence is selection: an empty or malformed map must not downgrade to
+    // single-UID execution or fall back to another principal source.
+    if std::env::var_os("ANYAGENTS_PRINCIPALS").is_some()
+        || std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY").is_some_and(|path| {
+            match std::fs::symlink_metadata(path) {
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+                _ => true,
+            }
+        })
+    {
+        return true;
+    }
     if [
         "ANYAGENTS_PRINCIPALS",
         "ANYAGENTS_AGENTS",
@@ -179,7 +191,11 @@ pub fn launch_boundary(agents: &[String]) -> bool {
 /// The socket group: the configured one, else the host's `anyagents-sock`
 /// when running outside isolated tests.
 fn sock_gid_for() -> Option<u32> {
-    number("ANYAGENTS_SOCKET_GID").or_else(|| lookup_group("anyagents-sock"))
+    number("ANYAGENTS_SOCKET_GID").or_else(|| {
+        (!is_isolated_test_env())
+            .then(|| lookup_group("anyagents-sock"))
+            .flatten()
+    })
 }
 
 fn lookup_group(name: &str) -> Option<u32> {
@@ -195,6 +211,11 @@ fn lookup_group(name: &str) -> Option<u32> {
     }
 }
 
+mod principals;
+#[cfg(test)]
+use principals::read_principal_registry;
+pub(crate) use principals::{bind_principal, load_principal_registry, reconcile_principals};
+
 /// The seat one agent runs in: `(seat user, uid, gid, socket gid)`.
 ///
 /// Only the operator-owned ANYAGENTS_PRINCIPALS map keyed by immutable agent
@@ -209,7 +230,11 @@ pub fn seat_for_agent_with_hint(
     parent_name: Option<&str>,
 ) -> Option<(String, u32, u32, u32)> {
     let _ = parent_name; // Display/ancestry metadata is never execution authority.
-    let raw = std::env::var("ANYAGENTS_PRINCIPALS").ok()?;
+    if let Some(raw) = std::env::var_os("ANYAGENTS_PRINCIPALS") {
+        return admitted_principal(raw.to_str()?, agent_name);
+    }
+    let path = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY")?;
+    let raw = principals::read_principal_registry(Path::new(&path).parent()?).ok()??;
     admitted_principal(&raw, agent_name)
 }
 
@@ -223,7 +248,11 @@ fn admitted_principal(raw: &str, agent_id: &str) -> Option<(String, u32, u32, u3
         return None;
     }
     Some((
-        entry.get("user")?.as_str()?.to_string(),
+        entry
+            .get("user")?
+            .as_str()
+            .filter(|user| !user.trim().is_empty())?
+            .to_string(),
         uid,
         number("gid")?,
         number("socket_gid")?,
@@ -581,6 +610,12 @@ pub(crate) fn peer_principals(store: &anyagents_core::Store) -> Result<String, E
     let mut peers = Vec::new();
     for agent in store.list_agents()? {
         if let Some((_, uid, gid, _)) = crate::create::resolved_agent_seat_info(store, &agent) {
+            let config = anyagents_core::agent_config_dir(store.data_dir(), &agent.id);
+            // The immutable-ID grant, not historical ownership, authorizes this
+            // projection. Reconcile created peers before another seat probes them.
+            if config.is_dir() && existing_config_seat(&config).is_none() {
+                share_config_with_seat_uid(&config, uid, gid);
+            }
             peers.push(anyagents_harness::SeatPeer {
                 root: anyagents_core::agent_config_dir(store.data_dir(), &agent.id)
                     .parent()
@@ -740,6 +775,124 @@ mod tests {
         std::fs::write(dir.path().join(".anyagents-seat"), "worker").unwrap();
         std::fs::write(dir.path().join("installation_id"), "mutable vendor file").unwrap();
         assert!(existing_config_seat(dir.path()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_inventory_reconciles_created_configs_only_for_registered_principals() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _env = crate::server::tests::env_lock();
+        let previous = std::env::var_os("ANYAGENTS_PRINCIPALS");
+        let dir = crate::test_tempdir();
+        let store = anyagents_core::Store::open(dir.path().join("state.db")).unwrap();
+        let admitted = store
+            .create_agent(anyagents_core::NewAgent::new("created-worker", "opencode"))
+            .unwrap();
+        let foreign = store
+            .create_agent(anyagents_core::NewAgent::new(
+                "unregistered-worker",
+                "opencode",
+            ))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &admitted.id);
+        let foreign_config = anyagents_core::agent_config_dir(dir.path(), &foreign.id);
+        for path in [&config, &foreign_config] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::fs::write(path.join("sentinel"), "preserved").unwrap();
+        }
+        assert_eq!(admitted.state, "created");
+        let uid = if server_uid() == 42001 { 42002 } else { 42001 };
+        let gid = server_gid();
+        unsafe {
+            std::env::set_var("ANYAGENTS_PRINCIPALS", serde_json::json!({
+            admitted.id.as_str(): {"user":"registered-worker", "uid":uid, "gid":gid, "socket_gid":gid}
+        }).to_string());
+        }
+        let peers: Vec<anyagents_harness::SeatPeer> =
+            serde_json::from_str(&peer_principals(&store).unwrap()).unwrap();
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].root, config.parent().unwrap());
+        assert_eq!((peers[0].uid, peers[0].gid), (uid, gid));
+        assert_eq!(std::fs::metadata(&config).unwrap().mode() & 0o7777, 0o2770);
+        assert_eq!(
+            std::fs::metadata(&foreign_config).unwrap().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(store.agent(&admitted.id).unwrap().state, "created");
+        for path in [&config, &foreign_config] {
+            assert_eq!(
+                std::fs::read_to_string(path.join("sentinel")).unwrap(),
+                "preserved"
+            );
+        }
+        assert_eq!(
+            peer_principals(&store).unwrap(),
+            serde_json::to_string(&peers).unwrap()
+        );
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persisted_principal_registry_preserves_explicit_grants_without_name_inference() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        assert!(read_principal_registry(dir.path()).unwrap().is_none());
+        let id = anyagents_core::AgentId::generate();
+        let uid = if current_uid() == 42001 { 42002 } else { 42001 };
+        let raw = serde_json::json!({id.as_str(): {"user":"worker", "uid":uid, "gid":42003, "socket_gid":42004}}).to_string();
+        let path = dir.path().join("execution-principals.json");
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let previous = std::env::var_os("ANYAGENTS_PRINCIPALS");
+        let previous_registry = std::env::var_os("ANYAGENTS_PRINCIPAL_REGISTRY");
+        unsafe {
+            std::env::remove_var("ANYAGENTS_PRINCIPALS");
+        }
+        load_principal_registry(dir.path()).unwrap();
+        assert_eq!(
+            seat_for_agent(id.as_str()),
+            Some(("worker".into(), uid, 42003, 42004))
+        );
+        assert!(seat_for_agent("worker").is_none());
+        // An explicit map is authoritative even when the fallback is broken.
+        std::fs::write(&path, "corrupted").unwrap();
+        unsafe {
+            std::env::set_var("ANYAGENTS_PRINCIPALS", "{}");
+        }
+        load_principal_registry(dir.path()).unwrap();
+        assert!(seat_for_agent(id.as_str()).is_none());
+        unsafe {
+            std::env::remove_var("ANYAGENTS_PRINCIPALS");
+        }
+        assert!(read_principal_registry(dir.path()).is_err());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "corrupted");
+        std::fs::write(&path, &raw).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_principal_registry(dir.path()).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&path, "[]").unwrap();
+        assert!(read_principal_registry(dir.path()).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("missing"), &path).unwrap();
+        assert!(read_principal_registry(dir.path()).is_err());
+        unsafe {
+            match previous_registry {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPAL_REGISTRY", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPAL_REGISTRY"),
+            }
+            match previous {
+                Some(value) => std::env::set_var("ANYAGENTS_PRINCIPALS", value),
+                None => std::env::remove_var("ANYAGENTS_PRINCIPALS"),
+            }
+        }
     }
 
     #[test]

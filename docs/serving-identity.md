@@ -33,3 +33,35 @@ and the admin PID/start time must describe its replacement process. A disk
 
 These fields contain no token, environment, account or agent data. They establish
 process identity, not whether every supervised agent is healthy.
+
+## Persisted execution principals
+
+An OS-seat deployment can keep its explicit grants without setting an environment
+variable on every restart. `<data>/execution-principals.json` records principal
+bindings keyed by immutable agent ID, using the same schema as
+`ANYAGENTS_PRINCIPALS`:
+
+```json
+{"agt_00000000000000000000000000":{"user":"worker","uid":42001,"gid":42002,"socket_gid":42003}}
+```
+
+The daemon user must own this regular file; use mode `0600`. Shared-write files,
+links, malformed JSON, invalid identities and incomplete grants are rejected
+without modifying the registry. The CLI loads it before launching services or
+vendors only when `ANYAGENTS_PRINCIPALS` is absent. An explicit environment map
+always wins, including an empty or invalid value: it never falls back to another
+principal.
+
+On the first daemon startup without a registry, the server can import existing
+operator-owned OS accounts using `ANYAGENTS_SEAT_USER_PREFIX` (default `seat-`)
+and the configured socket group. It prefers an account named for the immutable
+ID, accepts existing display-name accounts only for that initial import, and
+persists the resulting ID bindings before starting workers. Subsequent startups
+and renames never derive grants from mutable names or credential-file ownership.
+Keep this registry with the deployment's durable state.
+
+At creation, an exact per-ID OS account is preferred; otherwise a child inherits
+its parent's bound principal. Newly created roots without an exact ID account
+need an explicit operator grant before managed-seat execution. Explicit
+environment maps disable this provisioning path and remain wholly operator-owned.
+The registry is mode `0600`, and launch boundary checks deny it to agent seats.

@@ -1864,7 +1864,13 @@ mod tests {
             assert_eq!(handle.join().unwrap().unwrap().1, "checks_in_progress");
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
-        assert_eq!(tick_schedules_once(&store, &health, now), 0);
+        // Keep the manually advanced tick and subprocess completion clocks in
+        // one time domain; production reads the wall clock after every probe.
+        let now = anyagents_core::now_ms();
+        let tick = |store: &Store, health: &HealthBoard, at| {
+            github::with_completion_clock(at, || tick_schedules_once(store, health, at))
+        };
+        assert_eq!(tick(&store, &health, now), 0);
         assert_eq!(calls.load(Ordering::SeqCst), 3);
         for (stage_num, transition) in [
             (1, "checks_completed"),
@@ -1873,20 +1879,20 @@ mod tests {
         ] {
             *stage.lock().unwrap() = stage_num;
             let at = now + i64::from(stage_num) * 60_000;
-            assert_eq!(tick_schedules_once(&store, &health, at), 1);
+            assert_eq!(tick(&store, &health, at), 1);
             let inbox = store.inbox(&owner.id, None).unwrap();
             let last = inbox.last().unwrap();
             assert!(last.text.starts_with(&format!("[watch: github:pr:ExampleOrg/project#452 transition={transition}]\nverify PR 452")), "{}", last.text);
             store.note_delivered(&owner.id, last.seq).unwrap();
             store.note_turn_completed(&owner.id).unwrap();
-            assert_eq!(tick_schedules_once(&store, &health, at + 1_000), 0);
+            assert_eq!(tick(&store, &health, at + 1_000), 0);
             let active = store.list_schedules(Some(&owner.id), true).unwrap();
             assert_eq!(active.len(), 1);
         }
         // A shared secondary-limit window records one typed error, retains
         // the successful baseline, and rereads the terminal state on recovery.
         *stage.lock().unwrap() = 5;
-        assert_eq!(tick_schedules_once(&store, &health, now + 240_000), 0);
+        assert_eq!(tick(&store, &health, now + 240_000), 0);
         let active = store.list_schedules(Some(&owner.id), true).unwrap();
         assert_eq!(
             active[0].watch_baseline.as_deref(),
@@ -1899,11 +1905,11 @@ mod tests {
         let before = calls.load(Ordering::SeqCst);
         *stage.lock().unwrap() = 4;
         for at in [240_001, 300_000, 359_999, 360_000, 361_000] {
-            assert_eq!(tick_schedules_once(&store, &health, now + at), 0);
+            assert_eq!(tick(&store, &health, now + at), 0);
         }
         assert_eq!(calls.load(Ordering::SeqCst), before);
         // Recovery is jittered across reset+60..300 seconds, not reset itself.
-        assert_eq!(tick_schedules_once(&store, &health, now + 660_000), 1);
+        assert_eq!(tick(&store, &health, now + 660_000), 1);
         assert_eq!(calls.load(Ordering::SeqCst), before + 1);
         let inbox = store.inbox(&owner.id, None).unwrap();
         assert!(inbox.last().unwrap().text.contains("transition=merged]"));

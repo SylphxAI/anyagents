@@ -47,7 +47,9 @@ pub fn sign_in_agent(
 ) -> Result<SignInOutcome, Error> {
     let store = Store::open(data.join("state.db"))?;
     let agent = store.agent_by_name(agent_name)?;
-    let root = store.data_dir().to_path_buf();
+    // Both the child cwd and vendor HOME/config variables must name the
+    // same directory even when the CLI received `--data .`.
+    let root = std::path::absolute(store.data_dir())?;
     if !signable(&agent.harness) {
         return Err(Error::NotImplemented(format!(
             "sign-in for harness {}",

@@ -258,6 +258,7 @@ fn machine_path(dir: &Path) -> std::ffi::OsString {
 }
 
 fn create(dir: &Path, name: &str) -> String {
+    support::operator_at(dir);
     let created = Command::new(env!("CARGO_BIN_EXE_anyagents"))
         .arg("--data")
         .arg(dir)

@@ -304,6 +304,8 @@ fn call(socket: &Path, request: &str) -> Value {
 fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
     let store = Store::open(dir.join("state.db")).unwrap();
     let agent = store.agent_by_name("kind").unwrap();
+    let author = store.agent_by_name(name).unwrap();
+    let expected_sender = format!("agent:{}", author.id);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let inbox = store.inbox(&agent.id, None).unwrap();
@@ -318,7 +320,7 @@ fn ask(dir: &Path, name: &str, harness: &str, sent_id: &str) {
                     && message
                         .sender
                         .as_deref()
-                        .is_some_and(|sender| sender == format!("agent:{name}"))
+                        .is_some_and(|sender| sender == expected_sender)
             })
             .collect();
         assert!(

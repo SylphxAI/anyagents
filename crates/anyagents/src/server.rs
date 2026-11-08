@@ -129,6 +129,7 @@ async fn serve(
     let _server_lock = acquire_server_lock(data)?;
     crate::worktree_access::recover_inspections(data)?;
     let store = Arc::new(Store::open(data.join("state.db"))?);
+    crate::sandbox::reconcile_principals(&store)?;
     crate::host_memory::on_start(&store);
     let key = capability_key()?;
     store.hold_capability_key(&key)?;

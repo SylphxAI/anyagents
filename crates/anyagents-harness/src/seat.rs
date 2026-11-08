@@ -184,6 +184,7 @@ fn checks_with_principals(
         "anyagents.sock",
         "operator-token",
         "identity-boundary.json",
+        "execution-principals.json",
     ] {
         list.push(deny("the server's own files are denied", &data.join(name))?);
     }
