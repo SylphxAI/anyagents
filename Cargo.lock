@@ -232,6 +232,7 @@ dependencies = [
  "anyagents-harness",
  "libc",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

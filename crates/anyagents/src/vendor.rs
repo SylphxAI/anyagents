@@ -468,6 +468,27 @@ fn retire_session_pointer(path: &Path) -> Result<(), String> {
     }
 }
 
+fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, String> {
+    let (_, error) = anyagents_harness_agy::detect_agy_session_quota_and_error(config_dir, now_ms);
+    if !error.is_some_and(|error| {
+        error
+            .to_ascii_lowercase()
+            .contains("invalid_argument (code 400)")
+    }) {
+        return Ok(false);
+    }
+    // Preserve native conversation databases and host history; only this
+    // continuation pointer is poisoned. A watermark prevents stale log replay.
+    retire_session_pointer(&config_dir.join("agy-session-id"))?;
+    retire_session_pointer(&config_dir.join(".anyagents-last-error.json"))?;
+    std::fs::write(
+        config_dir.join(".anyagents-quota-cleared-ms"),
+        now_ms.to_string(),
+    )
+    .map_err(|err| format!("cannot persist agy recovery watermark: {err}"))?;
+    Ok(true)
+}
+
 fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     let root = request.config_dir.parent().ok_or("agent root missing")?;
     let source = memory_source(&request.agent);
@@ -796,6 +817,7 @@ fn vendor_launch_inner(
         return Ok(VendorHarness::Contract(Box::new(harness)));
     }
     if request.agent.harness == "agy" {
+        retire_poisoned_agy_session(&request.config_dir, anyagents_core::now_ms())?;
         crate::create::clear_stale_agy_quota_error_steps(&request.config_dir);
         let program = std::env::var("ANYAGENTS_AGY_BIN").unwrap_or_else(|_| "agy".to_string());
         let session = session_from_file(&request.config_dir, "agy-session-id")?;
@@ -2345,6 +2367,87 @@ done
         let json2: serde_json::Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(json2, json);
     }
+    #[test]
+    fn poisoned_agy_session_retires_only_the_pointer_and_stale_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path();
+        let db = config.join(".gemini/antigravity-cli/conversations/selected.db");
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"native history").unwrap();
+        std::fs::write(config.join("state.db"), b"host history").unwrap();
+        std::fs::write(config.join("agy-session-id"), "selected").unwrap();
+        let now = anyagents_core::now_ms();
+        std::fs::write(
+            config.join(".anyagents-last-error.json"),
+            serde_json::json!({
+                "error":"INVALID_ARGUMENT (code 400): Request contains an invalid argument",
+                "timestamp_ms": now - 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(retire_poisoned_agy_session(config, now).unwrap());
+        assert!(!config.join("agy-session-id").exists());
+        assert!(!config.join(".anyagents-last-error.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(config.join(".anyagents-quota-cleared-ms")).unwrap(),
+            now.to_string()
+        );
+        assert_eq!(std::fs::read(&db).unwrap(), b"native history");
+        assert_eq!(
+            std::fs::read(config.join("state.db")).unwrap(),
+            b"host history"
+        );
+        assert!(!retire_poisoned_agy_session(config, now + 1).unwrap());
+    }
+
+    #[test]
+    fn poison_recovery_watermark_does_not_retire_a_fresh_session_from_stale_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs = dir.path().join(".gemini/antigravity-cli/log");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(
+            logs.join("cli-fixture.log"),
+            "run ended with error and no response: INVALID_ARGUMENT (code 400): invalid argument\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("agy-session-id"), "poisoned").unwrap();
+        let now = anyagents_core::now_ms() + 1;
+        assert!(retire_poisoned_agy_session(dir.path(), now).unwrap());
+        std::fs::write(dir.path().join("agy-session-id"), "fresh").unwrap();
+        assert!(!retire_poisoned_agy_session(dir.path(), now + 1).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("agy-session-id")).unwrap(),
+            "fresh"
+        );
+    }
+
+    #[test]
+    fn ordinary_agy_errors_and_quota_do_not_retire_sessions() {
+        for error in [
+            "transient connection failure",
+            "RESOURCE_EXHAUSTED: quota reached",
+            "INVALID_ARGUMENT unrelated validation",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("agy-session-id"), "selected").unwrap();
+            let last_error =
+                serde_json::json!({ "error": error, "timestamp_ms": anyagents_core::now_ms() })
+                    .to_string();
+            std::fs::write(dir.path().join(".anyagents-last-error.json"), &last_error).unwrap();
+            assert!(!retire_poisoned_agy_session(dir.path(), anyagents_core::now_ms()).unwrap());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("agy-session-id")).unwrap(),
+                "selected"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(".anyagents-last-error.json")).unwrap(),
+                last_error
+            );
+            assert!(!dir.path().join(".anyagents-quota-cleared-ms").exists());
+        }
+    }
+
     #[test]
     fn continuation_pointer_absence_is_distinct_from_invalid_or_unreadable_selection() {
         let dir = tempfile::tempdir().unwrap();
