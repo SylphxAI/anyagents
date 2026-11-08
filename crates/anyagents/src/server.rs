@@ -797,6 +797,10 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
             return false;
         };
         let uid_str = seat_uid.to_string();
+        let expected_session = std::fs::read_to_string(cfg.join("agy-session-id"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         let Ok(proc_entries) = std::fs::read_dir("/proc") else {
             return false;
         };
@@ -828,6 +832,13 @@ fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
                 .filter_map(|s| std::str::from_utf8(s).ok())
                 .filter(|s| !s.is_empty())
                 .collect();
+            if let Some(ref sid) = expected_session
+                && !args
+                    .windows(2)
+                    .any(|w| (w[0] == "--conversation" || w[0] == "--resume") && w[1] == sid)
+            {
+                continue;
+            }
             if args
                 .first()
                 .is_some_and(|p| p.ends_with("/agy") || *p == "agy")
@@ -4825,12 +4836,15 @@ fn prepare_agent_wake(store: &Store, found: &Agent) -> Result<(), ApiError> {
         create::reconcile_agent_runtime_config(store, store.data_dir(), found, &cfg, &work_dir)
             .map_err(|err| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()))?;
     }
+    let had_error = cfg.join(".anyagents-last-error.json").is_file();
     let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
     let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
-    let _ = std::fs::write(
-        cfg.join(".anyagents-profile-rotated-ms"),
-        format!("{}\n", now_ms()),
-    );
+    let now_str = format!("{}\n", now_ms());
+    if found.state == "running" && !had_error && store.has_open_turn(&found.id).unwrap_or(false) {
+        let _ = std::fs::write(cfg.join(".anyagents-quota-cleared-ms"), &now_str);
+    } else {
+        let _ = std::fs::write(cfg.join(".anyagents-profile-rotated-ms"), &now_str);
+    }
     crate::worktree_access::restore_recorded(store.data_dir(), &found.id)
         .map_err(ApiError::from_store)?;
     clear_explicitly_archived(store.data_dir(), &found.id);

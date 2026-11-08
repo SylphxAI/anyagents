@@ -736,13 +736,35 @@ impl StreamHarness {
                     state.open.push(message.id.clone());
                 }
             }
-            if let Err(err) = agy_rpc_send_steer(
+            let mut steer_res = agy_rpc_send_steer(
                 port,
                 &rpc.csrf_token,
                 &session_id,
                 &composed,
                 planner_config.as_ref(),
-            ) {
+            );
+            if let Err(ref err) = steer_res
+                && err.contains("plan model not specified")
+                && planner_config.is_none()
+                && let Ok(Some(fetched)) =
+                    agy_rpc_fetch_planner_config(port, &rpc.csrf_token, &session_id)
+            {
+                planner_config = Some(fetched.clone());
+                {
+                    let mut state = lock(&self.shared);
+                    if state.generation == generation && state.alive {
+                        state.planner_config = Some(fetched);
+                    }
+                }
+                steer_res = agy_rpc_send_steer(
+                    port,
+                    &rpc.csrf_token,
+                    &session_id,
+                    &composed,
+                    planner_config.as_ref(),
+                );
+            }
+            if let Err(err) = steer_res {
                 let mut state = lock(&self.shared);
                 state.open.retain(|id| id != &message.id);
                 if err.contains("plan model not specified") {

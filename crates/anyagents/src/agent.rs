@@ -722,12 +722,16 @@ fn set_state(data: &Path, name: &str, state: &str) -> Result<AgentView, Error> {
         {
             crate::create::reconcile_agent_runtime_config(&store, data, &found, &cfg, &work_dir)?;
         }
+        let had_error = cfg.join(".anyagents-last-error.json").is_file();
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         let _ = std::fs::remove_file(cfg.join(".anyagents-notified-parent-error.json"));
-        let _ = std::fs::write(
-            cfg.join(".anyagents-profile-rotated-ms"),
-            format!("{}\n", anyagents_core::now_ms()),
-        );
+        let now_str = format!("{}\n", anyagents_core::now_ms());
+        if found.state == "running" && !had_error && store.has_open_turn(&found.id).unwrap_or(false)
+        {
+            let _ = std::fs::write(cfg.join(".anyagents-quota-cleared-ms"), &now_str);
+        } else {
+            let _ = std::fs::write(cfg.join(".anyagents-profile-rotated-ms"), &now_str);
+        }
     }
     if state == "running" {
         crate::worktree_access::restore_recorded(data, &found.id)?;

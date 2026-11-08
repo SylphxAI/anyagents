@@ -2992,16 +2992,23 @@ pub(crate) fn propagate_profile_files_to_bound_agents(
                 "no profile credentials installed for {dir_id}"
             )));
         }
+        let same_seeded_profile =
+            seeded_profile_name(&cfg).as_deref() == Some(target_tag.as_str());
+        let has_active_turn = store_opt
+            .as_ref()
+            .is_some_and(|s| s.has_open_turn(&agent_rec.id).unwrap_or(false));
+        let had_error = cfg.join(".anyagents-last-error.json").is_file();
         write_profile_marker(
             &cfg,
             ".anyagents-seeded-profile",
             &format!("{target_tag}\n"),
         )?;
-        write_profile_marker(
-            &cfg,
-            ".anyagents-profile-rotated-ms",
-            &format!("{}\n", anyagents_core::now_ms()),
-        )?;
+        let now_str = format!("{}\n", anyagents_core::now_ms());
+        if !same_seeded_profile || !has_active_turn || had_error {
+            write_profile_marker(&cfg, ".anyagents-profile-rotated-ms", &now_str)?;
+        } else {
+            write_profile_marker(&cfg, ".anyagents-quota-cleared-ms", &now_str)?;
+        }
         let _ = std::fs::remove_file(cfg.join(".anyagents-last-error.json"));
         if let Some(s) = store_opt.as_ref() {
             if let Some((_, uid, gid, _)) = resolved_agent_seat_info(s, agent_rec) {
