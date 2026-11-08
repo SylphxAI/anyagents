@@ -4451,6 +4451,10 @@ async fn delete_agent_route(
                 "agent is archived but its process has not stopped; identity and resources are retained",
             ));
         }
+        // Health is a projection: the supervisor may publish stopped before
+        // its worker exits. Actual process custody must be released before any
+        // grant, identity or resource is removed; retain the guard to commit.
+        let _process = state.store.try_lock_agent(&found.id).map_err(ApiError::from_store)?;
         crate::worktree_access::revoke_recorded(state.store.data_dir(), &found.id)
             .map_err(ApiError::from_store)?;
         let deleted = state
@@ -6223,7 +6227,11 @@ fn send_sync(
     };
     let actor = &resolved_actor;
     let body = SendRequest {
-        sender: Some(actor.as_address()),
+        // A display name may be reassigned while a journal lock is held. Carry
+        // the admitted identity through mailbox storage and trusted context.
+        sender: Some(plan.sender_id.as_ref()
+            .map(|id| format!("agent:{id}"))
+            .unwrap_or_else(|| actor.as_address())),
         ..body
     };
     // A call repeated after its answer was lost is the same delivery: the
@@ -6452,11 +6460,16 @@ impl Actor {
 
 /// Everyone a room message will reach, without writing anything: the room's
 /// members (its chat, when it names one) minus the sender.
+fn body_author_is(body: &SendRequest, agent: &Agent) -> bool {
+    let Some(sender) = body.sender.as_deref() else { return false; };
+    let sender = sender.strip_prefix("agent:").unwrap_or(sender);
+    match anyagents_core::AgentId::parse(sender) {
+        Ok(id) => id == agent.id,
+        Err(_) => sender == agent.name,
+    }
+}
+
 fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> {
-    let sender = body
-        .sender
-        .as_deref()
-        .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
     let members = match store.room_members(room) {
         Ok(members) => members,
         Err(_) => return Vec::new(),
@@ -6470,7 +6483,7 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
                 && !is_explicitly_archived(store.data_dir(), agent)
         })
         .filter(|agent| members.is_some() || agent.parent_id.is_none())
-        .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+        .filter(|agent| !body_author_is(body, agent))
         .filter(|agent| {
             members
                 .as_ref()
@@ -6481,10 +6494,6 @@ fn room_recipients(store: &Store, body: &SendRequest, room: &str) -> Vec<Agent> 
 
 /// Non-running agents in a room that a broadcast or group send skipped, with their state reason.
 fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api::SkippedDelivery> {
-    let sender = body
-        .sender
-        .as_deref()
-        .map(|value| value.strip_prefix("agent:").unwrap_or(value).to_string());
     let name = room.strip_prefix("group:").unwrap_or(room);
     if name == "all" || name == "peers" {
         return store
@@ -6492,7 +6501,7 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
             .unwrap_or_default()
             .into_iter()
             .filter(|agent| agent.parent_id.is_none())
-            .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+            .filter(|agent| !body_author_is(body, agent))
             .filter(|agent| {
                 agent.state != "running" && agent.state != "idle" && agent.state != "archived"
             })
@@ -6510,7 +6519,7 @@ fn room_skipped(store: &Store, body: &SendRequest, room: &str) -> Vec<crate::api
         .list_agents()
         .unwrap_or_default()
         .into_iter()
-        .filter(|agent| sender.as_deref() != Some(agent.name.as_str()))
+        .filter(|agent| !body_author_is(body, agent))
         .filter(|agent| members.iter().any(|m| m == &agent.name))
         .filter(|agent| agent.state != "running" && agent.state != "idle")
         .map(|agent| crate::api::SkippedDelivery {
@@ -6965,8 +6974,14 @@ pub(crate) mod tests {
             assert_eq!(refused.status, StatusCode::CONFLICT);
             assert_eq!(state.store.agent(&agent.id).unwrap().state, "archived");
             assert_eq!(std::fs::read_to_string(config.join("preserve")).unwrap(), "retained state");
+            let process = state.store.try_lock_agent(&agent.id).unwrap();
             live.process_alive = false;
             state.health.publish(&agent.id, live);
+            let refused = delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.err().expect("optimistic health must not revoke process custody");
+            assert_eq!(refused.status, StatusCode::CONFLICT);
+            assert!(state.store.agent(&agent.id).is_ok());
+            assert_eq!(std::fs::read_to_string(config.join("preserve")).unwrap(), "retained state");
+            drop(process);
             delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.unwrap_or_else(|error| panic!("{}", error.message));
             assert!(state.store.agent(&agent.id).is_err());
             assert!(!config.exists());
@@ -7068,7 +7083,54 @@ pub(crate) mod tests {
         send_sync(&store, &actor, body, plan, None)
             .unwrap_or_else(|error| panic!("{}", error.message));
         let received = store.inbox(&receiver.id, None).unwrap();
-        assert_eq!(received[0].sender.as_deref(), Some("agent:renamed"));
+        assert_eq!(received[0].sender.as_deref(), Some(format!("agent:{}", original.id).as_str()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_sender_identity_survives_rename_while_journal_waits() {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        use std::time::{Duration, Instant};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let original = store.create_agent(anyagents_core::NewAgent::new("author", "opencode")).unwrap();
+        store.set_agent_role(&original.id, Some("admitted role")).unwrap();
+        let mut child = anyagents_core::NewAgent::new("recipient", "opencode");
+        child.parent_id = Some(original.id.clone());
+        let recipient = store.create_agent(child).unwrap();
+        let actor = Actor::Agent(original.name.clone());
+        let body = SendRequest { to: vec![recipient.name.clone()], text: "queued identity sentinel".into(), ..Default::default() };
+        let plan = SendPlan::parse(&store, &actor, &body).unwrap_or_else(|e| panic!("{}", e.message));
+        let key = "identity-lock-test";
+        let filename: String = format!("{key}:0").as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+        let journal = dir.path().join("outbound-history");
+        std::fs::create_dir_all(&journal).unwrap();
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(journal.join(format!("{filename}.lock"))).unwrap();
+        lock.lock().unwrap();
+        let inode = lock.metadata().unwrap().ino();
+        std::thread::scope(|scope| {
+            let sending = scope.spawn(|| send_sync(&store, &actor, body, plan, Some(key.into())).map_err(|e| e.message));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let waiting = loop {
+                let waiting = std::fs::read_to_string("/proc/locks").unwrap().lines().any(|line| line.contains("-> FLOCK") && line.contains("WRITE") && line.split_whitespace().any(|field| field.ends_with(&format!(":{inode}"))));
+                if waiting || Instant::now() >= deadline { break waiting; }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            // Release even on a failed observation, so the fixture cannot deadlock.
+            if waiting {
+                store.rename_agent(&original.id, "renamed").unwrap();
+                let replacement = store.create_agent(anyagents_core::NewAgent::new("author", "opencode")).unwrap();
+                store.set_agent_role(&replacement.id, Some("wrong role")).unwrap();
+            }
+            drop(lock);
+            sending.join().unwrap().unwrap();
+            assert!(waiting, "actual journal-lock waiter must be observed");
+        });
+        let inbox = store.inbox(&recipient.id, None).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].sender.as_deref(), Some(format!("agent:{}", original.id).as_str()));
+        assert_eq!(inbox[0].context.sender_role.as_deref(), Some("admitted role"));
+        assert_eq!(inbox[0].context.sender_rel.as_deref(), Some("parent"));
     }
 
     #[test]
