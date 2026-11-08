@@ -22,7 +22,7 @@ pub fn write(
         dir.join(".config").join("opencode").join("opencode.json"),
         dir.join("opencode.json"),
     ];
-    let mut root = crate::mcp_config::read_candidates(&candidates)?;
+    let mut root = crate::mcp_config::read_managed_candidates(&candidates)?;
     if root.get("provider").is_none()
         && let Some(donor) = donor_provider_block(dir)?
     {
@@ -79,12 +79,13 @@ pub fn write(
             build["tools"]["task"] = serde_json::Value::Bool(false);
         }
     }
-    root["mcp"] = serde_json::json!({
-        "anyagents": {
+    if !root.get("mcp").is_some_and(serde_json::Value::is_object) {
+        root["mcp"] = serde_json::json!({});
+    }
+    root["mcp"]["anyagents"] = serde_json::json!({
             "type": "local",
             "command": command_args(command, args),
             "enabled": true,
-        }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
     write_atomic(&dir.join("opencode.json"), &bytes)?;
@@ -97,25 +98,8 @@ pub fn write(
     Ok(())
 }
 
-static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let tmp = path.with_file_name(format!(
-        ".{}.{pid}.{seq}.anyagents-new",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("opencode.json")
-    ));
-    std::fs::write(&tmp, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::mcp_config::atomic_write_shared(path, bytes)
 }
 
 fn donor_provider_block(dir: &Path) -> Result<Option<serde_json::Value>, Error> {
@@ -238,7 +222,7 @@ mod tests {
         assert!(parsed.get("model").is_none(), "{parsed}");
     }
     #[test]
-    fn invalid_existing_candidates_never_overwrite_valid_or_invalid_aliases() {
+    fn invalid_managed_candidates_recover_and_preserve_any_valid_alias() {
         for bad in [
             "opencode.json",
             "opencode/opencode.json",
@@ -251,10 +235,21 @@ mod tests {
             let malformed = dir.path().join(bad);
             std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
             std::fs::write(&malformed, b"{broken").unwrap();
-            let before = std::fs::read(&selected).unwrap();
-            assert!(write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
-            assert_eq!(std::fs::read(&selected).unwrap(), before);
-            assert_eq!(std::fs::read(&malformed).unwrap(), b"{broken");
+            write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&malformed).unwrap()).unwrap();
+            assert_eq!(
+                repaired["mcp"]["anyagents"]["command"][0],
+                "/opt/bin/anyagents"
+            );
+            if malformed != selected {
+                assert_eq!(repaired["custom"], "keep");
+            }
+            let backup = malformed.with_file_name(format!(
+                ".opencode.json.invalid-{}.json",
+                anyagents_core::learned_memory::sha256(b"{broken")
+            ));
+            assert_eq!(std::fs::read(backup).unwrap(), b"{broken");
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("opencode.json")).unwrap();
@@ -269,10 +264,12 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["custom"] = serde_json::json!("keep");
+        value["mcp"]["other"] = serde_json::json!({"type":"local","command":["other-program"]});
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
         let after: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(after["custom"], "keep");
+        assert_eq!(after["mcp"]["other"]["command"][0], "other-program");
     }
 }

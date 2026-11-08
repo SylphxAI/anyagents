@@ -69,7 +69,7 @@ pub fn write(
     args: &[String],
 ) -> Result<(), Error> {
     let path = dir.join("settings.json");
-    let mut root = crate::mcp_config::read_candidates(&[
+    let mut root = crate::mcp_config::read_managed_candidates(&[
         path.clone(),
         dir.join("muse/settings.json"),
         dir.join(".config/muse/settings.json"),
@@ -96,12 +96,16 @@ pub fn write(
         .to_string();
     all.push(clean_cmd);
     all.extend(args.iter().cloned());
-    root["mcpServers"] = serde_json::json!({
-        "anyagents": {
+    if !root
+        .get("mcpServers")
+        .is_some_and(serde_json::Value::is_object)
+    {
+        root["mcpServers"] = serde_json::json!({});
+    }
+    root["mcpServers"]["anyagents"] = serde_json::json!({
             "mode": "required",
             "command": all[0],
             "args": all[1..].to_vec(),
-        }
     });
     let bytes = serde_json::to_vec_pretty(&root).map_err(|err| Error::Message(err.to_string()))?;
     write_atomic(&path, &bytes)?;
@@ -302,25 +306,8 @@ fn finish_workspace_session(
     Ok(())
 }
 
-static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let tmp = path.with_file_name(format!(
-        ".{}.{pid}.{seq}.anyagents-new",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("settings.json")
-    ));
-    std::fs::write(&tmp, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    crate::mcp_config::atomic_write_shared(path, bytes)
 }
 
 #[cfg(test)]
@@ -421,7 +408,7 @@ mod tests {
         assert_eq!(muse_sub["model"], "muse-wonder-full-1.0");
     }
     #[test]
-    fn invalid_existing_candidates_never_overwrite_valid_or_invalid_aliases() {
+    fn invalid_managed_candidates_recover_and_preserve_any_valid_alias() {
         for bad in [
             "settings.json",
             "muse/settings.json",
@@ -434,10 +421,21 @@ mod tests {
             let malformed = dir.path().join(bad);
             std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
             std::fs::write(&malformed, b"{broken").unwrap();
-            let before = std::fs::read(&selected).unwrap();
-            assert!(write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
-            assert_eq!(std::fs::read(&selected).unwrap(), before);
-            assert_eq!(std::fs::read(&malformed).unwrap(), b"{broken");
+            write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+            let repaired: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&malformed).unwrap()).unwrap();
+            assert_eq!(
+                repaired["mcpServers"]["anyagents"]["command"],
+                "/opt/bin/anyagents"
+            );
+            if malformed != selected {
+                assert_eq!(repaired["custom"], "keep");
+            }
+            let backup = malformed.with_file_name(format!(
+                ".settings.json.invalid-{}.json",
+                anyagents_core::learned_memory::sha256(b"{broken")
+            ));
+            assert_eq!(std::fs::read(backup).unwrap(), b"{broken");
         }
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("settings.json")).unwrap();
@@ -452,11 +450,13 @@ mod tests {
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["custom"] = serde_json::json!("keep");
+        value["mcpServers"]["other"] = serde_json::json!({"command":"other-program"});
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
         let after: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(after["custom"], "keep");
+        assert_eq!(after["mcpServers"]["other"]["command"], "other-program");
     }
 
     fn initializer_fixture(session_result: &str) -> std::process::Child {

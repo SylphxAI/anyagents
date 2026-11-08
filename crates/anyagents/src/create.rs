@@ -11332,6 +11332,43 @@ mod runtime_config_tests {
     use super::*;
 
     #[test]
+    fn agy_runtime_reconciliation_rebuilds_empty_and_malformed_managed_mcp_config() {
+        let _env = crate::server::tests::env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        store
+            .hold_capability_key("0123456789abcdef0123456789abcdef")
+            .unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("worker", "agy"))
+            .unwrap();
+        let config = agent_config_dir(dir.path(), &agent.id);
+        let path = config.join(".gemini/config/mcp_config.json");
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        for bytes in [b"".as_slice(), b"{partial"] {
+            std::fs::write(&path, bytes).unwrap();
+            reconcile_agent_runtime_config(&store, dir.path(), &agent, &config, &work).unwrap();
+            let value: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(
+                value["mcpServers"]["anyagents"]["command"]
+                    .as_str()
+                    .is_some()
+            );
+            assert!(
+                value["mcpServers"]["anyagents"]["args"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|arg| arg == "mcp")
+            );
+            verify_harness_runtime_config(&config, "agy", None).unwrap();
+        }
+    }
+
+    #[test]
     fn required_writes_markers_and_refresh_recovery_report_destination_failures() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("required");

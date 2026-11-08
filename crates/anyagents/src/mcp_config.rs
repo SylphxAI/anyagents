@@ -29,8 +29,62 @@ pub(crate) fn read_candidates(paths: &[std::path::PathBuf]) -> Result<serde_json
     Ok(selected.unwrap_or_else(|| serde_json::json!({})))
 }
 
+/// Only callers projecting a managed MCP entry may recover malformed JSON.
+/// Preserve the exact rejected bytes before replacing a derivative config;
+/// permission and other I/O failures are not evidence of an empty document.
+pub(crate) fn read_managed_candidates(
+    paths: &[std::path::PathBuf],
+) -> Result<serde_json::Value, Error> {
+    let mut selected = None;
+    for path in paths {
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && value.is_object()
+        {
+            if selected.is_none() {
+                selected = Some(value);
+            }
+            continue;
+        }
+        let digest = anyagents_core::learned_memory::sha256(&bytes);
+        let backup = path.with_file_name(format!(
+            ".{}.invalid-{digest}.json",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        ));
+        match std::fs::read(&backup) {
+            Ok(saved) if saved == bytes => (),
+            Ok(_) => {
+                return Err(Error::Message(format!(
+                    "managed config recovery backup differs: {}",
+                    backup.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                crate::create::write_required_file(&backup, &bytes, 0o600)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if std::fs::read(&backup)? != bytes {
+            return Err(Error::Message(format!(
+                "managed config recovery backup verification failed: {}",
+                backup.display()
+            )));
+        }
+        eprintln!(
+            "mcp: rebuilding invalid managed config {}; original retained at {}",
+            path.display(),
+            backup.display()
+        );
+    }
+    Ok(selected.unwrap_or_else(|| serde_json::json!({})))
+}
+
 pub fn write_claude(path: &Path, command: &Path, args: &[String]) -> Result<(), Error> {
-    let mut root = read_json(path)?;
+    let mut root = read_managed_candidates(&[path.to_owned()])?;
     let servers = root
         .as_object_mut()
         .ok_or_else(|| Error::Message("claude config is not an object".into()))?
@@ -150,28 +204,8 @@ pub fn sanitize_claude_settings(config_dir: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-static NEXT_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let seq = NEXT_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let pid = std::process::id();
-    let tmp_path = path.with_file_name(format!(
-        ".{}.{pid}.{seq}.anyagents-new",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config")
-    ));
-    std::fs::write(&tmp_path, bytes)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp_path, path)?;
-    Ok(())
+pub(crate) fn atomic_write_shared(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    crate::create::write_required_file(path, bytes, 0o660)
 }
 
 #[allow(dead_code)]
@@ -477,6 +511,80 @@ fn toml_escape(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_mcp_json_recovers_empty_and_malformed_bytes_without_losing_them() {
+        for bytes in [b"".as_slice(), b"  \n", b"{broken", b"[]", &[0xff, 0xfe]] {
+            let dir = crate::test_tempdir();
+            let path = dir.path().join(".gemini/config/mcp_config.json");
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+            write_claude(&path, Path::new("/opt/bin/anyagents"), &["mcp".into()]).unwrap();
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                parsed["mcpServers"]["anyagents"]["command"],
+                "/opt/bin/anyagents"
+            );
+            let digest = anyagents_core::learned_memory::sha256(bytes);
+            let backup = path.with_file_name(format!(".mcp_config.json.invalid-{digest}.json"));
+            assert_eq!(std::fs::read(&backup).unwrap(), bytes);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                    0o660
+                );
+                assert_eq!(
+                    std::fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn managed_mcp_rebuild_preserves_other_servers_and_io_failures_still_refuse() {
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("mcp.json");
+        std::fs::write(
+            &path,
+            br#"{"custom":"keep","mcpServers":{"other":{"command":"other-program"}}}"#,
+        )
+        .unwrap();
+        write_claude(&path, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+        let value = read_json(&path).unwrap();
+        assert_eq!(value["custom"], "keep");
+        assert_eq!(value["mcpServers"]["other"]["command"], "other-program");
+        let unreadable = dir.path().join("directory.json");
+        std::fs::create_dir(&unreadable).unwrap();
+        assert!(write_claude(&unreadable, Path::new("unused"), &[]).is_err());
+        assert!(unreadable.is_dir());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn shared_config_atomic_replacement_keeps_old_open_inode_and_new_mode() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_tempdir();
+        let path = dir.path().join("mcp_config.json");
+        atomic_write_shared(&path, br#"{"previous":true}"#).unwrap();
+        let mut old = std::fs::File::open(&path).unwrap();
+        let inode = old.metadata().unwrap().ino();
+        atomic_write_shared(&path, br#"{"mcpServers":{"anyagents":{"command":"next"}}}"#).unwrap();
+        assert_ne!(std::fs::metadata(&path).unwrap().ino(), inode);
+        let mut retained = String::new();
+        old.read_to_string(&mut retained).unwrap();
+        assert_eq!(retained, r#"{"previous":true}"#);
+        assert_eq!(
+            read_json(&path).unwrap()["mcpServers"]["anyagents"]["command"],
+            "next"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o660);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
 
     #[test]
     fn codex_config_writes_native_sylphx_provider_and_reasoning_effort() {

@@ -366,15 +366,7 @@ pub fn write_grok_config(
             .replace('"', "\\\""),
         escaped_args.join(", ")
     ));
-    let tmp = path.with_extension("toml.new");
-    std::fs::write(&tmp, out)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o664));
-    }
-    std::fs::rename(&tmp, &path)?;
-    Ok(())
+    crate::mcp_config::atomic_write_shared(&path, out.as_bytes())
 }
 
 pub fn write_omp_mcp_config(

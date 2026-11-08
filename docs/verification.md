@@ -116,6 +116,14 @@ fixtures alone cannot establish its cause.
 
 ## Boundaries and live acceptance
 
+Managed MCP JSON projections recover missing, empty or malformed documents before
+registering `anyagents`; rejected original bytes are retained in a private,
+digest-named same-directory backup and verified before replacement. Read/permission
+failures still refuse. Valid unrelated server/settings keys survive. Config writes
+use synced same-directory temporary files, atomic rename and readback at mode 0660;
+an open reader keeps the previous complete inode. This recovery applies only to
+managed MCP projections, not unrelated credentials or vendor settings.
+
 Browser liveness distinguishes a running process from an unreaped zombie. On
 Unix, owned exited children are reaped; on Linux, zombie/dead procfs states are
 not live. Stale runtime metadata is retired without deleting the persistent
