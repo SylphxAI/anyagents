@@ -2025,7 +2025,7 @@ pub(crate) fn compute_live_session_continuity(
 }
 
 /// Walks `parent_id` in `state.db` up to the root ancestor so multi-hop sub-agents
-/// inherit the root ancestor's hint consistently across `serve-admin` and `serve`.
+/// inherit the root ancestor's hint consistently.
 pub(crate) fn resolve_root_seat_hint(store: &Store, agent: &Agent) -> Option<String> {
     let mut curr = agent.parent_id.clone();
     let mut hops = 0usize;

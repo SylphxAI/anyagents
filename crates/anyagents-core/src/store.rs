@@ -2173,7 +2173,7 @@ impl Store {
         let changed = {
             let mut conn = self.conn();
             // Read and merge under the same write transaction, including when
-            // serve and serve-admin use separate Store connections.
+            // callers use separate Store connections.
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = agent_by_id(&tx, id)?;
             let json = encode_env(&update(&current));

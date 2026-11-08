@@ -6,14 +6,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
-static PROCESS_STARTED_AT_MS: OnceLock<i64> = OnceLock::new();
-
 type ImageHasher = Box<dyn FnOnce() -> io::Result<String> + Send>;
-
-/// Called before command parsing, without hashing every short-lived CLI call.
-pub(crate) fn mark_process_start() -> i64 {
-    *PROCESS_STARTED_AT_MS.get_or_init(anyagents_core::now_ms)
-}
 
 struct ImageHash {
     result: OnceLock<Result<String, String>>,
@@ -24,8 +17,6 @@ struct ImageHash {
 pub(crate) struct ServingIdentity {
     version: &'static str,
     source_sha: &'static str,
-    process_started_at_ms: i64,
-    pid: u32,
     hash: Arc<ImageHash>,
 }
 
@@ -44,8 +35,6 @@ impl ServingIdentity {
         Self {
             version: env!("CARGO_PKG_VERSION"),
             source_sha: env!("ANYAGENTS_SOURCE_SHA"),
-            process_started_at_ms: mark_process_start(),
-            pid: std::process::id(),
             hash: Arc::new(ImageHash {
                 result: OnceLock::new(),
                 pending: Mutex::new(Some(Box::new(hasher))),
@@ -80,24 +69,19 @@ impl ServingIdentity {
         }
     }
 
-    pub(crate) fn status(&self, admin: bool) -> serde_json::Value {
+    pub(crate) fn status(&self) -> serde_json::Value {
         let (value, state) = match self.hash.result.get() {
             None => (None, "computing"),
             Some(Ok(value)) => (Some(value.as_str()), "ready"),
             Some(Err(_)) => (None, "failed"),
         };
-        let mut status = serde_json::json!({
+        serde_json::json!({
             "ok": true,
             "version": self.version,
             "source_sha": self.source_sha,
             "binary_sha256": value,
             "binary_sha256_state": state,
-        });
-        if admin {
-            status["pid"] = self.pid.into();
-            status["process_started_at_ms"] = self.process_started_at_ms.into();
-        }
-        status
+        })
     }
 
     fn read_image() -> io::Result<String> {

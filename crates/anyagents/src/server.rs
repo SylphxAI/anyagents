@@ -225,7 +225,6 @@ async fn serve(
         let reaper_health = state.health.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            interval.tick().await;
             let mut tick_count = 0u64;
             loop {
                 interval.tick().await;
@@ -235,6 +234,9 @@ async fn serve(
                 let store = Arc::clone(&reaper_store);
                 let health = reaper_health.clone();
                 let _ = tokio::task::spawn_blocking(move || {
+                    if let Err(error) = outbound_history::reconcile(&store) {
+                        eprintln!("outbound history settlement remains pending: {error}");
+                    }
                     reap_archived_agents(&store, &root, &health);
                     consolidate_idle_agent_memory(&store, &root, &health);
                     if run_verify
@@ -273,8 +275,7 @@ async fn serve(
                 .await;
             }
         });
-        // The primary serves scheduling only when no administrative scheduler owns it.
-        start_schedule_loops(Arc::clone(&store), state.health.clone(), true);
+        start_schedule_loops(Arc::clone(&store), state.health.clone());
     }
     if let Some(addr) = webhook_listen_addr() {
         match tokio::net::TcpListener::bind(&addr).await {
@@ -386,538 +387,6 @@ async fn serve(
     result.map_err(Error::from)
 }
 
-/// Serve the authenticated HTTP API on `<data>/admin.sock` without starting a
-/// second `Supervisor` or `Poller`. Allows newly shipped API routes (such as
-/// `POST /v1/agents/{name}/harness`) to answer authenticated callers across the
-/// OS seat boundary (`anyagents-sock`) while an existing `anyagents serve`
-/// daemon keeps running uninterrupted on `anyagents.sock`.
-#[derive(Default)]
-struct AdminReconcileState {
-    initialized: bool,
-    watermark_seq: std::collections::HashMap<String, i64>,
-    last_backoff_reset_ms: std::collections::HashMap<String, i64>,
-    flushing_sylphx: std::collections::HashSet<String>,
-}
-
-fn is_transient_sylphx_turn_error(err: &str) -> bool {
-    let lower = err.to_ascii_lowercase();
-    if lower.contains("\"retryable\":false") || lower.contains("\"retryable\": false") {
-        return false;
-    }
-    if lower.contains("insufficient_quota")
-        || lower.contains("credit balance is too low")
-        || lower.contains("out of credits")
-        || lower.contains("quota exceeded")
-    {
-        return false;
-    }
-    lower.contains("model_unavailable")
-        || lower.contains("included_capacity_unavailable")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("overloaded")
-        || lower.contains("server_error")
-        || lower.contains("api_error")
-        || lower.contains("rate_limit")
-        || lower.contains("\"retryable\":true")
-        || lower.contains("\"retryable\": true")
-        || lower.contains("http 408")
-        || lower.contains("http 409")
-        || lower.contains("http 425")
-        || lower.contains("http 429")
-        || lower.contains("http 500")
-        || lower.contains("http 502")
-        || lower.contains("http 503")
-        || lower.contains("http 504")
-        || lower.contains("invalid sylphx responses api json")
-        || lower.contains("eof while parsing")
-        || lower.contains("bad gateway")
-        || lower.contains("service unavailable")
-        || lower.contains("gateway timeout")
-        || lower.contains("connection reset")
-        || lower.contains("timed out")
-}
-
-fn spawn_admin_sylphx_delivery(
-    data: PathBuf,
-    agent: Agent,
-    health: HealthBoard,
-    reconcile: Arc<std::sync::Mutex<AdminReconcileState>>,
-) {
-    std::thread::spawn(move || {
-        let store = match Store::open(data.join("state.db")) {
-            Ok(s) => s,
-            Err(_) => {
-                let mut guard = match reconcile.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.flushing_sylphx.remove(agent.id.as_str());
-                return;
-            }
-        };
-        let _agent_lock = match store.try_lock_agent(&agent.id) {
-            Ok(lock) => lock,
-            Err(_) => {
-                let mut guard = match reconcile.lock() {
-                    Ok(g) => g,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
-                guard.flushing_sylphx.remove(agent.id.as_str());
-                return;
-            }
-        };
-        let (delivery_mode, steer_support) = declared(&agent.harness);
-        let cfg = anyagents_core::agent_config_dir(&data, &agent.id);
-        let work_dir = agent
-            .workdir
-            .as_deref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| anyagents_core::agent_work_dir(&data, &agent.id));
-        health.publish(
-            &agent.id,
-            anyagents_supervisor::LiveState {
-                process_alive: true,
-                turn_state: anyagents_harness::TurnState::InTurn,
-                delivery_mode,
-                steer_support,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: Some(std::process::id()),
-                live_harness: Some(agent.harness.clone()),
-                live_model: agent.model.clone(),
-                process_started_at_ms: Some(now_ms()),
-                last_error: None,
-            },
-        );
-        let delivery_result = (|| -> Result<(), Error> {
-            std::fs::create_dir_all(&work_dir)?;
-            // Creation and explicit wakes own grants; never follow a child's
-            // editable .git pointer to expand them during a harness launch.
-            let req = anyagents_supervisor::LaunchRequest {
-                agent: agent.clone(),
-                data_dir: data.clone(),
-                config_dir: cfg.clone(),
-                work_dir,
-                extra_env: Vec::new(),
-            };
-            match crate::vendor::vendor_launch(req) {
-                Ok(mut harness) => {
-                    let mut had_err = false;
-                    let mut completed_any = false;
-                    let mut recorded_usage = anyagents_harness::TurnUsage::default();
-                    let flush_harness_usage = |harness: &crate::vendor::VendorHarness,
-                                               recorded: &mut anyagents_harness::TurnUsage|
-                     -> Result<(), Error> {
-                        let served = anyagents_harness::Harness::last_usage(harness);
-                        let diff = served.difference(recorded.clone());
-                        if diff.input_tokens > 0 || diff.output_tokens > 0 {
-                            store.record_usage(anyagents_core::NewUsage {
-                                agent_id: agent.id.clone(),
-                                harness: agent.harness.clone(),
-                                model: agent.model.clone(),
-                                input_tokens: i64::try_from(diff.input_tokens).unwrap_or(i64::MAX),
-                                output_tokens: i64::try_from(diff.output_tokens)
-                                    .unwrap_or(i64::MAX),
-                                cache_read_tokens: i64::try_from(diff.cache_read_tokens)
-                                    .unwrap_or(i64::MAX),
-                                cache_write_tokens: i64::try_from(diff.cache_write_tokens)
-                                    .unwrap_or(i64::MAX),
-                                reported_cost_micros: diff.reported_cost_micros,
-                                estimated_cost_micros: None,
-                                billing_mode: anyagents_core::BillingMode::Subscription,
-                                quota_state: None,
-                                day: anyagents_core::utc_day(now_ms()),
-                            })?;
-                            *recorded = served;
-                        }
-                        Ok(())
-                    };
-                    while store.has_actionable_undelivered(&agent.id).unwrap_or(false) {
-                        let Ok(Some(message)) = store.next_undelivered(&agent.id) else {
-                            break;
-                        };
-                        let outbound = anyagents_harness::OutboundMessage {
-                            id: message.id.as_str().to_string(),
-                            seq: message.seq,
-                            text: message.text.clone(),
-                            sender: message.sender.clone(),
-                            reply_to: message.reply_to.clone(),
-                            source_time_ms: message.source_time_ms,
-                            context: message.context.clone(),
-                        };
-                        match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
-                            Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
-                                store.note_delivered(&agent.id, message.seq)?;
-                                if !turn_finished {
-                                    while anyagents_harness::Harness::health(&harness).turn_state
-                                        == anyagents_harness::TurnState::InTurn
-                                    {
-                                        if let Ok(Some(steered)) = store.next_undelivered(&agent.id)
-                                        {
-                                            let steered_out = anyagents_harness::OutboundMessage {
-                                                id: steered.id.as_str().to_string(),
-                                                seq: steered.seq,
-                                                text: steered.text.clone(),
-                                                sender: steered.sender.clone(),
-                                                reply_to: steered.reply_to.clone(),
-                                                source_time_ms: steered.source_time_ms,
-                                                context: steered.context.clone(),
-                                            };
-                                            if anyagents_harness::Harness::deliver(
-                                                &mut harness,
-                                                &steered_out,
-                                            )
-                                            .is_ok()
-                                            {
-                                                store.note_delivered(&agent.id, steered.seq)?;
-                                            }
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(100));
-                                    }
-                                }
-                                flush_harness_usage(&harness, &mut recorded_usage)?;
-                                let turn_err = anyagents_harness::Harness::health(&harness)
-                                    .sign_in_fault
-                                    .or_else(|| {
-                                        crate::vendor::read_persisted_last_error(&cfg)
-                                            .and_then(|(e, _)| e)
-                                    });
-                                if let Some(err_msg) = turn_err {
-                                    had_err = true;
-                                    let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
-                                        && store.open_turn(&agent.id).ok().flatten().is_some();
-                                    if can_auto_recover {
-                                        crate::vendor::persist_last_error(&cfg, None, None);
-                                    } else {
-                                        crate::vendor::persist_last_error(
-                                            &cfg,
-                                            Some(&err_msg),
-                                            None,
-                                        );
-                                        create::maybe_notify_parent_on_error(
-                                            &store, &agent, &cfg, &err_msg,
-                                        );
-                                    }
-                                    break;
-                                }
-                                store.note_turn_completed(&agent.id)?;
-                                completed_any = true;
-                                crate::vendor::persist_last_error(&cfg, None, None);
-                            }
-                            Ok(_) => {
-                                flush_harness_usage(&harness, &mut recorded_usage)?;
-                                store.note_turn_completed(&agent.id)?;
-                                break;
-                            }
-                            Err(err) => {
-                                had_err = true;
-                                let err_msg = err.to_string();
-                                let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
-                                    && store.open_turn(&agent.id).ok().flatten().is_some();
-                                if can_auto_recover {
-                                    crate::vendor::persist_last_error(&cfg, None, None);
-                                } else {
-                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
-                                    create::maybe_notify_parent_on_error(
-                                        &store, &agent, &cfg, &err_msg,
-                                    );
-                                }
-                                break;
-                            }
-                        }
-                    }
-                    if !had_err
-                        && !completed_any
-                        && let Ok(Some(open)) = store.open_turn(&agent.id)
-                    {
-                        let outbound = anyagents_supervisor::recovery_outbound(&open);
-                        match anyagents_harness::Harness::deliver(&mut harness, &outbound) {
-                            Ok(anyagents_harness::DeliverOutcome::Accepted { turn_finished }) => {
-                                store.note_turn_recovered(&agent.id, open.opened_seq)?;
-                                if !turn_finished {
-                                    while anyagents_harness::Harness::health(&harness).turn_state
-                                        == anyagents_harness::TurnState::InTurn
-                                    {
-                                        if let Ok(Some(steered)) = store.next_undelivered(&agent.id)
-                                        {
-                                            let steered_out = anyagents_harness::OutboundMessage {
-                                                id: steered.id.as_str().to_string(),
-                                                seq: steered.seq,
-                                                text: steered.text.clone(),
-                                                sender: steered.sender.clone(),
-                                                reply_to: steered.reply_to.clone(),
-                                                source_time_ms: steered.source_time_ms,
-                                                context: steered.context.clone(),
-                                            };
-                                            if anyagents_harness::Harness::deliver(
-                                                &mut harness,
-                                                &steered_out,
-                                            )
-                                            .is_ok()
-                                            {
-                                                store.note_delivered(&agent.id, steered.seq)?;
-                                            }
-                                        }
-                                        std::thread::sleep(std::time::Duration::from_millis(100));
-                                    }
-                                }
-                                flush_harness_usage(&harness, &mut recorded_usage)?;
-                                let turn_err = anyagents_harness::Harness::health(&harness)
-                                    .sign_in_fault
-                                    .or_else(|| {
-                                        crate::vendor::read_persisted_last_error(&cfg)
-                                            .and_then(|(e, _)| e)
-                                    });
-                                if let Some(err_msg) = turn_err {
-                                    had_err = true;
-                                    let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
-                                        && store.open_turn(&agent.id).ok().flatten().is_some();
-                                    if can_auto_recover {
-                                        crate::vendor::persist_last_error(&cfg, None, None);
-                                    } else {
-                                        crate::vendor::persist_last_error(
-                                            &cfg,
-                                            Some(&err_msg),
-                                            None,
-                                        );
-                                        create::maybe_notify_parent_on_error(
-                                            &store, &agent, &cfg, &err_msg,
-                                        );
-                                    }
-                                } else {
-                                    store.note_turn_completed(&agent.id)?;
-                                    completed_any = true;
-                                    crate::vendor::persist_last_error(&cfg, None, None);
-                                }
-                            }
-                            Ok(_) => {
-                                flush_harness_usage(&harness, &mut recorded_usage)?;
-                            }
-                            Err(err) => {
-                                had_err = true;
-                                let err_msg = err.to_string();
-                                let can_auto_recover = is_transient_sylphx_turn_error(&err_msg)
-                                    && store.open_turn(&agent.id).ok().flatten().is_some();
-                                if can_auto_recover {
-                                    crate::vendor::persist_last_error(&cfg, None, None);
-                                } else {
-                                    crate::vendor::persist_last_error(&cfg, Some(&err_msg), None);
-                                    create::maybe_notify_parent_on_error(
-                                        &store, &agent, &cfg, &err_msg,
-                                    );
-                                }
-                            }
-                        }
-                    }
-                    flush_harness_usage(&harness, &mut recorded_usage)?;
-                    if completed_any && !had_err {
-                        let _ = store.complete_idle_agent(&agent.id);
-                    }
-                }
-                Err(reason) => {
-                    crate::vendor::persist_last_error(&cfg, Some(&reason), None);
-                    create::maybe_notify_parent_on_error(&store, &agent, &cfg, &reason);
-                }
-            }
-            Ok(())
-        })();
-        if let Err(error) = delivery_result {
-            let message = format!("durable delivery transition failed: {error}");
-            eprintln!("{message}");
-            crate::vendor::persist_last_error(&cfg, Some(&message), None);
-        }
-        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-        let (still_running, has_pending_work) = Store::open(data.join("state.db"))
-            .ok()
-            .map(|s| {
-                let running = s
-                    .agent(&agent.id)
-                    .ok()
-                    .is_some_and(|a| a.state == "running");
-                let pending = s.next_undelivered(&agent.id).ok().flatten().is_some()
-                    || s.open_turn(&agent.id).ok().flatten().is_some();
-                (running, pending)
-            })
-            .unwrap_or((false, false));
-        health.publish(
-            &agent.id,
-            anyagents_supervisor::LiveState {
-                process_alive: still_running,
-                turn_state: if still_running && has_pending_work && persisted_err.is_none() {
-                    anyagents_harness::TurnState::InTurn
-                } else {
-                    anyagents_harness::TurnState::Idle
-                },
-                delivery_mode,
-                steer_support,
-                quota_reset_at_ms: None,
-                restart_at_ms: None,
-                pid: None,
-                live_harness: Some(agent.harness.clone()),
-                live_model: agent.model.clone(),
-                process_started_at_ms: None,
-                last_error: persisted_err,
-            },
-        );
-        let mut guard = match reconcile.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        guard.flushing_sylphx.remove(agent.id.as_str());
-    });
-}
-
-fn sync_agy_cli_port_hint(store: &Store, cfg: &Path, agent: &Agent) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        use std::io::{Read as _, Write as _};
-        use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
-        let Some((_, seat_uid, seat_gid, seat_spec)) =
-            create::resolved_agent_seat_info(store, agent)
-                .or_else(|| crate::sandbox::existing_config_seat(cfg))
-        else {
-            return false;
-        };
-        let uid_str = seat_uid.to_string();
-        let Ok(proc_entries) = std::fs::read_dir("/proc") else {
-            return false;
-        };
-        let mut found_pid_csrf: Option<(u32, String)> = None;
-        for entry in proc_entries.flatten() {
-            let name = entry.file_name();
-            let Some(pid_str) = name.to_str() else {
-                continue;
-            };
-            let Ok(pid) = pid_str.parse::<u32>() else {
-                continue;
-            };
-            let Ok(status_text) = std::fs::read_to_string(entry.path().join("status")) else {
-                continue;
-            };
-            let matches_uid = status_text
-                .lines()
-                .find(|l| l.starts_with("Uid:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .is_some_and(|u| u == uid_str);
-            if !matches_uid {
-                continue;
-            }
-            let Ok(cmd_bytes) = std::fs::read(entry.path().join("cmdline")) else {
-                continue;
-            };
-            let args: Vec<&str> = cmd_bytes
-                .split(|b| *b == 0)
-                .filter_map(|s| std::str::from_utf8(s).ok())
-                .filter(|s| !s.is_empty())
-                .collect();
-            if args
-                .first()
-                .is_some_and(|p| p.ends_with("/agy") || *p == "agy")
-                && let Some(idx) = args.iter().position(|a| *a == "--csrf_token")
-                && let Some(csrf) = args.get(idx + 1)
-            {
-                found_pid_csrf = Some((pid, (*csrf).to_string()));
-                break;
-            }
-        }
-        let Some((pid, csrf)) = found_pid_csrf else {
-            return false;
-        };
-        let Ok(tcp_text) = std::fs::read_to_string(format!("/proc/{pid}/net/tcp")) else {
-            return false;
-        };
-        let mut found_port: Option<u16> = None;
-        for line in tcp_text.lines() {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() > 9
-                && parts[3] == "0A"
-                && parts[7] == uid_str
-                && let Some((ip_hex, port_hex)) = parts[1].split_once(':')
-                && ip_hex == "0100007F"
-                && let Ok(port) = u16::from_str_radix(port_hex, 16)
-            {
-                let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-                if let Ok(mut stream) =
-                    TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500))
-                {
-                    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-                    let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(500)));
-                    let req = format!(
-                        "POST /exa.language_server_pb.LanguageServerService/GetAllCascadeTrajectories HTTP/1.0\r\n\
-                         Host: 127.0.0.1:{port}\r\n\
-                         Content-Type: application/json\r\n\
-                         x-codeium-csrf-token: {csrf}\r\n\
-                         Content-Length: 2\r\n\
-                         Connection: close\r\n\r\n{{}}"
-                    );
-                    let mut resp = String::new();
-                    if stream.write_all(req.as_bytes()).is_ok()
-                        && stream.read_to_string(&mut resp).is_ok()
-                        && (resp.starts_with("HTTP/1.1 200") || resp.starts_with("HTTP/1.0 200"))
-                    {
-                        found_port = Some(port);
-                        break;
-                    }
-                }
-            }
-        }
-        let Some(port) = found_port else {
-            return false;
-        };
-        let log_path = cfg.join(".gemini/antigravity-cli/cli.log");
-        let expected = format!(
-            "Starting language server process with pid {pid}\nLanguage server listening on random port at {port} for HTTP\n"
-        );
-        if std::fs::read_to_string(&log_path)
-            .ok()
-            .is_some_and(|cur| cur.contains(&expected))
-        {
-            return true;
-        }
-        let _ = std::fs::remove_file(&log_path);
-        if std::fs::write(&log_path, &expected).is_ok() {
-            return true;
-        }
-        if let Some(spec) = seat_spec {
-            let parts: Vec<&str> = spec.split('\t').collect();
-            if let [launcher, u, g, grps] = parts.as_slice() {
-                let script = format!(
-                    "/bin/rm -f '{}' && printf '%s' '{}' > '{}' && /bin/chmod 664 '{}'",
-                    log_path.display(),
-                    expected,
-                    log_path.display(),
-                    log_path.display()
-                );
-                let _ = std::process::Command::new(launcher)
-                    .args([
-                        "--reuid",
-                        u,
-                        "--regid",
-                        g,
-                        "--groups",
-                        grps,
-                        "--no-new-privs",
-                        "--",
-                        "/bin/sh",
-                        "-c",
-                        &script,
-                    ])
-                    .status();
-            } else {
-                let _ = (seat_uid, seat_gid);
-            }
-        }
-        std::fs::read_to_string(&log_path)
-            .ok()
-            .is_some_and(|cur| cur.contains(&expected))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (store, cfg, agent);
-        false
-    }
-}
-
 pub(crate) fn has_explicit_archive_marker(
     data_dir: &Path,
     agent_id: &anyagents_core::AgentId,
@@ -969,8 +438,8 @@ pub(crate) fn mark_explicitly_archived_locked(
     Ok(archived)
 }
 
-/// Reconciliation marks only this row: no descendant locks or filesystem reap
-/// may run while the global mail-reconciliation mutex is held.
+/// Mark only this row while its lifecycle lock is held; descendant cleanup is
+/// handled separately by maintenance.
 fn mark_archive_generation_locked(store: &Store, data_dir: &Path, agent: &Agent) {
     let cfg = anyagents_core::agent_config_dir(data_dir, &agent.id);
     let _ = std::fs::create_dir_all(&cfg);
@@ -1024,8 +493,8 @@ pub(crate) fn reap_archived_agent_locked(
     }
 }
 
-/// Existing independent maintenance workers run this at startup and each minute.
-/// Never take the global reconciliation mutex, and never wait for an agent lock.
+/// The maintenance worker runs this at startup and each minute without waiting
+/// for an agent lock.
 fn reap_archived_agents(store: &Store, data_dir: &Path, health: &HealthBoard) {
     let Ok(agents) = store.list_agents() else {
         return;
@@ -1093,396 +562,21 @@ pub(crate) fn clear_explicitly_archived(data_dir: &Path, agent_id: &anyagents_co
     let _ = std::fs::remove_file(cfg.join(".anyagents-archived"));
 }
 
-fn reconcile_stopped_and_backed_off_agents(
-    store: &Store,
-    health: &HealthBoard,
-    data: &Path,
-    reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
-    now_ms: i64,
-) {
-    if let Err(error) = outbound_history::reconcile(store) {
-        eprintln!("outbound history settlement remains pending: {error}");
-    }
-    let Ok(agents) = store.list_agents() else {
-        return;
-    };
-    reconcile_agent_snapshot(store, health, data, reconcile, now_ms, agents);
-}
-
-fn reconcile_agent_snapshot(
-    store: &Store,
-    health: &HealthBoard,
-    data: &Path,
-    reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
-    now_ms: i64,
-    agents: Vec<Agent>,
-) {
-    let mut guard = match reconcile.lock() {
-        Ok(g) => g,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if !guard.initialized {
-        for agent in &agents {
-            let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
-            guard.watermark_seq.insert(agent.id.to_string(), delivered);
-        }
-        guard.initialized = true;
-    }
-
-    let mut ordered_indices: Vec<usize> = (0..agents.len()).collect();
-    ordered_indices.sort_by_key(|&idx| {
-        let a = &agents[idx];
-        let last_try = guard
-            .last_backoff_reset_ms
-            .get(a.id.as_str())
-            .copied()
-            .unwrap_or(0);
-        (last_try, idx)
-    });
-
-    for idx in ordered_indices {
-        let Ok(current) = store.agent(&agents[idx].id) else {
-            continue;
-        };
-        // Match cascade ordering: parent before child. This keeps the parent's
-        // archive/wake decision stable while applying it to this child.
-        let _parent_lifecycle = if let Some(ref parent_id) = current.parent_id {
-            let Ok(lock) = store.try_lock_agent_lifecycle(parent_id) else {
-                continue;
-            };
-            Some(lock)
-        } else {
-            None
-        };
-        let Ok(_lifecycle) = store.try_lock_agent_lifecycle(&agents[idx].id) else {
-            continue;
-        };
-        // A send/wake may have changed this row since the population scan.
-        let Ok(agent) = store.agent(&agents[idx].id) else {
-            continue;
-        };
-        let agent = &agent;
-        if agent.state == "archived" && !health.get(&agent.id).is_some_and(|l| l.process_alive) {
-            continue;
-        }
-        let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
-        let parent_archived = agent.parent_id.as_ref().is_some_and(|pid| {
-            store
-                .agent(pid)
-                .is_ok_and(|parent| is_explicitly_archived(data, &parent))
-        });
-        if parent_archived && agent.state != "archived" {
-            let _ = store.set_agent_state(&agent.id, "archived");
-            mark_archive_generation_locked(store, data, agent);
-        }
-        if is_explicitly_archived(data, agent) || parent_archived {
-            if has_explicit_archive_marker(data, &agent.id) && agent.state != "archived" {
-                let _ = store.set_agent_state(&agent.id, "archived");
-            }
-            if agent.harness == "sylphx"
-                && !guard.flushing_sylphx.contains(agent.id.as_str())
-                && health.get(&agent.id).is_some_and(|l| l.process_alive)
-            {
-                let (delivery_mode, steer_support) = declared(&agent.harness);
-                health.publish(
-                    &agent.id,
-                    anyagents_supervisor::LiveState {
-                        process_alive: false,
-                        turn_state: anyagents_harness::TurnState::Idle,
-                        delivery_mode,
-                        steer_support,
-                        quota_reset_at_ms: None,
-                        restart_at_ms: None,
-                        pid: None,
-                        live_harness: Some(agent.harness.clone()),
-                        live_model: agent.model.clone(),
-                        process_started_at_ms: None,
-                        last_error: None,
-                    },
-                );
-            }
-            let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
-            let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
-            guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-            continue;
-        }
-        let oldest_age_ms = store
-            .lag(&agent.id, now_ms)
-            .ok()
-            .and_then(|l| l.oldest_undelivered_age_ms);
-        if agent.state == "idle" || agent.state == "created" {
-            if oldest_age_ms.is_some() {
-                let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
-                let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
-                let prev_wm = guard
-                    .watermark_seq
-                    .get(agent.id.as_str())
-                    .copied()
-                    .unwrap_or(delivered);
-                let has_new_mail =
-                    max_seq > delivered && (agent.state == "created" || max_seq > prev_wm);
-                if has_new_mail {
-                    let check_from = if agent.state == "created" {
-                        delivered
-                    } else {
-                        prev_wm
-                    };
-                    let should_wake = undelivered.iter().filter(|m| m.seq > check_from).any(|m| {
-                        if m.context.event.as_deref() == Some("reaction_passive") {
-                            return false;
-                        }
-                        let trimmed = m.text.trim_start();
-                        !(agent.parent_id.is_none()
-                            && (trimmed.starts_with("[Sub-Agent Completed]")
-                                || trimmed.starts_with("[Sub-Agent Error]")))
-                    });
-                    if should_wake {
-                        if store.set_agent_state(&agent.id, "running").is_ok() {
-                            if agent.harness == "sylphx" {
-                                if !guard.flushing_sylphx.contains(agent.id.as_str()) {
-                                    let mut running_agent = agent.clone();
-                                    running_agent.state = "running".to_string();
-                                    guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                                    guard
-                                        .last_backoff_reset_ms
-                                        .insert(agent.id.to_string(), now_ms);
-                                    guard.flushing_sylphx.insert(agent.id.to_string());
-                                    spawn_admin_sylphx_delivery(
-                                        data.to_path_buf(),
-                                        running_agent,
-                                        health.clone(),
-                                        Arc::clone(reconcile),
-                                    );
-                                }
-                            } else {
-                                guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                                create::poke_agent_wake_socket(data, &agent.id);
-                                create::poke_agent_wake_socket_mail(data, &agent.id);
-                            }
-                        }
-                    } else {
-                        guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                    }
-                }
-            } else {
-                guard.watermark_seq.insert(agent.id.to_string(), delivered);
-            }
-        } else if agent.state == "running" {
-            if agent.harness == "sylphx" {
-                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-                let persisted_err =
-                    crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
-                let has_open_recovery = store.open_turn(&agent.id).ok().flatten().is_some();
-                let has_pending_work = oldest_age_ms.is_some() || has_open_recovery;
-                if !guard.flushing_sylphx.contains(agent.id.as_str()) {
-                    if !has_pending_work
-                        && persisted_err.is_none()
-                        && store.complete_idle_agent(&agent.id).unwrap_or(false)
-                    {
-                        let (delivery_mode, steer_support) = declared(&agent.harness);
-                        health.publish(
-                            &agent.id,
-                            anyagents_supervisor::LiveState {
-                                process_alive: false,
-                                turn_state: anyagents_harness::TurnState::Idle,
-                                delivery_mode,
-                                steer_support,
-                                quota_reset_at_ms: None,
-                                restart_at_ms: None,
-                                pid: None,
-                                live_harness: Some(agent.harness.clone()),
-                                live_model: agent.model.clone(),
-                                process_started_at_ms: None,
-                                last_error: None,
-                            },
-                        );
-                        guard.watermark_seq.insert(agent.id.to_string(), delivered);
-                        continue;
-                    }
-                    let (delivery_mode, steer_support) = declared(&agent.harness);
-                    health.publish(
-                        &agent.id,
-                        anyagents_supervisor::LiveState {
-                            process_alive: true,
-                            turn_state: anyagents_harness::TurnState::Idle,
-                            delivery_mode,
-                            steer_support,
-                            quota_reset_at_ms: None,
-                            restart_at_ms: None,
-                            pid: None,
-                            live_harness: Some(agent.harness.clone()),
-                            live_model: agent.model.clone(),
-                            process_started_at_ms: None,
-                            last_error: persisted_err.clone(),
-                        },
-                    );
-                }
-                if has_pending_work && !guard.flushing_sylphx.contains(agent.id.as_str()) {
-                    let undelivered = store.inbox(&agent.id, Some(delivered)).unwrap_or_default();
-                    let max_seq = undelivered.last().map(|m| m.seq).unwrap_or(delivered);
-                    let prev_wm = guard
-                        .watermark_seq
-                        .get(agent.id.as_str())
-                        .copied()
-                        .unwrap_or(delivered);
-                    let last_try = guard
-                        .last_backoff_reset_ms
-                        .get(agent.id.as_str())
-                        .copied()
-                        .unwrap_or(0);
-                    let ready_to_spawn = if has_open_recovery && oldest_age_ms.is_none() {
-                        last_try == 0 || now_ms.saturating_sub(last_try) >= 10_000
-                    } else {
-                        (persisted_err.is_none()
-                            && (last_try == 0
-                                || max_seq > prev_wm
-                                || now_ms.saturating_sub(last_try) >= 5_000))
-                            || max_seq > prev_wm
-                            || now_ms.saturating_sub(last_try) >= 15_000
-                    };
-                    if ready_to_spawn {
-                        guard.watermark_seq.insert(agent.id.to_string(), max_seq);
-                        guard.flushing_sylphx.insert(agent.id.to_string());
-                        spawn_admin_sylphx_delivery(
-                            data.to_path_buf(),
-                            agent.clone(),
-                            health.clone(),
-                            Arc::clone(reconcile),
-                        );
-                    }
-                } else if oldest_age_ms.is_none() {
-                    guard.watermark_seq.insert(agent.id.to_string(), delivered);
-                }
-                continue;
-            }
-            if agent.harness == "codex" && store.has_open_turn(&agent.id).unwrap_or(false) {
-                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-                let rotated_ms = std::fs::read_to_string(cfg.join(".anyagents-profile-rotated-ms"))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<i64>().ok())
-                    .unwrap_or(0);
-                if crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms).is_some() {
-                    let last_reset = guard
-                        .last_backoff_reset_ms
-                        .get(agent.id.as_str())
-                        .copied()
-                        .unwrap_or(0);
-                    if now_ms.saturating_sub(last_reset) >= 60_000 {
-                        let work_dir = agent
-                            .workdir
-                            .as_deref()
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| anyagents_core::agent_work_dir(data, &agent.id));
-                        let reconciled = create::reconcile_agent_runtime_config(
-                            store, data, agent, &cfg, &work_dir,
-                        )
-                        .and_then(|_| {
-                            std::fs::write(
-                                cfg.join(".anyagents-profile-rotated-ms"),
-                                now_ms.to_string(),
-                            )
-                            .map_err(Error::from)
-                        });
-                        if let Err(error) = reconciled {
-                            eprintln!("runtime reconciliation failed for {}: {error}", agent.id);
-                            continue;
-                        }
-                        guard
-                            .last_backoff_reset_ms
-                            .insert(agent.id.to_string(), now_ms);
-                        create::poke_agent_wake_socket(data, &agent.id);
-                        create::poke_agent_wake_socket_mail(data, &agent.id);
-                        continue;
-                    }
-                }
-            }
-            if oldest_age_ms.is_none() {
-                guard.watermark_seq.insert(agent.id.to_string(), delivered);
-                continue;
-            }
-            if agent.harness == "agy" && oldest_age_ms.is_some_and(|age| age >= 3_000) {
-                let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-                if sync_agy_cli_port_hint(store, &cfg, agent) {
-                    create::poke_agent_wake_socket_mail(data, &agent.id);
-                }
-            }
-            let is_down_without_quota = match health.get(&agent.id) {
-                Some(live) => {
-                    !live.process_alive
-                        && live.quota_reset_at_ms.is_none()
-                        && (live.restart_at_ms.is_none()
-                            || live.restart_at_ms.is_some_and(|r| r >= 15_000))
-                }
-                None => true,
-            };
-            if is_down_without_quota
-                && oldest_age_ms.is_some_and(|age| age >= 15_000)
-                && crate::schedule::agent_wake_block_reason(store, health, agent, now_ms)
-                    != Some("quota_blocked")
-            {
-                let last_reset = guard
-                    .last_backoff_reset_ms
-                    .get(agent.id.as_str())
-                    .copied()
-                    .unwrap_or(0);
-                if now_ms.saturating_sub(last_reset) >= 60_000 {
-                    guard
-                        .last_backoff_reset_ms
-                        .insert(agent.id.to_string(), now_ms);
-                    let cfg = anyagents_core::agent_config_dir(data, &agent.id);
-                    let _ = std::fs::write(
-                        cfg.join(".anyagents-profile-rotated-ms"),
-                        now_ms.to_string(),
-                    );
-                    create::poke_agent_wake_socket(data, &agent.id);
-                    create::poke_agent_wake_socket_mail(data, &agent.id);
-                }
-            }
-        }
-    }
-}
-
-fn acquire_admin_lock(data: &Path) -> Result<std::fs::File, Error> {
-    std::fs::create_dir_all(data)?;
-    let lock_path = data.join("admin.lock");
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd as _;
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return Err(Error::Message(format!(
-                "anyagents serve-admin already running on {}",
-                data.display()
-            )));
-        }
-    }
-    Ok(file)
-}
-
 /// Both intervals tick immediately at startup. Each loop owns its blocking
 /// pass, so an in-flight external request cannot hold the next local tick.
 fn start_schedule_loops(
     store: Arc<Store>,
     health: HealthBoard,
-    defer_to_admin: bool,
 ) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
     let local = spawn_schedule_loop(
         Arc::clone(&store),
         health.clone(),
-        defer_to_admin,
         std::time::Duration::from_secs(1),
         crate::schedule::tick_local_schedules_once,
     );
     let external = spawn_schedule_loop(
         store,
         health,
-        defer_to_admin,
         std::time::Duration::from_secs(3),
         crate::schedule::tick_external_watches_once,
     );
@@ -1492,7 +586,6 @@ fn start_schedule_loops(
 fn spawn_schedule_loop(
     store: Arc<Store>,
     health: HealthBoard,
-    defer_to_admin: bool,
     period: std::time::Duration,
     tick: fn(&Store, &HealthBoard, i64) -> usize,
 ) -> tokio::task::JoinHandle<()> {
@@ -1503,198 +596,11 @@ fn spawn_schedule_loop(
             interval.tick().await;
             let st = Arc::clone(&store);
             let hb = health.clone();
-            if let Err(err) = tokio::task::spawn_blocking(move || {
-                let data = st.data_dir();
-                if defer_to_admin
-                    && (data.join("admin.sock").exists() || data.join("admin.lock").exists())
-                {
-                    return 0;
-                }
-                tick(&st, &hb, now_ms())
-            })
-            .await
-            {
+            if let Err(err) = tokio::task::spawn_blocking(move || tick(&st, &hb, now_ms())).await {
                 eprintln!("Schedule pass failed: {err}");
             }
         }
     })
-}
-
-pub fn run_admin(data: &Path) -> Result<(), Error> {
-    let identity = Arc::new(ServingIdentity::capture());
-    let _admin_lock = acquire_admin_lock(data)?;
-    crate::worktree_access::recover_inspections(data)?;
-    let runtime = tokio::runtime::Runtime::new()?;
-    let store = Arc::new(Store::open(data.join("state.db"))?);
-    if let Ok(key) = capability_key() {
-        let _ = store.hold_capability_key(&key);
-    }
-    crate::host_memory::on_start(&store);
-    let res = runtime.block_on(async move {
-        let auth = deployment_mode(data);
-        let path = data.join("admin.sock");
-        if path.as_os_str().len() > MAX_SOCKET_PATH {
-            return Err(Error::Message(format!(
-                "socket path is longer than {MAX_SOCKET_PATH} bytes"
-            )));
-        }
-        prepare_socket(&path)?;
-        let listener = tokio::net::UnixListener::bind(&path)?;
-        set_socket_mode(&path)?;
-        identity.start_hash();
-        if auth.is_confined() {
-            crate::sandbox::share_socket_with_seats(&path);
-        }
-        if let Ok(agents) = store.list_agents() {
-            for agent in agents {
-                if agent.harness == "sylphx" {
-                    create::poke_agent_wake_socket(data, &agent.id);
-                }
-            }
-        }
-        let health = HealthBoard::default();
-        sync_health_from_primary_socket(data, &health);
-        let rec_store = Arc::clone(&store);
-        let rec_health = health.clone();
-        let rec_data = data.to_path_buf();
-        let reconcile_state = Arc::new(std::sync::Mutex::new(AdminReconcileState::default()));
-        let reconcile_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-            let mut ticks: u64 = 0;
-            loop {
-                interval.tick().await;
-                ticks = ticks.wrapping_add(1);
-                let sync_health = ticks.is_multiple_of(5);
-                let st = Arc::clone(&rec_store);
-                let hb = rec_health.clone();
-                let dd = rec_data.clone();
-                let rec = Arc::clone(&reconcile_state);
-                let _ = tokio::task::spawn_blocking(move || {
-                    if sync_health {
-                        sync_health_from_primary_socket(&dd, &hb);
-                    }
-                    let now = now_ms();
-                    reconcile_stopped_and_backed_off_agents(&st, &hb, &dd, &rec, now);
-                })
-                .await;
-            }
-        });
-        let (local_sched_handle, external_sched_handle) =
-            start_schedule_loops(Arc::clone(&store), health.clone(), false);
-        let reaper_handle = if std::env::var_os("ANYAGENTS_FAKE_MODE").is_none()
-            && !crate::sandbox::is_isolated_test_env()
-        {
-            let reaper_root = data.to_path_buf();
-            let reaper_store = Arc::clone(&store);
-            let reaper_health = health.clone();
-            Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-                loop {
-                    interval.tick().await;
-                    let root = reaper_root.clone();
-                    let store = Arc::clone(&reaper_store);
-                    let health = reaper_health.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        reap_archived_agents(&store, &root, &health);
-                        consolidate_idle_agent_memory(&store, &root, &health);
-                        crate::browser::reap_idle_browsers(&root);
-                        crate::create::sync_fresher_bound_agent_credentials(&root);
-                        #[cfg(unix)]
-                        crate::create::sync_canonical_skills(&root);
-                    })
-                    .await;
-                }
-            }))
-        } else {
-            None
-        };
-        let state = AppState {
-            store: Arc::clone(&store),
-            health,
-            sign_in: Arc::new(std::sync::Mutex::new(ProcessRunner)),
-            auth,
-            identity,
-        };
-        let app = Router::new()
-            .route("/v1/agents", get(list_agents).post(create_agent_route))
-            .route("/v1/agents/{name}/admin", post(set_admin_route))
-            .route("/v1/agents/{name}/rename", post(rename_agent_route))
-            .route("/v1/agents/{name}/role", post(role_agent_route))
-            .route("/v1/agents/{name}/model", post(model_route))
-            .route("/v1/agents/{name}/harness", post(harness_route))
-            .route("/v1/agents/{name}/session/reset", post(reset_session_route))
-            .route(
-                "/v1/agents/{name}/schedules",
-                get(list_schedules_route).post(schedules_action_route),
-            )
-            .route(
-                "/v1/schedules",
-                get(list_self_schedules_route).post(self_schedules_action_route),
-            )
-            .route(
-                "/v1/agents/{name}/description",
-                get(get_description_route).post(set_description_route),
-            )
-            .route(
-                "/v1/agents/{name}/instructions",
-                get(get_description_route).post(set_description_route),
-            )
-            .route("/v1/browser", post(browser_route))
-            .route("/v1/web", post(web_route))
-            .route("/v1/profiles", get(profiles_route).post(set_profile_route))
-            .route("/v1/profiles/models", get(profile_models_route))
-            .route(
-                "/v1/subagent-defaults",
-                get(get_subagent_defaults_route).post(set_subagent_defaults_route),
-            )
-            .route("/v1/channels", get(channels_route).post(add_channel_route))
-            .route("/v1/agents/{name}/inbox", get(inbox))
-            .route("/v1/agents/{name}/conversation", get(conversation_route))
-            .route(
-                "/v1/agents/{name}/conversation/redact",
-                post(redact_conversation_route),
-            )
-            .route("/v1/agents/{name}/archive", post(archive_agent_route))
-            .route("/v1/agents/{name}/pause", post(pause_agent_route))
-            .route("/v1/agents/{name}/wake", post(wake_agent_route))
-            .route(
-                "/v1/agents/{name}",
-                axum::routing::delete(delete_agent_route),
-            )
-            .route(
-                "/v1/groups",
-                get(list_groups_route).post(group_action_route),
-            )
-            .route("/v1/send", post(send))
-            .route("/v1/interact", post(interact_route))
-            .route(
-                "/v1/operator/agents/{name}/capability",
-                post(mint_capability),
-            )
-            .route("/v1/operator/agents/{name}/inbox", get(operator_inbox))
-            .route("/v1/whoami", get(whoami))
-            .route("/v1/webhooks/healthz", get(admin_healthz))
-            .with_state(state);
-        let mut terminate =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        let result = axum::serve(listener, app)
-            .with_graceful_shutdown(async move {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    _ = terminate.recv() => {}
-                }
-            })
-            .await;
-        reconcile_handle.abort();
-        local_sched_handle.abort();
-        external_sched_handle.abort();
-        if let Some(h) = reaper_handle {
-            h.abort();
-        }
-        result.map_err(Error::from)
-    });
-    runtime.shutdown_timeout(std::time::Duration::from_millis(100));
-    res
 }
 
 /// How this server authenticates. A machine started without an operator token
@@ -1768,18 +674,8 @@ async fn mint_capability(
 async fn webhook_healthz(State(state): State<AppState>) -> impl IntoResponse {
     (
         [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(state.identity.status(false)),
+        Json(state.identity.status()),
     )
-}
-
-/// Process-local details are available only on the admin Unix socket, never
-/// through the internet-reachable webhook listener or its primary API aliases.
-async fn admin_healthz(State(state): State<AppState>) -> impl IntoResponse {
-    (
-        [(axum::http::header::CACHE_CONTROL, "no-store")],
-        Json(state.identity.status(true)),
-    )
-        .into_response()
 }
 
 /// `POST /v1/webhooks/telegram/{channel_id}`: receives one update pushed by
@@ -2199,115 +1095,6 @@ async fn transfer_agent_route(
         Ok(Json(view))
     })
     .await
-}
-
-fn sync_health_from_primary_socket(data: &Path, health: &HealthBoard) {
-    #[cfg(unix)]
-    {
-        use std::io::{Read as _, Write as _};
-        use std::os::unix::net::UnixStream;
-        let sock = data.join("anyagents.sock");
-        if !sock.exists() {
-            return;
-        }
-        let Ok(mut stream) = UnixStream::connect(&sock) else {
-            return;
-        };
-        let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(3000)));
-        let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(3000)));
-        let auth_hdr = match crate::operator::operator_token(data) {
-            Some(tok) => format!("{}: {tok}\r\n", crate::operator::HEADER),
-            None => String::new(),
-        };
-        let req = format!(
-            "GET /v1/agents HTTP/1.0\r\nHost: localhost\r\n{auth_hdr}Connection: close\r\n\r\n"
-        );
-        if stream.write_all(req.as_bytes()).is_err() {
-            return;
-        }
-        let mut resp = String::new();
-        if stream.read_to_string(&mut resp).is_err() {
-            return;
-        }
-        let Some((head, body)) = resp.split_once("\r\n\r\n") else {
-            return;
-        };
-        if !head.starts_with("HTTP/1.1 200") && !head.starts_with("HTTP/1.0 200") {
-            return;
-        }
-        let Some(start) = body.find('{') else {
-            return;
-        };
-        let Some(end) = body.rfind('}') else {
-            return;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&body[start..=end]) else {
-            return;
-        };
-        let Some(arr) = val.get("agents").and_then(serde_json::Value::as_array) else {
-            return;
-        };
-        for item in arr {
-            let Some(id_str) = item.get("id").and_then(serde_json::Value::as_str) else {
-                continue;
-            };
-            let Ok(id) = anyagents_core::AgentId::parse(id_str) else {
-                continue;
-            };
-            let alive = item
-                .get("process")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|p| p == "alive");
-            let working = item
-                .get("turn_state")
-                .and_then(serde_json::Value::as_str)
-                .is_some_and(|t| t == "working");
-            let harness_str = item
-                .get("harness")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("codex");
-            let (delivery_mode, steer_support) = declared(harness_str);
-            let raw_last_error = item
-                .get("last_error")
-                .and_then(serde_json::Value::as_str)
-                .map(str::to_string);
-            if harness_str == "sylphx" {
-                continue;
-            }
-            health.publish(
-                &id,
-                anyagents_supervisor::LiveState {
-                    process_alive: alive,
-                    turn_state: if working {
-                        anyagents_harness::TurnState::InTurn
-                    } else {
-                        anyagents_harness::TurnState::Idle
-                    },
-                    delivery_mode,
-                    steer_support,
-                    quota_reset_at_ms: item
-                        .get("quota_reset_at_ms")
-                        .and_then(serde_json::Value::as_i64),
-                    restart_at_ms: item
-                        .get("restart_at_ms")
-                        .and_then(serde_json::Value::as_i64),
-                    pid: None,
-                    live_harness: item
-                        .get("live_harness")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                    live_model: item
-                        .get("live_model")
-                        .and_then(serde_json::Value::as_str)
-                        .map(str::to_string),
-                    process_started_at_ms: item
-                        .get("process_started_at_ms")
-                        .and_then(serde_json::Value::as_i64),
-                    last_error: raw_last_error,
-                },
-            );
-        }
-    }
 }
 
 #[derive(Deserialize, Default)]
@@ -3751,15 +2538,7 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
                     store.try_lock_agent(&agent.id),
                     Err(anyagents_core::Error::AgentBusy)
                 );
-            let admin_alive = agent.harness == "sylphx"
-                && agent.state == "running"
-                && (store.data_dir().join("admin.sock").exists()
-                    || store.data_dir().join("admin.lock").exists());
-            let proc_str = if lock_busy || admin_alive {
-                "alive"
-            } else {
-                "down"
-            };
+            let proc_str = if lock_busy { "alive" } else { "down" };
             let turn_str = if lock_busy { "working" } else { "idle" };
             (
                 proc_str,
@@ -8450,8 +7229,7 @@ pub(crate) mod tests {
         }
         let release = Release(Some(release));
         runtime.block_on(async {
-            let (local, network) =
-                start_schedule_loops(Arc::clone(&store), HealthBoard::default(), false);
+            let (local, network) = start_schedule_loops(Arc::clone(&store), HealthBoard::default());
             let deadline = Instant::now() + Duration::from_secs(8);
             loop {
                 match received.try_recv() {
@@ -9326,71 +8104,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants() {
-        if single_test_worker(
-            "archive_reap_parent_reconciliation_marks_one_row_without_waiting_for_descendants",
-        ) {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("state.db");
-        let store = Store::open(&db).unwrap();
-        let parent = store
-            .create_agent(anyagents_core::NewAgent::new("parent", "opencode"))
-            .unwrap();
-        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
-        new.parent_id = Some(parent.id.clone());
-        let child = store.create_agent(new).unwrap();
-        let mut new = anyagents_core::NewAgent::new("grandchild", "opencode");
-        new.parent_id = Some(child.id.clone());
-        let grandchild = store.create_agent(new).unwrap();
-        store.set_agent_state(&parent.id, "archived").unwrap();
-        let cfg = anyagents_core::agent_config_dir(dir.path(), &child.id);
-        std::fs::create_dir_all(cfg.join(".claude")).unwrap();
-        let descendant = store.lock_agent_lifecycle(&grandchild.id).unwrap();
-        let scanner_store = Store::open(&db).unwrap();
-        let data = dir.path().to_path_buf();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let scanner = std::thread::spawn(move || {
-            reconcile_stopped_and_backed_off_agents(
-                &scanner_store,
-                &HealthBoard::default(),
-                &data,
-                &Arc::new(Mutex::new(AdminReconcileState::default())),
-                now_ms(),
-            );
-            done_tx.send(()).unwrap();
-        });
-        let progressed = done_rx
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .is_ok();
-        drop(descendant);
-        scanner.join().unwrap();
-        assert!(
-            progressed,
-            "reconciliation cascaded into a contended descendant"
-        );
-        assert_eq!(store.agent(&child.id).unwrap().state, "archived");
-        assert!(
-            cfg.join(".claude").exists(),
-            "reconciliation performed cleanup"
-        );
-        assert!(!cfg.join(".anyagents-reaped").exists());
-        reconcile_stopped_and_backed_off_agents(
-            &store,
-            &HealthBoard::default(),
-            dir.path(),
-            &Arc::new(Mutex::new(AdminReconcileState::default())),
-            now_ms(),
-        );
-        assert_eq!(store.agent(&grandchild.id).unwrap().state, "archived");
-    }
-
-    #[test]
-    fn archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail() {
-        if single_test_worker(
-            "archive_reap_blocked_in_git_does_not_hold_reconcile_or_delay_other_mail",
-        ) {
+    fn archive_reap_blocked_in_git_does_not_delay_other_mail() {
+        if single_test_worker("archive_reap_blocked_in_git_does_not_delay_other_mail") {
             return;
         }
         let _env = env_lock();
@@ -9421,7 +8136,7 @@ pub(crate) mod tests {
         store
             .receive(&recipient.id, anyagents_core::Incoming::new("pending mail"))
             .unwrap();
-        store.set_agent_state(&recipient.id, "created").unwrap();
+        store.set_agent_state(&recipient.id, "running").unwrap();
         let entered = dir.path().join("git-entered");
         let release = dir.path().join("git-release");
         let bin = dir.path().join("bin");
@@ -9493,17 +8208,14 @@ exec '{}' "$@"
             Err(Error::AgentBusy)
         );
         let rec_store = Store::open(&db).unwrap();
-        let rec_data = dir.path().to_path_buf();
-        let reconcile = Arc::new(Mutex::new(AdminReconcileState::default()));
-        let rec = Arc::clone(&reconcile);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let scanner = std::thread::spawn(move || {
-            reconcile_stopped_and_backed_off_agents(
+            authored_send(
                 &rec_store,
-                &HealthBoard::default(),
-                &rec_data,
-                &rec,
-                now_ms(),
+                &Actor::Operator("operator".into()),
+                "recipient",
+                "unrelated mail",
+                "during-reap",
             );
             done_tx.send(()).unwrap();
         });
@@ -9511,7 +8223,6 @@ exec '{}' "$@"
             .recv_timeout(std::time::Duration::from_secs(2))
             .is_ok();
         let recipient_running = store.agent(&recipient.id).unwrap().state == "running";
-        let mutex_free = reconcile.try_lock().is_ok();
         std::fs::write(&release, b"release").unwrap();
         worker.join().unwrap();
         scanner.join().unwrap();
@@ -9528,8 +8239,8 @@ exec '{}' "$@"
             "barrier did not observe reaper lifecycle ownership"
         );
         assert!(
-            progressed_while_blocked && recipient_running && mutex_free,
-            "unrelated mail reconciliation waited for blocked cleanup"
+            progressed_while_blocked && recipient_running,
+            "unrelated mail delivery waited for blocked cleanup"
         );
     }
 
@@ -9883,55 +8594,6 @@ exec '{}' "$@"
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
     }
-    #[test]
-    fn stale_reconcile_population_cannot_rearchive_a_woken_parent_and_child() {
-        let _env = env_lock();
-        unsafe {
-            std::env::set_var("ANYAGENTS_FAKE_MODE", "1");
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path().join("state.db")).unwrap();
-        let parent = store
-            .create_agent(anyagents_core::NewAgent::new("parent-agent", "opencode"))
-            .unwrap();
-        let mut new = anyagents_core::NewAgent::new("worker", "opencode");
-        new.parent_id = Some(parent.id.clone());
-        let child = store.create_agent(new).unwrap();
-        mark_explicitly_archived(&store, dir.path(), &parent);
-        let stale_population = store.list_agents().unwrap();
-        // Both wake operations happen after the population scan and before
-        // reconciliation takes their locks. The old parent row is not authority.
-        authored_send(
-            &store,
-            &Actor::Operator("operator".into()),
-            "parent-agent",
-            "continue",
-            "parent-wake",
-        );
-        authored_send(
-            &store,
-            &Actor::Agent(parent.name.clone()),
-            "worker",
-            "continue",
-            "child-wake",
-        );
-        reconcile_agent_snapshot(
-            &store,
-            &HealthBoard::default(),
-            dir.path(),
-            &Arc::new(Mutex::new(AdminReconcileState::default())),
-            now_ms(),
-            stale_population,
-        );
-        assert_eq!(store.agent(&parent.id).unwrap().state, "running");
-        assert_eq!(store.agent(&child.id).unwrap().state, "running");
-        assert!(!has_explicit_archive_marker(dir.path(), &parent.id));
-        assert!(!has_explicit_archive_marker(dir.path(), &child.id));
-        unsafe {
-            std::env::remove_var("ANYAGENTS_FAKE_MODE");
-        }
-    }
-
     #[test]
     fn archetype_templates_apply_frontmatter_defaults_and_prepend_instructions() {
         let _env = env_lock();

@@ -85,13 +85,13 @@ cargo test -p anyagents --test cli archive_reap --locked
 ```
 
 The unit cases verify mail progress while cleanup is blocked in a git probe,
-nonblocking descendant reconciliation, durable completion across restart,
+durable completion across restart,
 wake/rearchive invalidation, failed cleanup retry, and preservation of shared,
 external and unpushed work. Worktree admission also retains managed-config
 provenance after the last reader retires and its private gitdir is removed,
 without restoring retired access or accepting a replacement config link. The CLI cases execute the production binary with a
 cleared environment and synthetic host home. They verify archive cleanup does
-not recreate seat skill directories and real `serve-admin` maintenance reaps a
+not recreate seat skill directories and real `serve` maintenance reaps a
 legacy archive only once across restart. Unit-test isolation disables host-home
 and maintenance paths, so unit tests alone do not cover that production branch.
 These disposable fixtures do not certify adoption by an existing running daemon

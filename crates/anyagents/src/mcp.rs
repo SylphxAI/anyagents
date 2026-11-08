@@ -180,36 +180,8 @@ impl Client {
     ) -> Result<T, String> {
         let named = crate::client::agent_identity().map(|id| id.to_string());
         let cap = self.current_capability();
-        let body_clone = body.clone();
-        let admin_socket = self.socket.parent().map(|p| p.join("admin.sock"));
-        let prefer_admin = admin_socket.as_ref().is_some_and(|s| s.exists())
-            && ((method == "POST" && path == "/v1/agents")
-                || (method == "GET" && path == "/v1/agents")
-                || path.ends_with("/harness")
-                || path.ends_with("/model")
-                || path.ends_with("/rename")
-                || path.ends_with("/role")
-                || path.ends_with("/description")
-                || path.ends_with("/wake")
-                || path.ends_with("/pause")
-                || path.ends_with("/archive")
-                || path.starts_with("/v1/subagent-defaults")
-                || path.starts_with("/v1/profiles")
-                || path.starts_with("/v1/schedules")
-                || path.starts_with("/v1/browser")
-                || path.starts_with("/v1/web")
-                || path.starts_with("/v1/channels")
-                || path.starts_with("/v1/send")
-                || path.starts_with("/v1/interact")
-                || path.contains("/schedules")
-                || path.contains("/conversation"));
-        let (primary_sock, secondary_sock) = match (&admin_socket, prefer_admin) {
-            (Some(adm), true) => (adm.as_path(), Some(self.socket.as_path())),
-            (Some(adm), false) if adm.exists() => (self.socket.as_path(), Some(adm.as_path())),
-            _ => (self.socket.as_path(), None),
-        };
-        let primary_res = request_naming(
-            primary_sock,
+        let (status, bytes) = request_naming(
+            &self.socket,
             method,
             path,
             body,
@@ -217,42 +189,7 @@ impl Client {
             None,
             named.as_deref(),
         )
-        .await;
-        let (mut status, mut bytes) = match primary_res {
-            Ok(ans) => ans,
-            Err(primary_err) => {
-                if let Some(sec_sock) = secondary_sock {
-                    request_naming(
-                        sec_sock,
-                        method,
-                        path,
-                        body_clone.clone(),
-                        Some(&cap),
-                        None,
-                        named.as_deref(),
-                    )
-                    .await?
-                } else {
-                    return Err(primary_err);
-                }
-            }
-        };
-        if !status.is_success()
-            && let Some(sec_sock) = secondary_sock
-            && let Ok(fallback) = request_naming(
-                sec_sock,
-                method,
-                path,
-                body_clone,
-                Some(&cap),
-                None,
-                named.as_deref(),
-            )
-            .await
-            && fallback.0.is_success()
-        {
-            (status, bytes) = fallback;
-        }
+        .await?;
         if !status.is_success() {
             return Err(error_message(&bytes));
         }
@@ -260,77 +197,7 @@ impl Client {
     }
 
     async fn get_agents(&self) -> Result<AgentsResponse, String> {
-        let mut resp: AgentsResponse = self.get("/v1/agents", None).await?;
-        if let Some(parent_dir) = self.socket.parent() {
-            let admin_socket = parent_dir.join("admin.sock");
-            if admin_socket.exists() {
-                let named = crate::client::agent_identity().map(|id| id.to_string());
-                let cap = self.current_capability();
-                if let Ok((st, bytes)) = request_naming(
-                    &admin_socket,
-                    "GET",
-                    "/v1/agents",
-                    None,
-                    Some(&cap),
-                    None,
-                    named.as_deref(),
-                )
-                .await
-                    && st.is_success()
-                    && let Ok(admin_resp) = serde_json::from_slice::<AgentsResponse>(&bytes)
-                {
-                    let by_id: std::collections::HashMap<String, AgentView> = admin_resp
-                        .agents
-                        .into_iter()
-                        .map(|a| (a.id.clone(), a))
-                        .collect();
-                    for view in &mut resp.agents {
-                        if let Some(adm) = by_id.get(&view.id) {
-                            view.name = adm.name.clone();
-                            view.harness = adm.harness.clone();
-                            if adm.model.is_some() {
-                                view.model = adm.model.clone();
-                            }
-                            view.install = adm.install.clone();
-                            view.delivery_mode = adm.delivery_mode.clone();
-                            view.steer_support = adm.steer_support.clone();
-                            if adm.role.is_some() {
-                                view.role = adm.role.clone();
-                            }
-                            if !adm.aliases.is_empty() {
-                                view.aliases = adm.aliases.clone();
-                            }
-                            if view.quota_reset_at_ms.is_none() {
-                                view.quota_reset_at_ms = adm.quota_reset_at_ms;
-                            }
-                            if view.block_reason.is_none() {
-                                view.block_reason = adm.block_reason.clone();
-                            }
-                            if view.last_error.is_none() {
-                                view.last_error = adm.last_error.clone();
-                            }
-                            if adm.turn_state == "errored"
-                                || ((view.state == "running" || view.state == "idle")
-                                    && view.last_error.is_some()
-                                    && view.quota_reset_at_ms.is_none())
-                            {
-                                view.turn_state = "errored".to_string();
-                            }
-                            if view.oldest_undelivered_age_ms.is_none() {
-                                view.oldest_undelivered_age_ms = adm.oldest_undelivered_age_ms;
-                            }
-                            if adm.seat_user.is_some() {
-                                view.seat_user = adm.seat_user.clone();
-                                view.seat_uid = adm.seat_uid;
-                                view.seat_gid = adm.seat_gid;
-                            }
-                            view.schedules = adm.schedules.clone();
-                        }
-                    }
-                }
-            }
-        }
-        Ok(resp)
+        self.get("/v1/agents", None).await
     }
 }
 
@@ -2589,10 +2456,7 @@ impl AgentMcp {
     ) -> Result<rmcp::handler::server::wrapper::Json<serde_json::Value>, String> {
         let data_dir = self.client.socket.parent().map(Path::to_path_buf);
         let local_has_keys = !crate::web::load_web_keys(data_dir.as_deref()).is_empty();
-        let server_available = self.client.socket.exists()
-            || data_dir
-                .as_ref()
-                .is_some_and(|d| d.join("admin.sock").exists());
+        let server_available = self.client.socket.exists();
         if !local_has_keys && server_available {
             let body = serde_json::to_vec(&args).map_err(|e| e.to_string())?;
             if let Ok(val) = self

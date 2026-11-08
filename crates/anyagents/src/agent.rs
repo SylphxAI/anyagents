@@ -1054,14 +1054,10 @@ pub fn reconcile_and_enrich_views(data: &Path, views: &mut [AgentView]) {
             if lock_busy {
                 view.process = "alive".to_string();
                 view.turn_state = "working".to_string();
-            } else if view.state == "running"
-                && (data.join("admin.sock").exists() || data.join("admin.lock").exists())
-            {
-                view.process = "alive".to_string();
             }
         } else if view.state == "running"
             && view.process != "alive"
-            && (data.join("anyagents.sock").exists() || data.join("admin.sock").exists())
+            && crate::server::socket_path(data).exists()
             && matches!(
                 store.try_lock_agent(&id),
                 Err(anyagents_core::Error::AgentBusy)
