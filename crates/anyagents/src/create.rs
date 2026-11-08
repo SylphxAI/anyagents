@@ -2130,9 +2130,7 @@ pub(crate) fn reconcile_agent_runtime_config(
         .is_none_or(|raw| {
             crate::operator::verify_capability(store, &agent.id, raw.trim()).is_err()
         });
-    if needs_capability_repair
-        && let Err(mint_error) = crate::operator::ensure(store, &agent.id)
-    {
+    if needs_capability_repair && let Err(mint_error) = crate::operator::ensure(store, &agent.id) {
         let mut repaired = false;
         #[cfg(unix)]
         if let Some(op_tok) = crate::operator::operator_token(data) {
