@@ -2846,8 +2846,7 @@ pub(crate) fn run_native_gateway_turn(
                     if let Some(media_item) =
                         build_multimodal_user_item(&fn_name, &attached_media_urls)
                     {
-                        let media_item =
-                            append_transcript_message(&transcript_path, &media_item)?;
+                        let media_item = append_transcript_message(&transcript_path, &media_item)?;
                         input_items.push(media_item);
                     }
                 }
@@ -2938,8 +2937,7 @@ pub(crate) fn run_native_gateway_turn(
                     if let Some(media_item) =
                         build_multimodal_user_item(&fn_name, &attached_media_urls)
                     {
-                        let media_item =
-                            append_transcript_message(&transcript_path, &media_item)?;
+                        let media_item = append_transcript_message(&transcript_path, &media_item)?;
                         input_items.push(media_item);
                     }
                 }
@@ -6837,6 +6835,54 @@ mod tests {
     }
 
     #[test]
+    fn multimedia_tool_output_survives_responses_and_chat_requests() {
+        let image = "data:image/png;base64,aW1hZ2U=";
+        let pdf = "data:application/pdf;base64,cGRm";
+        let audio = "data:audio/wav;base64,YXVkaW8=";
+        let output = format!(
+            "attached{ATTACHED_IMAGE_MARKER_PREFIX}{image}{ATTACHED_IMAGE_MARKER_PREFIX}{pdf}{ATTACHED_IMAGE_MARKER_PREFIX}{audio}"
+        );
+        let (text, urls) = extract_attached_media_markers(&output);
+        assert_eq!(text, "attached");
+        let media = build_multimodal_user_item("code", &urls).unwrap();
+        let input = vec![
+            json!({
+                "type": "function_call",
+                "call_id": "media_call",
+                "name": "code",
+                "arguments": "{}",
+            }),
+            json!({
+                "type": "function_call_output",
+                "call_id": "media_call",
+                "output": text,
+            }),
+            media,
+        ];
+        let responses =
+            build_native_responses_request("model", "", &input, &[], "session", None).unwrap();
+        let parts = &responses["input"][2]["content"];
+        assert_eq!(parts[1], json!({"type": "input_image", "image_url": image}));
+        assert_eq!(parts[2]["type"], "input_file");
+        assert_eq!(parts[2]["file_data"], pdf);
+        assert_eq!(
+            parts[3]["input_audio"],
+            json!({"data": "YXVkaW8=", "format": "wav"})
+        );
+
+        let chat = build_chat_completions_request("model", "", &input, None).unwrap();
+        let parts = &chat["messages"][2]["content"];
+        assert_eq!(parts[1]["image_url"]["url"], image);
+        assert_eq!(parts[2]["type"], "file");
+        assert_eq!(parts[2]["file"]["file_data"], pdf);
+        assert_eq!(parts[3]["type"], "input_audio");
+        assert_eq!(
+            parts[3]["input_audio"],
+            json!({"data": "YXVkaW8=", "format": "wav"})
+        );
+    }
+
+    #[test]
     fn chat_completions_roundtrip_converts_tool_calls_and_reasoning_content() {
         let input = vec![
             json!({ "role": "user", "content": "Run uname" }),
@@ -7036,12 +7082,13 @@ exec "$@"
                 r#"#!/bin/sh
 set -eu
 shift 8
-if [ "$1" = /bin/sh ] && [ "$2" = -c ]; then
+if [ "$1" = /bin/sh ] && [ "$2" = -s ]; then
     prefix='id() {{ case "$1" in -u) echo {uid};; -g) echo {gid};; esac; }}
 awk() {{ echo 1; }}
 stat() {{ echo 640; }}
 '
-    exec /bin/sh -c "$prefix$3"
+    {{ printf '%s' "$prefix"; cat; }} | /bin/sh -s
+    exit $?
 fi
 exec "$@"
 "#
@@ -7111,7 +7158,11 @@ exec "$@"
             list[0].uid = wrong_principal.0;
             list[0].gid = wrong_principal.1;
             drop(list);
-            assert!(run(&turn_env).contains("peer seats' private trees are denied"));
+            let refused = run(&turn_env);
+            assert!(
+                refused.contains("peer seats' private trees are denied"),
+                "{refused}"
+            );
         }
         peers.lock().unwrap()[0] = anyagents_harness::SeatPeer {
             root: child,

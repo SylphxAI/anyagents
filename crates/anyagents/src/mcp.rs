@@ -2390,9 +2390,14 @@ impl AgentMcp {
         &self,
         Parameters(mut args): Parameters<crate::browser::BrowserRequest>,
     ) -> Result<MultimediaJson, String> {
-        if let Some(raw_path) = args.path.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        if let Some(raw_path) = args
+            .path
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
             && !Path::new(raw_path).is_absolute()
-            && let Ok(resolved) = resolve_workspace_path(&self.resolve_workdir(), Some(raw_path), true)
+            && let Ok(resolved) =
+                resolve_workspace_path(&self.resolve_workdir(), Some(raw_path), true)
         {
             args.path = Some(resolved.display().to_string());
         }
@@ -2551,10 +2556,7 @@ impl AgentMcp {
     #[tool(
         description = "Unified Cross-Harness Code Mode / Programmatic Tool Calling (`code`, optional `timeout_ms` default 30000, max 120000). Executes an async TypeScript / JavaScript snippet in an isolated capability sandbox (`process.env`, `require`, `child_process`, and raw `fs` are unavailable) with `anyagents.{memory,conversation,send,agents,schedule,groups,browser,web,computer,device,media,files}` (alias `tools.anyagents`), `web.{search,fetch}` (alias `tools.web`), `computer.{snapshot,list_windows,focus_window,clipboard_get,clipboard_set,screenshot,cursor_position,move,click,mouse_down,mouse_up,drag,scroll,type,key,hold_key,wait,zoom,action}` (alias `tools.computer`), `device.{screenshot,tap,swipe,type,press,install_app,launch_app,terminate_app,open_url,rotate}` (alias `tools.device`), `media.{image_generate,speech,transcribe}` (alias `tools.media`), and `workspace.{read,write,edit,multi_edit,patch,glob,grep,list,exec}` (alias `tools.workspace`). Calling `workspace.read(path)` on images, PDFs, audio, or video (or calling `browser.screenshot`, `computer.screenshot`, `device.screenshot`, `media.image_generate`, `media.speech`) natively attaches MCP multimedia content blocks (`image`, `audio`, `resource`) directly to the tool response for visual/multimodal inspection. Compose parallel multi-tool queries with `await Promise.all([...])`, filter/aggregate intermediate data in memory, log diagnostics via `console.log`, and `return` only the compact result `{ result, logs, duration_ms }`."
     )]
-    async fn code(
-        &self,
-        Parameters(args): Parameters<CodeArgs>,
-    ) -> Result<MultimediaJson, String> {
+    async fn code(&self, Parameters(args): Parameters<CodeArgs>) -> Result<MultimediaJson, String> {
         self.execute_code_tool(args).await
     }
 }
@@ -3484,13 +3486,19 @@ impl AgentMcp {
                 let parsed: ConversationArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `conversation` arguments: {e}"))?;
                 let res = self.conversation(Parameters(parsed)).await?.0;
-                Ok((serde_json::to_value(res).map_err(|e| e.to_string())?, Vec::new()))
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "groups" => {
                 let parsed: GroupsArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `groups` arguments: {e}"))?;
                 let res = self.groups(Parameters(parsed)).await?.0;
-                Ok((serde_json::to_value(res).map_err(|e| e.to_string())?, Vec::new()))
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "schedule" => {
                 let parsed: ScheduleArgs = serde_json::from_value(args)
@@ -3548,7 +3556,10 @@ impl AgentMcp {
                 let parsed: SpawnArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `spawn` arguments: {e}"))?;
                 let res = self.spawn(Parameters(parsed)).await?.0;
-                Ok((serde_json::to_value(res).map_err(|e| e.to_string())?, Vec::new()))
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "describe" => {
                 let parsed: DescribeArgs = serde_json::from_value(args)
@@ -3559,19 +3570,28 @@ impl AgentMcp {
                 let parsed: ArchiveArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `archive` arguments: {e}"))?;
                 let res = self.archive(Parameters(parsed)).await?.0;
-                Ok((serde_json::to_value(res).map_err(|e| e.to_string())?, Vec::new()))
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "wake" => {
                 let parsed: WakeArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `wake` arguments: {e}"))?;
                 let res = self.wake(Parameters(parsed)).await?.0;
-                Ok((serde_json::to_value(res).map_err(|e| e.to_string())?, Vec::new()))
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             "interact" => {
                 let parsed: InteractArgs = serde_json::from_value(args)
                     .map_err(|e| format!("invalid `interact` arguments: {e}"))?;
                 let res = self.interact(Parameters(parsed)).await?.0;
-                Ok((serde_json::to_value(res).map_err(|e| e.to_string())?, Vec::new()))
+                Ok((
+                    serde_json::to_value(res).map_err(|e| e.to_string())?,
+                    Vec::new(),
+                ))
             }
             other => Err(format!(
                 "unknown AnyAgents tool `{other}` in code mode; expected one of `memory`, `web`, `agents`, `send`, `conversation`, `groups`, `schedule`, `browser`, `files`"
@@ -3861,15 +3881,10 @@ impl AgentMcp {
 }
 
 #[derive(Debug, Clone)]
-pub struct MultimediaJson(
-    pub serde_json::Value,
-    pub Vec<rmcp::model::ContentBlock>,
-);
+pub struct MultimediaJson(pub serde_json::Value, pub Vec<rmcp::model::ContentBlock>);
 
 impl rmcp::handler::server::tool::IntoCallToolResult for MultimediaJson {
-    fn into_call_tool_result(
-        self,
-    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+    fn into_call_tool_result(self) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
         let mut res = rmcp::model::CallToolResult::structured(self.0);
         res.content.extend(self.1);
         Ok(res.into())
@@ -3970,10 +3985,10 @@ fn parse_image_dimensions(mime_type: &str, bytes: &[u8]) -> Option<(u32, u32)> {
         }
         "image/bmp" => {
             if bytes.len() >= 26 && &bytes[0..2] == b"BM" {
-                let w = i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]])
-                    .unsigned_abs();
-                let h = i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]])
-                    .unsigned_abs();
+                let w =
+                    i32::from_le_bytes([bytes[18], bytes[19], bytes[20], bytes[21]]).unsigned_abs();
+                let h =
+                    i32::from_le_bytes([bytes[22], bytes[23], bytes[24], bytes[25]]).unsigned_abs();
                 Some((w, h))
             } else {
                 None
@@ -4025,7 +4040,11 @@ fn parse_image_dimensions(mime_type: &str, bytes: &[u8]) -> Option<(u32, u32)> {
                 }
                 let marker = bytes[pos];
                 pos += 1;
-                if marker == 0xd8 || marker == 0xd9 || marker == 0x01 || (0xd0..=0xd7).contains(&marker) {
+                if marker == 0xd8
+                    || marker == 0xd9
+                    || marker == 0x01
+                    || (0xd0..=0xd7).contains(&marker)
+                {
                     continue;
                 }
                 if pos + 2 > bytes.len() {
@@ -7965,18 +7984,12 @@ mod spawn_args_tests {
             panic!("expected CallToolResponse::Complete");
         };
         assert!(call_res.structured_content.is_some());
-        assert!(
-            call_res
-                .content
-                .iter()
-                .any(|c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png"))
-        );
-        assert!(
-            call_res
-                .content
-                .iter()
-                .any(|c| matches!(c, rmcp::model::ContentBlock::Audio(a) if a.mime_type == "audio/wav"))
-        );
+        assert!(call_res.content.iter().any(
+            |c| matches!(c, rmcp::model::ContentBlock::Image(i) if i.mime_type == "image/png")
+        ));
+        assert!(call_res.content.iter().any(
+            |c| matches!(c, rmcp::model::ContentBlock::Audio(a) if a.mime_type == "audio/wav")
+        ));
         assert!(call_res.content.iter().any(|c| matches!(
             c,
             rmcp::model::ContentBlock::Resource(r)

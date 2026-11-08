@@ -8554,7 +8554,8 @@ mod tests {
     #[test]
     fn instruction_mirrors_share_one_pinned_snapshot_across_harnesses() {
         use anyagents_core::host_session;
-        let tmp = tempfile::tempdir().unwrap();
+        // Resume-pointer reads reject symlinked ancestors, including macOS /var.
+        let tmp = crate::test_tempdir();
         let data = tmp.path();
         let store = Store::open(data.join("state.db")).unwrap();
         store
@@ -8670,7 +8671,7 @@ mod tests {
 
     #[test]
     fn set_agent_harness_preserves_identity_history_and_refuses_incompatible() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tempdir();
         let data = tmp.path();
         let owner_workdir = data.join("owner-workdir");
         std::fs::create_dir(&owner_workdir).unwrap();
