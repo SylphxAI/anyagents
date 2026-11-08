@@ -459,6 +459,21 @@ fn add_telegram_copies_the_token_and_lists_no_secret() {
         assert!(
             String::from_utf8_lossy(&request).starts_with("POST /bot123456:ABC/getMe HTTP/1.1\r\n")
         );
+        let header = String::from_utf8(request).unwrap();
+        let length: usize = header
+            .lines()
+            .find_map(|line| {
+                let (key, value) = line.split_once(':')?;
+                key.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse().unwrap())
+            })
+            .unwrap();
+        let mut body = vec![0; length];
+        socket.read_exact(&mut body).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({})
+        );
         let body =
             r#"{"ok":true,"result":{"id":123456,"is_bot":true,"username":"alpha_fixture_bot"}}"#;
         write!(socket, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
