@@ -158,7 +158,7 @@ async fn serve(
     let seats: Vec<String> = store
         .list_agents()?
         .into_iter()
-        .map(|agent| agent.name)
+        .map(|agent| agent.id.to_string())
         .collect();
     if operator::operator_token(data).is_some() && !crate::sandbox::launch_boundary(&seats) {
         return Err(Error::Message(
