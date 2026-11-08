@@ -7424,6 +7424,7 @@ exec "$@"
             .collect();
         assert_eq!(names, vec!["code", "bash", "context"]);
 
+        let empty_env = workspace::Environment::default();
         let ctx_goal = execute_sylphx_tool(
             "context",
             &json!({
@@ -7434,7 +7435,7 @@ exec "$@"
             }),
             &cfg,
             &work,
-            &[],
+            &empty_env,
             Path::new("unused-mcp"),
             &[],
         );
@@ -7448,7 +7449,7 @@ exec "$@"
             }),
             &cfg,
             &work,
-            &[],
+            &empty_env,
             Path::new("unused-mcp"),
             &[],
         );

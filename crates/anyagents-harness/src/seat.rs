@@ -108,8 +108,8 @@ pub(super) fn admitted_command(
         command
     };
     let script = admission_script(checks);
-    let mut child = prefix()
-        .args(["/bin/sh", "-s"])
+    let output = prefix()
+        .args(["/bin/sh", "-c", &script, "seat-admission"])
         .envs(
             environment
                 .iter()
@@ -117,17 +117,7 @@ pub(super) fn admitted_command(
                 .map(|(k, v)| (k, v)),
         )
         .env_remove(crate::SEAT_LAUNCH_ENV)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| refuse(e.to_string()))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write as _;
-        let _ = stdin.write_all(script.as_bytes());
-    }
-    let output = child
-        .wait_with_output()
+        .output()
         .map_err(|e| refuse(e.to_string()))?;
     if !output.status.success() {
         let why = String::from_utf8_lossy(&output.stderr);

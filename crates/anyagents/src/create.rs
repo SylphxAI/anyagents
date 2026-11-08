@@ -699,11 +699,9 @@ pub(crate) fn write_agent_instructions_with_continuity(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        doc.push_str(
-            "\n## 2. Role, Responsibilities & Private Instructions (`instructions`)\n\n<role_instructions>\n",
-        );
+        doc.push_str("\n## 2. Role, Responsibilities & Private Instructions (`instructions`)\n\n");
         doc.push_str(custom);
-        doc.push_str("\n</role_instructions>\n");
+        doc.push('\n');
     }
 
     doc.push_str(
@@ -714,7 +712,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
          - `scope`: \"isolated\" = parent/children/bound channels; \"private\" (sub-agent default) adds shared groups; \"siblings\" adds siblings; \"public\" = workspace-wide. In group chats only the matching domain agent replies; otherwise `NO_REPLY`.\n\
          - Stdout never reaches peers/parents/channels. Always call `send` to reply/report (`to`, `reply_to: \"anyagents:reply:msg_...\"`, `text`, etc.); use the envelope's `answer_to`.\n\
          - Never poll an inbox: messages, sub-agent completions and watches wake you reactively.\n\
-         - Vendor sub-agent/timer tools are disabled by default. Use `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`, `device.*`, `media.*`) as your unified programmatic execution surface: `anyagents.agents` for lifecycle (isolated `<data>/agents/<id>/work` by default, or `repo` worktrees; `archive` reaps clean/pushed worktrees, preserves dirty/unpushed ones), `anyagents.memory` for durable memory, `anyagents.conversation` for history/search, `anyagents.groups` for groups, `anyagents.schedule` for wakes/event watches.\n\
+         - Vendor sub-agent/timer tools are disabled by default. Use `code` (`anyagents.*`, `workspace.*`, `web.*`, `computer.*`) or `agents` for lifecycle: isolated `<data>/agents/<id>/work` by default, or `repo` worktrees; `archive` reaps clean/pushed worktrees, preserves dirty/unpushed ones. Use `memory` for durable facts, `conversation` for history/search, `groups` for groups, `schedule` for wakes/event watches.\n\
          - `browser` provides persistent Chromium; fill secrets with `secret_ref: \"op://...\"` / `\"op-otp://...\"` without reading them. On `captcha_detected: true`, use `action: \"takeover\"` and send the takeover URL to the user.\n",
     );
     if let Some(parent) = parent_name {
@@ -726,7 +724,7 @@ pub(crate) fn write_agent_instructions_with_continuity(
     // Only the host lifecycle allocates a generation. Describe/restart/render
     // consume its persisted pin without opening live learned-memory files.
     if let Some(root) = config.parent() {
-        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nAll vendor-native auto-memory systems (`~/.claude/projects/*/memory`, Codex `[memories]`, Gemini/AGY auto-memory) are disabled so every agent shares the unified AnyAgents memory architecture. Learned facts live exclusively in `{}/memory/`, indexed by `MEMORY.md` (<150 lines / 4KB); you own curating your topic files via `conversation({{ \"scope\": \"memory\", \"topic\": \"<slug>\", \"description\": \"<1-line trigger>\", \"content\": \"<markdown>\" }})` (or `\"delete\": true` to prune superseded topics) or by editing `{}/memory/<topic>.md` directly. While idle, the host automatically rebuilds `MEMORY.md`, synchronizes the FTS5 memory index, and refreshes your `<learned_memory>` session pin. Your authored skills live in `{}/skills/`; shared skills are read-only. Memory updates are searchable immediately (`conversation` with `scope: \"memory\"`) and enter `<learned_memory>` on your next idle refresh or new host session.\n", root.display(), root.display(), root.display()));
+        doc.push_str(&format!("\n## Host File Operating Instructions (fixed; not learned memory)\n\nLearned facts live in `{}/memory/`, indexed by `MEMORY.md`; preserve fact-file frontmatter and relative links. Edit those host files via `anyagents.memory` when learning durable facts, never vendor project memory or another agent's namespace. Long progress pages belong in history, not the prompt index. Your authored skills live in `{}/skills/`; shared skills are read-only. File edits are searchable immediately but enter the system prompt only at an explicit new host session. Only the separately delimited `<learned_memory>` section is the bounded immutable snapshot for this session.\n", root.display(), root.display()));
         match anyagents_core::host_session::active(root) {
             Ok(Some(session)) if session.harness == agent.harness => {
                 doc.push('\n');
