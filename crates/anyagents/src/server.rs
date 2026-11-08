@@ -35,6 +35,8 @@ use crate::identity::ServingIdentity;
 use crate::operator;
 use crate::vendor::{self, VendorHarness};
 
+mod outbound_history;
+
 const SOCKET_NAME: &str = "anyagents.sock";
 /// `sockaddr_un.sun_path` holds 108 bytes, including the trailing NUL.
 const MAX_SOCKET_PATH: usize = 107;
@@ -1065,6 +1067,9 @@ fn reconcile_stopped_and_backed_off_agents(
     reconcile: &Arc<std::sync::Mutex<AdminReconcileState>>,
     now_ms: i64,
 ) {
+    if let Err(error) = outbound_history::reconcile(store) {
+        eprintln!("outbound history settlement remains pending: {error}");
+    }
     let Ok(agents) = store.list_agents() else {
         return;
     };
@@ -3876,27 +3881,42 @@ async fn create_agent_route(
                 .as_ref()
                 .map(|(_, name)| format!("agent:{name}"))
                 .unwrap_or_else(|| "operator".to_string());
-            state
-                .store
-                .receive(
-                    &agent.id,
-                    Incoming {
-                        text: prompt.to_string(),
-                        sender: Some(sender),
-                        source_time_ms: None,
-                        source_key: None,
-                        reply_to: None,
-                        quote: None,
-                        origin: None,
-                        received_at_ms: None,
-                    },
-                )
-                .map_err(ApiError::from_store)?;
-            if let Some((ref caller_id, _)) = caller_agent {
-                state
+            let enqueue = || {
+                let message = state
                     .store
-                    .record_outbound(caller_id, &format!("agent:{}", agent.name), None, prompt)
+                    .receive(
+                        &agent.id,
+                        Incoming {
+                            text: prompt.to_string(),
+                            sender: Some(sender),
+                            source_time_ms: None,
+                            source_key: None,
+                            reply_to: None,
+                            quote: None,
+                            origin: None,
+                            received_at_ms: None,
+                        },
+                    )
                     .map_err(ApiError::from_store)?;
+                Ok(vec![Delivery {
+                    to: format!("agent:{}", agent.name),
+                    id: message.id.to_string(),
+                    seq: message.seq,
+                    duplicate: false,
+                }])
+            };
+            if let Some((ref caller_id, _)) = caller_agent {
+                outbound_history::deliver(
+                    &state.store,
+                    caller_id,
+                    &format!("agent:{}", agent.name),
+                    None,
+                    prompt,
+                    None,
+                    enqueue,
+                )?;
+            } else {
+                enqueue()?;
             }
         }
         if has_prompt {
@@ -6202,7 +6222,8 @@ fn send_sync(
     let composed_body = anyagents_core::quote::compose(&body.text, body.quote.as_ref());
     let mut deliveries = Vec::with_capacity(plan.targets.len());
     let mut skipped = Vec::new();
-    for target in &plan.targets {
+    for (target_index, target) in plan.targets.iter().enumerate() {
+        let history_key = key.as_ref().map(|key| format!("{key}:{target_index}"));
         match target {
             Target::Agent(name) => {
                 // Only a single, explicitly named recipient of an authored
@@ -6214,31 +6235,55 @@ fn send_sync(
                     && body.to.len() == 1
                     && matches!(Address::parse(&body.to[0]), Ok(Address::Agent(ref name))
                         if !matches!(name.as_str(), "all" | "peers" | "siblings" | "team" | "children" | "parent"));
-                let d = deliver_agent(store, &body, name, key.as_deref(), wake_archived)?;
-                if let Some(ref sid) = sender_agent_id
-                    && !d.duplicate
-                {
-                    store
-                        .record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body)
-                        .map_err(ApiError::from_store)?;
-                }
-                deliveries.push(d);
+                let sent = if let Some(sid) = &sender_agent_id {
+                    outbound_history::deliver(
+                        store,
+                        sid,
+                        &format!("agent:{name}"),
+                        body.reply_to.as_deref(),
+                        &composed_body,
+                        history_key.as_deref(),
+                        || {
+                            Ok(vec![deliver_agent(
+                                store,
+                                &body,
+                                name,
+                                key.as_deref(),
+                                wake_archived,
+                            )?])
+                        },
+                    )?
+                } else {
+                    vec![deliver_agent(
+                        store,
+                        &body,
+                        name,
+                        key.as_deref(),
+                        wake_archived,
+                    )?]
+                };
+                deliveries.extend(sent);
             }
             Target::Room(room) => {
-                let mut all = deliver_room(store, &body, room, key.as_deref())?;
+                let dest = if room.starts_with("group:") || room.starts_with("telegram:") {
+                    room.clone()
+                } else {
+                    format!("group:{room}")
+                };
+                let mut all = if let Some(sid) = &sender_agent_id {
+                    outbound_history::deliver(
+                        store,
+                        sid,
+                        &dest,
+                        body.reply_to.as_deref(),
+                        &composed_body,
+                        history_key.as_deref(),
+                        || deliver_room(store, &body, room, key.as_deref()),
+                    )?
+                } else {
+                    deliver_room(store, &body, room, key.as_deref())?
+                };
                 let mut room_skip = room_skipped(store, &body, room);
-                if let Some(ref sid) = sender_agent_id
-                    && all.iter().any(|d| !d.duplicate)
-                {
-                    let dest = if room.starts_with("group:") || room.starts_with("telegram:") {
-                        room.clone()
-                    } else {
-                        format!("group:{room}")
-                    };
-                    store
-                        .record_outbound(sid, &dest, body.reply_to.as_deref(), &composed_body)
-                        .map_err(ApiError::from_store)?;
-                }
                 deliveries.append(&mut all);
                 for s in room_skip.drain(..) {
                     if !skipped
@@ -6255,21 +6300,32 @@ fn send_sync(
                 thread,
                 reply: address_reply,
             } => {
-                let d = deliver_telegram(
-                    store,
-                    actor,
-                    &body,
-                    address,
-                    chat,
-                    thread.as_deref(),
-                    address_reply.as_deref().or(reply.as_deref()),
-                )?;
-                if let Some(ref sid) = sender_agent_id {
-                    store
-                        .record_outbound(sid, &d.to, body.reply_to.as_deref(), &composed_body)
-                        .map_err(ApiError::from_store)?;
-                }
-                deliveries.push(d);
+                let send = || {
+                    deliver_telegram(
+                        store,
+                        actor,
+                        &body,
+                        address,
+                        chat,
+                        thread.as_deref(),
+                        address_reply.as_deref().or(reply.as_deref()),
+                    )
+                    .map(|delivery| vec![delivery])
+                };
+                let sent = if let Some(sid) = &sender_agent_id {
+                    outbound_history::deliver(
+                        store,
+                        sid,
+                        address,
+                        body.reply_to.as_deref(),
+                        &composed_body,
+                        history_key.as_deref(),
+                        send,
+                    )?
+                } else {
+                    send()?
+                };
+                deliveries.extend(sent);
             }
         }
     }
