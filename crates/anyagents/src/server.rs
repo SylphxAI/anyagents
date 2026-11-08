@@ -3883,7 +3883,7 @@ async fn create_agent_route(
             has_prompt = true;
             let sender = caller_agent
                 .as_ref()
-                .map(|(_, name)| format!("agent:{name}"))
+                .map(|(id, _)| format!("agent:{id}"))
                 .unwrap_or_else(|| "operator".to_string());
             let enqueue = || {
                 let message = state
@@ -3902,11 +3902,15 @@ async fn create_agent_route(
                         },
                     )
                     .map_err(ApiError::from_store)?;
+                let (message, duplicate) = match message {
+                    ReceiveOutcome::New(message) => (message, false),
+                    ReceiveOutcome::Duplicate(message) => (message, true),
+                };
                 Ok(vec![Delivery {
                     to: format!("agent:{}", agent.name),
                     id: message.id.to_string(),
                     seq: message.seq,
-                    duplicate: false,
+                    duplicate,
                 }])
             };
             if let Some((ref caller_id, _)) = caller_agent {
