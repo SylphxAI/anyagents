@@ -4193,11 +4193,35 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
         "session-env",
         "todos",
         "logs",
+        ".keel",
+        "logs_2.sqlite",
+        "logs_2.sqlite-wal",
+        "logs_2.sqlite-shm",
+        "state_5.sqlite-wal",
+        "state_5.sqlite-shm",
+        "thread_history_1.sqlite",
+        "thread_history_1.sqlite-wal",
+        "thread_history_1.sqlite-shm",
+        "local-evidence",
+        ".android",
+        ".sylphx-remote-models.json",
+        "models_cache.json",
+        "model-catalog-direct.json",
     ] {
         let target = config_dir.join(rel);
         complete &= remove_path_with_seat(&target, seat_ids);
     }
     complete &= remove_path_with_seat(&agent_root.join("tmp"), seat_ids);
+    complete &= remove_path_with_seat(&agent_root.join("state-import"), seat_ids);
+    for dir in [&agent_root, &agent_root.join("work")] {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with(".desk-worktree.") {
+                    complete &= remove_path_with_seat(&entry.path(), seat_ids);
+                }
+            }
+        }
+    }
     let _ = std::fs::remove_file(
         data_dir
             .join("locks")
@@ -4449,6 +4473,17 @@ fn detect_seat_ids(config_dir: &Path) -> Option<(u32, u32, u32)> {
     }
     if gid != my_gid && gid != 0 {
         return Some((gid, gid, sock_gid));
+    }
+    if let Ok(seat_name) = std::fs::read_to_string(config_dir.join(".anyagents-seat")) {
+        let seat_name = seat_name.trim();
+        if !seat_name.is_empty()
+            && let Some((_, uid, seat_gid, seat_sock_gid)) =
+                crate::sandbox::seat_for_agent(seat_name)
+            && uid != me
+            && uid != 0
+        {
+            return Some((uid, seat_gid, seat_sock_gid));
+        }
     }
     None
 }
