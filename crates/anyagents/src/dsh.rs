@@ -356,6 +356,15 @@ impl Drop for DshHarness {
     }
 }
 
+fn session_running(resp: &Value, session: &str) -> Option<bool> {
+    resp.pointer("/payload/items")?
+        .as_array()?
+        .iter()
+        .find(|item| item.get("sessionId").and_then(Value::as_str) == Some(session))?
+        .get("running")?
+        .as_bool()
+}
+
 fn poll_dsh_turns(shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
     loop {
         let (port, cookie, session) = {
@@ -381,18 +390,7 @@ fn poll_dsh_turns(shared: Arc<Mutex<State>>, wake: Arc<Condvar>) {
         let Ok(resp) = dsh_rpc(port, &cookie, "session/list", "poll", &json!({})) else {
             continue;
         };
-        let running = resp
-            .pointer("/payload/items")
-            .and_then(Value::as_array)
-            .and_then(|items| {
-                items
-                    .iter()
-                    .find(|item| item.get("sessionId").and_then(Value::as_str) == Some(&session))
-            })
-            .and_then(|item| item.get("running"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if !running {
+        if session_running(&resp, &session) == Some(false) {
             let mut st = lock(&shared);
             if !st.open.is_empty() {
                 let drained: Vec<String> = std::mem::take(&mut st.open);
@@ -590,4 +588,35 @@ fn uuid_v4() -> String {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn session_poll_requires_explicit_terminal_state_for_exact_session() {
+        assert_eq!(
+            session_running(
+                &json!({"payload":{"items":[{"sessionId":"selected","running":false}]}}),
+                "selected"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            session_running(
+                &json!({"payload":{"items":[{"sessionId":"selected","running":true}]}}),
+                "selected"
+            ),
+            Some(true)
+        );
+        for malformed in [
+            json!({}),
+            json!({"payload":{"items":[]}}),
+            json!({"payload":{"items":[{"sessionId":"other","running":false}]}}),
+            json!({"payload":{"items":[{"sessionId":"selected"}]}}),
+            json!({"payload":{"items":[{"sessionId":"selected","running":"false"}]}}),
+        ] {
+            assert_eq!(session_running(&malformed, "selected"), None);
+        }
+    }
 }

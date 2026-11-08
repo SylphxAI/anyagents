@@ -68,11 +68,22 @@ pub(crate) fn set_worktree_identity(path: &Path) -> Result<(), Error> {
     if config.symlink_metadata().is_ok_and(|m| !m.is_file()) {
         return Err(refusal(&config, "worktree config is not a regular file"));
     }
-    for (key, value) in [("user.name", "Kyle Tse"), ("user.email", "hi@kylet.se")] {
+    let name = std::env::var("ANYAGENTS_GIT_AUTHOR_NAME").ok();
+    let email = std::env::var("ANYAGENTS_GIT_AUTHOR_EMAIL").ok();
+    if name.is_some() != email.is_some() {
+        return Err(refusal(path, "configure both Git author name and email"));
+    }
+    for (key, value) in [("user.name", name), ("user.email", email)] {
+        let Some(value) = value else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            return Err(refusal(path, "Git author identity cannot be empty"));
+        }
         let out = std::process::Command::new("git")
             .args(["config", "--no-includes", "--file"])
             .arg(&config)
-            .args([key, value])
+            .args([key, &value])
             .output()?;
         if !out.status.success() {
             return Err(refusal(&config, "cannot set worktree commit identity"));
@@ -2300,7 +2311,7 @@ mod tests {
                 (&good, &survivor, gid + 1, "good"),
             ] {
                 f.consumer
-                    .remote("SylphxAI/demo", path, branch, None)
+                    .remote("ExampleOrg/demo", path, branch, None)
                     .unwrap();
                 let dirs = git_dirs(path).unwrap();
                 share_known(
@@ -2543,7 +2554,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         let common_config = f.source.join(".git/config");
         let before = std::fs::read(&common_config).unwrap();
@@ -2551,9 +2562,12 @@ mod tests {
         set_worktree_identity(&target).unwrap();
         assert_eq!(std::fs::read(&common_config).unwrap(), before);
         assert_eq!(std::fs::metadata(&common_config).unwrap().ino(), inode);
-        for (key, expected) in [("user.name", "Kyle Tse"), ("user.email", "hi@kylet.se")] {
+        for (key, expected) in [
+            ("user.name", "Example Author"),
+            ("user.email", "author@example.test"),
+        ] {
             assert_eq!(
-                crate::worktree::tests::git(&target, &["config", "--worktree", "--get", key]),
+                crate::worktree::tests::git(&target, &["config", "--get", key]),
                 expected
             );
         }
@@ -2577,7 +2591,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         set_worktree_identity(&target).unwrap();
         let id = anyagents_core::AgentId::generate();
@@ -2826,7 +2840,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         share(
             &target,
@@ -2950,7 +2964,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         let dirs = git_dirs(&target).unwrap();
         let common = dirs.last().unwrap();
@@ -3019,7 +3033,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         let dirs = git_dirs(&target).unwrap();
         let common = dirs.last().unwrap();
@@ -3072,7 +3086,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let first = dir.path().join("first");
         f.consumer
-            .remote("SylphxAI/demo", &first, "first", None)
+            .remote("ExampleOrg/demo", &first, "first", None)
             .unwrap();
         let id = anyagents_core::AgentId::generate();
         let journal = grant_path(dir.path(), &id);
@@ -3096,7 +3110,7 @@ mod tests {
 
         let second = dir.path().join("second");
         f.consumer
-            .remote("SylphxAI/demo", &second, "second", None)
+            .remote("ExampleOrg/demo", &second, "second", None)
             .unwrap();
         let second_id = anyagents_core::AgentId::generate();
         share(&second, uid, gid, &grant_path(dir.path(), &second_id)).unwrap();
@@ -3172,7 +3186,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         let dirs = git_dirs(&target).unwrap();
         let private = &dirs[0];
@@ -3214,7 +3228,7 @@ mod tests {
         assert!(acl(&common.join("logs/refs"), c"system.posix_acl_access").contains(&(8, 7, gid)));
         let sibling = dir.path().join("sibling");
         f.consumer
-            .remote("SylphxAI/demo", &sibling, "sibling", None)
+            .remote("ExampleOrg/demo", &sibling, "sibling", None)
             .unwrap();
         let sibling_dirs = git_dirs(&sibling).unwrap();
         share_known(
@@ -3371,7 +3385,7 @@ mod tests {
         for name in ["b1", "b2"] {
             let target = dir.path().join(name);
             f.consumer
-                .remote("SylphxAI/demo", &target, name, None)
+                .remote("ExampleOrg/demo", &target, name, None)
                 .unwrap();
             let dirs = git_dirs(&target).unwrap();
             let id = anyagents_core::AgentId::generate();
@@ -3431,7 +3445,7 @@ mod tests {
         let f = crate::worktree::tests::Fixture::new(dir.path());
         let target = dir.path().join("child");
         f.consumer
-            .remote("SylphxAI/demo", &target, "child", None)
+            .remote("ExampleOrg/demo", &target, "child", None)
             .unwrap();
         let dirs = git_dirs(&target).unwrap();
         let common = dirs.last().unwrap();
@@ -3571,5 +3585,45 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("hard-linked"), "{err}");
         assert_eq!(std::fs::metadata(&outside).unwrap().mode() & 0o777, 0o600);
+    }
+    #[test]
+    fn explicit_author_configuration_is_local_and_partial_configuration_refuses() {
+        let _env = crate::server::tests::env_lock();
+        let keys = ["ANYAGENTS_GIT_AUTHOR_NAME", "ANYAGENTS_GIT_AUTHOR_EMAIL"];
+        let old = keys.map(std::env::var_os);
+        let dir = tempfile::tempdir().unwrap();
+        let f = crate::worktree::tests::Fixture::new(dir.path());
+        let target = dir.path().join("child");
+        f.consumer
+            .remote("ExampleOrg/demo", &target, "child", None)
+            .unwrap();
+        let before = std::fs::read(f.source.join(".git/config")).unwrap();
+        unsafe {
+            std::env::set_var(keys[0], "Selected Author");
+            std::env::remove_var(keys[1]);
+        }
+        assert!(set_worktree_identity(&target).is_err());
+        assert_eq!(std::fs::read(f.source.join(".git/config")).unwrap(), before);
+        unsafe {
+            std::env::set_var(keys[1], "selected@example.test");
+        }
+        set_worktree_identity(&target).unwrap();
+        assert_eq!(
+            crate::worktree::tests::git(&target, &["config", "--worktree", "--get", "user.name"]),
+            "Selected Author"
+        );
+        assert_eq!(
+            crate::worktree::tests::git(&target, &["config", "--worktree", "--get", "user.email"]),
+            "selected@example.test"
+        );
+        assert_eq!(std::fs::read(f.source.join(".git/config")).unwrap(), before);
+        unsafe {
+            for (key, value) in keys.into_iter().zip(old) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 }

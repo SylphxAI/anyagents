@@ -22,25 +22,9 @@ pub fn write(
         dir.join(".config").join("opencode").join("opencode.json"),
         dir.join("opencode.json"),
     ];
-    let mut root = candidates
-        .iter()
-        .find_map(|path| {
-            let bytes = std::fs::read(path).ok()?;
-            let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-            val.get("provider").is_some().then_some(val)
-        })
-        .or_else(|| {
-            candidates.iter().find_map(|path| {
-                let bytes = std::fs::read(path).ok()?;
-                serde_json::from_slice::<serde_json::Value>(&bytes).ok()
-            })
-        })
-        .unwrap_or_else(|| serde_json::json!({}));
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
+    let mut root = crate::mcp_config::read_candidates(&candidates)?;
     if root.get("provider").is_none()
-        && let Some(donor) = donor_provider_block(dir)
+        && let Some(donor) = donor_provider_block(dir)?
     {
         root["provider"] = donor;
     }
@@ -134,7 +118,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn donor_provider_block(dir: &Path) -> Option<serde_json::Value> {
+fn donor_provider_block(dir: &Path) -> Result<Option<serde_json::Value>, Error> {
     let mut candidates = Vec::new();
     if let Some(data_dir) = dir.parent().and_then(Path::parent) {
         candidates.push(
@@ -149,17 +133,12 @@ fn donor_provider_block(dir: &Path) -> Option<serde_json::Value> {
         candidates.push(data_dir.join("opencode-provider.json"));
     }
     for path in candidates {
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        let Ok(val) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
+        let val = crate::mcp_config::read_candidates(&[path])?;
         if let Some(provider) = val.get("provider").cloned() {
-            return Some(provider);
+            return Ok(Some(provider));
         }
     }
-    None
+    Ok(None)
 }
 
 fn normalize_model(raw: &str, has_sylphx_provider: bool) -> String {
@@ -233,5 +212,43 @@ mod tests {
             serde_json::from_slice(&std::fs::read(dir.path().join("opencode.json")).unwrap())
                 .unwrap();
         assert!(parsed.get("model").is_none(), "{parsed}");
+    }
+    #[test]
+    fn invalid_existing_candidates_never_overwrite_valid_or_invalid_aliases() {
+        for bad in [
+            "opencode.json",
+            "opencode/opencode.json",
+            ".config/opencode/opencode.json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let selected = dir.path().join("opencode.json");
+            std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            std::fs::write(&selected, br#"{"custom":"keep"}"#).unwrap();
+            let malformed = dir.path().join(bad);
+            std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+            std::fs::write(&malformed, b"{broken").unwrap();
+            let before = std::fs::read(&selected).unwrap();
+            assert!(write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
+            assert_eq!(std::fs::read(&selected).unwrap(), before);
+            assert_eq!(std::fs::read(&malformed).unwrap(), b"{broken");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("opencode.json")).unwrap();
+        assert!(write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
+    }
+
+    #[test]
+    fn absent_config_initializes_and_keeps_valid_custom_data() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+        let path = dir.path().join("opencode/opencode.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["custom"] = serde_json::json!("keep");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["custom"], "keep");
     }
 }

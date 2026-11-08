@@ -1,4 +1,6 @@
-//! Managed checkouts have one provisioning authority: desk-git-hub.
+//! External checkout provider contract. The explicitly configured executable accepts
+//! `fetch <source> <ref>` and `worktree <source> <target> <branch> [base]`.
+//! No host-specific provider or install location is selected implicitly.
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -11,18 +13,20 @@ pub(crate) struct Consumer {
 impl Consumer {
     pub(crate) fn configured() -> Self {
         Self {
-            executable: std::env::var_os("ANYAGENTS_GIT_HUB_BIN")
+            executable: std::env::var_os("ANYAGENTS_CHECKOUT_PROVIDER_BIN")
                 .map(PathBuf::from)
-                .or_else(|| {
-                    crate::sandbox::host_home_dir()
-                        .map(|h| h.join(".local/bin/desk-git-hub"))
-                        .filter(|p| p.is_file())
-                })
-                .unwrap_or_else(|| PathBuf::from("desk-git-hub")),
+                .unwrap_or_default(),
         }
     }
 
     fn run(&self, repo: &str, args: &[&std::ffi::OsStr]) -> Result<(), Error> {
+        if self.executable.as_os_str().is_empty() {
+            return Err(Error::WorktreeProvisioning {
+                repo: repo.into(),
+                message: "configure ANYAGENTS_CHECKOUT_PROVIDER_BIN with a checkout provider"
+                    .into(),
+            });
+        }
         let out = Command::new(&self.executable)
             .args(args)
             .output()
@@ -79,10 +83,13 @@ impl Consumer {
         branch: &str,
         base: Option<&str>,
     ) -> Result<(), Error> {
-        let repo = github_repo(raw).ok_or_else(|| Error::WorktreeSourceUnpublished {
-            source_repo: raw.into(),
-            message: "use a GitHub org/repo or GitHub URL".into(),
-        })?;
+        let repo = github_repo(raw).unwrap_or_else(|| raw.to_string());
+        if repo.trim().is_empty() {
+            return Err(Error::WorktreeSourceUnpublished {
+                source_repo: raw.into(),
+                message: "repository source is empty".into(),
+            });
+        }
         let start = base.map(|base| {
             if base == "HEAD"
                 || base.starts_with("origin/")
@@ -141,9 +148,9 @@ impl Consumer {
             .into_iter()
             .find_map(|name| {
                 let url = git(&["config", "--get", &format!("remote.{name}.url")]).ok()?;
-                github_remote_repo(&url).map(|repo| (name, repo))
+                (!url.trim().is_empty()).then(|| (name, github_remote_repo(&url).unwrap_or(url)))
             })
-            .ok_or_else(|| refuse("no GitHub remote is configured".into()))?;
+            .ok_or_else(|| refuse("no remote is configured".into()))?;
         let head = git(&["rev-parse", "--verify", "HEAD^{commit}"])?;
         let selected = git(&[
             "rev-parse",
@@ -178,10 +185,10 @@ impl Consumer {
                     reachable.then(|| name.to_string())
                 })
         };
-        reachable_ref(&head).ok_or_else(|| refuse("HEAD is not reachable from the GitHub remote's advertised refs; push HEAD first (fetch the remote if local history is stale)".into()))?;
+        reachable_ref(&head).ok_or_else(|| refuse("HEAD is not reachable from the remote's advertised refs; push HEAD first (fetch the remote if local history is stale)".into()))?;
         let reference = reachable_ref(&selected).ok_or_else(|| {
             refuse(
-                "requested base is not reachable from the GitHub remote's advertised refs; push it first"
+                "requested base is not reachable from the remote's advertised refs; push it first"
                     .into(),
             )
         })?;
@@ -283,8 +290,8 @@ pub(crate) mod tests {
             std::fs::create_dir_all(source.join("src")).unwrap();
             std::fs::create_dir_all(source.join("excluded")).unwrap();
             git(&source, &["init", "-b", "main"]);
-            git(&source, &["config", "user.name", "Kyle Tse"]);
-            git(&source, &["config", "user.email", "hi@kylet.se"]);
+            git(&source, &["config", "user.name", "Example Author"]);
+            git(&source, &["config", "user.email", "author@example.test"]);
             std::fs::write(source.join("README.md"), "# Demo Repo\n").unwrap();
             std::fs::write(source.join("src/keep"), "included\n").unwrap();
             std::fs::write(source.join("excluded/large"), "excluded\n").unwrap();
@@ -306,7 +313,7 @@ pub(crate) mod tests {
                     "remote",
                     "add",
                     "origin",
-                    "https://github.com/SylphxAI/demo.git",
+                    "https://github.com/ExampleOrg/demo.git",
                 ],
             );
             git(
@@ -314,7 +321,7 @@ pub(crate) mod tests {
                 &[
                     "config",
                     &format!("url.file://{}.insteadOf", remote.display()),
-                    "https://github.com/SylphxAI/demo.git",
+                    "https://github.com/ExampleOrg/demo.git",
                 ],
             );
             git(&source, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
@@ -327,7 +334,7 @@ pub(crate) mod tests {
 set -eu
 printf '%s\n' "$*" >> {log:?}
 if [ -f {fail:?} ] && [ "$(cat {fail:?})" = "$1" ]; then
-  echo 'desk-git-hub: injected policy refusal' >&2
+  echo 'checkout-provider: injected policy refusal' >&2
   exit 42
 fi
 case "$1" in
@@ -382,7 +389,7 @@ esac
         let remote = dir.path().join("remote-work");
         f.consumer
             .remote(
-                "https://github.com/SylphxAI/demo.git",
+                "https://github.com/ExampleOrg/demo.git",
                 &remote,
                 "remote-work",
                 Some("main"),
@@ -399,8 +406,8 @@ esac
             git(&f.source, &["rev-parse", "HEAD"])
         );
         let log = std::fs::read_to_string(&f.log).unwrap();
-        assert!(log.contains("fetch SylphxAI/demo main"));
-        assert!(log.contains("fetch SylphxAI/demo refs/heads/main"));
+        assert!(log.contains("fetch ExampleOrg/demo main"));
+        assert!(log.contains("fetch ExampleOrg/demo refs/heads/main"));
         assert_eq!(
             log.lines().filter(|l| l.starts_with("worktree ")).count(),
             2
@@ -434,19 +441,16 @@ esac
     }
 
     #[test]
-    fn missing_github_remote_refuses_before_consumer() {
+    fn missing_remote_refuses_before_consumer() {
         let dir = tempfile::tempdir().unwrap();
         let f = Fixture::new(dir.path());
-        git(
-            &f.source,
-            &["remote", "set-url", "origin", f.remote.to_str().unwrap()],
-        );
+        git(&f.source, &["remote", "remove", "origin"]);
         let err = f
             .consumer
             .local(&f.source, &dir.path().join("work"), "work", None)
             .unwrap_err();
         assert!(
-            matches!(err, Error::WorktreeSourceUnpublished { ref message, .. } if message.contains("no GitHub remote")),
+            matches!(err, Error::WorktreeSourceUnpublished { ref message, .. } if message.contains("no remote")),
             "{err}"
         );
         assert!(!f.log.exists());
@@ -461,7 +465,7 @@ esac
             let target = dir.path().join("work");
             let err = f
                 .consumer
-                .remote("SylphxAI/demo", &target, "work", Some("main"))
+                .remote("ExampleOrg/demo", &target, "work", Some("main"))
                 .unwrap_err();
             assert!(
                 matches!(err, Error::WorktreeProvisioning { ref message, .. } if message.contains("injected policy refusal") && message.contains("42")),
@@ -479,18 +483,18 @@ esac
     #[test]
     fn github_urls_are_normalized_but_other_hosts_and_local_remotes_are_rejected() {
         for raw in [
-            "https://github.com/SylphxAI/demo.git",
-            "git@github.com:SylphxAI/demo.git",
-            "ssh://git@github.com/SylphxAI/demo",
+            "https://github.com/ExampleOrg/demo.git",
+            "git@github.com:ExampleOrg/demo.git",
+            "ssh://git@github.com/ExampleOrg/demo",
         ] {
-            assert_eq!(github_remote_repo(raw).as_deref(), Some("SylphxAI/demo"));
+            assert_eq!(github_remote_repo(raw).as_deref(), Some("ExampleOrg/demo"));
         }
         for raw in [
-            "SylphxAI/demo",
+            "ExampleOrg/demo",
             "../demo",
             "/tmp/demo",
-            "https://example.com/SylphxAI/demo",
-            "https://github.com/SylphxAI/../demo",
+            "https://example.com/ExampleOrg/demo",
+            "https://github.com/ExampleOrg/../demo",
         ] {
             assert!(github_remote_repo(raw).is_none(), "{raw}");
         }
@@ -530,5 +534,43 @@ esac
             "{err}"
         );
         assert!(!target.exists());
+    }
+    #[test]
+    fn unconfigured_checkout_provider_refuses_and_generic_remote_sources_are_forwarded() {
+        let dir = tempfile::tempdir().unwrap();
+        let unconfigured = Consumer {
+            executable: PathBuf::new(),
+        };
+        assert!(
+            unconfigured
+                .remote(
+                    "https://git.example.test/team/repo.git",
+                    &dir.path().join("target"),
+                    "branch",
+                    None
+                )
+                .is_err()
+        );
+        let executable = dir.path().join("provider");
+        let receipt = dir.path().join("args");
+        write_executable(
+            &executable,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                receipt.display()
+            ),
+        );
+        let configured = Consumer { executable };
+        configured
+            .remote(
+                "https://git.example.test/team/repo.git",
+                &dir.path().join("target"),
+                "branch",
+                Some("main"),
+            )
+            .unwrap();
+        let args = std::fs::read_to_string(receipt).unwrap();
+        assert!(args.contains("https://git.example.test/team/repo.git"));
+        assert!(args.contains("worktree"));
     }
 }

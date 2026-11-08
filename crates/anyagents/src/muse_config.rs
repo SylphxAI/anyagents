@@ -69,19 +69,11 @@ pub fn write(
     args: &[String],
 ) -> Result<(), Error> {
     let path = dir.join("settings.json");
-    let mut root: serde_json::Value = [
+    let mut root = crate::mcp_config::read_candidates(&[
         path.clone(),
         dir.join("muse/settings.json"),
         dir.join(".config/muse/settings.json"),
-    ]
-    .into_iter()
-    .find_map(|candidate| {
-        std::fs::read(&candidate)
-            .ok()
-            .filter(|bytes| !bytes.is_empty())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-    })
-    .unwrap_or_else(|| serde_json::json!({}));
+    ])?;
     if !root.is_object() {
         return Err(Error::Message("settings.json is not an object".into()));
     }
@@ -115,10 +107,8 @@ pub fn write(
     write_atomic(&path, &bytes)?;
     for sub in ["muse", ".config/muse"] {
         let sub_dir = dir.join(sub);
-        let _ = std::fs::create_dir_all(&sub_dir);
-        if sub_dir.is_dir() {
-            let _ = write_atomic(&sub_dir.join("settings.json"), &bytes);
-        }
+        std::fs::create_dir_all(&sub_dir)?;
+        write_atomic(&sub_dir.join("settings.json"), &bytes)?;
     }
     Ok(())
 }
@@ -194,101 +184,121 @@ pub fn ensure_workspace_session(
     .stdout(std::process::Stdio::piped())
     .stderr(std::process::Stdio::null());
 
-    let Ok(mut child) = cmd.spawn() else {
-        return Ok(());
+    finish_workspace_session(cmd.spawn()?, config_dir, work_dir, &environment)
+}
+
+/// Own the initializer through every error path, including malformed responses.
+struct InitializerChild {
+    child: std::process::Child,
+    environment: Vec<(String, String)>,
+}
+impl Drop for InitializerChild {
+    fn drop(&mut self) {
+        anyagents_harness::kill_child(&mut self.child, &self.environment);
+        let _ = self.child.wait();
+    }
+}
+
+fn rpc_result(
+    lines: &std::sync::mpsc::Receiver<std::io::Result<String>>,
+    id: i64,
+    deadline: std::time::Instant,
+) -> Result<serde_json::Value, Error> {
+    for _ in 0..32 {
+        let line = lines
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .map_err(|_| {
+                Error::Message(format!("Muse response {id} unavailable before deadline"))
+            })??;
+        let value: serde_json::Value = serde_json::from_str(&line)
+            .map_err(|err| Error::Message(format!("invalid Muse response: {err}")))?;
+        if value.get("id").and_then(|v| v.as_i64()) == Some(id) {
+            if value.get("error").is_some() {
+                return Err(Error::Message(format!("Muse request {id} rejected")));
+            }
+            return value
+                .get("result")
+                .filter(|v| v.is_object())
+                .cloned()
+                .ok_or_else(|| Error::Message(format!("Muse response {id} has no result object")));
+        }
+    }
+    Err(Error::Message(format!("Muse response {id} not observed")))
+}
+
+fn finish_workspace_session(
+    child: std::process::Child,
+    config_dir: &Path,
+    work_dir: &Path,
+    environment: &[(String, String)],
+) -> Result<(), Error> {
+    use std::io::{BufRead as _, Write as _};
+    let mut child = InitializerChild {
+        child,
+        environment: environment.to_vec(),
     };
-    let Some(mut stdin) = child.stdin.take() else {
-        let _ = child.wait();
-        return Ok(());
-    };
-    let Some(stdout) = child.stdout.take() else {
-        drop(stdin);
-        let _ = child.wait();
-        return Ok(());
-    };
-    use std::io::{BufRead as _, BufReader, Write as _};
-    let mut reader = BufReader::new(stdout);
-    let init = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "clientInfo": {"name": "anyagents", "version": "0.1.0"},
-            "capabilities": {
-                "requestedCapabilities": ["userShell", "sessionMcp"],
-                "userInputDialogs": false
+    let mut stdin = child
+        .child
+        .stdin
+        .take()
+        .ok_or_else(|| Error::Message("Muse initializer has no stdin".into()))?;
+    let stdout = child
+        .child
+        .stdout
+        .take()
+        .ok_or_else(|| Error::Message("Muse initializer has no stdout".into()))?;
+    let (send, lines) = std::sync::mpsc::sync_channel(32);
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            if send.send(line).is_err() {
+                break;
             }
         }
     });
-    if writeln!(stdin, "{init}").is_err() || stdin.flush().is_err() {
-        drop(stdin);
-        let _ = child.wait();
-        return Ok(());
-    }
-    let mut line = String::new();
-    if reader.read_line(&mut line).is_err() || line.is_empty() {
-        drop(stdin);
-        let _ = child.wait();
-        return Ok(());
-    }
-    let _ = writeln!(
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let init = serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+        "clientInfo":{"name":"anyagents","version":"0.1.0"},
+        "capabilities":{"requestedCapabilities":["userShell","sessionMcp"],"userInputDialogs":false}
+    }});
+    writeln!(stdin, "{init}")?;
+    stdin.flush()?;
+    rpc_result(&lines, 1, deadline)?;
+    writeln!(
         stdin,
-        r#"{{"jsonrpc":"2.0","method":"initialized","params":{{}}}}"#
-    );
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let ms = (nanos / 1_000_000) & 0xFFFF_FFFF_FFFF;
-    let rand_a = nanos & 0x0FFF;
-    let rand_b = (nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 4) & 0x3FFF_FFFF_FFFF_FFFF;
-    let val = (ms << 80) | (0x7 << 76) | (rand_a << 64) | (0b10 << 62) | rand_b;
-    let hex = format!("{val:032x}");
-    let cid = format!(
-        "{}-{}-{}-{}-{}",
-        &hex[0..8],
-        &hex[8..12],
-        &hex[12..16],
-        &hex[16..20],
-        &hex[20..32]
-    );
-    let start_req = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "session/start",
-        "params": {
-            "commandId": cid,
-            "workspaceRoot": work_dir.display().to_string(),
-            "permissionProfile": ":unrestricted"
-        }
-    });
-    if writeln!(stdin, "{start_req}").is_err() || stdin.flush().is_err() {
-        drop(stdin);
-        let _ = child.wait();
-        return Ok(());
-    }
-    let mut minted_sid = None;
-    for _ in 0..32 {
-        line.clear();
-        if reader.read_line(&mut line).is_err() || line.is_empty() {
-            break;
-        }
-        if let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line)
-            && obj.get("id").and_then(|v| v.as_i64()) == Some(2)
-        {
-            minted_sid = obj
-                .pointer("/result/session/sessionId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            break;
-        }
-    }
-    drop(stdin);
-    let _ = child.wait();
-    if let Some(sid) = minted_sid {
-        let _ = std::fs::write(&sid_path, format!("{sid}\n"));
-        let _ = std::fs::write(&marker_path, expected_marker(&sid));
-    }
+        "{}",
+        serde_json::json!({"jsonrpc":"2.0","method":"initialized","params":{}})
+    )?;
+    stdin.flush()?;
+    let start = serde_json::json!({"jsonrpc":"2.0","id":2,"method":"session/start","params":{
+        "commandId":format!("anyagents-{}-{}", std::process::id(), anyagents_core::now_ms()),
+        "workspaceRoot":work_dir.display().to_string(),"permissionProfile":":unrestricted"
+    }});
+    writeln!(stdin, "{start}")?;
+    stdin.flush()?;
+    let result = rpc_result(&lines, 2, deadline)?;
+    let sid = result
+        .pointer("/session/sessionId")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| {
+            Error::Message("Muse session/start did not return a session identity".into())
+        })?;
+    let marker = format!("{sid}\t{}\n", work_dir.display());
+    // This recovery record survives either alias-write failure; the matching
+    // final marker is published only after the selected launch pointer exists.
+    let pending = config_dir.join(".anyagents-muse-workspace-session.pending");
+    crate::create::write_required_file(&pending, marker.as_bytes(), 0o660)?;
+    crate::create::write_required_file(
+        &config_dir.join("muse-session-id"),
+        format!("{sid}\n").as_bytes(),
+        0o660,
+    )?;
+    crate::create::write_required_file(
+        &config_dir.join(".anyagents-muse-workspace-session"),
+        marker.as_bytes(),
+        0o660,
+    )?;
+    std::fs::remove_file(pending)?;
     Ok(())
 }
 
@@ -409,5 +419,117 @@ mod tests {
                 .unwrap();
         assert_eq!(muse_sub["schema_version"], 1);
         assert_eq!(muse_sub["model"], "muse-wonder-full-1.0");
+    }
+    #[test]
+    fn invalid_existing_candidates_never_overwrite_valid_or_invalid_aliases() {
+        for bad in [
+            "settings.json",
+            "muse/settings.json",
+            ".config/muse/settings.json",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let selected = dir.path().join("settings.json");
+            std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+            std::fs::write(&selected, br#"{"custom":"keep"}"#).unwrap();
+            let malformed = dir.path().join(bad);
+            std::fs::create_dir_all(malformed.parent().unwrap()).unwrap();
+            std::fs::write(&malformed, b"{broken").unwrap();
+            let before = std::fs::read(&selected).unwrap();
+            assert!(write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
+            assert_eq!(std::fs::read(&selected).unwrap(), before);
+            assert_eq!(std::fs::read(&malformed).unwrap(), b"{broken");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("settings.json")).unwrap();
+        assert!(write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).is_err());
+    }
+
+    #[test]
+    fn absent_config_initializes_and_keeps_valid_custom_data() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+        let path = dir.path().join("settings.json");
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["custom"] = serde_json::json!("keep");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        write(dir.path(), None, Path::new("/opt/bin/anyagents"), &[]).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(after["custom"], "keep");
+    }
+
+    fn initializer_fixture(session_result: &str) -> std::process::Child {
+        let script = format!(
+            r#"read -r line
+printf '%s\n' '{{"id":1,"result":{{}}}}'
+read -r line
+case "$line" in *initialized*) ;; *) exit 9 ;; esac
+read -r line
+printf '%s\n' '{session_result}'
+exec sleep 30"#
+        );
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    }
+
+    #[test]
+    fn initializer_observes_handshake_and_persists_matching_launch_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let work = dir.path().join("workspace");
+        let child =
+            initializer_fixture(r#"{"id":2,"result":{"session":{"sessionId":"new-session"}}}"#);
+        finish_workspace_session(child, dir.path(), &work, &[]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("muse-session-id")).unwrap(),
+            "new-session\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".anyagents-muse-workspace-session")).unwrap(),
+            format!("new-session\t{}\n", work.display())
+        );
+        assert!(
+            !dir.path()
+                .join(".anyagents-muse-workspace-session.pending")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn initializer_rejects_invalid_session_and_preserves_pointer_on_persistence_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("muse-session-id"), b"previous\n").unwrap();
+        for response in [
+            r#"{"id":2,"result":{}}"#,
+            r#"{"id":2,"error":{"code":-1}}"#,
+            "not-json",
+        ] {
+            let child = initializer_fixture(response);
+            assert!(finish_workspace_session(child, dir.path(), dir.path(), &[]).is_err());
+            assert_eq!(
+                std::fs::read(dir.path().join("muse-session-id")).unwrap(),
+                b"previous\n"
+            );
+        }
+        std::fs::remove_file(dir.path().join("muse-session-id")).unwrap();
+        std::fs::create_dir(dir.path().join("muse-session-id")).unwrap();
+        let child = initializer_fixture(
+            r#"{"id":2,"result":{"session":{"sessionId":"recoverable-session"}}}"#,
+        );
+        assert!(finish_workspace_session(child, dir.path(), dir.path(), &[]).is_err());
+        assert!(
+            std::fs::read_to_string(dir.path().join(".anyagents-muse-workspace-session.pending"))
+                .unwrap()
+                .starts_with("recoverable-session\t")
+        );
+        assert!(
+            !dir.path()
+                .join(".anyagents-muse-workspace-session")
+                .exists()
+        );
     }
 }
