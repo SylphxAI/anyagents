@@ -4320,12 +4320,36 @@ pub(crate) fn reap_subagent_ephemeral_dirs(
 
 fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u32)>) -> bool {
     let mut complete = true;
-    const BUILD_DIRS: &[&str] = &["target", "node_modules", ".next", ".turbo", "dist"];
+    const BUILD_DIRS: &[&str] = &[
+        "target",
+        "node_modules",
+        ".next",
+        ".turbo",
+        "dist",
+        "bun-runtime",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+        ".parcel-cache",
+        ".vite",
+    ];
     for rel in BUILD_DIRS {
         complete &= remove_path_with_seat(&wt_path.join(rel), seat_ids);
     }
-    for container in ["apps", "packages", "crates", "services"] {
+    for container in [
+        "apps",
+        "packages",
+        "crates",
+        "services",
+        "client",
+        "client-v1",
+        "backend",
+    ] {
         let dir = wt_path.join(container);
+        for rel in BUILD_DIRS {
+            complete &= remove_path_with_seat(&dir.join(rel), seat_ids);
+        }
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(error) => {
@@ -4347,6 +4371,41 @@ fn reap_build_outputs_in_worktree(wt_path: &Path, seat_ids: Option<(u32, u32, u3
         }
     }
     complete
+}
+
+fn is_ephemeral_worktree_status_path(raw_path: &str) -> bool {
+    let path = raw_path
+        .rsplit_once(" -> ")
+        .map_or(raw_path, |(_, dst)| dst)
+        .trim()
+        .trim_matches('"');
+    if matches!(path, "CLAUDE.md" | "AGENTS.md" | "GEMINI.md")
+        || path.starts_with(".desk-worktree")
+        || path.ends_with(".pyc")
+        || path.ends_with(".pyo")
+        || path.ends_with(".tsbuildinfo")
+    {
+        return true;
+    }
+    path.split('/').filter(|seg| !seg.is_empty()).any(|seg| {
+        matches!(
+            seg,
+            ".claude"
+                | ".gemini"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | ".next"
+                | ".turbo"
+                | "__pycache__"
+                | ".pytest_cache"
+                | ".ruff_cache"
+                | ".mypy_cache"
+                | ".parcel-cache"
+                | ".vite"
+                | "bun-runtime"
+        )
+    })
 }
 
 pub(crate) fn is_git_worktree_safe_to_reap(
@@ -4376,20 +4435,7 @@ pub(crate) fn is_git_worktree_safe_to_reap(
             let status_text = String::from_utf8_lossy(&status_out.stdout);
             let has_substantive_dirty = status_text.lines().any(|line| {
                 let path = line.get(3..).unwrap_or("").trim();
-                !matches!(
-                    path,
-                    "CLAUDE.md"
-                        | "AGENTS.md"
-                        | "GEMINI.md"
-                        | ".claude"
-                        | ".gemini"
-                        | "node_modules"
-                        | "target"
-                ) && !path.starts_with(".desk-worktree")
-                    && !path.starts_with(".claude/")
-                    && !path.starts_with(".gemini/")
-                    && !path.starts_with("node_modules/")
-                    && !path.starts_with("target/")
+                !is_ephemeral_worktree_status_path(path)
             });
             if has_substantive_dirty {
                 return Ok(false);
