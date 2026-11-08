@@ -2210,8 +2210,10 @@ done
                 std::os::unix::fs::symlink(&personal, config.join(".claude/skills")).unwrap();
             }
             crate::create::ensure_seat_skills(&config, &fixture);
-            let mut codex = agent.clone();
-            codex.harness = "codex".into();
+            // Launch consumes the persisted runtime selection. Changing only a
+            // cloned request would let current-record rendering legitimately
+            // restore the still-selected Claude generation before Codex binds.
+            let codex = store.set_agent_harness(&agent.id, "codex").unwrap();
             let harness = vendor_launch_with_store(
                 LaunchRequest {
                     agent: codex,
@@ -2307,6 +2309,42 @@ done
         std::fs::remove_dir_all(&fixture).unwrap();
         assert!(!fixture.exists());
         println!("NATIVE_VENDOR_FIXTURE_REMOVED");
+    }
+
+    #[test]
+    fn persisted_harness_cutover_renders_current_description_without_rotating_back() {
+        use anyagents_core::{NewAgent, Store, host_session};
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(NewAgent::new("worker", "claude-code"))
+            .unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        let root = config.parent().unwrap();
+        host_session::ensure_active(root, "claude-code").unwrap();
+        let codex = store.set_agent_harness(&agent.id, "codex").unwrap();
+        // A concurrent describe can advance independently of the launch snapshot.
+        store
+            .set_agent_description(&agent.id, Some("current description"))
+            .unwrap();
+        let request = LaunchRequest {
+            agent: codex,
+            data_dir: dir.path().into(),
+            config_dir: config.clone(),
+            work_dir: root.join("work"),
+            extra_env: vec![],
+        };
+        prepare_host_session_with_store(&request, Some(&store)).unwrap();
+        let prepared = host_session::active(root).unwrap().unwrap();
+        assert_eq!(prepared.harness, "codex");
+        assert_eq!(
+            host_session::bind_or_resume_vendor(root, "codex", "native-thread").unwrap(),
+            prepared
+        );
+        let rendered = std::fs::read_to_string(config.join("SYSTEM_PROMPT.md")).unwrap();
+        assert!(rendered.contains("current description"));
+        assert_eq!(store.agent(&agent.id).unwrap().harness, "codex");
     }
 
     #[test]
