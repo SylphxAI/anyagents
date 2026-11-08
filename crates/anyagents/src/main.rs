@@ -1335,7 +1335,7 @@ fn schedule_cmd(
                 "agent_id": rec.id.to_string(),
                 "agent": rec.name,
                 "cancelled": count,
-                "schedules": schedule::list_agent_schedules(&store, &rec.id, false),
+                "schedules": schedule::list_agent_schedules(&store, &rec.id, false).map_err(anyagents_core::Error::Message)?,
             });
             println!(
                 "{}",
@@ -1374,7 +1374,8 @@ fn schedule_cmd(
             }
         }
         _ => {
-            let list = schedule::list_agent_schedules(&store, &rec.id, false);
+            let list = schedule::list_agent_schedules(&store, &rec.id, false)
+                .map_err(anyagents_core::Error::Message)?;
             if json {
                 println!(
                     "{}",
@@ -1454,7 +1455,8 @@ fn inspect_cmd(
     }
     let store = anyagents_core::Store::open(data.join("state.db"))?;
     let rec = store.agent_by_name(&target)?;
-    let schedules = schedule::list_agent_schedules(&store, &rec.id, false);
+    let schedules = schedule::list_agent_schedules(&store, &rec.id, false)
+        .map_err(anyagents_core::Error::Message)?;
     let out = serde_json::json!({
         "agent": {
             "id": rec.id.to_string(),
@@ -2420,7 +2422,8 @@ fn status_cmd(data: &Path, json_out: bool) -> Result<(), anyagents_core::Error> 
                         seat_user: seat_info.as_ref().map(|(u, _, _, _)| u.clone()),
                         seat_uid: seat_info.as_ref().map(|(_, uid, _, _)| *uid),
                         seat_gid: seat_info.as_ref().map(|(_, _, gid, _)| *gid),
-                        schedules: schedule::list_agent_schedules(&store, &a.id, false),
+                        schedules: schedule::list_agent_schedules(&store, &a.id, false)
+                            .map_err(anyagents_core::Error::Message)?,
                     });
                 }
             }
