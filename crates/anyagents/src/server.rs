@@ -134,8 +134,14 @@ async fn serve(
     let key = capability_key()?;
     store.hold_capability_key(&key)?;
     let agents = store.list_agents()?;
+    // Keep small legacy deployments compatible without walking every archived
+    // seat tree in a large registry. Wake/admission mints a capability on demand.
+    let skip_archived_mint = agents.len() > 32;
     let mut mint_failures = Vec::new();
     for agent in &agents {
+        if skip_archived_mint && agent.state == "archived" {
+            continue;
+        }
         if let Err(err) = crate::operator::ensure(&store, &agent.id) {
             mint_failures.push(format!("{}: {err}", agent.name));
         }
@@ -1127,13 +1133,21 @@ fn reconcile_agent_snapshot(
     };
     if !guard.initialized {
         for agent in &agents {
+            if agent.state == "archived" {
+                continue;
+            }
             let delivered = store.delivered_cursor(&agent.id).unwrap_or(0);
             guard.watermark_seq.insert(agent.id.to_string(), delivered);
         }
         guard.initialized = true;
     }
 
-    let mut ordered_indices: Vec<usize> = (0..agents.len()).collect();
+    let mut ordered_indices: Vec<usize> = (0..agents.len())
+        .filter(|&idx| {
+            agents[idx].state != "archived"
+                || health.get(&agents[idx].id).is_some_and(|l| l.process_alive)
+        })
+        .collect();
     ordered_indices.sort_by_key(|&idx| {
         let a = &agents[idx];
         let last_try = guard
@@ -3694,14 +3708,19 @@ fn agent_view(store: &Store, health: &HealthBoard, agent: &Agent) -> Result<Agen
     let (session_quota, mut session_error) = if agent.state == "archived" {
         (None, None)
     } else if agent.harness == "claude-code" {
-        let (_, persisted_err) =
-            anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now);
+        let persisted_err = crate::vendor::read_persisted_last_error(&cfg).and_then(|(e, _)| e);
         (
             anyagents_harness_claude::detect_session_quota_reset_ms(&cfg, now),
             persisted_err,
         )
-    } else {
+    } else if agent.harness == "agy" {
         anyagents_harness_agy::detect_agy_session_quota_and_error(&cfg, now)
+    } else {
+        match crate::vendor::read_persisted_last_error(&cfg) {
+            Some((err, Some(reset_ms))) if reset_ms > now => (Some(reset_ms), err),
+            Some((err, None)) => (None, err),
+            _ => (None, None),
+        }
     };
     if agent.state != "archived" && session_error.is_none() && agent.harness == "codex" {
         session_error = crate::vendor::detect_codex_session_turn_error(&cfg, rotated_ms);
@@ -7488,6 +7507,56 @@ pub(crate) mod tests {
     use std::sync::MutexGuard;
 
     #[test]
+    fn agent_views_only_read_agy_logs_for_the_agy_harness() {
+        let _env = env_lock();
+        let dir = crate::test_tempdir();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let health = HealthBoard::default();
+        for harness in [
+            "agy",
+            "claude-code",
+            "codex",
+            "opencode",
+            "muse",
+            "omp",
+            "sylphx",
+        ] {
+            let agent = store
+                .create_agent(anyagents_core::NewAgent::new(harness, harness))
+                .unwrap();
+            let cfg = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+            let logs = cfg.join(".gemini/antigravity-cli/log");
+            std::fs::create_dir_all(&logs).unwrap();
+            std::fs::write(
+                logs.join("cli-previous-session.log"),
+                "run ended with error and no response: previous agy session failed\n",
+            )
+            .unwrap();
+            let mut view = agent_view(&store, &health, &agent).unwrap();
+            let expected = (harness == "agy").then_some("previous agy session failed");
+            assert_eq!(view.last_error.as_deref(), expected, "server: {harness}");
+            view.last_error = None;
+            crate::agent::reconcile_and_enrich_views(dir.path(), std::slice::from_mut(&mut view));
+            assert_eq!(view.last_error.as_deref(), expected, "client: {harness}");
+
+            std::fs::write(
+                cfg.join(".anyagents-last-error.json"),
+                serde_json::json!({
+                    "timestamp_ms": anyagents_core::now_ms(),
+                    "error": "current harness failed",
+                })
+                .to_string(),
+            )
+            .unwrap();
+            view = agent_view(&store, &health, &agent).unwrap();
+            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+            view.last_error = None;
+            crate::agent::reconcile_and_enrich_views(dir.path(), std::slice::from_mut(&mut view));
+            assert_eq!(view.last_error.as_deref(), Some("current harness failed"));
+        }
+    }
+
+    #[test]
     fn channel_roster_refuses_corrupt_persisted_state_without_mutation() {
         let dir = crate::test_tempdir();
         let state = archetype_validation_state(dir.path());
@@ -9939,6 +10008,28 @@ exec '{}' "$@"
         unsafe {
             std::env::remove_var("ANYAGENTS_FAKE_MODE");
         }
+    }
+
+    #[test]
+    fn archived_agents_do_not_seed_reconciliation_watermarks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path().join("state.db")).unwrap();
+        let agent = store
+            .create_agent(anyagents_core::NewAgent::new("retired", "codex"))
+            .unwrap();
+        store.set_agent_state(&agent.id, "archived").unwrap();
+        let reconcile = Arc::new(Mutex::new(AdminReconcileState::default()));
+        reconcile_agent_snapshot(
+            &store,
+            &HealthBoard::default(),
+            dir.path(),
+            &reconcile,
+            now_ms(),
+            store.list_agents().unwrap(),
+        );
+        let state = reconcile.lock().unwrap();
+        assert!(state.initialized);
+        assert!(state.watermark_seq.is_empty());
     }
 
     #[test]

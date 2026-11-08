@@ -626,6 +626,15 @@ const CAPABILITY_BYTES: usize = 32;
 /// New rows always have an explicit scope. This bounded, transactional upgrade
 /// touches only legacy environment metadata, never identities or work state.
 fn preserve_legacy_scopes(conn: &mut Connection) -> Result<(), Error> {
+    let missing_scope_sql = "SELECT EXISTS(SELECT 1 FROM agents WHERE NOT EXISTS (
+                SELECT 1 FROM json_each(CASE WHEN json_valid(launch_env) THEN launch_env ELSE '[]' END) entry
+                WHERE entry.key % 2 = 0 AND entry.value = 'ANYAGENTS_SCOPE'
+                  AND lower(trim(json_extract(launch_env, '$[' || (entry.key + 1) || ']'))) IN (
+                    'isolated','none','private','false','0','siblings','sibling','team',
+                    'public','org','all','true','1')))";
+    if !conn.query_row(missing_scope_sql, [], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let ids: Vec<String> = {
         let mut stmt = tx.prepare(
@@ -673,39 +682,57 @@ impl Store {
         let conn = Connection::open(path)?;
         conn.busy_timeout(Duration::from_secs(15))?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
-        let mode: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        let mut mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            mode = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+        }
         if !mode.eq_ignore_ascii_case("wal") {
             return Err(Error::Message(format!(
                 "sqlite journal mode is {mode}, not wal"
             )));
         }
         let mut conn = conn;
+        let schema_version = migrate::current_version(&conn)?;
         migrate::migrate(&mut conn)?;
         preserve_legacy_scopes(&mut conn)?;
         if migrate::current_version(&conn)? < 1 {
             return Err(Error::Message("migrations did not apply".into()));
         }
-        conn.execute(
-            "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
+        let has_legacy_state: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agents WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived'))",
             [],
+            |row| row.get(0),
         )?;
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS message_versions (
-                agent_id TEXT NOT NULL,
-                chat_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                body TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL,
-                PRIMARY KEY (agent_id, chat_id, message_id)
-            );
-            CREATE TABLE IF NOT EXISTS agent_topology_state (
-                agent_id TEXT PRIMARY KEY,
-                state_json TEXT NOT NULL,
-                updated_at_ms INTEGER NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
-                ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
+        if has_legacy_state {
+            conn.execute(
+                "UPDATE agents SET state = 'archived' WHERE state NOT IN ('created', 'running', 'idle', 'paused', 'archived')",
+                [],
+            )?;
+        }
+        let has_aux_schema: bool = conn.query_row(
+            "SELECT (SELECT count(*) FROM sqlite_master WHERE name IN ('message_versions', 'agent_topology_state', 'idx_rag_chunks_agent_id_time')) = 3",
+            [],
+            |row| row.get(0),
         )?;
+        if !has_aux_schema {
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS message_versions (
+                    agent_id TEXT NOT NULL,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    body TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL,
+                    PRIMARY KEY (agent_id, chat_id, message_id)
+                );
+                CREATE TABLE IF NOT EXISTS agent_topology_state (
+                    agent_id TEXT PRIMARY KEY,
+                    state_json TEXT NOT NULL,
+                    updated_at_ms INTEGER NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_rag_chunks_agent_id_time
+                    ON rag_chunks(agent_id, timestamp_ms DESC, chunk_id);",
+            )?;
+        }
         // Older databases may already have this column from an earlier runtime.
         // Presence, not an arbitrary failed ALTER, is the idempotency condition.
         let has_public: bool = conn.query_row(
@@ -719,7 +746,12 @@ impl Store {
                 [],
             )?;
         }
-        ensure_lexical_fts_backfilled(&mut conn)?;
+        // Current schemas maintain FTS transactionally on every history write.
+        // Only legacy upgrades need the full derivative-index validation; doing
+        // it on every open scans history and competes with the server writer.
+        if schema_version < 23 {
+            ensure_lexical_fts_backfilled(&mut conn)?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
             db_path: path.to_path_buf(),
@@ -5273,18 +5305,19 @@ fn claim_schedule_tick_on(
 }
 
 fn ensure_lexical_fts_backfilled(conn: &mut Connection) -> Result<(), Error> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // A nonempty index can still be partial, duplicated or stale. Check the
-    // entire derivative membership under the same lock as any rebuild.
-    let complete: bool = tx.query_row(
+    let fts_complete_sql =
         "SELECT (SELECT count(*) FROM rag_chunks) = (SELECT count(*) FROM rag_chunks_fts)
          AND NOT EXISTS (
             SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks
             EXCEPT
-            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks_fts)",
-        [],
-        |r| r.get(0),
-    )?;
+            SELECT chunk_id, agent_name, sender, destination, kind, tool_name, text FROM rag_chunks_fts)";
+    if conn.query_row(fts_complete_sql, [], |r| r.get::<_, bool>(0))? {
+        return Ok(());
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // A nonempty index can still be partial, duplicated or stale. Check the
+    // entire derivative membership under the same lock as any rebuild.
+    let complete: bool = tx.query_row(fts_complete_sql, [], |r| r.get(0))?;
     if !complete {
         tx.execute("DELETE FROM rag_chunks_fts", [])?;
         let mut sel = tx.prepare(

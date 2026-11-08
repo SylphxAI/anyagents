@@ -493,30 +493,21 @@ fn retire_poisoned_agy_session(config_dir: &Path, now_ms: i64) -> Result<bool, S
 fn prepare_host_session(request: &LaunchRequest) -> Result<(), String> {
     let root = request.config_dir.parent().ok_or("agent root missing")?;
     let source = memory_source(&request.agent);
-    anyagents_core::host_session::recover_pending(root).map_err(|e| e.to_string())?;
-    let previous = anyagents_core::host_session::active(root).map_err(|e| e.to_string())?;
-    let switched = previous
-        .as_ref()
-        .is_some_and(|s| s.harness != request.agent.harness);
-    if switched {
-        // Deliberate harness cutover starts a native session too. Keep its raw
-        // history in place; only retire the pointer, not its transcript/state.
-        if let Some(file) = crate::create::harness_session_filename(&request.agent.harness) {
-            match std::fs::remove_file(request.config_dir.join(file)) {
-                Ok(()) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        anyagents_core::host_session::new_session_with_source(root, &request.agent.harness, source)
-    } else {
+    let prepared = anyagents_core::host_session::prepare_harness_with_source(
+        root,
+        &request.agent.harness,
+        crate::create::harness_session_filename(&request.agent.harness),
+        source,
+    )
+    .map_err(|e| format!("host session pin failed: {e}"))?;
+    if prepared.is_none() {
         anyagents_core::host_session::ensure_active_with_source(
             root,
             &request.agent.harness,
             source,
         )
+        .map_err(|e| format!("host session pin failed: {e}"))?;
     }
-    .map_err(|e| format!("host session pin failed: {e}"))?;
     if let Some(file) = crate::create::harness_session_filename(&request.agent.harness)
         && let Some(id) = session_from_file(&request.config_dir, file)?
     {
