@@ -4445,6 +4445,12 @@ async fn delete_agent_route(
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
+        if state.health.get(&found.id).is_some_and(|live| live.process_alive) {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "agent is archived but its process has not stopped; identity and resources are retained",
+            ));
+        }
         crate::worktree_access::revoke_recorded(state.store.data_dir(), &found.id)
             .map_err(ApiError::from_store)?;
         let deleted = state
@@ -6930,6 +6936,42 @@ pub(crate) mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::sync::MutexGuard;
+
+    #[test]
+    fn deletion_retains_identity_and_resources_until_process_stop() {
+        let dir = crate::test_tempdir();
+        let state = archetype_validation_state(dir.path());
+        let agent = state.store.create_agent(anyagents_core::NewAgent::new("busy", "opencode")).unwrap();
+        let config = anyagents_core::agent_config_dir(dir.path(), &agent.id);
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("preserve"), "retained state").unwrap();
+        let (delivery_mode, steer_support) = declared(&agent.harness);
+        let mut live = anyagents_supervisor::LiveState {
+            process_alive: true,
+            turn_state: anyagents_harness::TurnState::Idle,
+            delivery_mode,
+            steer_support,
+            quota_reset_at_ms: None,
+            restart_at_ms: None,
+            pid: None,
+            live_harness: Some(agent.harness.clone()),
+            live_model: None,
+            process_started_at_ms: None,
+            last_error: None,
+        };
+        state.health.publish(&agent.id, live.clone());
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let refused = delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.err().expect("live process must retain identity");
+            assert_eq!(refused.status, StatusCode::CONFLICT);
+            assert_eq!(state.store.agent(&agent.id).unwrap().state, "archived");
+            assert_eq!(std::fs::read_to_string(config.join("preserve")).unwrap(), "retained state");
+            live.process_alive = false;
+            state.health.publish(&agent.id, live);
+            delete_agent_route(Principal::Operator, State(state.clone()), AxumPath(agent.name.clone())).await.unwrap_or_else(|error| panic!("{}", error.message));
+            assert!(state.store.agent(&agent.id).is_err());
+            assert!(!config.exists());
+        });
+    }
 
     #[test]
     fn deleted_authenticated_agent_cannot_read_roster_or_send() {
