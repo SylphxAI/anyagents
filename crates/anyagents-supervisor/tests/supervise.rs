@@ -372,6 +372,9 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
         "{:?}",
         other.inbox(&agent.id, None)
     );
+    // The cursor records pipe acceptance, not the child's subsequent read/log.
+    // Observe consumption before asserting exactly-once vendor execution.
+    assert!(wait_until(|| log_contains(&log, "user:3:")));
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     for seq in 1..=3 {
         let id = other
@@ -398,8 +401,8 @@ fn three_lines_sent_while_a_turn_is_open_are_all_taken_and_none_twice() {
     drop(supervisor);
 }
 
-/// A line already taken is not written again after the server restarts, and a
-/// line taken just before the restart is written exactly once more.
+/// A line consumed before a process kill stays delivered; subsequent mailbox
+/// lines reach the replacement once and do not replay the consumed input.
 #[test]
 fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
     let dir = short_dir();
@@ -431,6 +434,9 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
     assert!(wait_until(
         || other.delivered_cursor(&agent.id).unwrap() >= 1
     ));
+    // This case kills after vendor consumption, not merely after a pipe write.
+    // Killing earlier is a different unknown-consumption recovery boundary.
+    assert!(wait_until(|| log_contains(&log, "user:1:")));
     // The process dies with the turn still open. The supervisor starts a new
     // one after its backoff, and the next two lines go to it in order.
     let pid = supervisor.live(&agent.id).unwrap().pid.unwrap();
@@ -452,6 +458,7 @@ fn a_restart_mid_stream_loses_nothing_and_writes_nothing_twice() {
         "{:?}",
         other.inbox(&agent.id, None)
     );
+    assert!(wait_until(|| log_contains(&log, "user:2:")));
     let inbox = other.inbox(&agent.id, None).unwrap();
     let text = std::fs::read_to_string(&log).unwrap_or_default();
     for message in &inbox {
