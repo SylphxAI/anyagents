@@ -132,7 +132,7 @@ pub(super) fn probe(
     let base = std::env::var("ANYAGENTS_GITHUB_API_BASE").unwrap_or_default();
     let key = target_key(&base, owner, repo, reference, pr);
     let mut probes = PROBES.lock().ok()?;
-    Some(probes.probe(
+    Some(probes.probe_with_clock(
         &key,
         owner,
         repo,
@@ -140,6 +140,7 @@ pub(super) fn probe(
         pr,
         now,
         |path, etag, modified| request(&base, path, etag, modified, agent_id, owner),
+        anyagents_core::now_ms,
     ))
 }
 
@@ -251,6 +252,7 @@ impl Probes {
         target.resume_at = until.saturating_add(MIN_INTERVAL + offset);
     }
 
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     fn probe(
         &mut self,
@@ -260,7 +262,22 @@ impl Probes {
         reference: &str,
         pr: bool,
         now: i64,
+        request: impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
+    ) -> Observation {
+        self.probe_with_clock(key, owner, repo, reference, pr, now, request, || now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn probe_with_clock(
+        &mut self,
+        key: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        pr: bool,
+        now: i64,
         mut request: impl FnMut(&str, Option<&str>, Option<&str>) -> Result<Response, Error>,
+        completed_at: impl FnOnce() -> i64,
     ) -> Observation {
         let auth_owner = owner.to_ascii_lowercase();
         if now < self.auth_until.get(&auth_owner).copied().unwrap_or(0) {
@@ -307,6 +324,8 @@ impl Probes {
                 Ok(response)
             },
         );
+        // Network/subprocess time belongs to this probe, not its next interval.
+        let completed_at = completed_at();
         // Consume the response that crossed the floor, but admit no next page or
         // target until reset. A terminal final page can still be delivered.
         let previous_until = self.limited_until;
@@ -329,7 +348,7 @@ impl Probes {
                 };
                 target.successful = Some(observation.clone());
                 target.result = Some(observation.clone());
-                target.next_at = now.saturating_add(target.interval);
+                target.next_at = completed_at.saturating_add(target.interval);
                 self.limit_interval = 0;
                 observation
             }
@@ -346,7 +365,7 @@ impl Probes {
                         self.auth_until
                             .insert(auth_owner, now.saturating_add(MIN_INTERVAL));
                     }
-                    target.next_at = now.saturating_add(MIN_INTERVAL);
+                    target.next_at = completed_at.saturating_add(MIN_INTERVAL);
                     target.result = Some(error.observation());
                 }
                 error.observation()
@@ -931,6 +950,67 @@ mod tests {
             json!({"total_count":101,"check_runs":[{"id":101,"name":"ci-last","status":"in_progress","conclusion":null}]}),
             &[("etag", "\"page2-v1\"")],
         )
+    }
+
+    #[test]
+    fn probe_backoff_starts_after_successful_or_failed_request_completion() {
+        for fails in [false, true] {
+            let mut probes = Probes::default();
+            let result = probes.probe_with_clock(
+                "slow",
+                "o",
+                "r",
+                "1",
+                true,
+                1000,
+                |path, _, _| {
+                    if fails {
+                        return Err(Error::Transport);
+                    }
+                    Ok(response(
+                        200,
+                        if path.contains("/pulls/") {
+                            pull("open", false, SHA)
+                        } else if path.contains("/check-runs") {
+                            pending()
+                        } else {
+                            json!({"statuses":[]})
+                        },
+                        &[],
+                    ))
+                },
+                || 9000,
+            );
+            let next = 9000 + MIN_INTERVAL;
+            assert_eq!(probes.targets["slow"].next_at, next);
+            let cached = probes.probe_with_clock(
+                "slow",
+                "o",
+                "r",
+                "1",
+                true,
+                next - 1,
+                |_, _, _| panic!("slow probe must retain a complete post-request interval"),
+                || next - 1,
+            );
+            assert_eq!(cached, result);
+            let mut calls = 0;
+            probes.probe_with_clock(
+                "slow",
+                "o",
+                "r",
+                "1",
+                true,
+                next,
+                |_, _, _| {
+                    calls += 1;
+                    Err(Error::Transport)
+                },
+                || next + 2000,
+            );
+            assert_eq!(calls, 1, "an expired interval must admit another request");
+            assert_eq!(probes.targets["slow"].next_at, next + 2000 + MIN_INTERVAL);
+        }
     }
 
     // Acceptance assertion, deliberately not should_panic: an unsafe terminal is a failure.

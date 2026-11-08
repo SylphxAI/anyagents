@@ -250,7 +250,10 @@ fn a_session_acts_as_its_own_agent_and_nothing_else() {
     );
     assert!(beta_inbox.contains("hello"), "{beta_inbox}");
     // The author recorded is the capability's agent, never the body.
-    assert!(beta_inbox.contains(&format!("agent:{alpha}")), "{beta_inbox}");
+    assert!(
+        beta_inbox.contains(&format!("agent:{alpha}")),
+        "{beta_inbox}"
+    );
 
     // A body that names another sender is refused, with nothing written.
     let forged = support::call_raw(

@@ -664,8 +664,19 @@ pub fn tick_schedules_once(store: &Store, health: &HealthBoard, now: i64) -> usi
         }
     };
     github::begin_cycle(&schedules, now);
+    // Local observations must be admitted before any external probe can block
+    // on a subprocess or network timeout. Preserve order inside each phase.
+    let (external, local): (Vec<_>, Vec<_>) = schedules.into_iter().partition(|sched| {
+        sched.kind == "watch"
+            && matches!(
+                parse_watch_spec(&sched.spec),
+                Ok(WatchTarget::GitHubPr { .. }
+                    | WatchTarget::GitHubCheck { .. }
+                    | WatchTarget::SpironPromise { .. })
+            )
+    });
     let mut fired_count = 0;
-    for sched in schedules {
+    for sched in local.into_iter().chain(external) {
         if (sched.kind == "at" || sched.kind == "every")
             && sched.next_fire_at_ms.is_none_or(|due| now < due)
         {
@@ -1335,6 +1346,116 @@ mod tests {
     }
 
     #[test]
+    fn first_tick_admits_local_watches_and_timers_before_older_external_probes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::Arc;
+        let _env = crate::server::tests::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path().join("state.db")).unwrap());
+        let health = HealthBoard::default();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let external_owner = store
+            .create_agent(NewAgent::new("external", "codex"))
+            .unwrap();
+        store
+            .set_agent_running(&external_owner.id, "/work")
+            .unwrap();
+        let external = store
+            .create_schedule(NewSchedule {
+                agent_id: external_owner.id,
+                kind: "watch".into(),
+                spec: "github:pr:example-org/project#1".into(),
+                prompt: "external".into(),
+                interval_ms: None,
+                next_fire_at_ms: None,
+                watch_baseline: Some("pending".into()),
+            })
+            .unwrap();
+        // Make the external watch strictly older, independent of clock resolution.
+        rusqlite::Connection::open(dir.path().join("state.db"))
+            .unwrap()
+            .execute(
+                "UPDATE agent_schedules SET created_at_ms=1 WHERE id=?1",
+                [external.id.as_str()],
+            )
+            .unwrap();
+        let target = store
+            .create_agent(NewAgent::new("idle-target", "codex"))
+            .unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        let path = dir.path().join("ready");
+        std::fs::write(&path, "ready").unwrap();
+        let now = anyagents_core::now_ms();
+        let mut owners = Vec::new();
+        for (label, kind, spec) in [
+            ("file", "watch", format!("file:{}", path.display())),
+            ("process", "watch", format!("pid:{pid}")),
+            ("idle", "watch", format!("agent:idle:{}", target.name)),
+            ("timer", "at", "due".into()),
+            ("interval", "every", "1s".into()),
+        ] {
+            let owner = store.create_agent(NewAgent::new(label, "codex")).unwrap();
+            store.set_agent_running(&owner.id, "/work").unwrap();
+            store
+                .create_schedule(NewSchedule {
+                    agent_id: owner.id.clone(),
+                    kind: kind.into(),
+                    spec,
+                    prompt: label.into(),
+                    interval_ms: (kind == "every").then_some(1000),
+                    next_fire_at_ms: (kind != "watch").then_some(now - 1),
+                    watch_baseline: (label == "file").then(|| "missing".into()),
+                })
+                .unwrap();
+            owners.push(owner.id);
+        }
+        assert_eq!(store.list_schedules(None, true).unwrap()[0].id, external.id);
+        let observing_store = Arc::clone(&store);
+        let observed_owners = owners.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut request = [0; 4096];
+            let _ = stream.read(&mut request).unwrap();
+            // This is the start of an actual external HTTP probe, before it
+            // can finish or release the scheduler. Local admission must be done.
+            let counts: Vec<_> = observed_owners
+                .iter()
+                .map(|id| observing_store.inbox(id, None).unwrap().len())
+                .collect();
+            stream
+                .write_all(
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .unwrap();
+            counts
+        });
+        // SAFETY: serialized with all other process-wide GitHub API overrides.
+        unsafe {
+            std::env::set_var("ANYAGENTS_GITHUB_API_BASE", format!("http://{address}"));
+        }
+        let fired = tick_schedules_once(&store, &health, now);
+        unsafe {
+            std::env::remove_var("ANYAGENTS_GITHUB_API_BASE");
+        }
+        let counts_at_external_start = server.join().unwrap();
+        assert_eq!(fired, 5);
+        assert_eq!(counts_at_external_start, vec![1; 5]);
+        for owner in owners {
+            assert_eq!(store.inbox(&owner, None).unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn local_schedule_watch_fires_with_idle_delivery_loop_lock() {
         for harness in ["agy", "claude-code", "codex", "opencode", "muse", "omp"] {
             let dir = tempfile::tempdir().unwrap();
@@ -1646,6 +1767,7 @@ mod tests {
 
     #[test]
     fn github_pr_watch_stays_active_across_checks_and_review_failure_until_merged() {
+        let _env = crate::server::tests::env_lock();
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicUsize, Ordering};

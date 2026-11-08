@@ -7496,6 +7496,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
                 "model" => tpl.model = Some(value.to_string()),
                 "role" => tpl.role = Some(value.to_string()),
                 "profile" => tpl.profile = Some(value.to_string()),
+                "name" | "archetype" => {}
                 _ => {
                     return Err(Error::Message(format!(
                         "unknown archetype template frontmatter key {key:?}"
@@ -7514,7 +7515,7 @@ pub(crate) fn parse_archetype_markdown(raw: &str) -> Result<ArchetypeTemplate, E
 /// Resolve an archetype template by name across:
 /// 1. `<explicit_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
 /// 2. `<parent_workdir>/.agents/agents/<archetype>.md` (or `<archetype>/agent.md`)
-/// 3. `<data_dir>/agents-templates/<archetype>.md` (or `<data_dir>/archetypes/`, `<data_dir>/.agents/agents/`)
+/// 3. `<data_dir>/.agents/agents/<archetype>.md` (then `<data_dir>/agents-templates/`, `<data_dir>/archetypes/`)
 /// 4. `<HOME>/.agents/agents/<archetype>.md` (and `owner_workdir()/.agents/agents/`)
 pub(crate) fn resolve_archetype_template(
     archetype: &str,
@@ -7539,9 +7540,9 @@ pub(crate) fn resolve_archetype_template(
     if let Some(pwd) = parent_workdir {
         search_roots.push((pwd.to_path_buf(), PathBuf::from(".agents/agents")));
     }
+    search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
     search_roots.push((data_dir.to_path_buf(), PathBuf::from("agents-templates")));
     search_roots.push((data_dir.to_path_buf(), PathBuf::from("archetypes")));
-    search_roots.push((data_dir.to_path_buf(), PathBuf::from(".agents/agents")));
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
         search_roots.push((home, PathBuf::from(".agents/agents")));
     }
@@ -10666,6 +10667,46 @@ git -c safe.directory="$5" -C "$5" status --porcelain
 #[cfg(test)]
 mod archetype_tests {
     use super::*;
+
+    #[test]
+    fn data_archetypes_accept_name_metadata_and_prefer_shipped_templates() {
+        let dir = tempfile::tempdir().unwrap();
+        for root in [".agents/agents", "agents-templates", "archetypes"] {
+            std::fs::create_dir_all(dir.path().join(root)).unwrap();
+        }
+        for slug in ["worker", "reviewer", "mind"] {
+            std::fs::write(
+                dir.path().join(format!(".agents/agents/{slug}.md")),
+                format!(
+                    "---\nname: {slug}\narchetype: {slug}\nscope: private\n---\nShipped {slug}."
+                ),
+            )
+            .unwrap();
+            for fallback in ["agents-templates", "archetypes"] {
+                std::fs::write(
+                    dir.path().join(format!("{fallback}/{slug}.md")),
+                    "Fallback.",
+                )
+                .unwrap();
+            }
+            let template = resolve_archetype_template(slug, None, None, dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(template.body, format!("Shipped {slug}."));
+            assert_eq!(template.scope.as_deref(), Some("private"));
+            std::fs::remove_file(dir.path().join(format!(".agents/agents/{slug}.md"))).unwrap();
+            assert_eq!(
+                resolve_archetype_template(slug, None, None, dir.path())
+                    .unwrap()
+                    .unwrap()
+                    .body,
+                "Fallback."
+            );
+        }
+        assert!(
+            parse_archetype_markdown("---\nname: worker\nunknown: rejected\n---\nBody.").is_err()
+        );
+    }
 
     #[test]
     fn archetype_frontmatter_requires_valid_yaml_and_complete_delimiters() {
