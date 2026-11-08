@@ -5,7 +5,10 @@ import vm from 'node:vm';
 
 // Execute the shipped handlers, with deterministic frame, clock and HTTP edges.
 // Real trusted input and remote DOM effects are also covered by the Chromium suite.
-async function mount({ frameOk = true, readText = async () => 'native paste' } = {}) {
+async function mount({ frameOk = true, readText = async () => 'native paste',
+  decodeFrame = async () => ({ width: 1280, height: 800, close() {} }),
+} = {}) {
+  const painted = [], frameRequests = [];
   class Target {
     listeners = new Map(); style = {}; dataset = {}; value = ''; hidden = false;
     clientWidth = 390; clientHeight = 844; width = 1280; height = 800;
@@ -15,7 +18,7 @@ async function mount({ frameOk = true, readText = async () => 'native paste' } =
     focus() { if (document.activeElement === this) return; document.activeElement = this; document.emit('focusin', { target: this }); }
     blur() { document.activeElement = body; document.emit('focusout', { target: this, relatedTarget: null }); }
     closest() { return this.id === 'type-input' ? this : null; }
-    getContext() { return { drawImage() {} }; }
+    getContext() { return { drawImage(image) { painted.push(image.tag); } }; }
     setPointerCapture() {}
     setAttribute() {}
   }
@@ -33,9 +36,12 @@ async function mount({ frameOk = true, readText = async () => 'native paste' } =
     setTimeout: (fn, ms) => { const id = ++nextTimer; timers.set(id, { fn, ms, due: clock + ms }); return id; },
     clearTimeout: id => timers.delete(id),
     addEventListener() {}, navigator: { clipboard: { readText } },
-    createImageBitmap: async () => ({ width: 1280, height: 800, close() {} }),
+    createImageBitmap: decodeFrame,
     fetch: async (url, options) => {
-      if (url.includes('/frame.jpg') && !frameOk) throw new Error('capture unavailable');
+      if (url.includes('/frame.jpg')) {
+        frameRequests.push(url);
+        if (!frameOk) throw new Error('capture unavailable');
+      }
       if (url.includes('/input')) {
         inputs.push(JSON.parse(options.body));
         if (hold) await new Promise(resolve => held.push(resolve));
@@ -57,7 +63,7 @@ async function mount({ frameOk = true, readText = async () => 'native paste' } =
     }
     await settle();
   }
-  return { element, inputs, pointer, settle, advance, document, timers, window: context.window, hold: () => { hold = true; }, release: () => { hold = false; held.splice(0).forEach(resolve => resolve()); } };
+  return { element, inputs, pointer, settle, advance, document, timers, painted, frameRequests, window: context.window, hold: () => { hold = true; }, release: () => { hold = false; held.splice(0).forEach(resolve => resolve()); } };
 }
 
 test('two-finger scroll beginning on a button sends no press or release', async () => {
@@ -209,6 +215,32 @@ test('frame capture schedules immediately on success and backs off on failure', 
   const failed = await mount({ frameOk: false });
   assert.ok([...failed.timers.values()].some(timer => timer.ms === 100));
   assert.equal([...failed.timers.values()].some(timer => timer.ms === 0), false);
+});
+
+
+// The real Chromium fixture retains wall-clock input-to-painted-pixel samples.
+// Enforce the viewer's contribution here under a controlled task queue instead
+// of failing that end-to-end fixture on shared-runner scheduling delays.
+test('decoded frames paint in the same task and capture resumes without clock advance', async () => {
+  let finishDecode;
+  const closed = [];
+  const ui = await mount({ decodeFrame: () => new Promise(resolve => { finishDecode = resolve; }) });
+  const frameTasks = () => [...ui.timers].filter(([, timer]) => timer.fn?.name === 'pollFrame');
+  for (let tag = 1; tag <= 3; tag++) {
+    assert.equal(ui.frameRequests.length, tag, 'only one capture may be in flight');
+    assert.equal(ui.painted.length, tag - 1, 'an unfinished decode cannot paint');
+    assert.equal(frameTasks().length, 0, 'the next capture must wait for this frame');
+    finishDecode({ tag, width: 1280, height: 800, close() { closed.push(tag); } });
+    await ui.settle(); // Microtasks only: no timer or animation frame advances.
+    assert.deepEqual(ui.painted, Array.from({ length: tag }, (_, i) => i + 1), 'decoded pixels paint before another task');
+    assert.deepEqual(closed, ui.painted, 'each painted bitmap is released');
+    const tasks = frameTasks();
+    assert.equal(tasks.length, 1, 'exactly one next-frame task is scheduled');
+    const [id, task] = tasks[0];
+    assert.equal(task.ms, 0, 'a successful frame adds no cooldown');
+    assert.equal(task.due, 0, 'capture resumes without advancing the controlled clock');
+    if (tag < 3) { ui.timers.delete(id); void task.fn(); await ui.settle(); }
+  }
 });
 
 
